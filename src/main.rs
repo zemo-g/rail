@@ -7,20 +7,27 @@ mod typechecker;
 mod codegen;
 mod repl;
 mod modules;
+mod stdlib;
+mod ai;
+mod route;
 
 use std::env;
 use std::fs;
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
+    // Parse --allow/--sandbox/--open flags, return route + remaining args
+    let (route, args) = route::Route::from_args(&raw_args[1..]);
+    // Re-insert program name for index consistency
+    let args: Vec<String> = std::iter::once(raw_args[0].clone()).chain(args).collect();
 
     match args.get(1).map(|s| s.as_str()) {
         Some("run") => {
             let file = args.get(2).unwrap_or_else(|| {
-                eprintln!("usage: rail run <file.rail>");
+                eprintln!("usage: rail run <file.rail> [--allow fs:/path] [--allow shell] [--allow ai] [--allow net:host] [--allow all]");
                 std::process::exit(1);
             });
-            run_file(file);
+            run_file(file, route);
         }
         Some("compile") => {
             let file = args.get(2).unwrap_or_else(|| {
@@ -53,6 +60,24 @@ fn main() {
         Some("repl") => {
             repl::start();
         }
+        Some("init") => {
+            let dir = args.get(2).map(|s| s.as_str());
+            init_project(dir);
+        }
+        Some("stdlib-path") => {
+            let base = args.get(2)
+                .map(|s| std::path::PathBuf::from(s))
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
+            println!("stdlib search paths:");
+            for path in modules::stdlib_search_paths(&base) {
+                println!("  {}", path);
+            }
+            println!();
+            println!("embedded modules:");
+            for name in stdlib::list_modules() {
+                println!("  {}", name);
+            }
+        }
         Some("version") | Some("--version") | Some("-v") => {
             println!("Rail 0.1.0");
         }
@@ -66,7 +91,19 @@ fn main() {
             println!("  rail parse <file.rail>   Parse and show AST");
             println!("  rail lex <file.rail>     Tokenize and show tokens");
             println!("  rail repl                Interactive mode");
+            println!("  rail init [dir]          Create a new Rail project");
+            println!("  rail stdlib-path [dir]   Show stdlib search paths");
             println!("  rail version             Show version");
+            println!();
+            println!("route flags (capability system):");
+            println!("  --allow fs:/path         Allow filesystem access under /path");
+            println!("  --allow net:host         Allow network access to host");
+            println!("  --allow shell            Allow shell command execution");
+            println!("  --allow ai               Allow AI/LLM calls");
+            println!("  --allow env:VAR          Allow reading env var VAR");
+            println!("  --allow all              Full access (no restrictions)");
+            println!("  --open                   Shorthand for --allow all");
+            println!("  --sandbox                No system access (default)");
         }
     }
 }
@@ -246,7 +283,7 @@ fn parse_file(path: &str) {
     }
 }
 
-fn run_file(path: &str) {
+fn run_file(path: &str, route: route::Route) {
     let source = fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("error reading {}: {}", path, e);
         std::process::exit(1);
@@ -272,12 +309,24 @@ fn run_file(path: &str) {
 
     let program = resolve_modules(path, program);
 
-    let mut interp = interpreter::Interpreter::new();
+    // Show route if not default open
+    if !route.allow_all {
+        eprintln!("[route: {}]", route.describe());
+    }
+    let mut interp = interpreter::Interpreter::with_route(route);
     match interp.run(&program) {
         Ok(val) => {
-            // Don't print Unit — it means main ended with a print call
+            // main's return value is an exit code, not output.
+            // Unit = fine (ended with print or side effect)
+            // Int(0) = success, don't print
+            // Int(n) = use as process exit code
+            // Anything else = print it (useful in REPL / debugging)
             match val {
                 interpreter::Value::Unit => {}
+                interpreter::Value::Int(0) => {}
+                interpreter::Value::Int(code) => {
+                    std::process::exit(code as i32);
+                }
                 _ => println!("{}", val),
             }
         }
@@ -286,4 +335,61 @@ fn run_file(path: &str) {
             std::process::exit(1);
         }
     }
+}
+
+fn init_project(dir: Option<&str>) {
+    let project_dir = match dir {
+        Some(d) => std::path::PathBuf::from(d),
+        None => std::env::current_dir().unwrap_or_else(|e| {
+            eprintln!("cannot get current directory: {}", e);
+            std::process::exit(1);
+        }),
+    };
+
+    // Derive project name from directory
+    let project_name = project_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("my-project")
+        .to_string();
+
+    // Create directories
+    let src_dir = project_dir.join("src");
+    if let Err(e) = fs::create_dir_all(&src_dir) {
+        eprintln!("cannot create {}: {}", src_dir.display(), e);
+        std::process::exit(1);
+    }
+
+    // Create rail.toml
+    let toml_path = project_dir.join("rail.toml");
+    if toml_path.exists() {
+        eprintln!("rail.toml already exists in {}", project_dir.display());
+        std::process::exit(1);
+    }
+    let toml_content = format!(
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\n\n[dependencies]\n# future: external packages\n",
+        project_name
+    );
+    if let Err(e) = fs::write(&toml_path, toml_content) {
+        eprintln!("cannot write {}: {}", toml_path.display(), e);
+        std::process::exit(1);
+    }
+
+    // Create src/main.rail
+    let main_path = src_dir.join("main.rail");
+    if !main_path.exists() {
+        let main_content = "main =\n  let _ = print \"Hello from Rail!\"\n  0\n";
+        if let Err(e) = fs::write(&main_path, main_content) {
+            eprintln!("cannot write {}: {}", main_path.display(), e);
+            std::process::exit(1);
+        }
+    }
+
+    println!("initialized Rail project '{}' in {}", project_name, project_dir.display());
+    println!();
+    println!("  rail.toml       project manifest");
+    println!("  src/main.rail   entry point");
+    println!();
+    println!("run it:");
+    println!("  rail run src/main.rail");
 }

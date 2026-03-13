@@ -41,6 +41,20 @@ impl Parser {
         Ok(Program { declarations })
     }
 
+    /// Get the current token's (line, col) as a Span
+    fn current_span(&self) -> Span {
+        if self.pos < self.tokens.len() {
+            (self.tokens[self.pos].span.line, self.tokens[self.pos].span.col)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Create a spanned Expr from an ExprKind and a span
+    fn spanned(&self, kind: ExprKind, span: Span) -> Expr {
+        Expr::new(kind, span)
+    }
+
     fn parse_declaration(&mut self) -> Result<Decl, ParseError> {
         self.skip_newlines();
 
@@ -56,6 +70,7 @@ impl Parser {
     }
 
     fn parse_func_decl(&mut self) -> Result<Decl, ParseError> {
+        let span = self.current_span();
         let name = self.expect_ident()?;
         self.skip_newlines();
 
@@ -99,7 +114,7 @@ impl Parser {
             self.parse_expr()?
         };
 
-        Ok(Decl::Func { name, type_sig, params, body })
+        Ok(Decl::Func { name, type_sig, params, body, span })
     }
 
     fn parse_type_decl(&mut self) -> Result<Decl, ParseError> {
@@ -183,10 +198,19 @@ impl Parser {
     fn parse_export_decl(&mut self) -> Result<Decl, ParseError> {
         self.expect(&Token::Export)?;
         let mut names = Vec::new();
-        names.push(self.expect_ident()?);
-        while self.check(&Token::Comma) {
+        let has_parens = self.check(&Token::LParen);
+        if has_parens {
             self.advance();
+        }
+        if !has_parens || !self.check(&Token::RParen) {
             names.push(self.expect_ident()?);
+            while self.check(&Token::Comma) {
+                self.advance();
+                names.push(self.expect_ident()?);
+            }
+        }
+        if has_parens {
+            self.expect(&Token::RParen)?;
         }
         Ok(Decl::ExportDecl { names })
     }
@@ -253,6 +277,7 @@ impl Parser {
     // ---- Expressions ----
 
     fn parse_block(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current_span();
         let mut exprs = Vec::new();
 
         loop {
@@ -268,7 +293,7 @@ impl Parser {
         match exprs.len() {
             0 => Err(self.error("empty block")),
             1 => Ok(exprs.into_iter().next().unwrap()),
-            _ => Ok(Expr::Block(exprs)),
+            _ => Ok(self.spanned(ExprKind::Block(exprs), span)),
         }
     }
 
@@ -285,12 +310,13 @@ impl Parser {
             let saved_pos = self.pos;
             self.skip_newlines();
             if self.check(&Token::Pipe) {
+                let span = self.current_span();
                 self.advance(); // eat |>
                 let func = self.parse_let_expr()?;
-                expr = Expr::Pipe {
+                expr = self.spanned(ExprKind::Pipe {
                     value: Box::new(expr),
                     func: Box::new(func),
-                };
+                }, span);
             } else {
                 // Not a pipe — restore position so block parser sees the newlines
                 self.pos = saved_pos;
@@ -303,6 +329,7 @@ impl Parser {
 
     fn parse_let_expr(&mut self) -> Result<Expr, ParseError> {
         if self.check(&Token::Let) {
+            let span = self.current_span();
             self.advance(); // eat let
             let name = if self.check(&Token::Underscore) {
                 self.advance();
@@ -317,11 +344,11 @@ impl Parser {
             // The body is the rest of the block
             let body = self.parse_expr()?;
 
-            Ok(Expr::Let {
+            Ok(self.spanned(ExprKind::Let {
                 name,
                 value: Box::new(value),
                 body: Box::new(body),
-            })
+            }, span))
         } else if self.check(&Token::If) {
             self.parse_if_expr()
         } else if self.check(&Token::Match) {
@@ -334,6 +361,7 @@ impl Parser {
     }
 
     fn parse_if_expr(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current_span();
         self.expect(&Token::If)?;
         let cond = self.parse_expr()?;
         self.expect(&Token::Then)?;
@@ -344,14 +372,15 @@ impl Parser {
         self.skip_newlines();
         let else_branch = self.parse_expr()?;
 
-        Ok(Expr::If {
+        Ok(self.spanned(ExprKind::If {
             cond: Box::new(cond),
             then_branch: Box::new(then_branch),
             else_branch: Box::new(else_branch),
-        })
+        }, span))
     }
 
     fn parse_lambda(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current_span();
         self.expect(&Token::Backslash)?;
         let mut params = Vec::new();
         while !self.check(&Token::Arrow) && !self.at_eof() {
@@ -362,14 +391,27 @@ impl Parser {
         }
         self.expect(&Token::Arrow)?;
         self.skip_newlines();
-        let body = self.parse_expr()?;
-        Ok(Expr::Lambda {
+
+        // Support multi-line lambda bodies (indented block)
+        let body = if self.check_token(&Token::Indent) {
+            self.advance(); // eat Indent
+            let expr = self.parse_block()?;
+            if self.check_token(&Token::Dedent) {
+                self.advance();
+            }
+            expr
+        } else {
+            self.parse_expr()?
+        };
+
+        Ok(self.spanned(ExprKind::Lambda {
             params,
             body: Box::new(body),
-        })
+        }, span))
     }
 
     fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current_span();
         self.expect(&Token::Match)?;
         let scrutinee = self.parse_comparison()?;
         self.skip_newlines();
@@ -392,10 +434,10 @@ impl Parser {
             self.advance();
         }
 
-        Ok(Expr::Match {
+        Ok(self.spanned(ExprKind::Match {
             scrutinee: Box::new(scrutinee),
             arms,
-        })
+        }, span))
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
@@ -403,14 +445,15 @@ impl Parser {
 
         while let Token::Operator(ref op) = self.peek_token() {
             if matches!(op.as_str(), "==" | "!=" | "<" | ">" | "<=" | ">=") {
+                let span = self.current_span();
                 let op = op.clone();
                 self.advance();
                 let right = self.parse_logical()?;
-                left = Expr::BinOp {
+                left = self.spanned(ExprKind::BinOp {
                     op,
                     left: Box::new(left),
                     right: Box::new(right),
-                };
+                }, span);
             } else {
                 break;
             }
@@ -424,14 +467,15 @@ impl Parser {
 
         while let Token::Operator(ref op) = self.peek_token() {
             if matches!(op.as_str(), "&&" | "||") {
+                let span = self.current_span();
                 let op = op.clone();
                 self.advance();
                 let right = self.parse_additive()?;
-                left = Expr::BinOp {
+                left = self.spanned(ExprKind::BinOp {
                     op,
                     left: Box::new(left),
                     right: Box::new(right),
-                };
+                }, span);
             } else {
                 break;
             }
@@ -445,14 +489,15 @@ impl Parser {
 
         while let Token::Operator(ref op) = self.peek_token() {
             if matches!(op.as_str(), "+" | "-") {
+                let span = self.current_span();
                 let op = op.clone();
                 self.advance();
                 let right = self.parse_multiplicative()?;
-                left = Expr::BinOp {
+                left = self.spanned(ExprKind::BinOp {
                     op,
                     left: Box::new(left),
                     right: Box::new(right),
-                };
+                }, span);
             } else {
                 break;
             }
@@ -466,14 +511,15 @@ impl Parser {
 
         while let Token::Operator(ref op) = self.peek_token() {
             if matches!(op.as_str(), "*" | "/" | "%") {
+                let span = self.current_span();
                 let op = op.clone();
                 self.advance();
                 let right = self.parse_unary()?;
-                left = Expr::BinOp {
+                left = self.spanned(ExprKind::BinOp {
                     op,
                     left: Box::new(left),
                     right: Box::new(right),
-                };
+                }, span);
             } else {
                 break;
             }
@@ -485,13 +531,14 @@ impl Parser {
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         if let Token::Operator(ref op) = self.peek_token() {
             if op == "-" {
+                let span = self.current_span();
                 let op = op.clone();
                 self.advance();
                 let operand = self.parse_application()?;
-                return Ok(Expr::UnaryOp {
+                return Ok(self.spanned(ExprKind::UnaryOp {
                     op,
                     operand: Box::new(operand),
-                });
+                }, span));
             }
         }
         self.parse_application()
@@ -519,10 +566,11 @@ impl Parser {
         } else {
             let mut result = func;
             for arg in args {
-                result = Expr::App {
+                let span = result.span;
+                result = self.spanned(ExprKind::App {
                     func: Box::new(result),
                     arg: Box::new(arg),
-                };
+                }, span);
             }
             Ok(result)
         }
@@ -532,54 +580,56 @@ impl Parser {
         let mut expr = self.parse_atom()?;
 
         while self.check(&Token::Dot) {
+            let span = self.current_span();
             self.advance();
             let field = self.expect_ident()?;
-            expr = Expr::FieldAccess {
+            expr = self.spanned(ExprKind::FieldAccess {
                 expr: Box::new(expr),
                 field,
-            };
+            }, span);
         }
 
         Ok(expr)
     }
 
     fn parse_atom(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current_span();
         match self.peek_token() {
             Token::Int(n) => {
                 let n = n;
                 self.advance();
-                Ok(Expr::IntLit(n))
+                Ok(self.spanned(ExprKind::IntLit(n), span))
             }
             Token::Float(f) => {
                 let f = f;
                 self.advance();
-                Ok(Expr::FloatLit(f))
+                Ok(self.spanned(ExprKind::FloatLit(f), span))
             }
             Token::Str(s) => {
                 let s = s.clone();
                 self.advance();
-                Ok(Expr::StrLit(s))
+                Ok(self.spanned(ExprKind::StrLit(s), span))
             }
             Token::Bool(b) => {
                 let b = b;
                 self.advance();
-                Ok(Expr::BoolLit(b))
+                Ok(self.spanned(ExprKind::BoolLit(b), span))
             }
             Token::Ident(name) => {
                 let name = name.clone();
                 self.advance();
-                Ok(Expr::Var(name))
+                Ok(self.spanned(ExprKind::Var(name), span))
             }
             Token::TypeIdent(name) => {
                 let name = name.clone();
                 self.advance();
-                Ok(Expr::Constructor(name))
+                Ok(self.spanned(ExprKind::Constructor(name), span))
             }
             Token::LParen => {
                 self.advance();
                 if self.check(&Token::RParen) {
                     self.advance();
-                    return Ok(Expr::Tuple(vec![])); // unit
+                    return Ok(self.spanned(ExprKind::Tuple(vec![]), span)); // unit
                 }
 
                 // Check for operator section: `(+ 1)` or `(> 0)`
@@ -598,7 +648,7 @@ impl Parser {
                         elements.push(self.parse_expr()?);
                     }
                     self.expect(&Token::RParen)?;
-                    Ok(Expr::Tuple(elements))
+                    Ok(self.spanned(ExprKind::Tuple(elements), span))
                 } else {
                     self.expect(&Token::RParen)?;
                     Ok(expr)
@@ -615,7 +665,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Token::RBracket)?;
-                Ok(Expr::List(elements))
+                Ok(self.spanned(ExprKind::List(elements), span))
             }
             Token::LBrace => {
                 self.advance();
@@ -634,7 +684,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Token::RBrace)?;
-                Ok(Expr::Record(fields))
+                Ok(self.spanned(ExprKind::Record(fields), span))
             }
             _ => Err(self.error(&format!("expected expression, got {:?}", self.peek_token()))),
         }

@@ -108,11 +108,30 @@ type TypeEnv = HashMap<String, Scheme>;
 #[derive(Debug)]
 pub struct TypeError {
     pub message: String,
+    pub span: Option<Span>,
+}
+
+impl TypeError {
+    fn new(message: String) -> Self {
+        TypeError { message, span: None }
+    }
+
+    fn at(span: Span, message: String) -> Self {
+        TypeError { message, span: Some(span) }
+    }
 }
 
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "type error: {}", self.message)
+        if let Some((line, col)) = self.span {
+            if line > 0 {
+                write!(f, "type error at {}:{}: {}", line, col, self.message)
+            } else {
+                write!(f, "type error: {}", self.message)
+            }
+        } else {
+            write!(f, "type error: {}", self.message)
+        }
     }
 }
 
@@ -175,7 +194,7 @@ impl TypeChecker {
         // Second pass: type-check each function body
         for decl in &program.declarations {
             match decl {
-                Decl::Func { name, type_sig, params, body } => {
+                Decl::Func { name, type_sig, params, body, span } => {
                     match self.check_func(name, type_sig, params, body, &mut env) {
                         Ok(ty) => {
                             let resolved = self.resolve(&ty);
@@ -183,8 +202,10 @@ impl TypeChecker {
                             declarations.push((name.clone(), pretty));
                         }
                         Err(e) => {
+                            let err_span = e.span.or(Some(*span));
                             errors.push(TypeError {
                                 message: format!("in '{}': {}", name, e.message),
+                                span: err_span,
                             });
                         }
                     }
@@ -222,11 +243,9 @@ impl TypeChecker {
                         remaining_type = *ret_type;
                     }
                     _ => {
-                        return Err(TypeError {
-                            message: format!(
-                                "type signature has fewer parameters than definition"
-                            ),
-                        });
+                        return Err(TypeError::new(
+                            "type signature has fewer parameters than definition".to_string(),
+                        ));
                     }
                 }
             }
@@ -236,6 +255,7 @@ impl TypeChecker {
             self.unify(&body_type, &remaining_type).map_err(|e| TypeError {
                 message: format!("body type {} doesn't match declared {}: {}",
                     self.resolve(&body_type), self.resolve(&remaining_type), e.message),
+                span: Some(body.span),
             })?;
 
             // Update env with the declared type
@@ -272,40 +292,37 @@ impl TypeChecker {
     }
 
     fn infer(&mut self, expr: &Expr, env: &TypeEnv) -> Result<Type, TypeError> {
-        match expr {
-            Expr::IntLit(_) => Ok(Type::Int),
-            Expr::FloatLit(_) => Ok(Type::Float),
-            Expr::StrLit(_) => Ok(Type::Str),
-            Expr::BoolLit(_) => Ok(Type::Bool),
+        let span = expr.span;
+        match &expr.kind {
+            ExprKind::IntLit(_) => Ok(Type::Int),
+            ExprKind::FloatLit(_) => Ok(Type::Float),
+            ExprKind::StrLit(_) => Ok(Type::Str),
+            ExprKind::BoolLit(_) => Ok(Type::Bool),
 
-            Expr::Var(name) => {
+            ExprKind::Var(name) => {
                 let scheme = env.get(name)
-                    .ok_or_else(|| TypeError {
-                        message: format!("undefined: '{}'", name),
-                    })?;
+                    .ok_or_else(|| TypeError::at(span, format!("undefined: '{}'", name)))?;
                 Ok(self.instantiate(scheme))
             }
 
-            Expr::Constructor(name) => {
+            ExprKind::Constructor(name) => {
                 let scheme = env.get(name)
-                    .ok_or_else(|| TypeError {
-                        message: format!("undefined constructor: '{}'", name),
-                    })?;
+                    .ok_or_else(|| TypeError::at(span, format!("undefined constructor: '{}'", name)))?;
                 Ok(self.instantiate(scheme))
             }
 
-            Expr::App { func, arg } => {
+            ExprKind::App { func, arg } => {
                 let t_func = self.infer(func, env)?;
                 let t_arg = self.infer(arg, env)?;
                 let t_ret = self.fresh();
                 self.unify(&t_func, &Type::Fun(
                     Box::new(t_arg),
                     Box::new(t_ret.clone()),
-                ))?;
+                )).map_err(|e| TypeError { span: Some(span), ..e })?;
                 Ok(t_ret)
             }
 
-            Expr::Let { name, value, body } => {
+            ExprKind::Let { name, value, body } => {
                 let t_val = self.infer(value, env)?;
                 let resolved = self.resolve(&t_val);
                 let scheme = if name == "_" {
@@ -320,22 +337,22 @@ impl TypeChecker {
                 self.infer(body, &new_env)
             }
 
-            Expr::If { cond, then_branch, else_branch } => {
+            ExprKind::If { cond, then_branch, else_branch } => {
                 let t_cond = self.infer(cond, env)?;
-                self.unify(&t_cond, &Type::Bool)?;
+                self.unify(&t_cond, &Type::Bool).map_err(|e| TypeError { span: Some(cond.span), ..e })?;
                 let t_then = self.infer(then_branch, env)?;
                 let t_else = self.infer(else_branch, env)?;
-                self.unify(&t_then, &t_else)?;
+                self.unify(&t_then, &t_else).map_err(|e| TypeError { span: Some(span), ..e })?;
                 Ok(t_then)
             }
 
-            Expr::BinOp { op, left, right } => {
+            ExprKind::BinOp { op, left, right } => {
                 let t_left = self.infer(left, env)?;
                 let t_right = self.infer(right, env)?;
-                self.infer_binop(op, &t_left, &t_right)
+                self.infer_binop(op, &t_left, &t_right).map_err(|e| TypeError { span: Some(span), ..e })
             }
 
-            Expr::UnaryOp { op, operand } => {
+            ExprKind::UnaryOp { op, operand } => {
                 let t = self.infer(operand, env)?;
                 match op.as_str() {
                     "-" => {
@@ -345,11 +362,11 @@ impl TypeChecker {
                         // We don't have type classes, so accept Int or Float
                         Ok(t)
                     }
-                    _ => Err(TypeError { message: format!("unknown unary op: {}", op) }),
+                    _ => Err(TypeError::at(span, format!("unknown unary op: {}", op))),
                 }
             }
 
-            Expr::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms } => {
                 let t_scrut = self.infer(scrutinee, env)?;
                 let t_result = self.fresh();
 
@@ -364,7 +381,7 @@ impl TypeChecker {
                 Ok(t_result)
             }
 
-            Expr::Pipe { value, func } => {
+            ExprKind::Pipe { value, func } => {
                 // x |> f  ≡  f x
                 let t_val = self.infer(value, env)?;
                 let t_func = self.infer(func, env)?;
@@ -372,11 +389,11 @@ impl TypeChecker {
                 self.unify(&t_func, &Type::Fun(
                     Box::new(t_val),
                     Box::new(t_ret.clone()),
-                ))?;
+                )).map_err(|e| TypeError { span: Some(span), ..e })?;
                 Ok(t_ret)
             }
 
-            Expr::Lambda { params, body } => {
+            ExprKind::Lambda { params, body } => {
                 let mut local_env = env.clone();
                 let mut param_types = Vec::new();
                 for param in params {
@@ -392,14 +409,14 @@ impl TypeChecker {
                 Ok(func_type)
             }
 
-            Expr::Tuple(elems) => {
+            ExprKind::Tuple(elems) => {
                 let types: Result<Vec<_>, _> = elems.iter()
                     .map(|e| self.infer(e, env))
                     .collect();
                 Ok(Type::Tuple(types?))
             }
 
-            Expr::List(elems) => {
+            ExprKind::List(elems) => {
                 if elems.is_empty() {
                     Ok(Type::List(Box::new(self.fresh())))
                 } else {
@@ -412,7 +429,7 @@ impl TypeChecker {
                 }
             }
 
-            Expr::Record(fields) => {
+            ExprKind::Record(fields) => {
                 let mut field_types = Vec::new();
                 for (name, expr) in fields {
                     let ty = self.infer(expr, env)?;
@@ -421,7 +438,7 @@ impl TypeChecker {
                 Ok(Type::Record(field_types))
             }
 
-            Expr::FieldAccess { expr, field } => {
+            ExprKind::FieldAccess { expr, field } => {
                 let t_expr = self.infer(expr, env)?;
                 let t_expr = self.resolve(&t_expr);
                 match &t_expr {
@@ -431,9 +448,7 @@ impl TypeChecker {
                                 return Ok(ty.clone());
                             }
                         }
-                        Err(TypeError {
-                            message: format!("no field '{}' in record type", field),
-                        })
+                        Err(TypeError::at(span, format!("no field '{}' in record type", field)))
                     }
                     _ => {
                         // Can't infer field access on unknown type — use a fresh var
@@ -443,7 +458,7 @@ impl TypeChecker {
                 }
             }
 
-            Expr::Block(exprs) => {
+            ExprKind::Block(exprs) => {
                 if exprs.is_empty() {
                     return Ok(Type::Unit);
                 }
@@ -472,7 +487,7 @@ impl TypeChecker {
                 self.unify(t_right, &Type::Bool)?;
                 Ok(Type::Bool)
             }
-            _ => Err(TypeError { message: format!("unknown operator: {}", op) }),
+            _ => Err(TypeError::new(format!("unknown operator: {}", op))),
         }
     }
 
@@ -491,9 +506,7 @@ impl TypeChecker {
             Pattern::Constructor { name, args } => {
                 // Look up constructor type, instantiate, apply pattern args
                 let scheme = env.get(name)
-                    .ok_or_else(|| TypeError {
-                        message: format!("undefined constructor in pattern: '{}'", name),
-                    })?
+                    .ok_or_else(|| TypeError::new(format!("undefined constructor in pattern: '{}'", name)))?
                     .clone();
                 let mut con_type = self.instantiate(&scheme);
 
@@ -547,7 +560,7 @@ impl TypeChecker {
         match (&t1, &t2) {
             (Type::Var(id), _) => {
                 if self.occurs(*id, &t2) {
-                    return Err(TypeError { message: format!("infinite type: ?{} ~ {}", id, t2) });
+                    return Err(TypeError::new(format!("infinite type: ?{} ~ {}", id, t2)));
                 }
                 self.subst[*id as usize] = Some(t2);
                 Ok(())
@@ -571,9 +584,7 @@ impl TypeChecker {
             (Type::Record(a), Type::Record(b)) if a.len() == b.len() => {
                 for ((na, ta), (nb, tb)) in a.iter().zip(b.iter()) {
                     if na != nb {
-                        return Err(TypeError {
-                            message: format!("record field mismatch: {} vs {}", na, nb),
-                        });
+                        return Err(TypeError::new(format!("record field mismatch: {} vs {}", na, nb)));
                     }
                     self.unify(ta, tb)?;
                 }
@@ -587,9 +598,7 @@ impl TypeChecker {
                 Ok(())
             }
 
-            _ => Err(TypeError {
-                message: format!("cannot unify {} with {}", t1, t2),
-            }),
+            _ => Err(TypeError::new(format!("cannot unify {} with {}", t1, t2))),
         }
     }
 
@@ -1223,6 +1232,32 @@ impl TypeChecker {
         // float_to_str : f64 -> str
         env.insert("float_to_str".to_string(), Scheme::mono(
             Type::Fun(Box::new(Type::Float), Box::new(Type::Str))
+        ));
+
+        // --- AI ---
+
+        // prompt : str -> str
+        env.insert("prompt".to_string(), Scheme::mono(
+            Type::Fun(Box::new(Type::Str), Box::new(Type::Str))
+        ));
+
+        // prompt_with : str -> str -> str
+        env.insert("prompt_with".to_string(), Scheme::mono(
+            Type::Fun(Box::new(Type::Str), Box::new(
+                Type::Fun(Box::new(Type::Str), Box::new(Type::Str))
+            ))
+        ));
+
+        // prompt_json : str -> str -> str
+        env.insert("prompt_json".to_string(), Scheme::mono(
+            Type::Fun(Box::new(Type::Str), Box::new(
+                Type::Fun(Box::new(Type::Str), Box::new(Type::Str))
+            ))
+        ));
+
+        // embed : str -> [f64]
+        env.insert("embed".to_string(), Scheme::mono(
+            Type::Fun(Box::new(Type::Str), Box::new(Type::List(Box::new(Type::Float))))
         ));
 
         env

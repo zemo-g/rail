@@ -99,6 +99,16 @@ fn type_expr_to_rail(te: &TypeExpr) -> RailType {
     }
 }
 
+// ---- TCO context ----
+
+/// Tail call optimization context. When present, self-recursive calls
+/// in tail position are compiled as jumps back to the loop header block.
+struct TailCallCtx {
+    func_name: String,
+    entry_block: Block,
+    param_vars: Vec<Variable>,
+}
+
 // ---- Compiler ----
 
 /// Tracks a string literal embedded in the JIT data section
@@ -285,6 +295,7 @@ impl Compiler {
             let mut vars = HashMap::new();
             let mut var_counter = 0usize;
             let mut var_types = HashMap::new();
+            let mut param_vars = Vec::new();
 
             // Get param types from func_types
             let param_type_info = func_types.get(name);
@@ -298,6 +309,7 @@ impl Compiler {
                     let param_val = builder.block_params(entry)[i];
                     builder.def_var(var, param_val);
                     vars.insert(pname.clone(), var);
+                    param_vars.push(var);
 
                     // Track rail type
                     let rail_ty = if let Some((ptypes, _)) = param_type_info {
@@ -309,9 +321,36 @@ impl Compiler {
                 }
             }
 
-            let result = compile_expr(
+            // TCO: create loop header block for self-recursive tail calls
+            let loop_block = builder.create_block();
+            for (i, _) in params.iter().enumerate() {
+                let cl_type = builder.func.dfg.value_type(builder.block_params(entry)[i]);
+                builder.append_block_param(loop_block, cl_type);
+            }
+
+            // Jump from entry to loop block with initial param values
+            let initial_args: Vec<cranelift::prelude::Value> = param_vars.iter()
+                .map(|v| builder.use_var(*v))
+                .collect();
+            builder.ins().jump(loop_block, &initial_args);
+
+            // Switch to loop block and rebind param vars from block params
+            builder.switch_to_block(loop_block);
+            for (i, var) in param_vars.iter().enumerate() {
+                let block_param = builder.block_params(loop_block)[i];
+                builder.def_var(*var, block_param);
+            }
+
+            let tco_ctx = TailCallCtx {
+                func_name: name.to_string(),
+                entry_block: loop_block,
+                param_vars: param_vars.clone(),
+            };
+
+            let result = compile_expr_tail(
                 body, &mut builder, &mut vars, &mut var_types, &mut var_counter,
                 &mut self.module, &functions, &func_types, &string_ids,
+                Some(&tco_ctx),
             )?;
 
             builder.ins().return_(&[result]);
@@ -326,7 +365,7 @@ impl Compiler {
         Ok(())
     }
 
-    /// Walk the body and intern all string literals, returning a map of string → DataId
+    /// Walk the body and intern all string literals, returning a map of string -> DataId
     fn collect_and_intern_strings(&mut self, expr: &Expr) -> Result<HashMap<String, DataId>, String> {
         let mut ids = HashMap::new();
         self.collect_strings_inner(expr, &mut ids)?;
@@ -334,49 +373,49 @@ impl Compiler {
     }
 
     fn collect_strings_inner(&mut self, expr: &Expr, ids: &mut HashMap<String, DataId>) -> Result<(), String> {
-        match expr {
-            Expr::StrLit(s) => {
+        match &expr.kind {
+            ExprKind::StrLit(s) => {
                 if !ids.contains_key(s) {
                     let data_id = self.intern_string(s)?;
                     ids.insert(s.clone(), data_id);
                 }
             }
-            Expr::BinOp { left, right, .. } => {
+            ExprKind::BinOp { left, right, .. } => {
                 self.collect_strings_inner(left, ids)?;
                 self.collect_strings_inner(right, ids)?;
             }
-            Expr::UnaryOp { operand, .. } => {
+            ExprKind::UnaryOp { operand, .. } => {
                 self.collect_strings_inner(operand, ids)?;
             }
-            Expr::App { func, arg } => {
+            ExprKind::App { func, arg } => {
                 self.collect_strings_inner(func, ids)?;
                 self.collect_strings_inner(arg, ids)?;
             }
-            Expr::Let { value, body, .. } => {
+            ExprKind::Let { value, body, .. } => {
                 self.collect_strings_inner(value, ids)?;
                 self.collect_strings_inner(body, ids)?;
             }
-            Expr::If { cond, then_branch, else_branch } => {
+            ExprKind::If { cond, then_branch, else_branch } => {
                 self.collect_strings_inner(cond, ids)?;
                 self.collect_strings_inner(then_branch, ids)?;
                 self.collect_strings_inner(else_branch, ids)?;
             }
-            Expr::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms } => {
                 self.collect_strings_inner(scrutinee, ids)?;
                 for arm in arms {
                     self.collect_strings_inner(&arm.body, ids)?;
                 }
             }
-            Expr::Pipe { value, func } => {
+            ExprKind::Pipe { value, func } => {
                 self.collect_strings_inner(value, ids)?;
                 self.collect_strings_inner(func, ids)?;
             }
-            Expr::Block(exprs) => {
+            ExprKind::Block(exprs) => {
                 for e in exprs {
                     self.collect_strings_inner(e, ids)?;
                 }
             }
-            Expr::Tuple(exprs) | Expr::List(exprs) => {
+            ExprKind::Tuple(exprs) | ExprKind::List(exprs) => {
                 for e in exprs {
                     self.collect_strings_inner(e, ids)?;
                 }
@@ -408,14 +447,31 @@ fn compile_expr(
     func_types: &HashMap<String, (Vec<RailType>, RailType)>,
     string_ids: &HashMap<String, DataId>,
 ) -> Result<Value, String> {
-    match expr {
-        Expr::IntLit(n) => Ok(builder.ins().iconst(types::I64, *n)),
+    compile_expr_tail(expr, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, None)
+}
 
-        Expr::FloatLit(f) => Ok(builder.ins().f64const(*f)),
+/// Compile an expression, optionally in tail position with TCO context.
+fn compile_expr_tail(
+    expr: &Expr,
+    builder: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    var_types: &mut HashMap<String, RailType>,
+    var_counter: &mut usize,
+    module: &mut JITModule,
+    functions: &HashMap<String, FuncId>,
+    func_types: &HashMap<String, (Vec<RailType>, RailType)>,
+    string_ids: &HashMap<String, DataId>,
+    tco_ctx: Option<&TailCallCtx>,
+) -> Result<Value, String> {
+    let span = expr.span;
+    match &expr.kind {
+        ExprKind::IntLit(n) => Ok(builder.ins().iconst(types::I64, *n)),
 
-        Expr::BoolLit(b) => Ok(builder.ins().iconst(types::I64, if *b { 1 } else { 0 })),
+        ExprKind::FloatLit(f) => Ok(builder.ins().f64const(*f)),
 
-        Expr::StrLit(s) => {
+        ExprKind::BoolLit(b) => Ok(builder.ins().iconst(types::I64, if *b { 1 } else { 0 })),
+
+        ExprKind::StrLit(s) => {
             // Load pointer to interned string data
             let data_id = string_ids.get(s)
                 .ok_or_else(|| format!("string not interned: {:?}", s))?;
@@ -424,7 +480,7 @@ fn compile_expr(
             Ok(ptr)
         }
 
-        Expr::Var(name) => {
+        ExprKind::Var(name) => {
             if let Some(var) = vars.get(name) {
                 Ok(builder.use_var(*var))
             } else if let Some(&func_id) = functions.get(name) {
@@ -433,11 +489,11 @@ fn compile_expr(
                 let call = builder.ins().call(func_ref, &[]);
                 Ok(builder.inst_results(call)[0])
             } else {
-                Err(format!("undefined variable in codegen: '{}'", name))
+                Err(format!("error at {}:{}: undefined variable in codegen: '{}'", span.0, span.1, name))
             }
         }
 
-        Expr::BinOp { op, left, right } => {
+        ExprKind::BinOp { op, left, right } => {
             let l = compile_expr(left, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
             let r = compile_expr(right, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
 
@@ -474,7 +530,7 @@ fn compile_expr(
                         let cmp = builder.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r);
                         Ok(builder.ins().uextend(types::I64, cmp))
                     }
-                    _ => Err(format!("unsupported float operator in codegen: {}", op)),
+                    _ => Err(format!("error at {}:{}: unsupported float operator in codegen: {}", span.0, span.1, op)),
                 }
             } else {
                 match op.as_str() {
@@ -509,22 +565,22 @@ fn compile_expr(
                     }
                     "&&" => Ok(builder.ins().band(l, r)),
                     "||" => Ok(builder.ins().bor(l, r)),
-                    _ => Err(format!("unsupported operator in codegen: {}", op)),
+                    _ => Err(format!("error at {}:{}: unsupported operator in codegen: {}", span.0, span.1, op)),
                 }
             }
         }
 
-        Expr::UnaryOp { op, operand } => {
+        ExprKind::UnaryOp { op, operand } => {
             let v = compile_expr(operand, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
             let v_type = builder.func.dfg.value_type(v);
             match op.as_str() {
                 "-" if v_type == types::F64 => Ok(builder.ins().fneg(v)),
                 "-" => Ok(builder.ins().ineg(v)),
-                _ => Err(format!("unsupported unary op in codegen: {}", op)),
+                _ => Err(format!("error at {}:{}: unsupported unary op in codegen: {}", span.0, span.1, op)),
             }
         }
 
-        Expr::If { cond, then_branch, else_branch } => {
+        ExprKind::If { cond, then_branch, else_branch } => {
             let cond_val = compile_expr(cond, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
 
             let then_block = builder.create_block();
@@ -535,15 +591,15 @@ fn compile_expr(
             let cond_bool = builder.ins().icmp_imm(IntCC::NotEqual, cond_val, 0);
             builder.ins().brif(cond_bool, then_block, &[], else_block, &[]);
 
-            // Then branch
+            // Then branch — propagate tail position
             builder.switch_to_block(then_block);
-            let then_val = compile_expr(then_branch, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
+            let then_val = compile_expr_tail(then_branch, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, tco_ctx)?;
             let result_type = builder.func.dfg.value_type(then_val);
             builder.ins().jump(merge_block, &[then_val]);
 
-            // Else branch
+            // Else branch — propagate tail position
             builder.switch_to_block(else_block);
-            let else_val = compile_expr(else_branch, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
+            let else_val = compile_expr_tail(else_branch, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, tco_ctx)?;
             builder.ins().jump(merge_block, &[else_val]);
 
             // Merge — use the type from then branch
@@ -552,12 +608,39 @@ fn compile_expr(
             Ok(builder.block_params(merge_block)[0])
         }
 
-        Expr::App { .. } => {
-            // Flatten curried application: f a b → call f(a, b)
-            let (func_expr, args) = flatten_app(expr);
+        ExprKind::App { .. } => {
+            // Flatten curried application: f a b -> call f(a, b)
+            let (func_kind, func_span, args) = flatten_app(expr);
 
-            match func_expr {
-                Expr::Var(name) if name == "print" => {
+            // Check for self-recursive tail call optimization
+            if let Some(ctx) = tco_ctx {
+                if let ExprKind::Var(name) = func_kind {
+                    if name == &ctx.func_name && args.len() == ctx.param_vars.len() {
+                        // Self-recursive tail call — compile args, jump to loop header
+                        let compiled_args: Result<Vec<Value>, String> = args.iter()
+                            .map(|a| compile_expr(a, builder, vars, var_types, var_counter, module, functions, func_types, string_ids))
+                            .collect();
+                        let compiled_args = compiled_args?;
+
+                        builder.ins().jump(ctx.entry_block, &compiled_args);
+
+                        // Return dummy value from unreachable block
+                        let unreachable_block = builder.create_block();
+                        builder.switch_to_block(unreachable_block);
+                        let ret_type = func_types.get(&ctx.func_name)
+                            .map(|(_, rt)| rt.to_cranelift())
+                            .unwrap_or(types::I64);
+                        if ret_type == types::F64 {
+                            return Ok(builder.ins().f64const(0.0));
+                        } else {
+                            return Ok(builder.ins().iconst(types::I64, 0));
+                        }
+                    }
+                }
+            }
+
+            match func_kind {
+                ExprKind::Var(name) if name == "print" => {
                     // Dispatch print based on argument type
                     if args.len() != 1 {
                         return Err("print takes exactly 1 argument".to_string());
@@ -566,7 +649,7 @@ fn compile_expr(
                     let arg_type = builder.func.dfg.value_type(arg_val);
 
                     // Check if the arg is a string literal
-                    if let Expr::StrLit(s) = args[0] {
+                    if let ExprKind::StrLit(s) = &args[0].kind {
                         let func_id = functions["print_str"];
                         let func_ref = module.declare_func_in_func(func_id, builder.func);
                         let len = builder.ins().iconst(types::I64, s.len() as i64);
@@ -584,7 +667,7 @@ fn compile_expr(
                         Ok(builder.inst_results(call)[0])
                     }
                 }
-                Expr::Var(name) if name == "int_to_float" => {
+                ExprKind::Var(name) if name == "int_to_float" => {
                     if args.len() != 1 {
                         return Err("int_to_float takes exactly 1 argument".to_string());
                     }
@@ -594,7 +677,7 @@ fn compile_expr(
                     let call = builder.ins().call(func_ref, &[arg_val]);
                     Ok(builder.inst_results(call)[0])
                 }
-                Expr::Var(name) if name == "floor" => {
+                ExprKind::Var(name) if name == "floor" => {
                     if args.len() != 1 { return Err("floor takes exactly 1 argument".to_string()); }
                     let arg_val = compile_expr(args[0], builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
                     let func_id = functions["floor"];
@@ -602,7 +685,7 @@ fn compile_expr(
                     let call = builder.ins().call(func_ref, &[arg_val]);
                     Ok(builder.inst_results(call)[0])
                 }
-                Expr::Var(name) if name == "ceil" => {
+                ExprKind::Var(name) if name == "ceil" => {
                     if args.len() != 1 { return Err("ceil takes exactly 1 argument".to_string()); }
                     let arg_val = compile_expr(args[0], builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
                     let func_id = functions["ceil"];
@@ -610,7 +693,7 @@ fn compile_expr(
                     let call = builder.ins().call(func_ref, &[arg_val]);
                     Ok(builder.inst_results(call)[0])
                 }
-                Expr::Var(name) if name == "abs" => {
+                ExprKind::Var(name) if name == "abs" => {
                     if args.len() != 1 { return Err("abs takes exactly 1 argument".to_string()); }
                     let arg_val = compile_expr(args[0], builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
                     let arg_type = builder.func.dfg.value_type(arg_val);
@@ -620,7 +703,7 @@ fn compile_expr(
                     let call = builder.ins().call(func_ref, &[arg_val]);
                     Ok(builder.inst_results(call)[0])
                 }
-                Expr::Var(name) => {
+                ExprKind::Var(name) => {
                     if let Some(&func_id) = functions.get(name) {
                         let func_ref = module.declare_func_in_func(func_id, builder.func);
                         let compiled_args: Result<Vec<Value>, String> = args.iter()
@@ -629,14 +712,14 @@ fn compile_expr(
                         let call = builder.ins().call(func_ref, &compiled_args?);
                         Ok(builder.inst_results(call)[0])
                     } else {
-                        Err(format!("unknown function in codegen: '{}'", name))
+                        Err(format!("error at {}:{}: unknown function in codegen: '{}'", func_span.0, func_span.1, name))
                     }
                 }
                 _ => Err("only named function calls supported in native codegen".to_string()),
             }
         }
 
-        Expr::Let { name, value, body } => {
+        ExprKind::Let { name, value, body } => {
             let val = compile_expr(value, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
             if name != "_" {
                 let val_type = builder.func.dfg.value_type(val);
@@ -650,22 +733,27 @@ fn compile_expr(
                 let rail_ty = if val_type == types::F64 { RailType::Float } else { RailType::Int };
                 var_types.insert(name.clone(), rail_ty);
             }
-            compile_expr(body, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)
+            compile_expr_tail(body, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, tco_ctx)
         }
 
-        Expr::Block(exprs) => {
+        ExprKind::Block(exprs) => {
             let mut result = builder.ins().iconst(types::I64, 0);
-            for e in exprs {
-                result = compile_expr(e, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
+            for (i, e) in exprs.iter().enumerate() {
+                if i == exprs.len() - 1 {
+                    // Last expression is in tail position
+                    result = compile_expr_tail(e, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, tco_ctx)?;
+                } else {
+                    result = compile_expr(e, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
+                }
             }
             Ok(result)
         }
 
-        Expr::Pipe { value, func } => {
-            // x |> f → f(x)
+        ExprKind::Pipe { value, func } => {
+            // x |> f -> f(x)
             let v = compile_expr(value, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
-            match func.as_ref() {
-                Expr::Var(name) if name == "print" => {
+            match &func.kind {
+                ExprKind::Var(name) if name == "print" => {
                     let v_type = builder.func.dfg.value_type(v);
                     let key = if v_type == types::F64 { "print_f64" } else { "print_i64" };
                     let func_id = functions[key];
@@ -673,25 +761,25 @@ fn compile_expr(
                     let call = builder.ins().call(func_ref, &[v]);
                     Ok(builder.inst_results(call)[0])
                 }
-                Expr::Var(name) => {
+                ExprKind::Var(name) => {
                     if let Some(&func_id) = functions.get(name) {
                         let func_ref = module.declare_func_in_func(func_id, builder.func);
                         let call = builder.ins().call(func_ref, &[v]);
                         Ok(builder.inst_results(call)[0])
                     } else {
-                        Err(format!("unknown function in pipe codegen: '{}'", name))
+                        Err(format!("error at {}:{}: unknown function in pipe codegen: '{}'", func.span.0, func.span.1, name))
                     }
                 }
                 _ => Err("pipe target must be a named function in native codegen".to_string()),
             }
         }
 
-        Expr::Match { scrutinee, arms } => {
+        ExprKind::Match { scrutinee, arms } => {
             let scrut_val = compile_expr(scrutinee, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
-            compile_match_chain(scrut_val, arms, 0, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)
+            compile_match_chain(scrut_val, arms, 0, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, tco_ctx)
         }
 
-        _ => Err(format!("unsupported expression in native codegen: {:?}", std::mem::discriminant(expr))),
+        _ => Err(format!("error at {}:{}: unsupported expression in native codegen: {:?}", span.0, span.1, std::mem::discriminant(&expr.kind))),
     }
 }
 
@@ -707,6 +795,7 @@ fn compile_match_chain(
     functions: &HashMap<String, FuncId>,
     func_types: &HashMap<String, (Vec<RailType>, RailType)>,
     string_ids: &HashMap<String, DataId>,
+    tco_ctx: Option<&TailCallCtx>,
 ) -> Result<Value, String> {
     if idx >= arms.len() {
         return Err("non-exhaustive match in codegen".to_string());
@@ -726,7 +815,7 @@ fn compile_match_chain(
                 let rail_ty = if scrut_type == types::F64 { RailType::Float } else { RailType::Int };
                 var_types.insert(name.clone(), rail_ty);
             }
-            compile_expr(&arm.body, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)
+            compile_expr_tail(&arm.body, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, tco_ctx)
         }
         Pattern::IntLit(n) => {
             let lit = builder.ins().iconst(types::I64, *n);
@@ -739,12 +828,12 @@ fn compile_match_chain(
             builder.ins().brif(cmp, then_block, &[], else_block, &[]);
 
             builder.switch_to_block(then_block);
-            let then_val = compile_expr(&arm.body, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
+            let then_val = compile_expr_tail(&arm.body, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, tco_ctx)?;
             let result_type = builder.func.dfg.value_type(then_val);
             builder.ins().jump(merge_block, &[then_val]);
 
             builder.switch_to_block(else_block);
-            let else_val = compile_match_chain(scrut, arms, idx + 1, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
+            let else_val = compile_match_chain(scrut, arms, idx + 1, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, tco_ctx)?;
             builder.ins().jump(merge_block, &[else_val]);
 
             builder.append_block_param(merge_block, result_type);
@@ -762,12 +851,12 @@ fn compile_match_chain(
             builder.ins().brif(cmp, then_block, &[], else_block, &[]);
 
             builder.switch_to_block(then_block);
-            let then_val = compile_expr(&arm.body, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
+            let then_val = compile_expr_tail(&arm.body, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, tco_ctx)?;
             let result_type = builder.func.dfg.value_type(then_val);
             builder.ins().jump(merge_block, &[then_val]);
 
             builder.switch_to_block(else_block);
-            let else_val = compile_match_chain(scrut, arms, idx + 1, builder, vars, var_types, var_counter, module, functions, func_types, string_ids)?;
+            let else_val = compile_match_chain(scrut, arms, idx + 1, builder, vars, var_types, var_counter, module, functions, func_types, string_ids, tco_ctx)?;
             builder.ins().jump(merge_block, &[else_val]);
 
             builder.append_block_param(merge_block, result_type);
@@ -778,13 +867,14 @@ fn compile_match_chain(
     }
 }
 
-fn flatten_app<'a>(expr: &'a Expr) -> (&'a Expr, Vec<&'a Expr>) {
-    match expr {
-        Expr::App { func, arg } => {
-            let (f, mut args) = flatten_app(func);
+/// Flatten curried application, returning the function's ExprKind, span, and arg list
+fn flatten_app<'a>(expr: &'a Expr) -> (&'a ExprKind, Span, Vec<&'a Expr>) {
+    match &expr.kind {
+        ExprKind::App { func, arg } => {
+            let (f, f_span, mut args) = flatten_app(func);
             args.push(arg);
-            (f, args)
+            (f, f_span, args)
         }
-        other => (other, vec![]),
+        other => (other, expr.span, vec![]),
     }
 }

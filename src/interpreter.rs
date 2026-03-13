@@ -1,11 +1,126 @@
 /// Rail interpreter — tree-walking evaluator.
 /// Evaluates a parsed AST by walking the tree directly.
 /// Supports curried functions, pattern matching, ADTs, records, and recursion.
+/// Uses trampoline-based tail call optimization (TCO) for recursive tail calls.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
 use crate::ast::*;
+use crate::ai;
+use crate::route::Route;
+
+// ---- JSON parser (minimal, no deps) ----
+
+fn parse_json_value(s: &str) -> Result<Value, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty input".into());
+    }
+    let (val, _) = parse_json_inner(s)?;
+    Ok(val)
+}
+
+fn parse_json_inner(s: &str) -> Result<(Value, &str), String> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return Err("unexpected end of input".into());
+    }
+    match s.as_bytes()[0] {
+        b'"' => {
+            let rest = &s[1..];
+            let mut escaped = String::new();
+            let mut chars = rest.chars();
+            loop {
+                match chars.next() {
+                    None => return Err("unterminated string".into()),
+                    Some('\\') => {
+                        match chars.next() {
+                            Some('n') => escaped.push('\n'),
+                            Some('t') => escaped.push('\t'),
+                            Some('r') => escaped.push('\r'),
+                            Some('"') => escaped.push('"'),
+                            Some('\\') => escaped.push('\\'),
+                            Some('/') => escaped.push('/'),
+                            Some(c) => { escaped.push('\\'); escaped.push(c); }
+                            None => return Err("unterminated escape".into()),
+                        }
+                    }
+                    Some('"') => {
+                        let remaining = chars.as_str();
+                        return Ok((Value::Str(escaped), remaining));
+                    }
+                    Some(c) => escaped.push(c),
+                }
+            }
+        }
+        b'{' => {
+            let mut rest = s[1..].trim_start();
+            let mut pairs = Vec::new();
+            if rest.starts_with('}') {
+                return Ok((Value::List(pairs), &rest[1..]));
+            }
+            loop {
+                let (key, r) = parse_json_inner(rest)?;
+                let key_str = match key {
+                    Value::Str(s) => s,
+                    _ => return Err("expected string key".into()),
+                };
+                let r = r.trim_start();
+                if !r.starts_with(':') {
+                    return Err("expected ':' after key".into());
+                }
+                let (val, r) = parse_json_inner(&r[1..])?;
+                pairs.push(Value::Tuple(vec![Value::Str(key_str), val]));
+                let r = r.trim_start();
+                if r.starts_with('}') {
+                    return Ok((Value::List(pairs), &r[1..]));
+                }
+                if r.starts_with(',') {
+                    rest = r[1..].trim_start();
+                } else {
+                    return Err(format!("expected ',' or '}}' in object, got {:?}", &r[..r.len().min(20)]));
+                }
+            }
+        }
+        b'[' => {
+            let mut rest = s[1..].trim_start();
+            let mut items = Vec::new();
+            if rest.starts_with(']') {
+                return Ok((Value::List(items), &rest[1..]));
+            }
+            loop {
+                let (val, r) = parse_json_inner(rest)?;
+                items.push(val);
+                let r = r.trim_start();
+                if r.starts_with(']') {
+                    return Ok((Value::List(items), &r[1..]));
+                }
+                if r.starts_with(',') {
+                    rest = r[1..].trim_start();
+                } else {
+                    return Err(format!("expected ',' or ']' in array, got {:?}", &r[..r.len().min(20)]));
+                }
+            }
+        }
+        b't' if s.starts_with("true") => Ok((Value::Bool(true), &s[4..])),
+        b'f' if s.starts_with("false") => Ok((Value::Bool(false), &s[5..])),
+        b'n' if s.starts_with("null") => Ok((Value::Str(String::new()), &s[4..])),
+        b'-' | b'0'..=b'9' => {
+            let end = s.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-' && c != 'e' && c != 'E' && c != '+')
+                .unwrap_or(s.len());
+            let num_str = &s[..end];
+            if num_str.contains('.') || num_str.contains('e') || num_str.contains('E') {
+                let f: f64 = num_str.parse().map_err(|e| format!("bad float: {}", e))?;
+                Ok((Value::Float(f), &s[end..]))
+            } else {
+                let n: i64 = num_str.parse().map_err(|e| format!("bad int: {}", e))?;
+                Ok((Value::Int(n), &s[end..]))
+            }
+        }
+        c => Err(format!("unexpected character '{}' in JSON", c as char)),
+    }
+}
 
 // ---- Values ----
 
@@ -37,6 +152,19 @@ pub enum BuiltIn {
 }
 
 type Env = HashMap<String, Value>;
+
+/// Internal result type for tail call optimization.
+/// When a function call is in tail position, we return TailCall instead of
+/// recursing, allowing the trampoline loop to handle it iteratively.
+enum EvalResult {
+    Value(Value),
+    TailCall {
+        params: Vec<Pattern>,
+        body: Expr,
+        env: Env,
+        arg: Value,
+    },
+}
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -109,6 +237,17 @@ impl fmt::Debug for Value {
 #[derive(Debug)]
 pub struct RuntimeError(pub String);
 
+impl RuntimeError {
+    /// Create a runtime error with source location
+    fn at(span: Span, msg: String) -> Self {
+        if span != (0, 0) {
+            RuntimeError(format!("at {}:{}: {}", span.0, span.1, msg))
+        } else {
+            RuntimeError(msg)
+        }
+    }
+}
+
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "runtime error: {}", self.0)
@@ -119,10 +258,15 @@ impl fmt::Display for RuntimeError {
 
 pub struct Interpreter {
     globals: Env,
+    route: Route,
 }
 
 impl Interpreter {
     pub fn new() -> Self {
+        Self::with_route(Route::open())
+    }
+
+    pub fn with_route(route: Route) -> Self {
         let mut globals = HashMap::new();
 
         // Register built-in functions: (name, arity)
@@ -136,6 +280,15 @@ impl Interpreter {
             ("abs", 1), ("max", 2), ("min", 2), ("mod", 2),
             // IO
             ("read_line", 1), ("read_file", 1), ("write_file", 2),
+            // System
+            ("shell", 1), ("shell_lines", 1), ("env", 1), ("timestamp", 1),
+            ("sleep_ms", 1),
+            // JSON
+            ("json_parse", 1), ("json_get", 2),
+            // HTTP
+            ("http_get", 1), ("http_post", 2),
+            // AI
+            ("prompt", 1), ("prompt_with", 2), ("prompt_json", 2), ("embed", 1),
             // String operations
             ("split", 2), ("join", 2), ("trim", 1), ("chars", 1),
             ("contains", 2), ("starts_with", 2), ("ends_with", 2),
@@ -155,7 +308,7 @@ impl Interpreter {
             }));
         }
 
-        Interpreter { globals }
+        Interpreter { globals, route }
     }
 
     pub fn run(&mut self, program: &Program) -> Result<Value, RuntimeError> {
@@ -236,17 +389,18 @@ impl Interpreter {
     }
 
     fn eval(&self, expr: &Expr, env: &Env) -> Result<Value, RuntimeError> {
-        match expr {
-            Expr::IntLit(n) => Ok(Value::Int(*n)),
-            Expr::FloatLit(f) => Ok(Value::Float(*f)),
-            Expr::StrLit(s) => Ok(Value::Str(s.clone())),
-            Expr::BoolLit(b) => Ok(Value::Bool(*b)),
+        let span = expr.span;
+        match &expr.kind {
+            ExprKind::IntLit(n) => Ok(Value::Int(*n)),
+            ExprKind::FloatLit(f) => Ok(Value::Float(*f)),
+            ExprKind::StrLit(s) => Ok(Value::Str(s.clone())),
+            ExprKind::BoolLit(b) => Ok(Value::Bool(*b)),
 
-            Expr::Var(name) => {
+            ExprKind::Var(name) => {
                 let val = env.get(name)
                     .or_else(|| self.globals.get(name))
                     .cloned()
-                    .ok_or_else(|| RuntimeError(format!("undefined: '{}'", name)))?;
+                    .ok_or_else(|| RuntimeError::at(span, format!("undefined: '{}'", name)))?;
 
                 // Auto-evaluate zero-param closures (thunks like `origin = { ... }`)
                 match val {
@@ -257,34 +411,34 @@ impl Interpreter {
                 }
             }
 
-            Expr::Constructor(name) => {
+            ExprKind::Constructor(name) => {
                 self.globals.get(name)
                     .cloned()
-                    .ok_or_else(|| RuntimeError(format!("undefined constructor: '{}'", name)))
+                    .ok_or_else(|| RuntimeError::at(span, format!("undefined constructor: '{}'", name)))
             }
 
-            Expr::BinOp { op, left, right } => {
+            ExprKind::BinOp { op, left, right } => {
                 let l = self.eval(left, env)?;
                 let r = self.eval(right, env)?;
-                self.eval_binop(op, &l, &r)
+                self.eval_binop(op, &l, &r, span)
             }
 
-            Expr::UnaryOp { op, operand } => {
+            ExprKind::UnaryOp { op, operand } => {
                 let v = self.eval(operand, env)?;
                 match (op.as_str(), &v) {
                     ("-", Value::Int(n)) => Ok(Value::Int(-n)),
                     ("-", Value::Float(f)) => Ok(Value::Float(-f)),
-                    _ => Err(RuntimeError(format!("invalid unary op: {}{}", op, v))),
+                    _ => Err(RuntimeError::at(span, format!("invalid unary op: {}{}", op, v))),
                 }
             }
 
-            Expr::App { func, arg } => {
+            ExprKind::App { func, arg } => {
                 let f = self.eval(func, env)?;
                 let a = self.eval(arg, env)?;
-                self.apply(f, a)
+                self.apply(f, a, span)
             }
 
-            Expr::Let { name, value, body } => {
+            ExprKind::Let { name, value, body } => {
                 let val = self.eval(value, env)?;
                 let mut new_env = env.clone();
                 if name != "_" {
@@ -293,15 +447,15 @@ impl Interpreter {
                 self.eval(body, &new_env)
             }
 
-            Expr::If { cond, then_branch, else_branch } => {
+            ExprKind::If { cond, then_branch, else_branch } => {
                 match self.eval(cond, env)? {
                     Value::Bool(true) => self.eval(then_branch, env),
                     Value::Bool(false) => self.eval(else_branch, env),
-                    v => Err(RuntimeError(format!("if condition must be bool, got: {}", v))),
+                    v => Err(RuntimeError::at(span, format!("if condition must be bool, got: {}", v))),
                 }
             }
 
-            Expr::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms } => {
                 let val = self.eval(scrutinee, env)?;
                 for arm in arms {
                     if let Some(bindings) = self.match_pattern(&arm.pattern, &val) {
@@ -310,17 +464,17 @@ impl Interpreter {
                         return self.eval(&arm.body, &new_env);
                     }
                 }
-                Err(RuntimeError(format!("non-exhaustive match on: {}", val)))
+                Err(RuntimeError::at(span, format!("non-exhaustive match on: {}", val)))
             }
 
-            Expr::Pipe { value, func } => {
+            ExprKind::Pipe { value, func } => {
                 // x |> f  desugars to  f x
                 let v = self.eval(value, env)?;
                 let f = self.eval(func, env)?;
-                self.apply(f, v)
+                self.apply(f, v, span)
             }
 
-            Expr::Lambda { params, body } => {
+            ExprKind::Lambda { params, body } => {
                 Ok(Value::Closure {
                     params: params.clone(),
                     body: *body.clone(),
@@ -328,21 +482,21 @@ impl Interpreter {
                 })
             }
 
-            Expr::Tuple(elems) => {
+            ExprKind::Tuple(elems) => {
                 let vals: Result<Vec<_>, _> = elems.iter()
                     .map(|e| self.eval(e, env))
                     .collect();
                 Ok(Value::Tuple(vals?))
             }
 
-            Expr::List(elems) => {
+            ExprKind::List(elems) => {
                 let vals: Result<Vec<_>, _> = elems.iter()
                     .map(|e| self.eval(e, env))
                     .collect();
                 Ok(Value::List(vals?))
             }
 
-            Expr::Record(fields) => {
+            ExprKind::Record(fields) => {
                 let mut vals = Vec::new();
                 for (name, expr) in fields {
                     vals.push((name.clone(), self.eval(expr, env)?));
@@ -350,7 +504,7 @@ impl Interpreter {
                 Ok(Value::Record(vals))
             }
 
-            Expr::FieldAccess { expr, field } => {
+            ExprKind::FieldAccess { expr, field } => {
                 let val = self.eval(expr, env)?;
                 match &val {
                     Value::Record(fields) => {
@@ -359,13 +513,13 @@ impl Interpreter {
                                 return Ok(v.clone());
                             }
                         }
-                        Err(RuntimeError(format!("no field '{}' in record", field)))
+                        Err(RuntimeError::at(span, format!("no field '{}' in record", field)))
                     }
-                    _ => Err(RuntimeError(format!("field access on non-record: {}", val))),
+                    _ => Err(RuntimeError::at(span, format!("field access on non-record: {}", val))),
                 }
             }
 
-            Expr::Block(exprs) => {
+            ExprKind::Block(exprs) => {
                 if exprs.is_empty() {
                     return Ok(Value::Unit);
                 }
@@ -378,36 +532,130 @@ impl Interpreter {
         }
     }
 
-    fn apply(&self, func: Value, arg: Value) -> Result<Value, RuntimeError> {
+    /// Evaluate an expression in tail position.
+    /// Returns TailCall for function applications that are in tail position,
+    /// allowing the trampoline in `apply` to handle them without growing the stack.
+    fn eval_tail(&self, expr: &Expr, env: &Env) -> Result<EvalResult, RuntimeError> {
+        let span = expr.span;
+        match &expr.kind {
+            // If/else: both branches are in tail position
+            ExprKind::If { cond, then_branch, else_branch } => {
+                match self.eval(cond, env)? {
+                    Value::Bool(true) => self.eval_tail(then_branch, env),
+                    Value::Bool(false) => self.eval_tail(else_branch, env),
+                    v => Err(RuntimeError::at(span, format!("if condition must be bool, got: {}", v))),
+                }
+            }
+
+            // Match: each arm body is in tail position
+            ExprKind::Match { scrutinee, arms } => {
+                let val = self.eval(scrutinee, env)?;
+                for arm in arms {
+                    if let Some(bindings) = self.match_pattern(&arm.pattern, &val) {
+                        let mut new_env = env.clone();
+                        new_env.extend(bindings);
+                        return self.eval_tail(&arm.body, &new_env);
+                    }
+                }
+                Err(RuntimeError::at(span, format!("non-exhaustive match on: {}", val)))
+            }
+
+            // Let: the body is in tail position
+            ExprKind::Let { name, value, body } => {
+                let val = self.eval(value, env)?;
+                let mut new_env = env.clone();
+                if name != "_" {
+                    new_env.insert(name.clone(), val);
+                }
+                self.eval_tail(body, &new_env)
+            }
+
+            // Block: last expression is in tail position
+            ExprKind::Block(exprs) => {
+                if exprs.is_empty() {
+                    return Ok(EvalResult::Value(Value::Unit));
+                }
+                let (last, rest) = exprs.split_last().unwrap();
+                for expr in rest {
+                    self.eval(expr, env)?;
+                }
+                self.eval_tail(last, env)
+            }
+
+            // Function application in tail position — return TailCall
+            ExprKind::App { func, arg } => {
+                let f = self.eval(func, env)?;
+                let a = self.eval(arg, env)?;
+                self.apply_tail(f, a, span)
+            }
+
+            // Pipe in tail position
+            ExprKind::Pipe { value, func } => {
+                let v = self.eval(value, env)?;
+                let f = self.eval(func, env)?;
+                self.apply_tail(f, v, span)
+            }
+
+            // Everything else: not a tail call, just evaluate normally
+            _ => {
+                let val = self.eval(expr, env)?;
+                Ok(EvalResult::Value(val))
+            }
+        }
+    }
+
+    /// Apply a function, using the trampoline to handle tail calls iteratively.
+    fn apply(&self, func: Value, arg: Value, call_span: Span) -> Result<Value, RuntimeError> {
+        // Start with the initial application
+        let mut result = self.apply_tail(func, arg, call_span)?;
+
+        // Trampoline loop: keep resolving TailCalls until we get a Value
+        loop {
+            match result {
+                EvalResult::Value(v) => return Ok(v),
+                EvalResult::TailCall { params, body, env, arg } => {
+                    // Bind the argument to the first parameter
+                    let mut new_env = env;
+                    let bindings = self.match_pattern(&params[0], &arg)
+                        .ok_or_else(|| RuntimeError::at(call_span, format!(
+                            "argument {} doesn't match parameter pattern", arg
+                        )))?;
+                    new_env.extend(bindings);
+
+                    if params.len() == 1 {
+                        // All params bound — evaluate body in tail position
+                        result = self.eval_tail(&body, &new_env)?;
+                    } else {
+                        // Partial application — return closure (no tail call possible)
+                        return Ok(Value::Closure {
+                            params: params[1..].to_vec(),
+                            body,
+                            env: new_env,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Try to apply a function, returning TailCall if the closure body
+    /// should be evaluated in tail position by the trampoline.
+    fn apply_tail(&self, func: Value, arg: Value, call_span: Span) -> Result<EvalResult, RuntimeError> {
         match func {
             Value::Closure { params, body, env } if params.is_empty() => {
                 // Zero-param closure applied as value — evaluate body, then apply result
                 let result = self.eval(&body, &env)?;
-                self.apply(result, arg)
+                self.apply_tail(result, arg, call_span)
             }
             Value::Closure { params, body, env } => {
-                // Bind first param
-                let mut new_env = env;
-                let bindings = self.match_pattern(&params[0], &arg)
-                    .ok_or_else(|| RuntimeError(format!(
-                        "argument {} doesn't match parameter pattern", arg
-                    )))?;
-                new_env.extend(bindings);
-
-                if params.len() == 1 {
-                    // All params bound — evaluate body
-                    self.eval(&body, &new_env)
-                } else {
-                    // Partial application — return closure with remaining params
-                    Ok(Value::Closure {
-                        params: params[1..].to_vec(),
-                        body,
-                        env: new_env,
-                    })
-                }
+                // Return a TailCall so the trampoline handles binding + eval
+                Ok(EvalResult::TailCall { params, body, env, arg })
             }
-            Value::BuiltIn(builtin) => self.apply_builtin(builtin, arg),
-            other => Err(RuntimeError(format!("cannot apply non-function: {}", other))),
+            Value::BuiltIn(builtin) => {
+                let val = self.apply_builtin(builtin, arg)?;
+                Ok(EvalResult::Value(val))
+            }
+            other => Err(RuntimeError::at(call_span, format!("cannot apply non-function: {}", other))),
         }
     }
 
@@ -451,7 +699,7 @@ impl Interpreter {
                 (func, Value::List(list)) => {
                     let mut result = Vec::with_capacity(list.len());
                     for item in list {
-                        result.push(self.apply(func.clone(), item.clone())?);
+                        result.push(self.apply(func.clone(), item.clone(), (0,0))?);
                     }
                     Ok(Value::List(result))
                 }
@@ -461,7 +709,7 @@ impl Interpreter {
                 (func, Value::List(list)) => {
                     let mut result = Vec::new();
                     for item in list {
-                        match self.apply(func.clone(), item.clone())? {
+                        match self.apply(func.clone(), item.clone(), (0,0))? {
                             Value::Bool(true) => result.push(item.clone()),
                             Value::Bool(false) => {}
                             v => return Err(RuntimeError(format!("filter: predicate returned {}, expected bool", v))),
@@ -475,8 +723,8 @@ impl Interpreter {
                 (init, func, Value::List(list)) => {
                     let mut acc = init.clone();
                     for item in list {
-                        let partial = self.apply(func.clone(), acc)?;
-                        acc = self.apply(partial, item.clone())?;
+                        let partial = self.apply(func.clone(), acc, (0,0))?;
+                        acc = self.apply(partial, item.clone(), (0,0))?;
                     }
                     Ok(acc)
                 }
@@ -614,6 +862,7 @@ impl Interpreter {
             },
             "read_file" => match &args[0] {
                 Value::Str(path) => {
+                    self.route.check_fs(path).map_err(RuntimeError)?;
                     match std::fs::read_to_string(path) {
                         Ok(contents) => Ok(Value::Str(contents)),
                         Err(e) => Ok(Value::Str(format!("{}", e))),
@@ -623,6 +872,7 @@ impl Interpreter {
             },
             "write_file" => match (&args[0], &args[1]) {
                 (Value::Str(path), Value::Str(content)) => {
+                    self.route.check_fs(path).map_err(RuntimeError)?;
                     std::fs::write(path, content)
                         .map_err(|e| RuntimeError(format!("write_file: {}", e)))?;
                     Ok(Value::Unit)
@@ -753,22 +1003,202 @@ impl Interpreter {
                 v => Err(RuntimeError(format!("float_to_str: expected float, got {}", v))),
             },
 
+            // System operations (route-gated)
+            "shell" => match &args[0] {
+                Value::Str(cmd) => {
+                    self.route.check_shell().map_err(RuntimeError)?;
+                    match std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(cmd)
+                        .output()
+                    {
+                        Ok(output) => {
+                            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                            if output.status.success() {
+                                Ok(Value::Str(stdout))
+                            } else {
+                                Ok(Value::Str(format!("ERROR({}): {}{}", output.status.code().unwrap_or(-1), stderr, stdout)))
+                            }
+                        }
+                        Err(e) => Err(RuntimeError(format!("shell: {}", e))),
+                    }
+                }
+                v => Err(RuntimeError(format!("shell: expected string, got {}", v))),
+            },
+            "shell_lines" => match &args[0] {
+                Value::Str(cmd) => {
+                    self.route.check_shell().map_err(RuntimeError)?;
+                    match std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(cmd)
+                        .output()
+                    {
+                        Ok(output) => {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let lines: Vec<Value> = stdout.lines()
+                                .map(|l| Value::Str(l.to_string()))
+                                .collect();
+                            Ok(Value::List(lines))
+                        }
+                        Err(e) => Err(RuntimeError(format!("shell_lines: {}", e))),
+                    }
+                }
+                v => Err(RuntimeError(format!("shell_lines: expected string, got {}", v))),
+            },
+            "env" => match &args[0] {
+                Value::Str(name) => {
+                    self.route.check_env(name).map_err(RuntimeError)?;
+                    Ok(Value::Str(std::env::var(name).unwrap_or_default()))
+                }
+                v => Err(RuntimeError(format!("env: expected string, got {}", v))),
+            },
+            "timestamp" => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                Ok(Value::Int(ts))
+            },
+            "sleep_ms" => match &args[0] {
+                Value::Int(ms) => {
+                    std::thread::sleep(std::time::Duration::from_millis(*ms as u64));
+                    Ok(Value::Unit)
+                }
+                v => Err(RuntimeError(format!("sleep_ms: expected int, got {}", v))),
+            },
+
+            // JSON operations
+            "json_parse" => match &args[0] {
+                Value::Str(s) => {
+                    Ok(parse_json_value(s)
+                        .unwrap_or_else(|e| Value::Str(format!("JSON_ERROR: {}", e))))
+                }
+                v => Err(RuntimeError(format!("json_parse: expected string, got {}", v))),
+            },
+            "json_get" => match (&args[0], &args[1]) {
+                (Value::Str(key), Value::Str(json_str)) => {
+                    // Simple JSON field extraction — parse and get key
+                    match parse_json_value(json_str) {
+                        Ok(Value::List(pairs)) => {
+                            // Records are stored as list of (key, value) tuples
+                            for pair in &pairs {
+                                if let Value::Tuple(kv) = pair {
+                                    if kv.len() == 2 {
+                                        if let Value::Str(k) = &kv[0] {
+                                            if k == key {
+                                                return Ok(kv[1].clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Value::Str(String::new()))
+                        }
+                        _ => Ok(Value::Str(String::new())),
+                    }
+                }
+                _ => Err(RuntimeError("json_get: expected two strings (key, json)".into())),
+            },
+
+            // HTTP operations
+            "http_get" => match &args[0] {
+                Value::Str(url) => {
+                    self.route.check_net(url).map_err(RuntimeError)?;
+                    match std::process::Command::new("curl")
+                        .args(["-s", "-L", "--max-time", "30", url])
+                        .output()
+                    {
+                        Ok(output) => Ok(Value::Str(String::from_utf8_lossy(&output.stdout).to_string())),
+                        Err(e) => Err(RuntimeError(format!("http_get: {}", e))),
+                    }
+                }
+                v => Err(RuntimeError(format!("http_get: expected string, got {}", v))),
+            },
+            "http_post" => match (&args[0], &args[1]) {
+                (Value::Str(url), Value::Str(body)) => {
+                    self.route.check_net(url).map_err(RuntimeError)?;
+                    match std::process::Command::new("curl")
+                        .args(["-s", "-L", "--max-time", "30", "-X", "POST",
+                               "-H", "Content-Type: application/json",
+                               "-d", body, url])
+                        .output()
+                    {
+                        Ok(output) => Ok(Value::Str(String::from_utf8_lossy(&output.stdout).to_string())),
+                        Err(e) => Err(RuntimeError(format!("http_post: {}", e))),
+                    }
+                }
+                _ => Err(RuntimeError("http_post: expected two strings (url, body)".into())),
+            },
+
+            // AI operations (route-gated)
+            "prompt" => match &args[0] {
+                Value::Str(user_prompt) => {
+                    self.route.check_ai().map_err(RuntimeError)?;
+                    let config = ai::AiConfig::from_env();
+                    match ai::call_llm(&config, "", user_prompt) {
+                        Ok(response) => Ok(Value::Str(response)),
+                        Err(e) => Err(RuntimeError(format!("prompt: {}", e))),
+                    }
+                }
+                v => Err(RuntimeError(format!("prompt: expected string, got {}", v))),
+            },
+            "prompt_with" => match (&args[0], &args[1]) {
+                (Value::Str(system), Value::Str(user_prompt)) => {
+                    self.route.check_ai().map_err(RuntimeError)?;
+                    let config = ai::AiConfig::from_env();
+                    match ai::call_llm(&config, system, user_prompt) {
+                        Ok(response) => Ok(Value::Str(response)),
+                        Err(e) => Err(RuntimeError(format!("prompt_with: {}", e))),
+                    }
+                }
+                _ => Err(RuntimeError("prompt_with: expected two strings".into())),
+            },
+            "prompt_json" => match (&args[0], &args[1]) {
+                (Value::Str(schema_hint), Value::Str(user_prompt)) => {
+                    self.route.check_ai().map_err(RuntimeError)?;
+                    let config = ai::AiConfig::from_env();
+                    let system = format!(
+                        "{}. Respond with valid JSON only, no explanation.",
+                        schema_hint
+                    );
+                    match ai::call_llm(&config, &system, user_prompt) {
+                        Ok(response) => Ok(Value::Str(response)),
+                        Err(e) => Err(RuntimeError(format!("prompt_json: {}", e))),
+                    }
+                }
+                _ => Err(RuntimeError("prompt_json: expected two strings".into())),
+            },
+            "embed" => match &args[0] {
+                Value::Str(text) => {
+                    self.route.check_ai().map_err(RuntimeError)?;
+                    let config = ai::AiConfig::from_env();
+                    match ai::call_embed(&config, text) {
+                        Ok(vec) => Ok(Value::List(
+                            vec.into_iter().map(Value::Float).collect()
+                        )),
+                        Err(e) => Err(RuntimeError(format!("embed: {}", e))),
+                    }
+                }
+                v => Err(RuntimeError(format!("embed: expected string, got {}", v))),
+            },
+
             _ => Err(RuntimeError(format!("unknown builtin: {}", name))),
         }
     }
 
-    fn eval_binop(&self, op: &str, left: &Value, right: &Value) -> Result<Value, RuntimeError> {
+    fn eval_binop(&self, op: &str, left: &Value, right: &Value, span: Span) -> Result<Value, RuntimeError> {
         match (op, left, right) {
             // Integer arithmetic
             ("+", Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
             ("-", Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
             ("*", Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
             ("/", Value::Int(a), Value::Int(b)) => {
-                if *b == 0 { return Err(RuntimeError("division by zero".into())); }
+                if *b == 0 { return Err(RuntimeError::at(span, "division by zero".into())); }
                 Ok(Value::Int(a / b))
             }
             ("%", Value::Int(a), Value::Int(b)) => {
-                if *b == 0 { return Err(RuntimeError("modulo by zero".into())); }
+                if *b == 0 { return Err(RuntimeError::at(span, "modulo by zero".into())); }
                 Ok(Value::Int(a % b))
             }
 
@@ -809,7 +1239,7 @@ impl Interpreter {
             ("&&", Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
             ("||", Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
 
-            _ => Err(RuntimeError(format!(
+            _ => Err(RuntimeError::at(span, format!(
                 "type error: {} {} {}", left, op, right
             ))),
         }

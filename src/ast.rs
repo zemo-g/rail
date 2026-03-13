@@ -2,6 +2,9 @@
 /// Every Rail program is a list of declarations.
 /// Every declaration is a function, type, property, or module directive.
 
+/// Source location: (line, col)
+pub type Span = (usize, usize);
+
 #[derive(Debug, Clone)]
 pub enum Decl {
     /// Function with optional type signature
@@ -12,6 +15,7 @@ pub enum Decl {
         type_sig: Option<TypeExpr>,
         params: Vec<Pattern>,
         body: Expr,
+        span: Span,
     },
 
     /// Algebraic data type
@@ -57,8 +61,26 @@ pub struct Variant {
     pub fields: Vec<TypeExpr>,
 }
 
+/// An expression with source location tracking.
 #[derive(Debug, Clone)]
-pub enum Expr {
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+impl Expr {
+    pub fn new(kind: ExprKind, span: Span) -> Self {
+        Expr { kind, span }
+    }
+
+    /// Create an Expr with a default (0,0) span (for generated code / tests)
+    pub fn unspanned(kind: ExprKind) -> Self {
+        Expr { kind, span: (0, 0) }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ExprKind {
     /// Integer literal
     IntLit(i64),
 
