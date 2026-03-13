@@ -26,17 +26,21 @@ Every AI agent framework bolts LLM calls onto an imperative language and hopes f
 
 ## Install
 
-```bash
-cargo install rail-lang
-```
-
-Or build from source:
+Build from source:
 
 ```bash
 git clone https://github.com/zemo-g/rail
 cd rail
 cargo build --release
 # binary at target/release/rail
+```
+
+Add to your PATH:
+
+```bash
+cp target/release/rail ~/.local/bin/
+# or
+sudo cp target/release/rail /usr/local/bin/
 ```
 
 ## Quick start
@@ -50,9 +54,6 @@ rail run examples/conductor.rail --allow ai --allow shell --allow fs:.
 
 # Full access (development mode)
 rail run examples/self_evolve.rail --open
-
-# Type-check without running
-rail check examples/hello.rail
 
 # Native compilation (ARM64/x86_64 via Cranelift)
 rail compile examples/hello.rail
@@ -102,7 +103,7 @@ main =
   0
 ```
 
-The LLM generates a Rail program. Rail compiles and runs it. The output is checked. All in 10 lines. Proven working with Qwen 9B locally — zero training data, zero fine-tuning.
+The LLM generates a Rail program. Rail runs it. The output is checked. All in 10 lines. Proven working with Qwen 9B locally — zero training data, zero fine-tuning.
 
 ## Route system (capabilities)
 
@@ -133,7 +134,8 @@ add : i32 -> i32 -> i32
 add x y = x + y
 
 -- Curried functions
-double = map (* 2)
+inc : i32 -> i32
+inc = add 1
 
 -- Algebraic data types
 type Option T =
@@ -141,7 +143,9 @@ type Option T =
   | None
 
 -- Records
-type Point = x: f64, y: f64
+type Point =
+  x: f64
+  y: f64
 
 -- Pattern matching
 describe : i32 -> String
@@ -152,9 +156,10 @@ describe n =
     _ -> "many"
 
 -- Pipes
-result = "hello world"
-  |> split " "
-  |> length
+main =
+  let result = "hello world" |> split " " |> length
+  let _ = print result
+  0
 
 -- Lambdas (single and multi-line)
 transform = \x ->
@@ -168,6 +173,8 @@ loop n acc =
 ```
 
 Types: `i32`, `f64`, `String`, `Bool`, `[T]` (lists), `(A, B)` (tuples), ADTs, records.
+
+Operators: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`
 
 ## System builtins
 
@@ -195,16 +202,19 @@ All system builtins are gated by the route capability system.
 ## Module system
 
 ```
-use Math
-use String
+import Math (square, gcd, factorial)
 
 main =
-  let _ = print (Math.abs (-5))
-  let _ = print (String.upper "hello")
+  let _ = print (square 7)
+  let _ = print (gcd 12 8)
   0
 ```
 
 Stdlib modules: `Math`, `String`, `Prelude` (auto-imported). Custom modules resolved from source directory.
+
+Math exports: `square`, `cube`, `is_even`, `is_odd`, `gcd`, `lcm`, `factorial`, `fib`, `clamp`, `lerp`
+
+String exports: `words`, `unwords`, `lines`, `unlines`, `is_empty`, `repeat_str`
 
 ## Two backends
 
@@ -239,11 +249,24 @@ rail run src/main.rail
 
 Creates `rail.toml` manifest and `src/main.rail` entry point.
 
+## Testing
+
+```bash
+cargo test
+```
+
+109 tests covering the full pipeline: lexer, parser, interpreter, type checker, route system, and all example programs.
+
 ## Status
 
 Rail is v0.2.0. The language, interpreter, type checker, native compiler, module system, AI builtins, and capability system all work. It has been proven to bootstrap itself — a local 9B parameter model generates correct Rail programs zero-shot from the language grammar alone.
 
-What's coming: package manager, LSP, more stdlib, documentation.
+Known limitations:
+- Tuple destructuring in `let` bindings not yet supported — use `match`
+- No recursion depth limit — non-terminating recursion will hang
+- Operator sections like `(* 2)` not supported — use lambdas: `\x -> x * 2`
+
+What's coming: crates.io publishing, package manager, LSP, more stdlib.
 
 ## License
 

@@ -111,6 +111,12 @@ impl Lexer {
                     if self.peek() == '>' {
                         self.advance();
                         tokens.push(Spanned::new(Token::Pipe, self.line, start_col, 2));
+                    } else if self.peek() == '|' {
+                        self.advance();
+                        tokens.push(Spanned::new(
+                            Token::Operator("||".to_string()),
+                            self.line, start_col, 2,
+                        ));
                     } else {
                         tokens.push(Spanned::new(Token::Bar, self.line, start_col, 1));
                     }

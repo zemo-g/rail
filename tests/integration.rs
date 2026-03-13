@@ -185,10 +185,33 @@ fn test_logical_and() {
 }
 
 #[test]
-fn test_logical_not_false() {
-    // Rail doesn't have || operator — test && and negation instead
+fn test_logical_and_true() {
     assert_output(
         "main =\n  let _ = print (true && true)\n  0",
+        "true",
+    );
+}
+
+#[test]
+fn test_logical_or() {
+    assert_output(
+        "main =\n  let _ = print (false || true)\n  0",
+        "true",
+    );
+}
+
+#[test]
+fn test_logical_or_false() {
+    assert_output(
+        "main =\n  let _ = print (false || false)\n  0",
+        "false",
+    );
+}
+
+#[test]
+fn test_logical_combined() {
+    assert_output(
+        "main =\n  let _ = print (true && false || true)\n  0",
         "true",
     );
 }
