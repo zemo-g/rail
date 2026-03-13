@@ -79,7 +79,7 @@ fn main() {
             }
         }
         Some("version") | Some("--version") | Some("-v") => {
-            println!("Rail 0.1.0");
+            println!("Rail 0.2.0");
         }
         _ => {
             println!("Rail — a pure functional, AI-native language");
