@@ -1,35 +1,31 @@
-# Rail Grammar Specification v0.1
+# Rail Grammar Specification v0.6
 
 ## Philosophy
 - Pure functional: functions are the only abstraction
-- Immutable by default, explicit mutation via `mut` (rare, discouraged)
+- Immutable — no mutable bindings
 - Indentation-based scoping (2 spaces)
 - No hidden control flow — what you read is what runs
-- Effects are explicit (IO, State marked in types)
+- Effects via perform/handle/resume (algebraic effects)
 - Small grammar: ~30 production rules
 
 ## Types
 
 ```
 # Primitives
-i32 i64 f32 f64 bool str
+i32 f64 String Bool
 
 # Compound
 [T]           -- list
 (T, U)        -- tuple
-{key: T}      -- record
 T -> U        -- function
-T?            -- optional (no null)
-T!E           -- result (value or error E)
 ```
 
-## Functions (the only abstraction)
+## Functions
 
 ```rail
--- A function is a name, parameters, return type, and body
+-- Type signature (optional — Hindley-Milner infers)
 add : i32 -> i32 -> i32
-add x y =
-  x + y
+add x y = x + y
 
 -- Multi-line bodies use indentation
 distance : f64 -> f64 -> f64
@@ -39,26 +35,24 @@ distance x y =
   sqrt (dx + dy)
 ```
 
+## String Interpolation
+
+```rail
+greet name = print "hello, {name}!"
+report n = print "result: {show n}"
+```
+
+Expressions in `{}` are evaluated. Non-string values need `show`.
+
 ## Pattern Matching
 
 ```rail
-describe : i32 -> str
+describe : i32 -> String
 describe n =
   match n
     0 -> "zero"
     1 -> "one"
     _ -> "many"
-```
-
-## Records
-
-```rail
-type Point =
-  x: f64
-  y: f64
-
-origin : Point
-origin = { x: 0.0, y: 0.0 }
 ```
 
 ## Algebraic Data Types
@@ -73,6 +67,18 @@ type Result T E =
   | Err E
 ```
 
+## Records
+
+```rail
+type Point =
+  x: f64
+  y: f64
+
+origin = { x: 0.0, y: 0.0 }
+```
+
+Access fields with dot notation: `p.x`, `p.y`.
+
 ## Let Bindings (always immutable)
 
 ```rail
@@ -81,51 +87,78 @@ compute n =
   let a = n + 1
   let b = a * 2
   b + 10
+
+-- Tuple destructuring
+let (x, y) = (10, 20)
 ```
 
-## Pipe Operator (data flows like a train on rails)
+## Pipe Operator
 
 ```rail
-process : [i32] -> i32
 process xs =
-  xs
-  |> filter (> 0)
-  |> map (* 2)
-  |> fold 0 (+)
+  xs |> filter (\x -> x > 0) |> map (\x -> x * 2) |> length
 ```
 
-## Effects (explicit in types)
+## Lambdas
 
 ```rail
-greet : str -> IO ()
-greet name =
-  print "hello, {name}"
+double = \x -> x * 2
 
--- Pure functions cannot call IO functions
--- The type system enforces this
+transform = \x ->
+  let y = x + 1
+  y * 2
 ```
 
-## Properties (built-in testing)
+## Algebraic Effects
 
 ```rail
-prop add_commutative : i32 -> i32 -> bool
-prop add_commutative x y =
-  add x y == add y x
+effect Ask
+  ask : String -> String
 
-prop add_identity : i32 -> bool
-prop add_identity x =
-  add x 0 == x
+interview _ =
+  let name = perform ask "name"
+  let color = perform ask "color"
+  append name " likes " color
+
+main =
+  let r = handle (interview ()) with
+    ask q -> if q == "name" then resume "Alice" else resume "blue"
+  print r
+```
+
+## AI Builtins
+
+```rail
+-- Single call
+let answer = prompt "What is 2+2?"
+let answer = prompt_with "system prompt" "user message"
+
+-- Parallel fan-out (batched)
+let results = par_prompt "system" [input1, input2, input3]
+
+-- Multi-turn agent loop
+let result = agent_loop "system" tools fns "user message"
+
+-- Conversation context
+let ctx = context_new "system prompt"
+let (ctx, response) = context_prompt ctx "hello"
+
+-- Structured output
+let data = prompt_typed "description" "schema" "input"
+
+-- Token tracking
+let u = llm_usage ()
+print "{u.calls} calls, {u.total_tokens} tokens"
 ```
 
 ## Module System
 
 ```rail
-module Math
+import Math (square, gcd, factorial)
 
-export sqrt, abs, pow
-
-sqrt : f64 -> f64
-sqrt x = ...
+main =
+  print (square 7)
+  print (gcd 12 8)
 ```
 
 ## Comments
@@ -134,16 +167,20 @@ sqrt x = ...
 -- single line comment
 ```
 
-## Reserved Words (kept minimal)
+## Operators
 
-let, match, type, module, export, import, prop, mut, if, then, else, do
+`+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`, `|>` (pipe)
+
+## Reserved Words
+
+let, match, type, module, export, import, if, then, else, effect, perform, handle, with, resume
 
 ## What Rail Does NOT Have
 - No classes, no objects, no inheritance
 - No null (use Option)
 - No exceptions (use Result)
 - No implicit conversions
-- No macros (comptime later, maybe)
+- No macros
 - No operator overloading
-- No variadic arguments
-- No global mutable state
+- No mutable state
+- No multi-line list literals in blocks where indentation is ambiguous

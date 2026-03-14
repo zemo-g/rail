@@ -112,6 +112,7 @@ struct TailCallCtx {
 // ---- Compiler ----
 
 /// Tracks a string literal embedded in the JIT data section
+#[allow(dead_code)]
 struct StringData {
     data_id: DataId,
     len: usize,

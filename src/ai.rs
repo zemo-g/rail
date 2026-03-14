@@ -3,6 +3,36 @@
 /// Uses curl for HTTP (no external Rust dependencies).
 
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ---- Token tracking (global, thread-safe) ----
+
+static TOTAL_PROMPT_TOKENS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_COMPLETION_TOKENS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Record token usage from a response.
+pub fn track_usage(prompt_tokens: u64, completion_tokens: u64) {
+    TOTAL_PROMPT_TOKENS.fetch_add(prompt_tokens, Ordering::Relaxed);
+    TOTAL_COMPLETION_TOKENS.fetch_add(completion_tokens, Ordering::Relaxed);
+    TOTAL_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Get cumulative usage: (prompt_tokens, completion_tokens, total_calls)
+pub fn get_usage() -> (u64, u64, u64) {
+    (
+        TOTAL_PROMPT_TOKENS.load(Ordering::Relaxed),
+        TOTAL_COMPLETION_TOKENS.load(Ordering::Relaxed),
+        TOTAL_CALLS.load(Ordering::Relaxed),
+    )
+}
+
+/// Reset usage counters.
+pub fn reset_usage() {
+    TOTAL_PROMPT_TOKENS.store(0, Ordering::Relaxed);
+    TOTAL_COMPLETION_TOKENS.store(0, Ordering::Relaxed);
+    TOTAL_CALLS.store(0, Ordering::Relaxed);
+}
 
 /// AI configuration — which LLM backend to use
 pub struct AiConfig {
@@ -98,12 +128,14 @@ impl AiConfig {
 
 /// Send a prompt to the configured LLM backend.
 pub fn call_llm(config: &AiConfig, system: &str, user: &str) -> Result<String, String> {
-    match config.provider.as_str() {
+    let result = match config.provider.as_str() {
         "anthropic" => call_anthropic(config, system, user),
         "openai" | "local" => call_openai_compatible(config, system, user),
         "mock" => Ok(mock_response(system, user)),
         _ => Err(format!("unknown AI provider: {}", config.provider)),
-    }
+    };
+    // Strip thinking tags from all responses
+    result.map(|text| strip_thinking_tags(&text))
 }
 
 /// Get an embedding vector from the configured backend.
@@ -147,6 +179,7 @@ fn call_anthropic(config: &AiConfig, system: &str, user: &str) -> Result<String,
     }
 
     let response = String::from_utf8_lossy(&output.stdout).to_string();
+    extract_usage(&response);
     extract_anthropic_text(&response)
 }
 
@@ -219,6 +252,8 @@ fn call_openai_compatible(config: &AiConfig, system: &str, user: &str) -> Result
     }
 
     let response = String::from_utf8_lossy(&output.stdout).to_string();
+    // Extract and track token usage
+    extract_usage(&response);
     extract_openai_text(&response)
 }
 
@@ -458,6 +493,128 @@ fn find_closing_quote(json: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// Extract token usage from any JSON response and track it.
+fn extract_usage(json: &str) {
+    // Look for "usage":{"prompt_tokens":N,"completion_tokens":N,...}
+    // or Anthropic: "usage":{"input_tokens":N,"output_tokens":N}
+    if let Some(usage_pos) = json.find(r#""usage""#) {
+        let after = &json[usage_pos..];
+        let prompt_t = extract_int_field(after, "prompt_tokens")
+            .or_else(|| extract_int_field(after, "input_tokens"))
+            .unwrap_or(0);
+        let completion_t = extract_int_field(after, "completion_tokens")
+            .or_else(|| extract_int_field(after, "output_tokens"))
+            .unwrap_or(0);
+        track_usage(prompt_t, completion_t);
+    }
+}
+
+/// Extract an integer field value from JSON-like text.
+fn extract_int_field(json: &str, field: &str) -> Option<u64> {
+    let pattern = format!(r#""{}":"#, field);
+    if let Some(pos) = json.find(&pattern) {
+        let start = pos + pattern.len();
+        let rest = json[start..].trim_start();
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Call LLM with a specific model override (ignores RAIL_AI_MODEL env).
+pub fn call_llm_with_model(config: &AiConfig, model: &str, system: &str, user: &str) -> Result<String, String> {
+    let mut config = AiConfig {
+        provider: config.provider.clone(),
+        api_key: config.api_key.clone(),
+        model: model.to_string(),
+        base_url: config.base_url.clone(),
+        temperature: config.temperature,
+    };
+    // If model looks like a URL or contains localhost, switch to local provider
+    if model.contains("localhost") || model.contains("127.0.0.1") {
+        let parts: Vec<&str> = model.splitn(2, '|').collect();
+        if parts.len() == 2 {
+            // Format: "http://localhost:8080|model_id"
+            config.base_url = format!("{}/v1/chat/completions", parts[0]);
+            config.model = parts[1].to_string();
+            config.provider = "local".to_string();
+        }
+    }
+    call_llm(&config, system, user)
+}
+
+/// Strip LLM thinking/reasoning tags from output.
+/// Case-insensitive. Handles unclosed tags (strips to end).
+/// Collects removal ranges on a single lowercased copy, applies once.
+fn strip_thinking_tags(s: &str) -> String {
+    // Note: positions from lowercased copy index the original. Safe for ASCII/Latin
+    // content (byte length preserved). Would break on Turkish İ etc. before a tag.
+    let lower = s.to_lowercase();
+    // Longest tags first so "thinking" matches before "think"
+    let tags = [
+        "scratchpad", "reflection", "reasoning", "thinking", "internal",
+        "analysis", "thought", "think", "meta", "plan",
+    ];
+
+    // Collect byte ranges to remove: (start, end)
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+    for tag in tags {
+        let open = format!("<{}", tag);
+        let close = format!("</{}>", tag);
+        let mut search_from = 0;
+        while search_from < lower.len() {
+            let Some(pos) = lower[search_from..].find(&open) else { break };
+            let pos = search_from + pos;
+
+            // Ensure exact tag boundary: next char must be > or whitespace
+            let after = pos + open.len();
+            if after < lower.len() {
+                let next = lower.as_bytes()[after];
+                if next != b'>' && !next.is_ascii_whitespace() {
+                    search_from = pos + 1;
+                    continue;
+                }
+            }
+
+            // Check this range isn't already inside a prior removal
+            if removals.iter().any(|&(rs, re)| pos >= rs && pos < re) {
+                search_from = pos + 1;
+                continue;
+            }
+
+            if let Some(end_pos) = lower[pos..].find(&close) {
+                let end = pos + end_pos + close.len();
+                removals.push((pos, end));
+                search_from = end;
+            } else {
+                // Unclosed tag — strip from open tag to end
+                removals.push((pos, s.len()));
+                break;
+            }
+        }
+    }
+
+    if removals.is_empty() {
+        return s.trim().to_string();
+    }
+
+    // Sort by start position and apply removals
+    removals.sort_by_key(|&(start, _)| start);
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0;
+    for (start, end) in &removals {
+        if *start > cursor {
+            out.push_str(&s[cursor..*start]);
+        }
+        cursor = *end;
+    }
+    if cursor < s.len() {
+        out.push_str(&s[cursor..]);
+    }
+    out.trim().to_string()
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max { s } else { &s[..max] }
 }
@@ -528,6 +685,58 @@ mod tests {
     fn test_extract_openai() {
         let json = r#"{"choices":[{"message":{"role":"assistant","content":"Paris"}}]}"#;
         assert_eq!(extract_openai_text(json).unwrap(), "Paris");
+    }
+
+    #[test]
+    fn test_strip_thinking_basic() {
+        let input = "<analysis>some reasoning here</analysis>The answer is 42.";
+        assert_eq!(strip_thinking_tags(input), "The answer is 42.");
+    }
+
+    #[test]
+    fn test_strip_thinking_case_insensitive() {
+        let input = "<Analysis>deep thought</Analysis>Result here.";
+        assert_eq!(strip_thinking_tags(input), "Result here.");
+        let input2 = "<THINKING>hmm</THINKING>Done.";
+        assert_eq!(strip_thinking_tags(input2), "Done.");
+    }
+
+    #[test]
+    fn test_strip_thinking_unclosed() {
+        let input = "Answer is 42.<think>but wait let me reconsider";
+        assert_eq!(strip_thinking_tags(input), "Answer is 42.");
+    }
+
+    #[test]
+    fn test_strip_thinking_multiple() {
+        let input = "<think>a</think>Hello <reasoning>b</reasoning>world";
+        assert_eq!(strip_thinking_tags(input), "Hello world");
+    }
+
+    #[test]
+    fn test_strip_thinking_clean_passthrough() {
+        let input = "No tags here, just a normal response.";
+        assert_eq!(strip_thinking_tags(input), "No tags here, just a normal response.");
+    }
+
+    #[test]
+    fn test_strip_thinking_mixed_think_thinking() {
+        // Both <think> and <thinking> in same output — must strip both correctly
+        let input = "<thinking>deep thought</thinking>Answer.<think>wait</think>Done.";
+        assert_eq!(strip_thinking_tags(input), "Answer.Done.");
+    }
+
+    #[test]
+    fn test_strip_thinking_with_attributes() {
+        let input = "<analysis type=\"deep\">reasoning here</analysis>Result.";
+        assert_eq!(strip_thinking_tags(input), "Result.");
+    }
+
+    #[test]
+    fn test_strip_thinking_no_false_positive() {
+        // <metadata> should NOT be stripped (not in tag list, and "meta" boundary check blocks it)
+        let input = "The <metadata>field</metadata> is important.";
+        assert_eq!(strip_thinking_tags(input), "The <metadata>field</metadata> is important.");
     }
 
     #[test]

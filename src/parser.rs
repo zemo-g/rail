@@ -60,12 +60,17 @@ impl Parser {
 
         match self.peek_token() {
             Token::Type => self.parse_type_decl(),
+            Token::Effect => self.parse_effect_decl(),
             Token::Module => self.parse_module_decl(),
             Token::Export => self.parse_export_decl(),
             Token::Import => self.parse_import_decl(),
             Token::Prop => self.parse_property(),
             Token::Ident(_) => self.parse_func_decl(),
-            _ => Err(self.error("expected declaration")),
+            other => Err(self.error(&format!(
+                "expected a declaration (function, type, import, or effect), got {:?}. \
+                 Hint: function definitions look like: name x y = body",
+                other
+            ))),
         }
     }
 
@@ -189,6 +194,38 @@ impl Parser {
         }
     }
 
+    /// Parse `effect <Name>` with indented operations
+    /// ```
+    /// effect LLM
+    ///   ask : String -> String
+    ///   embed : String -> [f64]
+    /// ```
+    fn parse_effect_decl(&mut self) -> Result<Decl, ParseError> {
+        self.expect(&Token::Effect)?;
+        let name = self.expect_type_ident()?;
+        self.skip_newlines();
+
+        let mut operations = Vec::new();
+
+        if self.check_token(&Token::Indent) {
+            self.advance();
+        }
+
+        while !self.check_token(&Token::Dedent) && !self.at_eof() {
+            let op_name = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let type_sig = self.parse_type_expr()?;
+            operations.push(EffectOp { name: op_name, type_sig });
+            self.skip_newlines();
+        }
+
+        if self.check_token(&Token::Dedent) {
+            self.advance();
+        }
+
+        Ok(Decl::EffectDecl { name, operations })
+    }
+
     fn parse_module_decl(&mut self) -> Result<Decl, ParseError> {
         self.expect(&Token::Module)?;
         let name = self.expect_type_ident()?;
@@ -277,23 +314,73 @@ impl Parser {
     // ---- Expressions ----
 
     fn parse_block(&mut self) -> Result<Expr, ParseError> {
-        let span = self.current_span();
-        let mut exprs = Vec::new();
+        self.skip_newlines();
+        if self.check_token(&Token::Dedent) || self.at_eof() {
+            return Err(self.error("empty block"));
+        }
+        self.parse_block_body()
+    }
 
-        loop {
-            self.skip_newlines();
-            if self.check_token(&Token::Dedent) || self.at_eof() {
-                break;
+    /// Parse a sequence of block-level statements.
+    /// Let bindings scope over everything that follows them:
+    ///   let x = 5
+    ///   let y = x * 2     ← x is in scope
+    ///   print (x + y)     ← both x and y are in scope
+    ///
+    /// Non-let expressions evaluate for side effects, then continue:
+    ///   print "hello"     ← desugars to: let _ = print "hello" in ...
+    ///   print "world"
+    fn parse_block_body(&mut self) -> Result<Expr, ParseError> {
+        // At block level, intercept `let` to scope it over the rest
+        if self.check(&Token::Let) {
+            let span = self.current_span();
+            self.advance(); // eat let
+
+            // Check for tuple destructuring: let (a, b) = expr
+            if self.check(&Token::LParen) {
+                return self.parse_let_destructure(span, true);
             }
-            let expr = self.parse_expr()?;
-            exprs.push(expr);
+
+            let name = if self.check(&Token::Underscore) {
+                self.advance();
+                "_".to_string()
+            } else {
+                self.expect_ident()?
+            };
+            self.expect(&Token::Equals)?;
+            let value = self.parse_expr()?;
             self.skip_newlines();
+
+            // Body is the rest of the block
+            let body = if self.check_token(&Token::Dedent) || self.at_eof() {
+                self.spanned(ExprKind::Tuple(vec![]), span) // unit
+            } else {
+                self.parse_block_body()?
+            };
+
+            return Ok(self.spanned(ExprKind::Let {
+                name,
+                value: Box::new(value),
+                body: Box::new(body),
+            }, span));
         }
 
-        match exprs.len() {
-            0 => Err(self.error("empty block")),
-            1 => Ok(exprs.into_iter().next().unwrap()),
-            _ => Ok(self.spanned(ExprKind::Block(exprs), span)),
+        // Non-let expression
+        let expr = self.parse_expr()?;
+        self.skip_newlines();
+
+        if self.check_token(&Token::Dedent) || self.at_eof() {
+            // Last expression in block — this is the return value
+            Ok(expr)
+        } else {
+            // More expressions follow — evaluate this one for side effects
+            let span = expr.span;
+            let rest = self.parse_block_body()?;
+            Ok(self.spanned(ExprKind::Let {
+                name: "_".to_string(),
+                value: Box::new(expr),
+                body: Box::new(rest),
+            }, span))
         }
     }
 
@@ -331,6 +418,12 @@ impl Parser {
         if self.check(&Token::Let) {
             let span = self.current_span();
             self.advance(); // eat let
+
+            // Check for tuple destructuring: let (a, b) = expr
+            if self.check(&Token::LParen) {
+                return self.parse_let_destructure(span, false);
+            }
+
             let name = if self.check(&Token::Underscore) {
                 self.advance();
                 "_".to_string()
@@ -355,8 +448,14 @@ impl Parser {
             self.parse_match_expr()
         } else if self.check(&Token::Backslash) {
             self.parse_lambda()
+        } else if self.check(&Token::Perform) {
+            self.parse_perform_expr()
+        } else if self.check(&Token::Handle) {
+            self.parse_handle_expr()
+        } else if self.check(&Token::Resume) {
+            self.parse_resume_expr()
         } else {
-            self.parse_comparison()
+            self.parse_logical()
         }
     }
 
@@ -366,11 +465,33 @@ impl Parser {
         let cond = self.parse_expr()?;
         self.expect(&Token::Then)?;
         self.skip_newlines();
-        let then_branch = self.parse_expr()?;
+
+        // Support multi-line then/else branches (indented blocks)
+        let then_branch = if self.check_token(&Token::Indent) {
+            self.advance();
+            let expr = self.parse_block()?;
+            if self.check_token(&Token::Dedent) {
+                self.advance();
+            }
+            expr
+        } else {
+            self.parse_expr()?
+        };
+
         self.skip_newlines();
         self.expect(&Token::Else)?;
         self.skip_newlines();
-        let else_branch = self.parse_expr()?;
+
+        let else_branch = if self.check_token(&Token::Indent) {
+            self.advance();
+            let expr = self.parse_block()?;
+            if self.check_token(&Token::Dedent) {
+                self.advance();
+            }
+            expr
+        } else {
+            self.parse_expr()?
+        };
 
         Ok(self.spanned(ExprKind::If {
             cond: Box::new(cond),
@@ -440,15 +561,103 @@ impl Parser {
         }, span))
     }
 
+    /// Parse `perform <op> <args...>`
+    fn parse_perform_expr(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current_span();
+        self.expect(&Token::Perform)?;
+        let op = self.expect_ident()?;
+
+        // Collect arguments (same tokens that start atoms)
+        let mut args = Vec::new();
+        loop {
+            match self.peek_token() {
+                Token::Int(_) | Token::Float(_) | Token::Str(_) | Token::Bool(_)
+                | Token::Ident(_) | Token::LParen | Token::LBracket | Token::LBrace
+                | Token::TypeIdent(_) | Token::InterpStr(_) => {
+                    let arg = self.parse_field_access()?;
+                    args.push(arg);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(self.spanned(ExprKind::Perform { op, args }, span))
+    }
+
+    /// Parse `handle <expr> with <newline> <indent> <handlers> <dedent>`
+    fn parse_handle_expr(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current_span();
+        self.expect(&Token::Handle)?;
+
+        // Parse the body expression (could be a function call, parenthesized expr, etc.)
+        // Use parse_expr to allow pipes, lets, etc. inside
+        let body = self.parse_expr()?;
+
+        self.expect(&Token::With)?;
+        self.skip_newlines();
+
+        let mut handlers = Vec::new();
+
+        if self.check_token(&Token::Indent) {
+            self.advance();
+        }
+
+        while !self.check_token(&Token::Dedent) && !self.check_token(&Token::RParen) && !self.at_eof() {
+            // Each handler: <op_name> <params> -> <body>
+            // Stop if we see something that can't start a handler (e.g. keyword, closing delimiters)
+            match self.peek_token() {
+                Token::Ident(_) => {}
+                _ => break,
+            }
+            let op_name = self.expect_ident()?;
+            let mut params = Vec::new();
+            while !self.check(&Token::Arrow) && !self.at_eof() {
+                params.push(self.parse_simple_pattern()?);
+            }
+            self.expect(&Token::Arrow)?;
+            self.skip_newlines();
+            // Support multi-line handler bodies (indented blocks)
+            let handler_body = if self.check_token(&Token::Indent) {
+                self.advance();
+                let expr = self.parse_block()?;
+                if self.check_token(&Token::Dedent) {
+                    self.advance();
+                }
+                expr
+            } else {
+                self.parse_expr()?
+            };
+            handlers.push(EffectHandler { op_name, params, body: handler_body });
+            self.skip_newlines();
+        }
+
+        if self.check_token(&Token::Dedent) {
+            self.advance();
+        }
+
+        Ok(self.spanned(ExprKind::Handle {
+            body: Box::new(body),
+            handlers,
+        }, span))
+    }
+
+    /// Parse `resume <expr>`
+    fn parse_resume_expr(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current_span();
+        self.expect(&Token::Resume)?;
+        let value = self.parse_field_access()?;
+        Ok(self.spanned(ExprKind::Resume(Box::new(value)), span))
+    }
+
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_logical()?;
+        let mut left = self.parse_additive()?;
 
         while let Token::Operator(ref op) = self.peek_token() {
             if matches!(op.as_str(), "==" | "!=" | "<" | ">" | "<=" | ">=") {
                 let span = self.current_span();
                 let op = op.clone();
                 self.advance();
-                let right = self.parse_logical()?;
+                let right = self.parse_additive()?;
                 left = self.spanned(ExprKind::BinOp {
                     op,
                     left: Box::new(left),
@@ -463,14 +672,14 @@ impl Parser {
     }
 
     fn parse_logical(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_additive()?;
+        let mut left = self.parse_comparison()?;
 
         while let Token::Operator(ref op) = self.peek_token() {
             if matches!(op.as_str(), "&&" | "||") {
                 let span = self.current_span();
                 let op = op.clone();
                 self.advance();
-                let right = self.parse_additive()?;
+                let right = self.parse_comparison()?;
                 left = self.spanned(ExprKind::BinOp {
                     op,
                     left: Box::new(left),
@@ -553,7 +762,7 @@ impl Parser {
             match self.peek_token() {
                 Token::Int(_) | Token::Float(_) | Token::Str(_) | Token::Bool(_)
                 | Token::Ident(_) | Token::LParen | Token::LBracket | Token::LBrace
-                | Token::TypeIdent(_) => {
+                | Token::TypeIdent(_) | Token::InterpStr(_) => {
                     let arg = self.parse_field_access()?;
                     args.push(arg);
                 }
@@ -610,6 +819,11 @@ impl Parser {
                 self.advance();
                 Ok(self.spanned(ExprKind::StrLit(s), span))
             }
+            Token::InterpStr(parts) => {
+                let parts = parts.clone();
+                self.advance();
+                self.desugar_interp(parts, span)
+            }
             Token::Bool(b) => {
                 let b = b;
                 self.advance();
@@ -627,6 +841,7 @@ impl Parser {
             }
             Token::LParen => {
                 self.advance();
+                self.skip_layout();
                 if self.check(&Token::RParen) {
                     self.advance();
                     return Ok(self.spanned(ExprKind::Tuple(vec![]), span)); // unit
@@ -639,55 +854,134 @@ impl Parser {
                 }
 
                 let expr = self.parse_expr()?;
+                self.skip_layout();
 
                 if self.check(&Token::Comma) {
                     // Tuple
                     let mut elements = vec![expr];
                     while self.check(&Token::Comma) {
                         self.advance();
+                        self.skip_layout();
+                        if self.check(&Token::RParen) { break; } // trailing comma
                         elements.push(self.parse_expr()?);
+                        self.skip_layout();
                     }
-                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::RParen).map_err(|_| self.error("expected ')' to close tuple"))?;
                     Ok(self.spanned(ExprKind::Tuple(elements), span))
                 } else {
-                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::RParen).map_err(|_| self.error("expected ')' to close parenthesized expression"))?;
                     Ok(expr)
                 }
             }
             Token::LBracket => {
                 self.advance();
+                self.skip_layout(); // allow newline after [
                 let mut elements = Vec::new();
                 if !self.check(&Token::RBracket) {
                     elements.push(self.parse_expr()?);
+                    self.skip_layout();
                     while self.check(&Token::Comma) {
                         self.advance();
+                        self.skip_layout(); // allow newline after ,
+                        if self.check(&Token::RBracket) { break; } // trailing comma
                         elements.push(self.parse_expr()?);
+                        self.skip_layout();
                     }
                 }
-                self.expect(&Token::RBracket)?;
+                self.expect(&Token::RBracket).map_err(|_| self.error("expected ']' to close list literal"))?;
                 Ok(self.spanned(ExprKind::List(elements), span))
             }
             Token::LBrace => {
                 self.advance();
+                self.skip_layout(); // allow newline after {
                 let mut fields = Vec::new();
                 if !self.check(&Token::RBrace) {
                     let name = self.expect_ident()?;
                     self.expect(&Token::Colon)?;
                     let value = self.parse_expr()?;
                     fields.push((name, value));
+                    self.skip_layout();
                     while self.check(&Token::Comma) {
                         self.advance();
+                        self.skip_layout(); // allow newline after ,
+                        if self.check(&Token::RBrace) { break; } // trailing comma
                         let name = self.expect_ident()?;
                         self.expect(&Token::Colon)?;
                         let value = self.parse_expr()?;
                         fields.push((name, value));
+                        self.skip_layout();
                     }
                 }
-                self.expect(&Token::RBrace)?;
+                self.expect(&Token::RBrace).map_err(|_| self.error("expected '}' to close record literal"))?;
                 Ok(self.spanned(ExprKind::Record(fields), span))
             }
-            _ => Err(self.error(&format!("expected expression, got {:?}", self.peek_token()))),
+            token => {
+                let hint = match token {
+                    Token::Newline | Token::Indent | Token::Dedent =>
+                        ". Hint: check your indentation — Rail uses 2-space indentation",
+                    Token::EOF =>
+                        ". Hint: expression is incomplete — did you forget the body?",
+                    _ => "",
+                };
+                Err(self.error(&format!("expected expression, got {:?}{}", token, hint)))
+            }
         }
+    }
+
+    /// Desugar interpolated string into append/show chain.
+    /// "hello {name}!" → append (append "hello " (show name)) "!"
+    fn desugar_interp(&mut self, parts: Vec<crate::token::InterpPart>, span: Span) -> Result<Expr, ParseError> {
+        use crate::token::InterpPart;
+        use crate::lexer::Lexer;
+
+        let mut exprs: Vec<Expr> = Vec::new();
+
+        for part in &parts {
+            match part {
+                InterpPart::Lit(s) => {
+                    exprs.push(self.spanned(ExprKind::StrLit(s.clone()), span));
+                }
+                InterpPart::Expr(code) => {
+                    // Parse the expression inside {}
+                    let mut lexer = Lexer::new(code);
+                    let tokens = lexer.tokenize().map_err(|e| self.error(
+                        &format!("in string interpolation: {}", e)
+                    ))?;
+                    // Filter out layout tokens — interpolation is a single expression
+                    let tokens: Vec<_> = tokens.into_iter().filter(|t| {
+                        !matches!(t.token, crate::token::Token::Newline
+                            | crate::token::Token::Indent
+                            | crate::token::Token::Dedent)
+                    }).collect();
+                    let mut parser = Parser::new(tokens);
+                    let expr = parser.parse_expr().map_err(|e| self.error(
+                        &format!("in string interpolation: {}", e)
+                    ))?;
+                    // Wrap in show: show <expr>
+                    let show_expr = self.spanned(ExprKind::App {
+                        func: Box::new(self.spanned(ExprKind::Var("show".to_string()), span)),
+                        arg: Box::new(expr),
+                    }, span);
+                    exprs.push(show_expr);
+                }
+            }
+        }
+
+        // Build the append chain left-to-right
+        if exprs.is_empty() {
+            return Ok(self.spanned(ExprKind::StrLit(String::new()), span));
+        }
+        let mut result = exprs.remove(0);
+        for expr in exprs {
+            result = self.spanned(ExprKind::App {
+                func: Box::new(self.spanned(ExprKind::App {
+                    func: Box::new(self.spanned(ExprKind::Var("append".to_string()), span)),
+                    arg: Box::new(result),
+                }, span)),
+                arg: Box::new(expr),
+            }, span);
+        }
+        Ok(result)
     }
 
     // ---- Patterns ----
@@ -778,7 +1072,11 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(Pattern::Tuple(pats))
             }
-            _ => Err(self.error("expected pattern")),
+            _ => Err(self.error(&format!(
+                "expected a parameter name or pattern, got {:?}. \
+                 Hint: did you forget '=' before the function body?",
+                self.peek_token()
+            ))),
         }
     }
 
@@ -866,6 +1164,84 @@ impl Parser {
         }
     }
 
+    /// Parse `let (a, b, ...) = expr` destructuring.
+    /// Desugars into: let _tmp = expr; let a = _tmp.0; let b = _tmp.1; ... body
+    /// When `in_block` is true, the body comes from parse_block_body; otherwise parse_expr.
+    fn parse_let_destructure(&mut self, span: Span, in_block: bool) -> Result<Expr, ParseError> {
+        self.advance(); // eat (
+        let mut names = Vec::new();
+        if !self.check(&Token::RParen) {
+            names.push(if self.check(&Token::Underscore) {
+                self.advance();
+                "_".to_string()
+            } else {
+                self.expect_ident().map_err(|_| self.error("expected identifier in destructuring pattern"))?
+            });
+            while self.check(&Token::Comma) {
+                self.advance();
+                if self.check(&Token::RParen) { break; }
+                names.push(if self.check(&Token::Underscore) {
+                    self.advance();
+                    "_".to_string()
+                } else {
+                    self.expect_ident().map_err(|_| self.error("expected identifier in destructuring pattern"))?
+                });
+            }
+        }
+        self.expect(&Token::RParen).map_err(|_| self.error("expected ')' in let destructuring"))?;
+        self.expect(&Token::Equals).map_err(|_| self.error("expected '=' after destructuring pattern"))?;
+        let value = self.parse_expr()?;
+        self.skip_newlines();
+
+        let body = if in_block {
+            if self.check_token(&Token::Dedent) || self.at_eof() {
+                self.spanned(ExprKind::Tuple(vec![]), span)
+            } else {
+                self.parse_block_body()?
+            }
+        } else {
+            self.parse_expr()?
+        };
+
+        // Desugar: let _destructure_tmp = value in let a = match _destructure_tmp ... in body
+        let tmp_name = "_destructure_tmp".to_string();
+        let mut result = body;
+
+        // Bind names in reverse order so the chain nests correctly
+        for (i, name) in names.iter().enumerate().rev() {
+            if name == "_" { continue; }
+            // Create: match _destructure_tmp { (_, ..., x, _, ...) -> ... }
+            // Simpler approach: use a match with a tuple pattern
+            let mut pat_parts: Vec<Pattern> = (0..names.len())
+                .map(|j| if j == i { Pattern::Var(name.clone()) } else { Pattern::Wildcard })
+                .collect();
+            let pattern = if pat_parts.len() == 1 {
+                pat_parts.remove(0)
+            } else {
+                Pattern::Tuple(pat_parts)
+            };
+            let match_expr = self.spanned(ExprKind::Match {
+                scrutinee: Box::new(self.spanned(ExprKind::Var(tmp_name.clone()), span)),
+                arms: vec![MatchArm {
+                    pattern,
+                    body: self.spanned(ExprKind::Var(name.clone()), span),
+                }],
+            }, span);
+            result = self.spanned(ExprKind::Let {
+                name: name.clone(),
+                value: Box::new(match_expr),
+                body: Box::new(result),
+            }, span);
+        }
+
+        // Wrap in: let _destructure_tmp = value in result
+        Ok(self.spanned(ExprKind::Let {
+            name: tmp_name,
+            value: Box::new(value),
+            body: Box::new(result),
+        }, span))
+    }
+
     // ---- Helpers ----
 
     fn peek_token(&self) -> Token {
@@ -934,6 +1310,14 @@ impl Parser {
         }
     }
 
+    /// Skip layout tokens (newlines, indents, dedents) inside bracketed contexts.
+    /// Used for multi-line list literals, record literals, and tuples.
+    fn skip_layout(&mut self) {
+        while matches!(self.peek_token(), Token::Newline | Token::Indent | Token::Dedent | Token::Comment(_)) {
+            self.advance();
+        }
+    }
+
     fn at_eof(&self) -> bool {
         self.peek_token() == Token::EOF
     }
@@ -946,6 +1330,20 @@ impl Parser {
         };
         ParseError {
             message: message.to_string(),
+            line,
+            col,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn error_context(&self, message: &str, context: &str) -> ParseError {
+        let (line, col) = if self.pos < self.tokens.len() {
+            (self.tokens[self.pos].span.line, self.tokens[self.pos].span.col)
+        } else {
+            (0, 0)
+        };
+        ParseError {
+            message: format!("{} (while parsing {})", message, context),
             line,
             col,
         }

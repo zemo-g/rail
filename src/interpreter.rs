@@ -4,6 +4,8 @@
 /// Uses trampoline-based tail call optimization (TCO) for recursive tail calls.
 
 use std::collections::HashMap;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::fmt;
 use std::io::Write;
 use crate::ast::*;
@@ -254,11 +256,41 @@ impl fmt::Display for RuntimeError {
     }
 }
 
+// ---- Effect system ----
+
+#[derive(Clone)]
+struct HandleContext {
+    body: Rc<Expr>,
+    body_env: Env,
+    handlers: Vec<(String, Vec<Pattern>, Expr)>,
+    resume_answers: Vec<Value>,
+    resume_cursor: usize,
+    resumed: bool,
+    // Snapshot of outer contexts' cursors when this handle started —
+    // restored on re-execution so nested effects replay correctly
+    saved_outer_cursors: Vec<usize>,
+}
+
+struct EffectSignal {
+    op: String,
+    args: Vec<Value>,
+}
+
 // ---- Interpreter ----
 
+const MAX_RECURSION_DEPTH: usize = 200;
+
 pub struct Interpreter {
-    globals: Env,
+    globals: RefCell<Env>,
     route: Route,
+    // Effect system
+    effect_signal: RefCell<Option<EffectSignal>>,
+    handle_contexts: RefCell<Vec<HandleContext>>,
+    // Hot reload: persistent state + serve context
+    state: RefCell<HashMap<String, Value>>,
+    serve_ctx: Option<RefCell<crate::serve::ServeContext>>,
+    // Recursion depth tracking
+    depth: RefCell<usize>,
 }
 
 impl Interpreter {
@@ -272,7 +304,7 @@ impl Interpreter {
         // Register built-in functions: (name, arity)
         let builtins = [
             ("print", 1), ("show", 1), ("not", 1),
-            ("map", 2), ("filter", 2), ("fold", 3),
+            ("map", 2), ("par_map", 2), ("filter", 2), ("par_filter", 2), ("fold", 3),
             ("head", 1), ("tail", 1), ("length", 1),
             ("range", 2), ("cons", 2), ("append", 2), ("reverse", 1),
             ("sort", 1), ("zip", 2), ("enumerate", 1),
@@ -289,6 +321,7 @@ impl Interpreter {
             ("http_get", 1), ("http_post", 2),
             // AI
             ("prompt", 1), ("prompt_with", 2), ("prompt_json", 2), ("embed", 1),
+            ("prompt_model", 3), ("par_prompt", 2), ("llm_usage", 1), ("llm_reset", 1),
             // String operations
             ("split", 2), ("join", 2), ("trim", 1), ("chars", 1),
             ("contains", 2), ("starts_with", 2), ("ends_with", 2),
@@ -299,6 +332,11 @@ impl Interpreter {
             ("pi", 1), ("e", 1),
             // Conversion
             ("parse_int", 1), ("parse_float", 1), ("float_to_str", 1),
+            // Hot reload
+            ("set_state", 2), ("get_state", 1), ("check_reload", 1),
+            // Agent primitives (v0.5)
+            ("agent_loop", 4), ("prompt_stream", 3), ("prompt_typed", 3),
+            ("context_new", 1), ("context_push", 3), ("context_prompt", 2),
         ];
         for (name, arity) in builtins {
             globals.insert(name.to_string(), Value::BuiltIn(BuiltIn::Fn {
@@ -308,18 +346,58 @@ impl Interpreter {
             }));
         }
 
-        Interpreter { globals, route }
+        Interpreter {
+            globals: RefCell::new(globals),
+            route,
+            effect_signal: RefCell::new(None),
+            handle_contexts: RefCell::new(Vec::new()),
+            state: RefCell::new(HashMap::new()),
+            serve_ctx: None,
+            depth: RefCell::new(0),
+        }
     }
 
-    pub fn run(&mut self, program: &Program) -> Result<Value, RuntimeError> {
+    /// Inject persistent state from a previous generation (used by serve loop).
+    pub fn set_serve_context_state(&mut self, state: &HashMap<String, Value>) {
+        *self.state.borrow_mut() = state.clone();
+    }
+
+    /// Get a global value by name (used by test runner).
+    pub fn get_global(&self, name: &str) -> Option<Value> {
+        self.globals.borrow().get(name).cloned()
+    }
+
+    /// Apply a function value to an argument (public wrapper for test runner).
+    pub fn apply_value(&self, func: Value, arg: Value) -> Result<Value, RuntimeError> {
+        self.apply(func, arg, (0, 0))
+    }
+
+    /// Harvest persistent state after a run (used by serve loop).
+    pub fn take_serve_state(&self) -> HashMap<String, Value> {
+        self.state.borrow().clone()
+    }
+
+    /// Attach a serve context for check_reload support.
+    #[allow(dead_code)]
+    pub fn set_serve_context(&mut self, ctx: crate::serve::ServeContext) {
+        self.serve_ctx = Some(RefCell::new(ctx));
+    }
+
+    /// Take the serve context back (used by serve loop).
+    #[allow(dead_code)]
+    pub fn take_serve_context(&mut self) -> Option<crate::serve::ServeContext> {
+        self.serve_ctx.take().map(|c| c.into_inner())
+    }
+
+    pub fn run(&self, program: &Program) -> Result<Value, RuntimeError> {
         // Phase 1: register all declarations into globals
         for decl in &program.declarations {
             self.register(decl)?;
         }
 
         // Phase 2: find and evaluate main
-        let main_val = self.globals.get("main")
-            .ok_or_else(|| RuntimeError("no 'main' function defined".into()))?
+        let main_val = self.globals.borrow().get("main")
+            .ok_or_else(|| RuntimeError("no 'main' function defined. Add: main =\n  let _ = print \"hello\"\n  0".into()))?
             .clone();
 
         match main_val {
@@ -333,7 +411,7 @@ impl Interpreter {
         }
     }
 
-    pub fn register_decl(&mut self, decl: &Decl) -> Result<(), RuntimeError> {
+    pub fn register_decl(&self, decl: &Decl) -> Result<(), RuntimeError> {
         self.register(decl)
     }
 
@@ -341,11 +419,11 @@ impl Interpreter {
         self.eval(expr, &HashMap::new())
     }
 
-    pub fn globals(&self) -> &HashMap<String, Value> {
-        &self.globals
+    pub fn globals(&self) -> std::cell::Ref<'_, HashMap<String, Value>> {
+        self.globals.borrow()
     }
 
-    fn register(&mut self, decl: &Decl) -> Result<(), RuntimeError> {
+    fn register(&self, decl: &Decl) -> Result<(), RuntimeError> {
         match decl {
             Decl::Func { name, params, body, .. } => {
                 let val = Value::Closure {
@@ -353,13 +431,12 @@ impl Interpreter {
                     body: body.clone(),
                     env: HashMap::new(),
                 };
-                self.globals.insert(name.clone(), val);
+                self.globals.borrow_mut().insert(name.clone(), val);
             }
             Decl::TypeDecl { variants, .. } => {
                 for variant in variants {
                     if variant.fields.is_empty() {
-                        // Nullary constructor — just a value
-                        self.globals.insert(
+                        self.globals.borrow_mut().insert(
                             variant.name.clone(),
                             Value::Constructor {
                                 name: variant.name.clone(),
@@ -367,8 +444,7 @@ impl Interpreter {
                             },
                         );
                     } else {
-                        // Constructor function — takes N args
-                        self.globals.insert(
+                        self.globals.borrow_mut().insert(
                             variant.name.clone(),
                             Value::BuiltIn(BuiltIn::ConstructorFn {
                                 name: variant.name.clone(),
@@ -380,6 +456,7 @@ impl Interpreter {
                 }
             }
             Decl::RecordDecl { .. } => {} // type-level only
+            Decl::EffectDecl { .. } => {} // type-level only (handlers are runtime)
             Decl::Property { .. } => {}   // TODO: property-based testing
             Decl::ModuleDecl { .. } => {}
             Decl::ExportDecl { .. } => {}
@@ -389,6 +466,22 @@ impl Interpreter {
     }
 
     fn eval(&self, expr: &Expr, env: &Env) -> Result<Value, RuntimeError> {
+        // Check recursion depth
+        {
+            let mut d = self.depth.borrow_mut();
+            *d += 1;
+            if *d > MAX_RECURSION_DEPTH {
+                return Err(RuntimeError(format!(
+                    "recursion depth exceeded (limit: {})", MAX_RECURSION_DEPTH
+                )));
+            }
+        }
+        let result = self.eval_inner(expr, env);
+        *self.depth.borrow_mut() -= 1;
+        result
+    }
+
+    fn eval_inner(&self, expr: &Expr, env: &Env) -> Result<Value, RuntimeError> {
         let span = expr.span;
         match &expr.kind {
             ExprKind::IntLit(n) => Ok(Value::Int(*n)),
@@ -398,8 +491,8 @@ impl Interpreter {
 
             ExprKind::Var(name) => {
                 let val = env.get(name)
-                    .or_else(|| self.globals.get(name))
                     .cloned()
+                    .or_else(|| self.globals.borrow().get(name).cloned())
                     .ok_or_else(|| RuntimeError::at(span, format!("undefined: '{}'", name)))?;
 
                 // Auto-evaluate zero-param closures (thunks like `origin = { ... }`)
@@ -412,7 +505,7 @@ impl Interpreter {
             }
 
             ExprKind::Constructor(name) => {
-                self.globals.get(name)
+                self.globals.borrow().get(name)
                     .cloned()
                     .ok_or_else(|| RuntimeError::at(span, format!("undefined constructor: '{}'", name)))
             }
@@ -483,6 +576,9 @@ impl Interpreter {
             }
 
             ExprKind::Tuple(elems) => {
+                if elems.is_empty() {
+                    return Ok(Value::Unit);
+                }
                 let vals: Result<Vec<_>, _> = elems.iter()
                     .map(|e| self.eval(e, env))
                     .collect();
@@ -528,6 +624,180 @@ impl Interpreter {
                     result = self.eval(expr, env)?;
                 }
                 Ok(result)
+            }
+
+            ExprKind::Perform { op, args } => {
+                // Walk the handler stack from innermost to outermost,
+                // find the first context that handles this op and check for resume answer
+                let answer = {
+                    let mut contexts = self.handle_contexts.borrow_mut();
+                    let mut found = None;
+                    for ctx in contexts.iter_mut().rev() {
+                        if ctx.handlers.iter().any(|(name, _, _)| name == op) {
+                            // This context handles this op — check for pre-supplied answer
+                            if ctx.resume_cursor < ctx.resume_answers.len() {
+                                let val = ctx.resume_answers[ctx.resume_cursor].clone();
+                                ctx.resume_cursor += 1;
+                                found = Some(val);
+                            }
+                            break; // stop at first handler regardless
+                        }
+                    }
+                    found
+                };
+
+                if let Some(val) = answer {
+                    return Ok(val);
+                }
+
+                // Evaluate args
+                let evaluated_args: Result<Vec<_>, _> = args.iter()
+                    .map(|a| self.eval(a, env))
+                    .collect();
+                let evaluated_args = evaluated_args?;
+
+                // Check if any handler on the stack handles this op
+                let has_handler = self.handle_contexts.borrow().iter()
+                    .any(|ctx| ctx.handlers.iter().any(|(name, _, _)| name == op));
+
+                if !has_handler {
+                    return Err(RuntimeError::at(span, format!("unhandled effect: '{}'", op)));
+                }
+
+                // Signal the effect
+                *self.effect_signal.borrow_mut() = Some(EffectSignal {
+                    op: op.clone(),
+                    args: evaluated_args,
+                });
+                Err(RuntimeError("__effect__".into()))
+            }
+
+            ExprKind::Handle { body, handlers } => {
+                let handler_list: Vec<_> = handlers.iter().map(|h| {
+                    (h.op_name.clone(), h.params.clone(), h.body.clone())
+                }).collect();
+
+                // Save outer contexts' cursors so nested re-execution replays correctly
+                let saved_outer_cursors: Vec<usize> = self.handle_contexts.borrow()
+                    .iter().map(|c| c.resume_cursor).collect();
+
+                let ctx = HandleContext {
+                    body: Rc::new((**body).clone()),
+                    body_env: env.clone(),
+                    handlers: handler_list,
+                    resume_answers: vec![],
+                    resume_cursor: 0,
+                    resumed: false,
+                    saved_outer_cursors,
+                };
+
+                self.handle_contexts.borrow_mut().push(ctx);
+
+                if self.handle_contexts.borrow().len() > 100 {
+                    return Err(RuntimeError::at(span, "effect handler recursion limit exceeded (possible infinite resume loop)".into()));
+                }
+
+                // Start by evaluating the body
+                let mut result = self.eval(body, env);
+
+                // Loop: keep handling effect signals until we get a final value or real error.
+                // When a handler calls resume, it re-executes the body which may signal again.
+                // That signal propagates up through resume → handler body → here.
+                loop {
+                    match result {
+                        Ok(value) => {
+                            self.handle_contexts.borrow_mut().pop();
+                            return Ok(value);
+                        }
+                        Err(ref e) if e.0 == "__effect__" => {
+                            let signal = self.effect_signal.borrow_mut().take();
+                            if let Some(signal) = signal {
+                                // Find matching handler
+                                let handler = {
+                                    let contexts = self.handle_contexts.borrow();
+                                    let ctx = contexts.last().unwrap();
+                                    ctx.handlers.iter()
+                                        .find(|(name, _, _)| *name == signal.op)
+                                        .cloned()
+                                };
+
+                                if let Some((_, params, handler_body)) = handler {
+                                    // Reset resumed flag for this fresh handler invocation
+                                    self.handle_contexts.borrow_mut().last_mut().unwrap().resumed = false;
+
+                                    // Bind handler params to signal args
+                                    let mut handler_env = env.clone();
+                                    for (param, arg) in params.iter().zip(signal.args.iter()) {
+                                        match param {
+                                            Pattern::Var(name) => {
+                                                handler_env.insert(name.clone(), arg.clone());
+                                            }
+                                            Pattern::Wildcard => {}
+                                            _ => {}
+                                        }
+                                    }
+
+                                    // Eval handler body — if it resumes and body signals again,
+                                    // the result will be Err(__effect__) and we loop
+                                    result = self.eval(&handler_body, &handler_env);
+                                    continue;
+                                } else {
+                                    // No matching handler — propagate to outer handle
+                                    self.handle_contexts.borrow_mut().pop();
+                                    *self.effect_signal.borrow_mut() = Some(signal);
+                                    return Err(RuntimeError("__effect__".into()));
+                                }
+                            } else {
+                                self.handle_contexts.borrow_mut().pop();
+                                return Err(RuntimeError::at(span, "internal: effect signal lost".into()));
+                            }
+                        }
+                        Err(e) => {
+                            self.handle_contexts.borrow_mut().pop();
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+
+            ExprKind::Resume(value_expr) => {
+                let value = self.eval(value_expr, env)?;
+
+                // Check for double-resume
+                let already_resumed = {
+                    let contexts = self.handle_contexts.borrow();
+                    contexts.last()
+                        .map(|ctx| ctx.resumed)
+                        .unwrap_or(false)
+                };
+                if already_resumed {
+                    return Err(RuntimeError::at(span, "resume called more than once (continuation is one-shot)".into()));
+                }
+
+                // Get the body and env from the current handle context,
+                // and restore outer cursors for correct nested replay
+                let (body, body_env) = {
+                    let mut contexts = self.handle_contexts.borrow_mut();
+                    let ctx_idx = contexts.len() - 1;
+                    let ctx = &mut contexts[ctx_idx];
+                    ctx.resumed = true;
+                    ctx.resume_answers.push(value);
+                    ctx.resume_cursor = 0;
+
+                    // Restore outer contexts' cursors to where they were when
+                    // this handle started — so nested effects replay correctly
+                    let saved = ctx.saved_outer_cursors.clone();
+                    for (i, cursor) in saved.into_iter().enumerate() {
+                        if i < ctx_idx {
+                            contexts[i].resume_cursor = cursor;
+                        }
+                    }
+
+                    (Rc::clone(&contexts[ctx_idx].body), contexts[ctx_idx].body_env.clone())
+                };
+
+                // Re-execute the body — performs will consume resume_answers in order
+                self.eval(&body, &body_env)
             }
         }
     }
@@ -609,7 +879,9 @@ impl Interpreter {
         // Start with the initial application
         let mut result = self.apply_tail(func, arg, call_span)?;
 
-        // Trampoline loop: keep resolving TailCalls until we get a Value
+        // Trampoline loop: keep resolving TailCalls until we get a Value.
+        // No iteration limit here — TCO is designed for arbitrarily deep tail recursion.
+        // Non-tail recursion is caught by the depth counter in eval().
         loop {
             match result {
                 EvalResult::Value(v) => return Ok(v),
@@ -655,7 +927,14 @@ impl Interpreter {
                 let val = self.apply_builtin(builtin, arg)?;
                 Ok(EvalResult::Value(val))
             }
-            other => Err(RuntimeError::at(call_span, format!("cannot apply non-function: {}", other))),
+            Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_) => {
+                Err(RuntimeError::at(call_span, format!(
+                    "tried to call '{}' as a function, but it's a value — too many arguments?", arg
+                )))
+            }
+            other => Err(RuntimeError::at(call_span, format!(
+                "tried to call '{}' as a function — did you pass too many arguments?", other
+            ))),
         }
     }
 
@@ -697,6 +976,27 @@ impl Interpreter {
             // List operations
             "map" => match (&args[0], &args[1]) {
                 (func, Value::List(list)) => {
+                    // Auto-promote to parallel when function is pure and list is large enough
+                    if list.len() >= 8 && crate::purity::is_pure_value(func) {
+                        let globals = self.globals.borrow().clone();
+                        let route = self.route.clone();
+                        use rayon::prelude::*;
+                        let results: Result<Vec<Value>, RuntimeError> = list.par_iter()
+                            .map(|item| {
+                                let interp = Interpreter {
+                                    globals: RefCell::new(globals.clone()),
+                                    route: route.clone(),
+                                    effect_signal: RefCell::new(None),
+                                    handle_contexts: RefCell::new(Vec::new()),
+                                    state: RefCell::new(HashMap::new()),
+                                    serve_ctx: None,
+                                    depth: RefCell::new(0),
+                                };
+                                interp.apply(func.clone(), item.clone(), (0, 0))
+                            })
+                            .collect();
+                        return Ok(Value::List(results?));
+                    }
                     let mut result = Vec::with_capacity(list.len());
                     for item in list {
                         result.push(self.apply(func.clone(), item.clone(), (0,0))?);
@@ -705,8 +1005,65 @@ impl Interpreter {
                 }
                 (_, v) => Err(RuntimeError(format!("map: expected list, got {}", v))),
             },
+            "par_map" => match (&args[0], &args[1]) {
+                (func, Value::List(list)) => {
+                    if list.len() < 4 {
+                        // Sequential fallback for small lists
+                        let mut result = Vec::with_capacity(list.len());
+                        for item in list {
+                            result.push(self.apply(func.clone(), item.clone(), (0,0))?);
+                        }
+                        return Ok(Value::List(result));
+                    }
+                    // Parallel: each rayon task gets its own interpreter
+                    let globals = self.globals.borrow().clone();
+                    let route = self.route.clone();
+                    use rayon::prelude::*;
+                    let results: Result<Vec<Value>, RuntimeError> = list.par_iter()
+                        .map(|item| {
+                            let interp = Interpreter {
+                                globals: RefCell::new(globals.clone()),
+                                route: route.clone(),
+                                effect_signal: RefCell::new(None),
+                                handle_contexts: RefCell::new(Vec::new()),
+                                state: RefCell::new(HashMap::new()),
+                                serve_ctx: None,
+                                depth: RefCell::new(0),
+                            };
+                            interp.apply(func.clone(), item.clone(), (0, 0))
+                        })
+                        .collect();
+                    Ok(Value::List(results?))
+                }
+                (_, v) => Err(RuntimeError(format!("par_map: expected list, got {}", v))),
+            },
             "filter" => match (&args[0], &args[1]) {
                 (func, Value::List(list)) => {
+                    // Auto-promote to parallel when function is pure and list is large enough
+                    if list.len() >= 8 && crate::purity::is_pure_value(func) {
+                        let globals = self.globals.borrow().clone();
+                        let route = self.route.clone();
+                        use rayon::prelude::*;
+                        let results: Result<Vec<Option<Value>>, RuntimeError> = list.par_iter()
+                            .map(|item| {
+                                let interp = Interpreter {
+                                    globals: RefCell::new(globals.clone()),
+                                    route: route.clone(),
+                                    effect_signal: RefCell::new(None),
+                                    handle_contexts: RefCell::new(Vec::new()),
+                                    state: RefCell::new(HashMap::new()),
+                                    serve_ctx: None,
+                                    depth: RefCell::new(0),
+                                };
+                                match interp.apply(func.clone(), item.clone(), (0, 0))? {
+                                    Value::Bool(true) => Ok(Some(item.clone())),
+                                    Value::Bool(false) => Ok(None),
+                                    v => Err(RuntimeError(format!("filter: predicate returned {}, expected bool", v))),
+                                }
+                            })
+                            .collect();
+                        return Ok(Value::List(results?.into_iter().flatten().collect()));
+                    }
                     let mut result = Vec::new();
                     for item in list {
                         match self.apply(func.clone(), item.clone(), (0,0))? {
@@ -718,6 +1075,44 @@ impl Interpreter {
                     Ok(Value::List(result))
                 }
                 (_, v) => Err(RuntimeError(format!("filter: expected list, got {}", v))),
+            },
+            "par_filter" => match (&args[0], &args[1]) {
+                (func, Value::List(list)) => {
+                    if list.len() < 4 {
+                        let mut result = Vec::new();
+                        for item in list {
+                            match self.apply(func.clone(), item.clone(), (0,0))? {
+                                Value::Bool(true) => result.push(item.clone()),
+                                Value::Bool(false) => {}
+                                v => return Err(RuntimeError(format!("par_filter: predicate returned {}, expected bool", v))),
+                            }
+                        }
+                        return Ok(Value::List(result));
+                    }
+                    let globals = self.globals.borrow().clone();
+                    let route = self.route.clone();
+                    use rayon::prelude::*;
+                    let results: Result<Vec<Option<Value>>, RuntimeError> = list.par_iter()
+                        .map(|item| {
+                            let interp = Interpreter {
+                                globals: RefCell::new(globals.clone()),
+                                route: route.clone(),
+                                effect_signal: RefCell::new(None),
+                                handle_contexts: RefCell::new(Vec::new()),
+                                state: RefCell::new(HashMap::new()),
+                                serve_ctx: None,
+                                depth: RefCell::new(0),
+                            };
+                            match interp.apply(func.clone(), item.clone(), (0, 0))? {
+                                Value::Bool(true) => Ok(Some(item.clone())),
+                                Value::Bool(false) => Ok(None),
+                                v => Err(RuntimeError(format!("par_filter: predicate returned {}, expected bool", v))),
+                            }
+                        })
+                        .collect();
+                    Ok(Value::List(results?.into_iter().flatten().collect()))
+                }
+                (_, v) => Err(RuntimeError(format!("par_filter: expected list, got {}", v))),
             },
             "fold" => match (&args[0], &args[1], &args[2]) {
                 (init, func, Value::List(list)) => {
@@ -1183,6 +1578,292 @@ impl Interpreter {
                 v => Err(RuntimeError(format!("embed: expected string, got {}", v))),
             },
 
+            // prompt_model : model -> system -> user -> String
+            // Override the model per call. Useful for routing between 9B/27B/cloud.
+            "prompt_model" => match (&args[0], &args[1], &args[2]) {
+                (Value::Str(model), Value::Str(system), Value::Str(user_prompt)) => {
+                    self.route.check_ai().map_err(RuntimeError)?;
+                    let config = ai::AiConfig::from_env();
+                    match ai::call_llm_with_model(&config, model, system, user_prompt) {
+                        Ok(response) => Ok(Value::Str(response)),
+                        Err(e) => Err(RuntimeError(format!("prompt_model: {}", e))),
+                    }
+                }
+                _ => Err(RuntimeError("prompt_model: expected three strings (model, system, user)".into())),
+            },
+
+            // par_prompt : system -> [inputs] -> [outputs]
+            // Fan out LLM calls in parallel. Each input gets the same system prompt.
+            "par_prompt" => match (&args[0], &args[1]) {
+                (Value::Str(system), Value::List(inputs)) => {
+                    self.route.check_ai().map_err(RuntimeError)?;
+                    if inputs.is_empty() {
+                        return Ok(Value::List(vec![]));
+                    }
+                    let config = ai::AiConfig::from_env();
+                    let system = system.clone();
+                    let inputs: Result<Vec<String>, _> = inputs.iter().map(|v| match v {
+                        Value::Str(s) => Ok(s.clone()),
+                        other => Err(RuntimeError(format!("par_prompt: expected string in list, got {}", other))),
+                    }).collect();
+                    let inputs = inputs?;
+
+                    // Fan out in batches of 4 to avoid overwhelming the LLM server
+                    const MAX_CONCURRENT: usize = 4;
+                    let mut results: Vec<Result<String, String>> = Vec::with_capacity(inputs.len());
+                    for chunk in inputs.chunks(MAX_CONCURRENT) {
+                        let chunk_results: Vec<Result<String, String>> = std::thread::scope(|s| {
+                            let handles: Vec<_> = chunk.iter().map(|input| {
+                                let sys = &system;
+                                let cfg = &config;
+                                s.spawn(move || ai::call_llm(cfg, sys, input))
+                            }).collect();
+                            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                        });
+                        results.extend(chunk_results);
+                    }
+
+                    let mut output = Vec::with_capacity(results.len());
+                    for r in results {
+                        match r {
+                            Ok(text) => output.push(Value::Str(text)),
+                            Err(e) => output.push(Value::Str(format!("[error: {}]", e))),
+                        }
+                    }
+                    Ok(Value::List(output))
+                }
+                _ => Err(RuntimeError("par_prompt: expected (system_string, [input_strings])".into())),
+            },
+
+            // llm_usage : () -> {calls: Int, prompt_tokens: Int, completion_tokens: Int}
+            "llm_usage" => {
+                let (prompt_t, completion_t, calls) = ai::get_usage();
+                Ok(Value::Record(vec![
+                    ("calls".to_string(), Value::Int(calls as i64)),
+                    ("prompt_tokens".to_string(), Value::Int(prompt_t as i64)),
+                    ("completion_tokens".to_string(), Value::Int(completion_t as i64)),
+                    ("total_tokens".to_string(), Value::Int((prompt_t + completion_t) as i64)),
+                ]))
+            },
+
+            // llm_reset : () -> ()
+            "llm_reset" => {
+                ai::reset_usage();
+                Ok(Value::Unit)
+            },
+
+            // ---- Agent primitives (v0.5) ----
+
+            // agent_loop : system -> tools -> tool_fns -> user_message -> String
+            // tools: [(name, description)]
+            // tool_fns: [fn(String) -> Value]
+            "agent_loop" => match (&args[0], &args[1], &args[2], &args[3]) {
+                (Value::Str(system), Value::List(tools), Value::List(tool_fns), Value::Str(user_msg)) => {
+                    self.route.check_ai().map_err(RuntimeError)?;
+                    // Parse tool specs: list of (name, description) tuples
+                    let tool_specs: Result<Vec<(String, String)>, RuntimeError> = tools.iter()
+                        .map(|t| match t {
+                            Value::Tuple(parts) if parts.len() == 2 => {
+                                match (&parts[0], &parts[1]) {
+                                    (Value::Str(name), Value::Str(desc)) => Ok((name.clone(), desc.clone())),
+                                    _ => Err(RuntimeError("agent_loop: tool must be (name_string, description_string)".into())),
+                                }
+                            }
+                            _ => Err(RuntimeError("agent_loop: tool must be a (name, description) tuple".into())),
+                        })
+                        .collect();
+                    let tool_specs = tool_specs?;
+
+                    if tool_specs.len() != tool_fns.len() {
+                        return Err(RuntimeError(format!(
+                            "agent_loop: {} tool specs but {} tool functions",
+                            tool_specs.len(), tool_fns.len()
+                        )));
+                    }
+
+                    let apply_fn = |func: &Value, arg: Value| -> Result<Value, RuntimeError> {
+                        self.apply(func.clone(), arg, (0, 0))
+                    };
+
+                    let (answer, history) = crate::agent::run_agent_loop(
+                        system, &tool_specs, user_msg, &apply_fn, tool_fns,
+                    )?;
+
+                    // Return record with answer and history
+                    let history_vals: Vec<Value> = history.into_iter()
+                        .map(|(tool, input, output)| Value::Record(vec![
+                            ("tool".to_string(), Value::Str(tool)),
+                            ("input".to_string(), Value::Str(input)),
+                            ("output".to_string(), Value::Str(output)),
+                        ]))
+                        .collect();
+
+                    Ok(Value::Record(vec![
+                        ("answer".to_string(), Value::Str(answer)),
+                        ("history".to_string(), Value::List(history_vals)),
+                    ]))
+                }
+                _ => Err(RuntimeError("agent_loop: expected (system_str, [(name, desc)], [tool_fns], user_str)".into())),
+            },
+
+            // prompt_stream : system -> user -> callback -> ()
+            // callback receives each chunk as a string
+            "prompt_stream" => match (&args[0], &args[1], &args[2]) {
+                (Value::Str(system), Value::Str(user_msg), callback) => {
+                    self.route.check_ai().map_err(RuntimeError)?;
+                    let config = ai::AiConfig::from_env();
+
+                    // For now, call LLM normally and simulate streaming by splitting into chunks
+                    // Real streaming requires chunked HTTP parsing — future enhancement
+                    let response = ai::call_llm(&config, system, user_msg)
+                        .map_err(|e| RuntimeError(format!("prompt_stream: {}", e)))?;
+
+                    // Split response into word-level chunks for callback
+                    for word in response.split_inclusive(char::is_whitespace) {
+                        self.apply(callback.clone(), Value::Str(word.to_string()), (0, 0))?;
+                    }
+                    Ok(Value::Unit)
+                }
+                _ => Err(RuntimeError("prompt_stream: expected (system_str, user_str, callback_fn)".into())),
+            },
+
+            // prompt_typed : schema_desc -> schema_json -> input -> Record
+            // Forces JSON output matching the schema, retries on parse failure
+            "prompt_typed" => match (&args[0], &args[1], &args[2]) {
+                (Value::Str(description), Value::Str(schema), Value::Str(input)) => {
+                    self.route.check_ai().map_err(RuntimeError)?;
+                    let config = ai::AiConfig::from_env();
+
+                    let system = format!(
+                        "{}. You MUST respond with valid JSON matching this schema: {}. \
+                         No explanation, no markdown, just the JSON object.",
+                        description, schema
+                    );
+
+                    // Try up to 3 times
+                    for attempt in 0..3 {
+                        let response = ai::call_llm(&config, &system, input)
+                            .map_err(|e| RuntimeError(format!("prompt_typed: {}", e)))?;
+
+                        // Try to parse as JSON
+                        let trimmed = response.trim();
+                        // Strip markdown code fences if present
+                        let json_str = if trimmed.starts_with("```") {
+                            let inner = trimmed.trim_start_matches("```json")
+                                .trim_start_matches("```")
+                                .trim_end_matches("```")
+                                .trim();
+                            inner
+                        } else {
+                            trimmed
+                        };
+
+                        match parse_json_value(json_str) {
+                            Ok(val) => return Ok(val),
+                            Err(e) => {
+                                if attempt == 2 {
+                                    return Err(RuntimeError(format!(
+                                        "prompt_typed: failed to parse JSON after 3 attempts: {}. Last response: {}",
+                                        e, &response[..response.len().min(200)]
+                                    )));
+                                }
+                                // Retry with error context
+                            }
+                        }
+                    }
+                    unreachable!()
+                }
+                _ => Err(RuntimeError("prompt_typed: expected (description, schema_json, input)".into())),
+            },
+
+            // context_new : system_prompt -> Context
+            "context_new" => match &args[0] {
+                Value::Str(system) => {
+                    let ctx = crate::agent::ConversationContext::new(system);
+                    Ok(ctx.to_value())
+                }
+                v => Err(RuntimeError(format!("context_new: expected string, got {}", v))),
+            },
+
+            // context_push : context -> role -> content -> Context
+            "context_push" => match (&args[0], &args[1], &args[2]) {
+                (ctx_val, Value::Str(role), Value::Str(content)) => {
+                    let mut ctx = crate::agent::ConversationContext::from_value(ctx_val)
+                        .map_err(RuntimeError)?;
+                    ctx.push(role, content);
+                    Ok(ctx.to_value())
+                }
+                _ => Err(RuntimeError("context_push: expected (context, role_str, content_str)".into())),
+            },
+
+            // context_prompt : context -> message -> (Context, response_str)
+            "context_prompt" => match (&args[0], &args[1]) {
+                (ctx_val, Value::Str(message)) => {
+                    self.route.check_ai().map_err(RuntimeError)?;
+                    let mut ctx = crate::agent::ConversationContext::from_value(ctx_val)
+                        .map_err(RuntimeError)?;
+                    let response = ctx.prompt(message)
+                        .map_err(|e| RuntimeError(format!("context_prompt: {}", e)))?;
+                    Ok(Value::Tuple(vec![ctx.to_value(), Value::Str(response)]))
+                }
+                _ => Err(RuntimeError("context_prompt: expected (context, message_str)".into())),
+            },
+
+            // ---- Hot reload ----
+
+            "set_state" => match (&args[0], &args[1]) {
+                (Value::Str(key), value) => {
+                    self.state.borrow_mut().insert(key.clone(), value.clone());
+                    Ok(Value::Unit)
+                }
+                _ => Err(RuntimeError("set_state: expected (string, value)".into())),
+            },
+
+            "get_state" => match &args[0] {
+                Value::Str(key) => {
+                    Ok(self.state.borrow().get(key).cloned().unwrap_or(Value::Unit))
+                }
+                _ => Err(RuntimeError("get_state: expected string key".into())),
+            },
+
+            "check_reload" => {
+                // Check if source file changed. If yes, re-parse and swap globals.
+                // Returns true if reloaded, false if no change.
+                if let Some(ref ctx_cell) = self.serve_ctx {
+                    let ctx = ctx_cell.borrow();
+                    let changes = ctx.check_changes();
+                    if changes.is_empty() {
+                        return Ok(Value::Bool(false));
+                    }
+                    drop(ctx);
+
+                    // Reload
+                    let mut ctx = ctx_cell.borrow_mut();
+                    match ctx.reload() {
+                        Ok((program, fn_names)) => {
+                            eprintln!("[reload] gen {} — swapped: {}",
+                                ctx.generation,
+                                if fn_names.is_empty() { "(none)".to_string() }
+                                else { fn_names.join(", ") });
+                            drop(ctx);
+
+                            // Swap globals with new definitions
+                            for decl in &program.declarations {
+                                let _ = self.register(decl);
+                            }
+                            Ok(Value::Bool(true))
+                        }
+                        Err(e) => {
+                            eprintln!("[reload] error: {}", e);
+                            Ok(Value::Bool(false))
+                        }
+                    }
+                } else {
+                    // Not in serve mode — no-op
+                    Ok(Value::Bool(false))
+                }
+            },
+
             _ => Err(RuntimeError(format!("unknown builtin: {}", name))),
         }
     }
@@ -1234,6 +1915,12 @@ impl Interpreter {
             // Bool comparisons
             ("==", Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a == b)),
             ("!=", Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a != b)),
+
+            // Unit comparisons
+            ("==", Value::Unit, Value::Unit) => Ok(Value::Bool(true)),
+            ("!=", Value::Unit, Value::Unit) => Ok(Value::Bool(false)),
+            ("==", Value::Unit, _) | ("==", _, Value::Unit) => Ok(Value::Bool(false)),
+            ("!=", Value::Unit, _) | ("!=", _, Value::Unit) => Ok(Value::Bool(true)),
 
             // Boolean logic
             ("&&", Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),

@@ -349,11 +349,15 @@ impl Lexer {
     }
 
     fn lex_string(&mut self) -> Result<Spanned, LexError> {
+        use crate::token::InterpPart;
         let start_col = self.col;
         let start_line = self.line;
         self.advance(); // opening "
 
         let mut value = String::new();
+        let mut has_interp = false;
+        let mut parts: Vec<InterpPart> = Vec::new();
+
         loop {
             if self.pos >= self.source.len() {
                 return Err(LexError {
@@ -367,6 +371,35 @@ impl Lexer {
                 '"' => {
                     self.advance();
                     break;
+                }
+                '{' => {
+                    has_interp = true;
+                    self.advance(); // eat {
+                    // Save the literal part so far
+                    if !value.is_empty() {
+                        parts.push(InterpPart::Lit(std::mem::take(&mut value)));
+                    }
+                    // Collect expression text until matching }
+                    let mut expr_text = String::new();
+                    let mut depth = 1;
+                    while self.pos < self.source.len() {
+                        let c = self.peek();
+                        if c == '{' { depth += 1; }
+                        if c == '}' {
+                            depth -= 1;
+                            if depth == 0 { self.advance(); break; }
+                        }
+                        expr_text.push(c);
+                        self.advance();
+                    }
+                    if depth != 0 {
+                        return Err(LexError {
+                            message: "unterminated interpolation in string".to_string(),
+                            line: self.line,
+                            col: self.col,
+                        });
+                    }
+                    parts.push(InterpPart::Expr(expr_text));
                 }
                 '\\' => {
                     self.advance();
@@ -383,6 +416,7 @@ impl Lexer {
                         '\\' => { value.push('\\'); self.advance(); }
                         '"' => { value.push('"'); self.advance(); }
                         '{' => { value.push('{'); self.advance(); }
+                        '}' => { value.push('}'); self.advance(); }
                         other => {
                             return Err(LexError {
                                 message: format!("unknown escape: \\{}", other),
@@ -399,7 +433,14 @@ impl Lexer {
             }
         }
 
-        Ok(Spanned::new(Token::Str(value), start_line, start_col, self.col - start_col))
+        if has_interp {
+            if !value.is_empty() {
+                parts.push(InterpPart::Lit(value));
+            }
+            Ok(Spanned::new(Token::InterpStr(parts), start_line, start_col, self.col - start_col))
+        } else {
+            Ok(Spanned::new(Token::Str(value), start_line, start_col, self.col - start_col))
+        }
     }
 
     fn lex_number(&mut self) -> Result<Spanned, LexError> {
@@ -473,6 +514,11 @@ impl Lexer {
             "then" => Token::Then,
             "else" => Token::Else,
             "do" => Token::Do,
+            "effect" => Token::Effect,
+            "perform" => Token::Perform,
+            "handle" => Token::Handle,
+            "with" => Token::With,
+            "resume" => Token::Resume,
             "true" => Token::Bool(true),
             "false" => Token::Bool(false),
             "_" => Token::Underscore,

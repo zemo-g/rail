@@ -30,10 +30,10 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # ---------------------------------------------------------------------------
 
-RAIL_CARGO = os.path.expanduser("~/.cargo/bin/cargo")
+RAIL_BINARY = os.path.expanduser("~/projects/rail/target/release/rail")
 RAIL_PROJECT = os.path.expanduser("~/projects/rail")
 LLM_ENDPOINT = "http://localhost:8080/v1/chat/completions"
-DEFAULT_MODEL = os.path.expanduser("~/models/Qwen3.5-9B-6bit")
+DEFAULT_MODEL = None  # auto-detect from MLX /v1/models endpoint
 RESULTS_DIR = Path(__file__).resolve().parent / "autoresearch_results"
 RESULTS_FILE = RESULTS_DIR / "results.jsonl"
 TIMEOUT_SECS = 30  # per rail run invocation
@@ -67,7 +67,7 @@ TASKS: List[Task] = [
     ),
     Task(
         name="absolute_value",
-        description="Write a Rail program whose main prints the absolute value of -42.",
+        description="Write a Rail program whose main computes the absolute value of negative 42 (use 0 - 42 to get -42) and prints it.",
         expected_output="42",
         difficulty="easy",
     ),
@@ -79,7 +79,7 @@ TASKS: List[Task] = [
     ),
     Task(
         name="is_even",
-        description="Write a Rail program whose main prints true if 14 is even, false otherwise. Rail bools are lowercase: true, false.",
+        description="Write a Rail program whose main checks if 14 is even (14 % 2 == 0) and prints the result. Print only one value.",
         expected_output="true",
         difficulty="easy",
     ),
@@ -165,8 +165,113 @@ TASKS: List[Task] = [
     ),
     Task(
         name="pipe_chain",
-        description="Write a Rail program that uses the pipe operator to take 5, double it, add 3, and print the result.",
+        description="Write a Rail program that defines double x = x * 2 and add3 x = x + 3, then in main uses pipes to compute the result: let result = 5 |> double |> add3 and prints result. Pipe operator |> passes the left value as argument to the right function.",
         expected_output="13",
+        difficulty="hard",
+    ),
+    # --- New Easy ---
+    Task(
+        name="power_of_2",
+        description="Write a Rail program whose main computes 2 to the power of 10 using recursion (define a pow function) and prints the result.",
+        expected_output="1024",
+        difficulty="easy",
+    ),
+    Task(
+        name="min_two",
+        description="Write a Rail program whose main prints the minimum of 23 and 17.",
+        expected_output="17",
+        difficulty="easy",
+    ),
+    Task(
+        name="negate",
+        description="Write a Rail program whose main prints the result of the expression 0 - 99. Just compute 0 - 99 and print it.",
+        expected_output="-99",
+        difficulty="easy",
+    ),
+    # --- New Medium ---
+    Task(
+        name="count_down",
+        description="Write a Rail program that prints numbers from 5 down to 1, each on its own line, using recursion. Hint: use the pattern `if n <= 0 then 0 else let _ = print n` followed by the recursive call on the next indented line.",
+        expected_output="5\n4\n3\n2\n1",
+        difficulty="medium",
+    ),
+    Task(
+        name="list_head_tail",
+        description="Write a Rail program that prints the head and tail of [10, 20, 30, 40] on separate lines.",
+        expected_output="10\n[20, 30, 40]",
+        difficulty="medium",
+    ),
+    Task(
+        name="gcd",
+        description="Write a Rail program that computes the GCD of 48 and 18 using Euclid's algorithm (recursion with modulo) and prints it.",
+        expected_output="6",
+        difficulty="medium",
+    ),
+    Task(
+        name="clamp",
+        description="Write a Rail program that defines clamp lo hi x = if x < lo then lo else if x > hi then hi else x, then prints clamp 0 100 150.",
+        expected_output="100",
+        difficulty="medium",
+    ),
+    Task(
+        name="bool_logic",
+        description="Write a Rail program whose main prints the result of true && true. Rail bools are lowercase: true, false. The && operator means logical AND.",
+        expected_output="true",
+        difficulty="medium",
+    ),
+    Task(
+        name="nested_if",
+        description="Write a Rail program that classifies 75: if >= 90 print \"A\", else if >= 80 print \"B\", else if >= 70 print \"C\", else print \"F\".",
+        expected_output="C",
+        difficulty="medium",
+    ),
+    Task(
+        name="sum_recursive",
+        description="Write a Rail program that defines sumTo n which returns the sum 1+2+...+n using recursion (base case: n <= 0 returns 0), then prints sumTo 100.",
+        expected_output="5050",
+        difficulty="medium",
+    ),
+    # --- New Hard ---
+    Task(
+        name="flatten_map",
+        description="Write a Rail program that has a list of lists [[1,2],[3,4],[5]] and uses fold with append to flatten it into one list, then prints the result.",
+        expected_output="[1, 2, 3, 4, 5]",
+        difficulty="hard",
+    ),
+    Task(
+        name="collatz_steps",
+        description="Write a Rail program that counts how many Collatz steps it takes for 27 to reach 1 and prints the count. Collatz: if even, n/2; if odd, 3*n+1. Keep if/then/else on one line. Hint: `collatz n = if n == 1 then 0 else 1 + collatz (if n % 2 == 0 then n / 2 else 3 * n + 1)`.",
+        expected_output="111",
+        difficulty="hard",
+    ),
+    Task(
+        name="match_classify",
+        description='Write a Rail program that defines classify n which uses match on n % 3: 0 -> "fizz", 1 -> "one", _ -> "two". Print classify 7 (7 % 3 = 1, so "one").',
+        expected_output="one",
+        difficulty="hard",
+    ),
+    Task(
+        name="multi_let",
+        description="Write a Rail program whose main uses 5 let bindings to compute: a=3, b=4, c=a*b, d=c+1, e=d*2, then prints e.",
+        expected_output="26",
+        difficulty="hard",
+    ),
+    Task(
+        name="string_repeat",
+        description='Write a Rail program that defines repeatStr n s which appends s to itself n times using recursion (base: n<=0 returns ""), then prints repeatStr 4 "ab".',
+        expected_output="abababab",
+        difficulty="hard",
+    ),
+    Task(
+        name="two_functions",
+        description="Write a Rail program that defines square x = x * x and cube x = x * x * x, then prints square 3 + cube 2 in main.",
+        expected_output="17",
+        difficulty="hard",
+    ),
+    Task(
+        name="map_show",
+        description='Write a Rail program that maps show over [1, 2, 3] to get a list of strings, then joins them with "-" and prints the result.',
+        expected_output="1-2-3",
         difficulty="hard",
     ),
 ]
@@ -178,14 +283,16 @@ TASKS: List[Task] = [
 
 PARAM_SPACE = {
     "grammar_style": ["formal", "example_heavy", "minimal"],
-    "num_examples": [1, 3, 5, 8],
+    "num_examples": [1, 2, 3, 5, 8, 10],
     "instruction_prefix": [
         "Output ONLY valid Rail code. No markdown, no explanation.",
         "You are a Rail language expert. Respond with ONLY the Rail program.",
         "Generate a Rail program. Output raw code only, no commentary.",
         "Write the requested Rail program. Return ONLY the code.",
+        "You are a compiler for the Rail language. Given a task, output the Rail source code that accomplishes it. No commentary.",
+        "Translate the following task into a Rail program. Output ONLY the code.",
     ],
-    "temperature": [0.1, 0.3, 0.5, 0.7],
+    "temperature": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0],
     "include_builtins": [True, False],
     "include_gotchas": [True, False],
 }
@@ -215,11 +322,12 @@ def random_variant() -> PromptVariant:
     )
 
 
-def mutate_variant(v: PromptVariant) -> PromptVariant:
-    """Mutate exactly one dimension of the variant."""
+def mutate_variant(v: PromptVariant, n_mutations: int = 1) -> PromptVariant:
+    """Mutate 1-2 dimensions of the variant."""
     new = copy.deepcopy(v)
-    dim = random.choice(list(PARAM_SPACE.keys()))
-    setattr(new, dim, random.choice(PARAM_SPACE[dim]))
+    dims = random.sample(list(PARAM_SPACE.keys()), min(n_mutations, len(PARAM_SPACE)))
+    for dim in dims:
+        setattr(new, dim, random.choice(PARAM_SPACE[dim]))
     return new
 
 
@@ -332,12 +440,34 @@ main =
   let _ = print msg
   0
 ''',
+    # 11 - recursive printing (single-line if/else pattern)
+    '''\
+-- Print numbers down from n to 1
+countdown : i32 -> i32
+countdown n =
+  if n <= 0 then 0 else let _ = print n
+  countdown (n - 1)
+
+main =
+  let _ = countdown 3
+  0
+''',
+    # 12 - nested if on one line
+    '''\
+-- Classify with chained if/else (must be one line)
+classify : i32 -> String
+classify x = if x >= 90 then "A" else if x >= 80 then "B" else if x >= 70 then "C" else "F"
+
+main =
+  let _ = print (classify 85)
+  0
+''',
 ]
 
 BUILTINS_BLOCK = """\
 Builtin functions:
   List:    head, tail, length, map, filter, fold, reverse, sort, range, cons
-  String:  split, join, trim, contains, replace, append, show
+  String:  split sep str, join sep list, trim, contains, replace, append s1 s2, show
   I/O:     print, read_file, write_file
   System:  shell, shell_lines, env, timestamp
   Network: http_get, http_post, json_parse, json_get
@@ -346,14 +476,23 @@ Builtin functions:
 
 GOTCHAS_BLOCK = """\
 CRITICAL - Rail does NOT have:
+  - NO `let...in` syntax — use indented `let` bindings under the function body
   - NO `with` keyword in match expressions
   - NO `|` before match arms (just indent the arms under `match expr`)
   - NO multi-line lambdas (use named helper functions instead)
   - NO string interpolation (use `append` chains)
+  - NO operator sections like `(+)` — write `\\a -> \\b -> a + b` instead
   - `append` takes exactly 2 args; chain them: append (append a b) c
-  - `fold` takes 3 args: initial_value, function, list (in that order)
-  - NO list pattern matching like (x :: xs) -- use head/tail with length check
-  - Lambdas are single-expression only: \\x -> x + 1
+  - `fold` takes 3 args: initial_value, function, list — e.g. fold 0 (\\a -> \\b -> a + b) nums
+  - NO list pattern matching like (x :: xs) — use head/tail with length check
+  - Lambdas MUST start with backslash: `\\x -> x + 1` (not `x -> x + 1`)
+  - Negative numbers in function args need parens: `f (-42)` not `f -42`
+  - Each `let` binding must be on its own line, indented under the function
+  - `if/then/else` MUST be on ONE line — multi-line if/else blocks cause parse errors
+  - `else if` chains MUST be on one line: `if x > 90 then "A" else if x > 80 then "B" else "C"`
+  - For recursion with side effects in else: use a helper function instead of multi-line else
+  - NO pattern matching on function arguments — `f 0 = ...` is invalid. Use `if` inside the body instead.
+  - Recursion example: `pow b e = if e == 0 then 1 else b * pow b (e - 1)` (all on one line)
 """
 
 
@@ -374,7 +513,7 @@ Rail Language Grammar (BNF-like):
   lambda      ::= '\\\\' name '->' expr           (single expression only)
   pipe        ::= expr '|>' expr
   binop       ::= expr op expr
-  op          ::= '+' | '-' | '*' | '/' | '%' | '==' | '/=' | '<' | '>' | '<=' | '>=' | '&&' | '||'
+  op          ::= '+' | '-' | '*' | '/' | '%' | '==' | '!=' | '<' | '>' | '<=' | '>=' | '&&'
   app         ::= expr expr+
   atom        ::= number | string | bool | list | '(' expr ')'
   list        ::= '[' (expr (',' expr)*)? ']'
@@ -424,7 +563,7 @@ Pipe:                 5 |> double |> inc
 Lambda:               \\x -> x + 1       (single expr only!)
 Fold (init, fn, list): fold 0 (\\a -> \\b -> a + b) [1,2,3]
 
-Operators: + - * / % == /= < > <= >= && ||
+Operators: + - * / % == != < > <= >= && ||
 Types: i32, f64, Bool, String, [a], (a, b)
 Entry point: main = expr
 print returns unit, so: let _ = print x
@@ -448,7 +587,7 @@ Rail: typed functional language. Syntax:
   fold init fn list        -- fold
   print expr               -- print (returns unit, use let _ = print ...)
   main = expr              -- entry point
-Operators: + - * / % == /= < > <= >= && ||
+Operators: + - * / % == != < > <= >= && ||
 Types: i32 f64 Bool String [a] (a,b)
 List ops: head tail length map filter fold reverse sort range cons
 String ops: split join trim contains replace append show
@@ -495,7 +634,7 @@ def build_system_prompt(v: PromptVariant) -> str:
 
 def llm_generate(system_prompt: str, user_prompt: str, temperature: float,
                  model: str) -> Optional[str]:
-    """Call the local LLM via OpenAI-compatible API. Returns generated text or None."""
+    """Call the local LLM via subprocess curl to ensure clean connection cleanup on timeout."""
     payload = {
         "model": model,
         "messages": [
@@ -503,24 +642,32 @@ def llm_generate(system_prompt: str, user_prompt: str, temperature: float,
             {"role": "user", "content": user_prompt},
         ],
         "temperature": temperature,
-        "max_tokens": 1024,
+        "max_tokens": 4096,
         "chat_template_kwargs": {"enable_thinking": False},
     }
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        LLM_ENDPOINT,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode())
-        content = body["choices"][0]["message"]["content"]
-        return _strip_markdown_fences(content)
-    except Exception as e:
-        print(f"  [LLM ERROR] {e}", file=sys.stderr)
-        return None
+    payload_str = json.dumps(payload)
+
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                ["curl", "-s", "--max-time", "300",
+                 LLM_ENDPOINT,
+                 "-H", "Content-Type: application/json",
+                 "-d", payload_str],
+                capture_output=True, text=True, timeout=310,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                raise RuntimeError(f"curl exit {result.returncode}")
+            body = json.loads(result.stdout)
+            content = body["choices"][0]["message"]["content"]
+            return _strip_markdown_fences(content)
+        except Exception as e:
+            if attempt < 1:
+                print(f"  [LLM RETRY] {e}", file=sys.stderr)
+                time.sleep(5)
+            else:
+                print(f"  [LLM ERROR] {e}", file=sys.stderr)
+                return None
 
 
 def _strip_markdown_fences(text: str) -> str:
@@ -552,7 +699,7 @@ def run_rail(code: str) -> Tuple[Optional[str], Optional[str]]:
 
     try:
         result = subprocess.run(
-            [RAIL_CARGO, "run", "-q", "--", "run", tmppath, "--open"],
+            [RAIL_BINARY, "run", tmppath, "--open"],
             capture_output=True,
             text=True,
             timeout=TIMEOUT_SECS,
@@ -610,6 +757,10 @@ def evaluate_variant(
     for i, task in enumerate(tasks):
         if verbose:
             print(f"  [{i+1}/{len(tasks)}] {task.name} ({task.difficulty})...", end=" ", flush=True)
+
+        # Pause between LLM calls to prevent MLX server OOM under sustained load
+        if i > 0:
+            time.sleep(2)
 
         code = llm_generate(system_prompt, task.description, variant.temperature, model)
         if code is None:
@@ -682,8 +833,26 @@ def log_result(result: EvalResult) -> None:
 # Optimization loop
 # ---------------------------------------------------------------------------
 
-def run_optimization(iterations: int, model: str, verbose: bool) -> None:
+def detect_model() -> str:
+    """Query MLX /v1/models to get the loaded model ID."""
+    try:
+        req = urllib.request.Request(
+            "http://localhost:8080/v1/models",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode())
+        model_id = body["data"][0]["id"]
+        return model_id
+    except Exception as e:
+        print(f"WARNING: Could not detect model ({e}), using fallback", file=sys.stderr)
+        return os.path.expanduser("~/models/Qwen3.5-9B-6bit")
+
+
+def run_optimization(iterations: int, model: Optional[str], verbose: bool) -> None:
     """Main optimization loop: random exploration then hill-climbing."""
+    if model is None:
+        model = detect_model()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     tasks = TASKS
 
@@ -725,8 +894,10 @@ def run_optimization(iterations: int, model: str, verbose: bool) -> None:
         max_stale = 5  # restart from a different top-N candidate after 5 stale rounds
 
         for i in range(hill_climb_count):
-            candidate = mutate_variant(best_variant)
-            print(f"\n[Climb {i+1}/{hill_climb_count}] mutated from best ({best_score:.1%}) | "
+            # After 3 stale rounds, mutate 2 dimensions instead of 1
+            n_mut = 2 if stale >= 3 else 1
+            candidate = mutate_variant(best_variant, n_mutations=n_mut)
+            print(f"\n[Climb {i+1}/{hill_climb_count}] mutated({n_mut}) from best ({best_score:.1%}) | "
                   f"{candidate.grammar_style} | examples={candidate.num_examples} | "
                   f"temp={candidate.temperature} | builtins={candidate.include_builtins} | "
                   f"gotchas={candidate.include_gotchas}")
@@ -742,19 +913,34 @@ def run_optimization(iterations: int, model: str, verbose: bool) -> None:
                 best_score = result.score
                 best_variant = candidate
                 stale = 0
+            elif result.score == best_score:
+                stale += 1
+                print(f"  (tied, stale={stale})")
             else:
                 stale += 1
                 print(f"  (stale={stale})")
 
             # If stuck, jump to a different top candidate
-            if stale >= max_stale and len(leaderboard) >= 3:
+            if stale >= max_stale and len(leaderboard) >= 5:
                 leaderboard.sort(key=lambda x: x[0], reverse=True)
-                # Pick randomly from top 3 (excluding current best to diversify)
-                candidates = leaderboard[:3]
+                # Pick randomly from top 5 to diversify
+                candidates = leaderboard[:5]
                 pick = random.choice(candidates)
                 best_score, best_variant, _ = pick
                 stale = 0
                 print(f"  [RESTART] Jumping to variant with score {best_score:.1%}")
+            # Every 20 rounds, inject a fully random variant to escape local optima
+            if (i + 1) % 20 == 0:
+                print(f"  [INJECT] Random variant for diversity")
+                wild = random_variant()
+                wild_result = evaluate_variant(wild, tasks, model, verbose)
+                log_result(wild_result)
+                leaderboard.append((wild_result.score, wild, wild_result))
+                print(f"  Injected score: {wild_result.correct}/{wild_result.total} = {wild_result.score:.1%}")
+                if wild_result.score > best_score:
+                    print(f"  ** WILD CARD NEW BEST **")
+                    best_score = wild_result.score
+                    best_variant = wild
 
     # --- Final leaderboard ---
     leaderboard.sort(key=lambda x: x[0], reverse=True)
@@ -790,6 +976,36 @@ def run_optimization(iterations: int, model: str, verbose: bool) -> None:
         with open(best_prompt_path, "w") as f:
             f.write(build_system_prompt(best_variant))
         print(f"\nBest prompt saved to: {best_prompt_path}")
+
+        # Save top 5 prompts
+        for rank, (score, variant, result) in enumerate(leaderboard[:5], 1):
+            path = RESULTS_DIR / f"prompt_rank{rank}_{score:.0%}.txt"
+            with open(path, "w") as f:
+                f.write(f"# Score: {result.correct}/{result.total} = {score:.1%}\n")
+                f.write(f"# Config: {json.dumps(variant.to_dict())}\n\n")
+                f.write(build_system_prompt(variant))
+            print(f"  Rank {rank} prompt saved: {path.name}")
+
+        # Save analysis of which tasks are hardest
+        task_pass_counts: Dict[str, int] = {}
+        task_total_counts: Dict[str, int] = {}
+        for _, _, r in leaderboard:
+            for tr in r.task_results:
+                name = tr["task"]
+                task_total_counts[name] = task_total_counts.get(name, 0) + 1
+                if tr["passed"]:
+                    task_pass_counts[name] = task_pass_counts.get(name, 0) + 1
+        analysis_path = RESULTS_DIR / "task_difficulty_analysis.txt"
+        with open(analysis_path, "w") as f:
+            f.write("Task Pass Rates (sorted by difficulty)\n")
+            f.write("=" * 50 + "\n")
+            for name in sorted(task_total_counts.keys(),
+                               key=lambda n: task_pass_counts.get(n, 0) / max(task_total_counts[n], 1)):
+                total = task_total_counts[name]
+                passed = task_pass_counts.get(name, 0)
+                rate = passed / total if total > 0 else 0
+                f.write(f"  {name:25s}  {passed:3d}/{total:3d}  ({rate:.0%})\n")
+        print(f"  Task analysis saved: {analysis_path.name}")
 
     print(f"\nAll results logged to: {RESULTS_FILE}")
 

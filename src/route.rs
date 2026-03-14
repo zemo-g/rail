@@ -220,6 +220,7 @@ impl Route {
     }
 
     /// Display summary of what this route allows
+    #[allow(dead_code)]
     pub fn describe(&self) -> String {
         if self.allow_all {
             return "open (full access)".into();

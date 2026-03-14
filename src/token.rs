@@ -7,6 +7,9 @@ pub enum Token {
     Int(i64),
     Float(f64),
     Str(String),
+    /// Interpolated string: alternating literal and expression parts.
+    /// e.g. "hello {name}!" → [Lit("hello "), Expr("name"), Lit("!")]
+    InterpStr(Vec<InterpPart>),
     Bool(bool),
 
     // Identifiers and operators
@@ -27,6 +30,11 @@ pub enum Token {
     Then,
     Else,
     Do,
+    Effect,
+    Perform,
+    Handle,
+    With,
+    Resume,
 
     // Symbols
     Arrow,       // ->
@@ -58,10 +66,17 @@ pub enum Token {
     EOF,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum InterpPart {
+    Lit(String),
+    Expr(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct Span {
     pub line: usize,
     pub col: usize,
+    #[allow(dead_code)]
     pub len: usize,
 }
 

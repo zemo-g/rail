@@ -5,6 +5,7 @@
 /// Source location: (line, col)
 pub type Span = (usize, usize);
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Decl {
     /// Function with optional type signature
@@ -53,6 +54,14 @@ pub enum Decl {
         module: String,
         names: Option<Vec<String>>,
     },
+
+    /// Effect declaration
+    /// `effect LLM`
+    ///   `ask : String -> String`
+    EffectDecl {
+        name: String,
+        operations: Vec<EffectOp>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -74,11 +83,13 @@ impl Expr {
     }
 
     /// Create an Expr with a default (0,0) span (for generated code / tests)
+    #[allow(dead_code)]
     pub fn unspanned(kind: ExprKind) -> Self {
         Expr { kind, span: (0, 0) }
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     /// Integer literal
@@ -167,6 +178,21 @@ pub enum ExprKind {
 
     /// Block (sequence of let-bindings ending in an expression)
     Block(Vec<Expr>),
+
+    /// Perform an effect operation: `perform ask "hello"`
+    Perform {
+        op: String,
+        args: Vec<Expr>,
+    },
+
+    /// Handle effects: `handle <body> with <handlers>`
+    Handle {
+        body: Box<Expr>,
+        handlers: Vec<EffectHandler>,
+    },
+
+    /// Resume a continuation: `resume <value>`
+    Resume(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +225,24 @@ pub enum Pattern {
     Tuple(Vec<Pattern>),
 }
 
+/// An operation declared within an effect
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct EffectOp {
+    pub name: String,
+    pub type_sig: TypeExpr,
+}
+
+/// A handler clause within a handle expression
+#[derive(Debug, Clone)]
+pub struct EffectHandler {
+    pub op_name: String,
+    pub params: Vec<Pattern>,
+    pub body: Expr,
+}
+
 /// Type expressions
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum TypeExpr {
     /// Named type: `i32`, `bool`, `Option`

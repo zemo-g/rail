@@ -15,8 +15,12 @@ pub fn start() {
     let mut accumulated = String::new();
     let mut prev_decl_count: usize = 0;
 
-    eprint!("Rail v0.1 — interactive mode\n");
-    eprint!("Type expressions or declarations. :quit to exit.\n\n");
+    eprint!("Rail v0.6 — interactive mode\n");
+    eprint!("Type expressions or declarations. :help for commands.\n\n");
+
+    // Load history
+    let history_path = dirs_history_path();
+    let mut history: Vec<String> = load_history(&history_path);
     eprint!("> ");
     io::stderr().flush().unwrap();
 
@@ -35,7 +39,27 @@ pub fn start() {
         // Handle commands
         let trimmed = line.trim();
         if trimmed == ":quit" || trimmed == ":q" {
+            save_history(&history_path, &history);
             break;
+        }
+        if trimmed == ":help" || trimmed == ":h" {
+            eprint!("  :quit, :q     Exit the REPL\n");
+            eprint!("  :reset        Reset interpreter state\n");
+            eprint!("  :type <name>  Show inferred type of a name\n");
+            eprint!("  :help, :h     Show this help\n");
+            eprint!("\n");
+            eprint!("  Try these:\n");
+            eprint!("    1 + 1                     -- evaluate an expression\n");
+            eprint!("    let x = 42                -- bind a value\n");
+            eprint!("    double x = x * 2          -- define a function\n");
+            eprint!("    double 5                  -- call it\n");
+            eprint!("    map (\\x -> x * 2) [1,2,3] -- higher-order functions\n");
+            eprint!("\n");
+            eprint!("  Multi-line: end a line with '=' to continue on the next line.\n");
+            eprint!("  Finish multi-line input with a blank line.\n\n");
+            eprint!("> ");
+            io::stderr().flush().unwrap();
+            continue;
         }
         if trimmed == ":reset" {
             interp = Interpreter::new();
@@ -56,6 +80,11 @@ pub fn start() {
             eprint!("> ");
             io::stderr().flush().unwrap();
             continue;
+        }
+
+        // Save to history
+        if !trimmed.starts_with(':') {
+            history.push(trimmed.to_string());
         }
 
         // Multi-line input: if line ends with '=', keep reading
@@ -168,7 +197,7 @@ pub fn start() {
         match parse_source(&expr_source) {
             Ok(program) => {
                 // Register all declarations (re-register existing ones + __repl__)
-                let mut temp_interp = clone_interp_state(&interp, &accumulated);
+                let temp_interp = clone_interp_state(&interp, &accumulated);
                 let last = program.declarations.last();
                 if let Some(decl) = last {
                     match temp_interp.register_decl(decl) {
@@ -254,7 +283,7 @@ fn handle_type_command(name: &str, accumulated: &str) {
 
 /// Create a fresh interpreter and re-register all accumulated declarations.
 fn clone_interp_state(_original: &Interpreter, accumulated: &str) -> Interpreter {
-    let mut interp = Interpreter::new();
+    let interp = Interpreter::new();
     if !accumulated.is_empty() {
         if let Ok(program) = parse_source(accumulated) {
             for decl in &program.declarations {
@@ -263,4 +292,24 @@ fn clone_interp_state(_original: &Interpreter, accumulated: &str) -> Interpreter
         }
     }
     interp
+}
+
+fn dirs_history_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".rail_history")
+}
+
+fn load_history(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+fn save_history(path: &std::path::Path, history: &[String]) {
+    // Keep last 1000 entries
+    let start = if history.len() > 1000 { history.len() - 1000 } else { 0 };
+    let content = history[start..].join("\n");
+    let _ = std::fs::write(path, content);
 }

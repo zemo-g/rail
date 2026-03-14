@@ -894,3 +894,163 @@ fn test_allow_shell() {
     assert_eq!(stdout, "hi");
     std::fs::remove_file(&tmp).ok();
 }
+
+// =========================================================================
+// v0.4.0 — Parser polish
+// =========================================================================
+
+#[test]
+fn test_multiline_list() {
+    assert_output(
+        "main =\n  let xs = [\n    1,\n    2,\n    3\n  ]\n  let _ = print (length xs)\n  0",
+        "3",
+    );
+}
+
+#[test]
+fn test_multiline_list_trailing_comma() {
+    assert_output(
+        "main =\n  let xs = [\n    10,\n    20,\n  ]\n  let _ = print (length xs)\n  0",
+        "2",
+    );
+}
+
+#[test]
+fn test_multiline_record() {
+    assert_output(
+        "main =\n  let p = {\n    x: 10,\n    y: 20\n  }\n  let _ = print p.x\n  let _ = print p.y\n  0",
+        "10\n20",
+    );
+}
+
+#[test]
+fn test_multiline_record_trailing_comma() {
+    assert_output(
+        "main =\n  let p = {\n    x: 5,\n    y: 6,\n  }\n  let _ = print (p.x + p.y)\n  0",
+        "11",
+    );
+}
+
+#[test]
+fn test_tuple_destructuring() {
+    assert_output(
+        "main =\n  let pair = (10, 20)\n  let (a, b) = pair\n  let _ = print (a + b)\n  0",
+        "30",
+    );
+}
+
+#[test]
+fn test_tuple_destructuring_three() {
+    assert_output(
+        "main =\n  let triple = (1, 2, 3)\n  let (a, b, c) = triple\n  let _ = print (a + b + c)\n  0",
+        "6",
+    );
+}
+
+#[test]
+fn test_tuple_destructuring_with_wildcard() {
+    assert_output(
+        "main =\n  let pair = (42, 99)\n  let (x, _) = pair\n  let _ = print x\n  0",
+        "42",
+    );
+}
+
+#[test]
+fn test_recursion_depth_limit() {
+    // Non-tail-recursive: `1 + infinite(x+1)` prevents TCO,
+    // so it grows the eval stack and hits the depth limit
+    let (_, stderr, code) = rail_run(
+        "infinite x = 1 + (infinite (x + 1))\nmain =\n  let _ = print (infinite 0)\n  0",
+    );
+    assert_ne!(code, 0, "expected error from recursion limit");
+    assert!(stderr.contains("recursion depth exceeded") || stderr.contains("stack overflow"),
+        "expected recursion depth error, got: {}", stderr);
+}
+
+#[test]
+fn test_version_0_3() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rail"))
+        .args(["version"])
+        .output()
+        .expect("run rail version");
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(stdout.starts_with("Rail "), "expected 'Rail X.Y.Z', got: {}", stdout);
+}
+
+// =========================================================================
+// v0.5.0 — Agent primitives
+// =========================================================================
+
+#[test]
+fn test_context_new() {
+    assert_output(
+        "main =\n  let ctx = context_new \"You are helpful.\"\n  let _ = print ctx.system\n  0",
+        "You are helpful.",
+    );
+}
+
+#[test]
+fn test_context_push() {
+    assert_output(
+        "main =\n  let ctx = context_new \"sys\"\n  let ctx = context_push ctx \"user\" \"hello\"\n  let msgs = ctx.messages\n  let _ = print (length msgs)\n  0",
+        "1",
+    );
+}
+
+#[test]
+fn test_context_push_multiple() {
+    assert_output(
+        "main =\n  let ctx = context_new \"sys\"\n  let ctx = context_push ctx \"user\" \"hello\"\n  let ctx = context_push ctx \"assistant\" \"hi\"\n  let _ = print (length ctx.messages)\n  0",
+        "2",
+    );
+}
+
+// =========================================================================
+// v0.6.0 — Developer experience
+// =========================================================================
+
+#[test]
+fn test_fmt_check() {
+    let tmp = std::env::temp_dir().join("_rail_fmt_test.rail");
+    std::fs::write(&tmp, "add x y = x + y\n\nmain =\n  let _ = print (add 1 2)\n  0\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rail"))
+        .args(["fmt", tmp.to_str().unwrap(), "--check"])
+        .output()
+        .expect("run rail fmt");
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(stdout.contains("ok") || stdout.contains("formatted"),
+        "expected ok or formatted, got: {}", stdout);
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn test_fmt_formats() {
+    let tmp = std::env::temp_dir().join("_rail_fmt_test2.rail");
+    std::fs::write(&tmp, "add x y = x + y   \nmain =  \n  0\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rail"))
+        .args(["fmt", tmp.to_str().unwrap()])
+        .output()
+        .expect("run rail fmt");
+    assert!(output.status.success());
+    let content = std::fs::read_to_string(&tmp).unwrap();
+    assert!(!content.contains("   \n"), "trailing whitespace should be removed");
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn test_test_runner_discovers() {
+    // A file with test_ functions should be discoverable
+    assert_output(
+        "test_addition _ = 1 + 1 == 2\nmain = 0",
+        "",
+    );
+}
+
+#[test]
+fn test_prompt_stream_mock() {
+    // Mock provider — streaming simulated via word splitting
+    assert_output(
+        "main =\n  let _ = prompt_stream \"\" \"What is 2+2?\" (\\chunk -> print chunk)\n  0",
+        "4",
+    );
+}

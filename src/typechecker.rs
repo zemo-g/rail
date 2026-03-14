@@ -468,6 +468,27 @@ impl TypeChecker {
                 }
                 Ok(ty)
             }
+
+            // Effect system — type inference deferred to future work
+            ExprKind::Perform { args, .. } => {
+                for arg in args {
+                    self.infer(arg, env)?;
+                }
+                Ok(self.fresh())
+            }
+
+            ExprKind::Handle { body, handlers } => {
+                let body_ty = self.infer(body, env)?;
+                for handler in handlers {
+                    self.infer(&handler.body, env)?;
+                }
+                Ok(body_ty)
+            }
+
+            ExprKind::Resume(value_expr) => {
+                self.infer(value_expr, env)?;
+                Ok(self.fresh())
+            }
         }
     }
 

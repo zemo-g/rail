@@ -10,6 +10,12 @@ mod modules;
 mod stdlib;
 mod ai;
 mod route;
+mod purity;
+mod serve;
+mod agent;
+mod fmt;
+mod test_runner;
+mod lsp;
 
 use std::env;
 use std::fs;
@@ -57,8 +63,33 @@ fn main() {
             });
             lex_file(file);
         }
+        Some("serve") => {
+            let file = args.get(2).unwrap_or_else(|| {
+                eprintln!("usage: rail serve <file.rail> [--watch]");
+                std::process::exit(1);
+            });
+            serve::serve_loop(file, route);
+        }
         Some("repl") => {
             repl::start();
+        }
+        Some("fmt") => {
+            let file = args.get(2).unwrap_or_else(|| {
+                eprintln!("usage: rail fmt <file.rail> [--check]");
+                std::process::exit(1);
+            });
+            let check_only = args.iter().any(|a| a == "--check");
+            fmt_file(file, check_only);
+        }
+        Some("test") => {
+            let file = args.get(2).unwrap_or_else(|| {
+                eprintln!("usage: rail test <file.rail>");
+                std::process::exit(1);
+            });
+            test_file(file, route);
+        }
+        Some("lsp") => {
+            lsp::run_lsp();
         }
         Some("init") => {
             let dir = args.get(2).map(|s| s.as_str());
@@ -79,18 +110,29 @@ fn main() {
             }
         }
         Some("version") | Some("--version") | Some("-v") => {
-            println!("Rail 0.2.0");
+            println!("Rail 0.6.0");
+        }
+        Some(arg) if arg.ends_with(".rail") => {
+            // User typed `rail file.rail` — they probably meant `rail run file.rail`
+            eprintln!("hint: did you mean `rail run {}`?", arg);
+            eprintln!();
+            run_file(arg, route);
         }
         _ => {
             println!("Rail — a pure functional, AI-native language");
             println!();
             println!("usage:");
             println!("  rail run <file.rail>     Run a Rail program (interpreter)");
+            println!("  rail serve <file.rail>   Run with hot code reloading");
             println!("  rail compile <file.rail> Compile and run (native ARM64/x86_64)");
             println!("  rail check <file.rail>   Type-check a Rail program");
             println!("  rail parse <file.rail>   Parse and show AST");
             println!("  rail lex <file.rail>     Tokenize and show tokens");
+            println!("  rail fmt <file.rail>     Format a Rail source file");
+            println!("  rail fmt <file> --check  Check if file is formatted (CI mode)");
+            println!("  rail test <file.rail>    Run test_ functions in a file");
             println!("  rail repl                Interactive mode");
+            println!("  rail lsp                 Start Language Server Protocol server");
             println!("  rail init [dir]          Create a new Rail project");
             println!("  rail stdlib-path [dir]   Show stdlib search paths");
             println!("  rail version             Show version");
@@ -309,11 +351,11 @@ fn run_file(path: &str, route: route::Route) {
 
     let program = resolve_modules(path, program);
 
-    // Show route if not default open
+    // Show route if not default open — help beginners understand the sandbox
     if !route.allow_all {
-        eprintln!("[route: {}]", route.describe());
+        eprintln!("[sandbox mode — use --open for full access, or --allow ai/shell/fs:path]");
     }
-    let mut interp = interpreter::Interpreter::with_route(route);
+    let interp = interpreter::Interpreter::with_route(route);
     match interp.run(&program) {
         Ok(val) => {
             // main's return value is an exit code, not output.
@@ -332,8 +374,73 @@ fn run_file(path: &str, route: route::Route) {
         }
         Err(e) => {
             eprintln!("{}", e);
+            let msg = format!("{}", e);
+            if msg.contains("type error") {
+                eprintln!("hint: run `rail check {}` for detailed type analysis", path);
+            }
             std::process::exit(1);
         }
+    }
+}
+
+fn fmt_file(path: &str, check_only: bool) {
+    let source = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("error reading {}: {}", path, e);
+        std::process::exit(1);
+    });
+
+    let formatted = fmt::format_source(&source);
+
+    if check_only {
+        if formatted == source {
+            println!("{}: ok", path);
+        } else {
+            eprintln!("{}: not formatted", path);
+            std::process::exit(1);
+        }
+    } else {
+        if formatted == source {
+            println!("{}: already formatted", path);
+        } else {
+            fs::write(path, &formatted).unwrap_or_else(|e| {
+                eprintln!("error writing {}: {}", path, e);
+                std::process::exit(1);
+            });
+            println!("{}: formatted", path);
+        }
+    }
+}
+
+fn test_file(path: &str, route: route::Route) {
+    let source = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("error reading {}: {}", path, e);
+        std::process::exit(1);
+    });
+
+    let mut lexer = lexer::Lexer::new(&source);
+    let tokens = match lexer.tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let mut parser = parser::Parser::new(tokens);
+    let program = match parser.parse_program() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let program = resolve_modules(path, program);
+
+    let results = test_runner::run_tests(&program, route);
+    let failed = results.iter().filter(|r| !r.passed).count();
+    if failed > 0 {
+        std::process::exit(1);
     }
 }
 
