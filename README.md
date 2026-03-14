@@ -1,6 +1,6 @@
 # Rail
 
-A programming language for building AI agents.
+R Artifical Intellgence Language.
 
 ```
 -- 6 parallel LLM calls. 8 lines. No framework.
