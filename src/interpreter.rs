@@ -314,7 +314,7 @@ impl Interpreter {
             ("read_line", 1), ("read_file", 1), ("write_file", 2),
             // System
             ("shell", 1), ("shell_lines", 1), ("env", 1), ("timestamp", 1),
-            ("sleep_ms", 1),
+            ("sleep_ms", 1), ("random", 0), ("random_int", 2),
             // JSON
             ("json_parse", 1), ("json_get", 2),
             // HTTP
@@ -334,6 +334,8 @@ impl Interpreter {
             ("parse_int", 1), ("parse_float", 1), ("float_to_str", 1),
             // Hot reload
             ("set_state", 2), ("get_state", 1), ("check_reload", 1),
+            // SQLite
+            ("db_query", 2), ("db_execute", 2),
             // Agent primitives (v0.5)
             ("agent_loop", 4), ("prompt_stream", 3), ("prompt_typed", 3),
             ("context_new", 1), ("context_push", 3), ("context_prompt", 2),
@@ -1463,6 +1465,37 @@ impl Interpreter {
                 v => Err(RuntimeError(format!("sleep_ms: expected int, got {}", v))),
             },
 
+            // Random
+            "random" => {
+                // Returns a random float in [0.0, 1.0)
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_nanos().hash(&mut hasher);
+                std::thread::current().id().hash(&mut hasher);
+                let bits = hasher.finish();
+                let f = (bits >> 11) as f64 / (1u64 << 53) as f64;
+                Ok(Value::Float(f))
+            },
+            "random_int" => match (&args[0], &args[1]) {
+                // random_int lo hi — returns random int in [lo, hi)
+                (Value::Int(lo), Value::Int(hi)) => {
+                    if hi <= lo { return Ok(Value::Int(*lo)); }
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default().as_nanos().hash(&mut hasher);
+                    std::thread::current().id().hash(&mut hasher);
+                    let bits = hasher.finish();
+                    let range = (*hi - *lo) as u64;
+                    let val = *lo + (bits % range) as i64;
+                    Ok(Value::Int(val))
+                }
+                (a, b) => Err(RuntimeError(format!("random_int: expected (int, int), got ({}, {})", a, b))),
+            },
+
             // JSON operations
             "json_parse" => match &args[0] {
                 Value::Str(s) => {
@@ -1524,6 +1557,59 @@ impl Interpreter {
                     }
                 }
                 _ => Err(RuntimeError("http_post: expected two strings (url, body)".into())),
+            },
+
+            // SQLite operations (route-gated via fs)
+            // db_query : db_path -> sql -> [[values]]
+            // Returns list of rows, each row is a list of values
+            "db_query" => match (&args[0], &args[1]) {
+                (Value::Str(db_path), Value::Str(sql)) => {
+                    self.route.check_fs(db_path).map_err(RuntimeError)?;
+                    match std::process::Command::new("sqlite3")
+                        .args(["-json", db_path, sql])
+                        .output()
+                    {
+                        Ok(output) => {
+                            if !output.status.success() {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                return Err(RuntimeError(format!("db_query: {}", stderr.trim())));
+                            }
+                            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                            if stdout.trim().is_empty() {
+                                return Ok(Value::List(vec![]));
+                            }
+                            // sqlite3 -json returns JSON array of objects
+                            // Parse into list of records
+                            match parse_json_value(&stdout) {
+                                Ok(val) => Ok(val),
+                                Err(e) => Err(RuntimeError(format!("db_query: failed to parse result: {}", e))),
+                            }
+                        }
+                        Err(e) => Err(RuntimeError(format!("db_query: {}", e))),
+                    }
+                }
+                _ => Err(RuntimeError("db_query: expected (db_path, sql_string)".into())),
+            },
+
+            // db_execute : db_path -> sql -> Int (rows affected)
+            "db_execute" => match (&args[0], &args[1]) {
+                (Value::Str(db_path), Value::Str(sql)) => {
+                    self.route.check_fs(db_path).map_err(RuntimeError)?;
+                    match std::process::Command::new("sqlite3")
+                        .args([db_path, sql])
+                        .output()
+                    {
+                        Ok(output) => {
+                            if !output.status.success() {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                return Err(RuntimeError(format!("db_execute: {}", stderr.trim())));
+                            }
+                            Ok(Value::Int(0))
+                        }
+                        Err(e) => Err(RuntimeError(format!("db_execute: {}", e))),
+                    }
+                }
+                _ => Err(RuntimeError("db_execute: expected (db_path, sql_string)".into())),
             },
 
             // AI operations (route-gated)
@@ -1707,20 +1793,20 @@ impl Interpreter {
             },
 
             // prompt_stream : system -> user -> callback -> ()
-            // callback receives each chunk as a string
+            // callback receives each content delta as it arrives via SSE streaming
             "prompt_stream" => match (&args[0], &args[1], &args[2]) {
                 (Value::Str(system), Value::Str(user_msg), callback) => {
                     self.route.check_ai().map_err(RuntimeError)?;
                     let config = ai::AiConfig::from_env();
 
-                    // For now, call LLM normally and simulate streaming by splitting into chunks
-                    // Real streaming requires chunked HTTP parsing — future enhancement
-                    let response = ai::call_llm(&config, system, user_msg)
-                        .map_err(|e| RuntimeError(format!("prompt_stream: {}", e)))?;
+                    // Stream via SSE — collect chunks then deliver to callback
+                    let mut chunks: Vec<String> = Vec::new();
+                    ai::call_llm_stream(&config, system, user_msg, &mut |chunk| {
+                        chunks.push(chunk.to_string());
+                    }).map_err(|e| RuntimeError(format!("prompt_stream: {}", e)))?;
 
-                    // Split response into word-level chunks for callback
-                    for word in response.split_inclusive(char::is_whitespace) {
-                        self.apply(callback.clone(), Value::Str(word.to_string()), (0, 0))?;
+                    for chunk in chunks {
+                        self.apply(callback.clone(), Value::Str(chunk), (0, 0))?;
                     }
                     Ok(Value::Unit)
                 }
