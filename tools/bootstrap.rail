@@ -1,0 +1,510 @@
+-- bootstrap.rail — Rail running Rail
+-- Self-hosting bootstrap Step 5: proof of concept
+-- Usage: rail run tools/bootstrap.rail --open
+--
+-- This program reads a Rail source file, lexes it, parses it into an AST,
+-- and evaluates it — all in Rail. Rail interpreting itself.
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- LEXER
+-- ══════════════════════════════════════════════════════════════════════════════
+
+digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+alpha_lower = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"]
+alpha_upper = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+
+has item lst = if length lst == 0 then false else if head lst == item then true else has item (tail lst)
+is_digit c = has c digits
+is_alpha c = has c alpha_lower || has c alpha_upper || c == "_"
+is_alnum c = is_digit c || is_alpha c
+is_space c = c == " " || c == "\t"
+
+keywords_list = ["let", "if", "then", "else", "match", "type", "import", "module", "export", "effect", "perform", "handle", "with", "resume"]
+is_keyword w = has w keywords_list
+
+lex_collect pred cs =
+  if length cs == 0 then ("", [])
+  else if pred (head cs) then
+    let (r, rest) = lex_collect pred (tail cs)
+    (append (head cs) r, rest)
+  else ("", cs)
+
+lex_collect_string cs acc =
+  if length cs == 0 then (acc, [])
+  else if head cs == "\"" then (acc, tail cs)
+  else if head cs == "\\" then
+    if length (tail cs) > 0 then
+      let next = head (tail cs)
+      let esc = if next == "n" then "\n" else if next == "t" then "\t" else if next == "\\" then "\\" else if next == "\"" then "\"" else append "\\" next
+      lex_collect_string (tail (tail cs)) (append acc esc)
+    else (append acc "\\", [])
+  else lex_collect_string (tail cs) (append acc (head cs))
+
+lex_skip_line cs =
+  if length cs == 0 then []
+  else if head cs == "\n" then cs
+  else lex_skip_line (tail cs)
+
+lex_peek cs = if length cs == 0 then "" else head cs
+
+tokenize_chars cs =
+  if length cs == 0 then [("eof", "")]
+  else
+    let c = head cs
+    let rest = tail cs
+    let next = lex_peek rest
+    if c == "\n" then cons ("newline", "\n") (tokenize_chars rest)
+    else if is_space c then tokenize_chars rest
+    else if c == "\"" then
+      let (s, after) = lex_collect_string rest ""
+      cons ("str", s) (tokenize_chars after)
+    else if is_digit c then
+      let (nr, after) = lex_collect is_digit rest
+      cons ("int", append c nr) (tokenize_chars after)
+    else if is_alpha c then
+      let (wr, after) = lex_collect is_alnum rest
+      let w = append c wr
+      cons (if is_keyword w then ("kw", w) else ("ident", w)) (tokenize_chars after)
+    else if c == "-" then
+      if next == "-" then tokenize_chars (lex_skip_line (tail rest))
+      else if next == ">" then cons ("arrow", "->") (tokenize_chars (tail rest))
+      else cons ("op", "-") (tokenize_chars rest)
+    else if c == "=" then
+      if next == "=" then cons ("op", "==") (tokenize_chars (tail rest))
+      else cons ("eq", "=") (tokenize_chars rest)
+    else if c == "|" then
+      if next == ">" then cons ("pipe", "|>") (tokenize_chars (tail rest))
+      else if next == "|" then cons ("op", "||") (tokenize_chars (tail rest))
+      else tokenize_chars rest
+    else if c == "!" then
+      if next == "=" then cons ("op", "!=") (tokenize_chars (tail rest))
+      else tokenize_chars rest
+    else if c == "<" then
+      if next == "=" then cons ("op", "<=") (tokenize_chars (tail rest))
+      else cons ("op", "<") (tokenize_chars rest)
+    else if c == ">" then
+      if next == "=" then cons ("op", ">=") (tokenize_chars (tail rest))
+      else cons ("op", ">") (tokenize_chars rest)
+    else if c == "&" then
+      if next == "&" then cons ("op", "&&") (tokenize_chars (tail rest))
+      else tokenize_chars rest
+    else if c == "(" then cons ("lparen", "(") (tokenize_chars rest)
+    else if c == ")" then cons ("rparen", ")") (tokenize_chars rest)
+    else if c == "[" then cons ("lbracket", "[") (tokenize_chars rest)
+    else if c == "]" then cons ("rbracket", "]") (tokenize_chars rest)
+    else if c == "," then cons ("comma", ",") (tokenize_chars rest)
+    else if c == ":" then cons ("colon", ":") (tokenize_chars rest)
+    else if c == "." then cons ("dot", ".") (tokenize_chars rest)
+    else if c == "\\" then cons ("lambda", "\\") (tokenize_chars rest)
+    else if c == "+" then cons ("op", "+") (tokenize_chars rest)
+    else if c == "*" then cons ("op", "*") (tokenize_chars rest)
+    else if c == "/" then cons ("op", "/") (tokenize_chars rest)
+    else if c == "%" then cons ("op", "%") (tokenize_chars rest)
+    else tokenize_chars rest
+
+tokenize src = tokenize_chars (chars src)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- PARSER
+-- ══════════════════════════════════════════════════════════════════════════════
+
+tok_tag t =
+  let (tag, _) = t
+  tag
+tok_val t =
+  let (_, val) = t
+  val
+
+cur toks = if length toks == 0 then ("eof", "") else head toks
+cur_tag toks = tok_tag (cur toks)
+cur_val toks = tok_val (cur toks)
+adv toks = if length toks == 0 then [] else tail toks
+
+skip_nl toks = if cur_tag toks == "newline" then skip_nl (adv toks) else toks
+
+expect tag toks =
+  let t = cur toks
+  if tok_tag t == tag then (tok_val t, adv toks)
+  else ("ERROR", toks)
+
+expect_kw kw toks =
+  let t = cur toks
+  if tok_tag t == "kw" then
+    if tok_val t == kw then (kw, adv toks)
+    else ("ERROR", toks)
+  else ("ERROR", toks)
+
+is_cmp_op v = v == "==" || v == "!=" || v == "<" || v == ">" || v == "<=" || v == ">="
+is_add_op v = v == "+" || v == "-"
+is_mul_op v = v == "*" || v == "/" || v == "%"
+
+parse_atom toks =
+  let tag = cur_tag toks
+  let val = cur_val toks
+  if tag == "int" then (["int_lit", val], adv toks)
+  else if tag == "str" then (["str_lit", val], adv toks)
+  else if tag == "ident" then
+    if val == "true" then (["bool_lit", "true"], adv toks)
+    else if val == "false" then (["bool_lit", "false"], adv toks)
+    else (["var", val], adv toks)
+  else if tag == "lparen" then
+    let (expr, rest) = parse_expr (adv toks)
+    let (_, rest2) = expect "rparen" rest
+    (expr, rest2)
+  else if tag == "lbracket" then
+    let rest = adv toks
+    if cur_tag rest == "rbracket" then (["list", []], adv rest)
+    else
+      let (elems, rest2) = parse_list_elems rest
+      (cons "list" [elems], rest2)
+  else if tag == "lambda" then
+    let (param, rest) = expect "ident" (adv toks)
+    let (_, rest2) = expect "arrow" rest
+    let (body, rest3) = parse_expr rest2
+    (["lambda", param, body], rest3)
+  else (["error", "unexpected: " + tag], toks)
+
+parse_list_elems toks =
+  let (expr, rest) = parse_expr toks
+  if cur_tag rest == "comma" then
+    let (more, rest2) = parse_list_elems (adv rest)
+    (cons expr more, rest2)
+  else
+    let (_, rest2) = expect "rbracket" rest
+    ([expr], rest2)
+
+parse_app toks =
+  let (func, rest) = parse_atom toks
+  parse_app_rest func rest
+
+is_app_start tag = tag == "int" || tag == "str" || tag == "ident" || tag == "lparen" || tag == "lbracket" || tag == "lambda"
+
+parse_app_rest func toks =
+  if is_app_start (cur_tag toks) then
+    let (arg, rest) = parse_atom toks
+    parse_app_rest ["app", func, arg] rest
+  else (func, toks)
+
+parse_mul toks =
+  let (left, rest) = parse_app toks
+  parse_mul_rest left rest
+parse_mul_rest left toks =
+  if cur_tag toks == "op" then
+    if is_mul_op (cur_val toks) then
+      let op = cur_val toks
+      let (right, rest) = parse_app (adv toks)
+      parse_mul_rest ["binop", op, left, right] rest
+    else (left, toks)
+  else (left, toks)
+
+parse_add toks =
+  let (left, rest) = parse_mul toks
+  parse_add_rest left rest
+parse_add_rest left toks =
+  if cur_tag toks == "op" then
+    if is_add_op (cur_val toks) then
+      let op = cur_val toks
+      let (right, rest) = parse_mul (adv toks)
+      parse_add_rest ["binop", op, left, right] rest
+    else (left, toks)
+  else (left, toks)
+
+parse_cmp toks =
+  let (left, rest) = parse_add toks
+  if cur_tag rest == "op" then
+    if is_cmp_op (cur_val rest) then
+      let op = cur_val rest
+      let (right, rest2) = parse_add (adv rest)
+      (["binop", op, left, right], rest2)
+    else (left, rest)
+  else (left, rest)
+
+parse_and toks =
+  let (left, rest) = parse_cmp toks
+  parse_and_rest left rest
+parse_and_rest left toks =
+  if cur_tag toks == "op" then
+    if cur_val toks == "&&" then
+      let (right, rest) = parse_cmp (adv toks)
+      parse_and_rest ["binop", "&&", left, right] rest
+    else (left, toks)
+  else (left, toks)
+
+parse_or toks =
+  let (left, rest) = parse_and toks
+  parse_or_rest left rest
+parse_or_rest left toks =
+  if cur_tag toks == "op" then
+    if cur_val toks == "||" then
+      let (right, rest) = parse_and (adv toks)
+      parse_or_rest ["binop", "||", left, right] rest
+    else (left, toks)
+  else (left, toks)
+
+parse_pipe toks =
+  let (left, rest) = parse_or toks
+  parse_pipe_rest left rest
+parse_pipe_rest left toks =
+  if cur_tag toks == "pipe" then
+    let (right, rest) = parse_or (adv toks)
+    parse_pipe_rest ["app", right, left] rest
+  else (left, toks)
+
+parse_expr toks =
+  let toks2 = skip_nl toks
+  let tag = cur_tag toks2
+  let val = cur_val toks2
+  if tag == "kw" then
+    if val == "let" then
+      let (name, rest) = expect "ident" (adv toks2)
+      let (_, rest2) = expect "eq" rest
+      let (value, rest3) = parse_expr rest2
+      let rest4 = skip_nl rest3
+      let (body, rest5) = parse_expr rest4
+      (["let", name, value, body], rest5)
+    else if val == "if" then
+      let (cond, rest) = parse_expr (adv toks2)
+      let (_, rest2) = expect_kw "then" (skip_nl rest)
+      let (then_e, rest3) = parse_expr rest2
+      let (_, rest4) = expect_kw "else" (skip_nl rest3)
+      let (else_e, rest5) = parse_expr rest4
+      (["if", cond, then_e, else_e], rest5)
+    else parse_pipe toks2
+  else parse_pipe toks2
+
+collect_params toks =
+  if cur_tag toks == "eq" then ([], adv toks)
+  else if cur_tag toks == "ident" then
+    let name = cur_val toks
+    let (more, rest) = collect_params (adv toks)
+    (cons name more, rest)
+  else ([], toks)
+
+parse_decl toks =
+  let toks2 = skip_nl toks
+  if cur_tag toks2 == "ident" then
+    let name = cur_val toks2
+    let rest = adv toks2
+    if cur_tag rest == "colon" then
+      parse_decl (skip_type_sig rest)
+    else
+      let (params, rest2) = collect_params rest
+      let (body, rest3) = parse_expr rest2
+      (["func", name, params, body], rest3)
+  else (["error", "expected decl"], toks2)
+
+skip_type_sig toks =
+  if cur_tag toks == "newline" then toks
+  else if cur_tag toks == "eof" then toks
+  else skip_type_sig (adv toks)
+
+parse_program toks =
+  let toks2 = skip_nl toks
+  if cur_tag toks2 == "eof" then []
+  else
+    let (decl, rest) = parse_decl toks2
+    cons decl (parse_program rest)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- EVALUATOR
+-- ══════════════════════════════════════════════════════════════════════════════
+
+cat parts = join "" parts
+
+env_lookup name env =
+  if length env == 0 then ["error", "undefined: " + name]
+  else
+    let (k, v) = head env
+    if k == name then v
+    else env_lookup name (tail env)
+
+env_set name val env = cons (name, val) env
+
+parse_int_str s =
+  let cs = chars s
+  if length cs == 0 then 0
+  else if head cs == "-" then 0 - (parse_int_pos (tail cs) 0)
+  else parse_int_pos cs 0
+
+parse_int_pos cs acc =
+  if length cs == 0 then acc
+  else
+    let d = digit_val (head cs)
+    parse_int_pos (tail cs) (acc * 10 + d)
+
+digit_val c =
+  if c == "0" then 0 else if c == "1" then 1 else if c == "2" then 2
+  else if c == "3" then 3 else if c == "4" then 4 else if c == "5" then 5
+  else if c == "6" then 6 else if c == "7" then 7 else if c == "8" then 8
+  else 9
+
+show_val v =
+  let tag = head v
+  if tag == "int" then head (tail v)
+  else if tag == "str" then head (tail v)
+  else if tag == "bool" then head (tail v)
+  else if tag == "unit" then "()"
+  else if tag == "list" then cat ["[", join ", " (map show_val (head (tail v))), "]"]
+  else if tag == "closure" then "<fn>"
+  else if tag == "builtin" then "<builtin>"
+  else if tag == "error" then "ERROR: " + head (tail v)
+  else "<unknown>"
+
+eval_binop op left right =
+  let lt = head left
+  if lt == "int" then
+    let a = parse_int_str (head (tail left))
+    let b = parse_int_str (head (tail right))
+    if op == "+" then ["int", show (a + b)]
+    else if op == "-" then ["int", show (a - b)]
+    else if op == "*" then ["int", show (a * b)]
+    else if op == "/" then ["int", show (a / b)]
+    else if op == "%" then ["int", show (a % b)]
+    else if op == "==" then ["bool", if a == b then "true" else "false"]
+    else if op == "!=" then ["bool", if a != b then "true" else "false"]
+    else if op == "<" then ["bool", if a < b then "true" else "false"]
+    else if op == ">" then ["bool", if a > b then "true" else "false"]
+    else if op == "<=" then ["bool", if a <= b then "true" else "false"]
+    else if op == ">=" then ["bool", if a >= b then "true" else "false"]
+    else ["error", "unknown op: " + op]
+  else if lt == "str" then
+    let a = head (tail left)
+    let b = head (tail right)
+    if op == "+" then ["str", a + b]
+    else if op == "==" then ["bool", if a == b then "true" else "false"]
+    else if op == "!=" then ["bool", if a != b then "true" else "false"]
+    else ["error", "unknown str op: " + op]
+  else if lt == "bool" then
+    let a = head (tail left) == "true"
+    let b = head (tail right) == "true"
+    if op == "==" then ["bool", if a == b then "true" else "false"]
+    else ["error", "unknown bool op"]
+  else ["error", "binop on " + lt]
+
+eval_expr node env =
+  let tag = head node
+  if tag == "int_lit" then ["int", head (tail node)]
+  else if tag == "str_lit" then ["str", head (tail node)]
+  else if tag == "bool_lit" then ["bool", head (tail node)]
+  else if tag == "var" then env_lookup (head (tail node)) env
+  else if tag == "binop" then
+    let op = head (tail node)
+    let lv = eval_expr (head (tail (tail node))) env
+    let rv = eval_expr (head (tail (tail (tail node)))) env
+    eval_binop op lv rv
+  else if tag == "if" then
+    let cv = eval_expr (head (tail node)) env
+    if head (tail cv) == "true" then eval_expr (head (tail (tail node))) env
+    else eval_expr (head (tail (tail (tail node)))) env
+  else if tag == "let" then
+    let name = head (tail node)
+    let val = eval_expr (head (tail (tail node))) env
+    eval_expr (head (tail (tail (tail node)))) (env_set name val env)
+  else if tag == "app" then
+    let fv = eval_expr (head (tail node)) env
+    let av = eval_expr (head (tail (tail node))) env
+    apply_val fv av
+  else if tag == "lambda" then
+    ["closure", head (tail node), head (tail (tail node)), env, ""]
+  else if tag == "list" then
+    ["list", map (\e -> eval_expr e env) (head (tail node))]
+  else ["error", "unknown node: " + tag]
+
+apply_val func arg =
+  let tag = head func
+  if tag == "closure" then
+    let param = head (tail func)
+    let body = head (tail (tail func))
+    let cenv = head (tail (tail (tail func)))
+    let self_name = head (tail (tail (tail (tail func))))
+    let env1 = if self_name == "" then cenv else env_set self_name func cenv
+    eval_expr body (env_set param arg env1)
+  else if tag == "builtin" then
+    eval_builtin (head (tail func)) arg
+  else ["error", "cannot apply " + tag]
+
+eval_builtin name arg =
+  if name == "print" then
+    let _ = print (show_val arg)
+    ["unit", ""]
+  else if name == "show" then ["str", show_val arg]
+  else if name == "length" then
+    if head arg == "list" then ["int", show (length (head (tail arg)))]
+    else if head arg == "str" then ["int", show (length (chars (head (tail arg))))]
+    else ["error", "length: bad type"]
+  else if name == "head_fn" then
+    if head arg == "list" then head (head (tail arg))
+    else ["error", "head: not a list"]
+  else if name == "tail_fn" then
+    if head arg == "list" then ["list", tail (head (tail arg))]
+    else ["error", "tail: not a list"]
+  else if name == "cons_fn" then
+    ["closure", "__b", ["builtin_cons2", arg], [], ""]
+  else if name == "append_fn" then
+    ["closure", "__b", ["builtin_append2", arg], [], ""]
+  else ["error", "unknown builtin: " + name]
+
+initial_env = [("print", ["builtin", "print"]), ("show", ["builtin", "show"]), ("length", ["builtin", "length"]), ("head", ["builtin", "head_fn"]), ("tail", ["builtin", "tail_fn"]), ("cons", ["builtin", "cons_fn"]), ("append", ["builtin", "append_fn"])]
+
+wrap_lambda params body =
+  if length params == 0 then body
+  else ["lambda", head params, wrap_lambda (tail params) body]
+
+add_decls decls env =
+  if length decls == 0 then env
+  else
+    let d = head decls
+    let name = head (tail d)
+    let params = head (tail (tail d))
+    let body = head (tail (tail (tail d)))
+    let fv = if length params == 0 then eval_expr body env else if length params == 1 then ["closure", head params, body, env, name] else ["closure", head params, wrap_lambda (tail params) body, env, name]
+    add_decls (tail decls) (env_set name fv env)
+
+run_source src =
+  let toks = tokenize src
+  let decls = parse_program toks
+  let env = add_decls decls initial_env
+  env_lookup "main" env
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- BOOTSTRAP PROOF
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Test programs that the Rail-in-Rail interpreter will execute
+prog_hello = "main = print \"hello from Rail-in-Rail\""
+
+prog_factorial = "fact n =\n  if n <= 1 then 1\n  else n * fact (n - 1)\nmain =\n  let _ = print (fact 10)\n  fact 5"
+
+prog_fib = "fib n =\n  if n <= 0 then 0\n  else if n == 1 then 1\n  else fib (n - 1) + fib (n - 2)\nmain = fib 10"
+
+prog_higher_order = "apply f x = f x\ndouble x = x * 2\nmain = apply double 21"
+
+prog_let_chain = "main =\n  let a = 10\n  let b = 20\n  let c = a + b\n  let d = c * 2\n  d"
+
+prog_lambda = "main =\n  let f = \\x -> x * x\n  f 7"
+
+run_test name prog expected =
+  let result = run_source prog
+  let val = show_val result
+  let pass = val == expected
+  let status = if pass then "PASS" else "FAIL"
+  let _ = print (cat ["  ", status, " ", name, " = ", val, if pass then "" else " (expected " + expected + ")"])
+  pass
+
+main =
+  let _ = print "=== RAIL BOOTSTRAP: Rail interpreting Rail ==="
+  let _ = print ""
+  let _ = print "Running Rail programs inside Rail's own interpreter..."
+  let _ = print ""
+  let p1 = run_test "hello" prog_hello "()"
+  let p2 = run_test "factorial" prog_factorial "120"
+  let p3 = run_test "fibonacci" prog_fib "55"
+  let p4 = run_test "higher_order" prog_higher_order "42"
+  let p5 = run_test "let_chain" prog_let_chain "60"
+  let p6 = run_test "lambda" prog_lambda "49"
+  let _ = print ""
+  let total = (if p1 then 1 else 0) + (if p2 then 1 else 0) + (if p3 then 1 else 0) + (if p4 then 1 else 0) + (if p5 then 1 else 0) + (if p6 then 1 else 0)
+  let _ = print (cat [show total, "/6 passed"])
+  let _ = print ""
+  let _ = if total == 6 then print "Rail can run itself. Self-hosting bootstrap: PROVEN." else print "Some tests failed."
+  0

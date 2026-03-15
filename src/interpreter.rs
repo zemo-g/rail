@@ -278,7 +278,7 @@ struct EffectSignal {
 
 // ---- Interpreter ----
 
-const MAX_RECURSION_DEPTH: usize = 200;
+const MAX_RECURSION_DEPTH: usize = 500;
 
 pub struct Interpreter {
     globals: RefCell<Env>,

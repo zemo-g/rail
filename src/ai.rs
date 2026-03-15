@@ -615,6 +615,123 @@ fn strip_thinking_tags(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// Stream a prompt to the LLM and call `on_chunk` for each content delta.
+/// Uses SSE (Server-Sent Events) streaming via curl.
+/// Returns the full accumulated response.
+pub fn call_llm_stream(
+    config: &AiConfig,
+    system: &str,
+    user: &str,
+    on_chunk: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    if config.provider == "mock" {
+        let response = mock_response(system, user);
+        on_chunk(&response);
+        return Ok(response);
+    }
+
+    let system_escaped = escape_json_string(system);
+    let user_escaped = escape_json_string(user);
+
+    let (body, url, auth_header) = match config.provider.as_str() {
+        "anthropic" => {
+            let key = config.api_key.as_ref()
+                .ok_or("anthropic: no API key")?;
+            let body = format!(
+                r#"{{"model":"{}","max_tokens":1024,"temperature":{},"stream":true,"system":"{}","messages":[{{"role":"user","content":"{}"}}]}}"#,
+                config.model, config.temperature, system_escaped, user_escaped,
+            );
+            (body, config.base_url.clone(), format!("x-api-key: {}", key))
+        }
+        _ => {
+            // OpenAI-compatible
+            let mut msgs = String::new();
+            if !system.is_empty() {
+                msgs.push_str(&format!(
+                    r#"{{"role":"system","content":"{}"}},{{"role":"user","content":"{}"}}"#,
+                    system_escaped, user_escaped,
+                ));
+            } else {
+                msgs.push_str(&format!(r#"{{"role":"user","content":"{}"}}"#, user_escaped));
+            }
+            let body = format!(
+                r#"{{"model":"{}","temperature":{},"max_tokens":4096,"stream":true,"messages":[{}]}}"#,
+                config.model, config.temperature, msgs,
+            );
+            let auth = config.api_key.as_ref()
+                .map(|k| format!("Authorization: Bearer {}", k))
+                .unwrap_or_default();
+            (body, config.base_url.clone(), auth)
+        }
+    };
+
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "-N", "-X", "POST", &url, "-H", "content-type: application/json"]);
+
+    if config.provider == "anthropic" {
+        cmd.args(["-H", &auth_header, "-H", "anthropic-version: 2023-06-01"]);
+    } else if !auth_header.is_empty() {
+        cmd.args(["-H", &auth_header]);
+    }
+
+    cmd.args(["-d", &body]);
+    cmd.stdout(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("curl failed: {}", e))?;
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+
+    let mut full_response = String::new();
+    let reader = std::io::BufReader::new(stdout);
+
+    use std::io::BufRead;
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("stream read error: {}", e))?;
+        let line = line.trim().to_string();
+
+        if !line.starts_with("data: ") { continue; }
+        let data = &line[6..];
+        if data == "[DONE]" { break; }
+
+        // Extract content delta from SSE JSON
+        // OpenAI format: {"choices":[{"delta":{"content":"word"}}]}
+        // Anthropic format: {"type":"content_block_delta","delta":{"text":"word"}}
+        if let Some(chunk) = extract_stream_delta(data) {
+            on_chunk(&chunk);
+            full_response.push_str(&chunk);
+        }
+    }
+
+    let _ = child.wait();
+
+    let result = strip_thinking_tags(&full_response);
+    Ok(result)
+}
+
+/// Extract content from a streaming SSE data line.
+fn extract_stream_delta(json: &str) -> Option<String> {
+    // OpenAI: "delta":{"content":"..."}
+    if let Some(pos) = json.find(r#""content":""#) {
+        let start = pos + 11;
+        if let Some(end) = find_closing_quote(json, start) {
+            let text = unescape_json_string(&json[start..end]);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    // Anthropic: "text":"..."
+    if let Some(pos) = json.find(r#""text":""#) {
+        let start = pos + 8;
+        if let Some(end) = find_closing_quote(json, start) {
+            let text = unescape_json_string(&json[start..end]);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max { s } else { &s[..max] }
 }
