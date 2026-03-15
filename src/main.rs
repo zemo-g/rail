@@ -65,10 +65,19 @@ fn main() {
         }
         Some("serve") => {
             let file = args.get(2).unwrap_or_else(|| {
-                eprintln!("usage: rail serve <file.rail> [--watch]");
+                eprintln!("usage: rail serve <file.rail> [--http PORT] [--browser]");
                 std::process::exit(1);
             });
-            serve::serve_loop(file, route);
+            let http_port = args.iter().position(|a| a == "--http")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|p| p.parse::<u16>().ok());
+            let auto_open = args.iter().any(|a| a == "--browser");
+
+            if let Some(port) = http_port {
+                serve::serve_loop_http(file, route, port, auto_open);
+            } else {
+                serve::serve_loop(file, route);
+            }
         }
         Some("repl") => {
             repl::start();
@@ -124,6 +133,7 @@ fn main() {
             println!("usage:");
             println!("  rail run <file.rail>     Run a Rail program (interpreter)");
             println!("  rail serve <file.rail>   Run with hot code reloading");
+            println!("  rail serve <f> --http N  Serve main's output as HTML on port N");
             println!("  rail compile <file.rail> Compile and run (native ARM64/x86_64)");
             println!("  rail check <file.rail>   Type-check a Rail program");
             println!("  rail parse <file.rail>   Parse and show AST");
