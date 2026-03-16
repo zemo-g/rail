@@ -16,6 +16,7 @@ is_digit c = has c digits
 is_alpha c = has c alpha_lower || has c alpha_upper || c == "_"
 is_alnum c = is_digit c || is_alpha c
 is_space c = c == " " || c == "\t"
+is_upper_first s = if length s == 0 then false else has (head (chars s)) alpha_upper
 kw_list = ["let", "if", "then", "else", "match", "type", "import", "module", "export", "effect", "perform", "handle", "with", "resume"]
 is_kw w = has w kw_list
 
@@ -76,7 +77,7 @@ tc cs acc =
     else if c == "|" then
       if nx == ">" then tc (tail r) (cons ("pi", "|>") acc)
       else if nx == "|" then tc (tail r) (cons ("op", "||") acc)
-      else tc r acc
+      else tc r (cons ("bar", "|") acc)
     else tc2 c r nx acc
 
 tc2 c r nx acc =
@@ -294,6 +295,11 @@ pe ts =
       let (_, r4) = xk "else" (sn r3)
       let (el, r5) = pe r4
       (["?", c, th, el], r5)
+    else if v == "match" then
+      let (scrut, r) = pe (ad ts2)
+      let r2 = sn r
+      let (arms, r3) = pmarms r2
+      (["M", scrut, arms], r3)
     else ppi ts2
   else ppi ts2
 
@@ -310,9 +316,60 @@ sks ts =
   else if ct ts == "eof" then ts
   else sks (ad ts)
 
+-- Match arm parsing: | Ctor x y -> body
+pmarms ts =
+  if ct ts == "bar" then
+    let r = ad ts
+    let (ctor, binds, r2) = pmpat r
+    let (_, r3) = xp "ar" r2
+    let (body, r4) = pe r3
+    let r5 = sn r4
+    let (rest, r6) = pmarms r5
+    (cons [ctor, binds, body] rest, r6)
+  else ([], ts)
+
+pmpat ts =
+  let ctor = cv ts
+  let r = ad ts
+  let (binds, r2) = collect_binds r
+  (ctor, binds, r2)
+
+collect_binds ts =
+  if ct ts == "id" then
+    let (rest, r) = collect_binds (ad ts)
+    (cons (cv ts) rest, r)
+  else ([], ts)
+
+-- Type declaration parsing: type Name = | Ctor1 args | Ctor2 args
+ptype ts =
+  let (name, r) = xp "id" ts
+  let (_, r2) = xp "eq" r
+  let r3 = sn r2
+  let (variants, r4) = pvariants r3 0
+  (["TY", name, variants], r4)
+
+pvariants ts idx =
+  if ct ts == "bar" then
+    let r = ad ts
+    let (ctor, r2) = xp "id" r
+    let (arity, r3) = count_params r2
+    let r4 = sn r3
+    let (rest, r5) = pvariants r4 (idx + 1)
+    (cons [ctor, idx, arity] rest, r5)
+  else ([], ts)
+
+count_params ts =
+  if ct ts == "id" then
+    let (n, r) = count_params (ad ts)
+    (n + 1, r)
+  else (0, ts)
+
 pdcl ts =
   let ts2 = sn ts
-  if ct ts2 == "id" then
+  if ct ts2 == "kw" then
+    if cv ts2 == "type" then ptype (ad ts2)
+    else (["E", "expected decl"], ts2)
+  else if ct ts2 == "id" then
     let n = cv ts2
     let r = ad ts2
     if ct r == "co" then pdcl (sks r)
@@ -391,7 +448,16 @@ fvs2 node bound tg =
   else if tg == "L" then fvs_l (head (tail node)) bound
   else if tg == "T" then fvs_l (head (tail node)) bound
   else if tg == "TD" then append (fvs (head (tail (tail node))) bound) (fvs (head (tail (tail (tail node)))) (append (head (tail node)) bound))
+  else if tg == "M" then append (fvs (head (tail node)) bound) (fvs_arms (head (tail (tail node))) bound)
   else []
+
+fvs_arms arms bound =
+  if length arms == 0 then []
+  else
+    let arm = head arms
+    let binds = head (tail arm)
+    let body = head (tail (tail arm))
+    append (fvs body (append binds bound)) (fvs_arms (tail arms) bound)
 
 fvs_l elems bound = if length elems == 0 then [] else append (fvs (head elems) bound) (fvs_l (tail elems) bound)
 
@@ -515,6 +581,14 @@ cg_bi3 fname args env ar lc sl tp =
     let (pa, lc1, sl1) = cg_push_args args env ar lc sl
     (cat [pa, cg_pop_regs (length args) 0, "    bl _rail_join\n"], lc1, sl1)
   else
+    let (cidx, carity) = decode_ctor (afind fname ar)
+    if cidx != (0 - 1) then
+      -- Constructor application: allocate ADT [5, cidx, fields...]
+      let nargs = length args
+      let alloc_size = 16 + nargs * 8
+      let (pa, lc1, sl1) = cg_push_args args env ar lc sl
+      (cat [pa, emit_load_int (show alloc_size), "    bl _rail_alloc\n    mov x1, #5\n    str x1, [x0]\n    mov x1, #", show cidx, "\n    str x1, [x0, #8]\n", pop_to_adt nargs 0], lc1, sl1)
+    else
     let voff = efind fname env
     if voff != (0 - 1) then
       -- Local variable (closure call): compile args, load closure, indirect call
@@ -554,10 +628,20 @@ cg node env ar lc sl tp =
     if off == 0 - 1 then
       if nm == "args" then
         ("    bl _rail_args\n", lc, sl)
-      else if afind nm ar == 0 then
+      else
+        let ar_val = afind nm ar
+        let (cidx, carity) = decode_ctor ar_val
+        if cidx != (0 - 1) then
+          if carity == 0 then
+            -- Zero-arg constructor: allocate [5, cidx]
+            (cat ["    mov x0, #16\n    bl _rail_alloc\n    mov x1, #5\n    str x1, [x0]\n    mov x1, #", show cidx, "\n    str x1, [x0, #8]\n"], lc, sl)
+          else
+            -- Constructor reference (as function value) — wrap in closure
+            (cat ["    ; TODO: constructor-as-value for ", nm, "\n    mov x0, #0\n"], lc, sl)
+        else if ar_val == 0 then
         let call = if tp then cat ["    ldp x29, x30, [sp]\n    add sp, sp, #2048\n    b _", nm, "\n"] else cat ["    bl _", nm, "\n"]
         (call, lc, sl)
-      else if afind nm ar != (0 - 1) then
+      else if ar_val != (0 - 1) then
         (cat ["    mov x0, #24\n    bl _rail_alloc\n    mov x1, #4\n    str x1, [x0]\n    adrp x1, _", nm, "@PAGE\n    add x1, x1, _", nm, "@PAGEOFF\n    str x1, [x0, #8]\n    mov x1, #0\n    str x1, [x0, #16]\n"], lc, sl)
       else (cat ["    ; ERROR undefined: ", nm, "\n"], lc, sl)
     else (cat ["    ldr x0, [x29, #", show off, "]\n"], lc, sl)
@@ -616,7 +700,48 @@ cg2 node env ar lc sl tg tp =
     let pcaps = push_captured caps env
     let casm = cat [pcaps, "    mov x0, #", show (24 + ncap * 8), "\n    bl _rail_alloc\n    mov x1, #4\n    str x1, [x0]\n    adr x1, ", flbl, "\n    str x1, [x0, #8]\n    mov x1, #", show ncap, "\n    str x1, [x0, #16]\n", pop_to_closure ncap 0]
     (cat [fasm, casm], lc1, sl)
+  else if tg == "M" then
+    let scrut = head (tail node)
+    let arms = head (tail (tail node))
+    let end_lbl = cat [".Lmatch_end_", show lc]
+    let (sa, lc1, sl1) = cg scrut env ar (lc + 1) sl false
+    let scrut_sl = sl1
+    let (arms_asm, lc2, sl2) = cg_arms arms scrut_sl env ar lc1 (scrut_sl + 8) end_lbl tp
+    (cat [sa, "    str x0, [x29, #", show scrut_sl, "]\n", arms_asm, end_lbl, ":\n"], lc2, sl2)
   else (cat ["    ; unknown node: ", tg, "\n    mov x0, #0\n"], lc, sl)
+
+-- Match arms codegen
+cg_arms arms scrut_sl env ar lc sl end_lbl tp =
+  if length arms == 0 then ("    mov x0, #0\n", lc, sl)
+  else
+    let arm = head arms
+    let ctor = head arm
+    let binds = head (tail arm)
+    let body = head (tail (tail arm))
+    let (cidx, _) = decode_ctor (afind ctor ar)
+    let is_last = length (tail arms) == 0
+    if is_last then
+      let (ext, env2, sl2) = extract_adt_fields binds scrut_sl 0 sl env
+      let (ba, lc1, sl3) = cg body env2 ar lc sl2 tp
+      (cat [ext, ba], lc1, sl3)
+    else
+      let next_lbl = cat [".Lmatch_arm_", show lc]
+      let check = cat ["    ldr x0, [x29, #", show scrut_sl, "]\n    ldr x0, [x0, #8]\n    cmp x0, #", show cidx, "\n    b.ne ", next_lbl, "\n"]
+      let (ext, env2, sl2) = extract_adt_fields binds scrut_sl 0 sl env
+      let (ba, lc1, sl3) = cg body env2 ar (lc + 1) sl2 tp
+      let (rest, lc2, sl4) = cg_arms (tail arms) scrut_sl env ar lc1 sl end_lbl tp
+      (cat [check, ext, ba, "    b ", end_lbl, "\n", next_lbl, ":\n", rest], lc2, sl4)
+
+-- Extract ADT fields into environment slots
+extract_adt_fields binds scrut_sl idx next_sl env =
+  if length binds == 0 then ("", env, next_sl)
+  else
+    let nm = head binds
+    let field_off = 16 + idx * 8
+    let load = cat ["    ldr x0, [x29, #", show scrut_sl, "]\n    ldr x0, [x0, #", show field_off, "]\n    str x0, [x29, #", show next_sl, "]\n"]
+    let env2 = cons (nm, next_sl) env
+    let (rest, env3, sl2) = extract_adt_fields (tail binds) scrut_sl (idx + 1) (next_sl + 8) env2
+    (cat [load, rest], env3, sl2)
 
 -- Push args onto stack (left to right)
 cg_push_args args env ar lc sl =
@@ -688,14 +813,43 @@ mk_env params off =
   if length params == 0 then []
   else cons (head params, off) (mk_env (tail params) (off + 8))
 
--- Get arities from all declarations
+-- Decode constructor from arity table: returns (ctor_index, arity) or (-1, -1)
+decode_ctor val =
+  if val <= (0 - 100) then
+    let raw = 0 - val - 100
+    (raw / 100, raw % 100)
+  else (0 - 1, 0 - 1)
+
+-- Pop fields from stack into ADT object (reverse order, like pop_to_tuple)
+pop_to_adt n i =
+  if i >= n then ""
+  else
+    let off = 16 + (n - 1 - i) * 8
+    cat ["    ldr x1, [sp], #16\n    str x1, [x0, #", show off, "]\n", pop_to_adt n (i + 1)]
+
+-- Get arities from all declarations (functions + constructors)
 get_arities decls =
   if length decls == 0 then []
   else
     let d = head decls
-    let nm = head (tail d)
-    let ps = head (tail (tail d))
-    cons (nm, length ps) (get_arities (tail decls))
+    if head d == "TY" then
+      let variants = head (tail (tail d))
+      append (ctor_arities variants) (get_arities (tail decls))
+    else
+      let nm = head (tail d)
+      let ps = head (tail (tail d))
+      cons (nm, length ps) (get_arities (tail decls))
+
+-- Encode constructor entries: (name, -(100 + idx*100 + arity))
+ctor_arities variants =
+  if length variants == 0 then []
+  else
+    let v = head variants
+    let name = head v
+    let idx = head (tail v)
+    let arity = head (tail (tail v))
+    let encoded = 0 - (100 + idx * 100 + arity)
+    cons (name, encoded) (ctor_arities (tail variants))
 
 -- Compile a single function declaration (returns (asm, new_lc))
 compile_func d ar lc =
@@ -716,6 +870,7 @@ compile_func d ar lc =
 -- Compile all functions, threading label counter
 compile_funcs decls ar lc =
   if length decls == 0 then ("", lc)
+  else if head (head decls) == "TY" then compile_funcs (tail decls) ar lc
   else
     let (fasm, lc1) = compile_func (head decls) ar lc
     let (rest, lc2) = compile_funcs (tail decls) ar lc1
@@ -869,9 +1024,12 @@ run_tests _ =
   let t32 = run_test "integ" "cat parts = join \"\" parts\ndbl x = x * 2\nmain =\n  let xs = map dbl [3, 5, 7]\n  let (a, b) = (head xs, length xs)\n  let _ = print (cat [\"sum=\", show (a + b)])\n  0" "sum=9"
   let t33 = run_test "tco" "loop n = if n == 0 then 42 else loop (n - 1)\nmain =\n  let _ = print (show (loop 50000))\n  0" "42"
   let t34 = run_test "bigint" "main =\n  let x = 100000\n  x - 99958" "42"
-  let total = (if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0) + (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0) + (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0) + (if t31 then 1 else 0) + (if t32 then 1 else 0) + (if t33 then 1 else 0) + (if t34 then 1 else 0)
-  let _ = print (cat [show total, "/34 tests passed"])
-  if total == 34 then 0 else 1
+  let t35 = run_test "adt_none" "type Option = | Some x | None\nmain = match None | Some x -> x | None -> 42" "42"
+  let t36 = run_test "adt_some" "type Option = | Some x | None\nmain = match (Some 42) | Some x -> x | None -> 0" "42"
+  let t37 = run_test "adt_pair" "type Pair = | MkPair a b\nfst p = match p | MkPair a b -> a\nmain = fst (MkPair 10 32)" "10"
+  let total = (if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0) + (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0) + (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0) + (if t31 then 1 else 0) + (if t32 then 1 else 0) + (if t33 then 1 else 0) + (if t34 then 1 else 0) + (if t35 then 1 else 0) + (if t36 then 1 else 0) + (if t37 then 1 else 0)
+  let _ = print (cat [show total, "/37 tests passed"])
+  if total == 37 then 0 else 1
 
 self_compile _ =
   let _ = print "\n=== Self-compilation ==="
