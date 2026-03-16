@@ -333,16 +333,45 @@ sks ts =
   else if ct ts == "eof" then ts
   else sks (ad ts)
 
--- Match arm parsing: | Ctor x y -> body
+-- Match arm parsing: | Ctor x y -> body | 42 -> body | "s" -> body | _ -> body | pat if guard -> body
 pmarms ts =
   if ct ts == "bar" then
     let r = ad ts
-    let (ctor, binds, r2) = pmpat r
-    let (_, r3) = xp "ar" r2
-    let (body, r4) = pe r3
-    let r5 = sn r4
-    let (rest, r6) = pmarms r5
-    (cons [ctor, binds, body] rest, r6)
+    if ct r == "int" then
+      let v = cv r
+      let r2 = ad r
+      let (guard, r3) = pguard r2
+      let (_, r4) = xp "ar" r3
+      let (body, r5) = pe r4
+      let r6 = sn r5
+      let (rest, r7) = pmarms r6
+      (cons [cat ["#int:", v], [], body, guard] rest, r7)
+    else if ct r == "str" then
+      let v = cv r
+      let r2 = ad r
+      let (guard, r3) = pguard r2
+      let (_, r4) = xp "ar" r3
+      let (body, r5) = pe r4
+      let r6 = sn r5
+      let (rest, r7) = pmarms r6
+      (cons [cat ["#str:", v], [], body, guard] rest, r7)
+    else
+      let (ctor, binds, r2) = pmpat r
+      let (guard, r3) = pguard r2
+      let (_, r4) = xp "ar" r3
+      let (body, r5) = pe r4
+      let r6 = sn r5
+      let (rest, r7) = pmarms r6
+      (cons [ctor, binds, body, guard] rest, r7)
+  else ([], ts)
+
+-- Parse optional guard: if expr
+pguard ts =
+  if ct ts == "kw" then
+    if cv ts == "if" then
+      let (g, r) = pe (ad ts)
+      (g, r)
+    else ([], ts)
   else ([], ts)
 
 pmpat ts =
@@ -839,6 +868,27 @@ cg2 node env ar lc sl tg tp =
   else (cat ["    ; unknown node: ", tg, "\n    mov x0, #0\n"], lc, sl)
 
 -- Match arms codegen
+-- Check if string starts with a prefix
+str_starts_with prefix s =
+  let pcs = chars prefix
+  let scs = chars s
+  ssw_acc pcs scs
+
+ssw_acc pcs scs =
+  if length pcs == 0 then true
+  else if length scs == 0 then false
+  else if head pcs == head scs then ssw_acc (tail pcs) (tail scs)
+  else false
+
+-- Get suffix after prefix
+str_after prefix s =
+  let n = length prefix
+  sa_acc (chars s) n
+
+sa_acc cs n =
+  if n == 0 then join "" cs
+  else sa_acc (tail cs) (n - 1)
+
 cg_arms arms scrut_sl env ar lc sl end_lbl tp =
   if length arms == 0 then ("    mov x0, #0\n", lc, sl)
   else
@@ -846,24 +896,52 @@ cg_arms arms scrut_sl env ar lc sl end_lbl tp =
     let ctor = head arm
     let binds = head (tail arm)
     let body = head (tail (tail arm))
+    let guard = if length arm > 3 then head (tail (tail (tail arm))) else []
     if ctor == "_" then
-      -- Wildcard: matches anything, no tag check, no field extraction
-      let (ba, lc1, sl2) = cg body env ar lc sl tp
-      (ba, lc1, sl2)
+      let (ga, lc0, sl0, next0) = cg_guard guard env ar lc sl end_lbl
+      let (ba, lc1, sl2) = cg body env ar lc0 sl0 tp
+      (cat [ga, ba], lc1, sl2)
+    else if str_starts_with "#int:" ctor then
+      let val = str_after "#int:" ctor
+      let next_lbl = cat [".Lmatch_arm_", show lc]
+      let check = cat ["    ldr x0, [x29, #", show scrut_sl, "]\n", emit_load_int val, "    lsl x1, x0, #1\n    orr x1, x1, #1\n    ldr x0, [x29, #", show scrut_sl, "]\n    bl _rail_eq\n    cmp x0, #1\n    b.eq ", next_lbl, "\n"]
+      let (ga, lc0, sl0, _) = cg_guard guard env ar (lc + 1) sl next_lbl
+      let (ba, lc1, sl2) = cg body env ar lc0 sl0 tp
+      let (rest, lc2, sl3) = cg_arms (tail arms) scrut_sl env ar lc1 sl end_lbl tp
+      (cat [check, ga, ba, "    b ", end_lbl, "\n", next_lbl, ":\n", rest], lc2, sl3)
+    else if str_starts_with "#str:" ctor then
+      let val = str_after "#str:" ctor
+      let next_lbl = cat [".Lmatch_arm_", show lc]
+      let slbl = cat [".Lmstr_", show lc]
+      let albl = cat [".Lmstra_", show lc]
+      let check = cat ["    b ", albl, "\n", slbl, ":\n    .asciz \"", esc_asm val, "\"\n    .p2align 2\n", albl, ":\n    ldr x0, [x29, #", show scrut_sl, "]\n    adr x1, ", slbl, "\n    mov x2, x0\n    mov x0, x1\n    mov x1, x2\n    bl _rail_eq\n    cmp x0, #1\n    b.eq ", next_lbl, "\n"]
+      let (ga, lc0, sl0, _) = cg_guard guard env ar (lc + 1) sl next_lbl
+      let (ba, lc1, sl2) = cg body env ar lc0 sl0 tp
+      let (rest, lc2, sl3) = cg_arms (tail arms) scrut_sl env ar lc1 sl end_lbl tp
+      (cat [check, ga, ba, "    b ", end_lbl, "\n", next_lbl, ":\n", rest], lc2, sl3)
     else
     let (cidx, _) = decode_ctor (afind ctor ar)
     let is_last = length (tail arms) == 0
     if is_last then
       let (ext, env2, sl2) = extract_adt_fields binds scrut_sl 0 sl env
-      let (ba, lc1, sl3) = cg body env2 ar lc sl2 tp
-      (cat [ext, ba], lc1, sl3)
+      let (ga, lc0, sl0, _) = cg_guard guard env2 ar lc sl2 end_lbl
+      let (ba, lc1, sl3) = cg body env2 ar lc0 sl0 tp
+      (cat [ext, ga, ba], lc1, sl3)
     else
       let next_lbl = cat [".Lmatch_arm_", show lc]
       let check = cat ["    ldr x0, [x29, #", show scrut_sl, "]\n    ldr x0, [x0, #8]\n    cmp x0, #", show cidx, "\n    b.ne ", next_lbl, "\n"]
       let (ext, env2, sl2) = extract_adt_fields binds scrut_sl 0 sl env
-      let (ba, lc1, sl3) = cg body env2 ar (lc + 1) sl2 tp
+      let (ga, lc0, sl0, _) = cg_guard guard env2 ar (lc + 1) sl2 next_lbl
+      let (ba, lc1, sl3) = cg body env2 ar lc0 sl0 tp
       let (rest, lc2, sl4) = cg_arms (tail arms) scrut_sl env ar lc1 sl end_lbl tp
-      (cat [check, ext, ba, "    b ", end_lbl, "\n", next_lbl, ":\n", rest], lc2, sl4)
+      (cat [check, ext, ga, ba, "    b ", end_lbl, "\n", next_lbl, ":\n", rest], lc2, sl4)
+
+-- Compile guard: if guard fails, jump to next_lbl
+cg_guard guard env ar lc sl next_lbl =
+  if length guard == 0 then ("", lc, sl, next_lbl)
+  else
+    let (ga, lc1, sl1) = cg guard env ar lc sl false
+    (cat [ga, "    cmp x0, #1\n    b.eq ", next_lbl, "\n"], lc1, sl1, next_lbl)
 
 -- Extract ADT fields into environment slots
 extract_adt_fields binds scrut_sl idx next_sl env =
@@ -1071,14 +1149,14 @@ rt_arith =
   let rge = "_rail_ge:\n    tst x1, #1\n    b.eq .Lge_float\n    cmp x1, x0\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lge_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
   cat [rsub, rmul, rdiv, rmod, rlt, rgt, rle, rge]
 
--- Synchronous fiber runtime (spawn saves closure, await runs it)
--- Fiber struct: [state(8), closure(8), result(8)] = 24 bytes
+-- Async fiber runtime (true stack-switching)
+-- Fiber struct: [state(8), sp(8), closure(8), result(8)] = 32 bytes
 -- States: 0=pending, 2=done
+-- spawn saves closure + allocates private stack
+-- await: saves main context, switches to fiber stack, runs closure, switches back
 rt_fiber =
-  -- spawn: save closure in fiber struct, return struct ptr
-  let rspawn = "_rail_spawn:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    str x0, [sp, #-16]!\n    mov x0, #24\n    bl _rail_alloc\n    ldr x1, [sp], #16\n    mov x2, #0\n    str x2, [x0]\n    str x1, [x0, #8]\n    str xzr, [x0, #16]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
-  -- await: if not done, run the closure, store result, mark done
-  let rawait = "_rail_await:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x0, [x29, #16]\n    ldr x1, [x0]\n    cmp x1, #2\n    b.eq .Lawait_done\n    ldr x1, [x0, #8]\n    ldr x5, [x1, #8]\n    ldr x3, [x1, #16]\n    mov x0, #1\n    cmp x3, #0\n    b.eq .Lawait_call\n    ldr x1, [x1, #24]\n.Lawait_call:\n    blr x5\n    ldr x1, [x29, #16]\n    str x0, [x1, #16]\n    mov x2, #2\n    str x2, [x1]\n.Lawait_done:\n    ldr x0, [x29, #16]\n    ldr x0, [x0, #16]\n    ldp x29, x30, [sp], #32\n    ret\n\n"
+  let rspawn = "_rail_spawn:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x0, [x29, #16]\n    mov x0, #32\n    bl _rail_alloc\n    str x0, [x29, #24]\n    str xzr, [x0]\n    ldr x1, [x29, #16]\n    str x1, [x0, #16]\n    str xzr, [x0, #24]\n    movz x0, #1, lsl #16\n    bl _rail_alloc\n    add x0, x0, #16, lsl #12\n    and x0, x0, #-16\n    ldr x1, [x29, #24]\n    str x0, [x1, #8]\n    ldr x0, [x29, #24]\n    ldp x29, x30, [sp], #32\n    ret\n\n"
+  let rawait = "_rail_await:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    mov x20, x0\n    stp x19, x20, [sp, #-16]!\n    stp x21, x22, [sp, #-16]!\n    stp x23, x24, [sp, #-16]!\n    stp x25, x26, [sp, #-16]!\n    stp x27, x28, [sp, #-16]!\n    mov x19, sp\n    ldr x4, [x20, #8]\n    mov sp, x4\n    ldr x0, [x20, #16]\n    ldr x5, [x0, #8]\n    ldr x3, [x0, #16]\n    mov x0, #1\n    cmp x3, #0\n    b.eq .Lawait_call\n    ldr x1, [x0, #24]\n.Lawait_call:\n    blr x5\n    str x0, [x20, #24]\n    mov x1, #2\n    str x1, [x20]\n    mov sp, x19\n    ldp x27, x28, [sp], #16\n    ldp x25, x26, [sp], #16\n    ldp x23, x24, [sp], #16\n    ldp x21, x22, [sp], #16\n    ldp x19, x20, [sp], #16\n    ldr x0, [x20, #24]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
   let ryield = "_rail_yield:\n    ret\n\n"
   let rinit = "_rail_fiber_init:\n    ret\n\n"
   cat [rspawn, rawait, ryield, rinit]
@@ -1220,9 +1298,11 @@ run_tests _ =
   let t55 = run_test "fold_sum" "add a b = a + b\nmain =\n  let _ = print (show (fold add 0 (range 101)))\n  0" "5050"
   let t56 = run_test "neg_arith" "main = 10 + (-3)" "7"
   let t57 = run_test "spawn" "work x = x * 2\nmain =\n  let f = spawn (\\x -> work 21)\n  fiber_await f" "42"
-  let total = (if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0) + (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0) + (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0) + (if t31 then 1 else 0) + (if t32 then 1 else 0) + (if t33 then 1 else 0) + (if t34 then 1 else 0) + (if t35 then 1 else 0) + (if t36 then 1 else 0) + (if t37 then 1 else 0) + (if t38 then 1 else 0) + (if t39 then 1 else 0) + (if t40 then 1 else 0) + (if t41 then 1 else 0) + (if t42 then 1 else 0) + (if t43 then 1 else 0) + (if t44 then 1 else 0) + (if t45 then 1 else 0) + (if t46 then 1 else 0) + (if t47 then 1 else 0) + (if t48 then 1 else 0) + (if t49 then 1 else 0) + (if t50 then 1 else 0) + (if t51 then 1 else 0) + (if t52 then 1 else 0) + (if t53 then 1 else 0) + (if t54 then 1 else 0) + (if t55 then 1 else 0) + (if t56 then 1 else 0) + (if t57 then 1 else 0)
-  let _ = print (cat [show total, "/57 tests passed"])
-  if total == 57 then 0 else 1
+  let t58 = run_test "match_int" "classify n = match n\n  | 0 -> \"zero\"\n  | 1 -> \"one\"\n  | _ -> \"other\"\nmain =\n  let _ = print (classify 1)\n  0" "one"
+  let t59 = run_test "guard" "type Option = | Some x | None\nsafe_div a b = match b\n  | 0 -> None\n  | _ -> Some (a / b)\nmain = match (safe_div 10 2)\n  | Some x -> x\n  | None -> 0" "5"
+  let total = (if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0) + (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0) + (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0) + (if t31 then 1 else 0) + (if t32 then 1 else 0) + (if t33 then 1 else 0) + (if t34 then 1 else 0) + (if t35 then 1 else 0) + (if t36 then 1 else 0) + (if t37 then 1 else 0) + (if t38 then 1 else 0) + (if t39 then 1 else 0) + (if t40 then 1 else 0) + (if t41 then 1 else 0) + (if t42 then 1 else 0) + (if t43 then 1 else 0) + (if t44 then 1 else 0) + (if t45 then 1 else 0) + (if t46 then 1 else 0) + (if t47 then 1 else 0) + (if t48 then 1 else 0) + (if t49 then 1 else 0) + (if t50 then 1 else 0) + (if t51 then 1 else 0) + (if t52 then 1 else 0) + (if t53 then 1 else 0) + (if t54 then 1 else 0) + (if t55 then 1 else 0) + (if t56 then 1 else 0) + (if t57 then 1 else 0) + (if t58 then 1 else 0) + (if t59 then 1 else 0)
+  let _ = print (cat [show total, "/59 tests passed"])
+  if total == 59 then 0 else 1
 
 self_compile _ =
   let _ = print "\n=== Self-compilation ==="
