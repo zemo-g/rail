@@ -53,8 +53,15 @@ int main(int argc, char **argv) {
         [cmdBuf commit];
         [cmdBuf waitUntilCompleted];
 
-        // Print results
+        // Write all results to file + print summary to stdout
         int *result = (int *)[buf contents];
+        FILE *fout = fopen("/tmp/rail_gpu_out.csv", "w");
+        for (int i = 0; i < n; i++) {
+            fprintf(fout, "%d", result[i]);
+            if (i < n-1) fprintf(fout, ",");
+        }
+        fclose(fout);
+        // Print first few to stdout for quick verification
         for (int i = 0; i < n && i < 16; i++) {
             printf("%d", result[i]);
             if (i < n-1 && i < 15) printf(",");
