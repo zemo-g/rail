@@ -426,6 +426,28 @@ pfp_count ts =
     (n + 1, r)
   else (0, ts)
 
+-- Filter out private functions (names starting with _) from imports
+filter_exports decls =
+  if length decls == 0 then []
+  else
+    let d = head decls
+    if head d == "fn" then
+      let nm = head (tail d)
+      if str_starts_with "_" nm then filter_exports (tail decls)
+      else cons d (filter_exports (tail decls))
+    else cons d (filter_exports (tail decls))
+
+-- Prefix all function names in declarations with a qualifier
+prefix_decls pfx decls =
+  if length decls == 0 then []
+  else
+    let d = head decls
+    let tag = head d
+    if tag == "fn" then
+      let nm = head (tail d)
+      cons (cons "fn" (cons (append pfx nm) (tail (tail d)))) (prefix_decls pfx (tail decls))
+    else cons d (prefix_decls pfx (tail decls))
+
 pdcl ts =
   let ts2 = sn ts
   if ct ts2 == "kw" then
@@ -460,8 +482,16 @@ pprog ts =
       let (path, r2) = xp "str" r
       let imp_src = read_file path
       let imp_toks = tokenize imp_src
-      let imp_decls = pprog imp_toks
-      append imp_decls (pprog r2)
+      let imp_decls = filter_exports (pprog imp_toks)
+      -- Check for "as Name" qualifier
+      let r3 = sn r2
+      if ct r3 == "id" then
+        if cv r3 == "as" then
+          let (qname, r4) = xp "id" (ad r3)
+          let prefixed = prefix_decls (append qname "_") imp_decls
+          append prefixed (pprog r4)
+        else append imp_decls (pprog r2)
+      else append imp_decls (pprog r2)
     else if cv ts2 == "link" then
       -- skip link pragmas for now
       let r = ad ts2
@@ -677,6 +707,15 @@ cg_bi2 fname args env ar lc sl tp =
   else if fname == "not" then
     let (aa, lc1, sl1) = cg (head args) env ar lc sl false
     (cat [aa, "    eor x0, x0, #2\n"], lc1, sl1)
+  else if fname == "rc_alloc" then
+    let (aa, lc1, sl1) = cg (head args) env ar lc sl false
+    (cat [aa, "    bl _rail_rc_alloc\n"], lc1, sl1)
+  else if fname == "rc_retain" then
+    let (aa, lc1, sl1) = cg (head args) env ar lc sl false
+    (cat [aa, "    ldr x1, [x0, #-8]\n    add x1, x1, #1\n    str x1, [x0, #-8]\n"], lc1, sl1)
+  else if fname == "rc_release" then
+    let (aa, lc1, sl1) = cg (head args) env ar lc sl false
+    (cat [aa, "    bl _rail_rc_release\n"], lc1, sl1)
   else if fname == "arena_mark" then
     ("    adrp x0, _rail_heap_ptr@PAGE\n    ldr x0, [x0, _rail_heap_ptr@PAGEOFF]\n", lc, sl)
   else if fname == "arena_reset" then
@@ -1147,7 +1186,11 @@ rt_arith =
   let rgt = "_rail_gt:\n    tst x1, #1\n    b.eq .Lgt_float\n    cmp x1, x0\n    cset x0, gt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lgt_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, gt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
   let rle = "_rail_le:\n    tst x1, #1\n    b.eq .Lle_float\n    cmp x1, x0\n    cset x0, le\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lle_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, ls\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
   let rge = "_rail_ge:\n    tst x1, #1\n    b.eq .Lge_float\n    cmp x1, x0\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lge_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
-  cat [rsub, rmul, rdiv, rmod, rlt, rgt, rle, rge]
+  -- rc_alloc: allocate refcounted object. x0 = size (tagged). Returns ptr to data (refcount at ptr-8)
+  let rrcalloc = "_rail_rc_alloc:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    asr x0, x0, #1\n    add x0, x0, #8\n    bl _malloc\n    mov x1, #1\n    str x1, [x0]\n    add x0, x0, #8\n    ldp x29, x30, [sp], #16\n    ret\n\n"
+  -- rc_release: decrement refcount, free if zero
+  let rrcrelease = "_rail_rc_release:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    ldr x1, [x0, #-8]\n    sub x1, x1, #1\n    str x1, [x0, #-8]\n    cbnz x1, .Lrc_keep\n    sub x0, x0, #8\n    bl _free\n.Lrc_keep:\n    ldp x29, x30, [sp], #16\n    ret\n\n"
+  cat [rsub, rmul, rdiv, rmod, rlt, rgt, rle, rge, rrcalloc, rrcrelease]
 
 -- Async fiber runtime (true stack-switching)
 -- Fiber struct: [state(8), sp(8), closure(8), result(8)] = 32 bytes
@@ -1300,9 +1343,12 @@ run_tests _ =
   let t57 = run_test "spawn" "work x = x * 2\nmain =\n  let f = spawn (\\x -> work 21)\n  fiber_await f" "42"
   let t58 = run_test "match_int" "classify n = match n\n  | 0 -> \"zero\"\n  | 1 -> \"one\"\n  | _ -> \"other\"\nmain =\n  let _ = print (classify 1)\n  0" "one"
   let t59 = run_test "guard" "type Option = | Some x | None\nsafe_div a b = match b\n  | 0 -> None\n  | _ -> Some (a / b)\nmain = match (safe_div 10 2)\n  | Some x -> x\n  | None -> 0" "5"
-  let total = (if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0) + (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0) + (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0) + (if t31 then 1 else 0) + (if t32 then 1 else 0) + (if t33 then 1 else 0) + (if t34 then 1 else 0) + (if t35 then 1 else 0) + (if t36 then 1 else 0) + (if t37 then 1 else 0) + (if t38 then 1 else 0) + (if t39 then 1 else 0) + (if t40 then 1 else 0) + (if t41 then 1 else 0) + (if t42 then 1 else 0) + (if t43 then 1 else 0) + (if t44 then 1 else 0) + (if t45 then 1 else 0) + (if t46 then 1 else 0) + (if t47 then 1 else 0) + (if t48 then 1 else 0) + (if t49 then 1 else 0) + (if t50 then 1 else 0) + (if t51 then 1 else 0) + (if t52 then 1 else 0) + (if t53 then 1 else 0) + (if t54 then 1 else 0) + (if t55 then 1 else 0) + (if t56 then 1 else 0) + (if t57 then 1 else 0) + (if t58 then 1 else 0) + (if t59 then 1 else 0)
-  let _ = print (cat [show total, "/59 tests passed"])
-  if total == 59 then 0 else 1
+  let _ = write_file "/tmp/rail_quallib.rail" "double x = x * 2\n_private x = x\n"
+  let t60 = run_test "qual_import" "import \"/tmp/rail_quallib.rail\" as M\nmain = M_double 21" "42"
+  let t61 = run_test "rc" "foreign free p\nmain =\n  let p = rc_alloc 16\n  let _ = rc_retain p\n  let _ = rc_release p\n  let _ = rc_release p\n  42" "42"
+  let total = (if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0) + (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0) + (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0) + (if t31 then 1 else 0) + (if t32 then 1 else 0) + (if t33 then 1 else 0) + (if t34 then 1 else 0) + (if t35 then 1 else 0) + (if t36 then 1 else 0) + (if t37 then 1 else 0) + (if t38 then 1 else 0) + (if t39 then 1 else 0) + (if t40 then 1 else 0) + (if t41 then 1 else 0) + (if t42 then 1 else 0) + (if t43 then 1 else 0) + (if t44 then 1 else 0) + (if t45 then 1 else 0) + (if t46 then 1 else 0) + (if t47 then 1 else 0) + (if t48 then 1 else 0) + (if t49 then 1 else 0) + (if t50 then 1 else 0) + (if t51 then 1 else 0) + (if t52 then 1 else 0) + (if t53 then 1 else 0) + (if t54 then 1 else 0) + (if t55 then 1 else 0) + (if t56 then 1 else 0) + (if t57 then 1 else 0) + (if t58 then 1 else 0) + (if t59 then 1 else 0) + (if t60 then 1 else 0) + (if t61 then 1 else 0)
+  let _ = print (cat [show total, "/61 tests passed"])
+  if total == 61 then 0 else 1
 
 self_compile _ =
   let _ = print "\n=== Self-compilation ==="
