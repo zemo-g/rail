@@ -760,7 +760,25 @@ cg_bi2 fname args env ar lc sl tp =
   else cg_bi3 fname args env ar lc sl tp
 
 cg_bi3 fname args env ar lc sl tp =
-  if fname == "map" then
+  if fname == "gpu_map" then
+    -- GPU map: compile-time Metal kernel generation
+    let f = head args
+    let data_arg = head (tail args)
+    if head f == "F" then
+      let param = head (tail f)
+      let body = head (tail (tail f))
+      let metal_expr = ast_to_metal body param
+      let kernel_src = gen_metal_kernel metal_expr
+      let (da, lc1, sl1) = cg data_arg env ar lc sl false
+      let klbl = cat [".Lgpu_k_", show lc1]
+      let kalbl = cat [".Lgpu_ka_", show lc1]
+      let kdata = cat ["    b ", kalbl, "\n", klbl, ":\n    .asciz \"", esc_asm kernel_src, "\"\n    .p2align 2\n", kalbl, ":\n"]
+      (cat [da, "    str x0, [sp, #-16]!\n", kdata, "    adr x0, ", klbl, "\n    ldr x1, [sp], #16\n    bl _rail_gpu_map\n"], lc1 + 1, sl1)
+    else
+      -- Fallback to CPU map
+      let (pa, lc1, sl1) = cg_push_args args env ar lc sl
+      (cat [pa, cg_pop_regs (length args) 0, "    bl _rail_map\n"], lc1, sl1)
+  else if fname == "map" then
     let (pa, lc1, sl1) = cg_push_args args env ar lc sl
     (cat [pa, cg_pop_regs (length args) 0, "    bl _rail_map\n"], lc1, sl1)
   else if fname == "join" then
@@ -1253,7 +1271,14 @@ rt_fiber =
   let rchanrecv = "_rail_chan_recv:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    ldr x1, [x0, #8]\n    ldr x2, [x1]\n    cmp x2, #2\n    b.eq .Lrecv_empty\n    ldr x3, [x1, #8]\n    ldr x4, [x1, #16]\n    str x4, [x0, #8]\n    mov x0, x3\n    ldp x29, x30, [sp], #16\n    ret\n.Lrecv_empty:\n    mov x0, #1\n    ldp x29, x30, [sp], #16\n    ret\n\n"
   cat [rspawn, rawait, ryield, rinit, rchansend, rchanrecv]
 
-runtime_asm = cat [rt_core, rt_list, rt_closure, rt_io, rt_args, rt_arith, rt_fiber]
+-- GPU map runtime: write Metal source, compile, run gpu_host, parse output to Rail list
+-- x0 = Metal kernel source string, x1 = data list
+rt_gpu =
+  let rgpumap = "_rail_gpu_map:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    mov x0, x1\n    bl _rail_length\n    str x0, [x29, #32]\n    b .Lgm_ap\n.Lgm_mp:\n    .asciz \"/tmp/rail_gpu.metal\"\n    .p2align 2\n.Lgm_ap:\n    adr x0, .Lgm_mp\n    ldr x1, [x29, #16]\n    bl _rail_write_file\n    b .Lgm_ac\n.Lgm_cc:\n    .asciz \"xcrun metal -c /tmp/rail_gpu.metal -o /tmp/rail_gpu.air 2>/dev/null && xcrun metallib /tmp/rail_gpu.air -o /tmp/rail_gpu.metallib 2>/dev/null\"\n    .p2align 2\n.Lgm_ac:\n    adr x0, .Lgm_cc\n    bl _rail_shell\n    ldr x0, [x29, #32]\n    bl _rail_show\n    str x0, [x29, #40]\n    b .Lgm_ahp\n.Lgm_hp:\n    .asciz \"/tmp/gpu_host /tmp/rail_gpu.metallib rail_kernel \"\n    .p2align 2\n.Lgm_ahp:\n    adr x0, .Lgm_hp\n    ldr x1, [x29, #40]\n    bl _rail_str_append\n    bl _rail_shell\n    str x0, [x29, #48]\n    b .Lgm_arf\n.Lgm_rf:\n    .asciz \"/tmp/rail_gpu_out.csv\"\n    .p2align 2\n.Lgm_arf:\n    adr x0, .Lgm_rf\n    bl _rail_read_file\n    str x0, [x29, #48]\n    b .Lgm_acm\n.Lgm_cm:\n    .asciz \",\"\n    .p2align 2\n.Lgm_acm:\n    adr x0, .Lgm_cm\n    ldr x1, [x29, #48]\n    bl _rail_split\n    bl _rail_parse_int_list\n    ldp x29, x30, [sp], #64\n    ret\n\n"
+  let rparselist = "_rail_parse_int_list:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x0, [x29, #16]\n    ldr x1, [x0]\n    cmp x1, #2\n    b.eq .Lpil_nil\n    ldr x1, [x0, #8]\n    str x1, [x29, #24]\n    ldr x0, [x0, #16]\n    bl _rail_parse_int_list\n    str x0, [sp, #-16]!\n    ldr x0, [x29, #24]\n    bl _atoi\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldr x1, [sp], #16\n    bl _rail_cons\n    ldp x29, x30, [sp], #32\n    ret\n.Lpil_nil:\n    adrp x0, _rail_nil@PAGE\n    add x0, x0, _rail_nil@PAGEOFF\n    ldp x29, x30, [sp], #32\n    ret\n\n"
+  cat [rgpumap, rparselist]
+
+runtime_asm = cat [rt_core, rt_list, rt_closure, rt_io, rt_args, rt_arith, rt_fiber, rt_gpu]
 
 -- ══════════════════════════════════════════════════════════════════════════════
 -- OPTIMIZATION PASSES
@@ -1292,6 +1317,14 @@ opt2 node tg =
     if im then
       let (im2, g, d) = is_map_app inner
       if im2 then opt ["A", ["A", ["V", "map"], ["F", "_fx", ["A", f, ["A", g, ["V", "_fx"]]]]], d]
+      else if head f == "F" then
+        let fparam = head (tail f)
+        let fbody = head (tail (tail f))
+        if is_gpu_safe fbody fparam then
+          if head inner != "V" then
+            ["D", "_gd", inner, ["?", ["O", ">=", ["A", ["V", "length"], ["V", "_gd"]], ["I", "50000"]], ["A", ["A", ["V", "gpu_map"], f], ["V", "_gd"]], ["A", ["A", ["V", "map"], f], ["V", "_gd"]]]]
+          else onode
+        else onode
       else onode
     else onode
   else node
@@ -1312,6 +1345,40 @@ opt_decls decls =
     if head d == "fn" then
       cons ["fn", head (tail d), head (tail (tail d)), opt (head (tail (tail (tail d))))] (opt_decls (tail decls))
     else cons d (opt_decls (tail decls))
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- GPU AUTO-DISPATCH
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Check if AST is GPU-safe: pure arithmetic on param + int literals only
+is_gpu_safe node param =
+  let tg = head node
+  if tg == "I" then true
+  else if tg == "V" then head (tail node) == param
+  else if tg == "O" then
+    let op = head (tail node)
+    if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" then
+      if is_gpu_safe (head (tail (tail node))) param then
+        is_gpu_safe (head (tail (tail (tail node)))) param
+      else false
+    else false
+  else false
+
+-- Convert AST to Metal Shading Language expression
+ast_to_metal node param =
+  let tg = head node
+  if tg == "I" then head (tail node)
+  else if tg == "V" then "x"
+  else if tg == "O" then
+    let op = head (tail node)
+    let left = ast_to_metal (head (tail (tail node))) param
+    let right = ast_to_metal (head (tail (tail (tail node)))) param
+    cat ["(", left, " ", op, " ", right, ")"]
+  else "0"
+
+-- Generate complete Metal compute kernel source
+gen_metal_kernel body_expr =
+  cat ["#include <metal_stdlib>\nusing namespace metal;\nkernel void rail_kernel(device int *data [[buffer(0)]], uint id [[thread_position_in_grid]]) {\n    int x = data[id];\n    data[id] = ", body_expr, ";\n}\n"]
 
 -- Compile full program to assembly text
 compile_program src =
@@ -1601,10 +1668,10 @@ compile_linux path =
   let _ = print (cat ["  ", info])
   0
 
--- Dispatch: wasm via subprocess (keeps compile.rail within self-compile size limit)
+-- Dispatch: wasm via tools/wasm_compile.sh (Python parser + WAT codegen)
 dispatch_wasm path =
-  let me = head args
-  let out = shell (cat [me, " run tools/wasm.rail ", path, " 2>&1"])
+  let _ = print (cat ["Compiling ", path, " to WASM..."])
+  let out = shell (cat ["bash tools/wasm_compile.sh ", path, " 2>&1"])
   let _ = print out
   0
 
