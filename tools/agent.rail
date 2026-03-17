@@ -1,0 +1,677 @@
+-- agent.rail — The Rail Agent v3
+-- An autonomous system that thinks by writing Rail programs.
+-- Forges tools, probes the compiler, trains its own LoRA, deploys, evolves.
+-- Pure Rail. The language is the agent is the compiler.
+--
+-- Usage: ./rail_native run tools/agent.rail
+-- Goal:  edit tools/agent_goal.txt (hot-reloaded each cycle)
+-- Modes: explore | improve | repair | train | deploy <host> | evolve | auto [N]
+-- Auto: explore → improve → repair → train → sync → evolve (closed loop)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- FOUNDATION
+-- ══════════════════════════════════════════════════════════════════════════════
+
+str_cat parts = join "" parts
+trim s = head (split "\n" s)
+
+esc_json s = esc_acc (chars s) ""
+esc_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let e = if c == "\"" then "\\\"" else if c == "\n" then "\\n" else if c == "\\" then "\\\\" else if c == "\t" then "\\t" else c
+    esc_acc (tail cs) (append acc e)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ADAPTER SWAP — single MLX server, swap LoRA adapters on demand
+-- ══════════════════════════════════════════════════════════════════════════════
+
+adapter_code = "/Users/ledaticempire/projects/rail/training/adapters_st"
+adapter_reason = "/Users/ledaticempire/projects/rail/training/adapters_reason"
+model_path = "/Users/ledaticempire/models/Qwen3.5-9B-6bit"
+mlx_python = "/Users/ledaticempire/homebrew/bin/python3.11"
+
+-- Check if reasoning adapter exists (trained)
+has_reason_adapter _ =
+  trim (shell "test -f /Users/ledaticempire/projects/rail/training/adapters_reason/adapters.safetensors && echo yes || echo no")
+
+-- Read current adapter mode
+current_mode _ =
+  let mode = trim (read_file "/tmp/rail_agent_adapter_mode")
+  if length mode > 0 then mode else "code"
+
+-- Swap adapter: kill MLX, restart with new adapter, wait for warmup
+swap_adapter mode =
+  let cur = current_mode 0
+  if cur == mode then 0
+  else
+    let _ = print (str_cat ["  [swap] ", cur, " → ", mode])
+    let _ = shell "pkill -f 'mlx_lm.server' 2>/dev/null; sleep 3"
+    let adapter_path = if mode == "reason" then adapter_reason else adapter_code
+    let _ = shell (str_cat [mlx_python, " -m mlx_lm.server --model ", model_path, " --adapter-path ", adapter_path, " --host 0.0.0.0 --port 8080 --trust-remote-code --max-tokens 4096 > /tmp/mlx_agent_server.log 2>&1 &"])
+    let _ = shell "sleep 10"
+    let _ = wait_server 0
+    let _ = write_file "/tmp/rail_agent_adapter_mode" mode
+    0
+
+wait_server attempt =
+  if attempt >= 4 then print "  [swap] server not ready after 40s"
+  else
+    let check = trim (shell "curl -s -m 3 http://localhost:8080/v1/models 2>/dev/null | head -c 10")
+    if length check > 3 then print "  [swap] server ready"
+    else
+      let _ = shell "sleep 10"
+      wait_server (attempt + 1)
+
+-- Code brain: call MLX with code LoRA
+llm_code usr =
+  let body = str_cat ["{\"model\":\"", model_path, "\",\"messages\":[{\"role\":\"system\",\"content\":\"", esc_json rail_sys, "\"},{\"role\":\"user\",\"content\":\"", esc_json usr, "\"}],\"max_tokens\":2048,\"temperature\":0.3,\"chat_template_kwargs\":{\"enable_thinking\":false}}"]
+  let _ = write_file "/tmp/rail_agent_req.json" body
+  let _ = shell "curl -s http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d @/tmp/rail_agent_req.json > /tmp/rail_agent_resp.json"
+  shell "jq -r '.choices[0].message.content' /tmp/rail_agent_resp.json 2>/dev/null | grep -v '^`'"
+
+-- Reason brain: local MLX with reasoning LoRA, or Claude fallback
+reason_sys = "You are a Rail compiler expert. Rail is a pure functional language that compiles to native ARM64 via a self-hosting compiler. Analyze errors, diagnose root causes, and propose minimal fixes. When proposing fixes, use OLD:/ENDOLD/NEW:/ENDNEW markers."
+
+llm_reason sys usr =
+  let has_adapter = has_reason_adapter 0
+  if has_adapter == "yes" then
+    -- Use local reasoning adapter
+    let full_sys = if length sys > 0 then sys else reason_sys
+    let body = str_cat ["{\"model\":\"", model_path, "\",\"messages\":[{\"role\":\"system\",\"content\":\"", esc_json full_sys, "\"},{\"role\":\"user\",\"content\":\"", esc_json usr, "\"}],\"max_tokens\":4096,\"temperature\":0.5,\"chat_template_kwargs\":{\"enable_thinking\":false}}"]
+    let _ = write_file "/tmp/rail_agent_req.json" body
+    let _ = shell "curl -s http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d @/tmp/rail_agent_req.json > /tmp/rail_agent_resp.json"
+    let resp = shell "jq -r '.choices[0].message.content' /tmp/rail_agent_resp.json 2>/dev/null | grep -v '^`'"
+    -- Auto-harvest reasoning call
+    let _ = harvest_reason_call usr resp
+    resp
+  else
+    -- Fallback to Claude
+    let prompt = str_cat [sys, "\n\n", usr]
+    let _ = write_file "/tmp/rail_agent_claude_in.txt" prompt
+    let resp = shell "claude -p < /tmp/rail_agent_claude_in.txt 2>/dev/null"
+    -- Auto-harvest Claude's response too
+    let _ = harvest_reason_call usr resp
+    resp
+
+-- Auto-harvest every reasoning call for future training
+harvest_reason_call usr resp =
+  if length resp < 20 then 0
+  else
+    let q = "\""
+    let line = str_cat ["{", q, "messages", q, ":[{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, esc_json reason_sys, q, "},{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, esc_json usr, q, "},{", q, "role", q, ":", q, "assistant", q, ",", q, "content", q, ":", q, esc_json resp, q, "}]}"]
+    let _ = write_file "/tmp/rail_reason_harvest_line.txt" (str_cat [line, "\n"])
+    let _ = shell "cat /tmp/rail_reason_harvest_line.txt >> training/reason/harvest_reason.jsonl"
+    0
+
+rail_sys = "You are a Rail language expert. Rail is a pure functional language that compiles to native ARM64.\n\nRULES:\n- Functions: name params = body (top-level only)\n- let x = val (newline, 2-space indent) body — NO 'in' keyword\n- if cond then a else b (always both branches)\n- match expr | Pat -> body\n- Lists: [1,2,3], head, tail, cons, map, filter, fold, length, reverse, range\n- Tuples: (a,b), let (x,y) = expr\n- Lambda: \\x -> expr (SINGLE arg only)\n- Strings: join, split, append, show, print. NO ++ operator.\n- shell \"cmd\" for system commands, read_file/write_file for files\n- main must exist and return int\n- Use let _ = expr for side effects\n- && and || do NOT short-circuit — use nested if/else\n- Do NOT use 'cat' as a function name (conflicts with C)\n\nOutput ONLY Rail code. No markdown. No explanation."
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- MEMORY — persistent across cycles, survives restarts
+-- ══════════════════════════════════════════════════════════════════════════════
+
+vault = "/Users/ledaticempire/rail-brain"
+tool_dir = "tools/agent_tools"
+goal_file = "tools/agent_goal.txt"
+
+ensure_dirs _ =
+  let _ = shell (str_cat ["mkdir -p ", tool_dir, " ", vault, "/agent ", vault, "/gaps ", vault, "/tools ", vault, "/training"])
+  0
+
+-- Structured memory in Obsidian vault
+log_mem tag msg =
+  let _ = write_file "/tmp/rail_agent_mem.txt" (str_cat ["[", tag, "] ", msg, "\n"])
+  shell (str_cat ["cat /tmp/rail_agent_mem.txt >> ", vault, "/agent/log.md"])
+
+recall n =
+  shell (str_cat ["tail -", show n, " ", vault, "/agent/log.md 2>/dev/null"])
+
+-- Save a compiler gap as its own Obsidian note (no Claude call — save that for repair)
+save_gap name error code =
+  let _ = print (str_cat ["    saving gap: ", name])
+  let content = str_cat ["# Gap: ", name, "\n\n## Error\n", error, "\n\n## Code\nRAILCODE\n", code, "\nENDRAILCODE\n\n## Status\nOpen — awaiting repair\n"]
+  write_file (str_cat [vault, "/gaps/", name, ".md"]) content
+
+-- Update agent status page after each cycle
+update_status cycle tools_count gaps_count harvested_count =
+  let ts = trim (shell "date '+%Y-%m-%d %H:%M'")
+  let content = str_cat ["# Agent Status\n\n## Last Run\n- Cycle: ", show cycle, "\n- Time: ", ts, "\n- Tools: ", show tools_count, "\n- Gaps found: ", show gaps_count, "\n- Harvested: ", show harvested_count, "\n\n## Architecture\n- **Code brain**: Qwen 3.5-9B + Rail LoRA (localhost:8080)\n- **Reason brain**: Claude via `claude -p`\n- **Vault**: ~/rail-brain (Obsidian)\n\n## Capabilities\n- **forge** — LoRA writes Rail, compiler verifies\n- **explore** — gather system info, reuse saved tools\n- **improve** — adversarial compiler probes, gaps saved to vault\n- **train** — generate verified training data for LoRA harvest\n- **deploy** — cross-compile Linux ARM64, SCP + SSH\n- **evolve** — build new tools from curated suggestions\n\n## Links\n"]
+  let gap_list = shell (str_cat ["ls ", vault, "/gaps/*.md 2>/dev/null | xargs -I {} basename {} .md"])
+  let gap_links = if length gap_list > 0 then str_cat ["### Gaps\n", gap_list, "\n"] else ""
+  let _ = write_file (str_cat [vault, "/agent/status.md"]) (str_cat [content, gap_links])
+  -- Also write context.md for Claude sessions
+  let lora_progress = trim (read_file "training/self_train/progress.txt")
+  let recent = shell (str_cat ["tail -10 ", vault, "/agent/log.md 2>/dev/null"])
+  let ctx = str_cat ["# Rail Agent Context\n\nAuto-generated for Claude sessions.\n\n## Agent\n- Cycle: ", show cycle, " | Tools: ", show tools_count, " | Gaps: ", show gaps_count, " | Harvested: ", show harvested_count, "\n- Time: ", ts, "\n\n## LoRA\n", lora_progress, "\n\n## Recent Activity\n```\n", recent, "\n```\n\n## Open Gaps\n", gap_list, "\n"]
+  write_file (str_cat [vault, "/context.md"]) ctx
+
+-- Tool management
+list_tools _ =
+  shell (str_cat ["ls ", tool_dir, "/*.rail 2>/dev/null | xargs -I {} basename {} .rail 2>/dev/null"])
+
+read_tool name =
+  read_file (str_cat [tool_dir, "/", name, ".rail"])
+
+save_tool name code =
+  let path = str_cat [tool_dir, "/", name, ".rail"]
+  let _ = write_file path code
+  let _ = log_mem "tool" (str_cat ["saved ", name, " (", show (length code), " chars)"])
+  -- Also write tool doc to Obsidian
+  let doc = str_cat ["# Tool: ", name, "\n\nSource: `", path, "`\nSize: ", show (length code), " chars\n\n## Code\n```rail\n", code, "\n```\n"]
+  let _ = write_file (str_cat [vault, "/tools/", name, ".md"]) doc
+  path
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- FORGE — write Rail, compile, run, verify exit code
+-- ══════════════════════════════════════════════════════════════════════════════
+
+forge desc prev_err attempt =
+  if attempt > 3 then
+    let _ = log_mem "fail" (str_cat ["could not forge: ", desc])
+    ("FAILED", "")
+  else
+    -- Include existing tools as context
+    let tools_ctx = get_tools_context 0
+    let prompt = if length prev_err == 0 then
+      str_cat ["Write a Rail program to: ", desc, tools_ctx]
+    else
+      str_cat ["Write a Rail program to: ", desc, "\n\nPrevious error:\n", prev_err, "\n\nFix it. Output ONLY Rail code.", tools_ctx]
+    let code = llm_code prompt
+    let _ = write_file "/tmp/rail_agent_prog.rail" code
+    let compile_out = shell "cd ~/projects/rail && ./rail_native /tmp/rail_agent_prog.rail 2>&1"
+    let ok = trim (shell "test -f /tmp/rail_out && echo ok || echo fail")
+    if ok == "fail" then
+      let _ = print (str_cat ["    compile fail (", show attempt, "/3)"])
+      forge desc compile_out (attempt + 1)
+    else
+      -- Run with timeout, capture exit code via separate file
+      let _ = shell "perl -e 'alarm 10; exec @ARGV' /tmp/rail_out > /tmp/rail_agent_stdout.txt 2>&1; echo $? > /tmp/rail_agent_exit.txt"
+      let run_out = read_file "/tmp/rail_agent_stdout.txt"
+      let exit_code = trim (read_file "/tmp/rail_agent_exit.txt")
+      if exit_code == "0" then (run_out, code)
+      else
+        let _ = print (str_cat ["    runtime fail exit=", exit_code, " (", show attempt, "/3)"])
+        forge desc (str_cat ["Runtime error (exit ", exit_code, "): ", run_out]) (attempt + 1)
+
+last_elem xs = if length xs == 1 then head xs else last_elem (tail xs)
+
+-- Build context string from existing tools
+get_tools_context _ =
+  let tools = list_tools 0
+  if length tools == 0 then ""
+  else str_cat ["\n\nYou have these existing tools you can reference:\n", tools]
+
+-- Forge and save as a named tool
+forge_tool name desc =
+  let _ = print (str_cat ["  forging: ", name])
+  let existing = read_tool name
+  -- Skip if tool already exists and works
+  if length existing > 10 then
+    let _ = print (str_cat ["    reusing existing (", show (length existing), " chars)"])
+    existing
+  else
+    let (out, code) = forge desc "" 1
+    if out == "FAILED" then
+      let _ = print (str_cat ["    FAILED: ", name])
+      ""
+    else
+      let _ = print (str_cat ["    ok: ", trim out])
+      let _ = save_tool name code
+      out
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- HARVEST — with quality gate
+-- ══════════════════════════════════════════════════════════════════════════════
+
+harvest_example desc code =
+  -- Quality gate: reject garbage
+  if length desc < 15 then
+    let _ = print "    harvest skip: desc too short"
+    0
+  else if length code < 20 then
+    let _ = print "    harvest skip: code too short"
+    0
+  else if length (split "main" code) < 2 then
+    let _ = print "    harvest skip: no main function"
+    0
+  else
+    let q = "\""
+    let entry = str_cat ["{", q, "messages", q, ":[{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, "You are a Rail language expert.", q, "},{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, esc_json desc, q, "},{", q, "role", q, ":", q, "assistant", q, ",", q, "content", q, ":", q, esc_json code, q, "}]}"]
+    let _ = write_file "/tmp/rail_agent_harvest.txt" (str_cat [entry, "\n"])
+    let _ = shell "cat /tmp/rail_agent_harvest.txt >> training/self_train/harvest.jsonl"
+    let _ = log_mem "train" (str_cat ["harvested: ", trim desc])
+    -- Append to Obsidian training log
+    let _ = write_file "/tmp/rail_agent_tlog.txt" (str_cat ["- ", trim desc, "\n"])
+    let _ = shell (str_cat ["cat /tmp/rail_agent_tlog.txt >> ", vault, "/training/harvest_log.md"])
+    1
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- CAPABILITIES
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- 1. EXPLORE: gather information (reuses existing tools)
+explore _ =
+  let _ = print "\n═══ EXPLORE ═══"
+  let _ = forge_tool "sys_info" "Print system info on separate lines with labels. Use shell to get: hostname, sw_vers -productVersion for macOS version, sysctl -n hw.ncpu for CPU cores, df -h / for disk. Print each with a label like 'Host: ...' etc."
+  let _ = forge_tool "services" "List all running ledatic services. Run 'launchctl list | grep ledatic' via shell, print the output."
+  let _ = forge_tool "rail_stats" "Count Rail source files and total lines in ~/projects/rail. Use shell to run 'find ~/projects/rail -name *.rail | wc -l' and 'wc -l ~/projects/rail/tools/compile.rail'. Print both counts."
+  0
+
+-- 2. IMPROVE: adversarial compiler testing
+improve _ =
+  let _ = print "\n═══ IMPROVE ═══"
+  let _ = improve_test "nested_closure" "Write a Rail program with 3 levels of nested closures. An outer function returns a closure that returns another closure. Call all three levels and print the final result."
+  let _ = improve_test "large_adt" "Write a Rail program with an ADT that has 5 constructors (A, B, C, D, E) each with different arities. Pattern match on all 5 and compute a result."
+  let _ = improve_test "deep_recursion" "Write a Rail program that uses mutual recursion: function 'even' calls 'odd' and 'odd' calls 'even'. Test with n=1000 and print whether it is even."
+  let _ = improve_test "string_heavy" "Write a Rail program that builds a string by joining 50 elements from a range. Use map to convert each number to a string with show, then join them with commas."
+  let _ = improve_test "higher_order" "Write a Rail program that implements compose (f after g), applies it to double and add1 functions, maps the composed function over [1,2,3,4,5], and prints the result list joined by spaces."
+  0
+
+improve_test name desc =
+  let _ = print (str_cat ["  probe: ", name])
+  let code = llm_code desc
+  let _ = write_file "/tmp/rail_agent_test.rail" code
+  let compile_out = shell "cd ~/projects/rail && ./rail_native /tmp/rail_agent_test.rail 2>&1"
+  let ok = trim (shell "test -f /tmp/rail_out && echo ok || echo fail")
+  if ok == "fail" then
+    let _ = print (str_cat ["    GAP FOUND: ", trim compile_out])
+    let _ = log_mem "gap" (str_cat [name, ": ", trim compile_out])
+    let _ = save_gap name (trim compile_out) code
+    0
+  else
+    let _ = shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_out > /tmp/rail_agent_stdout.txt 2>&1; echo $? > /tmp/rail_agent_exit.txt"
+    let run_out = read_file "/tmp/rail_agent_stdout.txt"
+    let exit_code = trim (read_file "/tmp/rail_agent_exit.txt")
+    if exit_code == "0" then
+      let _ = print (str_cat ["    ok: ", trim run_out])
+      let safe_desc = str_cat ["Write a Rail program that tests ", name]
+      let _ = harvest_example safe_desc code
+      0
+    else
+      let _ = print (str_cat ["    RUNTIME FAIL: exit=", exit_code, " ", trim run_out])
+      let _ = log_mem "gap" (str_cat [name, " runtime: exit=", exit_code])
+      let _ = save_gap (str_cat [name, "_runtime"]) (str_cat ["exit=", exit_code]) code
+      0
+
+-- 3. TRAIN: generate targeted training examples
+train _ =
+  let _ = print "\n═══ TRAIN ═══"
+  let progress = read_file "training/self_train/progress.txt"
+  let _ = print (str_cat ["  LoRA: ", trim progress])
+  let _ = train_batch 1 5
+  0
+
+train_batch n max =
+  if n > max then
+    let _ = print (str_cat ["  Batch done: ", show max, " attempted"])
+    0
+  else
+    let _ = print (str_cat ["  Example ", show n, "/", show max])
+    -- Use hardcoded task descriptions — the LoRA can't write descriptions, only code
+    let desc = pick_train_task n
+    let (out, code) = forge desc "" 1
+    let _ = if out == "FAILED" then print "    skip: forge failed"
+      else
+        let _ = print (str_cat ["    harvested: ", desc])
+        harvest_example desc code
+    train_batch (n + 1) max
+
+pick_train_task n =
+  let tasks = ["Write a Rail program that implements insertion sort on a list of integers and prints the sorted result", "Write a Rail program that reverses each word in a sentence and prints the result", "Write a Rail program with a Tree ADT (Leaf and Node) that counts the total number of leaves", "Write a Rail program that computes the nth Fibonacci number using tail recursion and prints it for n equals 20", "Write a Rail program that uses fold to compute the product of all elements in a list", "Write a Rail program that finds the maximum element in a list using recursion", "Write a Rail program that checks if a string is a palindrome by comparing it with its reverse", "Write a Rail program that implements a simple stack using lists with push pop and peek operations", "Write a Rail program that flattens a list of lists into a single list using fold and append", "Write a Rail program that computes the GCD of two numbers using recursion"]
+  let idx = (n - 1) % 10
+  nth tasks idx
+
+nth xs n = if n <= 0 then head xs else nth (tail xs) (n - 1)
+
+-- 4. DEPLOY: cross-compile and send to remote hardware
+deploy target =
+  let _ = print "\n═══ DEPLOY ═══"
+  let _ = print (str_cat ["  Target: ", target])
+  let _ = forge_tool "deploy_payload" "Print hello from Rail on Linux. Print the hostname via shell 'hostname', then print 'Rail agent deployed successfully', and return 0."
+  let src = read_tool "deploy_payload"
+  if length src == 0 then
+    let _ = print "  No payload to deploy"
+    0
+  else
+    let _ = print "  Cross-compiling for Linux ARM64..."
+    let _ = write_file "/tmp/rail_agent_deploy.rail" src
+    let _ = shell "cd ~/projects/rail && ./rail_native linux /tmp/rail_agent_deploy.rail 2>&1"
+    let ok = trim (shell "test -f /tmp/rail_linux && echo ok || echo fail")
+    if ok == "fail" then
+      let _ = print "  Cross-compile failed"
+      0
+    else
+      let _ = print (str_cat ["  Deploying to ", target, "..."])
+      let scp_out = shell (str_cat ["scp -o ConnectTimeout=5 /tmp/rail_linux ", target, ":/tmp/rail_agent 2>&1"])
+      let ssh_out = shell (str_cat ["ssh -o ConnectTimeout=5 ", target, " 'chmod +x /tmp/rail_agent && /tmp/rail_agent' 2>&1"])
+      let _ = print (str_cat ["  Remote: ", trim ssh_out])
+      let _ = log_mem "deploy" (str_cat ["deployed to ", target, ": ", trim ssh_out])
+      0
+
+-- 5. REPAIR: async — submit gap to Claude (background), apply when ready
+repair _ =
+  let _ = print "\n═══ REPAIR ═══"
+  -- Check if Claude already responded from a previous cycle
+  let has_response = trim (shell "test -f /tmp/rail_repair_response.txt -a -s /tmp/rail_repair_response.txt && echo yes || echo no")
+  if has_response == "yes" then apply_patch 0
+  else
+    -- Check if we're waiting for Claude
+    let is_pending = trim (shell "test -f /tmp/rail_repair_pending && echo yes || echo no")
+    if is_pending == "yes" then
+      let _ = print "  Waiting for Claude (async)..."
+      0
+    else submit_gap 0
+
+-- Submit one gap to Claude in the background
+submit_gap _ =
+  let all_gaps = split "\n" (shell (str_cat ["ls ", vault, "/gaps/*.md 2>/dev/null | grep -v fixed"]))
+  let gap_count = length all_gaps
+  if gap_count == 0 then
+    let _ = print "  No gaps to repair."
+    0
+  else
+    let mem_lines = length (split "\n" (recall 5))
+    let gap_idx = mem_lines % gap_count
+    let gap_path = trim (nth all_gaps gap_idx)
+    let gap_name = trim (shell (str_cat ["basename ", gap_path, " .md"]))
+    let gap_code = extract_between (read_file gap_path) "RAILCODE" "ENDRAILCODE"
+    let gap_error = extract_between (read_file gap_path) "## Error" "## Code"
+    if length gap_code < 5 then
+      let _ = print "    no code in gap"
+      0
+    else
+      let _ = print (str_cat ["  Submitting: ", gap_name])
+      let rt = shell "sed -n '/^rt_core/,/^runtime_asm/p' tools/compile.rail | head -120"
+      let prompt = str_cat ["A self-hosting Rail compiler produces native ARM64. This program crashes:\n\n", gap_code, "\n\nError: ", trim gap_error, "\n\nRuntime:\n", rt, "\n\nPropose a MINIMAL fix. NO backticks. Format:\n\nOLD:\n(exact lines to replace)\nENDOLD\nNEW:\n(replacement)\nENDNEW"]
+      let _ = write_file "/tmp/rail_repair_prompt.txt" prompt
+      let _ = write_file "/tmp/rail_repair_gap.txt" gap_name
+      let _ = shell "rm -f /tmp/rail_repair_response.txt"
+      -- Background Claude call
+      let _ = shell "nohup sh -c 'claude -p < /tmp/rail_repair_prompt.txt > /tmp/rail_repair_response.txt 2>/dev/null' > /dev/null 2>&1 &"
+      let _ = shell "touch /tmp/rail_repair_pending"
+      let _ = log_mem "repair" (str_cat ["submitted: ", gap_name])
+      let _ = print "  Submitted (async). Will apply next cycle."
+      0
+
+-- Apply Claude's patch response
+apply_patch _ =
+  let _ = shell "rm -f /tmp/rail_repair_pending"
+  let raw = read_file "/tmp/rail_repair_response.txt"
+  let gap_name = trim (read_file "/tmp/rail_repair_gap.txt")
+  let _ = shell "rm -f /tmp/rail_repair_response.txt"
+  let gap_path = str_cat [vault, "/gaps/", gap_name, ".md"]
+  let gap_code = extract_between (read_file gap_path) "RAILCODE" "ENDRAILCODE"
+  let _ = print (str_cat ["  Applying patch for: ", gap_name])
+  -- Parse
+  let patch = strip_backticks raw
+  let old_s = extract_between patch "OLD:" "ENDOLD"
+  let new_s = extract_between patch "NEW:" "ENDNEW"
+  -- Fallback markers
+  let old_s = if length old_s < 3 then extract_between patch "OLD:" "NEW:" else old_s
+  if length old_s < 5 then
+    let _ = print "    unparseable patch"
+    let _ = log_mem "repair" (str_cat ["unparseable for ", gap_name])
+    0
+  else
+    let _ = print (str_cat ["  OLD: ", trim old_s])
+    let _ = print (str_cat ["  NEW: ", trim new_s])
+    -- Backup + apply via forge
+    let _ = shell "cp tools/compile.rail /tmp/compile.rail.backup && cp rail_native /tmp/rail_native.backup"
+    let _ = shell "cp tools/compile.rail /tmp/compile_patched.rail"
+    let _ = write_file "/tmp/rail_patch_old.txt" old_s
+    let _ = write_file "/tmp/rail_patch_new.txt" new_s
+    -- Forge a patcher program
+    let (patcher_out, _) = forge "Read /tmp/compile_patched.rail. Read /tmp/rail_patch_old.txt as old text. Read /tmp/rail_patch_new.txt as new text. Find where the first line of old text appears in the source. Replace those matching lines with the new text. Write result to /tmp/compile_patched.rail. Print OK or NOT_FOUND." "" 1
+    let _ = print (str_cat ["  Patcher: ", trim patcher_out])
+    -- Self-compile patched compiler
+    let _ = print "  Self-compiling..."
+    let _ = shell "cd ~/projects/rail && ./rail_native /tmp/compile_patched.rail 2>&1"
+    let ok = trim (shell "test -f /tmp/rail_out && echo ok || echo fail")
+    if ok == "fail" then
+      let _ = print "    won't compile — reverting"
+      let _ = log_mem "repair" (str_cat ["compile fail: ", gap_name])
+      0
+    else
+      let _ = shell "cp /tmp/rail_out /tmp/rail_patched && codesign -s - /tmp/rail_patched 2>/dev/null"
+      let _ = print "  Testing..."
+      let _ = shell "/tmp/rail_patched test > /tmp/rail_repair_tests.txt 2>&1"
+      let tests_ok = trim (shell "grep -c '67/67' /tmp/rail_repair_tests.txt 2>/dev/null")
+      if tests_ok == "0" then
+        let _ = print "    tests fail — reverting"
+        let _ = log_mem "repair" (str_cat ["tests fail: ", gap_name])
+        0
+      else
+        let _ = print "  67/67 pass. Testing gap..."
+        let _ = write_file "/tmp/rail_gap_test.rail" gap_code
+        let _ = shell "/tmp/rail_patched /tmp/rail_gap_test.rail 2>&1"
+        let _ = shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_out > /tmp/rail_agent_stdout.txt 2>&1; echo $? > /tmp/rail_agent_exit.txt"
+        let gap_exit = trim (read_file "/tmp/rail_agent_exit.txt")
+        if gap_exit == "0" then
+          let _ = print "  ★ GAP FIXED!"
+          let _ = shell "cp /tmp/compile_patched.rail tools/compile.rail && cp /tmp/rail_patched rail_native"
+          let _ = shell "cd ~/projects/rail && ./rail_native self 2>&1 && cp /tmp/rail_self rail_native"
+          let _ = shell (str_cat ["mv ", gap_path, " ", vault, "/gaps/fixed_", gap_name, ".md"])
+          let _ = log_mem "repair" (str_cat ["FIXED: ", gap_name])
+          1
+        else
+          let _ = print (str_cat ["    gap still crashes: exit=", gap_exit])
+          let _ = log_mem "repair" (str_cat ["gap crashes: ", gap_name, " exit=", gap_exit])
+          0
+
+-- Strip backtick lines from Claude output
+strip_backticks s =
+  let lines = split "\n" s
+  join "\n" (filter_backticks lines)
+
+filter_backticks lines =
+  if length lines == 0 then []
+  else
+    let line = head lines
+    let keep = if length line == 0 then true
+      else if head (chars line) == "`" then false
+      else true
+    if keep then cons line (filter_backticks (tail lines))
+    else filter_backticks (tail lines)
+
+-- Extract text between line markers using sed (Rail split is single-char only)
+extract_between text start_marker end_marker =
+  let _ = write_file "/tmp/rail_extract_tmp.txt" text
+  shell (str_cat ["sed -n '/^", start_marker, "/,/^", end_marker, "/{//d;p;}' /tmp/rail_extract_tmp.txt"])
+
+extract_after text marker =
+  let _ = write_file "/tmp/rail_extract_tmp.txt" text
+  shell (str_cat ["sed -n '/^", marker, "/,${//d;p;}' /tmp/rail_extract_tmp.txt"])
+
+-- 6. SYNC: mirror progress to vault + check reasoning retrain
+sync _ =
+  let progress = read_file "training/self_train/progress.txt"
+  let code_count = trim (shell "wc -l < training/self_train/harvest.jsonl 2>/dev/null")
+  let reason_count = trim (shell "wc -l < training/reason/harvest_reason.jsonl 2>/dev/null")
+  let content = str_cat ["# Training Progress\n\n## Self-Train\n```\n", progress, "```\n\n## Harvest\n- Code examples: ", code_count, "\n- Reasoning examples: ", reason_count, "\n"]
+  let _ = write_file (str_cat [vault, "/training/progress.md"]) content
+  -- Check if reasoning retrain needed (50+ new examples since last train)
+  let reason_n = parse_int reason_count
+  let has_adapter = has_reason_adapter 0
+  let threshold = if has_adapter == "yes" then 50 else 30
+  if reason_n >= threshold then
+    let _ = print (str_cat ["  [sync] ", show reason_n, " reasoning examples — consider training reasoning LoRA"])
+    let _ = log_mem "sync" (str_cat ["reasoning examples: ", show reason_n, " (threshold: ", show threshold, ")"])
+    0
+  else 0
+
+-- 7. EVOLVE: build new capabilities, informed by gaps and memory
+evolve _ =
+  let _ = print "\n═══ EVOLVE ═══"
+  let tools = list_tools 0
+  let memory = recall 20
+  let gaps = shell (str_cat ["ls ", vault, "/gaps/*.md 2>/dev/null | xargs -I {} basename {} .md"])
+  let _ = print (str_cat ["  Tools: ", tools])
+  let _ = if length gaps > 0 then print (str_cat ["  Known gaps: ", gaps]) else 0
+  -- Ask what to build next, with real context
+  -- Pick from a curated list of useful tools to build
+  let candidates = ["A tool that monitors memory usage by reading vm_stat and printing free pages", "A tool that checks how many training examples exist in training/self_train/harvest.jsonl and prints the count", "A tool that finds the largest Rail file by line count in tools/ and prints its name and size", "A tool that runs the compiler test suite and reports pass/fail count", "A tool that checks if the MLX server is responding on port 8080"]
+  let cycle_num = length (split "\n" memory)
+  let idx = cycle_num % 5
+  let suggestion = nth candidates idx
+  let names = ["mem_monitor", "training_stats", "biggest_rail", "test_runner", "mlx_health"]
+  let tool_name = nth names idx
+  let _ = print (str_cat ["  Building: ", tool_name, " — ", suggestion])
+  let _ = forge_tool tool_name suggestion
+  0
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- MAIN LOOP — with cycle budget
+-- ══════════════════════════════════════════════════════════════════════════════
+
+print_lines xs =
+  if length xs == 0 then 0
+  else
+    let _ = print (str_cat ["  • ", head xs])
+    print_lines (tail xs)
+
+parse_mode goal =
+  if length goal == 0 then "explore"
+  else
+    let words = split " " goal
+    let first = head words
+    if first == "explore" then "explore"
+    else if first == "improve" then "improve"
+    else if first == "repair" then "repair"
+    else if first == "train" then "train"
+    else if first == "deploy" then "deploy"
+    else if first == "evolve" then "evolve"
+    else if first == "auto" then "auto"
+    else "goal"
+
+parse_budget goal =
+  let words = split " " goal
+  if length words >= 2 then
+    let second = head (tail words)
+    parse_int second
+  else 5
+
+parse_int s = parse_int_acc (chars s) 0
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = if c == "0" then 0 else if c == "1" then 1 else if c == "2" then 2 else if c == "3" then 3 else if c == "4" then 4 else if c == "5" then 5 else if c == "6" then 6 else if c == "7" then 7 else if c == "8" then 8 else if c == "9" then 9 else 0
+    parse_int_acc (tail cs) (acc * 10 + d)
+
+run_cycle cycle max_cycles =
+  if cycle > max_cycles then
+    let _ = print (str_cat ["\n══ Completed ", show max_cycles, " cycles ══"])
+    let _ = log_mem "done" (str_cat ["completed ", show max_cycles, " cycles"])
+    let tools = list_tools 0
+    let tools_n = length (split "\n" tools)
+    let gaps_n = parse_int (trim (shell (str_cat ["ls ", vault, "/gaps/*.md 2>/dev/null | wc -l"])))
+    let harvested_n = parse_int (trim (shell (str_cat ["grep -c '\\[train\\]' ", vault, "/agent/log.md 2>/dev/null"])))
+    let _ = update_status max_cycles tools_n gaps_n harvested_n
+    let _ = print "\nSummary:"
+    let _ = print (str_cat ["  Tools: ", tools])
+    let _ = print (str_cat ["  Gaps: ", show gaps_n])
+    let _ = print (str_cat ["  Harvested: ", show harvested_n])
+    let _ = print (str_cat ["  Vault: ", vault])
+    0
+  else
+    let _ = print (str_cat ["\n╔══ Cycle ", show cycle, "/", show max_cycles, " ══╗"])
+    -- Hot-reload goal each cycle
+    let raw_goal = read_file goal_file
+    let goal = if length raw_goal > 1 then trim raw_goal else "auto 5"
+    let mode = parse_mode goal
+    let _ = print (str_cat ["  Mode: ", mode])
+
+    if mode == "explore" then
+      let _ = explore 0
+      run_cycle (cycle + 1) max_cycles
+    else if mode == "improve" then
+      let _ = improve 0
+      run_cycle (cycle + 1) max_cycles
+    else if mode == "train" then
+      let _ = train 0
+      run_cycle (cycle + 1) max_cycles
+    else if mode == "deploy" then
+      let target = join " " (tail (split " " goal))
+      let _ = deploy target
+      run_cycle (cycle + 1) max_cycles
+    else if mode == "evolve" then
+      let _ = evolve 0
+      run_cycle (cycle + 1) max_cycles
+    else if mode == "repair" then
+      let _ = repair 0
+      run_cycle (cycle + 1) max_cycles
+    else if mode == "auto" then
+      -- Phase 1: Code work (code adapter)
+      let _ = swap_adapter "code"
+      let _ = explore 0
+      let _ = improve 0
+      let _ = train 0
+      let _ = evolve 0
+      -- Phase 2: Reasoning work (reason adapter or Claude fallback)
+      let has_ra = has_reason_adapter 0
+      let _ = if has_ra == "yes" then swap_adapter "reason" else 0
+      let _ = repair 0
+      -- Phase 3: Sync and continue (swap back to code)
+      let _ = if has_ra == "yes" then swap_adapter "code" else 0
+      let _ = sync 0
+      run_cycle (cycle + 1) max_cycles
+    else
+      -- Goal mode: plan and execute
+      let _ = print "\n[planning...]"
+      let memory = recall 20
+      let steps = make_plan goal memory
+      let _ = print (str_cat ["  Plan: ", show (length steps), " steps"])
+      let _ = print_lines steps
+      let _ = print "\n[executing...]"
+      let context = run_steps steps "" 1
+      let _ = print "\n[synthesizing...]"
+      let (out, code) = forge (str_cat ["Build a tool for: ", goal, "\n\nContext:\n", context]) "" 1
+      let _ = if out == "FAILED" then print "  synthesis failed"
+        else
+          let _ = save_tool "latest" code
+          print (str_cat ["  done: ", trim out])
+      let _ = write_file goal_file "auto"
+      run_cycle (cycle + 1) max_cycles
+
+make_plan goal context =
+  let prompt = str_cat ["Break this goal into 3-5 concrete steps. Each step should describe what a Rail program needs to do. One step per line. No numbering. Start each with a verb.\n\nGoal: ", goal, "\n\nContext:\n", context]
+  let resp = llm_reason "" prompt
+  filter (\l -> length l > 5) (split "\n" resp)
+
+run_steps steps context step_num =
+  if length steps == 0 then context
+  else
+    let task = head steps
+    let _ = print (str_cat ["\n── Step ", show step_num, " ──"])
+    let _ = print (str_cat ["  Task: ", task])
+    let (out, code) = forge task "" 1
+    let new_ctx = if out == "FAILED" then
+      str_cat [context, "\nStep ", show step_num, ": ", task, " -> FAILED\n"]
+    else
+      let _ = save_tool (str_cat ["step_", show step_num]) code
+      str_cat [context, "\nStep ", show step_num, ": ", task, " -> ", trim out, "\n"]
+    run_steps (tail steps) new_ctx (step_num + 1)
+
+main =
+  let _ = ensure_dirs 0
+  let _ = print "╔══════════════════════════════════════════════════════╗"
+  let _ = print "║  RAIL AGENT v3                                      ║"
+  let _ = print "║  forges, probes, trains, deploys, evolves           ║"
+  let _ = print "╚══════════════════════════════════════════════════════╝"
+  let _ = print ""
+  let tools = list_tools 0
+  let _ = if length tools > 0 then print (str_cat ["  Tools: ", tools]) else print "  No saved tools yet."
+  let memory = recall 5
+  let _ = if length memory > 0 then
+    let _ = print "  Recent:"
+    let _ = print memory
+    0
+  else 0
+  -- Parse cycle budget from goal file (e.g. "auto 10" → 10 cycles)
+  let raw_goal = read_file goal_file
+  let goal = if length raw_goal > 1 then trim raw_goal else "auto 5"
+  let budget = parse_budget goal
+  let max = if budget > 0 then budget else 5
+  let _ = print (str_cat ["  Budget: ", show max, " cycles"])
+  run_cycle 1 max

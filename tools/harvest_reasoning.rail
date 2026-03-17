@@ -1,0 +1,135 @@
+-- harvest_reasoning.rail — Collect reasoning training data from Claude
+-- Reads gaps from vault, calls Claude for analysis, formats as JSONL
+-- Also generates planning examples from hardcoded goals
+-- Usage: cd ~/projects/rail && ./rail_native run tools/harvest_reasoning.rail
+
+str_cat parts = join "" parts
+trim s = head (split "\n" s)
+
+-- JSON escaping (char-by-char, same as agent.rail)
+esc_json s = esc_acc (chars s) ""
+esc_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let e = if c == "\"" then "\\\"" else if c == "\n" then "\\n" else if c == "\\" then "\\\\" else if c == "\t" then "\\t" else c
+    esc_acc (tail cs) (append acc e)
+
+-- Paths
+vault = "/Users/ledaticempire/rail-brain"
+harvest_file = "training/reason/harvest_reason.jsonl"
+
+-- Reasoning system prompt (distinct from code prompt)
+reason_sys = "You are a Rail compiler expert. Rail is a pure functional language that compiles to native ARM64 via a self-hosting compiler (tools/compile.rail). Analyze compiler errors, diagnose root causes in the ARM64 codegen or runtime, and propose minimal targeted fixes. When proposing fixes, use OLD:/ENDOLD/NEW:/ENDNEW markers with exact code to replace."
+
+-- Call Claude for reasoning
+ask_claude prompt =
+  let _ = write_file "/tmp/rail_harvest_claude_in.txt" prompt
+  let _ = print "  calling Claude..."
+  let result = shell "claude -p < /tmp/rail_harvest_claude_in.txt 2>/dev/null"
+  let _ = print (str_cat ["  got ", show (length result), " chars"])
+  result
+
+-- Write a JSONL entry
+write_entry usr asst =
+  let q = "\""
+  let line = str_cat ["{", q, "messages", q, ":[{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, esc_json reason_sys, q, "},{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, esc_json usr, q, "},{", q, "role", q, ":", q, "assistant", q, ",", q, "content", q, ":", q, esc_json asst, q, "}]}"]
+  let _ = write_file "/tmp/rail_harvest_line.txt" (str_cat [line, "\n"])
+  shell (str_cat ["cat /tmp/rail_harvest_line.txt >> ", harvest_file])
+
+-- Extract text between markers using sed
+extract_between path start end =
+  shell (str_cat ["sed -n '/^", start, "/,/^", end, "/{//d;p;}' ", path])
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- GAP HARVESTING — read gaps from vault, ask Claude, write training pairs
+-- ══════════════════════════════════════════════════════════════════════════════
+
+harvest_gaps _ =
+  let _ = print "\n=== Harvesting Gap Analyses ==="
+  let gap_files = split "\n" (shell (str_cat ["ls ", vault, "/gaps/*.md 2>/dev/null"]))
+  let _ = print (str_cat ["  Found ", show (length gap_files), " gap files"])
+  harvest_gap_list gap_files 0
+
+harvest_gap_list files count =
+  if length files == 0 then
+    let _ = print (str_cat ["  Harvested ", show count, " gap examples"])
+    count
+  else
+    let path = trim (head files)
+    if length path < 5 then harvest_gap_list (tail files) count
+    else
+      let name = trim (shell (str_cat ["basename ", path, " .md"]))
+      let _ = print (str_cat ["\n  Gap: ", name])
+      -- Write gap to temp for sed extraction
+      let content = read_file path
+      let _ = write_file "/tmp/rail_harvest_gap.txt" content
+      let code = extract_between "/tmp/rail_harvest_gap.txt" "RAILCODE" "ENDRAILCODE"
+      let error = extract_between "/tmp/rail_harvest_gap.txt" "## Error" "## Code"
+      if length code < 5 then
+        let _ = print "    skip: no code"
+        harvest_gap_list (tail files) count
+      else
+        let rt = shell "sed -n '/^rt_core/,/^runtime_asm/p' tools/compile.rail | head -120"
+        -- Variant 1: Full repair prompt
+        let prompt1 = str_cat ["This Rail program crashes with ", trim error, ":\n\n", code, "\n\nThe compiler runtime:\n", rt, "\n\nDiagnose the root cause and propose a minimal fix using OLD:/ENDOLD/NEW:/ENDNEW markers."]
+        let resp1 = ask_claude prompt1
+        let _ = if length resp1 > 20 then write_entry prompt1 resp1 else 0
+        -- Variant 2: Just diagnosis (no patch request)
+        let prompt2 = str_cat ["This Rail program crashes with ", trim error, ":\n\n", code, "\n\nExplain in one paragraph why this crashes and what the compiler would need to handle it."]
+        let resp2 = ask_claude prompt2
+        let _ = if length resp2 > 20 then write_entry prompt2 resp2 else 0
+        -- Variant 3: Different framing
+        let prompt3 = str_cat ["A user reports their Rail program segfaults:\n\n", code, "\n\nThe compiler produces ARM64 native binaries. Error: ", trim error, ". What is the likely cause and how should the compiler be fixed?"]
+        let resp3 = ask_claude prompt3
+        let _ = if length resp3 > 20 then write_entry prompt3 resp3 else 0
+        let new_count = count + 3
+        harvest_gap_list (tail files) new_count
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- PLANNING HARVESTING — ask Claude to plan goals, write training pairs
+-- ══════════════════════════════════════════════════════════════════════════════
+
+planning_goals = ["Check system health: disk space, memory, running services, and build a monitoring tool", "Find all Rail source files over 100 lines, analyze their complexity, report findings", "Test the compiler with 10 edge cases and document which ones fail", "Build a tool that reads the LoRA training progress and generates a report", "Cross-compile a hello world program for Linux ARM64 and verify it links", "Analyze the self-train harvest file and report statistics: total examples, unique tasks, average code length", "Build a dashboard that shows compiler test results, gap count, and training progress", "Find all uses of shell in Rail source files and check for command injection risks", "Implement a file watcher that recompiles when a .rail file changes", "Build a tool that compares two Rail programs and reports which language features each uses"]
+
+harvest_plans _ =
+  let _ = print "\n=== Harvesting Planning Examples ==="
+  harvest_plan_list planning_goals 0
+
+harvest_plan_list goals count =
+  if length goals == 0 then
+    let _ = print (str_cat ["  Harvested ", show count, " planning examples"])
+    count
+  else
+    let goal = head goals
+    let _ = print (str_cat ["\n  Goal: ", goal])
+    let prompt = str_cat ["Break this goal into 3-5 concrete steps. Each step should describe what a Rail program needs to do. One step per line. Start each with a verb. No numbering.\n\nGoal: ", goal]
+    let resp = ask_claude prompt
+    if length resp > 20 then
+      let _ = write_entry prompt resp
+      -- Variant: different framing
+      let prompt2 = str_cat ["You are planning work for an autonomous Rail agent. It can write and compile Rail programs, read files, run shell commands, and deploy to remote hardware. Plan how to: ", goal]
+      let resp2 = ask_claude prompt2
+      let _ = if length resp2 > 20 then write_entry prompt2 resp2 else 0
+      harvest_plan_list (tail goals) (count + 2)
+    else harvest_plan_list (tail goals) count
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- MAIN
+-- ══════════════════════════════════════════════════════════════════════════════
+
+main =
+  let _ = print "╔══════════════════════════════════════════════════════╗"
+  let _ = print "║  REASONING DATA HARVESTER                           ║"
+  let _ = print "╚══════════════════════════════════════════════════════╝"
+  let _ = shell (str_cat ["mkdir -p training/reason"])
+  let existing = trim (shell (str_cat ["wc -l < ", harvest_file, " 2>/dev/null || echo 0"]))
+  let _ = print (str_cat ["  Existing examples: ", existing])
+  let gap_count = harvest_gaps 0
+  let plan_count = harvest_plans 0
+  let total = trim (shell (str_cat ["wc -l < ", harvest_file]))
+  let _ = print (str_cat ["\n=== Done ==="])
+  let _ = print (str_cat ["  Gap examples: ", show gap_count])
+  let _ = print (str_cat ["  Plan examples: ", show plan_count])
+  let _ = print (str_cat ["  Total in harvest: ", total])
+  0

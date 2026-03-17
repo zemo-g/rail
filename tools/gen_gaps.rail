@@ -1,0 +1,90 @@
+-- gen_gaps.rail — Generate synthetic compiler gaps for reasoning training
+-- Reads edge-case programs from tools/edge_cases/, compiles each,
+-- captures errors, asks Claude for analysis, harvests as training data
+-- Usage: cd ~/projects/rail && ./rail_native run tools/gen_gaps.rail
+
+str_cat parts = join "" parts
+trim s = head (split "\n" s)
+
+esc_json s = esc_acc (chars s) ""
+esc_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let e = if c == "\"" then "\\\"" else if c == "\n" then "\\n" else if c == "\\" then "\\\\" else if c == "\t" then "\\t" else c
+    esc_acc (tail cs) (append acc e)
+
+harvest_file = "training/reason/harvest_reason.jsonl"
+reason_sys = "You are a Rail compiler expert. Rail is a pure functional language that compiles to native ARM64 via a self-hosting compiler (tools/compile.rail). Analyze compiler errors, diagnose root causes in the ARM64 codegen or runtime, and propose minimal targeted fixes. When proposing fixes, use OLD:/ENDOLD/NEW:/ENDNEW markers with exact code to replace."
+
+write_entry usr asst =
+  let q = "\""
+  let line = str_cat ["{", q, "messages", q, ":[{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, esc_json reason_sys, q, "},{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, esc_json usr, q, "},{", q, "role", q, ":", q, "assistant", q, ",", q, "content", q, ":", q, esc_json asst, q, "}]}"]
+  let _ = write_file "/tmp/rail_harvest_line.txt" (str_cat [line, "\n"])
+  shell (str_cat ["cat /tmp/rail_harvest_line.txt >> ", harvest_file])
+
+ask_claude prompt =
+  let _ = write_file "/tmp/rail_gengap_claude.txt" prompt
+  let _ = print "    asking Claude..."
+  let result = shell "claude -p < /tmp/rail_gengap_claude.txt 2>/dev/null"
+  let _ = print (str_cat ["    got ", show (length result), " chars"])
+  result
+
+-- Test one edge case file, harvest if it fails
+test_file path =
+  let name = trim (shell (str_cat ["basename ", path, " .rail"]))
+  let code = read_file path
+  if length code < 10 then 0
+  else
+    let _ = print (str_cat ["  ", name, " (", show (length code), " chars)"])
+    let _ = write_file "/tmp/rail_gengap_test.rail" code
+    let compile_out = shell "cd ~/projects/rail && ./rail_native /tmp/rail_gengap_test.rail 2>&1"
+    let ok = trim (shell "test -f /tmp/rail_out && echo ok || echo fail")
+    if ok == "fail" then
+      let _ = print "    COMPILE FAIL"
+      let prompt = str_cat ["This Rail program fails to compile:\n\n", code, "\n\nCompiler output: ", trim compile_out, "\n\nExplain why it fails and what the compiler needs to handle it."]
+      let resp = ask_claude prompt
+      if length resp > 20 then
+        let _ = write_entry prompt resp
+        1
+      else 0
+    else
+      let _ = shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_out > /tmp/rail_gengap_stdout.txt 2>&1; echo $? > /tmp/rail_gengap_exit.txt"
+      let exit_code = trim (read_file "/tmp/rail_gengap_exit.txt")
+      if exit_code == "0" then
+        let output = trim (read_file "/tmp/rail_gengap_stdout.txt")
+        let _ = print (str_cat ["    ok: ", output])
+        0
+      else
+        let _ = print (str_cat ["    RUNTIME FAIL exit=", exit_code])
+        let rt = shell "sed -n '/^rt_core/,/^runtime_asm/p' tools/compile.rail | head -80"
+        let prompt = str_cat ["This Rail program compiles but crashes (exit ", exit_code, "):\n\n", code, "\n\nRuntime:\n", rt, "\n\nDiagnose the root cause and propose a fix."]
+        let resp = ask_claude prompt
+        if length resp > 20 then
+          let _ = write_entry prompt resp
+          1
+        else 0
+
+-- Iterate over files in edge_cases/
+run_files files count =
+  if length files == 0 then count
+  else
+    let path = trim (head files)
+    if length path < 5 then run_files (tail files) count
+    else
+      let n = test_file path
+      run_files (tail files) (count + n)
+
+main =
+  let _ = print "╔══════════════════════════════════════════════════════╗"
+  let _ = print "║  SYNTHETIC GAP GENERATOR                            ║"
+  let _ = print "╚══════════════════════════════════════════════════════╝"
+  let _ = shell "mkdir -p training/reason tools/edge_cases"
+  let files = split "\n" (shell "ls tools/edge_cases/*.rail 2>/dev/null")
+  let _ = print (str_cat ["  Edge case files: ", show (length files)])
+  let harvested = run_files files 0
+  let total = trim (shell (str_cat ["wc -l < ", harvest_file, " 2>/dev/null || echo 0"]))
+  let _ = print (str_cat ["\n=== Done ==="])
+  let _ = print (str_cat ["  Harvested: ", show harvested])
+  let _ = print (str_cat ["  Total: ", total])
+  0
