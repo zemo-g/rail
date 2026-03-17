@@ -1,51 +1,32 @@
 # Rail Roadmap
 
-## v0.3.0 (complete)
-- Thinking tag stripping (case-insensitive, 10 tags, unclosed handling)
-- `par_prompt` with MAX_CONCURRENT: 4
-- Algebraic effects: perform/handle/resume
-- String interpolation, hot reload, purity analysis
-- 120 tests (28 unit + 92 integration)
+## v1.0.0 (current)
+- Self-hosting ARM64 compiler (1,762 lines of Rail)
+- Fixed-point self-compilation — compiler compiles itself to byte-identical binary
+- 67 tests: arithmetic, strings, lists, tuples, ADTs, closures, TCO, FFI, floats, GPU, channels, imports
+- 22 stdlib libraries (json, http, sqlite, regex, base64, socket, mmap, etc.)
+- Metal GPU backend — compile Rail expressions to Metal compute shaders
+- WASM backend — compile Rail to WebAssembly
+- tree-sitter grammar + VS Code extension
+- `#generate` directive — compile-time AI code generation via local LLM
+- No dependencies beyond `as` + `ld`
 
-## v0.4.0 (complete)
-- Multi-line list literals `[a,\n  b,\n  c]`
-- Multi-line record literals `{ x: 1,\n  y: 2 }`
-- Trailing comma support in lists, records, tuples
-- Tuple destructuring in let: `let (a, b) = expr`
-- Recursion depth limit (200, prevents stack overflow)
-- Better parser errors with context
+## v1.1.0 — Language completeness
+- Pattern matching on strings
+- Multi-char `split` delimiter
+- Closures over mutable bindings
+- Records / named fields
+- Type checker (incremental)
 
-## v0.5.0 (complete)
-- `agent_loop` builtin — multi-turn tool-use loops
-- `prompt_stream` builtin — streaming LLM responses via callbacks
-- `prompt_typed` builtin — structured JSON output with retry
-- Conversation context: `context_new`, `context_push`, `context_prompt`
+## v1.2.0 — Developer experience
+- REPL
+- Formatter (`rail fmt`)
+- Better error messages with source locations
+- LSP server
 
-## v0.6.0 (complete)
-- LSP server (`rail lsp`) — diagnostics, hover, completion, go-to-definition
-- VS Code extension (editors/vscode/) — syntax highlighting + LSP client
-- Formatter (`rail fmt`, `rail fmt --check`)
-- Built-in test runner (`rail test`) — discovers test_ functions
-- REPL improvements — :help command, history persistence (~/.rail_history)
-- GitHub Actions CI — test on macOS + Linux, release binaries
-
-## v0.7.0 — Packages (next)
-- `rail.toml` dependencies (git + path)
-- `rail add` / `rail install`
-- Namespaced imports
-- crates.io publish
-
-## v0.8.0 — Native compiler parity (optional for v1.0)
-- Strings, lists, records, ADTs in native codegen
-- FFI for calling C functions
-
-## v0.9.0 — Stability
-- Fuzz testing
-- Benchmarks
-- Error recovery in parser (multiple diagnostics)
-- Edge case hardening
-
-## v1.0.0 — Stable release
-- Syntax frozen until v2.0
-- Builtins API frozen (additions OK, no removals/renames)
-- 200+ tests, LSP, CI, `cargo install rail-language`
+## v2.0.0 — Platform
+- Package manager (`rail get`)
+- Module system with namespaced imports
+- Algebraic effects
+- Linux ARM64 native (libc.s exists, needs testing)
+- x86_64 backend

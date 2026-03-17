@@ -27,7 +27,7 @@ Then the ARM64 native compiler was rewritten in Rail itself (`tools/compile.rail
 3. The output was byte-identical (fixed point)
 4. The Rust was deleted
 
-The language now bootstraps from a 186K seed binary. No Rust. No Cargo. No dependencies beyond macOS `as` + `ld`.
+The language now bootstraps from a 297K seed binary. No Rust. No Cargo. No dependencies beyond macOS `as` + `ld`.
 
 ## Install
 
@@ -45,7 +45,7 @@ Apple Silicon only (ARM64 macOS). No build step needed.
 ```bash
 ./rail_native self           # compiles itself → /tmp/rail_self
 cp /tmp/rail_self ./rail_native   # install
-./rail_native test           # 34/34
+./rail_native test           # 67/67
 ```
 
 ## Usage
@@ -53,7 +53,7 @@ cp /tmp/rail_self ./rail_native   # install
 ```bash
 ./rail_native <file.rail>           # compile to /tmp/rail_out
 ./rail_native run <file.rail>       # compile + execute
-./rail_native test                  # run 34-test suite
+./rail_native test                  # run 67-test suite
 ./rail_native self                  # self-compile (bootstrap)
 ```
 
@@ -100,7 +100,7 @@ main =
 
 ## How it works
 
-The compiler (`tools/compile.rail`, ~950 lines) does:
+The compiler (`tools/compile.rail`, ~1,762 lines) does:
 
 1. **Lexer** — tokenizes Rail source into a token stream
 2. **Parser** — builds an AST from tokens (lists with tag strings)
@@ -120,34 +120,31 @@ Key implementation details:
 | Category | Functions |
 |----------|-----------|
 | **I/O** | `print`, `show`, `read_file`, `write_file`, `shell` |
-| **Lists** | `head`, `tail`, `cons`, `append`, `length`, `map`, `join` |
+| **Lists** | `head`, `tail`, `cons`, `append`, `length`, `map`, `filter`, `fold`, `reverse`, `join`, `range` |
 | **Strings** | `chars`, `split`, `append` |
-| **System** | `args` |
+| **Math** | `not`, `to_float`, float arithmetic |
+| **Concurrency** | `spawn`, `channel`, `send`, `recv` |
+| **FFI** | `foreign` declarations for C library calls |
+| **System** | `args`, `import` |
 
 ## What's not here (yet)
 
 The self-hosting compiler handles the subset of Rail needed to compile itself. These features existed in the Rust implementation and can be re-added incrementally:
 
-- Pattern matching / ADTs
-- Floats
-- Records
-- Algebraic effects
-- Modules / imports
+- Records / named fields
 - Type checker
 - LSP / formatter / REPL
-- AI builtins
-
-The Rust code is preserved in git history if needed.
+- Algebraic effects
 
 ## Numbers
 
 | | Before | After |
 |---|--------|-------|
-| **Compiler** | 21,086 lines (Rust) | 950 lines (Rail) |
-| **Binary** | ~8MB (Rust + Cranelift) | 186K (pure ARM64) |
+| **Compiler** | 21,086 lines (Rust) | 1,762 lines (Rail) |
+| **Binary** | ~8MB (Rust + Cranelift) | 297K (pure ARM64) |
 | **Dependencies** | Cargo, Cranelift, Rayon | `as` + `ld` |
 | **Build time** | ~30s (cargo build) | ~5s (self-compile) |
-| **Tests** | 141 (Rust) | 34 (self-testing) |
+| **Tests** | 141 (Rust) | 67 (self-testing) |
 
 ## License
 
