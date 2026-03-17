@@ -11,7 +11,7 @@ if [ -z "$INPUT" ]; then
 fi
 
 # Use Python to parse Rail and emit WAT (much faster than bootstrapping)
-/opt/homebrew/bin/python3.11 - "$INPUT" << 'PYTHON'
+python3 - "$INPUT" << 'PYTHON'
 import sys, re
 
 src = open(sys.argv[1]).read()
