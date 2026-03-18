@@ -1,0 +1,132 @@
+-- overfitting_test.rail — 20 novel tasks the model has NEVER seen in training
+-- Tests generalization vs memorization after LoRA round 2
+-- Usage: ./rail_native run tools/train/overfitting_test.rail
+-- Requires: MLX server on :8080, rail_native in PATH
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+
+-- System prompt with full grammar + examples (the Rail advantage: compiler verifies)
+mk_sys dummy =
+  let grammar = read_file "grammar/rail.ebnf"
+  cat ["You are a Rail language expert. Rail compiles to native ARM64.\n\nGRAMMAR:\n", grammar, "\n\nCRITICAL RULES:\n- Functions: name params = body (top-level only, no 'let rec')\n- Let uses NEWLINES not 'in': let x = 5\\n  x + 1\n- If: if cond then a else b (always both branches)\n- Match: match expr | Pat args -> expr (NO 'with', NO '::')\n- Lambda: \\x -> expr (single arg only)\n- Lists: [1,2,3], head, tail, cons, map, filter, fold, length, reverse, range\n- Tuples: (a,b), let (x,y) = expr\n- ADTs: type T = | A x | B\\nmatch val | A x -> ... | B -> ...\n- Strings: \"hello\", NO char literals (no 'a'), NO string indexing\n- print outputs value, show converts int to string\n- join sep list, split sep str, chars str, append str1 str2\n- main must exist and return an int\n- Use let _ = print expr for side effects\n- NO: let rec, match...with, x::xs, [x], arr[i], where, in (at end of let)\n\nExamples:\nfact n = if n <= 1 then 1 else n * fact (n - 1)\nmain =\\n  let _ = print (show (fact 10))\\n  0\n\nadd a b = a + b\\nmain =\\n  let _ = print (show (fold add 0 (range 101)))\\n  0\n\ntype Option = | Some x | None\\nsafe_div a b = match b | 0 -> None | _ -> Some (a / b)\\nmain = match (safe_div 10 2) | Some x -> x | None -> 0\n\nnth xs n = if n == 0 then head xs else nth (tail xs) (n - 1)\\nmain = nth [10, 20, 30, 40] 2"]
+
+-- Call LLM (uses whatever model is on :8080)
+llm_call sys_msg user_msg =
+  let esc_sys = esc_json sys_msg
+  let esc_usr = esc_json user_msg
+  let req = cat ["{\"model\": \"/Users/ledaticempire/models/Qwen3.5-9B-6bit\", \"messages\": [{\"role\": \"system\", \"content\": \"", esc_sys, "\"}, {\"role\": \"user\", \"content\": \"", esc_usr, "\"}], \"max_tokens\": 1024, \"temperature\": 0.3, \"chat_template_kwargs\": {\"enable_thinking\": false}}"]
+  let _ = write_file "/tmp/rail_ot_req.json" req
+  let _ = shell "curl -s http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d @/tmp/rail_ot_req.json > /tmp/rail_ot_resp.json"
+  let _ = shell "/opt/homebrew/bin/python3.11 -c \"import json; d=json.load(open('/tmp/rail_ot_resp.json')); c=d['choices'][0]['message']['content']; lines=[l for l in c.split('\\\\n') if not l.startswith('\\`')]; open('/tmp/rail_ot_code.rail','w').write('\\\\n'.join(lines))\""
+  read_file "/tmp/rail_ot_code.rail"
+
+-- Generate with validation loop: up to 3 attempts, compiler feedback
+gen desc =
+  let sys = mk_sys 0
+  gen_loop desc sys "" 1
+
+gen_loop desc sys prev_err attempt =
+  if attempt > 3 then ""
+  else
+    let user = if prev_err == "" then
+      cat [desc, "\n\nOutput ONLY Rail code. No markdown, no explanation. Functions before main."]
+    else
+      cat [desc, "\n\nYour previous attempt failed to compile:\n", prev_err, "\n\nFix the errors. Output ONLY Rail code. No markdown. Functions before main."]
+    let code = llm_call sys user
+    let _ = write_file "/tmp/rail_ot_test.rail" code
+    let _ = shell "rm -f /tmp/rail_ot_bin"
+    let compile_out = trim (shell "cd ~/projects/rail && ./rail_native /tmp/rail_ot_test.rail 2>&1 && cp /tmp/rail_out /tmp/rail_ot_bin 2>&1")
+    let check = trim (shell "test -f /tmp/rail_ot_bin && echo ok || echo fail")
+    if check == "ok" then code
+    else if attempt < 3 then
+      let _ = print (cat ["  Attempt ", show attempt, " failed, retrying..."])
+      gen_loop desc sys (cat ["Code:\n", code, "\nError:\n", compile_out]) (attempt + 1)
+    else code
+
+-- JSON escape (minimal)
+esc_json s = esc_acc (chars s) ""
+esc_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let e = if c == "\"" then "\\\"" else if c == "\n" then "\\n" else if c == "\\" then "\\\\" else c
+    esc_acc (tail cs) (append acc e)
+
+-- Try to compile and run generated code
+test_gen name desc =
+  let _ = print (cat ["\n═══ ", name, " ═══"])
+  let _ = print (cat ["  Task: ", desc])
+  let code = gen desc
+  let _ = print (cat ["  Code:\n", code])
+  -- gen already compiled via validation loop; check if binary exists
+  let check = trim (shell "test -f /tmp/rail_ot_bin && echo ok || echo fail")
+  if check == "fail" then
+    let _ = print "  RESULT: FAIL (compile error after 3 attempts)"
+    0
+  else
+    -- Run with 5s timeout via perl alarm
+    let run_out = shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_ot_bin 2>&1; echo $?"
+    let lines = split "\n" run_out
+    let exit_code = last_elem lines
+    let stdout = join "\n" (init_list lines)
+    if exit_code == "0" then
+      let _ = print (cat ["  Output: ", stdout])
+      let _ = print "  RESULT: PASS"
+      1
+    else if exit_code == "142" then
+      let _ = print "  RESULT: FAIL (timeout)"
+      0
+    else
+      let _ = print (cat ["  Output: ", stdout])
+      let _ = print (cat ["  RESULT: FAIL (exit ", exit_code, ")"])
+      0
+
+-- Get last non-empty element (shell output has trailing newline)
+last_elem xs =
+  if length xs == 0 then ""
+  else if length xs == 1 then head xs
+  else
+    let last = last_elem (tail xs)
+    if last == "" then head xs else last
+init_list xs = if length xs <= 1 then [] else cons (head xs) (init_list (tail xs))
+
+main =
+  let _ = print "╔══════════════════════════════════════════════════════╗"
+  let _ = print "║  OVERFITTING TEST — 20 novel tasks                  ║"
+  let _ = print "║  Tasks the model has NEVER seen in training data     ║"
+  let _ = print "╚══════════════════════════════════════════════════════╝"
+  let pass = 0
+
+  -- Algorithms the model hasn't seen in training
+  let pass = pass + test_gen "1. Binary search" "Write a Rail program that implements binary search on a sorted list [1,3,5,7,9,11,13] to find the index of 7"
+  let pass = pass + test_gen "2. Roman numerals" "Write a Rail program that converts a Roman numeral string like XIV to an integer (14). Handle I, V, X, L, C, D, M"
+  let pass = pass + test_gen "3. Run-length encoding" "Write a Rail program that does run-length encoding on a string: AAABBC becomes 3A2B1C"
+  let pass = pass + test_gen "4. Matrix multiply" "Write a Rail program that multiplies two 2x2 matrices represented as flat lists [a,b,c,d] and prints the result"
+  let pass = pass + test_gen "5. Merge sort" "Write a Rail program that implements merge sort on the list [5,3,8,1,9,2,7,4,6] and prints the sorted result"
+  let pass = pass + test_gen "6. Collatz sequence" "Write a Rail program that computes the Collatz sequence length for n=27. Collatz: if even n/2, if odd 3n+1, until 1"
+  let pass = pass + test_gen "7. ROT13" "Write a Rail program that applies ROT13 to the string hello. Handle lowercase a-z only"
+  let pass = pass + test_gen "8. Tower of Hanoi" "Write a Rail program that counts the minimum moves to solve Tower of Hanoi with 4 disks (should be 15)"
+  let pass = pass + test_gen "9. FizzBuzz" "Write a Rail program that prints FizzBuzz for numbers 1-15. Print Fizz for multiples of 3, Buzz for 5, FizzBuzz for both, otherwise the number"
+  let pass = pass + test_gen "10. Pascal's triangle" "Write a Rail program that generates row 5 of Pascal's triangle: [1,5,10,10,5,1]"
+  let pass = pass + test_gen "11. Sieve of Eratosthenes" "Write a Rail program that finds all primes up to 20 using the sieve method. Print them"
+  let pass = pass + test_gen "12. Levenshtein distance" "Write a Rail program that computes the Levenshtein edit distance between kitten and sitting"
+  let pass = pass + test_gen "13. Balanced parens" "Write a Rail program that checks if the string (()()) has balanced parentheses. Print yes or no"
+  let pass = pass + test_gen "14. Integer to words" "Write a Rail program that converts the number 42 to words: forty two"
+  let pass = pass + test_gen "15. Caesar cipher" "Write a Rail program that applies a Caesar cipher with shift 3 to the string hello, producing khoor"
+  let pass = pass + test_gen "16. Luhn check" "Write a Rail program that validates a number using the Luhn algorithm. Test with 79927398713 (should be valid)"
+  let pass = pass + test_gen "17. Permutations" "Write a Rail program that counts the number of permutations of the list [1,2,3]. Should be 6"
+  let pass = pass + test_gen "18. Ackermann function" "Write a Rail program that computes ackermann(2,3). ack(0,n)=n+1, ack(m,0)=ack(m-1,1), ack(m,n)=ack(m-1,ack(m,n-1))"
+  let pass = pass + test_gen "19. Flatten nested lists" "Write a Rail program that takes a list of lists [[1,2],[3],[4,5,6]] and flattens them to [1,2,3,4,5,6], printing the length (6)"
+  let pass = pass + test_gen "20. Fibonacci memo" "Write a Rail program that computes fib(20) efficiently using memoization (not naive recursion). Result: 6765"
+
+  let _ = print "\n══════════════════════════════════════════════════"
+  let _ = print (cat ["  RESULTS: ", show pass, " / 20 passed"])
+  let pct = pass * 100 / 20
+  let _ = print (cat ["  Pass rate: ", show pct, "%"])
+  let _ = if pct >= 60 then print "  STATUS: PASS (>= 60% target)" else print "  STATUS: FAIL (< 60% target)"
+  let _ = print "══════════════════════════════════════════════════"
+
+  -- Write results to file
+  let _ = write_file "training/overfitting_results.txt" (cat ["Overfitting Test Results\n", "Pass: ", show pass, " / 20\n", "Rate: ", show pct, "%\n"])
+  0

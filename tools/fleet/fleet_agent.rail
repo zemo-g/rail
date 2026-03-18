@@ -1,0 +1,204 @@
+-- fleet_agent.rail — Tiny fleet agent HTTP server
+-- Reports machine status, executes whitelisted commands.
+-- Usage: ./rail_native run tools/fleet/fleet_agent.rail [--port 9101]
+-- Auth: reads token from ~/.fleet/token
+-- Whitelist: reads ~/.fleet/allowed_commands (one per line)
+
+foreign time t
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+q = "\""
+now _ = time 0
+
+-- HTTP request parsing
+parse_request_line line =
+  let parts = split " " line
+  if length parts >= 3 then
+    (head parts, head (tail parts), head (tail (tail parts)))
+  else ("", "", "")
+
+parse_headers lines =
+  if length lines == 0 then []
+  else
+    let line = head lines
+    if length line <= 1 then []
+    else
+      let parts = split ": " line
+      if length parts >= 2 then
+        let name = head parts
+        let value = join ": " (tail parts)
+        cons (name, value) (parse_headers (tail lines))
+      else parse_headers (tail lines)
+
+get_header headers name =
+  if length headers == 0 then ""
+  else
+    let (k, v) = head headers
+    if k == name then v
+    else get_header (tail headers) name
+
+find_body lines =
+  if length lines == 0 then ""
+  else if length (head lines) <= 1 then join "\n" (tail lines)
+  else find_body (tail lines)
+
+parse_request raw =
+  let lines = split "\n" raw
+  if length lines == 0 then ("", "", [], "")
+  else
+    let (method, path, _version) = parse_request_line (head lines)
+    let hdrs = parse_headers (tail lines)
+    let body = find_body (tail lines)
+    (method, path, hdrs, body)
+
+-- HTTP response builder (all cat on single lines to avoid parser issue)
+mk_resp code text body =
+  cat ["HTTP/1.1 ", show code, " ", text, "\nContent-Type: application/json\nConnection: close\n\n", body]
+
+resp_ok body = mk_resp 200 "OK" body
+resp_403 = mk_resp 403 "Forbidden" (cat ["{", q, "error", q, ": ", q, "forbidden", q, "}"])
+resp_404 = mk_resp 404 "Not Found" (cat ["{", q, "error", q, ": ", q, "not found", q, "}"])
+resp_400 = mk_resp 400 "Bad Request" (cat ["{", q, "error", q, ": ", q, "missing cmd", q, "}"])
+resp_deny = mk_resp 403 "Forbidden" (cat ["{", q, "error", q, ": ", q, "command not whitelisted", q, "}"])
+
+-- JSON helpers
+json_esc s = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n" (split "\n" s)
+jstr k v = cat [q, k, q, ": ", q, json_esc (json_esc_nl v), q]
+jint k v = cat [q, k, q, ": ", show v]
+jbool k v = cat [q, k, q, ": ", if v then "true" else "false"]
+jobj pairs = cat ["{", join ", " pairs, "}"]
+
+-- Auth
+load_token _ =
+  trim (shell "cat ~/.fleet/token 2>/dev/null || echo ''")
+
+clean s =
+  let _ = write_file "/tmp/_fleet_clean.txt" s
+  trim (shell "sed 's/^[[:space:]]*//' /tmp/_fleet_clean.txt | tr -d '\\015'")
+
+check_auth headers token =
+  if length token == 0 then true
+  else
+    let raw = get_header headers "X-Fleet-Token"
+    let provided = clean raw
+    provided == token
+
+-- Whitelist
+load_whitelist _ =
+  let raw = shell "cat ~/.fleet/allowed_commands 2>/dev/null || echo ''"
+  filter (\l -> length l > 0) (split "\n" raw)
+
+cmd_allowed cmd whitelist =
+  if length whitelist == 0 then false
+  else
+    let entry = head whitelist
+    if cmd == entry then true
+    else
+      let prefix = cat [entry, " "]
+      let check = trim (shell (cat ["echo ", q, cmd, q, " | cut -c1-", show (length prefix)]))
+      if check == entry then true
+      else cmd_allowed cmd (tail whitelist)
+
+-- Extract "cmd" from JSON body: {"cmd": "..."}
+extract_cmd body =
+  let parts = split "\"cmd\"" body
+  if length parts >= 2 then
+    find_str_val (split "\"" (head (tail parts)))
+  else ""
+
+find_str_val parts =
+  if length parts == 0 then ""
+  else
+    let p = head parts
+    if p == ":" || p == ": " || p == " " || length p == 0 then find_str_val (tail parts)
+    else p
+
+-- GET /health
+handle_health start_time =
+  let up = (now 0) - start_time
+  resp_ok (jobj [jbool "alive" true, jint "uptime" up])
+
+-- GET /status
+handle_status _ =
+  let hostname = trim (shell "hostname")
+  let cpu = trim (shell "sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -p")
+  let mem = trim (shell "vm_stat | awk '/Pages free/{gsub(/\\./,\"\",$3);f=$3}/Pages inactive/{gsub(/\\./,\"\",$3);i=$3}/Pages purgeable/{gsub(/\\./,\"\",$3);p=$3}END{printf \"%d MB avail\", (f+i+p)*16384/1048576}' 2>/dev/null || echo unknown")
+  let disk = trim (shell "df -h / | tail -1 | awk '{print $4 \" free of \" $2}'")
+  let arch = trim (shell "uname -m")
+  let svc_raw = shell "launchctl list 2>/dev/null | grep ledatic | awk '{print $3}' | head -20"
+  let svc_lines = filter (\l -> length l > 0) (split "\n" svc_raw)
+  let svc_json = map (\s -> cat [q, s, q]) svc_lines
+  let svc_arr = cat ["[", join ", " svc_json, "]"]
+  let uptime = trim (shell "uptime | sed 's/.*up //' | sed 's/,.*//'")
+  let train = trim (shell "cat ~/projects/rail/training/self_train/progress.txt 2>/dev/null || echo ''")
+  let train_level = trim (shell "grep '^level=' ~/projects/rail/training/self_train/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
+  let train_round = trim (shell "grep '^round=' ~/projects/rail/training/self_train/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
+  let train_harvested = trim (shell "grep '^harvested=' ~/projects/rail/training/self_train/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
+  let train_last = trim (shell "tail -1 ~/projects/rail/training/self_train/log.txt 2>/dev/null | grep -o 'rate=[^ ]*' | cut -d= -f2 || echo ''")
+  let body = cat ["{", jstr "hostname" hostname, ", ", jstr "cpu" cpu, ", ", jstr "mem" mem, ", ", jstr "disk" disk, ", ", jstr "arch" arch, ", ", jstr "uptime" uptime, ", ", jstr "train_level" train_level, ", ", jstr "train_round" train_round, ", ", jstr "train_harvested" train_harvested, ", ", jstr "train_rate" train_last, ", ", q, "services", q, ": ", svc_arr, "}"]
+  resp_ok body
+
+-- POST /exec
+handle_exec body whitelist =
+  let cmd = extract_cmd body
+  if length cmd == 0 then resp_400
+  else if cmd_allowed cmd whitelist then
+    let output = shell (cat [cmd, " 2>&1"])
+    resp_ok (jobj [jstr "output" output, jint "exit_code" 0])
+  else resp_deny
+
+-- Router
+route method path body start_time whitelist =
+  if method == "GET" then
+    if path == "/health" then handle_health start_time
+    else if path == "/status" then handle_status 0
+    else resp_404
+  else if method == "POST" then
+    if path == "/exec" then handle_exec body whitelist
+    else resp_404
+  else resp_404
+
+-- Serve loop (dash_serve pattern: pre-write response, nc serves + captures)
+serve_loop port token start_time whitelist =
+  let default_resp = handle_status 0
+  let _ = write_file "/tmp/fleet_agent_resp.txt" default_resp
+  serve_nc port token start_time whitelist
+
+serve_nc port token start_time whitelist =
+  let req = shell (cat ["cat /tmp/fleet_agent_resp.txt | nc -l ", show port, " 2>/dev/null"])
+  let resp = if length req > 5 then process_req req token start_time whitelist else handle_status 0
+  let _ = write_file "/tmp/fleet_agent_resp.txt" resp
+  serve_nc port token start_time whitelist
+
+process_req req token start_time whitelist =
+  let (method, path, hdrs, body) = parse_request req
+  let _ = print (cat ["  ", method, " ", path])
+  if check_auth hdrs token then route method path body start_time whitelist
+  else resp_403
+
+-- CLI arg parsing
+get_port argv =
+  if length argv <= 1 then 9101
+  else get_port_acc (tail argv)
+
+get_port_acc argv =
+  if length argv == 0 then 9101
+  else if head argv == "--port" then
+    if length (tail argv) > 0 then to_int (head (tail argv))
+    else 9101
+  else get_port_acc (tail argv)
+
+main =
+  let port = get_port args
+  let token = load_token 0
+  let whitelist = load_whitelist 0
+  let start_time = now 0
+  let _ = print "Fleet Agent"
+  let _ = print (cat ["  port: ", show port])
+  let _ = print (cat ["  token: ", if length token > 0 then "loaded" else "NONE (open access)"])
+  let _ = print (cat ["  whitelist: ", show (length whitelist), " commands"])
+  let _ = print "  Ctrl+C to stop\n"
+  let _ = shell "mkdir -p ~/.fleet && touch ~/.fleet/token ~/.fleet/allowed_commands"
+  serve_loop port token start_time whitelist

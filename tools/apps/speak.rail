@@ -1,0 +1,92 @@
+-- speak.rail — Natural language → Rail → GPU
+-- You describe what to do. The 27B model writes Rail GPU code. The GPU runs it.
+-- Usage: ./rail_native run tools/apps/speak.rail "multiply every element by 3 and add 1"
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+q = "\""
+
+drop_first lst = if length lst <= 1 then [] else tail lst
+
+json_esc s = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n" (split "\n" s)
+
+llm system_prompt user_prompt =
+  let body = cat [
+    "{", q, "model", q, ":", q, "mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit", q, ",", q, "messages", q, ":[",
+    "{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, json_esc (json_esc_nl system_prompt), q, "},",
+    "{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, json_esc (json_esc_nl user_prompt), q, "}",
+    "],", q, "max_tokens", q, ":1024,", q, "temperature", q, ":0.0}"]
+  let cmd = cat ["curl -s -X POST http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '", body, "' | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message'].get('content',''))\""]
+  shell cmd
+
+-- Extract just the expression from the model's response
+extract_expr response =
+  let lines = split "\n" response
+  find_expr lines
+
+find_expr lines =
+  if length lines == 0 then "x"
+  else
+    let line = head lines
+    -- Look for a line that looks like a Rail expression (contains x and an operator)
+    let has_x = length (split "x" line) >= 2
+    let has_op = length (split "+" line) >= 2
+    let has_op2 = length (split "*" line) >= 2
+    let has_op3 = length (split "-" line) >= 2
+    let has_op4 = length (split "/" line) >= 2
+    if has_x then
+      if has_op then line
+      else if has_op2 then line
+      else if has_op3 then line
+      else if has_op4 then line
+      else find_expr (tail lines)
+    else find_expr (tail lines)
+
+-- Generate Metal kernel from expression
+emit_metal_expr expr =
+  if expr == "x" then "x"
+  else expr
+
+gen_kernel body =
+  cat [
+    "#include <metal_stdlib>\nusing namespace metal;\n\n",
+    "kernel void rail_kernel(\n",
+    "    device int *data [[buffer(0)]],\n",
+    "    uint id [[thread_position_in_grid]])\n",
+    "{\n",
+    "    int x = data[id];\n",
+    "    data[id] = ", body, ";\n",
+    "}\n"]
+
+compile_and_run_gpu expr n =
+  let src = gen_kernel expr
+  let _ = write_file "/tmp/rail_speak.metal" src
+  let _ = shell "xcrun metal -c /tmp/rail_speak.metal -o /tmp/rail_speak.air 2>&1"
+  let _ = shell "xcrun metallib /tmp/rail_speak.air -o /tmp/rail_speak.metallib 2>&1"
+  let result = trim (shell (cat ["/tmp/gpu_host /tmp/rail_speak.metallib rail_kernel ", show n]))
+  result
+
+main =
+  let a = args
+  if length a < 2 then
+    let _ = print "Usage: speak <description>"
+    let _ = print "Example: speak \"multiply by 3 and add 1\""
+    1
+  else
+    let desc = join " " (drop_first a)
+    let _ = print (cat ["You: ", desc])
+    let _ = print ""
+    -- Ask the 27B to generate a C-like expression
+    let sys = "You are a code generator. Given a description of an operation on integer array elements, output ONLY a single C expression using variable x (the current element). No explanation. No markdown. Just the expression. Examples:\n- multiply by 2: x * 2\n- square and add one: x * x + 1\n- negate: -x\n- add 100 then divide by 2: (x + 100) / 2"
+    let _ = print "Thinking..."
+    let response = llm sys desc
+    let _ = print (cat ["Model: ", response])
+    let expr = extract_expr response
+    let _ = print (cat ["Expression: ", expr])
+    let _ = print ""
+    -- Compile to Metal and run on GPU
+    let _ = print "Compiling to Metal..."
+    let result = compile_and_run_gpu expr 16
+    let _ = print (cat ["GPU result: [", result, "]"])
+    0
