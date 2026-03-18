@@ -1,0 +1,835 @@
+-- self_train.rail — Rail trains itself to write better Rail
+-- The compiler is the oracle. Generate → Compile → Harvest → Retrain → Repeat.
+-- Usage: cd ~/projects/rail && ./rail_native run tools/train/self_train.rail
+--
+-- Requires: MLX server on :8080 with LoRA adapter loaded
+--   /Users/ledaticempire/homebrew/bin/python3.11 -m mlx_lm.server \
+--     --model /Users/ledaticempire/models/Qwen3.5-9B-6bit \
+--     --adapter-path training/adapters_st \
+--     --host 0.0.0.0 --port 8080 --trust-remote-code --max-tokens 4096
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- JSON / JSONL helpers (from build_training_data.rail)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+q = "\""
+json_esc_bs s = join "\\\\" (split "\\" s)
+json_esc_q s = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n" (split "\n" s)
+json_esc_tab s = join "\\t" (split "\t" s)
+json_esc s = json_esc_tab (json_esc_nl (json_esc_q (json_esc_bs s)))
+
+sys_prompt = "You are a Rail language expert. Rail is a pure functional language that compiles to native ARM64 and Metal GPU shaders. Write correct Rail code."
+
+entry usr asst =
+  cat ["{", q, "messages", q, ":[",
+    "{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, json_esc sys_prompt, q, "},",
+    "{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, json_esc usr, q, "},",
+    "{", q, "role", q, ":", q, "assistant", q, ",", q, "content", q, ":", q, json_esc asst, q, "}]}"]
+
+write_line file text =
+  let _ = write_file "/tmp/rail_st_line.txt" (cat [text, "\n"])
+  shell (cat ["cat /tmp/rail_st_line.txt >> ", file])
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- LLM interface
+-- ══════════════════════════════════════════════════════════════════════════════
+
+mk_sys dummy =
+  let grammar = read_file "grammar/rail.ebnf"
+  cat ["You are a Rail language expert. Rail compiles to native ARM64.\n\nGRAMMAR:\n", grammar, "\n\nCRITICAL RULES:\n- Functions: name params = body (top-level only, no 'let rec')\n- Let uses NEWLINES not 'in': let x = 5\\n  x + 1\n- If: if cond then a else b (always both branches)\n- Match: match expr | Pat args -> expr (NO 'with', NO '::')\n- Lambda: \\x -> expr (single arg only)\n- Lists: [1,2,3], head, tail, cons, map, filter, fold, length, reverse, range\n- Tuples: (a,b), let (x,y) = expr\n- ADTs: type T = | A x | B\\nmatch val | A x -> ... | B -> ...\n- Strings: \"hello\", NO char literals (no 'a'), NO string indexing\n- print outputs value, show converts int to string\n- join sep list, split sep str, chars str, append str1 str2\n- main must exist and return an int\n- Use let _ = print expr for side effects\n- NO: let rec, match...with, x::xs, [x], arr[i], where, in (at end of let)"]
+
+-- Native LLM call via builtin
+-- Port read from /tmp/rail_st_port.txt (written by main from --port arg)
+llm_call sys_msg user_msg temp =
+  let port = trim (shell "cat /tmp/rail_st_port.txt 2>/dev/null || echo 8080")
+  llm port sys_msg user_msg
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Compile + Run verification
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Returns: "success", "compile_fail", "runtime_fail", "timeout"
+verify code =
+  let _ = write_file "/tmp/rail_st_test.rail" code
+  let _ = shell "rm -f /tmp/rail_st_bin"
+  let compile_out = shell "cd ~/projects/rail && ./rail_native /tmp/rail_st_test.rail 2>&1 && cp /tmp/rail_out /tmp/rail_st_bin 2>&1"
+  let check = trim (shell "test -f /tmp/rail_st_bin && echo ok || echo fail")
+  if check == "fail" then "compile_fail"
+  else
+    let run_out = shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_st_bin 2>&1; echo $?"
+    let lines = split "\n" run_out
+    let exit_code = last_nonempty lines
+    if exit_code == "0" then "success"
+    else if exit_code == "142" then "timeout"
+    else "runtime_fail"
+
+last_nonempty xs =
+  if length xs == 0 then ""
+  else if length xs == 1 then head xs
+  else
+    let last = last_nonempty (tail xs)
+    if last == "" then head xs else last
+
+-- Generate with retry loop (up to 3 attempts with compiler feedback)
+gen_with_retry sys task prev_err attempt temp =
+  if attempt > 3 then ("", "compile_fail")
+  else
+    let user = if prev_err == "" then
+      cat [task, "\n\nOutput ONLY Rail code. No markdown, no explanation. Functions before main."]
+    else
+      cat [task, "\n\nYour previous attempt failed:\n", prev_err, "\n\nFix the errors. Output ONLY Rail code."]
+    let code = llm_call sys user temp
+    let result = verify code
+    if result == "success" then (code, "success")
+    else if result == "compile_fail" then
+      let err_out = trim (shell "cat /tmp/rail_st_test.rail 2>/dev/null | head -5")
+      gen_with_retry sys task (cat ["Compile error for:\n", err_out]) (attempt + 1) temp
+    else (code, result)
+
+-- Try N attempts with varying temperature
+try_task sys task =
+  try_task_n sys task 1
+
+try_task_n sys task temp =
+  if temp > 5 then ("", "all_failed")
+  else
+    let (code, result) = gen_with_retry sys task "" 1 temp
+    if result == "success" then (code, "success")
+    else try_task_n sys task (temp + 1)
+
+-- Per-level seed functions — only allocate strings for the requested level
+seeds_for level =
+  if level == 1 then seeds_1 0
+  else if level == 2 then seeds_2 0
+  else if level == 3 then seeds_3 0
+  else if level == 4 then seeds_4 0
+  else if level == 5 then seeds_5 0
+  else if level == 6 then seeds_6 0
+  else if level == 7 then seeds_7 0
+  else if level == 8 then seeds_8 0
+  else if level == 9 then seeds_9 0
+  else if level == 10 then seeds_10 0
+  else if level == 11 then seeds_11 0
+  else if level == 12 then seeds_12 0
+  else if level == 13 then seeds_13 0
+  else if level == 14 then seeds_14 0
+  else if level == 15 then seeds_15 0
+  else if level == 16 then seeds_16 0
+  else if level == 17 then seeds_17 0
+  else if level == 18 then seeds_18 0
+  else if level == 19 then seeds_19 0
+  else if level == 20 then seeds_20 0
+  else if level == 21 then seeds_21 0
+  else if level == 22 then seeds_22 0
+  else if level == 23 then seeds_23 0
+  else if level == 24 then seeds_24 0
+  else if level == 25 then seeds_25 0
+  else []
+
+seeds_1 dummy = [
+  "1\tWrite a Rail program that computes 2^10 (1024) using repeated multiplication",
+  "1\tWrite a Rail program that prints the sum of 1 to 100",
+  "1\tWrite a Rail program that converts Celsius 37 to Fahrenheit and prints it",
+  "1\tWrite a Rail program that computes absolute value of -42",
+  "1\tWrite a Rail program that prints the larger of 17 and 25",
+  "1\tWrite a Rail program that computes remainder of 100 divided by 7",
+  "1\tWrite a Rail program that prints hello world 3 times using recursion",
+  "1\tWrite a Rail program that checks if 17 is odd and prints yes or no",
+  "1\tWrite a Rail program that swaps two variables using a tuple and prints them",
+  "1\tWrite a Rail program that computes the average of [10, 20, 30] as an integer"]
+
+seeds_2 dummy = [
+  "2\tWrite a Rail program that finds all even numbers in [1,2,3,4,5,6,7,8,9,10]",
+  "2\tWrite a Rail program that computes dot product of [1,2,3] and [4,5,6]",
+  "2\tWrite a Rail program that finds the second-largest element in [3,1,4,1,5,9]",
+  "2\tWrite a Rail program that removes all zeros from [1,0,2,0,3,0]",
+  "2\tWrite a Rail program that zips [1,2,3] with [a,b,c] as strings like 1a 2b 3c",
+  "2\tWrite a Rail program that generates the first 10 fibonacci numbers as a list",
+  "2\tWrite a Rail program that checks if [1,2,3,4,5] is sorted ascending",
+  "2\tWrite a Rail program that rotates a list [1,2,3,4,5] left by 2 positions",
+  "2\tWrite a Rail program that takes every other element from [1,2,3,4,5,6]",
+  "2\tWrite a Rail program that finds the sum of squares of [1,2,3,4,5]"]
+
+seeds_3 dummy = [
+  "3\tWrite a Rail program with a Maybe ADT that safely divides 10 by 0 and prints None",
+  "3\tWrite a Rail program with a List ADT (Cons/Nil) that computes length of a 3-element list",
+  "3\tWrite a Rail program that uses closures to create increment and decrement functions",
+  "3\tWrite a Rail program with a Tree ADT that counts the number of leaves",
+  "3\tWrite a Rail program that uses map with a closure to add n to every element where n=10",
+  "3\tWrite a Rail program with an Expr ADT (Num/Add/Mul) that evaluates Add (Num 3) (Mul (Num 2) (Num 4))",
+  "3\tWrite a Rail program that implements a stack ADT with push pop and peek operations",
+  "3\tWrite a Rail program that uses tuples to return both quotient and remainder of 17/5",
+  "3\tWrite a Rail program with a Color ADT (Red/Green/Blue) that converts to RGB integer values",
+  "3\tWrite a Rail program that implements function composition and applies it"]
+
+seeds_4 dummy = [
+  "4\tWrite a Rail program that implements insertion sort on [5,3,8,1,9,2] and prints sorted",
+  "4\tWrite a Rail program that flattens a list of lists using fold and append",
+  "4\tWrite a Rail program that implements a simple calculator: eval Add (Num 3) (Num 4) = 7",
+  "4\tWrite a Rail program that groups consecutive equal elements: [1,1,2,2,2,3] -> lengths [2,3,1]",
+  "4\tWrite a Rail program that implements binary search returning the index of 7 in [1,3,5,7,9,11]",
+  "4\tWrite a Rail program that transposes a 2x3 matrix represented as list of lists",
+  "4\tWrite a Rail program that implements a priority queue using sorted list insertion",
+  "4\tWrite a Rail program that converts a number to its binary string representation",
+  "4\tWrite a Rail program that implements run-length encoding: AAABBC -> 3A2B1C as a string",
+  "4\tWrite a Rail program that finds the longest common prefix of [hello, help, heap]"]
+
+-- Level 5: Practical I/O — shell calls, file I/O, string building, arg parsing
+seeds_5 dummy = [
+  "5\tWrite a Rail program that uses shell to run hostname and prints the result",
+  "5\tWrite a Rail program that writes a key=value config to a file then reads it back and parses it",
+  "5\tWrite a Rail program that uses shell to list files in /tmp and counts how many lines the output has",
+  "5\tWrite a Rail program that builds a JSON object with 3 fields using string concatenation and prints it",
+  "5\tWrite a Rail program that reads a file, splits it into lines, filters lines containing a keyword, and prints matches",
+  "5\tWrite a Rail program that parses command-line args to find a --name flag and prints its value or a default",
+  "5\tWrite a Rail program that escapes special characters in a string for JSON: quotes, newlines, backslashes",
+  "5\tWrite a Rail program that writes numbers 1 to 10 to a file one per line then reads the file and sums them",
+  "5\tWrite a Rail program that splits a URL string into protocol, host, and path components and prints each",
+  "5\tWrite a Rail program that builds an HTML table from a list of (name, value) tuples using string concatenation"]
+
+-- Level 6: HTTP and networking — request/response parsing, JSON, REST patterns
+seeds_6 dummy = [
+  "6\tWrite a Rail program that parses an HTTP request line like GET /status HTTP/1.1 into method, path, and version",
+  "6\tWrite a Rail program that builds an HTTP response with status 200, Content-Type JSON header, and a body",
+  "6\tWrite a Rail program that parses HTTP headers from a string into a list of (name, value) tuples",
+  "6\tWrite a Rail program that builds a JSON array of objects from a list of (key, value) pairs",
+  "6\tWrite a Rail program that URL-encodes a string: replaces spaces with %20 and special chars with %XX",
+  "6\tWrite a Rail program that extracts a JSON field value from a simple flat JSON string using split",
+  "6\tWrite a Rail program that builds a multi-line HTTP response with status code, headers, and JSON body",
+  "6\tWrite a Rail program that parses query string parameters like name=foo&age=25 into a list of pairs",
+  "6\tWrite a Rail program that uses shell curl to fetch a URL and extracts the HTTP status code from output",
+  "6\tWrite a Rail program with a Route ADT (Get path | Post path) that matches a request to a handler",
+  "6\tWrite a Rail program that parses a full HTTP request (request line + headers + body) into a tuple",
+  "6\tWrite a Rail program that builds JSON with nested objects using helper functions like jstr, jint, jobj",
+  "6\tWrite a Rail program that implements a router: given method and path, dispatch to the right handler function",
+  "6\tWrite a Rail program that validates an auth token from HTTP headers and returns 403 if invalid",
+  "6\tWrite a Rail program that escapes HTML entities in a string: < > & and quotes"]
+
+-- Level 7: Real tools — site generators, dashboards, config parsers, deploy scripts
+seeds_7 dummy = [
+  "7\tWrite a Rail program that generates an HTML page with a title, CSS style block, and a list of items",
+  "7\tWrite a Rail program that reads key=value lines from a config file into a lookup list and queries it",
+  "7\tWrite a Rail program that generates a status dashboard HTML page showing hostname, uptime, and disk usage via shell",
+  "7\tWrite a Rail program that parses a log file, counts occurrences of ERROR and WARN, and prints a summary",
+  "7\tWrite a Rail program that generates a complete HTML page with inline CSS, a navigation bar, and content sections",
+  "7\tWrite a Rail program that writes incremental output to a file in chunks to avoid large string concatenation",
+  "7\tWrite a Rail program that reads a CSV-like file (lines with comma-separated values), parses it, and prints a formatted table",
+  "7\tWrite a Rail program that checks if a process is running via shell pgrep and prints alive or dead",
+  "7\tWrite a Rail program that generates an HTML table from data with alternating row colors using inline CSS",
+  "7\tWrite a Rail program that reads a progress file with key=value pairs, increments a counter, and writes it back",
+  "7\tWrite a Rail program that builds a deploy script: check file exists, copy to destination, verify via shell",
+  "7\tWrite a Rail program that generates a multi-section HTML report with a table of contents linking to anchors",
+  "7\tWrite a Rail program that monitors a directory by running ls -la via shell and comparing output to a previous snapshot",
+  "7\tWrite a Rail program that parses INI-style config with sections [section] and key=value pairs into nested lists",
+  "7\tWrite a Rail program that generates an SVG bar chart from a list of (label, value) pairs as a string"]
+
+-- Level 8: Systems programming — memory management, FFI, process control, error handling
+seeds_8 dummy = [
+  "8\tWrite a Rail program that uses arena_mark and arena_reset to process a list of items in batches without leaking memory",
+  "8\tWrite a Rail program with a Result ADT (Ok value | Err msg) that chains operations and propagates errors",
+  "8\tWrite a Rail program that manages child processes: start via shell, check if alive via pgrep, kill if needed",
+  "8\tWrite a Rail program that implements a retry loop: try an operation up to 3 times with increasing delays",
+  "8\tWrite a Rail program that reads a file in fixed-size chunks using shell head and tail with offsets",
+  "8\tWrite a Rail program with a Config ADT that loads defaults, overrides from file, and overrides from args",
+  "8\tWrite a Rail program that writes to a temp file then atomically renames it to the target path via shell mv",
+  "8\tWrite a Rail program that implements a simple task queue: read tasks from a file, process each, mark done",
+  "8\tWrite a Rail program that checks system resources via shell (df, vm_stat) and prints warnings if thresholds exceeded",
+  "8\tWrite a Rail program that implements a state machine with a State ADT for a multi-step deployment pipeline",
+  "8\tWrite a Rail program that uses arena_mark and arena_reset inside a recursive loop processing 100 items without OOM",
+  "8\tWrite a Rail program that implements exponential backoff: try shell curl, double wait time on failure up to 32s",
+  "8\tWrite a Rail program with a Logger ADT that writes timestamped entries to a file with severity levels",
+  "8\tWrite a Rail program that implements a file-based lock: create lockfile, do work, remove lockfile, handle stale locks",
+  "8\tWrite a Rail program that validates a config file: check required keys exist, values are valid, report all errors"]
+
+-- Level 9: Compiler patterns — bytecode, type checking, AST transforms, code generation
+seeds_9 dummy = [
+  "9\tWrite a Rail program with a Bytecode ADT (Push/Add/Mul/Print) and a stack-based VM that executes it",
+  "9\tWrite a Rail program that compiles arithmetic Expr ADTs into a list of stack Bytecodes then executes them",
+  "9\tWrite a Rail program that infers types for expressions with Int and Bool literals, Add and If, printing the type",
+  "9\tWrite a Rail program that implements constant folding on an Expr ADT: simplify Add (Num 3) (Num 4) to Num 7",
+  "9\tWrite a Rail program that implements scope analysis: collect free variables from nested Let/Lam expressions",
+  "9\tWrite a Rail program that implements tail-call optimization detection on a recursive function AST",
+  "9\tWrite a Rail program with a bytecode VM that supports Push, Add, Mul, JmpIf, and Halt instructions",
+  "9\tWrite a Rail program that compiles If expressions into bytecode with conditional jumps",
+  "9\tWrite a Rail program that implements closure conversion: lift free variables into an explicit environment parameter",
+  "9\tWrite a Rail program that implements a peephole optimizer: replace Push a, Push b, Add with Push (a+b)",
+  "9\tWrite a Rail program that emits ARM64 assembly strings for simple arithmetic expressions",
+  "9\tWrite a Rail program that implements lambda calculus beta reduction on an Expr ADT (Var/Lam/App)",
+  "9\tWrite a Rail program that lexes and parses a simple language into an AST then pretty-prints it back",
+  "9\tWrite a Rail program that implements a simple pattern match compiler: flatten nested matches into flat cases",
+  "9\tWrite a Rail program that implements exhaustiveness checking for pattern matches on a simple ADT"]
+
+-- Level 10: Full programs — complete tools like the ones in the Rail repo
+seeds_10 dummy = [
+  "10\tWrite a Rail program that implements a complete HTTP health-check server: parse request, route to handler, return JSON",
+  "10\tWrite a Rail program that generates a full HTML dashboard page with system stats gathered via shell commands",
+  "10\tWrite a Rail program that implements a CLI tool: parse args, read config file, execute command, write output",
+  "10\tWrite a Rail program that implements a site generator: read data from a file, build HTML with template, write to output",
+  "10\tWrite a Rail program that implements an LLM caller: build JSON request, shell curl to API, parse JSON response",
+  "10\tWrite a Rail program that implements a deploy pipeline: check preconditions, build, copy files, verify, report status",
+  "10\tWrite a Rail program that implements a log analyzer: read log file, parse entries, compute stats, generate HTML report",
+  "10\tWrite a Rail program that implements a key-value store server: parse GET/SET/DEL commands over HTTP, persist to file",
+  "10\tWrite a Rail program that implements a training data harvester: read source files, extract examples, write JSONL output",
+  "10\tWrite a Rail program that implements a service monitor: check multiple endpoints via curl, report status, write results",
+  "10\tWrite a Rail program that implements a config-driven task runner: read tasks from a file, execute each via shell, log results",
+  "10\tWrite a Rail program that implements a Cloudflare KV deployer: read HTML file, build API request, upload via curl, verify",
+  "10\tWrite a Rail program that implements a complete HTTP router with auth middleware, JSON responses, and error handling",
+  "10\tWrite a Rail program that implements a file-based message queue: enqueue writes to dir, dequeue reads and deletes oldest",
+  "10\tWrite a Rail program that implements a progress tracker: read state file, run batch, update state, write log, loop"]
+
+-- Level 11: API integration — talk to real external services
+seeds_11 dummy = [
+  "11\tWrite a Rail program that calls the GitHub API via curl to list repos for a user and prints their names",
+  "11\tWrite a Rail program that uploads a file to Cloudflare KV via curl with an API token and namespace ID",
+  "11\tWrite a Rail program that sends a Telegram message via the Bot API using curl with a chat ID and token",
+  "11\tWrite a Rail program that fetches JSON from a REST API via curl, extracts a field using split, and prints it",
+  "11\tWrite a Rail program that posts a webhook payload to a URL via curl and checks the HTTP status code",
+  "11\tWrite a Rail program that reads an API token from a secrets file, makes an authenticated curl request, and handles errors",
+  "11\tWrite a Rail program that paginates through an API: fetch page 1, extract next cursor, fetch page 2, combine results",
+  "11\tWrite a Rail program that implements rate limiting for API calls: track timestamps in a file, sleep if too fast",
+  "11\tWrite a Rail program that calls two different APIs, merges their JSON results, and writes a combined report",
+  "11\tWrite a Rail program that implements an API health checker: hit 3 endpoints, report which are up/down with latency"]
+
+-- Level 12: Database interaction — SQLite via shell, structured data persistence
+seeds_12 dummy = [
+  "12\tWrite a Rail program that creates a SQLite table via shell sqlite3, inserts 3 rows, and queries them back",
+  "12\tWrite a Rail program that reads a CSV file, parses rows, and inserts each into a SQLite table via shell",
+  "12\tWrite a Rail program that queries SQLite for rows matching a condition and formats the output as JSON",
+  "12\tWrite a Rail program that implements a key-value store backed by SQLite: get, set, delete operations via shell",
+  "12\tWrite a Rail program that aggregates data from SQLite (COUNT, SUM, AVG) and prints a formatted report",
+  "12\tWrite a Rail program that migrates a SQLite schema: check if column exists, add it if not, backfill data",
+  "12\tWrite a Rail program that reads from one SQLite table, transforms the data, and writes to another table",
+  "12\tWrite a Rail program that implements a simple ORM pattern: convert between ADT records and SQLite rows",
+  "12\tWrite a Rail program that logs events to SQLite with timestamps and queries recent events within a time window",
+  "12\tWrite a Rail program that joins two SQLite tables via shell query and formats the result as an HTML table"]
+
+-- Level 13: Data pipelines — ETL, transform, aggregate, report
+seeds_13 dummy = [
+  "13\tWrite a Rail program that reads a JSONL file, filters by a field value, transforms records, and writes output JSONL",
+  "13\tWrite a Rail program that reads log files from a directory via shell ls, parses each, and produces aggregate statistics",
+  "13\tWrite a Rail program that implements a 3-stage pipeline: extract data from files, transform with map/filter, load into output",
+  "13\tWrite a Rail program that deduplicates a JSONL file by a key field, keeping the latest entry",
+  "13\tWrite a Rail program that reads data from multiple sources (files + shell commands), joins them by key, writes merged output",
+  "13\tWrite a Rail program that computes a rolling average over a time-series data file and writes the smoothed output",
+  "13\tWrite a Rail program that generates a daily report: read today's data, compare to yesterday's, highlight changes",
+  "13\tWrite a Rail program that validates data quality: check required fields, valid ranges, report errors with line numbers",
+  "13\tWrite a Rail program that implements batch processing: read a large file in chunks of 10 lines, process each chunk, write results",
+  "13\tWrite a Rail program that builds a data dictionary: scan JSONL files, collect all unique field names, count occurrences"]
+
+-- Level 14: Testing and validation — programs that verify their own correctness
+seeds_14 dummy = [
+  "14\tWrite a Rail program with a test framework: define test cases as (name, expected, actual) tuples, run all, report pass/fail",
+  "14\tWrite a Rail program that generates random test inputs, runs a function, checks invariants, and reports failures",
+  "14\tWrite a Rail program that implements property-based testing: test that sort produces sorted output for 10 random lists",
+  "14\tWrite a Rail program that compiles another Rail file via shell, runs it, captures output, and asserts expected result",
+  "14\tWrite a Rail program that implements a regression test runner: read expected outputs from files, run programs, diff results",
+  "14\tWrite a Rail program that tests an HTTP endpoint: send request via curl, parse response, assert status and body fields",
+  "14\tWrite a Rail program that implements snapshot testing: run a function, compare output to saved snapshot, update if flag set",
+  "14\tWrite a Rail program that validates a config file against a schema: required keys, types, valid value ranges",
+  "14\tWrite a Rail program that tests file I/O roundtrips: write data to file, read it back, assert equality",
+  "14\tWrite a Rail program that implements a test harness with setup, test, and teardown phases using closures"]
+
+-- Level 15: Concurrency patterns — fibers, parallel work, coordination
+seeds_15 dummy = [
+  "15\tWrite a Rail program that uses shell backgrounding to run 3 commands in parallel and collects all their outputs",
+  "15\tWrite a Rail program that implements a worker pool pattern: dispatch tasks to N background shell processes, gather results",
+  "15\tWrite a Rail program that implements a producer-consumer pattern using files: one loop writes tasks, another reads and processes",
+  "15\tWrite a Rail program that runs a command with a timeout: start in background, sleep, check if done, kill if not",
+  "15\tWrite a Rail program that implements parallel map: split a list into chunks, process each via background shell, merge results",
+  "15\tWrite a Rail program that implements a semaphore using lockfiles: acquire before work, release after, limit concurrency to N",
+  "15\tWrite a Rail program that polls multiple endpoints in parallel via background curl and reports the first to respond",
+  "15\tWrite a Rail program that implements a pipeline with stages: stage 1 writes to a file, stage 2 reads and transforms, stage 3 outputs",
+  "15\tWrite a Rail program that coordinates two background tasks: one monitors a file for changes, another processes new entries",
+  "15\tWrite a Rail program that implements a simple job scheduler: read jobs from a queue file, run up to 3 in parallel, log completion"]
+
+-- Level 16: Protocol implementation — wire formats, message passing, serialization
+seeds_16 dummy = [
+  "16\tWrite a Rail program that implements a tag-length-value binary protocol: encode 3 messages and decode them back",
+  "16\tWrite a Rail program that implements a line-based text protocol: parse commands like SET key value and QUERY key",
+  "16\tWrite a Rail program that serializes a Tree ADT to a compact string format and reconstructs it exactly",
+  "16\tWrite a Rail program that implements a simple RPC protocol: encode function name and args as JSON, decode and dispatch",
+  "16\tWrite a Rail program that implements a versioned file format: write header with version, data section, checksum footer",
+  "16\tWrite a Rail program that parses and generates TOML-subset config: sections, string values, integer values, arrays",
+  "16\tWrite a Rail program that implements a message framing protocol: length-prefix each message for reliable transmission",
+  "16\tWrite a Rail program that converts between different serialization formats: key=value config to JSON and back",
+  "16\tWrite a Rail program that implements a diff protocol: compute changes between two states, serialize as patch, apply patch",
+  "16\tWrite a Rail program that implements a simple event sourcing pattern: append events to a log file, replay to rebuild state"]
+
+-- Level 17: Code generation — programs that write other programs
+seeds_17 dummy = [
+  "17\tWrite a Rail program that generates a Rail program from a template: replace placeholders with values and write valid .rail file",
+  "17\tWrite a Rail program that reads a data schema and generates Rail ADT type definitions as a .rail source file",
+  "17\tWrite a Rail program that generates a shell script from a list of deployment steps and writes it to a file",
+  "17\tWrite a Rail program that generates HTML+CSS from a page description ADT with sections, styles, and content",
+  "17\tWrite a Rail program that generates SQL CREATE TABLE and INSERT statements from a data definition list",
+  "17\tWrite a Rail program that generates a Makefile from a list of build targets with dependencies and commands",
+  "17\tWrite a Rail program that reads function signatures and generates a test harness that calls each with sample inputs",
+  "17\tWrite a Rail program that generates a Cloudflare Worker JavaScript file from a route definition list",
+  "17\tWrite a Rail program that generates Rail source code for a state machine from a transition table definition",
+  "17\tWrite a Rail program that generates a complete REST API server scaffold: routes, handlers, JSON responses"]
+
+-- Level 18: Self-modifying systems — programs that update themselves based on results
+seeds_18 dummy = [
+  "18\tWrite a Rail program that reads its own config, runs a task, evaluates the result, and adjusts config parameters for next run",
+  "18\tWrite a Rail program that maintains a priorities file, runs the highest-priority task, updates priorities based on outcome",
+  "18\tWrite a Rail program that implements a feedback loop: measure performance, compare to target, adjust parameters, repeat",
+  "18\tWrite a Rail program that tracks which tasks succeed/fail in a log and generates a difficulty ranking for future scheduling",
+  "18\tWrite a Rail program that reads a strategy file, executes it, scores the result, and writes an improved strategy",
+  "18\tWrite a Rail program that implements A/B testing: run two approaches, compare metrics, persist the winner for next run",
+  "18\tWrite a Rail program that implements curriculum advancement: track pass rates per category, focus on weakest areas",
+  "18\tWrite a Rail program that maintains a knowledge base file: add new facts from each run, deduplicate, prune stale entries",
+  "18\tWrite a Rail program that implements an adaptive retry policy: track failure patterns, adjust timeouts and retry counts",
+  "18\tWrite a Rail program that reads execution logs, identifies bottlenecks, and generates an optimized execution plan"]
+
+-- Level 19: Infrastructure automation — deploy, monitor, alert, recover
+seeds_19 dummy = [
+  "19\tWrite a Rail program that implements a full deploy pipeline: git pull, build, test, deploy, verify, rollback on failure",
+  "19\tWrite a Rail program that monitors 5 services via curl health checks, writes status to a file, alerts on failures",
+  "19\tWrite a Rail program that implements a cron-like scheduler: read schedule from file, check if tasks are due, execute them",
+  "19\tWrite a Rail program that manages launchd services: check status, restart if crashed, log restarts, alert on repeated failures",
+  "19\tWrite a Rail program that implements a canary deploy: deploy to one instance, monitor for 60s, promote or rollback",
+  "19\tWrite a Rail program that collects system metrics (CPU, memory, disk) into a time-series file and generates trend reports",
+  "19\tWrite a Rail program that implements log rotation: check file sizes, rename old logs, compress via shell, clean up aged files",
+  "19\tWrite a Rail program that implements a secrets manager: encrypt values with shell openssl, store in file, decrypt on read",
+  "19\tWrite a Rail program that generates an infrastructure status HTML dashboard from live service checks and system metrics",
+  "19\tWrite a Rail program that implements auto-recovery: detect service failure, diagnose cause, apply known fix, verify recovery"]
+
+-- Level 20: Language tooling — REPL, formatter, linter, documentation generator
+seeds_20 dummy = [
+  "20\tWrite a Rail program that implements a Rail code formatter: parse indentation, normalize spacing, align let bindings",
+  "20\tWrite a Rail program that implements a Rail linter: detect common mistakes like missing main, unused lets, shadowed names",
+  "20\tWrite a Rail program that generates documentation from Rail source: extract function names, signatures, and comments",
+  "20\tWrite a Rail program that implements a Rail REPL: read expression string, compile via shell, run, print result, loop",
+  "20\tWrite a Rail program that counts lines of code, functions, and ADT definitions in a Rail source file and prints stats",
+  "20\tWrite a Rail program that finds all function definitions in a .rail file and generates a call graph as a dot string",
+  "20\tWrite a Rail program that implements syntax highlighting for Rail: tokenize source and wrap tokens in HTML color spans",
+  "20\tWrite a Rail program that detects duplicate function definitions across multiple .rail files via shell and reports them",
+  "20\tWrite a Rail program that generates a module dependency graph: scan imports/includes, output as sorted adjacency list",
+  "20\tWrite a Rail program that implements a Rail test runner: find test files, compile each, run, collect pass/fail, print summary"]
+
+-- Level 21: Distributed patterns — multi-node coordination, replication, consensus
+seeds_21 dummy = [
+  "21\tWrite a Rail program that implements a heartbeat system: send periodic pings to a remote endpoint, detect timeouts",
+  "21\tWrite a Rail program that syncs a local directory to a remote machine via shell scp, tracking changed files only",
+  "21\tWrite a Rail program that implements leader election using file locks: N processes compete, one wins, others wait",
+  "21\tWrite a Rail program that implements a command dispatcher: receive commands from a file, route to local or remote execution",
+  "21\tWrite a Rail program that implements eventual consistency: write to local log, periodically push to remote, merge on conflict",
+  "21\tWrite a Rail program that coordinates work across machines: split a task list, assign via files/curl, collect results",
+  "21\tWrite a Rail program that implements a gossip protocol: exchange state with a random peer, converge on shared knowledge",
+  "21\tWrite a Rail program that implements a distributed task queue: enqueue via HTTP POST, workers poll via GET, ack on complete",
+  "21\tWrite a Rail program that implements config distribution: update config on one node, push to all others, verify consistency",
+  "21\tWrite a Rail program that implements a fleet status aggregator: query N nodes for status, merge into unified dashboard"]
+
+-- Level 22: AI/ML integration — LLM orchestration, prompt engineering, agent patterns
+seeds_22 dummy = [
+  "22\tWrite a Rail program that calls an LLM API with a system prompt and user message, parses the response, and uses the result",
+  "22\tWrite a Rail program that implements prompt chaining: call LLM once for analysis, use result to build a second prompt, call again",
+  "22\tWrite a Rail program that implements retry with feedback: call LLM, validate output, if invalid send error back to LLM, retry",
+  "22\tWrite a Rail program that implements an LLM router: classify task difficulty, route easy tasks to small model, hard to large",
+  "22\tWrite a Rail program that generates training data: create task descriptions, compile solutions, harvest successful pairs as JSONL",
+  "22\tWrite a Rail program that implements an agent loop: observe state, call LLM for decision, execute action, update state, repeat",
+  "22\tWrite a Rail program that implements RAG: read context files, embed query in prompt with context, call LLM, return answer",
+  "22\tWrite a Rail program that evaluates LLM output quality: compile generated code, run tests, score accuracy, log results",
+  "22\tWrite a Rail program that implements a multi-turn conversation: maintain history in a file, append new turns, trim old ones",
+  "22\tWrite a Rail program that implements structured output extraction: call LLM, parse JSON from response, validate against schema"]
+
+-- Level 23: Compiler extensions — adding features to the Rail compiler itself
+seeds_23 dummy = [
+  "23\tWrite a Rail program that implements a lexer for Rail: tokenize keywords (let, if, then, else, match), identifiers, and literals",
+  "23\tWrite a Rail program that parses Rail function definitions into an AST ADT with name, params, and body",
+  "23\tWrite a Rail program that implements type checking for Rail expressions: infer Int, String, Bool, List, and function types",
+  "23\tWrite a Rail program that implements constant propagation on a Rail AST: replace known variables with their values",
+  "23\tWrite a Rail program that implements a Rail pretty-printer: convert an AST back to formatted Rail source code",
+  "23\tWrite a Rail program that implements dead code detection for Rail: find functions that are defined but never called",
+  "23\tWrite a Rail program that generates ARM64 assembly for a simple Rail expression: let x = 3 + 4 in x * 2",
+  "23\tWrite a Rail program that implements a Rail module resolver: given an import, find the file, parse exports, check usage",
+  "23\tWrite a Rail program that implements tail-call optimization for Rail: detect tail-recursive functions and mark them",
+  "23\tWrite a Rail program that implements an optimizer pass for Rail: inline small functions, fold constants, eliminate dead lets"]
+
+-- Level 24: Meta-compilation — programs that improve the compilation process
+seeds_24 dummy = [
+  "24\tWrite a Rail program that profiles Rail compilation: time each phase (parse, typecheck, codegen), identify bottlenecks",
+  "24\tWrite a Rail program that generates test cases for the Rail compiler: produce valid and invalid programs, verify compiler behavior",
+  "24\tWrite a Rail program that implements a fuzzer for Rail: generate random syntactically-valid programs and check for compiler crashes",
+  "24\tWrite a Rail program that compares two compiler outputs: compile same source with two binaries, diff the generated assembly",
+  "24\tWrite a Rail program that implements a benchmark suite: compile and run N programs, measure time and binary size, track regressions",
+  "24\tWrite a Rail program that generates Rail stdlib documentation from source: extract function signatures, docstrings, examples",
+  "24\tWrite a Rail program that implements an error message improver: parse compiler errors, suggest fixes based on common patterns",
+  "24\tWrite a Rail program that implements a compile cache: hash source files, skip recompilation if hash matches cached output",
+  "24\tWrite a Rail program that tests compiler correctness: compile programs, run them, compare output to expected, report mismatches",
+  "24\tWrite a Rail program that generates ARM64 instruction encoding tables from a specification format"]
+
+-- Level 25: Self-improvement — programs that improve the training loop itself
+seeds_25 dummy = [
+  "25\tWrite a Rail program that analyzes training logs to find which task types have lowest pass rates and generates focused seed tasks",
+  "25\tWrite a Rail program that evaluates training data quality: detect near-duplicates in JSONL, measure diversity, prune redundant entries",
+  "25\tWrite a Rail program that implements curriculum optimization: analyze pass rates per level, adjust difficulty thresholds dynamically",
+  "25\tWrite a Rail program that generates harder variants of passed tasks: add constraints, combine concepts, increase complexity",
+  "25\tWrite a Rail program that implements a training data augmenter: take successful code, generate paraphrased task descriptions",
+  "25\tWrite a Rail program that scores model capability: run a fixed benchmark suite, compare to previous scores, track improvement curve",
+  "25\tWrite a Rail program that implements active learning: identify tasks near the decision boundary and prioritize those for training",
+  "25\tWrite a Rail program that analyzes compiler errors from failed attempts, clusters common failure modes, generates targeted fixes",
+  "25\tWrite a Rail program that implements the full self-training loop: generate tasks, compile solutions, harvest, retrain, advance",
+  "25\tWrite a Rail program that optimizes its own prompt: try variations, measure pass rate, keep the best performing system prompt"]
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- PROGRESS tracking
+-- ══════════════════════════════════════════════════════════════════════════════
+
+progress_file = "training/self_train/progress.txt"
+harvest_file = "training/self_train/harvest.jsonl"
+log_file = "training/self_train/log.txt"
+
+read_progress dummy =
+  let content = read_file progress_file
+  if length content == 0 then (1, 1, 0, 0, 0, 0)
+  else
+    let lines = split "\n" content
+    let round = parse_kv lines "round"
+    let level = parse_kv lines "level"
+    let harvested = parse_kv lines "harvested"
+    let since_retrain = parse_kv lines "since_retrain"
+    let consecutive_pass = parse_kv lines "consecutive_pass"
+    let consecutive_zero = parse_kv lines "consecutive_zero"
+    (round, level, harvested, since_retrain, consecutive_pass, consecutive_zero)
+
+parse_kv lines key =
+  if length lines == 0 then 0
+  else
+    let parts = split "=" (head lines)
+    if length parts >= 2 then
+      if head parts == key then to_int_safe (head (tail parts))
+      else parse_kv (tail lines) key
+    else parse_kv (tail lines) key
+
+to_int_safe s =
+  let trimmed = trim s
+  parse_digits (chars trimmed) 0
+
+parse_digits cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = if c == "0" then 0 else if c == "1" then 1 else if c == "2" then 2 else if c == "3" then 3 else if c == "4" then 4 else if c == "5" then 5 else if c == "6" then 6 else if c == "7" then 7 else if c == "8" then 8 else if c == "9" then 9 else 0
+    parse_digits (tail cs) (acc * 10 + d)
+
+write_progress round level harvested since_retrain consecutive_pass consecutive_zero =
+  write_file progress_file (cat [
+    "round=", show round, "\n",
+    "level=", show level, "\n",
+    "harvested=", show harvested, "\n",
+    "since_retrain=", show since_retrain, "\n",
+    "consecutive_pass=", show consecutive_pass, "\n",
+    "consecutive_zero=", show consecutive_zero, "\n"])
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- TASK SELECTION
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Select tasks at given level from seed bank
+select_tasks level all_tasks =
+  filter (\t -> head (split "\t" t) == show level) all_tasks
+
+-- Get task description from "level\ttask" format
+task_desc t = head (tail (split "\t" t))
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- HARVEST — save successful (task, code) pairs
+-- ══════════════════════════════════════════════════════════════════════════════
+
+harvest task code =
+  -- Deduplicate: check if this exact task already harvested (first 80 chars of code as fingerprint)
+  let fingerprint = take_str code 80
+  let already = trim (shell (cat ["grep -cF ", q, json_esc fingerprint, q, " ", harvest_file, " 2>/dev/null || echo 0"]))
+  if already != "0" then
+    let _ = print "    (duplicate — skipped)"
+    0
+  else
+    -- Write 3 variants (different phrasings, same code)
+    let _ = write_line harvest_file (entry task code)
+    let _ = write_line harvest_file (entry (cat ["Implement in Rail: ", task]) code)
+    let _ = write_line harvest_file (entry (cat ["Rail code for: ", task]) code)
+    3
+
+take_str s n =
+  let cs = chars s
+  join "" (take_n cs n)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- RETRAIN — merge data + LoRA train + reload
+-- ══════════════════════════════════════════════════════════════════════════════
+
+retrain dummy =
+  let _ = print "\n══ RETRAINING ══"
+  -- Stop ALL MLX processes (pkill, not kill — prevents zombie servers)
+  let _ = shell "pkill -9 -f 'mlx_lm' 2>/dev/null; sleep 2"
+  -- Also stop launchd MLX services so they don't auto-restart
+  let _ = shell "launchctl bootout gui/$(id -u)/com.ledatic.mlx 2>/dev/null; launchctl bootout gui/$(id -u)/com.ledatic.mlx_fast 2>/dev/null"
+  -- Verify all MLX processes are dead
+  let _ = shell "sleep 2"
+  let alive = trim (shell "pgrep -f 'mlx_lm' 2>/dev/null | wc -l")
+  let _ = if alive != "0" then
+    let _ = print (cat ["  WARNING: ", alive, " MLX processes still alive, force killing..."])
+    shell "pkill -9 -f 'mlx_lm' 2>/dev/null; sleep 3"
+  else print "  MLX server stopped."
+  -- Re-harvest git metadata (picks up any new commits since last retrain)
+  let _ = print "  Harvesting git history..."
+  let _ = shell "/opt/homebrew/bin/python3.11 ~/projects/rail/tools/train/harvest_git.py > /tmp/rail_harvest_git.log 2>&1"
+  -- Merge all training data: original + self-harvest + git harvest
+  let _ = shell "mkdir -p /tmp/rail_st_data"
+  let _ = shell "cat ~/projects/rail/training/train.jsonl ~/projects/rail/training/self_train/harvest.jsonl ~/projects/rail/training/git_harvest.jsonl > /tmp/rail_st_merged.jsonl"
+  let total = trim (shell "wc -l < /tmp/rail_st_merged.jsonl")
+  let _ = print (cat ["  Merged training data: ", total, " examples"])
+  -- 90/5/5 split
+  let n = parse_digits (chars (trim total)) 0
+  let train_n = n * 9 / 10
+  let valid_n = n / 20
+  let _ = shell (cat ["head -n ", show train_n, " /tmp/rail_st_merged.jsonl > /tmp/rail_st_data/train.jsonl"])
+  let _ = shell (cat ["tail -n +", show (train_n + 1), " /tmp/rail_st_merged.jsonl | head -n ", show valid_n, " > /tmp/rail_st_data/valid.jsonl"])
+  let _ = shell (cat ["tail -n +", show (train_n + valid_n + 1), " /tmp/rail_st_merged.jsonl > /tmp/rail_st_data/test.jsonl"])
+  let _ = print (cat ["  Split: ", show train_n, " train / ", show valid_n, " valid / ", show (n - train_n - valid_n), " test"])
+  -- LoRA train
+  let _ = print "  Starting LoRA training (this takes ~30 min)..."
+  let train_out = shell "/Users/ledaticempire/homebrew/bin/python3.11 -m mlx_lm lora --model /Users/ledaticempire/models/Qwen3.5-9B-6bit --train --data /tmp/rail_st_data/ --iters 2000 --batch-size 1 --learning-rate 1e-5 --num-layers 16 --steps-per-report 200 --steps-per-eval 500 --save-every 1000 --max-seq-length 1024 --mask-prompt --adapter-path /Users/ledaticempire/projects/rail/training/adapters_st 2>&1"
+  -- Verify training produced an adapter file
+  let adapter_ok = trim (shell "test -f /Users/ledaticempire/projects/rail/training/adapters_st/adapters.safetensors && echo ok || echo fail")
+  let _ = if adapter_ok == "fail" then
+    let _ = print "  ERROR: LoRA training failed. Restarting server without adapter."
+    let port = trim (shell "cat /tmp/rail_st_port.txt 2>/dev/null || echo 8080")
+    shell (cat ["/Users/ledaticempire/homebrew/bin/python3.11 -m mlx_lm.server --model /Users/ledaticempire/models/Qwen3.5-9B-6bit --host 0.0.0.0 --port ", port, " --trust-remote-code --max-tokens 4096 > /tmp/mlx_st_server.log 2>&1 &"])
+  else
+    let _ = print "  Training complete. Starting server with new adapter..."
+    let port = trim (shell "cat /tmp/rail_st_port.txt 2>/dev/null || echo 8080")
+    shell (cat ["/Users/ledaticempire/homebrew/bin/python3.11 -m mlx_lm.server --model /Users/ledaticempire/models/Qwen3.5-9B-6bit --adapter-path /Users/ledaticempire/projects/rail/training/adapters_st --host 0.0.0.0 --port ", port, " --trust-remote-code --max-tokens 4096 > /tmp/mlx_st_server.log 2>&1 &"])
+  -- Wait for server warmup and verify
+  let _ = shell "sleep 15"
+  let _ = wait_for_server 0
+  0
+
+-- Check if MLX server is alive (returns true/false)
+check_server dummy =
+  let port = trim (shell "cat /tmp/rail_st_port.txt 2>/dev/null || echo 8080")
+  let check = trim (shell (cat ["curl -s -m 5 http://localhost:", port, "/v1/models 2>/dev/null | head -1"]))
+  length check > 5
+
+-- Wait for MLX server with retries
+wait_for_server attempt =
+  if attempt >= 6 then print "  WARNING: Server not responding after 60s — continuing anyway"
+  else
+    let port = trim (shell "cat /tmp/rail_st_port.txt 2>/dev/null || echo 8080")
+    let check = trim (shell (cat ["curl -s -m 5 http://localhost:", port, "/v1/models 2>/dev/null | head -1"]))
+    if length check > 5 then print (cat ["  Server ready: ", check])
+    else
+      let _ = print (cat ["  Waiting for server... (attempt ", show (attempt + 1), "/6)"])
+      let _ = shell "sleep 10"
+      wait_for_server (attempt + 1)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- GOALS — read from training/self_train/goals.txt, steer task generation
+-- ══════════════════════════════════════════════════════════════════════════════
+
+goals_file = "training/self_train/goals.txt"
+
+load_goals dummy =
+  let content = read_file goals_file
+  if length content == 0 then []
+  else
+    let lines = split "\n" content
+    filter (\l -> if length l < 3 then false else head (chars l) != "#") lines
+
+-- Pick a goal for this round (rotate based on round number)
+pick_goal goals round =
+  if length goals == 0 then ""
+  else
+    let idx = round % length goals
+    nth_elem goals idx
+
+nth_elem xs n = if n <= 0 then head xs else nth_elem (tail xs) (n - 1)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- GENERATE NEW TASKS via LLM — steered by goals
+-- ══════════════════════════════════════════════════════════════════════════════
+
+generate_tasks level sys n =
+  generate_tasks_with_goal level sys n ""
+
+-- Generate ultimate tasks for goal grind mode (post level 10)
+generate_hard_tasks sys n goal =
+  let _ = print (cat ["  Generating ", show n, " ULTIMATE goal-grind tasks (level 10)..."])
+  let prompt = cat ["Generate ", show n, " ULTIMATE programming task descriptions for Rail (a pure functional language). These are EXPERT-level tasks that build real, practical programs. Each task should be on its own line. Output ONLY task descriptions, one per line, no numbering.\n\nFOCUS GOAL: ", goal, "\n\nGenerate tasks that DIRECTLY implement aspects of this goal. Programs should use Rail's full capabilities: shell calls, file I/O, HTTP serving, JSON building, ADTs, closures, arena memory management.\n\nExamples of this difficulty:\n- Write a Rail program that implements a complete HTTP API server with routing, auth, and JSON responses\n- Write a Rail program that generates a multi-page website with navigation, CSS, and data from shell commands\n- Write a Rail program that implements a deploy pipeline reading config, building artifacts, uploading via curl\n- Write a Rail program that implements a bytecode compiler and VM for a small expression language\n- Write a Rail program that implements an LLM-powered agent with retry logic and file-based memory"]
+  let response = llm_call sys prompt 3
+  let lines = split "\n" response
+  let tasks = filter (\l -> length l > 10) lines
+  let _ = print (cat ["  Generated ", show (length tasks), " ultimate tasks for: ", goal])
+  map (\t -> cat ["10\t", t]) tasks
+
+generate_tasks_with_goal level sys n goal =
+  let _ = print (cat ["  Generating ", show n, " new tasks at level ", show level, "..."])
+  let goal_context = if goal == "" then "" else cat ["\n\nFOCUS GOAL: ", goal, "\nGenerate tasks that progress toward this goal. Each task should build skills needed for the goal."]
+  let prompt = cat ["Generate ", show n, " programming task descriptions for Rail (a pure functional language). Level ", show level, "/25. Each task should be on its own line. Output ONLY task descriptions, one per line, no numbering.", goal_context, "\n\nLevel guide:\n1=basic arithmetic/print\n2=lists/recursion\n3=ADTs/closures\n4=multi-concept composition\n5=practical I/O (shell calls, read_file/write_file, JSON building, arg parsing)\n6=HTTP/networking (request/response parsing, JSON, routing, auth)\n7=real tools (site generators, dashboards, config parsers, deploy scripts)\n8=systems (arena memory, Result ADT errors, process management, retries)\n9=compiler patterns (bytecode VM, type inference, AST transforms, codegen)\n10=full programs (HTTP servers, deploy pipelines, LLM callers, monitors)\n11=API integration (GitHub/Cloudflare/Telegram APIs via curl, pagination, rate limiting)\n12=database (SQLite via shell, CRUD, migrations, aggregation, joins)\n13=data pipelines (ETL, JSONL transform, dedup, validation, batch processing)\n14=testing (test frameworks, property testing, regression, snapshot, fuzzing)\n15=concurrency (parallel shell, worker pools, timeouts, job schedulers)\n16=protocols (wire formats, serialization, message framing, event sourcing)\n17=code generation (generate Rail/.sh/.sql/.html from templates and schemas)\n18=self-modifying (feedback loops, adaptive config, A/B testing, curriculum)\n19=infrastructure (deploy pipelines, monitoring, alerting, auto-recovery, cron)\n20=language tooling (Rail formatter, linter, REPL, doc generator, test runner)\n21=distributed (heartbeat, sync, leader election, gossip, fleet aggregation)\n22=AI/ML integration (LLM calls, prompt chaining, agent loops, RAG, evaluation)\n23=compiler extensions (Rail lexer/parser, type checker, optimizer, codegen)\n24=meta-compilation (fuzzer, benchmarks, error improvement, compile cache)\n25=self-improvement (training analysis, curriculum optimization, active learning)"]
+  let response = llm_call sys prompt 2
+  let lines = split "\n" response
+  let tasks = filter (\l -> length l > 10) lines
+  let _ = print (cat ["  Generated ", show (length tasks), " tasks"])
+  let _ = if goal != "" then print (cat ["  Goal: ", goal]) else 0
+  map (\t -> cat [show level, "\t", t]) tasks
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- MAIN LOOP
+-- ══════════════════════════════════════════════════════════════════════════════
+
+get_flag argv flag def =
+  if length argv == 0 then def
+  else if head argv == flag then
+    if length (tail argv) > 0 then head (tail argv)
+    else def
+  else get_flag (tail argv) flag def
+
+main =
+  -- Parse CLI: --port PORT (default 8080), --no-retrain
+  let port = get_flag args "--port" "8080"
+  let no_retrain = get_flag args "--no-retrain" "no"
+  let _ = write_file "/tmp/rail_st_port.txt" port
+  let _ = write_file "/tmp/rail_st_no_retrain.txt" (if no_retrain != "no" then "yes" else "no")
+  let _ = print "=== RAIL SELF-TRAINING LOOP ==="
+  let _ = print (cat ["  Port: ", port, if no_retrain != "no" then " (no-retrain)" else ""])
+
+  let sys = mk_sys 0
+
+  -- Load progress first so we know which level to load
+  let (round, level, harvested, since_retrain, saved_cp, saved_cz) = read_progress 0
+  let _ = print (cat ["  Resuming: round=", show round, " level=", show level, " harvested=", show harvested, " since_retrain=", show since_retrain, " cp=", show saved_cp, " cz=", show saved_cz])
+
+  -- Only load seed tasks for current level (saves arena memory)
+  let tasks = seeds_for level
+  let _ = print (cat ["  Seed tasks at level ", show level, ": ", show (length tasks)])
+
+  -- Load goals
+  let goals = load_goals 0
+  let _ = print (cat ["  Goals: ", show (length goals)])
+  let _ = if length goals > 0 then
+    let _ = map (\g -> print (cat ["    • ", g])) goals
+    0
+  else print "    (none — add goals to training/self_train/goals.txt)"
+
+  -- Run the loop (restore persisted curriculum counters)
+  run_loop sys tasks goals round level harvested since_retrain saved_cp saved_cz
+
+run_loop sys all_tasks goals round level harvested since_retrain consecutive_pass consecutive_zero =
+  let _ = print (cat ["\n════ ROUND ", show round, " (level ", show level, " cp=", show consecutive_pass, " cz=", show consecutive_zero, ") ════"])
+
+  -- Health-check MLX server before wasting a round
+  let server_ok = check_server 0
+  if server_ok == false then
+    let _ = print "  ⚠ MLX server not responding — waiting 30s then retrying..."
+    let _ = shell "sleep 30"
+    let _ = write_progress round level harvested since_retrain consecutive_pass consecutive_zero
+    run_loop sys all_tasks goals round level harvested since_retrain consecutive_pass consecutive_zero
+  else
+
+  -- Pick this round's goal (rotates through goals list)
+  let goal = pick_goal goals round
+  let _ = if goal != "" then print (cat ["  Focus: ", goal]) else 0
+
+  -- Select tasks at current level
+  let level_tasks = select_tasks level all_tasks
+  let _ = print (cat ["  Tasks at level ", show level, ": ", show (length level_tasks)])
+
+  -- Always generate fresh tasks (seeds are a starting point, not the whole diet)
+  let fresh_tasks = generate_tasks_with_goal level sys 10 goal
+  let level_tasks = if length level_tasks == 0 then fresh_tasks
+    else append level_tasks fresh_tasks
+
+  -- Run up to 10 tasks this round (use arena mark/reset if available)
+  let batch = take_n level_tasks 10
+  let (pass, fail, new_harvested) = run_batch sys batch 0 0 0
+
+  let pass_rate = if (pass + fail) > 0 then pass * 100 / (pass + fail) else 0
+
+  let _ = print (cat ["\n  Round ", show round, " results: ", show pass, "/", show (pass + fail), " (", show pass_rate, "%)"])
+  let _ = print (cat ["  New examples harvested: ", show new_harvested])
+
+  -- Update totals
+  let harvested = harvested + new_harvested
+  let since_retrain = since_retrain + new_harvested
+
+  -- Log
+  let _ = write_line log_file (cat ["round=", show round, " level=", show level, " pass=", show pass, "/", show (pass + fail), " rate=", show pass_rate, "% harvested=", show harvested])
+
+  -- Check curriculum advancement (up) or fallback (down)
+  let consecutive_pass = if pass_rate >= 80 then consecutive_pass + 1 else 0
+  let consecutive_zero = if pass_rate == 0 then consecutive_zero + 1 else 0
+
+  -- Save progress with counters BEFORE retrain (so we don't lose state if retrain crashes)
+  let _ = write_progress round level harvested since_retrain consecutive_pass consecutive_zero
+
+  -- Check retrain trigger (skip if --no-retrain flag set)
+  let no_retrain = trim (shell "cat /tmp/rail_st_no_retrain.txt 2>/dev/null || echo no")
+  let since_retrain = if no_retrain == "yes" then since_retrain
+    else if since_retrain >= 200 then
+      let _ = retrain 0
+      let _ = print "  Adapter reloaded. Continuing with improved model."
+      0
+    else since_retrain
+
+  let (level, consecutive_pass, consecutive_zero, all_tasks) = if consecutive_pass >= 2 then
+    let new_level = level + 1
+    let _ = print (cat ["\n  ★ ADVANCING to level ", show new_level, "!"])
+    if new_level > 25 then
+      let _ = print "\n  ★★★ ALL 25 LEVELS MASTERED — entering goal grind mode ★★★"
+      let goal = pick_goal goals round
+      let _ = print (cat ["  Grinding goal: ", goal])
+      let new_tasks = generate_hard_tasks sys 10 goal
+      (25, 0, 0, new_tasks)
+    else
+      let goal = pick_goal goals round
+      -- Load seed tasks for new level + generate extras
+      let seeds = seeds_for new_level
+      let new_tasks = generate_tasks_with_goal new_level sys 10 goal
+      (new_level, 0, 0, append seeds new_tasks)
+  else if consecutive_zero >= 3 then
+    -- FALLBACK: 3 consecutive 0% rounds — drop back one level
+    let fallback_level = if level > 1 then level - 1 else 1
+    let _ = print (cat ["\n  ⚠ PLATEAU DETECTED — 3 rounds at 0%. Falling back to level ", show fallback_level])
+    let goal = pick_goal goals round
+    let seeds = seeds_for fallback_level
+    let new_tasks = generate_tasks_with_goal fallback_level sys 10 goal
+    (fallback_level, 0, 0, append seeds new_tasks)
+  else (level, consecutive_pass, consecutive_zero, all_tasks)
+
+  -- Reload goals each round (user can edit mid-run)
+  let goals = load_goals 0
+
+  -- Save progress with updated counters
+  let _ = write_progress round level harvested since_retrain consecutive_pass consecutive_zero
+
+  -- Continue forever
+  run_loop sys all_tasks goals (round + 1) level harvested since_retrain consecutive_pass consecutive_zero
+
+-- Process a batch of tasks
+run_batch sys tasks pass fail new_harvested =
+  if length tasks == 0 then (pass, fail, new_harvested)
+  else
+    let task_line = head tasks
+    let desc = task_desc task_line
+    let _ = print (cat ["\n  → ", desc])
+
+    -- Reset arena to prevent accumulation
+    let m = arena_mark 0
+
+    let (code, result) = try_task sys desc
+    let _ = arena_reset m
+
+    if result == "success" then
+      let _ = print "    ✓ PASS"
+      let n = harvest desc code
+      run_batch sys (tail tasks) (pass + 1) fail (new_harvested + n)
+    else
+      let _ = print (cat ["    ✗ FAIL (", result, ")"])
+      run_batch sys (tail tasks) pass (fail + 1) new_harvested
+
+take_n lst n = if n <= 0 then [] else if length lst == 0 then [] else cons (head lst) (take_n (tail lst) (n - 1))
