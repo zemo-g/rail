@@ -1,0 +1,248 @@
+-- autocatalyst.rail — The autocatalytic compiler
+-- A closed loop: generate Rail → compile → verify → harvest → feed back.
+--
+-- v3: 275 diverse tasks from the seed bank. Rail shuffles them itself.
+-- No LLM calls wasted on task generation. All inference → code.
+--
+-- Usage: cd ~/projects/rail && ./rail_native_llm run tools/autocatalyst.rail [--port 8082] [--cycles 50] [--tasks 5]
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+q = "\""
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- JSON helpers
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+json_esc_bs s = join "\\\\" (split "\\" s)
+json_esc_q s = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n" (split "\n" s)
+json_esc_tab s = join "\\t" (split "\t" s)
+json_esc s = json_esc_tab (json_esc_nl (json_esc_q (json_esc_bs s)))
+
+entry usr asst =
+  cat ["{", q, "messages", q, ":[",
+    "{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, json_esc sys_prompt, q, "},",
+    "{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, json_esc usr, q, "},",
+    "{", q, "role", q, ":", q, "assistant", q, ",", q, "content", q, ":", q, json_esc asst, q, "}]}"]
+
+sys_prompt = "You are a Rail language expert. Rail is a pure functional language that compiles to native ARM64 and Metal GPU shaders. Write correct Rail code."
+
+write_line file text =
+  let _ = write_file "/tmp/rail_ac_line.txt" (cat [text, "\n"])
+  shell (cat ["cat /tmp/rail_ac_line.txt >> ", file])
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- LLM interface
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+llm_call port sys_msg user_msg =
+  llm (show port) sys_msg user_msg
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- System prompt — grammar-aware
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+mk_sys dummy =
+  let grammar = read_file "grammar/rail.ebnf"
+  cat ["You are a Rail language expert. Rail compiles to native ARM64.\n\nGRAMMAR:\n", grammar, "\n\nCRITICAL RULES:\n- Functions: name params = body (top-level only, no 'let rec')\n- Let uses NEWLINES not 'in': let x = 5\\n  x + 1\n- If: if cond then a else b (always both branches)\n- Match: match expr | Pat args -> expr (NO 'with', NO '::')\n- Lambda: \\x -> expr (single arg only)\n- Lists: [1,2,3], head, tail, cons, map, filter, fold, length, reverse, range\n- Tuples: (a,b), let (x,y) = expr\n- ADTs: type T = | A x | B\\nmatch val | A x -> ... | B -> ...\n- Strings: \"hello\", NO char literals (no 'a'), NO string indexing\n- print outputs value, show converts int to string\n- join sep list, split sep str, chars str, append str1 str2\n- main must exist and return an int\n- Use let _ = print expr for side effects\n- NO: let rec, match...with, x::xs, [x], arr[i], where, in (at end of let)"]
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Compile + Run verification (the oracle)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+verify code =
+  let _ = write_file "/tmp/rail_ac_test.rail" code
+  let _ = shell "rm -f /tmp/rail_ac_bin"
+  let compile_out = shell "cd ~/projects/rail && ./rail_native /tmp/rail_ac_test.rail 2>&1 && cp /tmp/rail_out /tmp/rail_ac_bin 2>&1"
+  let check = trim (shell "test -f /tmp/rail_ac_bin && echo ok || echo fail")
+  if check == "fail" then ("compile_fail", compile_out)
+  else
+    let run_out = shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_ac_bin 2>&1; echo $?"
+    let lines = split "\n" run_out
+    let exit_code = last_nonempty lines
+    if exit_code == "0" then ("success", run_out)
+    else if exit_code == "142" then ("timeout", run_out)
+    else ("runtime_fail", run_out)
+
+last_nonempty xs =
+  if length xs == 0 then ""
+  else if length xs == 1 then head xs
+  else
+    let last = last_nonempty (tail xs)
+    if last == "" then head xs else last
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Generate with retry — compiler feedback closes the loop
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+gen_with_retry port sys task prev_err attempt =
+  if attempt > 3 then ("", "fail")
+  else
+    let user = if prev_err == "" then
+      cat [task, "\n\nOutput ONLY Rail code. No markdown, no explanation. Functions before main."]
+    else
+      cat [task, "\n\nYour previous attempt failed:\n", prev_err, "\n\nFix the errors. Output ONLY Rail code."]
+    let code = llm_call port sys user
+    let (result, detail) = verify code
+    if result == "success" then (code, "success")
+    else if result == "compile_fail" then
+      gen_with_retry port sys task (cat ["Compile error. First 5 lines of your code:\n", trim (shell "head -5 /tmp/rail_ac_test.rail 2>/dev/null")]) (attempt + 1)
+    else (code, result)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Task pool — 275 diverse tasks, shuffled by Rail via shell
+-- Rail reads the file. Shell shuffles. No LLM calls wasted.
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+task_pool_file = "/tmp/rail_task_pool.txt"
+
+-- Grab N random tasks from the pool
+draw_tasks n =
+  let shuffled = shell (cat ["awk 'BEGIN{srand()}{print rand()\"\\t\"$0}' ", task_pool_file, " | sort -n | cut -f2- | head -n ", show n])
+  let lines = split "\n" shuffled
+  filter (\l -> length l > 10) lines
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Harvest
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+harvest_file = "training/self_train/harvest.jsonl"
+
+take_str s n =
+  let cs = chars s
+  join "" (take_n cs n)
+
+take_n lst n = if n <= 0 then [] else if length lst == 0 then [] else cons (head lst) (take_n (tail lst) (n - 1))
+
+harvest task code =
+  let fingerprint = take_str code 80
+  let already = trim (shell (cat ["grep -cF ", q, json_esc fingerprint, q, " ", harvest_file, " 2>/dev/null || echo 0"]))
+  if already != "0" then
+    let _ = print "    (duplicate - skipped)"
+    0
+  else
+    let _ = write_line harvest_file (entry task code)
+    let _ = write_line harvest_file (entry (cat ["Implement in Rail: ", task]) code)
+    let _ = write_line harvest_file (entry (cat ["Rail code for: ", task]) code)
+    3
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Run tasks
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+run_tasks port sys tasks =
+  run_tasks_acc port sys tasks 0 0 0
+
+run_tasks_acc port sys tasks pass fail harvested =
+  if length tasks == 0 then (pass, fail, harvested)
+  else
+    let task = head tasks
+    let _ = print (cat ["  > ", take_str task 80])
+    let m = arena_mark 0
+    let (code, result) = gen_with_retry port sys task "" 1
+    let _ = arena_reset m
+    if result == "success" then
+      let _ = print "    PASS"
+      let n = harvest task code
+      run_tasks_acc port sys (tail tasks) (pass + 1) fail (harvested + n)
+    else
+      let _ = print (cat ["    FAIL (", result, ")"])
+      run_tasks_acc port sys (tail tasks) pass (fail + 1) harvested
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Convergence tracking
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+convergence_file = "/tmp/autocatalyst_convergence.txt"
+
+log_convergence cycle pass total harvested =
+  let timestamp = trim (shell "date +%Y-%m-%dT%H:%M:%S")
+  let rate = if total > 0 then pass * 100 / total else 0
+  write_line convergence_file (cat [timestamp, " cycle=", show cycle, " pass=", show pass, "/", show total, " (", show rate, "%) harvested=", show harvested])
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Main
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+get_flag argv flag def =
+  if length argv == 0 then def
+  else if head argv == flag then
+    if length (tail argv) > 0 then head (tail argv)
+    else def
+  else get_flag (tail argv) flag def
+
+to_int_safe s = parse_digits (chars (trim s)) 0
+
+parse_digits cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = if c == "0" then 0 else if c == "1" then 1 else if c == "2" then 2 else if c == "3" then 3 else if c == "4" then 4 else if c == "5" then 5 else if c == "6" then 6 else if c == "7" then 7 else if c == "8" then 8 else if c == "9" then 9 else 0
+    parse_digits (tail cs) (acc * 10 + d)
+
+main =
+  let port = to_int_safe (get_flag args "--port" "8082")
+  let max_cycles = to_int_safe (get_flag args "--cycles" "50")
+  let tpc = to_int_safe (get_flag args "--tasks" "5")
+
+  let _ = print ""
+  let _ = print "╔═══════════════════════════════════════════════════════════╗"
+  let _ = print "║        AUTOCATALYTIC COMPILER v3                        ║"
+  let _ = print "║  275 diverse tasks — shuffled each cycle — no waste     ║"
+  let _ = print "║  generate -> compile -> verify -> harvest -> feed back  ║"
+  let _ = print "╚═══════════════════════════════════════════════════════════╝"
+  let _ = print ""
+
+  -- Check inference engine
+  let check = trim (shell (cat ["curl -s -m 5 http://localhost:", show port, "/v1/models 2>/dev/null | head -1"]))
+  let _ = if length check < 5 then
+    let _ = print (cat ["ERROR: No model server on :", show port])
+    shell "exit 1"
+  else print (cat ["Engine: localhost:", show port])
+
+  -- Check task pool
+  let pool_size = trim (shell (cat ["wc -l < ", task_pool_file, " 2>/dev/null | tr -d ' '"]))
+  let _ = print (cat ["Task pool: ", pool_size, " tasks"])
+
+  let sys = mk_sys 0
+
+  let existing = trim (shell (cat ["wc -l < ", harvest_file, " 2>/dev/null | tr -d ' '"]))
+  let _ = print (cat ["Corpus before: ", existing])
+  let _ = print (cat ["Plan: ", show max_cycles, " cycles x ", show tpc, " tasks = ", show (max_cycles * tpc), " tasks"])
+  let _ = print ""
+
+  run_cycles port sys 1 max_cycles tpc 0 0 0
+
+run_cycles port sys cycle max_cycles tpc total_pass total_fail total_harvested =
+  if cycle > max_cycles then
+    let total = total_pass + total_fail
+    let rate = if total > 0 then total_pass * 100 / total else 0
+    let corpus_now = trim (shell (cat ["wc -l < ", harvest_file, " 2>/dev/null | tr -d ' '"]))
+    let _ = print "\n═══════════════════════════════════════════════════════════"
+    let _ = print "  AUTOCATALYTIC CYCLE COMPLETE"
+    let _ = print "═══════════════════════════════════════════════════════════"
+    let _ = print (cat ["  Total tasks:     ", show total])
+    let _ = print (cat ["  Passed:          ", show total_pass, "/", show total, " (", show rate, "%)"])
+    let _ = print (cat ["  Harvested:       ", show total_harvested, " training examples"])
+    let _ = print (cat ["  Corpus now:      ", corpus_now])
+    let _ = print ""
+    0
+  else
+    let m_cycle = arena_mark 0
+
+    let _ = print (cat ["═══ CYCLE ", show cycle, "/", show max_cycles, " ═══"])
+
+    -- Draw random tasks from the pool
+    let tasks = draw_tasks tpc
+    let _ = print (cat ["  Drew ", show (length tasks), " tasks"])
+
+    -- Run them
+    let (pass, fail, harvested) = run_tasks port sys tasks
+    let _ = log_convergence cycle pass (pass + fail) harvested
+
+    let _ = arena_reset m_cycle
+
+    let _ = print (cat ["\n  Cycle ", show cycle, ": ", show pass, "/", show (pass + fail), " passed, ", show harvested, " harvested\n"])
+
+    run_cycles port sys (cycle + 1) max_cycles tpc (total_pass + pass) (total_fail + fail) (total_harvested + harvested)
