@@ -1,0 +1,273 @@
+-- waterfall.rail — Coordinated dual-node flywheel orchestrator
+-- Replaces waterfall.sh (424 lines of bash) — pure Rail
+--
+-- Mac Mini (24GB): serves models + generates training data
+-- Razer3070 (8GB VRAM): CUDA training for 4B (QLoRA, 16 layers)
+--
+-- Usage: ./rail_native run flywheel/waterfall.rail {status|start|stop|sync|pull|cycle|serve|bench|mini|razer}
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Config
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+razer = "Detro@100.109.63.37"
+razer_dir = "rail_training"
+model_dir = "/Users/ledaticempire/models"
+mlx_python = "/Users/ledaticempire/homebrew/bin/python3.11"
+pid_dir = "/tmp/waterfall"
+port_2b = 8082
+port_08b = 8083
+port_4b = 8081
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Helpers
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+esc = shell "printf '\\033'"
+green s = cat [esc, "[32m", s, esc, "[0m"]
+yellow s = cat [esc, "[33m", s, esc, "[0m"]
+red s = cat [esc, "[31m", s, esc, "[0m"]
+bold s = cat [esc, "[1m", esc, "[36m", s, esc, "[0m"]
+log s = print (cat [green "[waterfall]", " ", s])
+warn s = print (cat [yellow "[waterfall]", " ", s])
+err s = print (cat [red "[waterfall]", " ", s])
+hdr s = print (cat ["\n", bold s])
+
+ssh_cmd cmd = trim (shell (cat ["ssh -o ConnectTimeout=5 ", razer, " \"", cmd, "\" 2>/dev/null"]))
+scp_to src dst = shell (cat ["scp -q ", src, " ", razer, ":~/", razer_dir, "/", dst, " 2>/dev/null"])
+server_up port = length (trim (shell (cat ["curl -s -m 2 http://localhost:", show port, "/v1/models 2>/dev/null"]))) > 10
+read_pid name = trim (shell (cat ["cat ", pid_dir, "/", name, ".pid 2>/dev/null"]))
+write_pid name pid = shell (cat ["echo ", pid, " > ", pid_dir, "/", name, ".pid"])
+proc_alive pid = trim (shell (cat ["kill -0 ", pid, " 2>/dev/null && echo yes || echo no"])) == "yes"
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Data operations
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+merge_data _ =
+  let _ = log "Merging datasets..."
+  let count = trim (shell "cd ~/projects/rail && cat /tmp/rail_train_clean/train.jsonl training/self_train/harvest_clean.jsonl 2>/dev/null | python3 -c \"import sys,json\nseen=set()\nout=[]\nfor l in sys.stdin:\n l=l.strip()\n if not l:continue\n h=hash(l)\n if h not in seen:\n  seen.add(h)\n  try:\n   o=json.loads(l)\n   if 'messages' in o and len(o['messages'])>=2:out.append(l)\n  except:pass\nfor x in out:print(x)\nprint(len(out),file=sys.stderr)\" > /tmp/rail_dataset_merged.jsonl 2>/tmp/wf_mc.txt && cat /tmp/wf_mc.txt")
+  log (cat ["  Merged: ", count, " valid examples"])
+
+sync_to_razer _ =
+  let _ = merge_data 0
+  let _ = log "Pushing dataset to Razer..."
+  let _ = scp_to "/tmp/rail_dataset_merged.jsonl" "data/train.jsonl"
+  let remote_count = ssh_cmd (cat ["wc -l < ~/", razer_dir, "/data/train.jsonl 2>/dev/null || echo 0"])
+  log (cat ["  Razer has ", trim remote_count, " examples"])
+
+pull_adapter _ =
+  let dest = "training/adapters_4b_cuda"
+  let _ = shell (cat ["mkdir -p ", dest])
+  let _ = log "Pulling 4B adapter from Razer..."
+  let result = shell (cat ["scp -rq ", razer, ":~/", razer_dir, "/adapters_4b/latest/* ", dest, "/ 2>&1"])
+  let files = trim (shell (cat ["ls ", dest, "/ | wc -l"]))
+  log (cat ["  Pulled ", files, " files to ", dest, "/"])
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Model server management
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+serve_model model_path adapter_path port name =
+  if server_up port then
+    let _ = warn (cat [name, " already running on :", show port])
+    0
+  else
+    let _ = log (cat ["Starting ", name, " on :", show port, "..."])
+    let adapter_flag = if adapter_path == "none" then ""
+      else if trim (shell (cat ["test -d ", adapter_path, " && echo yes || echo no"])) == "yes"
+      then cat [" --adapter-path ", adapter_path]
+      else ""
+    let cmd = cat ["nohup ", mlx_python, " -m mlx_lm.server --model ", model_path, adapter_flag, " --host 0.0.0.0 --port ", show port, " --trust-remote-code --max-tokens 4096 > /tmp/waterfall_", name, ".log 2>&1 & echo $!"]
+    let pid = trim (shell cmd)
+    let _ = write_pid name pid
+    let _ = log (cat ["  Launched PID ", pid, ", waiting..."])
+    -- Wait up to 60s
+    wait_server port name 0
+
+wait_server port name attempt =
+  if attempt >= 12 then
+    let _ = err (cat ["  ", name, " failed to start"])
+    1
+  else
+    let _ = shell "sleep 5"
+    if server_up port then
+      let _ = log (cat ["  ", name, " ready on :", show port])
+      0
+    else wait_server port name (attempt + 1)
+
+stop_server port name =
+  let _ = shell (cat ["lsof -ti:", show port, " 2>/dev/null | xargs kill 2>/dev/null; rm -f ", pid_dir, "/", name, ".pid"])
+  log (cat ["Stopped ", name])
+
+serve_cmd name =
+  if name == "2b" then serve_model (cat [model_dir, "/Qwen3.5-2B"]) "training/adapters_2b" port_2b "2b-rail"
+  else if name == "0.8b" then serve_model (cat [model_dir, "/Qwen3.5-0.8B"]) "training/adapters_0.8b" port_08b "0.8b-rail"
+  else if name == "4b" then serve_model (cat [model_dir, "/Qwen3.5-4B-4bit"]) "training/adapters_4b" port_4b "4b-rail"
+  else
+    let _ = print "Usage: waterfall.rail serve {2b|0.8b|4b}"
+    1
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Mini: self-train (data generation)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+start_mini port =
+  if server_up port == 0 then
+    let _ = err (cat ["No model server on :", show port])
+    1
+  else
+    let pid = read_pid "selftrain"
+    if length pid > 0 then
+      if proc_alive pid then
+        let _ = warn (cat ["Self-train already running (PID ", pid, ")"])
+        0
+      else start_selftrain port
+    else start_selftrain port
+
+start_selftrain port =
+  let _ = log (cat ["Starting self_train on Mini (port ", show port, ")..."])
+  let pid = trim (shell (cat ["nohup ./rail_native_llm run tools/train/self_train.rail --port ", show port, " --no-retrain yes > /tmp/waterfall_selftrain.log 2>&1 & echo $!"]))
+  let _ = write_pid "selftrain" pid
+  log (cat ["  PID: ", pid])
+
+stop_mini _ =
+  let pid = read_pid "selftrain"
+  if length pid > 0 then
+    if proc_alive pid then
+      let _ = shell (cat ["kill ", pid, " 2>/dev/null"])
+      log (cat ["Stopped self_train (PID ", pid, ")"])
+    else log "Self-train not running"
+  else warn "No self_train PID file"
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Razer: CUDA training
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+razer_alive _ = length (ssh_cmd "echo ok") > 0
+razer_training _ = length (ssh_cmd "tasklist 2>/dev/null | grep python.exe | grep -v fleet") > 0
+
+start_razer model iters =
+  if razer_alive 0 == 0 then
+    let _ = err "Razer not reachable"
+    1
+  else
+    let _ = log (cat ["Starting training on Razer (", model, ", ", show iters, " iters)..."])
+    let cmd = cat ["cd ~/", razer_dir, " && python train_cuda.py --model ", model, " --data ./data --adapter-path ./adapters_4b --iters ", show iters, " --batch-size 1 --learning-rate 1e-5 --lora-rank 8 --lora-alpha 16 --num-layers 16 --max-seq-length 1024 --quantize-4bit --gradient-checkpointing --warmup-steps 100 --grad-clip 1.0 --save-every 250 --report-every 50 > train.log 2>&1 & disown; echo ok"]
+    let _ = ssh_cmd cmd
+    log "  Launched. Monitor: ssh Detro@100.109.63.37 'tail -f ~/rail_training/train.log'"
+
+stop_razer _ =
+  let _ = log "Stopping Razer training..."
+  let _ = ssh_cmd "cmd //c 'taskkill /F /IM python.exe' 2>/dev/null"
+  log "  Done."
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Status
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+show_status _ =
+  let _ = hdr "WATERFALL STATUS"
+
+  -- Mini servers
+  let _ = hdr "Mini — Model Servers"
+  let _ = print (cat ["  ", if server_up port_2b then green "UP" else yellow "--", "   :", show port_2b, "  2B"])
+  let _ = print (cat ["  ", if server_up port_08b then green "UP" else yellow "--", "   :", show port_08b, "  0.8B"])
+  let _ = print (cat ["  ", if server_up port_4b then green "UP" else yellow "--", "   :", show port_4b, "  4B"])
+
+  -- Mini self-train
+  let _ = hdr "Mini — Data Generation"
+  let pid = read_pid "selftrain"
+  let running = if length pid > 0 then proc_alive pid else 0
+  let _ = print (cat ["  self_train: ", if running then green "RUNNING" else yellow "STOPPED"])
+  let progress = trim (shell "grep -E '^(round|level|harvested)=' training/self_train/progress.txt 2>/dev/null | tr '\\n' ' '")
+  let _ = if length progress > 0 then print (cat ["  ", progress]) else 0
+  let harvest_count = trim (shell "wc -l < training/self_train/harvest_clean.jsonl 2>/dev/null || echo 0")
+  let _ = print (cat ["  harvest_clean: ", harvest_count, " examples"])
+
+  -- Razer
+  let _ = hdr "Razer — CUDA Training"
+  if razer_alive 0 then
+    let _ = print (cat ["  Connection: ", green "UP"])
+    let gpu = ssh_cmd "nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null"
+    let _ = print (cat ["  GPU: ", gpu])
+    let training = razer_training 0
+    let _ = print (cat ["  Training: ", if training then green "RUNNING" else yellow "STOPPED"])
+    let last_log = ssh_cmd (cat ["tail -1 ~/", razer_dir, "/4b-train.log 2>/dev/null"])
+    let _ = if length last_log > 5 then print (cat ["  Last: ", last_log]) else 0
+    let ckpts = ssh_cmd (cat ["ls -d ~/", razer_dir, "/adapters_4b/0*_adapter 2>/dev/null | wc -l"])
+    print (cat ["  Checkpoints: ", trim ckpts])
+  else
+    print (cat ["  Connection: ", red "OFFLINE"])
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Compound commands
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+cycle _ =
+  let _ = hdr "WATERFALL CYCLE"
+  let _ = stop_razer 0
+  let _ = shell "sleep 2"
+  let _ = sync_to_razer 0
+  let _ = start_razer "Qwen/Qwen3.5-4B" 2000
+  log "Cycle complete — Razer retraining on fresh data."
+
+start_all _ =
+  let _ = hdr "STARTING WATERFALL"
+  let _ = serve_model (cat [model_dir, "/Qwen3.5-2B"]) "training/adapters_2b" port_2b "2b-rail"
+  let _ = start_mini port_2b
+  let _ = sync_to_razer 0
+  let _ = start_razer "Qwen/Qwen3.5-4B" 2000
+  let _ = log "Waterfall running on both nodes."
+  show_status 0
+
+stop_all _ =
+  let _ = hdr "STOPPING WATERFALL"
+  let _ = stop_mini 0
+  let _ = stop_razer 0
+  let _ = stop_server port_2b "2b-rail"
+  let _ = stop_server port_08b "0.8b-rail"
+  let _ = stop_server port_4b "4b-rail"
+  log "Waterfall stopped."
+
+run_bench port =
+  let _ = log (cat ["Running benchmark against :", show port, "..."])
+  print (shell (cat ["cd ~/projects/rail && ./rail_native_llm run flywheel/bench.rail --port ", show port, " 2>&1"]))
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Main — dispatch
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+usage _ =
+  let _ = print "Usage: waterfall.rail {start|stop|status|sync|pull|cycle|serve|bench|mini|razer}"
+  let _ = print ""
+  let _ = print "  start   — launch servers + self_train + Razer training"
+  let _ = print "  stop    — stop everything"
+  let _ = print "  status  — check all nodes"
+  let _ = print "  sync    — merge data + push to Razer"
+  let _ = print "  pull    — pull trained adapter from Razer"
+  let _ = print "  cycle   — sync + restart Razer training"
+  let _ = print "  serve   — start a model server (2b, 0.8b, 4b)"
+  let _ = print "  bench   — run 30-task benchmark"
+  let _ = print "  mini    — start self_train only"
+  let _ = print "  razer   — start Razer training only"
+  1
+
+main =
+  let _ = shell (cat ["mkdir -p ", pid_dir])
+  let a = args
+  let cmd = if length a >= 2 then head (tail a) else "status"
+  if cmd == "status" then show_status 0
+  else if cmd == "start" then start_all 0
+  else if cmd == "stop" then stop_all 0
+  else if cmd == "sync" then sync_to_razer 0
+  else if cmd == "pull" then pull_adapter 0
+  else if cmd == "cycle" then cycle 0
+  else if cmd == "serve" then serve_cmd (if length a >= 3 then head (tail (tail a)) else "")
+  else if cmd == "bench" then run_bench (if length a >= 3 then to_int (head (tail (tail a))) else port_2b)
+  else if cmd == "mini" then start_mini (if length a >= 3 then to_int (head (tail (tail a))) else port_2b)
+  else if cmd == "razer" then start_razer "Qwen/Qwen3.5-4B" (if length a >= 3 then to_int (head (tail (tail a))) else 2000)
+  else usage 0

@@ -1,0 +1,304 @@
+-- autocatalyst_v4.rail — True autocatalytic compiler
+-- One process. Runs forever. Retrains itself. Measures its own improvement.
+--
+-- Loop:
+--   1. Generate Rail code via LLM
+--   2. Compile with rail_native (oracle)
+--   3. Harvest successes as training data
+--   4. Every RETRAIN_EVERY new examples: pause, retrain LoRA, restart server, resume
+--   5. Track pre/post retrain pass rates to prove compounding
+--
+-- Usage: cd ~/projects/rail && ./rail_native_llm run tools/autocatalyst_v4.rail [--port 8082]
+-- Kill:  kill $(pgrep -f autocatalyst_v4)
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+q = "\""
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Config
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+retrain_every = 200
+tasks_per_cycle = 5
+bench_cycles = 10
+model_path = "/Users/ledaticempire/models/Qwen3.5-9B-6bit"
+adapter_path = "/Users/ledaticempire/projects/rail/training/adapters_st"
+harvest_file = "training/self_train/harvest.jsonl"
+progress_file = "/tmp/autocatalyst_v4_progress.txt"
+convergence_file = "/tmp/autocatalyst_v4_convergence.txt"
+task_pool_file = "/tmp/rail_task_pool.txt"
+mlx_python = "/Users/ledaticempire/homebrew/bin/python3.11"
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- JSON helpers
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+json_esc_bs s = join "\\\\" (split "\\" s)
+json_esc_q s = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n" (split "\n" s)
+json_esc_tab s = join "\\t" (split "\t" s)
+json_esc s = json_esc_tab (json_esc_nl (json_esc_q (json_esc_bs s)))
+
+sys_prompt = "You are a Rail language expert. Rail is a pure functional language that compiles to native ARM64 and Metal GPU shaders. Write correct Rail code."
+
+entry usr asst =
+  cat ["{", q, "messages", q, ":[",
+    "{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, json_esc sys_prompt, q, "},",
+    "{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, json_esc usr, q, "},",
+    "{", q, "role", q, ":", q, "assistant", q, ",", q, "content", q, ":", q, json_esc asst, q, "}]}"]
+
+-- Use unique temp files per purpose to prevent interleaving
+write_harvest text =
+  let _ = write_file "/tmp/rail_ac4_h.txt" (cat [text, "\n"])
+  shell (cat ["cat /tmp/rail_ac4_h.txt >> ", harvest_file])
+
+write_log text =
+  let _ = write_file "/tmp/rail_ac4_l.txt" (cat [text, "\n"])
+  shell (cat ["cat /tmp/rail_ac4_l.txt >> ", convergence_file])
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- LLM + Verification (the oracle)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+mk_sys dummy =
+  let grammar = read_file "grammar/rail.ebnf"
+  cat ["You are a Rail language expert. Rail compiles to native ARM64.\n\nGRAMMAR:\n", grammar, "\n\nCRITICAL RULES:\n- Functions: name params = body (top-level only, no 'let rec')\n- Let uses NEWLINES not 'in': let x = 5\\n  x + 1\n- If: if cond then a else b (always both branches)\n- Match: match expr | Pat args -> expr (NO 'with', NO '::')\n- Lambda: \\x -> expr (single arg only)\n- Lists: [1,2,3], head, tail, cons, map, filter, fold, length, reverse, range\n- Tuples: (a,b), let (x,y) = expr\n- ADTs: type T = | A x | B\\nmatch val | A x -> ... | B -> ...\n- Strings: \"hello\", NO char literals (no 'a'), NO string indexing\n- print outputs value, show converts int to string\n- join sep list, split sep str, chars str, append str1 str2\n- main must exist and return an int\n- Use let _ = print expr for side effects\n- NO: let rec, match...with, x::xs, [x], arr[i], where, in (at end of let)"]
+
+llm_call port sys_msg user_msg = llm (show port) sys_msg user_msg
+
+verify code =
+  let _ = write_file "/tmp/rail_ac4_test.rail" code
+  let _ = shell "rm -f /tmp/rail_ac4_bin"
+  let _ = shell "cd ~/projects/rail && ./rail_native /tmp/rail_ac4_test.rail 2>&1 && cp /tmp/rail_out /tmp/rail_ac4_bin 2>&1"
+  let check = trim (shell "test -f /tmp/rail_ac4_bin && echo ok || echo fail")
+  if check == "fail" then "compile_fail"
+  else
+    let run_out = shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_ac4_bin 2>&1; echo $?"
+    let lines = split "\n" run_out
+    let exit_code = last_nonempty lines
+    if exit_code == "0" then "success"
+    else if exit_code == "142" then "timeout"
+    else "runtime_fail"
+
+last_nonempty xs =
+  if length xs == 0 then ""
+  else if length xs == 1 then head xs
+  else let l = last_nonempty (tail xs)
+    if l == "" then head xs else l
+
+gen_with_retry port sys task prev_err attempt =
+  if attempt > 3 then ("", "fail")
+  else
+    let user = if prev_err == "" then
+      cat [task, "\n\nOutput ONLY Rail code. No markdown, no explanation. Functions before main."]
+    else
+      cat [task, "\n\nYour previous attempt failed:\n", prev_err, "\n\nFix the errors. Output ONLY Rail code."]
+    let code = llm_call port sys user
+    let result = verify code
+    if result == "success" then (code, "success")
+    else if result == "compile_fail" then
+      gen_with_retry port sys task (cat ["Compile error. First 5 lines:\n", trim (shell "head -5 /tmp/rail_ac4_test.rail 2>/dev/null")]) (attempt + 1)
+    else (code, result)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Task drawing + harvesting
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+draw_tasks n =
+  let shuffled = shell (cat ["awk 'BEGIN{srand()}{print rand()\"\\t\"$0}' ", task_pool_file, " | sort -n | cut -f2- | head -n ", show n])
+  filter (\l -> length l > 10) (split "\n" shuffled)
+
+take_str s n = join "" (take_n (chars s) n)
+take_n lst n = if n <= 0 then [] else if length lst == 0 then [] else cons (head lst) (take_n (tail lst) (n - 1))
+
+harvest task code =
+  -- Always harvest. Dedup happens at retrain time (proper hash, not prefix).
+  let _ = write_harvest (entry task code)
+  let _ = write_harvest (entry (cat ["Implement in Rail: ", task]) code)
+  let _ = write_harvest (entry (cat ["Rail code for: ", task]) code)
+  3
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Progress persistence
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+save_progress cycle since_rt total_harvested generation =
+  write_file progress_file (cat [
+    "cycle=", show cycle, "\n",
+    "since_retrain=", show since_rt, "\n",
+    "total_harvested=", show total_harvested, "\n",
+    "generation=", show generation, "\n"])
+
+load_progress dummy =
+  let content = read_file progress_file
+  if length content == 0 then (1, 0, 0, 0)
+  else
+    let lines = split "\n" content
+    let cycle = kv lines "cycle"
+    let since_rt = kv lines "since_retrain"
+    let total_h = kv lines "total_harvested"
+    let gen = kv lines "generation"
+    (cycle, since_rt, total_h, gen)
+
+kv lines key =
+  if length lines == 0 then 0
+  else
+    let parts = split "=" (head lines)
+    if length parts >= 2 then
+      if head parts == key then to_int (trim (head (tail parts)))
+      else kv (tail lines) key
+    else kv (tail lines) key
+
+to_int s = parse_digits (chars s) 0
+parse_digits cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = if c == "0" then 0 else if c == "1" then 1 else if c == "2" then 2 else if c == "3" then 3 else if c == "4" then 4 else if c == "5" then 5 else if c == "6" then 6 else if c == "7" then 7 else if c == "8" then 8 else if c == "9" then 9 else 0
+    parse_digits (tail cs) (acc * 10 + d)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Logging
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+log cycle pass total harvested generation =
+  let timestamp = trim (shell "date +%Y-%m-%dT%H:%M:%S")
+  let rate = if total > 0 then pass * 100 / total else 0
+  write_log (cat [timestamp, " gen=", show generation, " cycle=", show cycle, " pass=", show pass, "/", show total, " (", show rate, "%) harvested=", show harvested])
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- RETRAIN — the compounding step
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+retrain port generation =
+  let _ = print "\n╔═══════════════════════════════════════════════════════════╗"
+  let _ = print (cat ["║  RETRAIN — generation ", show generation, " → ", show (generation + 1)])
+  let _ = print "╚═══════════════════════════════════════════════════════════╝"
+
+  -- Step 1: Dedup harvest
+  let _ = print "\n  [1/5] Deduping corpus..."
+  let _ = shell "python3 -c \"\nimport json, hashlib\nseen=set(); out=[]\nwith open('training/self_train/harvest.jsonl') as f:\n    for line in f:\n        try:\n            obj=json.loads(line.strip())\n            code=obj['messages'][-1]['content'].strip()\n            h=hashlib.sha256(code.encode()).hexdigest()\n            if h not in seen:\n                seen.add(h)\n                out.append(line.strip())\n        except: pass\nwith open('training/self_train/harvest.jsonl','w') as f:\n    f.write('\\n'.join(out)+'\\n')\nprint(f'  Kept {len(out)} unique examples')\n\""
+  let corpus = trim (shell "wc -l < training/self_train/harvest.jsonl | tr -d ' '")
+  let _ = print (cat ["  Corpus: ", corpus, " examples"])
+
+  -- Step 2: Kill MLX server
+  let _ = print "\n  [2/5] Stopping MLX server..."
+  let _ = shell "pkill -f 'mlx_lm.server.*8082' 2>/dev/null || true"
+  let _ = shell "sleep 5"
+
+  -- Step 3: Merge + split + LoRA train
+  let _ = print "\n  [3/5] Merging data and training LoRA..."
+  let _ = shell "python3 -c \"\nimport json, hashlib, random, os\nos.makedirs('/tmp/rail_retrain_data', exist_ok=True)\nseen=set(); out=[]\nfor f in ['training/train.jsonl', 'training/self_train/harvest.jsonl', 'training/git_harvest.jsonl']:\n    try:\n        for line in open(f):\n            try:\n                h=hashlib.sha256(line.strip().encode()).hexdigest()\n                if h not in seen:\n                    seen.add(h)\n                    out.append(line.strip())\n            except: pass\n    except: pass\nrandom.shuffle(out)\nn=len(out); tr=int(n*0.9); va=int(n*0.05)\nwith open('/tmp/rail_retrain_data/train.jsonl','w') as f: f.write('\\n'.join(out[:tr])+'\\n')\nwith open('/tmp/rail_retrain_data/valid.jsonl','w') as f: f.write('\\n'.join(out[tr:tr+va])+'\\n')\nwith open('/tmp/rail_retrain_data/test.jsonl','w') as f: f.write('\\n'.join(out[tr+va:])+'\\n')\nprint(f'  Split: {tr} train / {va} valid / {n-tr-va} test')\n\""
+
+  let train_out = shell (cat [mlx_python, " -m mlx_lm lora --model ", model_path, " --train --data /tmp/rail_retrain_data/ --iters 2000 --batch-size 1 --learning-rate 1e-5 --num-layers 16 --steps-per-report 200 --steps-per-eval 500 --save-every 1000 --max-seq-length 1024 --mask-prompt --adapter-path ", adapter_path, " 2>&1 | tail -5"])
+  let _ = print train_out
+
+  -- Step 4: Restart server
+  let _ = print "\n  [4/5] Restarting MLX server..."
+  let _ = shell (cat [mlx_python, " -m mlx_lm.server --model ", model_path, " --adapter-path ", adapter_path, " --host 0.0.0.0 --port ", show port, " --trust-remote-code --max-tokens 4096 > /tmp/mlx_ac4_server.log 2>&1 &"])
+  let _ = wait_for_server port 0
+
+  -- Step 5: Done
+  let _ = print (cat ["\n  [5/5] Generation ", show (generation + 1), " ready.\n"])
+  generation + 1
+
+wait_for_server port attempt =
+  if attempt >= 12 then print "  WARNING: Server not responding after 120s"
+  else
+    let _ = shell "sleep 10"
+    let check = trim (shell (cat ["curl -s -m 3 http://localhost:", show port, "/v1/models 2>/dev/null | head -c 10"]))
+    if length check > 3 then print (cat ["  Server ready (attempt ", show (attempt + 1), ")"])
+    else
+      let _ = print (cat ["  Waiting... (", show (attempt + 1), "/12)"])
+      wait_for_server port (attempt + 1)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- MAIN LOOP — the true autocatalyst
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+main =
+  let _ = print ""
+  let _ = print "╔═══════════════════════════════════════════════════════════╗"
+  let _ = print "║  AUTOCATALYTIC COMPILER v4 — TRUE CLOSED LOOP           ║"
+  let _ = print "║  generate → compile → harvest → retrain → repeat        ║"
+  let _ = print "║  one process, runs forever, compounds on itself         ║"
+  let _ = print "╚═══════════════════════════════════════════════════════════╝"
+
+  let port = to_int (get_flag args "--port" "8082")
+
+  -- Verify server
+  let check = trim (shell (cat ["curl -s -m 5 http://localhost:", show port, "/v1/models 2>/dev/null | head -c 10"]))
+  let _ = if length check < 3 then
+    let _ = print (cat ["ERROR: No model server on :", show port])
+    shell "exit 1"
+  else print (cat ["  Engine: localhost:", show port])
+
+  -- Verify task pool
+  let pool_size = trim (shell (cat ["wc -l < ", task_pool_file, " 2>/dev/null | tr -d ' '"]))
+  let _ = print (cat ["  Task pool: ", pool_size, " tasks"])
+
+  -- Load or init progress
+  let (cycle, since_rt, total_h, generation) = load_progress 0
+  let _ = print (cat ["  Resuming: cycle=", show cycle, " since_retrain=", show since_rt, " harvested=", show total_h, " generation=", show generation])
+
+  let sys = mk_sys 0
+  let _ = print ""
+
+  run port sys cycle since_rt total_h generation
+
+run port sys cycle since_rt total_h generation =
+  let _ = print (cat ["═══ CYCLE ", show cycle, " (gen ", show generation, ", +", show since_rt, "/", show retrain_every, ") ═══"])
+
+  -- Draw and run tasks (arena-managed per task inside run_tasks)
+  let tasks = draw_tasks tasks_per_cycle
+  let _ = print (cat ["  Drew ", show (length tasks), " tasks"])
+  let (pass, fail, harvested) = run_tasks port sys tasks 0 0 0
+  let total = pass + fail
+  let rate = if total > 0 then pass * 100 / total else 0
+
+  let _ = print (cat ["  Result: ", show pass, "/", show total, " (", show rate, "%) +", show harvested, " harvested"])
+  let _ = log cycle pass total harvested generation
+
+  -- Update counters (ints, not strings — survive arena resets)
+  let new_since = since_rt + harvested
+  let new_total_h = total_h + harvested
+
+  -- Save progress
+  let _ = save_progress (cycle + 1) new_since new_total_h generation
+
+  -- Check retrain trigger
+  if new_since >= retrain_every then
+    let new_gen = retrain port generation
+    let _ = save_progress (cycle + 1) 0 new_total_h new_gen
+    run port sys (cycle + 1) 0 new_total_h new_gen
+  else
+    run port sys (cycle + 1) new_since new_total_h generation
+
+-- Run tasks with accumulator
+run_tasks port sys tasks pass fail harvested =
+  if length tasks == 0 then (pass, fail, harvested)
+  else
+    let task = head tasks
+    let _ = print (cat ["  > ", take_str task 75])
+    let tm = arena_mark 0
+    let (code, result) = gen_with_retry port sys task "" 1
+    let _ = arena_reset tm
+    if result == "success" then
+      let _ = print "    PASS"
+      let n = harvest task code
+      run_tasks port sys (tail tasks) (pass + 1) fail (harvested + n)
+    else
+      let _ = print (cat ["    FAIL (", result, ")"])
+      run_tasks port sys (tail tasks) pass (fail + 1) harvested
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Arg parsing
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+get_flag argv flag def =
+  if length argv == 0 then def
+  else if head argv == flag then
+    if length (tail argv) > 0 then head (tail argv)
+    else def
+  else get_flag (tail argv) flag def
