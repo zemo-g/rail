@@ -57,13 +57,8 @@ def get_changed_rail_files(commit):
     return [f for f in out.split("\n") if f.strip().endswith(".rail")]
 
 def make_variants(sys_msg, task_desc, code):
-    """Generate multiple phrasings for the same (task, code) pair."""
-    variants = [
-        entry(sys_msg, task_desc, code),
-        entry(sys_msg, f"Implement in Rail: {task_desc}", code),
-        entry(sys_msg, f"Write Rail code for: {task_desc}", code),
-    ]
-    return variants
+    """Single entry per program — with prompt masking, variants are pure waste."""
+    return [entry(sys_msg, task_desc, code)]
 
 # Skip these — they're training infrastructure, not Rail programs to teach
 SKIP_FILES = {
