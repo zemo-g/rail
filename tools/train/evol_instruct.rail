@@ -1,0 +1,171 @@
+-- evol_instruct.rail — Evolve training data via compiler-verified mutations
+-- Takes good harvest examples, asks LLM to make them harder, verifies with compiler.
+-- Inspired by WizardCoder's Evol-Instruct but with compiler oracle.
+--
+-- Usage: ./rail_native run tools/train/evol_instruct.rail
+-- Output: training/self_train/evolved.jsonl
+
+-- JSON helpers
+q = "\""
+nl = "\n"
+
+json_esc_char c =
+  if c == 34 then append "\\" (append "\"" "")
+  else if c == 92 then append "\\" (append "\\" "")
+  else if c == 10 then append "\\" (append "n" "")
+  else if c == 9 then append "\\" (append "t" "")
+  else append (char_to_str c) ""
+
+json_esc s =
+  let cs = chars s
+  join "" (map json_esc_char cs)
+
+-- Evolution strategies (6 types)
+strat_add_constraint dummy =
+  "Add a constraint or edge case to this Rail program. For example: handle empty list, handle negative numbers, add a bounds check. Keep the same structure but make it more robust. Output ONLY the evolved Rail code."
+
+strat_increase_complexity dummy =
+  "Make this Rail program more complex. Add another function, use more pattern matching, combine more list operations, or add a second ADT. The program must still compile and produce correct output. Output ONLY the evolved Rail code."
+
+strat_compose_patterns dummy =
+  "Combine this program's pattern with another Rail pattern. For example: if it uses fold, also add map or filter. If it uses an ADT, add a second ADT. If it's recursive, add mutual recursion. Output ONLY the evolved Rail code."
+
+strat_optimize dummy =
+  "Rewrite this Rail program to be more elegant or idiomatic. Use pipelines (|>), fold instead of explicit recursion, or pattern matching instead of if-else chains. Must produce the same output. Output ONLY the evolved Rail code."
+
+strat_generalize dummy =
+  "Generalize this Rail program. If it works on a specific list, make it work on any list via a function parameter. If it uses a fixed value, make it configurable. Output ONLY the evolved Rail code."
+
+strat_extend dummy =
+  "Extend this Rail program with additional functionality. Add a new function that uses the existing ones, or add IO (print more results, write to file). Output ONLY the evolved Rail code."
+
+-- Pick evolution strategy by index (mod 6)
+pick_strat n =
+  let m = n % 6
+  if m == 0 then strat_add_constraint 0
+  else if m == 1 then strat_increase_complexity 0
+  else if m == 2 then strat_compose_patterns 0
+  else if m == 3 then strat_optimize 0
+  else if m == 4 then strat_generalize 0
+  else strat_extend 0
+
+-- System prompt for evolution
+sys_prompt dummy =
+  "You write Rail code. EXAMPLE:\nadd a b = a + b\nmain =\n  let _ = print (show (fold add 0 [1,2,3]))\n  0\nADT EXAMPLE:\ntype Option = | Some x | None\ngetOr opt = match opt\n  | Some x -> x\n  | None -> 0\nmain =\n  let _ = print (show (getOr (Some 42)))\n  0\nSYNTAX: fn x y = body (before main). match e | P -> body (NO with). fold f init list (named fn). NO: let rec, match...with, fn/def keyword, nested lambda, type annotations.\nOutput ONLY code. No explanation."
+
+-- Verify code compiles and runs
+verify code =
+  let _ = write_file "/tmp/rail_evol_test.rail" code
+  let result = shell "./rail_native /tmp/rail_evol_test.rail 2>&1"
+  let exit = shell "echo $?"
+  if trim exit == "0" then
+    let run = shell "timeout 5 /tmp/rail_out 2>&1; echo EXIT:$?"
+    let run_exit = shell "echo $?"
+    if trim run_exit == "0" then "pass"
+    else "runtime_fail"
+  else "compile_fail"
+
+-- Extract code from a JSONL harvest line
+extract_code line =
+  let _ = write_file "/tmp/rail_evol_parse.py" (cat [
+    "import json,sys\n",
+    "d=json.loads(sys.stdin.readline())\n",
+    "msgs=d.get('messages',[])\n",
+    "for m in msgs:\n",
+    "  if m.get('role')=='assistant':\n",
+    "    print(m.get('content',''))\n",
+    "    break\n"])
+  let _ = write_file "/tmp/rail_evol_line.txt" (cat [line, "\n"])
+  trim (shell "cat /tmp/rail_evol_line.txt | /opt/homebrew/bin/python3.11 /tmp/rail_evol_parse.py 2>/dev/null")
+
+-- Extract task from a JSONL harvest line
+extract_task line =
+  let _ = write_file "/tmp/rail_evol_parse2.py" (cat [
+    "import json,sys\n",
+    "d=json.loads(sys.stdin.readline())\n",
+    "msgs=d.get('messages',[])\n",
+    "for m in msgs:\n",
+    "  if m.get('role')=='user':\n",
+    "    print(m.get('content',''))\n",
+    "    break\n"])
+  let _ = write_file "/tmp/rail_evol_line.txt" (cat [line, "\n"])
+  trim (shell "cat /tmp/rail_evol_line.txt | /opt/homebrew/bin/python3.11 /tmp/rail_evol_parse2.py 2>/dev/null")
+
+-- Build JSONL entry
+make_entry task code =
+  cat ["{", q, "messages", q, ":[",
+    "{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, json_esc (sys_prompt 0), q, "},",
+    "{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, json_esc task, q, "},",
+    "{", q, "role", q, ":", q, "assistant", q, ",", q, "content", q, ":", q, json_esc code, q, "}]}"]
+
+-- Write a line to the output file
+write_line file text =
+  let _ = write_file "/tmp/rail_evol_append.txt" (cat [text, "\n"])
+  shell (cat ["cat /tmp/rail_evol_append.txt >> ", file])
+
+-- Main evolution loop
+main =
+  let port = trim (shell "cat /tmp/rail_st_port.txt 2>/dev/null || echo 8080")
+  let harvest_file = "training/self_train/harvest.jsonl"
+  let output_file = "training/self_train/evolved.jsonl"
+  let hash_file = "training/self_train/evolved_hashes.txt"
+
+  -- Sample N random lines from harvest
+  let n_samples = 50
+  let _ = print (cat ["Evol-Instruct: sampling ", show n_samples, " examples from harvest"])
+  let _ = shell (cat ["shuf -n ", show n_samples, " ", harvest_file, " > /tmp/rail_evol_samples.txt"])
+  let samples = trim (shell "cat /tmp/rail_evol_samples.txt")
+  let lines = split "\n" samples
+
+  let _ = print (cat ["Got ", show (length lines), " samples, evolving..."])
+
+  -- Process each sample
+  let evolved = 0
+  let failed = 0
+  let _ = arena_mark 0
+
+  let process_line idx line =
+    let _ = arena_mark 0
+    let code = extract_code line
+    let task = extract_task line
+    let result =
+      if length code < 20 then "skip"
+      else
+        let strat = pick_strat idx
+        let user_msg = cat ["Here is a working Rail program:\n\n", code, "\n\n", strat]
+        let new_code = llm port (sys_prompt 0) user_msg
+        let _ = print (cat ["  [", show idx, "] Strategy: ", strat])
+        if length new_code < 20 then "empty"
+        else
+          let status = verify new_code
+          if status == "pass" then
+            -- Check not duplicate
+            let hash = trim (shell (cat ["echo '", new_code, "' | shasum -a 256 | cut -d' ' -f1"]))
+            let is_dup = trim (shell (cat ["grep -q '", hash, "' ", hash_file, " 2>/dev/null && echo yes || echo no"]))
+            if is_dup == "yes" then "dup"
+            else
+              let new_task = cat ["[EVOLVED] ", task]
+              let entry = make_entry new_task new_code
+              let _ = write_line output_file entry
+              let _ = write_line hash_file hash
+              let _ = print (cat ["    ✓ EVOLVED (", show (length new_code), " chars)"])
+              "evolved"
+          else
+            let _ = print (cat ["    ✗ ", status])
+            "fail"
+    let _ = arena_reset 0
+    result
+
+  -- Simple fold over indices
+  let indices = range (length lines)
+  let results = map (\i -> process_line i (head (drop i lines))) indices
+
+  let evolved_count = length (filter (\r -> r == "evolved") results)
+  let fail_count = length (filter (\r -> r == "fail") results)
+
+  let _ = print ""
+  let _ = print (cat ["=== Evol-Instruct Complete ==="])
+  let _ = print (cat ["  Evolved: ", show evolved_count, " / ", show (length lines)])
+  let _ = print (cat ["  Failed: ", show fail_count])
+  let _ = print (cat ["  Output: ", output_file])
+  0

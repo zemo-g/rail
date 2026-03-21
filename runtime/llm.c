@@ -43,7 +43,7 @@ char *rail_llm(const char *port_str, const char *sys_prompt, const char *user_pr
         "{\"role\": \"system\", \"content\": \"%s\"}, "
         "{\"role\": \"user\", \"content\": \"%s\"}], "
         "\"max_tokens\": 4096, \"temperature\": 0.3, "
-        "\"chat_template_kwargs\": {\"enable_thinking\": false}}",
+        "\"chat_template_kwargs\": {\"enable_thinking\": true}}",
         esc_sys, esc_usr);
 
     FILE *f = fopen("/tmp/rail_llm_req.json", "w");
@@ -74,19 +74,45 @@ char *rail_llm(const char *port_str, const char *sys_prompt, const char *user_pr
     if (total > 0 && result[total-1] == '\n')
         result[total-1] = 0;
 
-    // Strip markdown code fences if present
+    // Strip leading whitespace/newlines (thinking mode adds \n\n prefix)
+    char *ws = result;
+    while (*ws == '\n' || *ws == '\r' || *ws == ' ' || *ws == '\t') ws++;
+    if (ws != result) {
+        memmove(result, ws, strlen(ws) + 1);
+    }
+
+    // Strip <think>...</think> tags if present (Qwen thinking mode leak)
+    char *think_start = strstr(result, "<think>");
+    if (think_start) {
+        char *think_end = strstr(think_start, "</think>");
+        if (think_end) {
+            think_end += 8; // skip "</think>"
+            while (*think_end == '\n' || *think_end == '\r') think_end++;
+            memmove(think_start, think_end, strlen(think_end) + 1);
+        }
+    }
+
+    // Strip markdown code fences if present (extract first ``` block only)
     if (strncmp(result, "```", 3) == 0) {
         char *start = strchr(result, '\n');
         if (start) {
             start++;
             char *end = strstr(start, "\n```");
-            if (end) *end = 0;
+            if (end) *end = 0;  // cuts off closing fence + any explanation after
             char *clean = malloc(strlen(start) + 1);
             strcpy(clean, start);
             free(result);
             result = clean;
         }
     }
+
+    // Strip trailing explanation text (thinking mode appends "**Explanation:**..." etc.)
+    // Look for common patterns after code ends
+    char *trail = strstr(result, "\n\n**");
+    if (!trail) trail = strstr(result, "\n\nExplanation");
+    if (!trail) trail = strstr(result, "\n\nNote:");
+    if (!trail) trail = strstr(result, "\n\nThis ");
+    if (trail) *trail = 0;
 
     free(req);
     free(esc_sys);
