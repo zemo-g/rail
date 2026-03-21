@@ -65,17 +65,27 @@ def load_model(args):
 
 
 def apply_lora(model, args):
-    all_layers = [n for n, _ in model.named_modules()
-                  if "self_attn" in n and any(p in n for p in ["q_proj", "k_proj", "v_proj", "o_proj"])]
-    layer_indices = sorted(set(int(n.split(".")[2]) for n in all_layers if n.split(".")[2].isdigit()))
+    # Discover ALL attention layers: self_attn (8 full-attention) + linear_attn (24 DeltaNet)
+    attn_modules = [n for n, _ in model.named_modules()
+                    if ("self_attn" in n or "linear_attn" in n) and
+                    any(p in n for p in ["q_proj", "k_proj", "v_proj", "o_proj",
+                                         "in_proj_qkv", "in_proj_z", "in_proj_b",
+                                         "in_proj_a", "out_proj"])]
+    layer_indices = sorted(set(int(n.split(".")[2]) for n in attn_modules if n.split(".")[2].isdigit()))
     target_layers = layer_indices[-args.num_layers:] if len(layer_indices) > args.num_layers else layer_indices
 
+    # Count by type for diagnostics
+    sa_count = len([i for i in target_layers if any("self_attn" in n and f".{i}." in n for n in attn_modules)])
+    dn_count = len([i for i in target_layers if any("linear_attn" in n and f".{i}." in n for n in attn_modules)])
     print(f"  Found {len(layer_indices)} attention layers: {layer_indices[0]}-{layer_indices[-1]}")
     print(f"  Targeting last {len(target_layers)}: {target_layers}")
+    print(f"  Breakdown: {sa_count} self_attn + {dn_count} DeltaNet layers")
 
     config = LoraConfig(
         r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "in_proj_qkv", "in_proj_z", "in_proj_b",
+                        "in_proj_a", "out_proj"],
         layers_to_transform=target_layers,
         task_type=TaskType.CAUSAL_LM)
     model = get_peft_model(model, config)
@@ -294,8 +304,20 @@ def train(model, train_examples, valid_examples, args, tokenizer):
                         val_str = f" val={val_loss:.4f}"
                         if val_loss > avg_loss * 1.5:
                             val_str += " !!OVERFIT"
+                        # Collapse detection: val loss diverging from best
+                        if val_loss > best_val_loss * 2.0 and step > args.warmup_steps:
+                            val_str += " !!COLLAPSE_RISK"
 
-                print(f"  Iter {step}/{args.iters}: loss={avg_loss:.4f} best={best_loss:.4f}{val_str} lr={lr:.2e} tok/s={tps:.0f} eta={eta_m:.0f}m")
+                # Log entropy of last batch logits (collapse = entropy → 0)
+                with torch.no_grad():
+                    logits = outputs.logits[:, -1, :]
+                    probs = torch.softmax(logits, dim=-1)
+                    entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean().item()
+                entropy_str = f" entropy={entropy:.2f}"
+                if entropy < 1.0 and step > args.warmup_steps:
+                    entropy_str += " !!LOW"
+
+                print(f"  Iter {step}/{args.iters}: loss={avg_loss:.4f} best={best_loss:.4f}{val_str} lr={lr:.2e} tok/s={tps:.0f}{entropy_str} eta={eta_m:.0f}m")
                 sys.stdout.flush()
                 total_loss = 0.0
 

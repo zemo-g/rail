@@ -39,7 +39,7 @@ write_line file text =
 -- ══════════════════════════════════════════════════════════════════════════════
 
 mk_sys dummy =
-  cat ["You write Rail code. EXAMPLE:\nadd a b = a + b\nmain =\n  let _ = print (show (fold add 0 [1,2,3]))\n  0\nSYNTAX: fn x y = body (before main). let x = e\\n  rest. if c then a else b. match e\\n  | P x -> body. type T = | A x | B. \\x -> expr (no nesting). fold f init list (f must be named fn, NOT lambda). map f list. head/tail/cons/length/reverse/range/filter. show int->str. join sep list. split char str. print str. chars str. append s1 s2. write_file/read_file path str.\nNO: let rec, match...with, x::xs, where, in, char literals, string index, nested lambda, def/fun/fn keyword. main returns int."]
+  cat ["You write Rail code. Output ONLY code, no explanation.\nEXAMPLE 1:\nadd a b = a + b\nmain =\n  let _ = print (show (fold add 0 [1,2,3]))\n  0\nEXAMPLE 2 (ADT + pattern match):\ntype Option = | Some x | None\ngetOr opt = match opt\n  | Some x -> x\n  | None -> 0\nmain =\n  let _ = print (show (getOr (Some 42)))\n  0\nSYNTAX: fn x y = body (before main). let x = e\\n  rest. if c then a else b. match e\\n  | P x -> body (NO with keyword). type T = | A x | B. \\x -> expr (no nesting). fold f init list (f must be named fn NOT lambda). map f list. head/tail/cons/length/reverse/range/filter. show int->str. join sep list. split char str. print str. chars str. append s1 s2. write_file/read_file path str.\nCRITICAL: NO let rec. NO match...with. NO x::xs. NO where. NO in. NO char literals. NO string index. NO nested lambda. NO fn/def/fun keyword. NO type annotations. main returns int. Indent continuation with 2 spaces."]
 
 -- Native LLM call via builtin
 -- Port read from /tmp/rail_st_port.txt (written by main from --port arg)
@@ -602,19 +602,14 @@ retrain dummy =
   -- Re-harvest git metadata (picks up any new commits since last retrain)
   let _ = print "  Harvesting git history..."
   let _ = shell "/opt/homebrew/bin/python3.11 ~/projects/rail/tools/train/harvest_git.py > /tmp/rail_harvest_git.log 2>&1"
-  -- Merge all training data: original + self-harvest + git harvest
+  -- Use full data pipeline (dedup → merge all 10 sources → split)
   let _ = shell "mkdir -p /tmp/rail_st_data"
-  let _ = shell "cat ~/projects/rail/training/train.jsonl ~/projects/rail/training/real_programs.jsonl ~/projects/rail/training/self_train/harvest.jsonl ~/projects/rail/training/self_train/repairs.jsonl ~/projects/rail/training/git_harvest.jsonl > /tmp/rail_st_merged.jsonl 2>/dev/null"
-  let total = trim (shell "wc -l < /tmp/rail_st_merged.jsonl")
-  let _ = print (cat ["  Merged training data: ", total, " examples"])
-  -- 90/5/5 split
-  let n = parse_digits (chars (trim total)) 0
-  let train_n = n * 9 / 10
-  let valid_n = n / 20
-  let _ = shell (cat ["head -n ", show train_n, " /tmp/rail_st_merged.jsonl > /tmp/rail_st_data/train.jsonl"])
-  let _ = shell (cat ["tail -n +", show (train_n + 1), " /tmp/rail_st_merged.jsonl | head -n ", show valid_n, " > /tmp/rail_st_data/valid.jsonl"])
-  let _ = shell (cat ["tail -n +", show (train_n + valid_n + 1), " /tmp/rail_st_merged.jsonl > /tmp/rail_st_data/test.jsonl"])
-  let _ = print (cat ["  Split: ", show train_n, " train / ", show valid_n, " valid / ", show (n - train_n - valid_n), " test"])
+  let _ = shell "cd ~/projects/rail && ./rail_native run flywheel/dataset.rail prepare 2>/dev/null"
+  let _ = shell "cp /tmp/rail_flywheel_data/train.jsonl /tmp/rail_st_data/train.jsonl && cp /tmp/rail_flywheel_data/valid.jsonl /tmp/rail_st_data/valid.jsonl && cp /tmp/rail_flywheel_data/test.jsonl /tmp/rail_st_data/test.jsonl"
+  let _ = shell "cat /tmp/rail_st_data/train.jsonl /tmp/rail_st_data/valid.jsonl /tmp/rail_st_data/test.jsonl > /tmp/rail_st_merged.jsonl 2>/dev/null"
+  let total = trim (shell "wc -l < /tmp/rail_st_data/train.jsonl 2>/dev/null || echo 0")
+  let valid_n = trim (shell "wc -l < /tmp/rail_st_data/valid.jsonl 2>/dev/null || echo 0")
+  let _ = print (cat ["  Data pipeline: ", total, " train / ", valid_n, " valid (all 10 sources, deduplicated)"])
   -- LoRA train
   let _ = print "  Starting LoRA training (this takes ~30 min)..."
   let train_out = shell "/Users/ledaticempire/homebrew/bin/python3.11 -m mlx_lm lora --model /Users/ledaticempire/models/Qwen3.5-9B-6bit --train --data /tmp/rail_st_data/ --iters 2000 --batch-size 1 --learning-rate 1e-5 --num-layers 16 --steps-per-report 200 --steps-per-eval 500 --save-every 1000 --max-seq-length 1024 --mask-prompt --adapter-path /Users/ledaticempire/projects/rail/training/adapters_st 2>&1"
@@ -701,16 +696,43 @@ generate_hard_tasks sys n goal =
   let _ = print (cat ["  Generated ", show (length tasks), " ultimate tasks for: ", goal])
   map (\t -> cat ["10\t", t]) tasks
 
+-- OK-pattern: for L11+ tasks, generate a reference solution to get expected output
+-- Returns "level\ttask\texpected" or "level\ttask" if no output verified
+add_expected_output sys level task =
+  if level < 11 then task
+  else
+    let _ = arena_mark 0
+    let task_desc = head (tail (split "\t" task))
+    let ref_prompt = cat ["Write a Rail program for this task. The program MUST print its result.\n\nTask: ", task_desc]
+    let ref_code = llm_call sys ref_prompt 1
+    let _ = write_file "/tmp/rail_st_ref.rail" ref_code
+    let compile = shell "cd ~/projects/rail && ./rail_native /tmp/rail_st_ref.rail 2>&1 && cp /tmp/rail_out /tmp/rail_st_ref_bin 2>/dev/null"
+    let bin_ok = trim (shell "test -f /tmp/rail_st_ref_bin && echo ok || echo fail")
+    let result = if bin_ok == "ok" then
+      let run = shell "timeout 5 /tmp/rail_st_ref_bin 2>/dev/null"
+      let output = trim (shell "cat /tmp/rail_st_run_out.txt 2>/dev/null")
+      let exit = trim (shell "echo $?")
+      if length output > 0 then
+        let _ = print (cat ["    OK-pattern: ", task_desc, " → ", output])
+        cat [task, "\t", output]
+      else task
+    else task
+    let _ = arena_reset 0
+    result
+
 generate_tasks_with_goal level sys n goal =
   let _ = print (cat ["  Generating ", show n, " new tasks at level ", show level, "..."])
   let goal_context = if goal == "" then "" else cat ["\n\nFOCUS GOAL: ", goal, "\nGenerate tasks that progress toward this goal. Each task should build skills needed for the goal."]
-  let prompt = cat ["Generate ", show n, " programming task descriptions for Rail (a pure functional language). Level ", show level, "/25. Each task should be on its own line. Output ONLY task descriptions, one per line, no numbering.", goal_context, "\n\nLevel guide:\n1=basic arithmetic/print\n2=lists/recursion\n3=ADTs/closures\n4=multi-concept composition\n5=practical I/O (shell calls, read_file/write_file, JSON building, arg parsing)\n6=HTTP/networking (request/response parsing, JSON, routing, auth)\n7=real tools (site generators, dashboards, config parsers, deploy scripts)\n8=systems (arena memory, Result ADT errors, process management, retries)\n9=compiler patterns (bytecode VM, type inference, AST transforms, codegen)\n10=full programs (HTTP servers, deploy pipelines, LLM callers, monitors)\n11=API integration (GitHub/Cloudflare/Telegram APIs via curl, pagination, rate limiting)\n12=database (SQLite via shell, CRUD, migrations, aggregation, joins)\n13=data pipelines (ETL, JSONL transform, dedup, validation, batch processing)\n14=testing (test frameworks, property testing, regression, snapshot, fuzzing)\n15=concurrency (parallel shell, worker pools, timeouts, job schedulers)\n16=protocols (wire formats, serialization, message framing, event sourcing)\n17=code generation (generate Rail/.sh/.sql/.html from templates and schemas)\n18=self-modifying (feedback loops, adaptive config, A/B testing, curriculum)\n19=infrastructure (deploy pipelines, monitoring, alerting, auto-recovery, cron)\n20=language tooling (Rail formatter, linter, REPL, doc generator, test runner)\n21=distributed (heartbeat, sync, leader election, gossip, fleet aggregation)\n22=AI/ML integration (LLM calls, prompt chaining, agent loops, RAG, evaluation)\n23=compiler extensions (Rail lexer/parser, type checker, optimizer, codegen)\n24=meta-compilation (fuzzer, benchmarks, error improvement, compile cache)\n25=self-improvement (training analysis, curriculum optimization, active learning)"]
+  let prompt = cat ["Generate ", show n, " programming task descriptions for Rail (a pure functional language). Level ", show level, "/25. Each task should be on its own line. Output ONLY task descriptions, one per line, no numbering. IMPORTANT: each task must produce visible output (print something).", goal_context, "\n\nLevel guide:\n1=basic arithmetic/print\n2=lists/recursion\n3=ADTs/closures\n4=multi-concept composition\n5=practical I/O (shell calls, read_file/write_file, JSON building, arg parsing)\n6=HTTP/networking (request/response parsing, JSON, routing, auth)\n7=real tools (site generators, dashboards, config parsers, deploy scripts)\n8=systems (arena memory, Result ADT errors, process management, retries)\n9=compiler patterns (bytecode VM, type inference, AST transforms, codegen)\n10=full programs (HTTP servers, deploy pipelines, LLM callers, monitors)\n11=API integration (GitHub/Cloudflare/Telegram APIs via curl, pagination, rate limiting)\n12=database (SQLite via shell, CRUD, migrations, aggregation, joins)\n13=data pipelines (ETL, JSONL transform, dedup, validation, batch processing)\n14=testing (test frameworks, property testing, regression, snapshot, fuzzing)\n15=concurrency (parallel shell, worker pools, timeouts, job schedulers)\n16=protocols (wire formats, serialization, message framing, event sourcing)\n17=code generation (generate Rail/.sh/.sql/.html from templates and schemas)\n18=self-modifying (feedback loops, adaptive config, A/B testing, curriculum)\n19=infrastructure (deploy pipelines, monitoring, alerting, auto-recovery, cron)\n20=language tooling (Rail formatter, linter, REPL, doc generator, test runner)\n21=distributed (heartbeat, sync, leader election, gossip, fleet aggregation)\n22=AI/ML integration (LLM calls, prompt chaining, agent loops, RAG, evaluation)\n23=compiler extensions (Rail lexer/parser, type checker, optimizer, codegen)\n24=meta-compilation (fuzzer, benchmarks, error improvement, compile cache)\n25=self-improvement (training analysis, curriculum optimization, active learning)"]
   let response = llm_call sys prompt 2
   let lines = split "\n" response
   let tasks = filter (\l -> length l > 10) lines
   let _ = print (cat ["  Generated ", show (length tasks), " tasks"])
   let _ = if goal != "" then print (cat ["  Goal: ", goal]) else 0
-  map (\t -> cat [show level, "\t", t]) tasks
+  let raw_tasks = map (\t -> cat [show level, "\t", t]) tasks
+  -- For L11+, try to add expected output via OK-pattern
+  if level >= 11 then map (add_expected_output sys level) raw_tasks
+  else raw_tasks
 
 -- ══════════════════════════════════════════════════════════════════════════════
 -- MAIN LOOP

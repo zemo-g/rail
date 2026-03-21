@@ -128,21 +128,37 @@ for key, arr in weights.items():
 
 save_file(mlx_weights, str(out_dir / "adapters.safetensors"))
 
+# Auto-detect LoRA keys from converted weights
+lora_keys = set()
+for k in mlx_weights:
+    if ".lora_a" in k:
+        parts = k.split(".")
+        li = parts.index("layers") + 1
+        module_key = ".".join(parts[li+1:]).replace(".lora_a", "")
+        lora_keys.add(module_key)
+
 # Write MLX adapter config (must match mlx_lm expected format)
+num_lora_layers = len(set(
+    int(k.split(".")[k.split(".").index("layers")+1])
+    for k in mlx_weights if "layers" in k
+))
 mlx_cfg = {
     "fine_tune_type": "lora",
-    "num_layers": len(layers) if layers else 8,
+    "num_layers": num_lora_layers,
     "lora_parameters": {
         "rank": r,
         "dropout": 0.0,
-        "scale": float(alpha) / r
-    }
+        "scale": float(alpha) / r,
+        "keys": sorted(lora_keys)
+    },
+    "model": "/Users/ledaticempire/models/Qwen3.5-4B-4bit"
 }
 with open(out_dir / "adapter_config.json", "w") as f:
     json.dump(mlx_cfg, f, indent=2)
 
-print(f"Converted {len(mlx_weights)} weight tensors")
-print(f"Config: rank={r}, alpha={alpha}, layers={len(layers) if layers else 8}")
+print(f"Converted {len(mlx_weights)} weight tensors across {num_lora_layers} layers")
+print(f"LoRA keys: {sorted(lora_keys)}")
+print(f"Config: rank={r}, alpha={alpha}")
 print(f"Saved to {out_dir}")
 CONVERT_EOF
 
