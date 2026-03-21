@@ -307,6 +307,68 @@ _ftell:
     svc #0
     ret
 
+_fflush:
+    mov x0, #0
+    ret
+
+_open:
+    mov x3, #0x1B6
+    mov x2, x1
+    mov x1, x0
+    mov x0, #-100
+    mov x8, #56
+    svc #0
+    ret
+
+_ioctl:
+    mov x8, #29
+    svc #0
+    ret
+
+_sys_write:
+    mov x8, #64
+    svc #0
+    ret
+
+_sys_close:
+    mov x8, #57
+    svc #0
+    ret
+
+_usleep:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    mov x1, #1000
+    mul x1, x0, x1
+    mov x0, #0
+    stp x0, x1, [x29, #16]
+    add x0, x29, #16
+    mov x1, #0
+    mov x8, #101
+    svc #0
+    ldp x29, x30, [sp], #32
+    ret
+
+_poke_byte:
+    strb w2, [x0, x1]
+    mov x0, #0
+    ret
+
+_peek_byte:
+    ldrb w0, [x0, x1]
+    ret
+
+_memset2:
+    cbz x3, .Lms2_done
+.Lms2_loop:
+    strb w1, [x0], #1
+    strb w2, [x0], #1
+    sub x3, x3, #1
+    cbnz x3, .Lms2_loop
+.Lms2_done:
+    mov x0, #0
+    ret
+
 // ---- popen/pclose: fork + execve + pipe ----
 
 _popen:
