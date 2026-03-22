@@ -6,16 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64.
 
-- **Compiler source**: `tools/compile.rail` (~1,774 lines)
+- **Compiler source**: `tools/compile.rail` (~1,900 lines)
 - **Seed binary**: `rail_native` (~304K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
-- **Runtime**: C files in `runtime/` (allocator, GC stubs, LLM builtin, string ops) linked into every compiled program
-- **Bump allocator**: 1GB arena (upgraded from 256MB on 2026-03-21). Programs that exhaust it fall through to malloc. Use `arena_mark`/`arena_reset` in loops.
-- **Tests**: `./rail_native test` — 67 tests, should be 67/67. Historically flaky due to old 256MB allocator, now stable at 1GB.
+- **Runtime**: C files in `runtime/` (gc.c, llm.c) linked into every compiled program
+- **GC**: Conservative mark-sweep garbage collector (`runtime/gc.c`). Scans ARM64 stack frames, marks reachable tagged objects, sweeps into free list. Triggered when 1GB arena bump-alloc fails. Programs can now allocate well beyond 1GB total.
+- **Allocator**: 1GB bump arena + GC free list + malloc fallback. `arena_mark`/`arena_reset` still work (clear free list on reset).
+- **Tests**: `./rail_native test` — 70 tests, should be 70/70. Stable since GC + 1GB allocator.
 
 ### Key Commands
 
 ```bash
-./rail_native test                    # run 67-test suite
+./rail_native test                    # run 70-test suite
 ./rail_native self                    # self-compile → /tmp/rail_self (must be byte-identical)
 ./rail_native run file.rail           # compile + execute
 ./rail_native file.rail               # compile only → /tmp/rail_out
@@ -39,7 +40,7 @@ map f list, filter f list             -- list ops
 head xs, tail xs, length xs, reverse xs, cons x xs
 range N                               -- [0..N-1]
 \x -> x + 1                          -- single lambda OK
--- \a -> \b -> a + b                  -- NESTED LAMBDAS BROKEN — use named functions
+\a -> \b -> a + b                    -- nested lambdas work (flattened to multi-param)
 write_file path content, read_file path
 let _ = shell "command"
 join sep list, split "c" str          -- split is per-character, NOT substring
@@ -50,11 +51,16 @@ x |> f                                -- pipe operator (f x)
 ### Known Compiler Limitations
 
 - **`split` is single-character**: `split "abc" s` splits on `a`, `b`, and `c` individually
-- **Nested lambdas don't compile**: `\a -> \b -> expr` fails silently. Use named functions.
-- **Single lambdas in filter can segfault at runtime**: `filter (\x -> x > 3) list` compiles but crashes (closure bug)
-- **65K char limit**: files over ~65K chars can silently miscompile (allocator overflow)
+- **Single lambdas in filter can segfault at runtime**: `filter (\x -> x > 3) list` compiles but crashes (runtime filter dispatch bug). Workaround: use named predicate functions.
 - **WASM backend**: compiles but segfaults at runtime (heap limit)
-- **Large programs (300+ lines)**: can segfault from string concatenation pressure. Workaround: write to file incrementally.
+- **Exhaustiveness warnings**: Non-exhaustive `match` on ADT types emits a compiler warning (not error). Missing constructors are listed.
+
+### What's Fixed (v1.4.0)
+
+- **Nested lambdas**: `\a -> \b -> a + b` compiles correctly. Flattened to multi-param closures. Direct application beta-reduced.
+- **Multi-capture closures**: Closures with 2+ captured variables now load all captures (up to 4).
+- **GC**: Conservative mark-sweep garbage collector. Programs can allocate well beyond 1GB total. The 65K char limit and 300-line program limit are eliminated.
+- **Exhaustiveness checking**: Compiler warns on non-exhaustive ADT pattern matches.
 
 ### Modifying the Compiler
 
@@ -64,7 +70,7 @@ After editing `tools/compile.rail`:
 3. `./rail_native self` — compile with new binary
 4. Compare: `diff /tmp/rail_self /tmp/rail_out` — must be empty (fixed point)
 5. If not identical, repeat step 2-4 until stable
-6. `./rail_native test` — verify 67/67
+6. `./rail_native test` — verify 70/70
 
 ## Flywheel (Self-Training System)
 
