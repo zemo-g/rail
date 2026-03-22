@@ -1,19 +1,25 @@
 # Rail
 
+[![tests: 67/67](https://img.shields.io/badge/tests-67%2F67-brightgreen)](#)
+[![self-hosting](https://img.shields.io/badge/self--hosting-fixed%20point-blue)](#)
+[![ARM64](https://img.shields.io/badge/target-ARM64-orange)](#)
+[![dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen)](#)
+[![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-green)](LICENSE)
+
 A programming language that deleted its own compiler.
 
 ```
 -- Rail compiles itself. This is the entire bootstrap:
 --   ./rail_native self && cp /tmp/rail_self ./rail_native
 --
--- 950 lines of Rail replaced 21,086 lines of Rust.
+-- 1,774 lines of Rail replaced 21,086 lines of Rust.
 -- The compiler is a fixed point of itself.
 
+add a b = a + b
+
 main =
-  let src = read_file "tools/compile.rail"
-  let asm = compile_program src
-  let _ = build asm
-  print "Self-compilation complete."
+  let _ = print (show (fold add 0 [1,2,3,4,5]))
+  0
 ```
 
 ## What happened
@@ -38,69 +44,84 @@ cd rail
 ./rail_native run examples/hello.rail
 ```
 
-Apple Silicon only (ARM64 macOS). No build step needed.
+Apple Silicon only (ARM64 macOS). Linux ARM64 cross-compilation supported.
 
 ### Rebuild from source (optional)
 
 ```bash
-./rail_native self           # compiles itself → /tmp/rail_self
-cp /tmp/rail_self ./rail_native   # install
-./rail_native test           # 67/67
+./rail_native self                    # compiles itself → /tmp/rail_self
+cp /tmp/rail_self ./rail_native       # install
+./rail_native test                    # 67/67
 ```
 
 ## Usage
 
 ```bash
-./rail_native <file.rail>           # compile to /tmp/rail_out
-./rail_native run <file.rail>       # compile + execute
-./rail_native test                  # run 67-test suite
-./rail_native self                  # self-compile (bootstrap)
+./rail_native <file.rail>             # compile to /tmp/rail_out
+./rail_native run <file.rail>         # compile + execute
+./rail_native test                    # run 67-test suite
+./rail_native self                    # self-compile (bootstrap)
 ```
 
 ## The language
 
 ```
--- Functions
+-- Functions (defined before main)
 double x = x * 2
-add x y = x + y
+add a b = a + b
 
--- Recursion with tail-call optimization
+-- Algebraic data types + pattern matching
+type Option = | Some x | None
+
+getOr opt = match opt
+  | Some x -> x
+  | None -> 0
+
+-- Main returns an integer
+main =
+  let _ = print (show (getOr (Some 42)))
+  0
+```
+
+```
+-- Recursion
 factorial n = if n <= 1 then 1 else n * factorial (n - 1)
 
--- Let bindings
+-- Higher-order functions (fold requires named function, not lambda)
+sum_sq acc x = acc + x * x
+
 main =
-  let a = 7
-  let b = a * a
-  b - 1
+  let result = fold sum_sq 0 [1,2,3,4,5]
+  let _ = print (show result)
+  0
+```
 
--- Strings
-greet name = print (append "hello, " name)
-
--- Lists
-main = head (map double [3, 5, 7])
-
--- Tuples
-swap a b = (b, a)
+```
+-- Lists, strings, I/O
 main =
-  let (x, y) = swap 1 2
-  x * 10 + y
+  let words = split " " "hello world"
+  let reversed = join " " (reverse words)
+  let _ = print reversed
+  let _ = write_file "/tmp/test.txt" reversed
+  0
 
--- Lambdas with closures
+-- Pipe operator
+inc x = x + 1
 main =
-  let n = 100
-  head (map (\x -> x + n) [1, 2, 3])
+  let r = [1,2,3] |> reverse |> head |> inc
+  let _ = print (show r)
+  0
 
--- File I/O, shell
+-- Shell integration
 main =
-  let _ = write_file "/tmp/out.txt" "hello"
-  let s = read_file "/tmp/out.txt"
-  let _ = print s
+  let date = shell "date +%Y-%m-%d"
+  let _ = print date
   0
 ```
 
 ## How it works
 
-The compiler (`tools/compile.rail`, ~1,762 lines) does:
+The compiler (`tools/compile.rail`, 1,774 lines) does:
 
 1. **Lexer** — tokenizes Rail source into a token stream
 2. **Parser** — builds an AST from tokens (lists with tag strings)
@@ -109,38 +130,66 @@ The compiler (`tools/compile.rail`, ~1,762 lines) does:
 
 Key implementation details:
 - **Tagged pointers** — integers: `(v << 1) | 1`, strings/heap objects: raw pointer (bit 0 = 0)
-- **256MB bump allocator** — no GC, just allocate forward
+- **1GB bump allocator** — no GC, just allocate forward. Arena mark/reset for loops.
 - **Tail-call optimization** — frame teardown + jump for constant-stack recursion
-- **2048-byte stack frames** — fits functions with 250+ local variables
 - **Closures** — inline lambda functions with captured variables
 - **Self-hosting** — the compiler compiles itself and reaches a fixed point
+
+## Backends
+
+| Backend | Status | Target |
+|---------|--------|--------|
+| **ARM64 native** | Stable | macOS, Linux (cross-compile) |
+| **Metal GPU** | Working | Apple Silicon compute shaders |
+| **x86_64** | Sandboxed subset | Linux/Windows (experimental) |
+| **WASM** | Compiles, runtime WIP | Browser/edge |
 
 ## Builtins
 
 | Category | Functions |
 |----------|-----------|
-| **I/O** | `print`, `show`, `read_file`, `write_file`, `shell` |
+| **I/O** | `print`, `show`, `read_file`, `write_file`, `shell`, `cat` |
 | **Lists** | `head`, `tail`, `cons`, `append`, `length`, `map`, `filter`, `fold`, `reverse`, `join`, `range` |
-| **Strings** | `chars`, `split`, `append` |
+| **Strings** | `chars`, `split`, `append`, `trim` |
 | **Math** | `not`, `to_float`, float arithmetic |
+| **ADTs** | `type`, `match` with pattern matching |
 | **Concurrency** | `spawn`, `channel`, `send`, `recv` |
-| **FFI** | `foreign` declarations for C library calls |
+| **Memory** | `arena_mark`, `arena_reset` |
+| **FFI** | `foreign` declarations, `llm` builtin |
 | **System** | `args`, `import` |
 
-## What's not here (yet)
+## Stdlib
 
-The self-hosting compiler handles the subset of Rail needed to compile itself. These features existed in the Rust implementation and can be re-added incrementally:
+22 modules in `stdlib/`:
 
-- Records / named fields
-- Type checker
-- LSP / formatter / REPL
-- Algebraic effects
+`json` `http` `sqlite` `regex` `base64` `socket` `crypto` `csv` `datetime` `env` `fs` `hash` `math` `net` `os` `path` `process` `random` `sort` `string` `test` `toml`
+
+## The Flywheel
+
+Rail has a self-training loop: generate Rail code with an LLM, compile it to verify, harvest what works, train a better model. The compiler is the oracle.
+
+```
+Generate → Compile → Harvest → Train → Repeat
+              ↑                    |
+              └────────────────────┘
+```
+
+- 25-level curriculum with auto-advancement
+- 4,500+ compiler-verified training examples
+- Quality scoring: binary size + execution time on every compile
+- Dual-node: Mac Mini (inference) + RTX 3070 (CUDA QLoRA training)
+- Thinking mode inference with robust response parsing
+- GRPO reward function wired to compiler exit code
+
+The model doesn't just learn to write valid code — it learns to write *fast* code. The compiler evolves the AI that writes the language the compiler is written in.
+
+More: [ledatic.org](https://ledatic.org) | [ledatic.org/system](https://ledatic.org/system)
 
 ## Numbers
 
 | | Before | After |
 |---|--------|-------|
-| **Compiler** | 21,086 lines (Rust) | 1,762 lines (Rail) |
+| **Compiler** | 21,086 lines (Rust) | 1,774 lines (Rail) |
 | **Binary** | ~8MB (Rust + Cranelift) | 297K (pure ARM64) |
 | **Dependencies** | Cargo, Cranelift, Rayon | `as` + `ld` |
 | **Build time** | ~30s (cargo build) | ~5s (self-compile) |
