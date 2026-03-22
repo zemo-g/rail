@@ -633,6 +633,31 @@ fv_filter free envns =
     let h = head free
     if fv_has h envns then cons h (fv_filter (tail free) envns) else fv_filter (tail free) envns
 
+-- Flatten nested lambdas: \a -> \b -> \c -> body → ([a, b, c], body)
+collect_lam_params node =
+  if head node == "F" then
+    let p = head (tail node)
+    let b = head (tail (tail node))
+    let (ps, ib) = collect_lam_params b
+    (cons p ps, ib)
+  else ([], node)
+
+-- Extract function expression from nested applications: A(A(fn, x), y) → fn
+get_app_fn node =
+  if head node == "A" then get_app_fn (head (tail node))
+  else node
+
+-- Beta-reduce: bind lambda params to args via let-bindings
+cg_let_binds params args env ar lc sl =
+  if length params == 0 then ("", env, lc, sl)
+  else
+    let p = head params
+    let a = head args
+    let (aasm, lc1, sl1) = cg a env ar lc sl false
+    let env2 = cons (p, sl1) env
+    let (rest, env3, lc2, sl2) = cg_let_binds (tail params) (tail args) env2 ar lc1 (sl1 + 8)
+    (cat [aasm, "    str x0, [x29, #", show sl1, "]\n", rest], env3, lc2, sl2)
+
 -- Large integer support: ARM64 mov only handles 16-bit immediates
 char_to_digit c =
   if c == "0" then 0 else if c == "1" then 1 else if c == "2" then 2
@@ -758,7 +783,7 @@ cg_bi2 fname args env ar lc sl tp =
     ("    adrp x0, _rail_heap_ptr@PAGE\n    ldr x0, [x0, _rail_heap_ptr@PAGEOFF]\n", lc, sl)
   else if fname == "arena_reset" then
     let (aa, lc1, sl1) = cg (head args) env ar lc sl false
-    (cat [aa, "    adrp x1, _rail_heap_ptr@PAGE\n    str x0, [x1, _rail_heap_ptr@PAGEOFF]\n    mov x0, #1\n"], lc1, sl1)
+    (cat [aa, "    adrp x1, _rail_heap_ptr@PAGE\n    str x0, [x1, _rail_heap_ptr@PAGEOFF]\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    bl _rail_free_list_clear\n    ldp x29, x30, [sp], #16\n    mov x0, #1\n"], lc1, sl1)
   else if fname == "chars" then
     let (aa, lc1, sl1) = cg (head args) env ar lc sl false
     (cat [aa, "    bl _rail_chars\n"], lc1, sl1)
@@ -855,7 +880,8 @@ cg_bi3 fname args env ar lc sl tp =
       let nargs = length args
       let pop = cg_pop_regs nargs 0
       let load_clos = cat ["    ldr x7, [x29, #", show voff, "]\n    ldr x6, [x7, #8]\n    ldr x5, [x7, #16]\n"]
-      let load_caps = cat ["    cmp x5, #0\n    b.eq .Lcall_", show lc1, "\n    ldr x", show nargs, ", [x7, #24]\n.Lcall_", show lc1, ":\n"]
+      let clbl = cat [".Lcall_", show lc1]
+      let load_caps = cat ["    cmp x5, #0\n    b.eq ", clbl, "\n", load_closure_caps nargs 0 clbl]
       let call = if tp then "    ldp x29, x30, [sp]\n    add sp, sp, #2048\n    br x6\n" else "    blr x6\n"
       (cat [pa, pop, load_clos, load_caps, call], lc1 + 1, sl1)
     else if length args == 1 then
@@ -951,17 +977,51 @@ cg2 node env ar lc sl tg tp =
     (cat [va, "    str x0, [x29, #", show sl, "]\n", ext, ba], lc2, sl3)
   else if tg == "A" then
     let (fname, args) = flat node
-    cg_bi fname args env ar lc sl tp
+    if fname == "_expr" then
+      let fn_node = get_app_fn node
+      if head fn_node == "F" then
+        let (params, inner_body) = collect_lam_params fn_node
+        let np = length params
+        let na = length args
+        if na == np then
+          let (bind_asm, env2, lc2, sl2) = cg_let_binds params args env ar lc sl
+          let (body_asm, lc3, sl3) = cg inner_body env2 ar lc2 sl2 tp
+          (cat [bind_asm, body_asm], lc3, sl3)
+        else
+          let (fn_asm, lc1, sl1) = cg fn_node env ar lc sl false
+          let clos_sl = sl1
+          let (pa, lc2, sl2) = cg_push_args args env ar lc1 (sl1 + 8)
+          let nargs2 = length args
+          let pop = cg_pop_regs nargs2 0
+          let clbl = cat [".Lcall_", show lc2]
+          let load_clos = cat ["    ldr x7, [x29, #", show clos_sl, "]\n    ldr x6, [x7, #8]\n    ldr x5, [x7, #16]\n"]
+          let lcaps = cat ["    cmp x5, #0\n    b.eq ", clbl, "\n", load_closure_caps nargs2 0 clbl]
+          let call = if tp then "    ldp x29, x30, [sp]\n    add sp, sp, #2048\n    br x6\n" else "    blr x6\n"
+          (cat [fn_asm, "    str x0, [x29, #", show clos_sl, "]\n", pa, pop, load_clos, lcaps, call], lc2 + 1, sl2)
+      else
+        let (fn_asm, lc1, sl1) = cg fn_node env ar lc sl false
+        let clos_sl = sl1
+        let (pa, lc2, sl2) = cg_push_args args env ar lc1 (sl1 + 8)
+        let nargs = length args
+        let pop = cg_pop_regs nargs 0
+        let clbl = cat [".Lcall_", show lc2]
+        let load_clos = cat ["    ldr x7, [x29, #", show clos_sl, "]\n    ldr x6, [x7, #8]\n    ldr x5, [x7, #16]\n"]
+        let lcaps = cat ["    cmp x5, #0\n    b.eq ", clbl, "\n", load_closure_caps nargs 0 clbl]
+        let call = if tp then "    ldp x29, x30, [sp]\n    add sp, sp, #2048\n    br x6\n" else "    blr x6\n"
+        (cat [fn_asm, "    str x0, [x29, #", show clos_sl, "]\n", pa, pop, load_clos, lcaps, call], lc2 + 1, sl2)
+    else
+      cg_bi fname args env ar lc sl tp
   else if tg == "F" then
-    let param = head (tail node)
-    let body = head (tail (tail node))
-    let caps = captured_vars body param env
+    let (params, inner_body) = collect_lam_params node
+    let free = fv_uniq (fvs inner_body params)
+    let envns = env_names env
+    let caps = fv_filter free envns
     let ncap = length caps
     let flbl = cat ["_lambda_", show lc]
     let albl = cat [".Lafter_lam_", show lc]
-    let all_ps = cons param caps
+    let all_ps = append params caps
     let lam_env = mk_env all_ps 16
-    let (basm, lc1, _) = cg body lam_env ar (lc + 1) (16 + 8 * length all_ps) true
+    let (basm, lc1, _) = cg inner_body lam_env ar (lc + 1) (16 + 8 * length all_ps) true
     let fasm = cat ["    b ", albl, "\n", flbl, ":\n    sub sp, sp, #2048\n    stp x29, x30, [sp]\n    mov x29, sp\n", save_params all_ps 0, basm, "    ldp x29, x30, [sp]\n    add sp, sp, #2048\n    ret\n", albl, ":\n"]
     let pcaps = push_captured caps env
     let casm = cat [pcaps, "    mov x0, #", show (24 + ncap * 8), "\n    bl _rail_alloc\n    mov x1, #4\n    str x1, [x0]\n    adr x1, ", flbl, "\n    str x1, [x0, #8]\n    mov x1, #", show ncap, "\n    str x1, [x0, #16]\n", pop_to_closure ncap 0]
@@ -1095,6 +1155,15 @@ cg_list elems env ar lc sl =
     let (ha, lc2, sl2) = cg (head elems) env ar lc1 sl1 false
     (cat [ta, "    str x0, [sp, #-16]!\n", ha, "    ldr x1, [sp], #16\n    bl _rail_cons\n"], lc2, sl2)
 
+-- Load closure captures into registers x{base}..x{base+n-1} (unrolled, max 4)
+load_closure_caps base i lbl =
+  if i >= 4 then cat [lbl, ":\n"]
+  else if base + i > 4 then cat [lbl, ":\n"]
+  else
+    let load = cat ["    ldr x", show (base + i), ", [x7, #", show (24 + i * 8), "]\n"]
+    let check = cat ["    cmp x5, #", show (i + 1), "\n    b.eq ", lbl, "\n"]
+    cat [load, check, load_closure_caps base (i + 1) lbl]
+
 -- Push captured variables to stack (for closure creation)
 push_captured caps env =
   if length caps == 0 then ""
@@ -1224,7 +1293,7 @@ rt_core =
   cat [req, rne, radd, rprint, rshow, rstrapp]
 
 rt_list =
-  let ralloc = "_rail_alloc:\n    adrp x1, _rail_heap_ptr@PAGE\n    add x1, x1, _rail_heap_ptr@PAGEOFF\n    ldr x2, [x1]\n    add x3, x2, x0\n    add x3, x3, #7\n    and x3, x3, #-8\n    adrp x4, _rail_heap_end@PAGE\n    ldr x4, [x4, _rail_heap_end@PAGEOFF]\n    cmp x3, x4\n    b.hi .Lalloc_overflow\n    str x3, [x1]\n    mov x0, x2\n    ret\n.Lalloc_overflow:\n    add x0, x0, #7\n    and x0, x0, #-8\n    b _malloc\n\n"
+  let ralloc = "_rail_alloc:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x0, [x29, #16]\n    add x0, x0, #15\n    and x0, x0, #-8\n    adrp x1, _rail_heap_ptr@PAGE\n    add x1, x1, _rail_heap_ptr@PAGEOFF\n    ldr x2, [x1]\n    add x3, x2, x0\n    adrp x4, _rail_heap_end@PAGE\n    ldr x4, [x4, _rail_heap_end@PAGEOFF]\n    cmp x3, x4\n    b.hi .Lalloc_slow\n    str x3, [x1]\n    ldr x5, [x29, #16]\n    str x5, [x2]\n    add x0, x2, #8\n    ldp x29, x30, [sp], #32\n    ret\n.Lalloc_slow:\n    ldr x0, [x29, #16]\n    bl _rail_free_list_alloc\n    cbnz x0, .Lalloc_done\n    bl _rail_gc\n    ldr x0, [x29, #16]\n    bl _rail_free_list_alloc\n    cbnz x0, .Lalloc_done\n    ldr x0, [x29, #16]\n    add x0, x0, #7\n    and x0, x0, #-8\n    bl _malloc\n.Lalloc_done:\n    ldp x29, x30, [sp], #32\n    ret\n\n"
   let rcons = "_rail_cons:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    mov x0, #24\n    bl _rail_alloc\n    mov x1, #1\n    str x1, [x0]\n    ldr x1, [x29, #16]\n    str x1, [x0, #8]\n    ldr x1, [x29, #24]\n    str x1, [x0, #16]\n    ldp x29, x30, [sp], #32\n    ret\n\n"
   let rhead = "_rail_head:\n    ldr x0, [x0, #8]\n    ret\n\n"
   let rtail = "_rail_tail:\n    ldr x0, [x0, #16]\n    ret\n\n"
@@ -1235,8 +1304,8 @@ rt_list =
 rt_closure =
   let rmap = "_rail_map:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    ldr x2, [x1]\n    cmp x2, #2\n    b.eq .Lmap_nil\n    ldr x3, [x1, #8]\n    str x3, [x29, #32]\n    ldr x3, [x1, #16]\n    str x3, [x29, #40]\n    ldr x2, [x29, #16]\n    ldr x5, [x2, #8]\n    ldr x3, [x2, #16]\n    ldr x0, [x29, #32]\n    cmp x3, #0\n    b.eq .Lmap_call\n    ldr x1, [x2, #24]\n    cmp x3, #1\n    b.eq .Lmap_call\n    ldr x4, [x2, #32]\n    mov x2, x4\n.Lmap_call:\n    blr x5\n    str x0, [sp, #-16]!\n    ldr x0, [x29, #16]\n    ldr x1, [x29, #40]\n    bl _rail_map\n    mov x1, x0\n    ldr x0, [sp], #16\n    bl _rail_cons\n    ldp x29, x30, [sp], #48\n    ret\n.Lmap_nil:\n    adrp x0, _rail_nil@PAGE\n    add x0, x0, _rail_nil@PAGEOFF\n    ldp x29, x30, [sp], #48\n    ret\n\n"
   let rjoin = "_rail_join:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    ldr x2, [x1]\n    cmp x2, #2\n    b.eq .Ljoin_empty\n    ldr x3, [x1, #8]\n    str x3, [x29, #32]\n    ldr x4, [x1, #16]\n    ldr x2, [x4]\n    cmp x2, #2\n    b.eq .Ljoin_single\n    ldr x0, [x29, #16]\n    mov x1, x4\n    bl _rail_join\n    str x0, [x29, #40]\n    ldr x0, [x29, #32]\n    ldr x1, [x29, #16]\n    bl _rail_str_append\n    ldr x1, [x29, #40]\n    bl _rail_str_append\n    ldp x29, x30, [sp], #48\n    ret\n.Ljoin_empty:\n    adrp x0, _rail_empty_str@PAGE\n    add x0, x0, _rail_empty_str@PAGEOFF\n    ldp x29, x30, [sp], #48\n    ret\n.Ljoin_single:\n    ldr x0, [x29, #32]\n    ldp x29, x30, [sp], #48\n    ret\n\n"
-  let rchars = "_rail_chars:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x0, [x29, #16]\n    bl _strlen\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    ldr x1, [x29, #24]\n    bl _rail_chars_build\n    ldp x29, x30, [sp], #32\n    ret\n_rail_chars_build:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    adrp x2, _rail_nil@PAGE\n    add x2, x2, _rail_nil@PAGEOFF\n    str x2, [x29, #32]\n    sub x3, x1, #1\n    str x3, [x29, #40]\n.Lchars_loop:\n    ldr x3, [x29, #40]\n    cmp x3, #0\n    b.lt .Lchars_done\n    mov x0, #2\n    bl _rail_alloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #16]\n    ldr x3, [x29, #40]\n    ldrb w2, [x1, x3]\n    strb w2, [x0]\n    mov w2, #0\n    strb w2, [x0, #1]\n    ldr x0, [sp], #16\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    str x0, [x29, #32]\n    ldr x3, [x29, #40]\n    sub x3, x3, #1\n    str x3, [x29, #40]\n    b .Lchars_loop\n.Lchars_done:\n    ldr x0, [x29, #32]\n    ldp x29, x30, [sp], #48\n    ret\n\n"
-  let rsplit = "_rail_split:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    ldrb w2, [x0]\n    str x2, [x29, #32]\n    mov x0, x1\n    bl _strlen\n    str x0, [x29, #40]\n    ldr x0, [x29, #24]\n    ldr x1, [x29, #40]\n    ldr x2, [x29, #32]\n    bl _rail_split_build\n    ldp x29, x30, [sp], #48\n    ret\n_rail_split_build:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x2, [x29, #24]\n    adrp x3, _rail_nil@PAGE\n    add x3, x3, _rail_nil@PAGEOFF\n    str x3, [x29, #32]\n    str x1, [x29, #40]\n    sub x3, x1, #1\n    str x3, [x29, #48]\n.Lsplit_bk:\n    ldr x3, [x29, #48]\n    cmp x3, #0\n    b.lt .Lsplit_first\n    ldr x0, [x29, #16]\n    ldrb w4, [x0, x3]\n    ldr x5, [x29, #24]\n    cmp w4, w5\n    b.eq .Lsplit_hit\n    sub x3, x3, #1\n    str x3, [x29, #48]\n    b .Lsplit_bk\n.Lsplit_hit:\n    ldr x5, [x29, #40]\n    sub x6, x5, x3\n    sub x6, x6, #1\n    str x6, [x29, #56]\n    add x0, x6, #1\n    bl _rail_alloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #16]\n    ldr x3, [x29, #48]\n    add x1, x1, x3\n    add x1, x1, #1\n    ldr x6, [x29, #56]\n    mov x4, #0\n.Lsplit_cp1:\n    cmp x4, x6\n    b.ge .Lsplit_cp1d\n    ldrb w7, [x1, x4]\n    strb w7, [x0, x4]\n    add x4, x4, #1\n    b .Lsplit_cp1\n.Lsplit_cp1d:\n    mov w7, #0\n    strb w7, [x0, x6]\n    ldr x0, [sp], #16\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    str x0, [x29, #32]\n    ldr x3, [x29, #48]\n    str x3, [x29, #40]\n    sub x3, x3, #1\n    str x3, [x29, #48]\n    b .Lsplit_bk\n.Lsplit_first:\n    ldr x6, [x29, #40]\n    str x6, [x29, #56]\n    add x0, x6, #1\n    bl _rail_alloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #16]\n    ldr x6, [x29, #56]\n    mov x4, #0\n.Lsplit_cp2:\n    cmp x4, x6\n    b.ge .Lsplit_cp2d\n    ldrb w7, [x1, x4]\n    strb w7, [x0, x4]\n    add x4, x4, #1\n    b .Lsplit_cp2\n.Lsplit_cp2d:\n    mov w7, #0\n    strb w7, [x0, x6]\n    ldr x0, [sp], #16\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    ldp x29, x30, [sp], #64\n    ret\n\n"
+  let rchars = "_rail_chars:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x0, [x29, #16]\n    bl _strlen\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    ldr x1, [x29, #24]\n    bl _rail_chars_build\n    ldp x29, x30, [sp], #32\n    ret\n_rail_chars_build:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    adrp x2, _rail_nil@PAGE\n    add x2, x2, _rail_nil@PAGEOFF\n    str x2, [x29, #32]\n    sub x3, x1, #1\n    str x3, [x29, #40]\n.Lchars_loop:\n    ldr x3, [x29, #40]\n    cmp x3, #0\n    b.lt .Lchars_done\n    mov x0, #2\n    bl _malloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #16]\n    ldr x3, [x29, #40]\n    ldrb w2, [x1, x3]\n    strb w2, [x0]\n    mov w2, #0\n    strb w2, [x0, #1]\n    ldr x0, [sp], #16\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    str x0, [x29, #32]\n    ldr x3, [x29, #40]\n    sub x3, x3, #1\n    str x3, [x29, #40]\n    b .Lchars_loop\n.Lchars_done:\n    ldr x0, [x29, #32]\n    ldp x29, x30, [sp], #48\n    ret\n\n"
+  let rsplit = "_rail_split:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    ldrb w2, [x0]\n    str x2, [x29, #32]\n    mov x0, x1\n    bl _strlen\n    str x0, [x29, #40]\n    ldr x0, [x29, #24]\n    ldr x1, [x29, #40]\n    ldr x2, [x29, #32]\n    bl _rail_split_build\n    ldp x29, x30, [sp], #48\n    ret\n_rail_split_build:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x2, [x29, #24]\n    adrp x3, _rail_nil@PAGE\n    add x3, x3, _rail_nil@PAGEOFF\n    str x3, [x29, #32]\n    str x1, [x29, #40]\n    sub x3, x1, #1\n    str x3, [x29, #48]\n.Lsplit_bk:\n    ldr x3, [x29, #48]\n    cmp x3, #0\n    b.lt .Lsplit_first\n    ldr x0, [x29, #16]\n    ldrb w4, [x0, x3]\n    ldr x5, [x29, #24]\n    cmp w4, w5\n    b.eq .Lsplit_hit\n    sub x3, x3, #1\n    str x3, [x29, #48]\n    b .Lsplit_bk\n.Lsplit_hit:\n    ldr x5, [x29, #40]\n    sub x6, x5, x3\n    sub x6, x6, #1\n    str x6, [x29, #56]\n    add x0, x6, #1\n    bl _malloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #16]\n    ldr x3, [x29, #48]\n    add x1, x1, x3\n    add x1, x1, #1\n    ldr x6, [x29, #56]\n    mov x4, #0\n.Lsplit_cp1:\n    cmp x4, x6\n    b.ge .Lsplit_cp1d\n    ldrb w7, [x1, x4]\n    strb w7, [x0, x4]\n    add x4, x4, #1\n    b .Lsplit_cp1\n.Lsplit_cp1d:\n    mov w7, #0\n    strb w7, [x0, x6]\n    ldr x0, [sp], #16\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    str x0, [x29, #32]\n    ldr x3, [x29, #48]\n    str x3, [x29, #40]\n    sub x3, x3, #1\n    str x3, [x29, #48]\n    b .Lsplit_bk\n.Lsplit_first:\n    ldr x6, [x29, #40]\n    str x6, [x29, #56]\n    add x0, x6, #1\n    bl _malloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #16]\n    ldr x6, [x29, #56]\n    mov x4, #0\n.Lsplit_cp2:\n    cmp x4, x6\n    b.ge .Lsplit_cp2d\n    ldrb w7, [x1, x4]\n    strb w7, [x0, x4]\n    add x4, x4, #1\n    b .Lsplit_cp2\n.Lsplit_cp2d:\n    mov w7, #0\n    strb w7, [x0, x6]\n    ldr x0, [sp], #16\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    ldp x29, x30, [sp], #64\n    ret\n\n"
   let rfilter = "_rail_filter:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    ldr x2, [x1]\n    cmp x2, #2\n    b.eq .Lfilt_nil\n    ldr x3, [x1, #8]\n    str x3, [x29, #32]\n    ldr x3, [x1, #16]\n    str x3, [x29, #40]\n    ldr x2, [x29, #16]\n    ldr x5, [x2, #8]\n    ldr x3, [x2, #16]\n    ldr x0, [x29, #32]\n    cmp x3, #0\n    b.eq .Lfilt_call\n    ldr x1, [x2, #24]\n.Lfilt_call:\n    blr x5\n    str x0, [sp, #-16]!\n    ldr x0, [x29, #16]\n    ldr x1, [x29, #40]\n    bl _rail_filter\n    ldr x1, [sp], #16\n    cmp x1, #3\n    b.ne .Lfilt_skip\n    mov x1, x0\n    ldr x0, [x29, #32]\n    bl _rail_cons\n    ldp x29, x30, [sp], #48\n    ret\n.Lfilt_skip:\n    ldp x29, x30, [sp], #48\n    ret\n.Lfilt_nil:\n    adrp x0, _rail_nil@PAGE\n    add x0, x0, _rail_nil@PAGEOFF\n    ldp x29, x30, [sp], #48\n    ret\n\n"
   let rfold = "_rail_fold:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    str x2, [x29, #32]\n    ldr x3, [x2]\n    cmp x3, #2\n    b.eq .Lfold_done\n    ldr x4, [x2, #8]\n    str x4, [x29, #40]\n    ldr x3, [x29, #16]\n    ldr x5, [x3, #8]\n    ldr x4, [x3, #16]\n    ldr x0, [x29, #24]\n    ldr x1, [x29, #40]\n    cmp x4, #0\n    b.eq .Lfold_call\n    ldr x2, [x3, #24]\n.Lfold_call:\n    blr x5\n    ldr x2, [x29, #32]\n    ldr x2, [x2, #16]\n    mov x1, x0\n    ldr x0, [x29, #16]\n    bl _rail_fold\n    ldp x29, x30, [sp], #48\n    ret\n.Lfold_done:\n    ldr x0, [x29, #24]\n    ldp x29, x30, [sp], #48\n    ret\n\n"
   let rreverse = "_rail_reverse:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    adrp x1, _rail_nil@PAGE\n    add x1, x1, _rail_nil@PAGEOFF\n    str x1, [x29, #16]\n.Lrev_loop:\n    ldr x2, [x0]\n    cmp x2, #2\n    b.eq .Lrev_done\n    ldr x1, [x0, #8]\n    str x1, [x29, #24]\n    ldr x0, [x0, #16]\n    str x0, [sp, #-16]!\n    ldr x0, [x29, #24]\n    ldr x1, [x29, #16]\n    bl _rail_cons\n    str x0, [x29, #16]\n    ldr x0, [sp], #16\n    b .Lrev_loop\n.Lrev_done:\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #32\n    ret\n\n"
@@ -1251,7 +1320,7 @@ rt_io =
   cat [rwritefile, rshell, rreadfile]
 
 rt_args =
-  "_rail_args:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    adrp x0, _rail_argc@PAGE\n    ldr x0, [x0, _rail_argc@PAGEOFF]\n    adrp x1, _rail_argv@PAGE\n    ldr x1, [x1, _rail_argv@PAGEOFF]\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    adrp x0, _rail_nil@PAGE\n    add x0, x0, _rail_nil@PAGEOFF\n    str x0, [x29, #32]\n    ldr x0, [x29, #16]\n    sub x0, x0, #1\n    str x0, [x29, #16]\n.Largs_lp:\n    ldr x0, [x29, #16]\n    cmp x0, #0\n    b.lt .Largs_dn\n    ldr x1, [x29, #24]\n    ldr x0, [x1, x0, lsl #3]\n    str x0, [x29, #40]\n    bl _strlen\n    add x0, x0, #1\n    bl _rail_alloc\n    str x0, [x29, #48]\n    ldr x1, [x29, #40]\n    bl _strcpy\n    ldr x0, [x29, #48]\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    str x0, [x29, #32]\n    ldr x0, [x29, #16]\n    sub x0, x0, #1\n    str x0, [x29, #16]\n    b .Largs_lp\n.Largs_dn:\n    ldr x0, [x29, #32]\n    ldp x29, x30, [sp], #64\n    ret\n\n"
+  "_rail_args:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    adrp x0, _rail_argc@PAGE\n    ldr x0, [x0, _rail_argc@PAGEOFF]\n    adrp x1, _rail_argv@PAGE\n    ldr x1, [x1, _rail_argv@PAGEOFF]\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    adrp x0, _rail_nil@PAGE\n    add x0, x0, _rail_nil@PAGEOFF\n    str x0, [x29, #32]\n    ldr x0, [x29, #16]\n    sub x0, x0, #1\n    str x0, [x29, #16]\n.Largs_lp:\n    ldr x0, [x29, #16]\n    cmp x0, #0\n    b.lt .Largs_dn\n    ldr x1, [x29, #24]\n    ldr x0, [x1, x0, lsl #3]\n    str x0, [x29, #40]\n    bl _strlen\n    add x0, x0, #1\n    bl _malloc\n    str x0, [x29, #48]\n    ldr x1, [x29, #40]\n    bl _strcpy\n    ldr x0, [x29, #48]\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    str x0, [x29, #32]\n    ldr x0, [x29, #16]\n    sub x0, x0, #1\n    str x0, [x29, #16]\n    b .Largs_lp\n.Largs_dn:\n    ldr x0, [x29, #32]\n    ldp x29, x30, [sp], #64\n    ret\n\n"
 
 rt_arith =
   let rsub = "_rail_sub:\n    tst x1, #1\n    b.eq .Lsub_float\n    asr x1, x1, #1\n    asr x0, x0, #1\n    sub x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lsub_float:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fsub d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
@@ -1392,18 +1461,129 @@ ast_to_metal node param =
 gen_metal_kernel body_expr =
   cat ["#include <metal_stdlib>\nusing namespace metal;\nkernel void rail_kernel(device int *data [[buffer(0)]], uint id [[thread_position_in_grid]]) {\n    int x = data[id];\n    data[id] = ", body_expr, ";\n}\n"]
 
+-- Exhaustiveness checking for match expressions
+-- Build map: ctor_name → [all ctor names in same type]
+build_ctor_siblings decls =
+  if length decls == 0 then []
+  else
+    let d = head decls
+    if head d == "TY" then
+      let variants = head (tail (tail d))
+      let names = get_ctor_names variants
+      append (tag_siblings variants names) (build_ctor_siblings (tail decls))
+    else build_ctor_siblings (tail decls)
+
+get_ctor_names variants =
+  if length variants == 0 then []
+  else cons (head (head variants)) (get_ctor_names (tail variants))
+
+tag_siblings variants names =
+  if length variants == 0 then []
+  else cons (head (head variants), names) (tag_siblings (tail variants) names)
+
+-- Check if a list contains a string
+str_in item lst =
+  if length lst == 0 then false
+  else if head lst == item then true
+  else str_in item (tail lst)
+
+-- Find missing constructors from arms
+find_missing all_ctors arm_ctors =
+  if length all_ctors == 0 then []
+  else
+    let c = head all_ctors
+    if str_in c arm_ctors then find_missing (tail all_ctors) arm_ctors
+    else cons c (find_missing (tail all_ctors) arm_ctors)
+
+-- Extract constructor names from match arms
+arm_ctors arms =
+  if length arms == 0 then []
+  else
+    let ctor = head (head arms)
+    cons ctor (arm_ctors (tail arms))
+
+-- Safe sibling lookup (returns [] on not found, avoids afind's -1 vs list issue)
+find_sibs ctor siblings =
+  if length siblings == 0 then []
+  else
+    let (k, v) = head siblings
+    if k == ctor then v
+    else find_sibs ctor (tail siblings)
+
+-- Check a single match expression for exhaustiveness
+check_match_exhaustive arms siblings =
+  let ctors = arm_ctors arms
+  if str_in "_" ctors then 0
+  else if length ctors == 0 then 0
+  else
+    let first = head ctors
+    let sibs = find_sibs first siblings
+    if length sibs == 0 then 0
+    else
+      let missing = find_missing sibs ctors
+      if length missing == 0 then 0
+      else
+        let _ = print (cat ["  WARNING: non-exhaustive match — missing: ", join ", " missing])
+        0
+
+-- Walk AST node looking for match expressions
+check_node node siblings =
+  let tg = head node
+  if tg == "M" then
+    let arms = head (tail (tail node))
+    let _ = check_match_exhaustive arms siblings
+    let _ = check_node (head (tail node)) siblings
+    check_arms_nodes arms siblings
+  else if tg == "A" then
+    let _ = check_node (head (tail node)) siblings
+    check_node (head (tail (tail node))) siblings
+  else if tg == "O" then
+    let _ = check_node (head (tail (tail node))) siblings
+    check_node (head (tail (tail (tail node)))) siblings
+  else if tg == "?" then
+    let _ = check_node (head (tail node)) siblings
+    let _ = check_node (head (tail (tail node))) siblings
+    check_node (head (tail (tail (tail node)))) siblings
+  else if tg == "D" then
+    let _ = check_node (head (tail (tail node))) siblings
+    check_node (head (tail (tail (tail node)))) siblings
+  else if tg == "F" then
+    check_node (head (tail (tail node))) siblings
+  else 0
+
+check_arms_nodes arms siblings =
+  if length arms == 0 then 0
+  else
+    let body = head (tail (tail (head arms)))
+    let _ = check_node body siblings
+    check_arms_nodes (tail arms) siblings
+
+-- Check all function bodies
+check_exhaustiveness decls siblings =
+  if length decls == 0 then 0
+  else
+    let d = head decls
+    if head d == "fn" then
+      let nm = head (tail d)
+      let body = head (tail (tail (tail d)))
+      let _ = check_node body siblings
+      check_exhaustiveness (tail decls) siblings
+    else check_exhaustiveness (tail decls) siblings
+
 -- Compile full program to assembly text
 compile_program src =
   let toks = tokenize src
   let decls = pprog toks
   let decls = opt_decls decls
   let ar = get_arities decls
+  let siblings = build_ctor_siblings decls
+  let _ = check_exhaustiveness decls siblings
   let hdr = ".section __TEXT,__text\n.global _main\n.p2align 2\n\n"
   let (funcs, _) = compile_funcs decls ar 0
   let rt = runtime_asm
   -- Data section: format strings for printf/snprintf
   -- _fmt_int: "%ld\n"  _fmt_str: "%s\n"  _fmt_ld: "%ld"
-  let data = "\n.section __DATA,__data\n_fmt_int:\n    .byte 37, 108, 100, 10, 0\n_fmt_str:\n    .byte 37, 115, 10, 0\n_fmt_ld:\n    .byte 37, 108, 100, 0\n_fmt_g:\n    .asciz \"%g\\n\"\n_fmt_gbare:\n    .asciz \"%.15g\"\n.p2align 3\n_rail_empty_str:\n    .byte 0\n_mode_w:\n    .asciz \"w\"\n_mode_r:\n    .asciz \"r\"\n.p2align 3\n_rail_nil:\n    .quad 2\n.p2align 3\n_rail_heap_ptr:\n    .quad _rail_heap\n.p2align 3\n_rail_heap_end:\n    .quad _rail_heap + 1073741824\n.p2align 3\n_rail_argc:\n    .quad 0\n_rail_argv:\n    .quad 0\n.zerofill __DATA,__bss,_rail_heap,1073741824,3\n"
+  let data = "\n.section __DATA,__data\n_fmt_int:\n    .byte 37, 108, 100, 10, 0\n_fmt_str:\n    .byte 37, 115, 10, 0\n_fmt_ld:\n    .byte 37, 108, 100, 0\n_fmt_g:\n    .asciz \"%g\\n\"\n_fmt_gbare:\n    .asciz \"%.15g\"\n.p2align 3\n_rail_empty_str:\n    .byte 0\n_mode_w:\n    .asciz \"w\"\n_mode_r:\n    .asciz \"r\"\n.p2align 3\n_rail_nil:\n    .quad 2\n.p2align 3\n.global _rail_heap_ptr\n_rail_heap_ptr:\n    .quad _rail_heap\n.p2align 3\n.global _rail_heap_end\n_rail_heap_end:\n    .quad _rail_heap + 1073741824\n.p2align 3\n_rail_argc:\n    .quad 0\n_rail_argv:\n    .quad 0\n.global _rail_heap\n.zerofill __DATA,__bss,_rail_heap,1073741824,3\n"
   cat [hdr, funcs, rt, data]
 
 -- ══════════════════════════════════════════════════════════════════════════════
@@ -1415,7 +1595,7 @@ build asm_text =
   let sdk = trim (shell "xcrun --show-sdk-path")
   let as_result = trim (shell "as -o /tmp/rail_out.o /tmp/rail_out.s 2>&1")
   let _ = if as_result != "" then print (cat ["  as: ", as_result]) else print "  as: OK"
-  let ld_cmd = cat ["ld -o /tmp/rail_out /tmp/rail_out.o /Users/ledaticempire/projects/rail/runtime/llm.o -lSystem -syslibroot ", sdk, " -arch arm64 2>&1"]
+  let ld_cmd = cat ["ld -o /tmp/rail_out /tmp/rail_out.o /Users/ledaticempire/projects/rail/runtime/llm.o /Users/ledaticempire/projects/rail/runtime/gc.o -lSystem -syslibroot ", sdk, " -arch arm64 2>&1"]
   let ld_result = trim (shell ld_cmd)
   let _ = if ld_result != "" then print (cat ["  ld: ", ld_result]) else print "  ld: OK"
   let _ = shell "codesign -s - /tmp/rail_out 2>&1"
@@ -1542,9 +1722,12 @@ run_tests _ =
   let _ = shell "ls /tmp/gpu_host >/dev/null 2>&1 && echo ok || clang -framework Metal -framework Foundation tools/gpu_host.m -o /tmp/gpu_host 2>/dev/null"
   let t66 = run_test "gpu_map" "main =\n  let r = gpu_map (\\x -> x * 3 + 1) (range 8)\n  let _ = print (show (head r))\n  0" "1"
   let t67 = run_test "gpu_auto" "main =\n  let r = map (\\x -> x * 2 + 1) (range 8)\n  let _ = print (show (head r))\n  0" "1"
-  let total = (if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0) + (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0) + (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0) + (if t31 then 1 else 0) + (if t32 then 1 else 0) + (if t33 then 1 else 0) + (if t34 then 1 else 0) + (if t35 then 1 else 0) + (if t36 then 1 else 0) + (if t37 then 1 else 0) + (if t38 then 1 else 0) + (if t39 then 1 else 0) + (if t40 then 1 else 0) + (if t41 then 1 else 0) + (if t42 then 1 else 0) + (if t43 then 1 else 0) + (if t44 then 1 else 0) + (if t45 then 1 else 0) + (if t46 then 1 else 0) + (if t47 then 1 else 0) + (if t48 then 1 else 0) + (if t49 then 1 else 0) + (if t50 then 1 else 0) + (if t51 then 1 else 0) + (if t52 then 1 else 0) + (if t53 then 1 else 0) + (if t54 then 1 else 0) + (if t55 then 1 else 0) + (if t56 then 1 else 0) + (if t57 then 1 else 0) + (if t58 then 1 else 0) + (if t59 then 1 else 0) + (if t60 then 1 else 0) + (if t61 then 1 else 0) + (if t62 then 1 else 0) + (if t63 then 1 else 0) + (if t64 then 1 else 0) + (if t65 then 1 else 0) + (if t66 then 1 else 0) + (if t67 then 1 else 0)
-  let _ = print (cat [show total, "/67 tests passed"])
-  if total == 67 then 0 else 1
+  let t68 = run_test "nested_lam" "main = (\\a -> \\b -> a + b) 3 4" "7"
+  let t69 = run_test "nested_lam_let" "main =\n  let f = \\a -> \\b -> a + b\n  f 3 4" "7"
+  let t70 = run_test "nested_lam_cap" "main =\n  let n = 10\n  let f = \\a -> \\b -> a + b + n\n  f 3 4" "17"
+  let total = (if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0) + (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0) + (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0) + (if t31 then 1 else 0) + (if t32 then 1 else 0) + (if t33 then 1 else 0) + (if t34 then 1 else 0) + (if t35 then 1 else 0) + (if t36 then 1 else 0) + (if t37 then 1 else 0) + (if t38 then 1 else 0) + (if t39 then 1 else 0) + (if t40 then 1 else 0) + (if t41 then 1 else 0) + (if t42 then 1 else 0) + (if t43 then 1 else 0) + (if t44 then 1 else 0) + (if t45 then 1 else 0) + (if t46 then 1 else 0) + (if t47 then 1 else 0) + (if t48 then 1 else 0) + (if t49 then 1 else 0) + (if t50 then 1 else 0) + (if t51 then 1 else 0) + (if t52 then 1 else 0) + (if t53 then 1 else 0) + (if t54 then 1 else 0) + (if t55 then 1 else 0) + (if t56 then 1 else 0) + (if t57 then 1 else 0) + (if t58 then 1 else 0) + (if t59 then 1 else 0) + (if t60 then 1 else 0) + (if t61 then 1 else 0) + (if t62 then 1 else 0) + (if t63 then 1 else 0) + (if t64 then 1 else 0) + (if t65 then 1 else 0) + (if t66 then 1 else 0) + (if t67 then 1 else 0) + (if t68 then 1 else 0) + (if t69 then 1 else 0) + (if t70 then 1 else 0)
+  let _ = print (cat [show total, "/70 tests passed"])
+  if total == 70 then 0 else 1
 
 self_compile _ =
   let _ = print "\n=== Self-compilation ==="
@@ -1556,7 +1739,7 @@ self_compile _ =
   let sdk = trim (shell "xcrun --show-sdk-path")
   let as_res = trim (shell "as -o /tmp/rail_self.o /tmp/rail_self.s 2>&1")
   let _ = if as_res != "" then print (cat ["  as: ", as_res]) else print "  as: OK"
-  let ld_res = trim (shell (cat ["ld -o /tmp/rail_self /tmp/rail_self.o -lSystem -syslibroot ", sdk, " -arch arm64 2>&1"]))
+  let ld_res = trim (shell (cat ["ld -o /tmp/rail_self /tmp/rail_self.o /Users/ledaticempire/projects/rail/runtime/gc.o -lSystem -syslibroot ", sdk, " -arch arm64 2>&1"]))
   let _ = if ld_res != "" then print (cat ["  ld: ", ld_res]) else print "  ld: OK"
   let _ = shell "codesign -s - /tmp/rail_self 2>&1"
   let _ = print "  Binary: /tmp/rail_self"
