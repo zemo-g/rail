@@ -34,6 +34,12 @@ check_razer() {
         fi
         exit 0
     fi
+
+    # Crash detection: GPU idle but no adapter = training died
+    if [ -z "$GPU_PID" ] && [ "$HAS_ADAPTER" = "NO" ]; then
+        echo "$(date '+%H:%M:%S') | WARNING: GPU idle, no adapter — training may have crashed!"
+        echo "Check: ssh $RAZER 'tail -20 ~/rail_training/v6_train.log'"
+    fi
 }
 
 echo "Monitoring Razer v6 training (check every 5min)..."
