@@ -1,0 +1,277 @@
+-- fleet_agent_x86.rail — Fleet agent for x86_64/Windows nodes
+-- Drop-in replacement for fleet_agent.py. Serves identical JSON API on :9101.
+-- Cross-compile from ARM64 Mac, deploy binary to target node.
+-- Usage: ./fleet_agent_x86 [--port 9101]
+-- Auth: reads token from ~/.fleet/token
+-- Whitelist: reads ~/.fleet/allowed_commands (one per line)
+--
+-- NOTE: Platform-specific limitations vs fleet_agent.py:
+--   - No psutil (memory/disk use shell commands)
+--   - No timeout on exec commands
+--   - GPU info requires nvidia-smi in PATH
+
+foreign time t
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+q = "\""
+now _ = time 0
+
+-- HTTP request parsing
+parse_request_line line =
+  let parts = split " " line
+  if length parts >= 3 then
+    (head parts, head (tail parts), head (tail (tail parts)))
+  else ("", "", "")
+
+parse_headers lines =
+  if length lines == 0 then []
+  else
+    let line = head lines
+    if length line <= 1 then []
+    else
+      let parts = split ": " line
+      if length parts >= 2 then
+        let name = head parts
+        let value = join ": " (tail parts)
+        cons (name, value) (parse_headers (tail lines))
+      else parse_headers (tail lines)
+
+get_header headers name =
+  if length headers == 0 then ""
+  else
+    let (k, v) = head headers
+    if k == name then v
+    else get_header (tail headers) name
+
+find_body lines =
+  if length lines == 0 then ""
+  else if length (head lines) <= 1 then join "\n" (tail lines)
+  else find_body (tail lines)
+
+parse_request raw =
+  let lines = split "\n" raw
+  if length lines == 0 then ("", "", [], "")
+  else
+    let (method, path, _version) = parse_request_line (head lines)
+    let hdrs = parse_headers (tail lines)
+    let body = find_body (tail lines)
+    (method, path, hdrs, body)
+
+-- HTTP response builder
+mk_resp code text body =
+  cat ["HTTP/1.1 ", show code, " ", text, "\nContent-Type: application/json\nConnection: close\n\n", body]
+
+resp_ok body = mk_resp 200 "OK" body
+resp_403 = mk_resp 403 "Forbidden" (cat ["{", q, "error", q, ": ", q, "forbidden", q, "}"])
+resp_404 = mk_resp 404 "Not Found" (cat ["{", q, "error", q, ": ", q, "not found", q, "}"])
+resp_400 = mk_resp 400 "Bad Request" (cat ["{", q, "error", q, ": ", q, "missing cmd", q, "}"])
+resp_deny = mk_resp 403 "Forbidden" (cat ["{", q, "error", q, ": ", q, "command not whitelisted", q, "}"])
+
+-- JSON helpers
+json_esc s = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n" (split "\n" s)
+jstr k v = cat [q, k, q, ": ", q, json_esc (json_esc_nl v), q]
+jint k v = cat [q, k, q, ": ", show v]
+jbool k v = cat [q, k, q, ": ", if v then "true" else "false"]
+jobj pairs = cat ["{", join ", " pairs, "}"]
+
+-- Auth
+load_token _ =
+  trim (shell "cat ~/.fleet/token 2>/dev/null || echo ''")
+
+clean s =
+  let _ = write_file "/tmp/_fleet_clean.txt" s
+  trim (shell "sed 's/^[[:space:]]*//' /tmp/_fleet_clean.txt | tr -d '\\015'")
+
+check_auth headers token =
+  if length token == 0 then true
+  else
+    let raw = get_header headers "X-Fleet-Token"
+    let provided = clean raw
+    provided == token
+
+-- Whitelist
+load_whitelist _ =
+  let raw = shell "cat ~/.fleet/allowed_commands 2>/dev/null || echo ''"
+  let nonempty line = length line > 0
+  filter nonempty (split "\n" raw)
+
+cmd_allowed cmd whitelist =
+  if length whitelist == 0 then false
+  else
+    let entry = head whitelist
+    if cmd == entry then true
+    else
+      let prefix = cat [entry, " "]
+      let check = trim (shell (cat ["echo ", q, cmd, q, " | cut -c1-", show (length prefix)]))
+      if check == entry then true
+      else cmd_allowed cmd (tail whitelist)
+
+-- Extract "cmd" from JSON body
+extract_cmd body =
+  let parts = split "\"cmd\"" body
+  if length parts >= 2 then
+    find_str_val (split "\"" (head (tail parts)))
+  else ""
+
+find_str_val parts =
+  if length parts == 0 then ""
+  else
+    let p = head parts
+    if p == ":" then find_str_val (tail parts)
+    else if p == ": " then find_str_val (tail parts)
+    else if p == " " then find_str_val (tail parts)
+    else if length p == 0 then find_str_val (tail parts)
+    else p
+
+-- Detect platform
+detect_platform _ =
+  let check = trim (shell "uname -s 2>/dev/null || echo Windows")
+  if check == "Windows" then "windows"
+  else "unix"
+
+-- GET /health
+handle_health start_time =
+  let up = (now 0) - start_time
+  resp_ok (jobj [jbool "alive" true, jint "uptime" up])
+
+-- GPU info via nvidia-smi (works on Windows and Linux)
+get_gpu_fields _ =
+  let raw = trim (shell "nvidia-smi --query-gpu=name,memory.total,memory.free,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || echo ''")
+  if length raw == 0 then ""
+  else
+    let parts = split "," raw
+    if length parts >= 4 then
+      let gn = trim (shell (cat ["echo '", head parts, "' | xargs"]))
+      let gt = trim (shell (cat ["echo '", head (tail parts), "' | xargs"]))
+      let gf = trim (shell (cat ["echo '", head (tail (tail parts)), "' | xargs"]))
+      let gu = trim (shell (cat ["echo '", head (tail (tail (tail parts))), "' | xargs"]))
+      cat [", ", jstr "gpu" gn, ", ", jstr "gpu_mem_total" (cat [gt, " MB"]), ", ", jstr "gpu_mem_free" (cat [gf, " MB"]), ", ", jstr "gpu_util" (cat [gu, "%"])]
+    else ""
+
+-- System info for Windows
+get_cpu_win _ = trim (shell "wmic cpu get name 2>nul | findstr /v /c:Name 2>nul || echo unknown")
+get_mem_win _ = trim (shell "wmic OS get FreePhysicalMemory 2>nul | findstr /v /c:Free 2>nul || echo unknown")
+get_disk_win _ = trim (shell "wmic logicaldisk where driveid='C:' get freespace,size 2>nul || echo unknown")
+get_uptime_win _ = trim (shell "wmic os get lastbootuptime 2>nul | findstr /v /c:Last 2>nul || echo unknown")
+get_services_win _ = shell "tasklist /FO CSV /NH 2>nul | findstr /i \"python mlx nvidia fleet\" || echo ''"
+
+-- System info for Unix/Linux
+get_cpu_unix _ = trim (shell "cat /proc/cpuinfo 2>/dev/null | grep 'model name' | head -1 | cut -d: -f2 | sed 's/^ //' || uname -p")
+get_mem_unix _ = trim (shell "free -m 2>/dev/null | awk '/Mem:/{printf \"%d MB avail\", $7}' || echo unknown")
+get_disk_unix _ = trim (shell "df -h / | tail -1 | awk '{print $4 \" free of \" $2}'")
+get_uptime_unix _ = trim (shell "uptime | sed 's/.*up //' | sed 's/,.*//'")
+get_services_unix _ = shell "launchctl list 2>/dev/null | grep ledatic | awk '{print $3}' | head -20"
+
+-- GET /status
+handle_status_win _ =
+  let hostname = trim (shell "hostname")
+  let arch = trim (shell "uname -m 2>/dev/null || echo x86_64")
+  let cpu = get_cpu_win 0
+  let mem = get_mem_win 0
+  let disk = get_disk_win 0
+  let uptime = get_uptime_win 0
+  let svc_raw = get_services_win 0
+  let nonempty line = length line > 0
+  let svc_lines = filter nonempty (split "\n" svc_raw)
+  let quote_svc s = cat [q, s, q]
+  let svc_json = map quote_svc svc_lines
+  let svc_arr = cat ["[", join ", " svc_json, "]"]
+  let tl = trim (shell "grep '^level=' ~/rail_training/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
+  let tr = trim (shell "grep '^round=' ~/rail_training/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
+  let th = trim (shell "grep '^harvested=' ~/rail_training/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
+  let tt = trim (shell "tail -1 ~/rail_training/log.txt 2>/dev/null | grep -o 'rate=[^ ]*' | cut -d= -f2 || echo ''")
+  let gpu = get_gpu_fields 0
+  let body = cat ["{", jstr "hostname" hostname, ", ", jstr "cpu" cpu, ", ", jstr "mem" mem, ", ", jstr "disk" disk, ", ", jstr "arch" arch, ", ", jstr "uptime" uptime, ", ", jstr "train_level" tl, ", ", jstr "train_round" tr, ", ", jstr "train_harvested" th, ", ", jstr "train_rate" tt, gpu, ", ", q, "services", q, ": ", svc_arr, "}"]
+  resp_ok body
+
+handle_status_unix _ =
+  let hostname = trim (shell "hostname")
+  let arch = trim (shell "uname -m")
+  let cpu = get_cpu_unix 0
+  let mem = get_mem_unix 0
+  let disk = get_disk_unix 0
+  let uptime = get_uptime_unix 0
+  let svc_raw = get_services_unix 0
+  let nonempty line = length line > 0
+  let svc_lines = filter nonempty (split "\n" svc_raw)
+  let quote_svc s = cat [q, s, q]
+  let svc_json = map quote_svc svc_lines
+  let svc_arr = cat ["[", join ", " svc_json, "]"]
+  let tl = trim (shell "grep '^level=' ~/projects/rail/training/self_train/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
+  let tr = trim (shell "grep '^round=' ~/projects/rail/training/self_train/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
+  let th = trim (shell "grep '^harvested=' ~/projects/rail/training/self_train/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
+  let tt = trim (shell "tail -1 ~/projects/rail/training/self_train/log.txt 2>/dev/null | grep -o 'rate=[^ ]*' | cut -d= -f2 || echo ''")
+  let gpu = get_gpu_fields 0
+  let body = cat ["{", jstr "hostname" hostname, ", ", jstr "cpu" cpu, ", ", jstr "mem" mem, ", ", jstr "disk" disk, ", ", jstr "arch" arch, ", ", jstr "uptime" uptime, ", ", jstr "train_level" tl, ", ", jstr "train_round" tr, ", ", jstr "train_harvested" th, ", ", jstr "train_rate" tt, gpu, ", ", q, "services", q, ": ", svc_arr, "}"]
+  resp_ok body
+
+handle_status plat =
+  if plat == "windows" then handle_status_win 0
+  else handle_status_unix 0
+
+-- POST /exec
+handle_exec body whitelist =
+  let cmd = extract_cmd body
+  if length cmd == 0 then resp_400
+  else if cmd_allowed cmd whitelist then
+    let output = shell (cat [cmd, " 2>&1"])
+    resp_ok (jobj [jstr "output" output, jint "exit_code" 0])
+  else resp_deny
+
+-- Router
+route method path body start_time whitelist plat =
+  if method == "GET" then
+    if path == "/health" then handle_health start_time
+    else if path == "/status" then handle_status plat
+    else resp_404
+  else if method == "POST" then
+    if path == "/exec" then handle_exec body whitelist
+    else resp_404
+  else resp_404
+
+-- Serve loop
+serve_loop port token start_time whitelist plat =
+  let default_resp = handle_status plat
+  let _ = write_file "/tmp/fleet_agent_resp.txt" default_resp
+  serve_nc port token start_time whitelist plat
+
+serve_nc port token start_time whitelist plat =
+  let req = shell (cat ["cat /tmp/fleet_agent_resp.txt | nc -l ", show port, " 2>/dev/null"])
+  let resp = if length req > 5 then process_req req token start_time whitelist plat else handle_status plat
+  let _ = write_file "/tmp/fleet_agent_resp.txt" resp
+  serve_nc port token start_time whitelist plat
+
+process_req req token start_time whitelist plat =
+  let (method, path, hdrs, body) = parse_request req
+  let _ = print (cat ["  ", method, " ", path])
+  if check_auth hdrs token then route method path body start_time whitelist plat
+  else resp_403
+
+-- CLI arg parsing
+get_port argv =
+  if length argv <= 1 then 9101
+  else get_port_acc (tail argv)
+
+get_port_acc argv =
+  if length argv == 0 then 9101
+  else if head argv == "--port" then
+    if length (tail argv) > 0 then to_int (head (tail argv))
+    else 9101
+  else get_port_acc (tail argv)
+
+main =
+  let port = get_port args
+  let _ = shell "mkdir -p ~/.fleet && touch ~/.fleet/token ~/.fleet/allowed_commands"
+  let token = load_token 0
+  let whitelist = load_whitelist 0
+  let plat = detect_platform 0
+  let start_time = now 0
+  let _ = print "Fleet Agent (x86_64)"
+  let _ = print (cat ["  port: ", show port])
+  let _ = print (cat ["  platform: ", plat])
+  let _ = print (cat ["  token: ", if length token > 0 then "loaded" else "NONE (open access)"])
+  let _ = print (cat ["  whitelist: ", show (length whitelist), " commands"])
+  let _ = print "  Ctrl+C to stop\n"
+  serve_loop port token start_time whitelist plat

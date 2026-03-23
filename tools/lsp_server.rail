@@ -1,0 +1,412 @@
+-- lsp_server.rail — Rail LSP server (message processor)
+-- Reads a JSON-RPC request from /tmp/rail_lsp_req.json
+-- Writes JSON-RPC response to /tmp/rail_lsp_resp.json
+-- Called by tools/lsp_wrapper.sh for each LSP message
+--
+-- Usage: ./rail_native run tools/lsp_server.rail
+
+import "stdlib/json.rail"
+
+-- ── String helpers ──────────────────────────────────────────────────
+
+str_contains haystack needle =
+  let h = chars haystack
+  let n = chars needle
+  let nlen = length n
+  str_contains_loop h n nlen
+
+str_contains_loop h n nlen =
+  if length h < nlen then 0
+  else if str_prefix_match h n nlen then 1
+  else str_contains_loop (tail h) n nlen
+
+str_prefix_match h n nlen =
+  if nlen == 0 then 1
+  else if length h == 0 then 0
+  else if head h == head n then str_prefix_match (tail h) (tail n) (nlen - 1)
+  else 0
+
+-- Extract substring between two delimiters (first occurrence)
+str_between s open close =
+  let cs = chars s
+  let ocs = chars open
+  let olen = length ocs
+  str_between_find cs ocs olen close
+
+str_between_find cs ocs olen close =
+  if length cs < olen then ""
+  else if str_prefix_match cs ocs olen then
+    let rest = drop olen cs
+    str_until rest (head (chars close)) ""
+  else str_between_find (tail cs) ocs olen close
+
+str_until cs delim acc =
+  if length cs == 0 then acc
+  else if head cs == delim then acc
+  else str_until (tail cs) delim (append acc (head cs))
+
+-- ── JSON building helpers ───────────────────────────────────────────
+
+json_null = "null"
+json_true = "true"
+json_false = "false"
+
+jstr s = cat ["\"", json_escape s, "\""]
+
+json_escape s = json_escape_loop (chars s) ""
+
+json_escape_loop cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let esc = if c == "\"" then "\\\""
+              else if c == "\\" then "\\\\"
+              else if c == "\n" then "\\n"
+              else if c == "\t" then "\\t"
+              else c
+    json_escape_loop (tail cs) (append acc esc)
+
+jnum n = show n
+
+jobj pairs = cat ["{", join "," pairs, "}"]
+
+jarr items = cat ["[", join "," items, "]"]
+
+jpair k v = cat [jstr k, ":", v]
+
+-- ── Builtin signatures for hover ────────────────────────────────────
+
+hover_for name =
+  if name == "print" then "print : a -> IO ()\nPrint a value to stdout with newline"
+  else if name == "show" then "show : Int -> String\nConvert integer to string"
+  else if name == "append" then "append : String -> String -> String\nConcatenate two strings"
+  else if name == "cat" then "cat : [String] -> String\nConcatenate a list of strings"
+  else if name == "join" then "join : String -> [String] -> String\nJoin strings with separator"
+  else if name == "split" then "split : String -> String -> [String]\nSplit string on each character in delimiter (single-char split)"
+  else if name == "chars" then "chars : String -> [String]\nConvert string to list of single-character strings"
+  else if name == "length" then "length : [a] -> Int\nReturn length of a list"
+  else if name == "head" then "head : [a] -> a\nReturn first element of a list"
+  else if name == "tail" then "tail : [a] -> [a]\nReturn all but first element of a list"
+  else if name == "cons" then "cons : a -> [a] -> [a]\nPrepend element to a list"
+  else if name == "reverse" then "reverse : [a] -> [a]\nReverse a list"
+  else if name == "map" then "map : (a -> b) -> [a] -> [b]\nApply function to each element"
+  else if name == "filter" then "filter : (a -> Bool) -> [a] -> [a]\nKeep elements matching predicate (use named functions, not lambdas)"
+  else if name == "fold" then "fold : (b -> a -> b) -> b -> [a] -> b\nLeft fold over a list"
+  else if name == "range" then "range : Int -> [Int]\nGenerate [0..N-1]"
+  else if name == "read_file" then "read_file : String -> String\nRead entire file as string"
+  else if name == "write_file" then "write_file : String -> String -> IO ()\nWrite string to file"
+  else if name == "shell" then "shell : String -> String\nRun shell command, return stdout"
+  else if name == "to_int" then "to_int : Float -> Int\nConvert float to integer"
+  else if name == "to_float" then "to_float : Int -> Float\nConvert integer to float"
+  else if name == "llm" then "llm : Int -> String -> String -> String\nCall LLM: llm port system_prompt user_prompt"
+  else if name == "arena_mark" then "arena_mark : () -> Int\nSave current arena allocation point"
+  else if name == "arena_reset" then "arena_reset : Int -> ()\nReset arena to saved mark (frees allocations since mark)"
+  else if name == "not" then "not : Bool -> Bool\nLogical negation"
+  else if name == "spawn" then "spawn : (() -> a) -> ThreadId\nSpawn a new thread"
+  else if name == "channel" then "channel : () -> Channel a\nCreate a new channel"
+  else if name == "send" then "send : Channel a -> a -> ()\nSend a value on a channel"
+  else if name == "recv" then "recv : Channel a -> a\nReceive a value from a channel"
+  else ""
+
+-- ── Keyword completions ─────────────────────────────────────────────
+
+builtin_names = ["print", "show", "append", "cat", "join", "split", "chars", "length", "head", "tail", "cons", "reverse", "map", "filter", "fold", "range", "read_file", "write_file", "shell", "to_int", "to_float", "llm", "arena_mark", "arena_reset", "not", "spawn", "channel", "send", "recv"]
+
+keyword_names = ["let", "if", "then", "else", "match", "type", "import", "main"]
+
+make_completion_item name kind =
+  jobj [jpair "label" (jstr name), jpair "kind" (jnum kind)]
+
+-- kind 3 = Function, kind 14 = Keyword
+make_builtin_completions names =
+  if length names == 0 then []
+  else cons (make_completion_item (head names) 3) (make_builtin_completions (tail names))
+
+make_keyword_completions names =
+  if length names == 0 then []
+  else cons (make_completion_item (head names) 14) (make_keyword_completions (tail names))
+
+all_completions _ =
+  let bi = make_builtin_completions builtin_names
+  let kw = make_keyword_completions keyword_names
+  jarr (append_lists bi kw)
+
+append_lists a b =
+  if length a == 0 then b
+  else cons (head a) (append_lists (tail a) b)
+
+-- ── Diagnostics (compile check) ─────────────────────────────────────
+
+get_diagnostics uri =
+  let path = uri_to_path uri
+  let result = shell (cat ["./rail_native ", path, " 2>&1; echo \"EXIT:$?\""])
+  let lines = split "\n" result
+  parse_diag_lines lines []
+
+uri_to_path uri =
+  -- Remove file:// prefix
+  if str_contains uri "file://" == 1 then
+    let cs = chars uri
+    let dropped = drop 7 cs
+    join "" dropped
+  else uri
+
+parse_diag_lines lines acc =
+  if length lines == 0 then jarr (reverse acc)
+  else
+    let line = head lines
+    -- Look for "Error" or "error" in the line
+    if str_contains line "rror" == 1 then
+      let diag = make_diagnostic line
+      parse_diag_lines (tail lines) (cons diag acc)
+    else parse_diag_lines (tail lines) acc
+
+make_diagnostic msg =
+  let line_num = extract_line_num msg
+  let rng = jobj [jpair "start" (jobj [jpair "line" (jnum line_num), jpair "character" (jnum 0)]),
+                  jpair "end" (jobj [jpair "line" (jnum line_num), jpair "character" (jnum 80)])]
+  jobj [jpair "range" rng,
+        jpair "severity" (jnum 1),
+        jpair "source" (jstr "rail"),
+        jpair "message" (jstr msg)]
+
+extract_line_num msg =
+  -- Try to find "line N" pattern
+  if str_contains msg "line " == 1 then
+    let after = str_after msg "line "
+    parse_leading_int (chars after) 0
+  else 0
+
+str_after s prefix =
+  let cs = chars s
+  let ps = chars prefix
+  let plen = length ps
+  str_after_loop cs ps plen
+
+str_after_loop cs ps plen =
+  if length cs < plen then ""
+  else if str_prefix_match cs ps plen then join "" (drop plen cs)
+  else str_after_loop (tail cs) ps plen
+
+parse_leading_int cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    if c == "0" then parse_leading_int (tail cs) (acc * 10)
+    else if c == "1" then parse_leading_int (tail cs) (acc * 10 + 1)
+    else if c == "2" then parse_leading_int (tail cs) (acc * 10 + 2)
+    else if c == "3" then parse_leading_int (tail cs) (acc * 10 + 3)
+    else if c == "4" then parse_leading_int (tail cs) (acc * 10 + 4)
+    else if c == "5" then parse_leading_int (tail cs) (acc * 10 + 5)
+    else if c == "6" then parse_leading_int (tail cs) (acc * 10 + 6)
+    else if c == "7" then parse_leading_int (tail cs) (acc * 10 + 7)
+    else if c == "8" then parse_leading_int (tail cs) (acc * 10 + 8)
+    else if c == "9" then parse_leading_int (tail cs) (acc * 10 + 9)
+    else acc
+
+-- ── Definition lookup ───────────────────────────────────────────────
+
+find_definition uri word =
+  let path = uri_to_path uri
+  let src = read_file path
+  let lines = split "\n" src
+  find_def_in_lines lines word 0
+
+find_def_in_lines lines word linenum =
+  if length lines == 0 then ""
+  else
+    let line = head lines
+    -- Check if line starts with "word " or "word =" (function definition)
+    if line_defines word line then
+      jobj [jpair "uri" (jstr (cat ["file://", uri_to_path (cat ["file://", ""])])),
+            jpair "range" (jobj [jpair "start" (jobj [jpair "line" (jnum linenum), jpair "character" (jnum 0)]),
+                                 jpair "end" (jobj [jpair "line" (jnum linenum), jpair "character" (jnum (length (chars word)))])])]
+    else find_def_in_lines (tail lines) word (linenum + 1)
+
+line_defines word line =
+  let wcs = chars word
+  let wlen = length wcs
+  let lcs = chars line
+  if length lcs < wlen then 0
+  else if str_prefix_match lcs wcs wlen then
+    -- Next char after word should be space or =
+    if length lcs == wlen then 1
+    else
+      let next = head (drop wlen lcs)
+      if next == " " then 1
+      else if next == "=" then 1
+      else 0
+  else 0
+
+-- ── Word extraction at cursor position ──────────────────────────────
+
+-- Extract word at a given character position from a line of text
+word_at_pos line col =
+  let cs = chars line
+  -- Find word boundaries around col
+  let before = take_n col cs
+  let after = drop col cs
+  let w_start = reverse_take_word (reverse before) ""
+  let w_end = take_word after ""
+  append w_start w_end
+
+take_n n xs =
+  if n <= 0 then []
+  else if length xs == 0 then []
+  else cons (head xs) (take_n (n - 1) (tail xs))
+
+reverse_take_word cs acc =
+  if length cs == 0 then acc
+  else if is_word_char (head cs) then reverse_take_word (tail cs) (append (head cs) acc)
+  else acc
+
+take_word cs acc =
+  if length cs == 0 then acc
+  else if is_word_char (head cs) then take_word (tail cs) (append acc (head cs))
+  else acc
+
+is_word_char c =
+  if c == "_" then 1
+  else if c == "a" then 1 else if c == "b" then 1 else if c == "c" then 1
+  else if c == "d" then 1 else if c == "e" then 1 else if c == "f" then 1
+  else if c == "g" then 1 else if c == "h" then 1 else if c == "i" then 1
+  else if c == "j" then 1 else if c == "k" then 1 else if c == "l" then 1
+  else if c == "m" then 1 else if c == "n" then 1 else if c == "o" then 1
+  else if c == "p" then 1 else if c == "q" then 1 else if c == "r" then 1
+  else if c == "s" then 1 else if c == "t" then 1 else if c == "u" then 1
+  else if c == "v" then 1 else if c == "w" then 1 else if c == "x" then 1
+  else if c == "y" then 1 else if c == "z" then 1
+  else if c == "A" then 1 else if c == "B" then 1 else if c == "C" then 1
+  else if c == "D" then 1 else if c == "E" then 1 else if c == "F" then 1
+  else if c == "G" then 1 else if c == "H" then 1 else if c == "I" then 1
+  else if c == "J" then 1 else if c == "K" then 1 else if c == "L" then 1
+  else if c == "M" then 1 else if c == "N" then 1 else if c == "O" then 1
+  else if c == "P" then 1 else if c == "Q" then 1 else if c == "R" then 1
+  else if c == "S" then 1 else if c == "T" then 1 else if c == "U" then 1
+  else if c == "V" then 1 else if c == "W" then 1 else if c == "X" then 1
+  else if c == "Y" then 1 else if c == "Z" then 1
+  else if c == "0" then 1 else if c == "1" then 1 else if c == "2" then 1
+  else if c == "3" then 1 else if c == "4" then 1 else if c == "5" then 1
+  else if c == "6" then 1 else if c == "7" then 1 else if c == "8" then 1
+  else if c == "9" then 1
+  else 0
+
+-- Get line N from a multi-line string
+get_line_n src n =
+  let lines = split "\n" src
+  get_nth lines n
+
+get_nth xs n =
+  if length xs == 0 then ""
+  else if n == 0 then head xs
+  else get_nth (tail xs) (n - 1)
+
+-- ── LSP message handler ─────────────────────────────────────────────
+
+handle_message json_str =
+  let msg = parse_json json_str
+  let method = json_str (json_get msg "method")
+  let id_val = json_get msg "id"
+  let id = if head id_val == "num" then show (head (tail id_val)) else "null"
+  let params = json_get msg "params"
+
+  if method == "initialize" then handle_initialize id
+  else if method == "shutdown" then handle_shutdown id
+  else if method == "exit" then "EXIT"
+  else if method == "textDocument/didOpen" then handle_did_open params
+  else if method == "textDocument/didSave" then handle_did_save params
+  else if method == "textDocument/hover" then handle_hover id params
+  else if method == "textDocument/definition" then handle_definition id params
+  else if method == "textDocument/completion" then handle_completion id params
+  else if method == "initialized" then ""
+  else if method == "textDocument/didClose" then ""
+  else if method == "textDocument/didChange" then ""
+  else
+    -- Unknown method: if it has an id, respond with method not found
+    if id == "null" then ""
+    else make_response id json_null
+
+-- ── Handler implementations ─────────────────────────────────────────
+
+handle_initialize id =
+  let caps = jobj [
+    jpair "textDocumentSync" (jobj [jpair "openClose" json_true,
+                                    jpair "change" (jnum 0),
+                                    jpair "save" (jobj [jpair "includeText" json_false])]),
+    jpair "hoverProvider" json_true,
+    jpair "definitionProvider" json_true,
+    jpair "completionProvider" (jobj [jpair "triggerCharacters" (jarr [jstr "."])])]
+  let result = jobj [jpair "capabilities" caps,
+                     jpair "serverInfo" (jobj [jpair "name" (jstr "rail-lsp"), jpair "version" (jstr "1.0.0")])]
+  make_response id result
+
+handle_shutdown id =
+  make_response id json_null
+
+handle_did_open params =
+  let td = json_get params "textDocument"
+  let uri = json_str (json_get td "uri")
+  publish_diagnostics uri
+
+handle_did_save params =
+  let td = json_get params "textDocument"
+  let uri = json_str (json_get td "uri")
+  publish_diagnostics uri
+
+publish_diagnostics uri =
+  let diags = get_diagnostics uri
+  let params_json = jobj [jpair "uri" (jstr uri), jpair "diagnostics" diags]
+  make_notification "textDocument/publishDiagnostics" params_json
+
+handle_hover id params =
+  let td = json_get params "textDocument"
+  let uri = json_str (json_get td "uri")
+  let pos = json_get params "position"
+  let line_num = head (tail (json_get pos "line"))
+  let col_num = head (tail (json_get pos "character"))
+  let path = uri_to_path uri
+  let src = read_file path
+  let line = get_line_n src line_num
+  let word = word_at_pos line col_num
+  let sig = hover_for word
+  if sig == "" then make_response id json_null
+  else
+    let contents = jobj [jpair "kind" (jstr "markdown"), jpair "value" (jstr (cat ["```rail\n", sig, "\n```"]))]
+    let result = jobj [jpair "contents" contents]
+    make_response id result
+
+handle_definition id params =
+  let td = json_get params "textDocument"
+  let uri = json_str (json_get td "uri")
+  let pos = json_get params "position"
+  let line_num = head (tail (json_get pos "line"))
+  let col_num = head (tail (json_get pos "character"))
+  let path = uri_to_path uri
+  let src = read_file path
+  let line = get_line_n src line_num
+  let word = word_at_pos line col_num
+  let defn = find_definition uri word
+  if defn == "" then make_response id json_null
+  else
+    let loc = jobj [jpair "uri" (jstr uri), jpair "range" (json_get (parse_json defn) "range")]
+    make_response id loc
+
+handle_completion id params =
+  let items = all_completions 0
+  make_response id items
+
+-- ── JSON-RPC message formatting ─────────────────────────────────────
+
+make_response id result =
+  jobj [jpair "jsonrpc" (jstr "2.0"), jpair "id" id, jpair "result" result]
+
+make_notification method params_json =
+  jobj [jpair "jsonrpc" (jstr "2.0"), jpair "method" (jstr method), jpair "params" params_json]
+
+-- ── Main ────────────────────────────────────────────────────────────
+
+main =
+  let req = read_file "/tmp/rail_lsp_req.json"
+  let resp = handle_message req
+  let _ = write_file "/tmp/rail_lsp_resp.json" resp
+  0
