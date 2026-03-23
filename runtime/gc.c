@@ -76,7 +76,7 @@ static void try_mark(uint64_t val) {
 
     // Check if this points to a valid object (past a size header)
     uint64_t tag = get_tag(obj);
-    if (tag < 1 || tag > 6) return;  // not a valid tagged object
+    if (tag < 1 || tag > 8) return;  // not a valid tagged object
     if (is_marked(obj)) return;
 
     set_mark(obj);
@@ -90,7 +90,7 @@ static void try_mark(uint64_t val) {
         if (is_heap_ptr(head)) {
             void* h = (void*)head;
             uint64_t ht = get_tag(h);
-            if (ht >= 1 && ht <= 6 && !is_marked(h)) {
+            if (ht >= 1 && ht <= 8 && !is_marked(h)) {
                 mark_push(h);
             }
         }
@@ -106,7 +106,7 @@ static void try_mark(uint64_t val) {
             if (is_heap_ptr(th)) {
                 void* thp = (void*)th;
                 uint64_t tht = get_tag(thp);
-                if (tht >= 1 && tht <= 6 && !is_marked(thp))
+                if (tht >= 1 && tht <= 8 && !is_marked(thp))
                     mark_push(thp);
             }
             tail = ((uint64_t*)t)[2];
@@ -123,7 +123,7 @@ static void try_mark(uint64_t val) {
             if (is_heap_ptr(child)) {
                 void* c = (void*)child;
                 uint64_t ct = get_tag(c);
-                if (ct >= 1 && ct <= 6 && !is_marked(c))
+                if (ct >= 1 && ct <= 8 && !is_marked(c))
                     mark_push(c);
             }
         }
@@ -136,7 +136,7 @@ static void try_mark(uint64_t val) {
             if (is_heap_ptr(child)) {
                 void* c = (void*)child;
                 uint64_t ct = get_tag(c);
-                if (ct >= 1 && ct <= 6 && !is_marked(c))
+                if (ct >= 1 && ct <= 8 && !is_marked(c))
                     mark_push(c);
             }
         }
@@ -149,12 +149,27 @@ static void try_mark(uint64_t val) {
             if (is_heap_ptr(child)) {
                 void* c = (void*)child;
                 uint64_t ct = get_tag(c);
-                if (ct >= 1 && ct <= 6 && !is_marked(c))
+                if (ct >= 1 && ct <= 8 && !is_marked(c))
                     mark_push(c);
             }
         }
         break;
     }
+    case 7: { // HashMap [tag, count, capacity, buckets_ptr]
+        uint64_t cap = ((uint64_t*)obj)[2];
+        uint64_t* buckets = (uint64_t*)(((uint64_t*)obj)[3]);
+        if (buckets) {
+            for (uint64_t i = 0; i < cap; i++) {
+                if (buckets[i * 3 + 2] == 1) { // occupied
+                    try_mark(buckets[i * 3]);     // key
+                    try_mark(buckets[i * 3 + 1]); // value
+                }
+            }
+        }
+        break;
+    }
+    case 8: // StringBuffer — no Rail children to trace
+        break;
     }
 }
 
@@ -191,7 +206,20 @@ static void drain_mark_stack(void) {
                 try_mark(((uint64_t*)obj)[2 + i]);
             break;
         }
-        default: break; // Nil, Float — no children
+        case 7: { // HashMap — trace bucket contents
+            uint64_t cap = ((uint64_t*)obj)[2];
+            uint64_t* buckets = (uint64_t*)(((uint64_t*)obj)[3]);
+            if (buckets) {
+                for (uint64_t i = 0; i < cap; i++) {
+                    if (buckets[i * 3 + 2] == 1) {
+                        try_mark(buckets[i * 3]);
+                        try_mark(buckets[i * 3 + 1]);
+                    }
+                }
+            }
+            break;
+        }
+        default: break; // Nil, Float, StringBuffer — no children
         }
     }
 }
@@ -218,11 +246,16 @@ static void sweep(void) {
         if ((char*)obj + sz > end) break;      // corrupt/partial — stop
 
         uint64_t tag = get_tag(obj);
-        if (tag >= 1 && tag <= 6) {
+        if (tag >= 1 && tag <= 8) {
             if (is_marked(obj)) {
                 clear_mark(obj);
             } else {
-                // Unmarked — add to free list
+                // Unmarked — finalize and add to free list
+                if (tag == 7 || tag == 8) {
+                    // Free malloc'd buffer at obj[3]
+                    void* buf = (void*)(((uint64_t*)obj)[3]);
+                    if (buf) { free(buf); ((uint64_t*)obj)[3] = 0; }
+                }
                 free_node_t* node = (free_node_t*)obj;
                 node->size = sz;
                 node->next = rail_free_list;
