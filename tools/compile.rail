@@ -1402,7 +1402,110 @@ rt_gpu =
   let rparselist = "_rail_parse_int_list:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x0, [x29, #16]\n    ldr x1, [x0]\n    cmp x1, #2\n    b.eq .Lpil_nil\n    ldr x1, [x0, #8]\n    str x1, [x29, #24]\n    ldr x0, [x0, #16]\n    bl _rail_parse_int_list\n    str x0, [sp, #-16]!\n    ldr x0, [x29, #24]\n    bl _atoi\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldr x1, [sp], #16\n    bl _rail_cons\n    ldp x29, x30, [sp], #32\n    ret\n.Lpil_nil:\n    adrp x0, _rail_nil@PAGE\n    add x0, x0, _rail_nil@PAGEOFF\n    ldp x29, x30, [sp], #32\n    ret\n\n"
   cat [rgpumap, rparselist]
 
-runtime_asm = cat [rt_core, rt_list, rt_closure, rt_io, rt_args, rt_arith, rt_fiber, rt_gpu]
+-- GC: conservative mark-sweep, written in ARM64 assembly
+-- Replaces runtime/gc.c — zero C dependencies
+rt_gc_1 =
+  -- Free list globals + mark stack globals
+  cat [".data\n.global _rail_free_list\n_rail_free_list:\n    .quad 0\n",
+  "_gc_mark_stack:\n    .quad 0\n_gc_mark_top:\n    .quad 0\n_gc_mark_cap:\n    .quad 0\n.text\n\n",
+  -- rail_free_list_alloc: first-fit search. x0=size, returns ptr or 0
+  "_rail_free_list_alloc:\n    adrp x1, _rail_free_list@PAGE\n    add x1, x1, _rail_free_list@PAGEOFF\n",
+  ".Lfla_loop:\n    ldr x2, [x1]\n    cbz x2, .Lfla_fail\n    ldr x3, [x2]\n    cmp x3, x0\n    b.ge .Lfla_found\n    add x1, x2, #8\n    b .Lfla_loop\n",
+  ".Lfla_found:\n    ldr x3, [x2, #8]\n    str x3, [x1]\n    mov x0, x2\n    ret\n",
+  ".Lfla_fail:\n    mov x0, #0\n    ret\n\n",
+  -- rail_free_list_clear
+  "_rail_free_list_clear:\n    adrp x0, _rail_free_list@PAGE\n    str xzr, [x0, _rail_free_list@PAGEOFF]\n    ret\n\n"]
+
+rt_gc_2 =
+  -- _gc_try_mark: x0=value. Check if heap ptr, mark if valid object, push children.
+  cat ["_gc_try_mark:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n",
+  -- Check: not tagged int (bit 0), in heap range, 8-byte aligned
+  "    tst x0, #1\n    b.ne .Ltm_ret\n",
+  "    adrp x1, _rail_heap_ptr@PAGE\n    ldr x1, [x1, _rail_heap_ptr@PAGEOFF]\n    cmp x0, x1\n    b.hs .Ltm_ret\n",
+  "    tst x0, #7\n    b.ne .Ltm_ret\n",
+  -- Load tag, mask mark bit, check valid range 1-6
+  "    ldr x1, [x0]\n    and x2, x1, #0x7fffffffffffffff\n    cmp x2, #1\n    b.lo .Ltm_ret\n    cmp x2, #6\n    b.hi .Ltm_ret\n",
+  -- Check not already marked (bit 63)
+  "    tbnz x1, #63, .Ltm_ret\n",
+  -- Set mark bit
+  "    orr x1, x1, #0x8000000000000000\n    str x1, [x0]\n",
+  -- Push to mark stack
+  "    str x0, [x29, #16]\n",
+  "    adrp x1, _gc_mark_top@PAGE\n    add x1, x1, _gc_mark_top@PAGEOFF\n    ldr x3, [x1]\n",
+  "    adrp x4, _gc_mark_cap@PAGE\n    ldr x4, [x4, _gc_mark_cap@PAGEOFF]\n    cmp x3, x4\n    b.hs .Ltm_ret\n",
+  "    adrp x5, _gc_mark_stack@PAGE\n    ldr x5, [x5, _gc_mark_stack@PAGEOFF]\n",
+  "    ldr x0, [x29, #16]\n    str x0, [x5, x3, lsl #3]\n    add x3, x3, #1\n    str x3, [x1]\n",
+  ".Ltm_ret:\n    ldp x29, x30, [sp], #48\n    ret\n\n"]
+
+rt_gc_3 =
+  -- _gc_drain: process mark stack, call try_mark on children
+  cat ["_gc_drain:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n",
+  ".Ldrain_loop:\n",
+  "    adrp x0, _gc_mark_top@PAGE\n    add x0, x0, _gc_mark_top@PAGEOFF\n    ldr x1, [x0]\n    cbz x1, .Ldrain_done\n",
+  "    sub x1, x1, #1\n    str x1, [x0]\n",
+  "    adrp x2, _gc_mark_stack@PAGE\n    ldr x2, [x2, _gc_mark_stack@PAGEOFF]\n    ldr x3, [x2, x1, lsl #3]\n",
+  -- x3 = object ptr. Load tag.
+  "    str x3, [x29, #16]\n    ldr x4, [x3]\n    and x4, x4, #0x7fffffffffffffff\n",
+  -- Case 1: Cons — mark head and tail
+  "    cmp x4, #1\n    b.ne .Ldrain_c3\n    ldr x0, [x3, #8]\n    bl _gc_try_mark\n    ldr x3, [x29, #16]\n    ldr x0, [x3, #16]\n    bl _gc_try_mark\n    b .Ldrain_loop\n",
+  -- Case 3: Tuple — mark all elements
+  ".Ldrain_c3:\n    cmp x4, #3\n    b.ne .Ldrain_c4\n",
+  "    ldr x5, [x3, #-8]\n    sub x5, x5, #8\n    lsr x5, x5, #3\n    mov x6, #0\n    str x5, [x29, #24]\n",
+  ".Ldrain_t_loop:\n    ldr x5, [x29, #24]\n    cmp x6, x5\n    b.hs .Ldrain_loop\n    str x6, [x29, #32]\n    ldr x3, [x29, #16]\n    add x7, x6, #1\n    ldr x0, [x3, x7, lsl #3]\n    bl _gc_try_mark\n    ldr x6, [x29, #32]\n    add x6, x6, #1\n    b .Ldrain_t_loop\n",
+  -- Case 4: Closure — mark captures
+  ".Ldrain_c4:\n    cmp x4, #4\n    b.ne .Ldrain_c5\n",
+  "    ldr x5, [x3, #16]\n    mov x6, #0\n    str x5, [x29, #24]\n",
+  ".Ldrain_cl_loop:\n    ldr x5, [x29, #24]\n    cmp x6, x5\n    b.hs .Ldrain_loop\n    str x6, [x29, #32]\n    ldr x3, [x29, #16]\n    add x7, x6, #3\n    ldr x0, [x3, x7, lsl #3]\n    bl _gc_try_mark\n    ldr x6, [x29, #32]\n    add x6, x6, #1\n    b .Ldrain_cl_loop\n",
+  -- Case 5: ADT — mark fields
+  ".Ldrain_c5:\n    cmp x4, #5\n    b.ne .Ldrain_loop\n",
+  "    ldr x5, [x3, #-8]\n    sub x5, x5, #16\n    lsr x5, x5, #3\n    mov x6, #0\n    str x5, [x29, #24]\n",
+  ".Ldrain_a_loop:\n    ldr x5, [x29, #24]\n    cmp x6, x5\n    b.hs .Ldrain_loop\n    str x6, [x29, #32]\n    ldr x3, [x29, #16]\n    add x7, x6, #2\n    ldr x0, [x3, x7, lsl #3]\n    bl _gc_try_mark\n    ldr x6, [x29, #32]\n    add x6, x6, #1\n    b .Ldrain_a_loop\n",
+  ".Ldrain_done:\n    ldp x29, x30, [sp], #64\n    ret\n\n"]
+
+rt_gc_4 =
+  -- _rail_gc: main entry point. Walk stack frames, mark, sweep.
+  cat ["_rail_gc:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n",
+  -- Allocate mark stack: 512K entries * 8 = 4MB
+  "    mov x0, #4194304\n    bl _malloc\n    cbz x0, .Lgc_ret\n",
+  "    adrp x1, _gc_mark_stack@PAGE\n    str x0, [x1, _gc_mark_stack@PAGEOFF]\n",
+  "    adrp x1, _gc_mark_top@PAGE\n    str xzr, [x1, _gc_mark_top@PAGEOFF]\n",
+  "    mov x0, #524288\n    adrp x1, _gc_mark_cap@PAGE\n    str x0, [x1, _gc_mark_cap@PAGEOFF]\n",
+  -- Walk stack frames via x29 chain
+  "    mov x19, x29\n",
+  ".Lgc_frame_loop:\n    cbz x19, .Lgc_sweep\n",
+  "    ldr x20, [x19]\n",
+  -- Scan frame: slots from fp+16 to fp+2048 (or parent frame)
+  "    add x21, x19, #16\n    add x22, x19, #2048\n",
+  "    cmp x20, #0\n    b.eq .Lgc_scan\n    cmp x20, x22\n    b.hs .Lgc_scan\n    mov x22, x20\n",
+  ".Lgc_scan:\n    cmp x21, x22\n    b.hs .Lgc_scan_done\n    ldr x0, [x21]\n    str x21, [x29, #16]\n    str x22, [x29, #24]\n    bl _gc_try_mark\n    ldr x21, [x29, #16]\n    ldr x22, [x29, #24]\n    add x21, x21, #8\n    b .Lgc_scan\n",
+  ".Lgc_scan_done:\n    bl _gc_drain\n    mov x19, x20\n    b .Lgc_frame_loop\n",
+  -- Sweep phase
+  ".Lgc_sweep:\n",
+  "    adrp x0, _rail_free_list@PAGE\n    str xzr, [x0, _rail_free_list@PAGEOFF]\n",
+  -- pos = heap start, end = heap_ptr
+  "    adrp x19, _rail_heap@PAGE\n    add x19, x19, _rail_heap@PAGEOFF\n",
+  "    adrp x20, _rail_heap_ptr@PAGE\n    ldr x20, [x20, _rail_heap_ptr@PAGEOFF]\n",
+  ".Lsweep_loop:\n    add x1, x19, #8\n    cmp x1, x20\n    b.hi .Lsweep_done\n",
+  "    ldr x2, [x19]\n",
+  "    add x3, x1, x2\n    cmp x3, x20\n    b.hi .Lsweep_done\n",
+  -- x1=obj, x2=size. Load tag.
+  "    ldr x4, [x1]\n    and x5, x4, #0x7fffffffffffffff\n",
+  "    cmp x5, #1\n    b.lo .Lsweep_next\n    cmp x5, #6\n    b.hi .Lsweep_next\n",
+  -- Marked? Clear mark.
+  "    tbnz x4, #63, .Lsweep_clear\n",
+  -- Unmarked: add to free list
+  "    str x2, [x1]\n",
+  "    adrp x6, _rail_free_list@PAGE\n    add x6, x6, _rail_free_list@PAGEOFF\n    ldr x7, [x6]\n    str x7, [x1, #8]\n    str x1, [x6]\n",
+  "    b .Lsweep_next\n",
+  ".Lsweep_clear:\n    and x4, x4, #0x7fffffffffffffff\n    str x4, [x1]\n",
+  ".Lsweep_next:\n    add x2, x2, #7\n    and x2, x2, #-8\n    add x19, x19, x2\n    add x19, x19, #8\n    b .Lsweep_loop\n",
+  ".Lsweep_done:\n",
+  -- Free mark stack
+  "    adrp x0, _gc_mark_stack@PAGE\n    add x0, x0, _gc_mark_stack@PAGEOFF\n    ldr x0, [x0]\n    bl _free\n",
+  "    adrp x1, _gc_mark_stack@PAGE\n    str xzr, [x1, _gc_mark_stack@PAGEOFF]\n",
+  ".Lgc_ret:\n    ldp x29, x30, [sp], #64\n    ret\n\n"]
+
+runtime_asm = cat [rt_core, rt_list, rt_closure, rt_io, rt_args, rt_arith, rt_fiber, rt_gpu, rt_gc_1, rt_gc_2, rt_gc_3, rt_gc_4]
 
 -- ══════════════════════════════════════════════════════════════════════════════
 -- OPTIMIZATION PASSES
@@ -1926,7 +2029,7 @@ build asm_text =
   let rtdir = get_runtime_dir 0
   let as_result = trim (shell "as -o /tmp/rail_out.o /tmp/rail_out.s 2>&1")
   let _ = if as_result != "" then print (cat ["  as: ", as_result]) else print "  as: OK"
-  let ld_cmd = cat ["ld -o /tmp/rail_out /tmp/rail_out.o ", rtdir, "/gc.o -lSystem -syslibroot ", sdk, " -arch arm64 2>&1"]
+  let ld_cmd = cat ["ld -o /tmp/rail_out /tmp/rail_out.o -lSystem -syslibroot ", sdk, " -arch arm64 2>&1"]
   let ld_result = trim (shell ld_cmd)
   let _ = if ld_result != "" then print (cat ["  ld: ", ld_result]) else print "  ld: OK"
   let _ = shell "codesign -s - /tmp/rail_out 2>&1"
@@ -2096,7 +2199,7 @@ self_compile _ =
   let as_res = trim (shell "as -o /tmp/rail_self.o /tmp/rail_self.s 2>&1")
   let _ = if as_res != "" then print (cat ["  as: ", as_res]) else print "  as: OK"
   let rtdir2 = get_runtime_dir 0
-  let ld_res = trim (shell (cat ["ld -o /tmp/rail_self /tmp/rail_self.o ", rtdir2, "/gc.o -lSystem -syslibroot ", sdk, " -arch arm64 2>&1"]))
+  let ld_res = trim (shell (cat ["ld -o /tmp/rail_self /tmp/rail_self.o -lSystem -syslibroot ", sdk, " -arch arm64 2>&1"]))
   let _ = if ld_res != "" then print (cat ["  ld: ", ld_res]) else print "  ld: OK"
   let _ = shell "codesign -s - /tmp/rail_self 2>&1"
   let _ = print "  Binary: /tmp/rail_self"
