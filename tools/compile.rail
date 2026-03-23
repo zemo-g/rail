@@ -502,6 +502,20 @@ gen_call_llm desc =
   let _ = write_file "/tmp/rail_gen_code.rail" code
   code
 
+-- Validate that a name contains only safe characters (alphanumeric, underscore, hyphen)
+is_safe_name name =
+  let check = trim (shell (cat ["printf '%s' '", name, "' | grep -qE '^[a-zA-Z0-9_-]+$' && echo yes || echo no"]))
+  check == "yes"
+
+-- Resolve a bare import name to a file path
+-- Resolution order: ./name.rail → stdlib/name.rail → ~/.rail/packages/name/name.rail
+resolve_bare_import name =
+  if is_safe_name name == false then "_NOT_FOUND"
+  else
+    let bindir = trim (shell (cat ["dirname '", head args, "'"]))
+    let cmd = cat ["f='", name, ".rail'; test -f \"$f\" && echo \"$f\" && exit 0; f='", bindir, "/stdlib/", name, ".rail'; test -f \"$f\" && echo \"$f\" && exit 0; f='stdlib/", name, ".rail'; test -f \"$f\" && echo \"$f\" && exit 0; f=\"$HOME/.rail/packages/", name, "/", name, ".rail\"; test -f \"$f\" && echo \"$f\" && exit 0; echo _NOT_FOUND"]
+    trim (shell cmd)
+
 pprog ts =
   let ts2 = sn ts
   if ct ts2 == "eof" then []
@@ -514,19 +528,40 @@ pprog ts =
   else if ct ts2 == "kw" then
     if cv ts2 == "import" then
       let r = ad ts2
-      let (path, r2) = xp "str" r
-      let imp_src = read_file path
-      let imp_toks = tokenize imp_src
-      let imp_decls = filter_exports (pprog imp_toks)
-      -- Check for "as Name" qualifier
-      let r3 = sn r2
-      if ct r3 == "id" then
-        if cv r3 == "as" then
-          let (qname, r4) = xp "id" (ad r3)
-          let prefixed = prefix_decls (append qname "_") imp_decls
-          append prefixed (pprog r4)
+      -- Support both quoted imports and bare imports
+      if ct (sn r) == "str" then
+        -- Quoted: import "path/to/file.rail"
+        let (path, r2) = xp "str" r
+        let imp_src = read_file path
+        let imp_toks = tokenize imp_src
+        let imp_decls = filter_exports (pprog imp_toks)
+        -- Check for "as Name" qualifier
+        let r3 = sn r2
+        if ct r3 == "id" then
+          if cv r3 == "as" then
+            let (qname, r4) = xp "id" (ad r3)
+            let prefixed = prefix_decls (append qname "_") imp_decls
+            append prefixed (pprog r4)
+          else append imp_decls (pprog r2)
         else append imp_decls (pprog r2)
-      else append imp_decls (pprog r2)
+      else if ct (sn r) == "id" then
+        -- Bare: import math | import math as M
+        let (name, r2) = xp "id" r
+        let path = resolve_bare_import name
+        let _ = if str_starts_with "_NOT_FOUND" path then print (cat ["Error: cannot resolve import '", name, "' (searched ./, stdlib/, ~/.rail/packages/)"]) else 0
+        let imp_src = read_file path
+        let imp_toks = tokenize imp_src
+        let imp_decls = filter_exports (pprog imp_toks)
+        -- Check for "as Name" qualifier
+        let r3 = sn r2
+        if ct r3 == "id" then
+          if cv r3 == "as" then
+            let (qname, r4) = xp "id" (ad r3)
+            let prefixed = prefix_decls (append qname "_") imp_decls
+            append prefixed (pprog r4)
+          else append imp_decls (pprog r2)
+        else append imp_decls (pprog r2)
+      else pprog r
     else if cv ts2 == "link" then
       -- skip link pragmas for now
       let r = ad ts2
@@ -1570,6 +1605,202 @@ check_exhaustiveness decls siblings =
       check_exhaustiveness (tail decls) siblings
     else check_exhaustiveness (tail decls) siblings
 
+-- ══════════════════════════════════════════════════════════════════════════════
+-- TYPE CHECKER (simple forward inference — warnings only)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Type universe: "int", "float", "string", "bool", "list", "fun", "tuple", "adt", "any"
+
+-- Lookup in type environment: returns "any" if not found
+tc_lookup name tenv =
+  if length tenv == 0 then "any"
+  else
+    let (k, v) = head tenv
+    if k == name then v
+    else tc_lookup name (tail tenv)
+
+-- Builtin return types: returns (expected_arg_type, return_type, arity) or ("any", "any", -1)
+tc_builtin_ret fname =
+  if fname == "head" then ("list", "any", 1)
+  else if fname == "tail" then ("list", "list", 1)
+  else if fname == "reverse" then ("list", "list", 1)
+  else if fname == "range" then ("int", "list", 1)
+  else if fname == "length" then ("any", "int", 1)
+  else if fname == "show" then ("any", "string", 1)
+  else if fname == "print" then ("any", "int", 1)
+  else if fname == "read_file" then ("string", "string", 1)
+  else if fname == "shell" then ("string", "string", 1)
+  else if fname == "chars" then ("string", "list", 1)
+  else if fname == "not" then ("bool", "bool", 1)
+  else if fname == "to_float" then ("int", "float", 1)
+  else if fname == "to_int" then ("float", "int", 1)
+  else tc_builtin_ret2 fname
+
+tc_builtin_ret2 fname =
+  if fname == "cons" then ("any", "list", 2)
+  else if fname == "append" then ("any", "any", 2)
+  else if fname == "write_file" then ("string", "int", 2)
+  else if fname == "split" then ("string", "list", 2)
+  else if fname == "join" then ("string", "string", 2)
+  else if fname == "map" then ("fun", "list", 2)
+  else if fname == "filter" then ("fun", "list", 2)
+  else if fname == "fold" then ("fun", "any", 3)
+  else if fname == "llm" then ("any", "string", 3)
+  else ("any", "any", 0 - 1)
+
+-- Infer the type of an AST node given a type environment
+-- Returns the inferred type as a string
+tc_infer node tenv fname_ctx =
+  let tg = head node
+  if tg == "I" then "int"
+  else if tg == "FL" then "float"
+  else if tg == "S" then "string"
+  else if tg == "B" then "bool"
+  else if tg == "NULL" then "any"
+  else if tg == "V" then tc_lookup (head (tail node)) tenv
+  else if tg == "L" then "list"
+  else if tg == "T" then "tuple"
+  else if tg == "F" then "fun"
+  else if tg == "O" then tc_infer_op node tenv fname_ctx
+  else if tg == "?" then tc_infer_if node tenv fname_ctx
+  else if tg == "D" then tc_infer_let node tenv fname_ctx
+  else if tg == "TD" then tc_infer_td node tenv fname_ctx
+  else if tg == "A" then tc_infer_app node tenv fname_ctx
+  else if tg == "M" then "any"
+  else "any"
+
+-- Infer type of operator expression and warn on mismatches
+tc_infer_op node tenv fname_ctx =
+  let op = head (tail node)
+  let lt = tc_infer (head (tail (tail node))) tenv fname_ctx
+  let rt = tc_infer (head (tail (tail (tail node)))) tenv fname_ctx
+  if op == "+" then
+    if lt == "string" || rt == "string" then "string"
+    else if lt == "float" || rt == "float" then "float"
+    else "int"
+  else if op == "-" || op == "*" || op == "/" || op == "%" then
+    let _ = if lt == "string" then print (cat ["  WARNING [typecheck] in ", fname_ctx, ": arithmetic '", op, "' on string value"]) else 0
+    let _ = if rt == "string" then print (cat ["  WARNING [typecheck] in ", fname_ctx, ": arithmetic '", op, "' on string value"]) else 0
+    let _ = if lt == "list" then print (cat ["  WARNING [typecheck] in ", fname_ctx, ": arithmetic '", op, "' on list value"]) else 0
+    let _ = if rt == "list" then print (cat ["  WARNING [typecheck] in ", fname_ctx, ": arithmetic '", op, "' on list value"]) else 0
+    let _ = if lt == "bool" then print (cat ["  WARNING [typecheck] in ", fname_ctx, ": arithmetic '", op, "' on bool value"]) else 0
+    let _ = if rt == "bool" then print (cat ["  WARNING [typecheck] in ", fname_ctx, ": arithmetic '", op, "' on bool value"]) else 0
+    if lt == "float" || rt == "float" then "float" else "int"
+  else if op == "&&" || op == "||" then "bool"
+  else if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" then
+    let _ = if op == "<" || op == ">" || op == "<=" || op == ">=" then
+      if lt != "any" then
+        if rt != "any" then
+          if lt != rt then
+            print (cat ["  WARNING [typecheck] in ", fname_ctx, ": comparison '", op, "' on mismatched types '", lt, "' and '", rt, "'"])
+          else 0
+        else 0
+      else 0
+    else 0
+    "bool"
+  else "any"
+
+-- Infer type of if/then/else
+tc_infer_if node tenv fname_ctx =
+  let _ = tc_infer (head (tail node)) tenv fname_ctx
+  let then_t = tc_infer (head (tail (tail node))) tenv fname_ctx
+  let else_t = tc_infer (head (tail (tail (tail node)))) tenv fname_ctx
+  if then_t == else_t then then_t
+  else if then_t == "any" then else_t
+  else if else_t == "any" then then_t
+  else "any"
+
+-- Infer type of let binding
+tc_infer_let node tenv fname_ctx =
+  let nm = head (tail node)
+  let val_t = tc_infer (head (tail (tail node))) tenv fname_ctx
+  let tenv2 = cons (nm, val_t) tenv
+  tc_infer (head (tail (tail (tail node)))) tenv2 fname_ctx
+
+-- Infer type of tuple destructuring let
+tc_infer_td node tenv fname_ctx =
+  let names = head (tail node)
+  let _ = tc_infer (head (tail (tail node))) tenv fname_ctx
+  let tenv2 = tc_add_names names tenv
+  tc_infer (head (tail (tail (tail node)))) tenv2 fname_ctx
+
+tc_add_names names tenv =
+  if length names == 0 then tenv
+  else tc_add_names (tail names) (cons (head names, "any") tenv)
+
+-- Infer type of function application + check builtins
+tc_infer_app node tenv fname_ctx =
+  let (fname, fargs) = flat node
+  let nargs = length fargs
+  if fname == "_expr" then
+    let fn_node = get_app_fn node
+    if head fn_node == "F" then "any"
+    else
+      let fn_t = tc_infer fn_node tenv fname_ctx
+      let _ = if fn_t != "any" then
+        if fn_t != "fun" then
+          print (cat ["  WARNING [typecheck] in ", fname_ctx, ": calling non-function value of type '", fn_t, "'"])
+        else 0
+      else 0
+      "any"
+  else
+    let (exp_arg_t, ret_t, bi_arity) = tc_builtin_ret fname
+    if bi_arity != (0 - 1) then
+      -- Check arity for builtins
+      let _ = if bi_arity != nargs then
+        if bi_arity > 0 then
+          print (cat ["  WARNING [typecheck] in ", fname_ctx, ": '", fname, "' expects ", show bi_arity, " argument(s), got ", show nargs])
+        else 0
+      else 0
+      -- Check first argument type for single-arg builtins that expect list
+      let _ = if nargs >= 1 then
+        if exp_arg_t == "list" then
+          let arg_t = tc_infer (head fargs) tenv fname_ctx
+          if arg_t != "any" then
+            if arg_t != "list" then
+              print (cat ["  WARNING [typecheck] in ", fname_ctx, ": '", fname, "' expects list argument, got '", arg_t, "'"])
+            else 0
+          else 0
+        else 0
+      else 0
+      ret_t
+    else
+      -- User-defined or local variable: check if calling a non-function
+      let var_t = tc_lookup fname tenv
+      let _ = if var_t != "any" then
+        if var_t != "fun" then
+          print (cat ["  WARNING [typecheck] in ", fname_ctx, ": calling non-function '", fname, "' of type '", var_t, "'"])
+        else 0
+      else 0
+      let _ = tc_infer_args fargs tenv fname_ctx
+      "any"
+
+-- Infer types of a list of argument expressions (for side effects)
+tc_infer_args fargs tenv fname_ctx =
+  if length fargs == 0 then 0
+  else
+    let _ = tc_infer (head fargs) tenv fname_ctx
+    tc_infer_args (tail fargs) tenv fname_ctx
+
+-- Build initial type environment for a function's parameters (all "any")
+tc_param_env params =
+  if length params == 0 then []
+  else cons (head params, "any") (tc_param_env (tail params))
+
+-- Type check all function declarations
+tc_check_decls decls =
+  if length decls == 0 then 0
+  else
+    let d = head decls
+    if head d == "fn" then
+      let nm = head (tail d)
+      let ps = head (tail (tail d))
+      let body = head (tail (tail (tail d)))
+      let tenv = tc_param_env ps
+      let _ = tc_infer body tenv nm
+      tc_check_decls (tail decls)
+    else tc_check_decls (tail decls)
+
 -- Compile full program to assembly text
 compile_program src =
   let toks = tokenize src
@@ -1578,6 +1809,7 @@ compile_program src =
   let ar = get_arities decls
   let siblings = build_ctor_siblings decls
   let _ = check_exhaustiveness decls siblings
+  let _ = tc_check_decls decls
   let hdr = ".section __TEXT,__text\n.global _main\n.p2align 2\n\n"
   let (funcs, _) = compile_funcs decls ar 0
   let rt = runtime_asm
@@ -1904,22 +2136,122 @@ dispatch_wasm path =
   let _ = print out
   0
 
+-- Validate GitHub-style path: alphanumeric, underscore, hyphen, dot, forward slash
+is_safe_pkg_name name =
+  let check = trim (shell (cat ["printf '%s' '", name, "' | grep -qE '^[a-zA-Z0-9_./-]+$' && echo yes || echo no"]))
+  check == "yes"
+
 -- Package manager (inline — small enough)
 dispatch_get name =
-  let _ = shell "mkdir -p ~/.rail/packages"
-  let src_path = cat ["stdlib/", name, ".rail"]
-  let home = trim (shell "echo $HOME")
-  let dest_dir = cat [home, "/.rail/packages/", name]
-  let _ = shell (cat ["mkdir -p ", dest_dir])
-  let dest_path = cat [dest_dir, "/", name, ".rail"]
-  let src = read_file src_path
-  if length src == 0 then
-    let _ = print (cat ["Package not found: ", name])
+  if is_safe_pkg_name name == false then
+    let _ = print (cat ["Error: invalid package name: ", name])
     1
   else
-    let _ = write_file dest_path src
-    let _ = print (cat ["Installed: ", name, " -> ", dest_path])
+    let _ = shell "mkdir -p ~/.rail/packages"
+    let home = trim (shell "echo $HOME")
+    if str_starts_with "github.com/" name then
+      -- GitHub package: git clone to ~/.rail/packages/user/repo
+      let rest = str_after "github.com/" name
+      let dest_dir = cat [home, "/.rail/packages/", rest]
+      let parent = trim (shell (cat ["dirname '", dest_dir, "'"]))
+      let _ = shell (cat ["mkdir -p '", parent, "'"])
+      let exists = trim (shell (cat ["test -d '", dest_dir, "' && echo yes || echo no"]))
+      if exists == "yes" then
+        let _ = print (cat ["Updating: ", name])
+        let _ = shell (cat ["cd '", dest_dir, "' && git pull 2>&1"])
+        let _ = print (cat ["Updated: ", name, " -> ", dest_dir])
+        0
+      else
+        let _ = print (cat ["Cloning: ", name])
+        let url = cat ["https://", name, ".git"]
+        let res = trim (shell (cat ["git clone '", url, "' '", dest_dir, "' 2>&1"]))
+        let _ = print res
+        let _ = print (cat ["Installed: ", name, " -> ", dest_dir])
+        0
+    else
+      -- Stdlib or local package
+      let bindir = trim (shell (cat ["dirname '", head args, "'"]))
+      let src_path = cat [bindir, "/stdlib/", name, ".rail"]
+      let src = read_file src_path
+      let src2 = if length src == 0 then read_file (cat ["stdlib/", name, ".rail"]) else src
+      let dest_dir = cat [home, "/.rail/packages/", name]
+      let _ = shell (cat ["mkdir -p '", dest_dir, "'"])
+      let dest_path = cat [dest_dir, "/", name, ".rail"]
+      if length src2 == 0 then
+        let _ = print (cat ["Package not found: ", name])
+        1
+      else
+        let _ = write_file dest_path src2
+        let _ = print (cat ["Installed: ", name, " -> ", dest_path])
+        0
+
+-- rail.toml support: read manifest + install dependencies
+dispatch_pkg _ =
+  let toml = read_file "rail.toml"
+  if length toml == 0 then
+    let _ = print "No rail.toml found in current directory."
+    1
+  else
+    let _ = print "=== rail pkg: installing dependencies from rail.toml ==="
+    let lines = split "\n" toml
+    let _ = pkg_process_lines lines false
     0
+
+-- Process rail.toml lines, in_deps tracks if we are in [dependencies]
+pkg_process_lines lines in_deps =
+  if length lines == 0 then 0
+  else
+    let line = head lines
+    let rest = tail lines
+    if line == "[dependencies]" then pkg_process_lines rest true
+    else if str_starts_with "[" line then pkg_process_lines rest false
+    else if in_deps then
+      if length line == 0 then pkg_process_lines rest in_deps
+      else if str_starts_with "--" line then pkg_process_lines rest in_deps
+      else if str_starts_with "#" line then pkg_process_lines rest in_deps
+      else
+        -- Parse: name = "source"
+        let parts = split "=" line
+        if length parts >= 2 then
+          let dep_name = pkg_trim_str (head parts)
+          let dep_src = pkg_trim_str (head (tail parts))
+          let _ = if dep_src == "stdlib" then
+            let _ = print (cat ["  Installing ", dep_name, " (stdlib)"])
+            dispatch_get dep_name
+          else
+            let _ = print (cat ["  Installing ", dep_name, " from ", dep_src])
+            dispatch_get dep_src
+          pkg_process_lines rest in_deps
+        else pkg_process_lines rest in_deps
+    else pkg_process_lines rest in_deps
+
+-- Trim whitespace and quotes from a toml value
+pkg_trim_str s =
+  let cs = chars s
+  let cs2 = pkg_drop_spaces cs
+  let cs3 = reverse (pkg_drop_spaces (reverse cs2))
+  let cs4 = pkg_drop_quotes cs3
+  join "" cs4
+
+pkg_drop_spaces cs =
+  if length cs == 0 then []
+  else if head cs == " " then pkg_drop_spaces (tail cs)
+  else if head cs == "\t" then pkg_drop_spaces (tail cs)
+  else cs
+
+pkg_drop_quotes cs =
+  if length cs == 0 then []
+  else
+    let first = head cs
+    if first == "\"" then pkg_strip_end_quote (tail cs)
+    else cs
+
+pkg_strip_end_quote cs =
+  if length cs == 0 then []
+  else
+    let r = reverse cs
+    if head r == "\"" then reverse (tail r)
+    else cs
 
 dispatch_packages _ =
   let _ = shell "mkdir -p ~/.rail/packages"
@@ -1960,6 +2292,7 @@ main =
       else let _ = print "Usage: rail get <package>"
       1
     else if cmd == "packages" then dispatch_packages 0
+    else if cmd == "pkg" then dispatch_pkg 0
     else if cmd == "deploy" then dispatch_deploy a
     else compile_file cmd
   else
