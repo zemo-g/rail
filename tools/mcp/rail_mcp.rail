@@ -1,0 +1,285 @@
+-- rail_mcp.rail — MCP server for Rail compiler, bench, and flywheel.
+--
+-- Lets Claude Code directly compile Rail code, run benchmarks, check training
+-- progress, and manage the fleet — no manual SSH or shell commands needed.
+--
+-- This program handles a single JSON-RPC request per invocation.
+-- The shell wrapper (mcp_loop.sh) handles stdin/stdout framing.
+--
+-- Usage:
+--   Add to Claude Code settings.json:
+--   {
+--     "mcpServers": {
+--       "rail": {
+--         "command": "/Users/ledaticempire/projects/rail/tools/mcp/mcp_loop.sh"
+--       }
+--     }
+--   }
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+q = "\""
+nl = "\n"
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- JSON helpers
+-- ══════════════════════════════════════════════════════════════════════════════
+
+json_esc_bs s = join "\\\\" (split "\\" s)
+json_esc_q s = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n" (split "\n" s)
+json_esc_tab s = join "\\t" (split "\t" s)
+json_esc s = json_esc_tab (json_esc_nl (json_esc_q (json_esc_bs s)))
+
+jstr k v = cat [q, k, q, ": ", q, json_esc v, q]
+jint k v = cat [q, k, q, ": ", show v]
+jbool k v = cat [q, k, q, ": ", if v then "true" else "false"]
+jobj pairs = cat ["{", join ", " pairs, "}"]
+jarr items = cat ["[", join ", " items, "]"]
+
+-- Raw JSON value (no quoting)
+jraw k v = cat [q, k, q, ": ", v]
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- JSON-RPC response builders
+-- ══════════════════════════════════════════════════════════════════════════════
+
+rpc_result req_id result_json =
+  cat ["{", q, "jsonrpc", q, ": ", q, "2.0", q, ", ", q, "id", q, ": ", req_id, ", ", q, "result", q, ": ", result_json, "}"]
+
+rpc_error req_id code msg =
+  cat ["{", q, "jsonrpc", q, ": ", q, "2.0", q, ", ", q, "id", q, ": ", req_id, ", ", q, "error", q, ": ", jobj [jint "code" code, jstr "message" msg], "}"]
+
+rpc_tool_result req_id text =
+  rpc_result req_id (jobj [jraw "content" (jarr [jobj [jstr "type" "text", jstr "text" text]])])
+
+rpc_tool_error req_id text =
+  rpc_result req_id (jobj [jraw "content" (jarr [jobj [jstr "type" "text", jstr "text" text]]), jraw "isError" "true"])
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Minimal JSON parsing (extract fields from JSON-RPC request)
+-- We use shell jq/perl for robust parsing
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Extract a string field from the JSON request file
+jq_str field =
+  trim (shell (cat ["cat /tmp/rail_mcp_req.json | perl -MJSON::PP -e '$j=decode_json(<STDIN>); print $j->{", q, field, q, "} // ", q, q, "'"]))
+
+-- Extract nested field like params.name
+jq_nested a b =
+  trim (shell (cat ["cat /tmp/rail_mcp_req.json | perl -MJSON::PP -e '$j=decode_json(<STDIN>); print $j->{", q, a, q, "}->{", q, b, q, "} // ", q, q, "'"]))
+
+-- Extract the request id (could be number or string)
+jq_id _ =
+  trim (shell "cat /tmp/rail_mcp_req.json | perl -MJSON::PP -e '$j=decode_json(<STDIN>); my $id=$j->{id}; if(defined $id){print ref($id)?encode_json($id):($id=~/^\\d+$/?$id:\"\\\"$id\\\"\")}else{print \"null\"}'")
+
+-- Extract params.arguments.code (the Rail source code for compile tool)
+jq_arg_code _ =
+  shell "cat /tmp/rail_mcp_req.json | perl -MJSON::PP -e '$j=decode_json(<STDIN>); print $j->{params}->{arguments}->{code} // \"\"'"
+
+-- Extract params.arguments.path
+jq_arg_path _ =
+  trim (shell "cat /tmp/rail_mcp_req.json | perl -MJSON::PP -e '$j=decode_json(<STDIN>); print $j->{params}->{arguments}->{path} // \"\"'")
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Tool: rail_compile
+-- Compile Rail code, optionally run the binary
+-- ══════════════════════════════════════════════════════════════════════════════
+
+tool_compile code =
+  let _ = write_file "/tmp/rail_mcp_src.rail" code
+  let _ = shell "rm -f /tmp/rail_mcp_compiled"
+  let compile_out = shell "cd ~/projects/rail && ./rail_native /tmp/rail_mcp_src.rail 2>&1 && cp /tmp/rail_out /tmp/rail_mcp_compiled 2>&1"
+  let compiled = trim (shell "test -f /tmp/rail_mcp_compiled && echo true || echo false")
+  if compiled == "true" then
+    let run_out = shell "timeout 5 /tmp/rail_mcp_compiled 2>&1 || true"
+    let run_exit = trim (shell "timeout 5 /tmp/rail_mcp_compiled > /tmp/rail_mcp_run_out.txt 2>&1; echo $?")
+    let output = trim (shell "cat /tmp/rail_mcp_run_out.txt 2>/dev/null")
+    let ran = if run_exit == "0" then "true" else "false"
+    let bin_size = trim (shell "stat -f%z /tmp/rail_mcp_compiled 2>/dev/null || echo 0")
+    let result = jobj [jbool "compiled" true, jstr "compiler_output" (trim compile_out), jraw "ran" ran, jstr "output" output, jstr "runtime_error" (if ran == "false" then trim run_out else ""), jstr "binary_size" bin_size]
+    result
+  else
+    jobj [jbool "compiled" false, jstr "compiler_output" (trim compile_out)]
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Tool: rail_test
+-- Run the test suite
+-- ══════════════════════════════════════════════════════════════════════════════
+
+tool_test _ =
+  let output = shell "cd ~/projects/rail && ./rail_native test 2>&1"
+  let lines = split "\n" output
+  let last = last_line lines
+  let passed = trim (shell "cd ~/projects/rail && ./rail_native test > /dev/null 2>&1 && echo true || echo false")
+  jobj [jraw "passed" passed, jstr "summary" last, jstr "full_output" (last_chars output 2000)]
+
+last_line xs =
+  if length xs == 0 then ""
+  else if length xs == 1 then head xs
+  else last_line (tail xs)
+
+last_chars s n =
+  let len = length s
+  if len <= n then s
+  else
+    let cs = chars s
+    join "" (drop_n cs (len - n))
+
+drop_n xs n =
+  if n <= 0 then xs
+  else if length xs == 0 then []
+  else drop_n (tail xs) (n - 1)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Tool: rail_bench
+-- Run the 30-task benchmark
+-- ══════════════════════════════════════════════════════════════════════════════
+
+tool_bench _ =
+  let output = shell "cd ~/projects/rail && ./rail_native run flywheel/bench.rail 2>&1"
+  let log = trim (shell "tail -3 ~/projects/rail/flywheel/bench_log.txt 2>/dev/null")
+  jobj [jstr "output" (last_chars output 2000), jstr "log" log]
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Tool: rail_self_train_status
+-- Check self-training progress
+-- ══════════════════════════════════════════════════════════════════════════════
+
+tool_self_train_status _ =
+  let progress = trim (shell "cat ~/projects/rail/training/self_train/progress.txt 2>/dev/null")
+  let log = trim (shell "tail -10 ~/projects/rail/training/self_train/log.txt 2>/dev/null")
+  let harvest_count = trim (shell "wc -l < ~/projects/rail/training/self_train/harvest.jsonl 2>/dev/null || echo 0")
+  jobj [jstr "progress" progress, jstr "recent_rounds" log, jstr "harvest_count" harvest_count]
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Tool: rail_fleet_status
+-- Check all fleet nodes
+-- ══════════════════════════════════════════════════════════════════════════════
+
+tool_fleet_status _ =
+  let mlx_out = trim (shell "curl -s -m 3 http://localhost:8080/v1/models 2>/dev/null | head -1")
+  let mlx_status = if length mlx_out > 0 then "up" else "down"
+  let st_pid = trim (shell "pgrep -f rail_st_bin 2>/dev/null || echo none")
+  let st_status = if st_pid == "none" then "stopped" else "running"
+  let razer_gpu = trim (shell "ssh -o ConnectTimeout=5 Detro@100.109.63.37 'nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null' 2>/dev/null || echo ''")
+  let razer_status = if length razer_gpu > 0 then "up" else "unreachable"
+  let razer_log = trim (shell "ssh -o ConnectTimeout=5 Detro@100.109.63.37 'tail -3 ~/rail_training/v6_train.log 2>/dev/null' 2>/dev/null || echo ''")
+  let mini = jobj [jstr "mlx_server" mlx_status, jstr "self_train" st_status]
+  let razer = if razer_status == "up" then
+    jobj [jstr "status" "up", jstr "gpu" razer_gpu, jstr "training_log" razer_log]
+  else
+    jobj [jstr "status" "unreachable"]
+  jobj [jraw "mini" mini, jraw "razer" razer]
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Tool: rail_data_stats
+-- Show training data statistics
+-- ══════════════════════════════════════════════════════════════════════════════
+
+count_lines path =
+  trim (shell (cat ["wc -l < ", path, " 2>/dev/null || echo 0"]))
+
+tool_data_stats _ =
+  let s1 = jstr "train.jsonl" (count_lines "~/projects/rail/training/train.jsonl")
+  let s2 = jstr "real_programs.jsonl" (count_lines "~/projects/rail/training/real_programs.jsonl")
+  let s3 = jstr "git_harvest.jsonl" (count_lines "~/projects/rail/training/git_harvest.jsonl")
+  let s4 = jstr "handcrafted_l2_l5.jsonl" (count_lines "~/projects/rail/training/handcrafted_l2_l5.jsonl")
+  let s5 = jstr "harvest.jsonl" (count_lines "~/projects/rail/training/self_train/harvest.jsonl")
+  let s6 = jstr "harvest_clean.jsonl" (count_lines "~/projects/rail/training/self_train/harvest_clean.jsonl")
+  let s7 = jstr "repairs.jsonl" (count_lines "~/projects/rail/training/self_train/repairs.jsonl")
+  let s8 = jstr "synthetic_repairs.jsonl" (count_lines "~/projects/rail/training/self_train/synthetic_repairs.jsonl")
+  let s9 = jstr "cloud_harvest.jsonl" (count_lines "~/projects/rail/training/self_train/cloud_harvest.jsonl")
+  let s10 = jstr "evolved.jsonl" (count_lines "~/projects/rail/training/self_train/evolved.jsonl")
+  let m1 = jstr "merged_train" (count_lines "/tmp/rail_flywheel_data/train.jsonl")
+  let m2 = jstr "merged_valid" (count_lines "/tmp/rail_flywheel_data/valid.jsonl")
+  let m3 = jstr "merged_test" (count_lines "/tmp/rail_flywheel_data/test.jsonl")
+  jobj [s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, m1, m2, m3]
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Tool: rail_run_file
+-- Compile and run a .rail file
+-- ══════════════════════════════════════════════════════════════════════════════
+
+tool_run_file path =
+  let output = shell (cat ["cd ~/projects/rail && ./rail_native run ", path, " 2>&1"])
+  let rc = trim (shell (cat ["cd ~/projects/rail && ./rail_native run ", path, " > /dev/null 2>&1 && echo 0 || echo 1"]))
+  let success = if rc == "0" then "true" else "false"
+  jobj [jraw "success" success, jstr "output" (last_chars (trim output) 2000)]
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Tool definitions (for tools/list response)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+tool_def name desc schema =
+  jobj [jstr "name" name, jstr "description" desc, jraw "inputSchema" schema]
+
+schema_empty = jobj [jstr "type" "object", jraw "properties" "{}"]
+
+schema_code = jobj [jstr "type" "object", jraw "properties" (jobj [jraw "code" (jobj [jstr "type" "string", jstr "description" "Rail source code to compile"])]), jraw "required" (jarr [cat [q, "code", q]])]
+
+schema_path = jobj [jstr "type" "object", jraw "properties" (jobj [jraw "path" (jobj [jstr "type" "string", jstr "description" "Path to .rail file (relative to repo root)"])]), jraw "required" (jarr [cat [q, "path", q]])]
+
+all_tools _ = jarr [
+  tool_def "rail_compile" "Compile Rail code and run the binary. Returns compile status, output, and binary size." schema_code,
+  tool_def "rail_test" "Run Rail's test suite. Returns pass/fail summary." schema_empty,
+  tool_def "rail_bench" "Run the 30-task benchmark across 6 difficulty bands." schema_empty,
+  tool_def "rail_self_train_status" "Check self-training progress: round, level, pass rates, harvest count." schema_empty,
+  tool_def "rail_fleet_status" "Check fleet status: Mini (MLX server, self-train), Razer (GPU, training)." schema_empty,
+  tool_def "rail_data_stats" "Show training data statistics across all JSONL sources." schema_empty,
+  tool_def "rail_run_file" "Compile and run a .rail file from the repo." schema_path
+  ]
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Request dispatch
+-- ══════════════════════════════════════════════════════════════════════════════
+
+handle_initialize req_id =
+  let caps = jobj [jraw "tools" "{}"]
+  let info = jobj [jstr "name" "rail-mcp", jstr "version" "1.0.0"]
+  rpc_result req_id (jobj [jstr "protocolVersion" "2024-11-05", jraw "capabilities" caps, jraw "serverInfo" info])
+
+handle_tools_list req_id =
+  rpc_result req_id (jobj [jraw "tools" (all_tools 0)])
+
+handle_tools_call req_id =
+  let tool_name = jq_nested "params" "name"
+  if tool_name == "rail_compile" then
+    let code = jq_arg_code 0
+    if length code == 0 then rpc_tool_error req_id "Missing 'code' argument"
+    else rpc_tool_result req_id (tool_compile code)
+  else if tool_name == "rail_test" then
+    rpc_tool_result req_id (tool_test 0)
+  else if tool_name == "rail_bench" then
+    rpc_tool_result req_id (tool_bench 0)
+  else if tool_name == "rail_self_train_status" then
+    rpc_tool_result req_id (tool_self_train_status 0)
+  else if tool_name == "rail_fleet_status" then
+    rpc_tool_result req_id (tool_fleet_status 0)
+  else if tool_name == "rail_data_stats" then
+    rpc_tool_result req_id (tool_data_stats 0)
+  else if tool_name == "rail_run_file" then
+    let path = jq_arg_path 0
+    if length path == 0 then rpc_tool_error req_id "Missing 'path' argument"
+    else rpc_tool_result req_id (tool_run_file path)
+  else
+    rpc_error req_id (0 - 32601) (cat ["Unknown tool: ", tool_name])
+
+handle_request method req_id =
+  if method == "initialize" then handle_initialize req_id
+  else if method == "notifications/initialized" then ""
+  else if method == "tools/list" then handle_tools_list req_id
+  else if method == "tools/call" then handle_tools_call req_id
+  else if method == "ping" then rpc_result req_id "{}"
+  else rpc_error req_id (0 - 32601) (cat ["Method not found: ", method])
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Main: read request from /tmp/rail_mcp_req.json, dispatch, print response
+-- ══════════════════════════════════════════════════════════════════════════════
+
+main =
+  let method = jq_str "method"
+  let req_id = jq_id 0
+  let response = handle_request method req_id
+  let _ = if length response > 0 then print response else 0
+  0
