@@ -6,20 +6,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64.
 
-- **Compiler source**: `tools/compile.rail` (~1,900 lines)
-- **Seed binary**: `rail_native` (~304K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
+- **Compiler source**: `tools/compile.rail` (~2,320 lines)
+- **Seed binary**: `rail_native` (~367K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
 - **Runtime**: C files in `runtime/` (gc.c, llm.c) linked into every compiled program
 - **GC**: Conservative mark-sweep garbage collector (`runtime/gc.c`). Scans ARM64 stack frames, marks reachable tagged objects, sweeps into free list. Triggered when 1GB arena bump-alloc fails. Programs can now allocate well beyond 1GB total.
 - **Allocator**: 1GB bump arena + GC free list + malloc fallback. `arena_mark`/`arena_reset` still work (clear free list on reset).
-- **Tests**: `./rail_native test` — 70 tests, should be 70/70. Stable since GC + 1GB allocator.
+- **Type checker**: Forward inference pass emits warnings (not errors) for: head/tail on non-list, arithmetic on non-numeric, wrong arity, calling non-functions.
+- **Package manager**: `import math` (bare imports), `rail get github.com/...`, `rail pkg` reads `rail.toml`.
+- **Tests**: `./rail_native test` — 75 tests, should be 75/75.
 
 ### Key Commands
 
 ```bash
-./rail_native test                    # run 70-test suite
+./rail_native test                    # run 75-test suite
 ./rail_native self                    # self-compile → /tmp/rail_self (must be byte-identical)
 ./rail_native run file.rail           # compile + execute
 ./rail_native file.rail               # compile only → /tmp/rail_out
+./rail_native get <package>           # install package (stdlib name or github.com/user/pkg)
+./rail_native pkg                     # install dependencies from rail.toml
 ```
 
 ### Rail Syntax Quick Reference
@@ -52,15 +56,20 @@ x |> f                                -- pipe operator (f x)
 
 - **`split` is single-character**: `split "abc" s` splits on `a`, `b`, and `c` individually
 - **Single lambdas in filter can segfault at runtime**: `filter (\x -> x > 3) list` compiles but crashes (runtime filter dispatch bug). Workaround: use named predicate functions.
-- **WASM backend**: compiles but segfaults at runtime (heap limit)
+- **WASM backend**: basic programs work (ints, strings, print, show, if/else, functions) via Python codegen bridge. Lists/closures unsupported.
 - **Exhaustiveness warnings**: Non-exhaustive `match` on ADT types emits a compiler warning (not error). Missing constructors are listed.
 
-### What's Fixed (v1.4.0)
+### What's Fixed (v1.5.0)
 
-- **Nested lambdas**: `\a -> \b -> a + b` compiles correctly. Flattened to multi-param closures. Direct application beta-reduced.
-- **Multi-capture closures**: Closures with 2+ captured variables now load all captures (up to 4).
-- **GC**: Conservative mark-sweep garbage collector. Programs can allocate well beyond 1GB total. The 65K char limit and 300-line program limit are eliminated.
-- **Exhaustiveness checking**: Compiler warns on non-exhaustive ADT pattern matches.
+- **Type inference**: Forward type checker warns on common type errors at compile time instead of runtime segfault.
+- **Bare imports**: `import math` resolves stdlib → ~/.rail/packages automatically.
+- **Package manager**: `rail get github.com/user/pkg` clones packages, `rail pkg` reads `rail.toml`.
+- **x86_64 backend**: Full codegen (1,033 lines) with parser, System V ABI, tagged pointers, ADTs, closures, 675-line runtime.
+- **WASM backend**: Bump allocator + string support — basic programs run under wasmtime.
+- **LSP server**: `tools/lsp_server.py` provides diagnostics, hover, go-to-def, completions for VS Code.
+- **Nested lambdas**: `\a -> \b -> a + b` compiles correctly (v1.4.0). Flattened to multi-param closures.
+- **GC**: Conservative mark-sweep garbage collector (v1.4.0). Programs can allocate well beyond 1GB total.
+- **Exhaustiveness checking**: Compiler warns on non-exhaustive ADT pattern matches (v1.4.0).
 
 ### Modifying the Compiler
 
@@ -70,7 +79,7 @@ After editing `tools/compile.rail`:
 3. `./rail_native self` — compile with new binary
 4. Compare: `diff /tmp/rail_self /tmp/rail_out` — must be empty (fixed point)
 5. If not identical, repeat step 2-4 until stable
-6. `./rail_native test` — verify 70/70
+6. `./rail_native test` — verify 75/75
 
 ## Flywheel (Self-Training System)
 
