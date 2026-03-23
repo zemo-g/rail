@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64.
 
-- **Compiler source**: `tools/compile.rail` (~2,320 lines)
-- **Seed binary**: `rail_native` (~367K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
+- **Compiler source**: `tools/compile.rail` (~2,428 lines)
+- **Seed binary**: `rail_native` (~389K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
+- **Error messages**: `file:line:col: error: message` — parse errors halt cleanly instead of segfaulting.
 - **Runtime**: C files in `runtime/` (gc.c, llm.c) linked into every compiled program
 - **GC**: Conservative mark-sweep garbage collector (`runtime/gc.c`). Scans ARM64 stack frames, marks reachable tagged objects, sweeps into free list. Triggered when 1GB arena bump-alloc fails. Programs can now allocate well beyond 1GB total.
 - **Allocator**: 1GB bump arena + GC free list + malloc fallback. `arena_mark`/`arena_reset` still work (clear free list on reset).
