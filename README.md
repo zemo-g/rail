@@ -14,7 +14,7 @@ Rail compiles itself. Then it teaches machines to write Rail.
 -- This is the entire bootstrap:
 ./rail_native self && cp /tmp/rail_self ./rail_native
 
--- 3,865 lines of Rail compile to a 646K ARM64 binary.
+-- 3,865 lines of Rail compile to a 631K ARM64 binary.
 -- That binary compiles the compiler again.
 -- The output is byte-identical. Fixed point.
 -- Zero C dependencies. GC in assembly. Everything is Rail.
@@ -261,7 +261,7 @@ Tail-recursive loops match C `-O2`: 5 instructions per iteration.
 | | Before | After |
 |---|--------|-------|
 | **Compiler** | 21,086 lines (Rust) | 3,865 lines (Rail) |
-| **Binary** | ~8MB (Rust + Cranelift) | 646K (pure ARM64) |
+| **Binary** | ~8MB (Rust + Cranelift) | 631K (pure ARM64) |
 | **Dependencies** | Cargo, Cranelift, Rayon | `as` + `ld` |
 | **Build time** | ~30s (cargo build) | ~5s (self-compile) |
 | **Tests** | 141 (Rust) | 92 (self-testing) |
