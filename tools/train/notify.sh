@@ -3,9 +3,9 @@
 # Usage: ./notify.sh "message"
 #        ./notify.sh monitor   — poll Razer training + self-train progress
 
-TOKEN="8393851683:AAH7X_AyUQoNiCMWvfNQI-W9vDqdxUN8amo"
-CHAT_ID="7737719797"
-FLEET_TOKEN="fleet-test-token-2026"
+TOKEN="${RAIL_TELEGRAM_TOKEN:?Set RAIL_TELEGRAM_TOKEN}"
+CHAT_ID="${RAIL_TELEGRAM_CHAT:?Set RAIL_TELEGRAM_CHAT}"
+FLEET_TOKEN="${RAIL_FLEET_TOKEN:-}"
 RAZER="100.109.63.37"
 PROGRESS="$HOME/projects/rail/training/self_train/progress.txt"
 STLOG="$HOME/projects/rail/training/self_train/log.txt"
