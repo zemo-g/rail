@@ -1,0 +1,501 @@
+-- wasm_backend.rail — WASM codegen backend for Rail
+--
+-- Called by: ./rail_native wasm <file.rail>
+-- Reads Rail source, compiles to WAT, writes /tmp/rail_out.wat
+-- Uses the Rail compiler's parser via ./rail_native (compile to ASM first,
+-- then this tool handles the WASM codegen).
+--
+-- Actually: this IS a standalone Rail program that includes its own lexer/parser
+-- (reuses the same approach as compile.rail). It reads Rail source and emits WAT.
+
+-- Import the compiler's tokenizer and parser by embedding them
+-- (This file is self-contained — no imports needed)
+
+-- ═══ INLINE TOKENIZER + PARSER ═══
+-- (Subset: enough to parse user programs, not the full compiler)
+
+trim s = head (split "\n" s)
+
+-- Parse integer from string
+parse_int_val s =
+  if str_sub s 0 1 == "-" then 0 - parse_uint (str_sub s 1 (length s - 1))
+  else parse_uint s
+
+parse_uint s = parse_uint_acc (chars s) 0
+
+parse_uint_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = cd (head cs)
+    if d < 0 then acc
+    else parse_uint_acc (tail cs) (acc * 10 + d)
+
+cd c =
+  if c == "0" then 0 else if c == "1" then 1 else if c == "2" then 2
+  else if c == "3" then 3 else if c == "4" then 4 else if c == "5" then 5
+  else if c == "6" then 6 else if c == "7" then 7 else if c == "8" then 8
+  else if c == "9" then 9 else 0 - 1
+
+whas item lst =
+  if length lst == 0 then false
+  else if head lst == item then true
+  else whas item (tail lst)
+
+wisd c = whas c ["0","1","2","3","4","5","6","7","8","9"]
+wisa c = whas c ["a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z","_","A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z"]
+wisan c = wisd c || wisa c
+
+-- Collect digits
+wcold cs =
+  if length cs == 0 then ("", [])
+  else if wisd (head cs) then
+    let (r, rest) = wcold (tail cs)
+    (join "" [head cs, r], rest)
+  else ("", cs)
+
+-- Collect ident
+wcoli cs =
+  if length cs == 0 then ("", [])
+  else if wisan (head cs) then
+    let (r, rest) = wcoli (tail cs)
+    (join "" [head cs, r], rest)
+  else ("", cs)
+
+-- Collect string contents
+wlxstr cs acc =
+  if length cs == 0 then (acc, [])
+  else if head cs == "\"" then (acc, tail cs)
+  else if head cs == "\\" then
+    if length (tail cs) > 0 then
+      let nx = head (tail cs)
+      let e = if nx == "n" then "\n" else if nx == "t" then "\t" else if nx == "\\" then "\\" else if nx == "\"" then "\"" else nx
+      wlxstr (tail (tail cs)) (join "" [acc, e])
+    else (acc, [])
+  else wlxstr (tail cs) (join "" [acc, head cs])
+
+-- Skip to newline (comment)
+wskip cs =
+  if length cs == 0 then []
+  else if head cs == "\n" then cs
+  else wskip (tail cs)
+
+-- Tokenize
+wtok cs acc =
+  if length cs == 0 then reverse (cons ("eof", "") acc)
+  else
+    let c = head cs
+    let r = tail cs
+    if c == " " || c == "\t" || c == "\r" then wtok r acc
+    else if c == "\n" then wtok r (cons ("nl", "") acc)
+    else if c == "-" then
+      if length r > 0 then
+        if head r == "-" then wtok (wskip (tail r)) acc
+        else wtok r (cons ("op", "-") acc)
+      else wtok r (cons ("op", "-") acc)
+    else if c == "+" then wtok r (cons ("op", "+") acc)
+    else if c == "*" then wtok r (cons ("op", "*") acc)
+    else if c == "/" then wtok r (cons ("op", "/") acc)
+    else if c == "%" then wtok r (cons ("op", "%") acc)
+    else if c == "(" then wtok r (cons ("lp", "") acc)
+    else if c == ")" then wtok r (cons ("rp", "") acc)
+    else if c == "[" then wtok r (cons ("lb", "") acc)
+    else if c == "]" then wtok r (cons ("rb", "") acc)
+    else if c == "," then wtok r (cons ("cm", "") acc)
+    else if c == "=" then
+      if length r > 0 then
+        if head r == "=" then wtok (tail r) (cons ("op", "==") acc)
+        else wtok r (cons ("eq", "") acc)
+      else wtok r (cons ("eq", "") acc)
+    else if c == "!" then
+      if length r > 0 then
+        if head r == "=" then wtok (tail r) (cons ("op", "!=") acc)
+        else wtok r acc
+      else wtok r acc
+    else if c == "<" then
+      if length r > 0 then
+        if head r == "=" then wtok (tail r) (cons ("op", "<=") acc)
+        else wtok r (cons ("op", "<") acc)
+      else wtok r (cons ("op", "<") acc)
+    else if c == ">" then
+      if length r > 0 then
+        if head r == "=" then wtok (tail r) (cons ("op", ">=") acc)
+        else wtok r (cons ("op", ">") acc)
+      else wtok r (cons ("op", ">") acc)
+    else if c == "\"" then
+      let (s, af) = wlxstr r ""
+      wtok af (cons ("str", s) acc)
+    else if wisd c then
+      let (n, af) = wcold cs
+      wtok af (cons ("num", n) acc)
+    else if wisa c then
+      let (w, af) = wcoli cs
+      let tp = if w == "let" || w == "if" || w == "then" || w == "else" || w == "true" || w == "false" || w == "foreign" || w == "type" || w == "match" then "kw" else "id"
+      wtok af (cons (tp, w) acc)
+    else wtok r acc
+
+wtokenize src = wtok (chars src) []
+
+-- ═══ SIMPLE PARSER ═══
+-- Parses: functions, let, if/else, arithmetic, calls, strings, ints
+
+wskipnl ts =
+  if length ts == 0 then ts
+  else if head (head ts) == "nl" then wskipnl (tail ts)
+  else ts
+
+wpe ts = wpe_if (wskipnl ts)
+
+wpe_if ts =
+  let t = head ts
+  if head t == "kw" && head (tail t) == "if" then
+    let (cond, ts2) = wpe (tail ts)
+    let ts3 = wskipnl ts2
+    let ts4 = if head (head ts3) == "kw" && head (tail (head ts3)) == "then" then tail ts3 else ts3
+    let (thn, ts5) = wpe ts4
+    let ts6 = wskipnl ts5
+    let ts7 = if head (head ts6) == "kw" && head (tail (head ts6)) == "else" then tail ts6 else ts6
+    let (els, ts8) = wpe ts7
+    (["?", cond, thn, els], ts8)
+  else if head t == "kw" && head (tail t) == "let" then wpe_let (tail ts)
+  else wpe_cmp ts
+
+wpe_let ts =
+  let ts2 = wskipnl ts
+  let nm = head (tail (head ts2))
+  let ts3 = wskipnl (tail ts2)
+  let ts4 = if head (head ts3) == "eq" then tail ts3 else ts3
+  let (val, ts5) = wpe ts4
+  let (body, ts6) = wpe ts5
+  (["D", nm, val, body], ts6)
+
+wpe_cmp ts =
+  let (l, ts2) = wpe_add ts
+  let ts3 = wskipnl ts2
+  let t = head ts3
+  if head t == "op" then
+    let op = head (tail t)
+    if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" then
+      let (r, ts4) = wpe_add (tail ts3)
+      (["O", op, l, r], ts4)
+    else (l, ts3)
+  else (l, ts3)
+
+wpe_add ts =
+  let (l, ts2) = wpe_mul ts
+  wpe_add_rest l ts2
+
+wpe_add_rest l ts =
+  let ts2 = wskipnl ts
+  let t = head ts2
+  if head t == "op" then
+    let op = head (tail t)
+    if op == "+" || op == "-" then
+      let (r, ts3) = wpe_mul (tail ts2)
+      wpe_add_rest ["O", op, l, r] ts3
+    else (l, ts2)
+  else (l, ts2)
+
+wpe_mul ts =
+  let (l, ts2) = wpe_atom ts
+  wpe_mul_rest l ts2
+
+wpe_mul_rest l ts =
+  let ts2 = wskipnl ts
+  let t = head ts2
+  if head t == "op" then
+    let op = head (tail t)
+    if op == "*" || op == "/" || op == "%" then
+      let (r, ts3) = wpe_atom (tail ts2)
+      wpe_mul_rest ["O", op, l, r] ts3
+    else (l, ts2)
+  else (l, ts2)
+
+wpe_atom ts =
+  let ts2 = wskipnl ts
+  let t = head ts2
+  if head t == "num" then (["I", head (tail t)], tail ts2)
+  else if head t == "str" then (["S", head (tail t)], tail ts2)
+  else if head t == "kw" && head (tail t) == "true" then (["B", "true"], tail ts2)
+  else if head t == "kw" && head (tail t) == "false" then (["B", "false"], tail ts2)
+  else if head t == "lp" then
+    let (e, ts3) = wpe (tail ts2)
+    let ts4 = wskipnl ts3
+    let ts5 = if head (head ts4) == "rp" then tail ts4 else ts4
+    (e, ts5)
+  else if head t == "id" then
+    let nm = head (tail t)
+    wpe_call nm (tail ts2)
+  else (["I", "0"], tail ts2)
+
+wpe_call nm ts =
+  let ts2 = wskipnl ts
+  let t = head ts2
+  if head t == "num" || head t == "str" || head t == "id" || head t == "lp" || (head t == "kw" && (head (tail t) == "true" || head (tail t) == "false")) then
+    let (arg, ts3) = wpe_atom ts2
+    wpe_call_more ["A", ["V", nm], arg] ts3
+  else (["V", nm], ts2)
+
+wpe_call_more node ts =
+  let ts2 = wskipnl ts
+  let t = head ts2
+  if head t == "num" || head t == "str" || head t == "id" || head t == "lp" || (head t == "kw" && (head (tail t) == "true" || head (tail t) == "false")) then
+    let (arg, ts3) = wpe_atom ts2
+    wpe_call_more ["A", node, arg] ts3
+  else (node, ts2)
+
+-- Parse function: name params = body
+wpfun ts =
+  let ts2 = wskipnl ts
+  let nm = head (tail (head ts2))
+  let (ps, ts3) = wcolp (tail ts2)
+  let ts4 = wskipnl ts3
+  let ts5 = if head (head ts4) == "eq" then tail ts4 else ts4
+  let (body, ts6) = wpe ts5
+  (["FN", nm, ps, body], ts6)
+
+wcolp ts =
+  let ts2 = wskipnl ts
+  if head (head ts2) == "id" then
+    let nm = head (tail (head ts2))
+    let (rest, ts3) = wcolp (tail ts2)
+    (cons nm rest, ts3)
+  else ([], ts2)
+
+-- Parse program
+wpprog ts =
+  let ts2 = wskipnl ts
+  if length ts2 == 0 then []
+  else if head (head ts2) == "eof" then []
+  else if head (head ts2) == "kw" && head (tail (head ts2)) == "foreign" then wpprog (wskip_to_nl ts2)
+  else if head (head ts2) == "kw" && head (tail (head ts2)) == "type" then wpprog (wskip_to_nl ts2)
+  else
+    let (d, ts3) = wpfun ts2
+    cons d (wpprog ts3)
+
+wskip_to_nl ts =
+  if length ts == 0 then ts
+  else if head (head ts) == "nl" then tail ts
+  else if head (head ts) == "eof" then ts
+  else wskip_to_nl (tail ts)
+
+-- ═══ WASM CODEGEN ═══
+
+wefind n env =
+  if length env == 0 then 0 - 1
+  else
+    let (k, v) = head env
+    if k == n then v
+    else wefind n (tail env)
+
+wflat node =
+  if head node == "A" then
+    let (nm, a2) = wflat (head (tail node))
+    (nm, append a2 [head (tail (tail node))])
+  else if head node == "V" then (head (tail node), [])
+  else ("_expr", [])
+
+wcg node env strtab =
+  let tg = head node
+  if tg == "I" then
+    let v = parse_int_val (head (tail node))
+    cat ["    i64.const ", show (v * 2 + 1), "\n"]
+  else if tg == "S" then
+    let s = head (tail node)
+    let offset = wstr_find s strtab
+    cat ["    i64.const ", show (offset * 2), "\n"]
+  else if tg == "B" then
+    if head (tail node) == "true" then "    i64.const 3\n" else "    i64.const 1\n"
+  else if tg == "V" then
+    let nm = head (tail node)
+    if wefind nm env >= 0 then cat ["    local.get $", nm, "\n"]
+    else "    i64.const 1\n"
+  else if tg == "O" then
+    let op = head (tail node)
+    let u = "    i64.const 1\n    i64.shr_s\n"
+    let r = "    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"
+    cat [wcg (head (tail (tail node))) env strtab, u, wcg (head (tail (tail (tail node)))) env strtab, u, wop op, r]
+  else if tg == "?" then
+    cat [wcg (head (tail node)) env strtab, "    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    if (result i64)\n", wcg (head (tail (tail node))) env strtab, "    else\n", wcg (head (tail (tail (tail node)))) env strtab, "    end\n"]
+  else if tg == "D" then
+    let nm = head (tail node)
+    let val_code = wcg (head (tail (tail node))) env strtab
+    let body_env = cons (nm, length env) env
+    let body_code = wcg (head (tail (tail (tail node)))) body_env strtab
+    cat [val_code, "    local.set $", nm, "\n", body_code]
+  else if tg == "A" then
+    let (fname, fargs) = wflat node
+    if fname == "print" then
+      cat [wcg (head fargs) env strtab, "    call $__rail_print\n    i64.const 1\n"]
+    else if fname == "show" then
+      wcg (head fargs) env strtab
+    else
+      cat [wcg_args fargs env strtab, "    call $", fname, "\n"]
+  else "    i64.const 1\n"
+
+wcg_args fargs env strtab =
+  if length fargs == 0 then ""
+  else cat [wcg (head fargs) env strtab, wcg_args (tail fargs) env strtab]
+
+wop op =
+  if op == "+" then "    i64.add\n"
+  else if op == "-" then "    i64.sub\n"
+  else if op == "*" then "    i64.mul\n"
+  else if op == "/" then "    i64.div_s\n"
+  else if op == "%" then "    i64.rem_s\n"
+  else if op == "==" then "    i64.eq\n    i64.extend_i32_u\n"
+  else if op == "!=" then "    i64.ne\n    i64.extend_i32_u\n"
+  else if op == "<" then "    i64.lt_s\n    i64.extend_i32_u\n"
+  else if op == ">" then "    i64.gt_s\n    i64.extend_i32_u\n"
+  else if op == "<=" then "    i64.le_s\n    i64.extend_i32_u\n"
+  else if op == ">=" then "    i64.ge_s\n    i64.extend_i32_u\n"
+  else "    i64.add\n"
+
+-- Collect local declarations
+wlocs node =
+  let tg = head node
+  if tg == "D" then cons (head (tail node)) (append (wlocs (head (tail (tail node)))) (wlocs (head (tail (tail (tail node))))))
+  else if tg == "?" then append (wlocs (head (tail node))) (append (wlocs (head (tail (tail node)))) (wlocs (head (tail (tail (tail node))))))
+  else if tg == "O" then append (wlocs (head (tail (tail node)))) (wlocs (head (tail (tail (tail node)))))
+  else if tg == "A" then wlocs_l (tail node)
+  else []
+
+wlocs_l ns =
+  if length ns == 0 then []
+  else append (wlocs (head ns)) (wlocs_l (tail ns))
+
+wuniq lst =
+  if length lst == 0 then []
+  else
+    let h = head lst
+    let rest = wuniq (tail lst)
+    if whas h rest then rest else cons h rest
+
+-- Compile one function
+wcfunc d strtab =
+  let nm = head (tail d)
+  let ps = head (tail (tail d))
+  let bd = head (tail (tail (tail d)))
+  let params = wmkparams ps
+  let env = wmkenv ps 0
+  let locals = wuniq (wlocs bd)
+  let real = wfilter locals ps
+  let ld = wmklocals real
+  let body = wcg bd env strtab
+  cat ["  (func $", nm, " ", params, " (result i64)\n", ld, body, "  )\n\n"]
+
+wmkparams ps =
+  if length ps == 0 then ""
+  else join " " (wmkparams_l ps)
+
+wmkparams_l ps =
+  if length ps == 0 then []
+  else cons (cat ["(param $", head ps, " i64)"]) (wmkparams_l (tail ps))
+
+wmklocals ls =
+  if length ls == 0 then ""
+  else join "" (wmklocals_l ls)
+
+wmklocals_l ls =
+  if length ls == 0 then []
+  else cons (cat ["    (local $", head ls, " i64)\n"]) (wmklocals_l (tail ls))
+
+wmkenv ps idx =
+  if length ps == 0 then []
+  else cons (head ps, idx) (wmkenv (tail ps) (idx + 1))
+
+wfilter lst exclude =
+  if length lst == 0 then []
+  else if whas (head lst) exclude then wfilter (tail lst) exclude
+  else cons (head lst) (wfilter (tail lst) exclude)
+
+-- Compile all functions
+wcfuncs decls strtab =
+  if length decls == 0 then ""
+  else
+    let tg = head (head decls)
+    if tg == "E" || tg == "TY" then wcfuncs (tail decls) strtab
+    else cat [wcfunc (head decls) strtab, wcfuncs (tail decls) strtab]
+
+-- ═══ STRING TABLE ═══
+
+wcollect node =
+  let tg = head node
+  if tg == "S" then [head (tail node)]
+  else if tg == "O" then append (wcollect (head (tail (tail node)))) (wcollect (head (tail (tail (tail node)))))
+  else if tg == "?" then append (wcollect (head (tail node))) (append (wcollect (head (tail (tail node)))) (wcollect (head (tail (tail (tail node))))))
+  else if tg == "D" then append (wcollect (head (tail (tail node)))) (wcollect (head (tail (tail (tail node)))))
+  else if tg == "A" then wcollect_l (tail node)
+  else []
+
+wcollect_l ns =
+  if length ns == 0 then []
+  else append (wcollect (head ns)) (wcollect_l (tail ns))
+
+wcollect_all decls =
+  if length decls == 0 then []
+  else
+    let tg = head (head decls)
+    if tg == "E" || tg == "TY" then wcollect_all (tail decls)
+    else wuniq (append (wcollect (head (tail (tail (tail (head decls)))))) (wcollect_all (tail decls)))
+
+wbuild strs offset =
+  if length strs == 0 then []
+  else
+    let s = head strs
+    cons (s, offset) (wbuild (tail strs) (offset + 4 + length s))
+
+wstr_find s tbl =
+  if length tbl == 0 then 0
+  else
+    let (k, v) = head tbl
+    if k == s then v
+    else wstr_find s (tail tbl)
+
+-- Hex encoding for data segments
+whex n =
+  if n < 10 then show n
+  else if n == 10 then "a" else if n == 11 then "b" else if n == 12 then "c" else if n == 13 then "d" else if n == 14 then "e" else "f"
+
+whex2 n = join "" [whex (n / 16), whex (n % 16)]
+
+-- Get char code via shell (simpler than inline table)
+wcharcode c = parse_int_val (trim (shell (cat ["printf '%d' \"'", c, "\""])))
+
+wesc_str s = wesc_chars (chars s)
+
+wesc_chars cs =
+  if length cs == 0 then ""
+  else
+    let code = wcharcode (head cs)
+    cat ["\\", whex2 code, wesc_chars (tail cs)]
+
+wgen_data tbl =
+  if length tbl == 0 then ""
+  else
+    let (s, offset) = head tbl
+    let slen = length s
+    cat ["  (data (i32.const ", show offset, ") \"\\", whex2 (slen % 256), "\\", whex2 ((slen / 256) % 256), "\\00\\00", wesc_str s, "\")\n", wgen_data (tail tbl)]
+
+-- ═══ MAIN ═══
+
+main =
+  let argv = args
+  if length argv < 2 then
+    let _ = print "Usage: wasm_backend <file.rail>"
+    1
+  else
+    let path = head (tail argv)
+    let src = read_file path
+    let toks = wtokenize src
+    let decls = wpprog toks
+    let all_strs = wcollect_all decls
+    let strtab = wbuild all_strs 256
+    let hdr = "(module\n  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))\n  (import \"wasi_snapshot_preview1\" \"proc_exit\" (func $proc_exit (param i32)))\n  (memory (export \"memory\") 2 1024)\n\n"
+    let rt = read_file "tools/wasm_runtime.wat"
+    let funcs = wcfuncs decls strtab
+    let start = "  (func $_start (export \"_start\")\n    call $main\n    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    call $proc_exit\n  )\n\n"
+    let str_data = wgen_data strtab
+    let wat = cat [hdr, rt, funcs, start, str_data, ")\n"]
+    let _ = write_file "/tmp/rail_out.wat" wat
+    let _ = print (cat ["  WAT: /tmp/rail_out.wat (", show (length wat), " bytes)"])
+    0
