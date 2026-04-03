@@ -6,8 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64, x86_64, and Linux ARM64.
 
-- **Compiler source**: `tools/compile.rail` (~3,865 lines)
-- **Seed binary**: `rail_native` (~646K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
+- **Compiler source**: `tools/compile.rail` (~4,050 lines)
+- **Seed binary**: `rail_native` (656K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
+- **Native floats (v2.0)**: unboxed IEEE 754 doubles in ARM64 d-registers. No heap allocation. `fadd`/`fmul`/`fdiv`/`fcmp` directly. Float arrays, foreign float calls (`sin`/`cos`/`tanh`/`sqrt`), auto int→float promotion.
+- **REPL**: `./rail_native run tools/repl.rail` — interactive, persistent definitions
+- **HTTP server**: `stdlib/http_server.rail` + `tools/http_demo.rail` — compile handler binary, serve via `tools/http_server.py`
 - **Error messages**: `file:line:col: error: message` — parse errors halt cleanly instead of segfaulting.
 - **Runtime**: Zero C dependencies. GC is ARM64 assembly embedded in the compiler. Only needs `as` + `ld`.
 - **GC**: Conservative mark-sweep garbage collector in ARM64 assembly. Scans stack frames, marks reachable tagged objects, sweeps into free list. Triggered when 256MB arena bump-alloc fails.
@@ -77,7 +80,9 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 - **Single lambdas in filter can segfault at runtime**: `filter (\x -> x > 3) list` compiles but crashes. Workaround: use named predicate functions.
 - **WASM backend**: basic programs work but segfaults at runtime on larger programs (heap limit).
 - **Exhaustiveness warnings**: Non-exhaustive `match` emits a warning (not error).
-- **No REPL**: Must write to file, compile, run.
+- **`read_line` zero-arg**: Use `read_line 0` (pass dummy arg) — zero-arg dispatch has a codegen quirk in the V-handler.
+- **Cross-function float return inference**: Works via `__fret_` markers, but `show(user_func(1.0))` won't auto-detect float return. Use `show_float` explicitly.
+- **Float self-loop TCO**: Deferred — `body_has_float` guard prevents int-TCO corruption but float-specific d8-d15 TCO not yet implemented.
 
 ### Performance Optimizations (in compile.rail)
 
@@ -90,6 +95,10 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 - **Constant folding**: `3 + 4` → `7` at compile time
 - **Type guard elimination**: Skip runtime type checks when operands are provably int
 - **Fused compare-and-branch**: Direct `cmp + b.cc` without intermediate booleans
+- **Native float arithmetic**: Float ops via `fadd`/`fmul` in d-registers, no heap boxing (~10x vs boxed)
+- **Float type inference**: `is_float` + `__float_` env markers propagate through let bindings
+- **Int→float auto-promotion**: Mixed int/float ops: `asr + scvtf` for int operand, `fmov` for float
+- **Cross-function float return**: `__fret_` markers in arity map for float-returning user functions
 
 ### Modifying the Compiler
 
