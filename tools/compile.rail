@@ -1001,7 +1001,12 @@ cg_bi3 fname args env ar lc sl tp fs =
     (cat [aa, "    fmov d0, x0\n    fabs d0, d0\n    fmov x0, d0\n"], lc1, sl1)
   else if fname == "error" then
     let (aa, lc1, sl1) = cg (head args) env ar lc sl false fs
-    (cat [aa, "    mov x1, x0\n    mov x0, #16\n    bl _rail_alloc\n    mov x2, #8\n    str x2, [x0]\n    str x1, [x0, #8]\n"], lc1, sl1)
+    -- error now calls _rail_raise: if handler installed, longjmp; else create error value
+    (cat [aa, "    bl _rail_raise\n"], lc1, sl1)
+  else if fname == "try" then
+    -- try body handler: body and handler are closures
+    let (pa, lc1, sl1) = cg_push_args args env ar lc sl fs
+    (cat [pa, cg_pop_regs (length args) 0, "    bl _rail_try\n"], lc1, sl1)
   else if fname == "is_error" then
     let (aa, lc1, sl1) = cg (head args) env ar lc sl false fs
     let elbl = cat [".Liserr_", show lc]
@@ -2211,7 +2216,17 @@ rt_float =
   let rfarrlen = "_rail_float_arr_len:\n    ldr x0, [x0]\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
   cat [rshowf, rprintf, rfarrnew, rfarrget, rfarrset, rfarrlen]
 
-runtime_asm = cat [rt_core, rt_list, rt_closure, rt_io, rt_args, rt_arith, rt_fiber, rt_thread, rt_array, rt_gpu, rt_string, rt_float, rt_gc_1, rt_gc_2, rt_gc_3, rt_gc_4]
+-- Effect handlers: try/catch with setjmp/longjmp
+-- Handler frame: malloc'd block [prev_handler(8), jmp_buf(25*8=200), error_val(8)]
+-- _rail_try: x0=body_closure, x1=handler_closure → result
+-- If body calls error, longjmp unwinds to handler
+rt_effects =
+  let rtry = "_rail_try:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    mov x0, #216\n    bl _malloc\n    str x0, [x29, #32]\n    adrp x1, _rail_handler_top@PAGE\n    add x1, x1, _rail_handler_top@PAGEOFF\n    ldr x2, [x1]\n    str x2, [x0]\n    str x0, [x1]\n    add x0, x0, #8\n    bl _setjmp\n    cbnz x0, .Ltry_caught\n    ldr x0, [x29, #16]\n    ldr x5, [x0, #8]\n    mov x0, #1\n    blr x5\n    str x0, [x29, #40]\n    ldr x0, [x29, #32]\n    ldr x1, [x0]\n    adrp x2, _rail_handler_top@PAGE\n    add x2, x2, _rail_handler_top@PAGEOFF\n    str x1, [x2]\n    ldr x0, [x29, #32]\n    bl _free\n    ldr x0, [x29, #40]\n    ldp x29, x30, [sp], #64\n    ret\n.Ltry_caught:\n    ldr x0, [x29, #32]\n    ldr x3, [x0, #208]\n    str x3, [x29, #48]\n    ldr x1, [x0]\n    adrp x2, _rail_handler_top@PAGE\n    add x2, x2, _rail_handler_top@PAGEOFF\n    str x1, [x2]\n    ldr x0, [x29, #32]\n    bl _free\n    ldr x0, [x29, #24]\n    ldr x5, [x0, #8]\n    ldr x1, [x0, #16]\n    cmp x1, #0\n    b.eq .Ltry_nocap\n    ldr x2, [x0, #24]\n    ldr x0, [x29, #48]\n    blr x5\n    ldp x29, x30, [sp], #64\n    ret\n.Ltry_nocap:\n    ldr x0, [x29, #48]\n    blr x5\n    ldp x29, x30, [sp], #64\n    ret\n\n"
+  -- _rail_raise: x0=error_msg_string → noreturn (longjmp to handler)
+  let rraise = "_rail_raise:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x0, [x29, #16]\n    adrp x1, _rail_handler_top@PAGE\n    add x1, x1, _rail_handler_top@PAGEOFF\n    ldr x2, [x1]\n    cbz x2, .Lraise_nohandler\n    ldr x0, [x29, #16]\n    str x0, [x2, #208]\n    add x0, x2, #8\n    mov x1, #1\n    bl _longjmp\n.Lraise_nohandler:\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #8\n    str x1, [x0]\n    ldr x1, [x29, #16]\n    str x1, [x0, #8]\n    ldp x29, x30, [sp], #32\n    ret\n\n"
+  cat [rtry, rraise]
+
+runtime_asm = cat [rt_core, rt_list, rt_closure, rt_io, rt_args, rt_arith, rt_fiber, rt_thread, rt_array, rt_gpu, rt_string, rt_float, rt_effects, rt_gc_1, rt_gc_2, rt_gc_3, rt_gc_4]
 
 -- Check if variable name appears in AST node
 uses_var node name =
@@ -2766,7 +2781,7 @@ compile_checked decls =
   let hdr = ".section __TEXT,__text\n.global _main\n.p2align 2\n\n"
   let (funcs, _) = compile_funcs decls ar 0
   let rt = runtime_asm
-  let data = "\n.section __DATA,__data\n_fmt_int:\n    .byte 37, 108, 100, 10, 0\n_fmt_str:\n    .byte 37, 115, 10, 0\n_fmt_ld:\n    .byte 37, 108, 100, 0\n_fmt_g:\n    .asciz \"%g\\n\"\n_fmt_gbare:\n    .asciz \"%.15g\"\n.p2align 3\n_rail_empty_str:\n    .byte 0\n_mode_w:\n    .asciz \"w\"\n_mode_r:\n    .asciz \"r\"\n.p2align 3\n_rail_nil:\n    .quad 2\n.p2align 3\n.global _rail_heap_ptr\n_rail_heap_ptr:\n    .quad _rail_heap\n.p2align 3\n.global _rail_heap_end\n_rail_heap_end:\n    .quad _rail_heap + 1073741824\n.p2align 3\n_rail_argc:\n    .quad 0\n_rail_argv:\n    .quad 0\n.global _rail_heap\n.zerofill __DATA,__bss,_rail_heap,1073741824,3\n"
+  let data = "\n.section __DATA,__data\n_fmt_int:\n    .byte 37, 108, 100, 10, 0\n_fmt_str:\n    .byte 37, 115, 10, 0\n_fmt_ld:\n    .byte 37, 108, 100, 0\n_fmt_g:\n    .asciz \"%g\\n\"\n_fmt_gbare:\n    .asciz \"%.15g\"\n.p2align 3\n_rail_empty_str:\n    .byte 0\n_mode_w:\n    .asciz \"w\"\n_mode_r:\n    .asciz \"r\"\n.p2align 3\n_rail_nil:\n    .quad 2\n.p2align 3\n.global _rail_heap_ptr\n_rail_heap_ptr:\n    .quad _rail_heap\n.p2align 3\n.global _rail_heap_end\n_rail_heap_end:\n    .quad _rail_heap + 1073741824\n.p2align 3\n_rail_argc:\n    .quad 0\n_rail_argv:\n    .quad 0\n.p2align 3\n_rail_handler_top:\n    .quad 0\n.global _rail_heap\n.zerofill __DATA,__bss,_rail_heap,1073741824,3\n"
   cat [hdr, funcs, rt, data]
 
 compile_program src =
@@ -2782,7 +2797,7 @@ compile_program src =
   let rt = runtime_asm
   -- Data section: format strings for printf/snprintf
   -- _fmt_int: "%ld\n"  _fmt_str: "%s\n"  _fmt_ld: "%ld"
-  let data = "\n.section __DATA,__data\n_fmt_int:\n    .byte 37, 108, 100, 10, 0\n_fmt_str:\n    .byte 37, 115, 10, 0\n_fmt_ld:\n    .byte 37, 108, 100, 0\n_fmt_g:\n    .asciz \"%g\\n\"\n_fmt_gbare:\n    .asciz \"%.15g\"\n.p2align 3\n_rail_empty_str:\n    .byte 0\n_mode_w:\n    .asciz \"w\"\n_mode_r:\n    .asciz \"r\"\n.p2align 3\n_rail_nil:\n    .quad 2\n.p2align 3\n.global _rail_heap_ptr\n_rail_heap_ptr:\n    .quad _rail_heap\n.p2align 3\n.global _rail_heap_end\n_rail_heap_end:\n    .quad _rail_heap + 1073741824\n.p2align 3\n_rail_argc:\n    .quad 0\n_rail_argv:\n    .quad 0\n.global _rail_heap\n.zerofill __DATA,__bss,_rail_heap,1073741824,3\n"
+  let data = "\n.section __DATA,__data\n_fmt_int:\n    .byte 37, 108, 100, 10, 0\n_fmt_str:\n    .byte 37, 115, 10, 0\n_fmt_ld:\n    .byte 37, 108, 100, 0\n_fmt_g:\n    .asciz \"%g\\n\"\n_fmt_gbare:\n    .asciz \"%.15g\"\n.p2align 3\n_rail_empty_str:\n    .byte 0\n_mode_w:\n    .asciz \"w\"\n_mode_r:\n    .asciz \"r\"\n.p2align 3\n_rail_nil:\n    .quad 2\n.p2align 3\n.global _rail_heap_ptr\n_rail_heap_ptr:\n    .quad _rail_heap\n.p2align 3\n.global _rail_heap_end\n_rail_heap_end:\n    .quad _rail_heap + 1073741824\n.p2align 3\n_rail_argc:\n    .quad 0\n_rail_argv:\n    .quad 0\n.p2align 3\n_rail_handler_top:\n    .quad 0\n.global _rail_heap\n.zerofill __DATA,__bss,_rail_heap,1073741824,3\n"
   cat [hdr, funcs, rt, data]
 
 -- BUILD: assemble + link
