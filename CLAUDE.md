@@ -6,15 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64, x86_64, and Linux ARM64.
 
-- **Compiler source**: `tools/compile.rail` (~4,050 lines)
-- **Seed binary**: `rail_native` (656K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
+- **Compiler source**: `tools/compile.rail` (~4,200 lines, 335 functions)
+- **Seed binary**: `rail_native` (686K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
 - **Native floats (v2.0)**: unboxed IEEE 754 doubles in ARM64 d-registers. No heap allocation. `fadd`/`fmul`/`fdiv`/`fcmp` directly. Float arrays, foreign float calls (`sin`/`cos`/`tanh`/`sqrt`), auto int→float promotion.
 - **REPL**: `./rail_native run tools/repl.rail` — interactive, persistent definitions
 - **HTTP server**: `stdlib/http_server.rail` + `tools/http_demo.rail` — compile handler binary, serve via `tools/http_server.py`
 - **Error messages**: `file:line:col: error: message` — parse errors halt cleanly instead of segfaulting.
 - **Runtime**: Zero C dependencies. GC is ARM64 assembly embedded in the compiler. Only needs `as` + `ld`.
 - **GC**: Conservative mark-sweep garbage collector in ARM64 assembly. Scans stack frames, marks reachable tagged objects, sweeps into free list. Triggered when 256MB arena bump-alloc fails.
-- **Allocator**: 256MB bump arena + GC free list + malloc fallback. `arena_mark`/`arena_reset` still work.
+- **Allocator**: 1GB bump arena + GC free list + malloc fallback. 256MB thread stack. `arena_mark`/`arena_reset` still work.
+- **Effect handlers**: `try body handler` — setjmp/longjmp non-local error recovery. Deep unwinding, nested handlers.
 - **Type checker**: Forward inference pass emits warnings (not errors) for: head/tail on non-list, arithmetic on non-numeric, wrong arity, calling non-functions.
 - **Package manager**: `import math` (bare imports), `rail get github.com/...`, `rail pkg` reads `rail.toml`.
 - **Tests**: `./rail_native test` — 92 tests, should be 92/92.
