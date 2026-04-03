@@ -4,25 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Rail Compiler
 
-Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64.
+Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64, x86_64, and Linux ARM64.
 
-- **Compiler source**: `tools/compile.rail` (~2,428 lines)
-- **Seed binary**: `rail_native` (~389K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
+- **Compiler source**: `tools/compile.rail` (~3,865 lines)
+- **Seed binary**: `rail_native` (~646K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
 - **Error messages**: `file:line:col: error: message` — parse errors halt cleanly instead of segfaulting.
-- **Runtime**: C files in `runtime/` (gc.c, llm.c) linked into every compiled program
-- **GC**: Conservative mark-sweep garbage collector (`runtime/gc.c`). Scans ARM64 stack frames, marks reachable tagged objects, sweeps into free list. Triggered when 1GB arena bump-alloc fails. Programs can now allocate well beyond 1GB total.
-- **Allocator**: 1GB bump arena + GC free list + malloc fallback. `arena_mark`/`arena_reset` still work (clear free list on reset).
+- **Runtime**: Zero C dependencies. GC is ARM64 assembly embedded in the compiler. Only needs `as` + `ld`.
+- **GC**: Conservative mark-sweep garbage collector in ARM64 assembly. Scans stack frames, marks reachable tagged objects, sweeps into free list. Triggered when 256MB arena bump-alloc fails.
+- **Allocator**: 256MB bump arena + GC free list + malloc fallback. `arena_mark`/`arena_reset` still work.
 - **Type checker**: Forward inference pass emits warnings (not errors) for: head/tail on non-list, arithmetic on non-numeric, wrong arity, calling non-functions.
 - **Package manager**: `import math` (bare imports), `rail get github.com/...`, `rail pkg` reads `rail.toml`.
-- **Tests**: `./rail_native test` — 75 tests, should be 75/75.
+- **Tests**: `./rail_native test` — 92 tests, should be 92/92.
+- **Performance**: Tail-recursive loops match C -O2 (5 instructions/iteration). Self-loop optimization, untagged register params, bottom-test with `subs`.
+- **Targets**: macOS ARM64 (native), Linux ARM64 (Pi Zero), Linux x86_64 (Razer WSL)
 
 ### Key Commands
 
 ```bash
-./rail_native test                    # run 75-test suite
+./rail_native test                    # run 92-test suite
 ./rail_native self                    # self-compile → /tmp/rail_self (must be byte-identical)
 ./rail_native run file.rail           # compile + execute
 ./rail_native file.rail               # compile only → /tmp/rail_out
+./rail_native x86 file.rail           # compile to x86_64 Linux → /tmp/rail_x86.s
+./rail_native linux file.rail         # cross-compile to Linux ARM64 → /tmp/rail_linux
 ./rail_native get <package>           # install package (stdlib name or github.com/user/pkg)
 ./rail_native pkg                     # install dependencies from rail.toml
 ```
@@ -49,28 +53,43 @@ range N                               -- [0..N-1]
 write_file path content, read_file path
 let _ = shell "command"
 join sep list, split "c" str          -- split is per-character, NOT substring
+str_split ", " str                    -- multi-char split
+str_find "needle" "haystack"          -- returns index or -1
+str_contains "needle" "haystack"      -- returns bool
+str_replace "old" "new" str           -- replaces all occurrences
+str_sub str start len                 -- substring extraction
+read_line                             -- read line from stdin
 show n                                -- int to string
 x |> f                                -- pipe operator (f x)
+error "msg", is_error x, err_msg x   -- error handling
+arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 ```
+
+### Runtime Safety
+
+- `head []` returns 0 (not segfault). `head` on non-list returns 0.
+- `tail []` returns `[]`. `tail` on non-list returns `[]`.
+- Type errors on head/tail are graceful. Other type errors (arithmetic on strings, calling non-functions) may still segfault.
 
 ### Known Compiler Limitations
 
-- **`split` is single-character**: `split "abc" s` splits on `a`, `b`, and `c` individually
-- **Single lambdas in filter can segfault at runtime**: `filter (\x -> x > 3) list` compiles but crashes (runtime filter dispatch bug). Workaround: use named predicate functions.
-- **WASM backend**: basic programs work (ints, strings, print, show, if/else, functions) via Python codegen bridge. Lists/closures unsupported.
-- **Exhaustiveness warnings**: Non-exhaustive `match` on ADT types emits a compiler warning (not error). Missing constructors are listed.
+- **`split` is single-character**: `split "abc" s` splits on `a`, `b`, and `c` individually. Use `str_split` for multi-char delimiters.
+- **Single lambdas in filter can segfault at runtime**: `filter (\x -> x > 3) list` compiles but crashes. Workaround: use named predicate functions.
+- **WASM backend**: basic programs work but segfaults at runtime on larger programs (heap limit).
+- **Exhaustiveness warnings**: Non-exhaustive `match` emits a warning (not error).
+- **No REPL**: Must write to file, compile, run.
 
-### What's Fixed (v1.5.0)
+### Performance Optimizations (in compile.rail)
 
-- **Type inference**: Forward type checker warns on common type errors at compile time instead of runtime segfault.
-- **Bare imports**: `import math` resolves stdlib → ~/.rail/packages automatically.
-- **Package manager**: `rail get github.com/user/pkg` clones packages, `rail pkg` reads `rail.toml`.
-- **x86_64 backend**: Full codegen (1,033 lines) with parser, System V ABI, tagged pointers, ADTs, closures, 675-line runtime.
-- **WASM backend**: Bump allocator + string support — basic programs run under wasmtime.
-- **LSP server**: `tools/lsp_server.py` provides diagnostics, hover, go-to-def, completions for VS Code.
-- **Nested lambdas**: `\a -> \b -> a + b` compiles correctly (v1.4.0). Flattened to multi-param closures.
-- **GC**: Conservative mark-sweep garbage collector (v1.4.0). Programs can allocate well beyond 1GB total.
-- **Exhaustiveness checking**: Compiler warns on non-exhaustive ADT pattern matches (v1.4.0).
+- **Self-loop → bottom-test**: Tail-recursive self-calls become tight loops with `subs + b.gt`
+- **Untagged register params**: First 3 int params stored raw in x19/x20/x21, untagged on entry
+- **Direct register arithmetic**: Self-loop args computed with raw `add`/`sub`/`mul` on registers
+- **Dependency-aware write scheduling**: Minimizes temp registers in self-loop arg writes
+- **Auto-memoization**: Pure self-recursive single-arg int functions get transparent memo tables
+- **Per-function frame sizing**: Stack frames sized to actual need (not fixed 2048)
+- **Constant folding**: `3 + 4` → `7` at compile time
+- **Type guard elimination**: Skip runtime type checks when operands are provably int
+- **Fused compare-and-branch**: Direct `cmp + b.cc` without intermediate booleans
 
 ### Modifying the Compiler
 
@@ -78,9 +97,11 @@ After editing `tools/compile.rail`:
 1. `./rail_native self` — compile with old binary
 2. `cp /tmp/rail_self rail_native` — install new binary
 3. `./rail_native self` — compile with new binary
-4. Compare: `diff /tmp/rail_self /tmp/rail_out` — must be empty (fixed point)
+4. `diff rail_native /tmp/rail_self` — must be empty (fixed point)
 5. If not identical, repeat step 2-4 until stable
-6. `./rail_native test` — verify 75/75
+6. `./rail_native test` — verify 92/92
+
+**IMPORTANT**: If you change the runtime (`rt_core`, `rt_list`, `rt_string`, etc.), the old binary generates the old runtime. You must bootstrap: compile with old binary → install → compile again with new binary → verify fixed point.
 
 ## Flywheel (Self-Training System)
 
@@ -137,61 +158,20 @@ tail -20 /tmp/rail_training.log                       # recent round results
 ./tools/train/mlx_watchdog.sh
 ```
 
-### PEFT → MLX Adapter Conversion
-
-PEFT adapters from Razer need conversion for MLX serving:
-1. **Key prefix**: `base_model.model.model.layers.N` → `language_model.model.layers.N`
-2. **Key suffix**: `.lora_A.weight` → `.lora_a`, `.lora_B.weight` → `.lora_b`
-3. **Transpose**: all weight matrices need `.T`
-4. **Scale**: `lora_alpha / rank` (e.g., 16/8 = 2.0)
-
-### Adapters
-
-| Adapter | Model | Source | Status |
-|---------|-------|--------|--------|
-| `training/adapters_st/` | 9B | MLX-trained on Mini | Working but 9B crashes under load |
-| `training/adapters_4b_v4_mlx/` | 4B | PEFT→MLX converted | Deployed, stable |
-| `training/adapters_4b_v5_mlx/` | 4B | PEFT→MLX converted (v5, more data) | Current |
-| `training/adapters_4b_v5_cuda/` | 4B | Raw PEFT from Razer | For conversion |
-
-### Training Data Sources
-
-Merged by `dataset.rail` from `training/` and `training/self_train/`:
-- `harvest.jsonl` — compiler-verified examples from self-training
-- `repairs.jsonl` — compiler error → fix pairs
-- `train.jsonl` — handwritten examples
-- `real_programs.jsonl` — real Rail programs from the repo
-- `git_harvest.jsonl` — harvested from git history
-- Cloud-generated data is compiler-verified before inclusion (previous unverified cloud data was 78% poison — deleted)
-
-### Qwen3.5-4B Hybrid Architecture
-
-32 layers: 8 full self-attention + 24 Gated DeltaNet. LoRA must target both:
-- Self-attention: `q_proj, k_proj, v_proj, o_proj` (layers 3,7,11,15,19,23,27,31)
-- DeltaNet: `in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj` (all other layers)
-- MLP modules (`gate_proj, up_proj, down_proj`) cause PEFT to hang on 4-bit models — don't include
-
 ## Compute Fleet
 
 | Node | Role | Access |
 |------|------|--------|
 | Mac Mini M4 Pro (24GB) | Inference, compilation, orchestration | local |
 | Razer3070 (RTX 3070 8GB) | CUDA QLoRA training | `ssh Detro@100.109.63.37` (Tailscale) |
+| Pi Zero 2 W (416MB) | Fleet display, Rail execution | `ssh zemog@100.87.231.45` (Tailscale) |
 
-### Razer Operational Notes
+### Pi Zero Notes
 
-- **Windows + Git Bash SSH** — `/F` flags get mangled, use `cmd.exe /c` or dash-style args
-- **Tailscale requires user login** — after reboot, SSH won't connect until someone logs into Windows
-- **GPU memory leaks on OOM** — crashed CUDA processes leak VRAM permanently on WDDM. Only fix: reboot.
-- **Background processes**: `nohup ... &` can fail. Use wrapper scripts:
-  ```bash
-  ssh Razer 'cat > ~/script.sh << "EOF"
-  #!/bin/bash
-  cd ~/rail_training && python train_cuda.py ...
-  EOF
-  chmod +x ~/script.sh && nohup ~/script.sh &'
-  ```
-- **Training takes ~10h** for 3000 iters on 4B model
+- Rail compiler deployed at `~/rail_native` (532K static ELF)
+- Runtime libs at `~/tools/linux_libc.s`, `~/tools/linux_data.s`
+- Fleet display: `fleet-rail.service` (Rail binary, SPI LCD)
+- Cross-compile from Mini: `./rail_native linux tools/compile.rail && scp /tmp/rail_linux zemog@100.87.231.45:~/rail_native`
 
 ## Site Generation
 
