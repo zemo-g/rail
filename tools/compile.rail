@@ -2808,7 +2808,7 @@ build asm_text =
       0
     else 0
     let rt_objs = if has_llm != "0" then cat [" ", rtdir, "/llm.o /tmp/rail_llm_tramp.o"] else ""
-    let ld_cmd = cat ["ld -o /tmp/rail_out /tmp/rail_out.o", rt_objs, " -lSystem -syslibroot ", sdk, " -arch arm64 2>&1"]
+    let ld_cmd = cat ["ld -o /tmp/rail_out /tmp/rail_out.o", rt_objs, " -lSystem -syslibroot ", sdk, " -arch arm64 -stack_size 0x10000000 2>&1"]
     let ld_result = trim (shell ld_cmd)
     let _ = if ld_result != "" then print (cat ["  ld: ", ld_result]) else print "  ld: OK"
     let _ = shell "codesign -s - /tmp/rail_out 2>&1"
@@ -2994,7 +2994,7 @@ self_compile _ =
   let as_res = trim (shell "as -o /tmp/rail_self.o /tmp/rail_self.s 2>&1")
   let _ = if as_res != "" then print (cat ["  as: ", as_res]) else print "  as: OK"
   let rtdir2 = get_runtime_dir 0
-  let ld_res = trim (shell (cat ["ld -o /tmp/rail_self /tmp/rail_self.o -lSystem -syslibroot ", sdk, " -arch arm64 2>&1"]))
+  let ld_res = trim (shell (cat ["ld -o /tmp/rail_self /tmp/rail_self.o -lSystem -syslibroot ", sdk, " -arch arm64 -stack_size 0x10000000 2>&1"]))
   let _ = if ld_res != "" then print (cat ["  ld: ", ld_res]) else print "  ld: OK"
   let _ = shell "codesign -s - /tmp/rail_self 2>&1"
   let _ = print "  Binary: /tmp/rail_self"
@@ -3140,9 +3140,195 @@ compile_linux path =
 
 dispatch_wasm path =
   let _ = print (cat ["Compiling ", path, " to WASM..."])
-  let out = shell (cat ["bash tools/wasm_compile.sh ", path, " 2>&1"])
-  let _ = print out
-  0
+  let src = read_file path
+  let toks = tokenize src
+  let decls = pprog toks
+  let wat = wasm_program decls
+  let _ = write_file "/tmp/rail_out.wat" wat
+  let _ = print (cat ["  WAT: ", show (length wat), " bytes"])
+  let w2w = trim (shell "wat2wasm /tmp/rail_out.wat -o /tmp/rail_out.wasm 2>&1")
+  let _ = if w2w != "" then print (cat ["  wat2wasm: ", w2w]) else print "  wat2wasm: OK"
+  let wt = trim (shell "which wasmtime 2>/dev/null")
+  if length wt > 0 then
+    let r = shell "wasmtime /tmp/rail_out.wasm 2>&1"
+    let _ = print r
+    0
+  else
+    let _ = print "  Binary: /tmp/rail_out.wasm"
+    0
+
+wasm_program decls =
+  let strs = wasm_strs_all decls
+  let stab = wasm_stab strs 256
+  let hdr = "(module\n  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))\n  (import \"wasi_snapshot_preview1\" \"proc_exit\" (func $proc_exit (param i32)))\n  (memory (export \"memory\") 2 1024)\n\n"
+  let rt = read_file "tools/wasm_runtime.wat"
+  let fns = wasm_fns decls stab
+  let start = "  (func $_start (export \"_start\")\n    call $main\n    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    call $proc_exit\n  )\n\n"
+  let sd = wasm_sdata stab
+  cat [hdr, rt, fns, start, sd, ")\n"]
+
+wasm_fns decls stab =
+  if length decls == 0 then ""
+  else
+    let tg = head (head decls)
+    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_fns (tail decls) stab
+    else cat [wasm_fn (head decls) stab, wasm_fns (tail decls) stab]
+
+wasm_fn d stab =
+  let nm = head (tail d)
+  let ps = head (tail (tail d))
+  let bd = head (tail (tail (tail d)))
+  let pstr = if length ps == 0 then "" else join " " (wasm_plist ps)
+  let env = wasm_env ps 0
+  let locs = wasm_dedup (wasm_locs bd)
+  let rl = wasm_fltr locs ps
+  let ld = if length rl == 0 then "" else join "" (wasm_llist rl)
+  let body = wg bd env stab
+  cat ["  (func $", nm, " ", pstr, " (result i64)\n", ld, body, "  )\n\n"]
+
+wasm_plist ps =
+  if length ps == 0 then []
+  else cons (cat ["(param $", head ps, " i64)"]) (wasm_plist (tail ps))
+
+wasm_llist ls =
+  if length ls == 0 then []
+  else cons (cat ["    (local $", head ls, " i64)\n"]) (wasm_llist (tail ls))
+
+wasm_env ps i =
+  if length ps == 0 then []
+  else cons (head ps, i) (wasm_env (tail ps) (i + 1))
+
+wasm_locs node =
+  let tg = head node
+  if tg == "D" then cons (head (tail node)) (append (wasm_locs (head (tail (tail node)))) (wasm_locs (head (tail (tail (tail node))))))
+  else if tg == "TD" then append (head (tail node)) (append (wasm_locs (head (tail (tail node)))) (wasm_locs (head (tail (tail (tail node))))))
+  else if tg == "?" then append (wasm_locs (head (tail node))) (append (wasm_locs (head (tail (tail node)))) (wasm_locs (head (tail (tail (tail node))))))
+  else if tg == "O" then append (wasm_locs (head (tail (tail node)))) (wasm_locs (head (tail (tail (tail node)))))
+  else if tg == "A" then wasm_locs_l (tail node)
+  else []
+
+wasm_locs_l ns =
+  if length ns == 0 then []
+  else append (wasm_locs (head ns)) (wasm_locs_l (tail ns))
+
+wasm_has x ls =
+  if length ls == 0 then false
+  else if head ls == x then true
+  else wasm_has x (tail ls)
+
+wasm_dedup ls =
+  if length ls == 0 then []
+  else
+    let h = head ls
+    let r = wasm_dedup (tail ls)
+    if wasm_has h r then r else cons h r
+
+wasm_fltr ls ex =
+  if length ls == 0 then []
+  else if wasm_has (head ls) ex then wasm_fltr (tail ls) ex
+  else cons (head ls) (wasm_fltr (tail ls) ex)
+
+wasm_efind n env =
+  if length env == 0 then 0 - 1
+  else
+    let (k, v) = head env
+    if k == n then v
+    else wasm_efind n (tail env)
+
+wg node env stab =
+  let tg = head node
+  if tg == "I" then cat ["    i64.const ", show (str_to_int (head (tail node)) * 2 + 1), "\n"]
+  else if tg == "S" then cat ["    i64.const ", show (wasm_sfind (head (tail node)) stab * 2), "\n"]
+  else if tg == "B" then if head (tail node) == "true" then "    i64.const 3\n" else "    i64.const 1\n"
+  else if tg == "V" then
+    let nm = head (tail node)
+    if wasm_efind nm env >= 0 then cat ["    local.get $", nm, "\n"] else "    i64.const 1\n"
+  else if tg == "O" then
+    let op = head (tail node)
+    cat [wg (head (tail (tail node))) env stab, "    i64.const 1\n    i64.shr_s\n", wg (head (tail (tail (tail node)))) env stab, "    i64.const 1\n    i64.shr_s\n", wasm_op op, "    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"]
+  else if tg == "?" then
+    cat [wg (head (tail node)) env stab, "    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    if (result i64)\n", wg (head (tail (tail node))) env stab, "    else\n", wg (head (tail (tail (tail node)))) env stab, "    end\n"]
+  else if tg == "D" then
+    let nm = head (tail node)
+    cat [wg (head (tail (tail node))) env stab, "    local.set $", nm, "\n", wg (head (tail (tail (tail node)))) (cons (nm, length env) env) stab]
+  else if tg == "TD" then cat [wg (head (tail (tail node))) env stab, "    drop\n", wg (head (tail (tail (tail node)))) env stab]
+  else if tg == "A" then
+    let (fname, fargs) = flat node
+    if fname == "print" then cat [wg (head fargs) env stab, "    call $__rail_print\n    i64.const 1\n"]
+    else if fname == "show" then wg (head fargs) env stab
+    else cat [wg_args fargs env stab, "    call $", fname, "\n"]
+  else if tg == "NULL" then "    i64.const 0\n"
+  else "    i64.const 1\n"
+
+wg_args fa env stab =
+  if length fa == 0 then ""
+  else cat [wg (head fa) env stab, wg_args (tail fa) env stab]
+
+wasm_op op =
+  if op == "+" then "    i64.add\n" else if op == "-" then "    i64.sub\n"
+  else if op == "*" then "    i64.mul\n" else if op == "/" then "    i64.div_s\n"
+  else if op == "%" then "    i64.rem_s\n"
+  else if op == "==" then "    i64.eq\n    i64.extend_i32_u\n"
+  else if op == "!=" then "    i64.ne\n    i64.extend_i32_u\n"
+  else if op == "<" then "    i64.lt_s\n    i64.extend_i32_u\n"
+  else if op == ">" then "    i64.gt_s\n    i64.extend_i32_u\n"
+  else if op == "<=" then "    i64.le_s\n    i64.extend_i32_u\n"
+  else if op == ">=" then "    i64.ge_s\n    i64.extend_i32_u\n"
+  else "    i64.add\n"
+
+wasm_strs node =
+  let tg = head node
+  if tg == "S" then [head (tail node)]
+  else if tg == "O" then append (wasm_strs (head (tail (tail node)))) (wasm_strs (head (tail (tail (tail node)))))
+  else if tg == "?" then append (wasm_strs (head (tail node))) (append (wasm_strs (head (tail (tail node)))) (wasm_strs (head (tail (tail (tail node))))))
+  else if tg == "D" then append (wasm_strs (head (tail (tail node)))) (wasm_strs (head (tail (tail (tail node)))))
+  else if tg == "A" then wasm_strs_l (tail node)
+  else []
+
+wasm_strs_l ns =
+  if length ns == 0 then []
+  else append (wasm_strs (head ns)) (wasm_strs_l (tail ns))
+
+wasm_strs_all decls =
+  if length decls == 0 then []
+  else
+    let tg = head (head decls)
+    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_strs_all (tail decls)
+    else wasm_dedup (append (wasm_strs (head (tail (tail (tail (head decls)))))) (wasm_strs_all (tail decls)))
+
+wasm_stab strs off =
+  if length strs == 0 then []
+  else cons (head strs, off) (wasm_stab (tail strs) (off + 4 + length (head strs)))
+
+wasm_sfind s tbl =
+  if length tbl == 0 then 0
+  else
+    let (k, v) = head tbl
+    if k == s then v else wasm_sfind s (tail tbl)
+
+wasm_sdata tbl =
+  if length tbl == 0 then ""
+  else
+    let (s, off) = head tbl
+    let slen = length s
+    cat ["  (data (i32.const ", show off, ") \"\\", wasm_h2 (slen % 256), "\\", wasm_h2 ((slen / 256) % 256), "\\00\\00", wasm_esc s, "\")\n", wasm_sdata (tail tbl)]
+
+wasm_hd n =
+  if n < 10 then show n
+  else if n == 10 then "a" else if n == 11 then "b" else if n == 12 then "c" else if n == 13 then "d" else if n == 14 then "e" else "f"
+
+wasm_h2 n = join "" [wasm_hd (n / 16), wasm_hd (n % 16)]
+
+wasm_esc s = wasm_esc_c (chars s)
+
+wasm_esc_c cs =
+  if length cs == 0 then ""
+  else cat ["\\", wasm_h2 (wasm_cc (head cs)), wasm_esc_c (tail cs)]
+
+wasm_cc c =
+  if c == "\n" then 10
+  else if c == "\t" then 9
+  else str_to_int (trim (shell (cat ["printf '%d' \"'", c, "\""])))
 
 is_safe_pkg_name name =
   let check = trim (shell (cat ["printf '%s' '", name, "' | grep -qE '^[a-zA-Z0-9_./-]+$' && echo yes || echo no"]))
