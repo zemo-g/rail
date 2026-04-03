@@ -78,7 +78,7 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 ### Known Compiler Limitations
 
 - **`split` is single-character**: `split "abc" s` splits on `a`, `b`, and `c` individually. Use `str_split` for multi-char delimiters.
-- **Single lambdas in filter can segfault at runtime**: `filter (\x -> x > 3) list` compiles but crashes. Workaround: use named predicate functions.
+- **Polymorphic show**: `show` works on ints, floats, strings, lists (including nested), and nil. Tuples/closures not yet supported.
 - **WASM backend**: basic programs work but segfaults at runtime on larger programs (heap limit).
 - **Exhaustiveness warnings**: Non-exhaustive `match` emits a warning (not error).
 - **`read_line` zero-arg**: Use `read_line 0` (pass dummy arg) — zero-arg dispatch has a codegen quirk in the V-handler.
@@ -104,14 +104,16 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 ### Modifying the Compiler
 
 After editing `tools/compile.rail`:
-1. `archive/gen2_head_backup self` — compile with bootstrap binary (ALWAYS use this, not rail_native)
+1. `./rail_native self` — self-compile
 2. `cp /tmp/rail_self rail_native` — install new binary
 3. `./rail_native test` — verify 92/92
-4. Self-compile exits 139 (cosmetic crash, output is correct) — verify with `cmp`
+4. `./rail_native self && cmp rail_native /tmp/rail_self` — verify fixed point (may need 2-3 rounds)
 
-**CRITICAL**: The current rail_native binary CANNOT self-compile without crashing. Always bootstrap from `archive/gen2_head_backup`. This is a known codegen bug — the binary produces correct output but crashes during compilation of large (235K+) sources. See rail-bugs.md in Claude memory.
+**NOTE**: Self-compile works cleanly since the 256MB stack fix. No gen2_head bootstrap needed.
 
-**IMPORTANT**: If you change the runtime (`rt_core`, `rt_list`, `rt_string`, etc.), the old binary generates the old runtime. You must bootstrap: compile with gen2_head → install → compile again with new binary.
+**IMPORTANT**: If you change the runtime (`rt_core`, `rt_list`, `rt_string`, etc.), the old binary generates the old runtime. You must bootstrap: compile → install → compile again with new binary.
+
+**DATA SECTION BUG**: Changes to the `data` string literal in `compile_program` may not propagate. If you need new data section labels, construct strings at runtime via `malloc` + byte stores in the ARM64 assembly instead. See polymorphic show implementation in `rshow` for the pattern.
 
 ## Flywheel (Self-Training System)
 
