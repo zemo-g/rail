@@ -54,7 +54,7 @@ def load_model(args):
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
-    kwargs["device_map"] = "auto"
+    kwargs["device_map"] = {"": 0}  # force all to GPU — gradient checkpoint keeps VRAM in check
     model = AutoModelForCausalLM.from_pretrained(args.model, **kwargs)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -65,27 +65,43 @@ def load_model(args):
 
 
 def apply_lora(model, args):
-    # Discover ALL attention layers: self_attn (8 full-attention) + linear_attn (24 DeltaNet)
-    attn_modules = [n for n, _ in model.named_modules()
-                    if ("self_attn" in n or "linear_attn" in n) and
-                    any(p in n for p in ["q_proj", "k_proj", "v_proj", "o_proj",
-                                         "in_proj_qkv", "in_proj_z", "in_proj_b",
-                                         "in_proj_a", "out_proj"])]
-    layer_indices = sorted(set(int(n.split(".")[2]) for n in attn_modules if n.split(".")[2].isdigit()))
+    # Auto-detect architecture: find all attention projection layers
+    all_names = [n for n, _ in model.named_modules()]
+    # Try standard attention patterns (Gemma, Llama, Qwen standard)
+    proj_names = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    # Also check for DeltaNet (Qwen3.5 hybrid)
+    delta_names = ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"]
+
+    attn_modules = [n for n in all_names
+                    if any(p in n for p in proj_names + delta_names)]
+    # Extract layer indices
+    layer_indices = sorted(set(
+        int(part) for n in attn_modules
+        for i, part in enumerate(n.split("."))
+        if part.isdigit() and i <= 3
+    ))
+
+    if not layer_indices:
+        print(f"  WARNING: No attention layers found! Using all layers.")
+        print(f"  Sample module names: {all_names[:20]}")
+        layer_indices = list(range(args.num_layers))
+
     target_layers = layer_indices[-args.num_layers:] if len(layer_indices) > args.num_layers else layer_indices
 
-    # Count by type for diagnostics
-    sa_count = len([i for i in target_layers if any("self_attn" in n and f".{i}." in n for n in attn_modules)])
-    dn_count = len([i for i in target_layers if any("linear_attn" in n and f".{i}." in n for n in attn_modules)])
-    print(f"  Found {len(layer_indices)} attention layers: {layer_indices[0]}-{layer_indices[-1]}")
+    # Detect which projection names actually exist
+    found_projs = set()
+    for n in attn_modules:
+        for p in proj_names + delta_names:
+            if p in n:
+                found_projs.add(p)
+
+    print(f"  Found {len(layer_indices)} layers: {layer_indices[0]}-{layer_indices[-1]}")
     print(f"  Targeting last {len(target_layers)}: {target_layers}")
-    print(f"  Breakdown: {sa_count} self_attn + {dn_count} DeltaNet layers")
+    print(f"  Projections: {sorted(found_projs)}")
 
     config = LoraConfig(
         r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "in_proj_qkv", "in_proj_z", "in_proj_b",
-                        "in_proj_a", "out_proj"],
+        target_modules=sorted(found_projs),
         layers_to_transform=target_layers,
         task_type=TaskType.CAUSAL_LM)
     model = get_peft_model(model, config)
