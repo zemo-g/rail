@@ -197,10 +197,10 @@ main =
 
 main =
   let scale = 10
-  let mul = \\x -> x * scale
+  let mul = \\\\x -> x * scale
   let _ = print (show (apply mul 7))
   let offset = 100
-  let add = \\x -> x + offset
+  let add = \\\\x -> x + offset
   let _ = print (show (apply add 42))
   0`,
 `fizzbuzz n = if n > 20 then 0
