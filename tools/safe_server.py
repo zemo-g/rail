@@ -80,6 +80,15 @@ def _read_name(data, pos):
     name = data[pos:pos+length].decode('utf-8', errors='replace')
     return name, pos + length
 
+def _skip_limits(data, pos):
+    """Skip WASM limits encoding (used by table and memory imports)."""
+    flags = data[pos]
+    pos += 1
+    _, pos = _read_leb128(data, pos)  # min
+    if flags & 1:
+        _, pos = _read_leb128(data, pos)  # max (if has_max flag)
+    return pos
+
 def _check_imports(data, pos, end):
     count, pos = _read_leb128(data, pos)
     allowed = {
@@ -88,18 +97,25 @@ def _check_imports(data, pos, end):
     }
     found = set()
     for _ in range(count):
+        if pos >= end:
+            return False  # Truncated import section
         mod, pos = _read_name(data, pos)
         name, pos = _read_name(data, pos)
         kind = data[pos]
         pos += 1
-        if kind == 0:  # func
+        if kind == 0:  # func import
             _, pos = _read_leb128(data, pos)  # type index
-        elif kind == 1:  # table
-            pos += 3  # simplified skip
-        elif kind == 2:  # memory
-            pos += 2
-        elif kind == 3:  # global
-            pos += 2
+        elif kind == 1:  # table import
+            _ = data[pos]  # reftype
+            pos += 1
+            pos = _skip_limits(data, pos)
+        elif kind == 2:  # memory import
+            pos = _skip_limits(data, pos)
+        elif kind == 3:  # global import
+            pos += 1  # valtype
+            pos += 1  # mutability
+        else:
+            return False  # Unknown import kind
         found.add((mod, name))
     return found.issubset(allowed)
 
@@ -323,7 +339,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(wasm)
 
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as te:
+            # Ensure child is dead — prevent zombies
+            try:
+                os.kill(te.pid, 9) if hasattr(te, 'pid') and te.pid else None
+                os.waitpid(-1, os.WNOHANG)
+            except (OSError, ChildProcessError):
+                pass
             self._error(408, 'Compilation timeout (5s)')
         except Exception:
             self._error(500, 'Internal error')
