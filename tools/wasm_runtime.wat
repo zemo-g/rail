@@ -125,6 +125,64 @@
     i64.or
   )
 
+  (func $str_eq (param $a i64) (param $b i64) (result i32)
+    (local $pa i32) (local $pb i32) (local $la i32) (local $i i32)
+    local.get $a
+    i32.wrap_i64
+    i32.const 1
+    i32.shr_u
+    local.set $pa
+    local.get $b
+    i32.wrap_i64
+    i32.const 1
+    i32.shr_u
+    local.set $pb
+    local.get $pa
+    i32.load
+    local.set $la
+    local.get $la
+    local.get $pb
+    i32.load
+    i32.ne
+    if
+      i32.const 0
+      return
+    end
+    i32.const 0
+    local.set $i
+    block $done
+      loop $loop
+        local.get $i
+        local.get $la
+        i32.ge_u
+        br_if $done
+        local.get $pa
+        i32.const 4
+        i32.add
+        local.get $i
+        i32.add
+        i32.load8_u
+        local.get $pb
+        i32.const 4
+        i32.add
+        local.get $i
+        i32.add
+        i32.load8_u
+        i32.ne
+        if
+          i32.const 0
+          return
+        end
+        local.get $i
+        i32.const 1
+        i32.add
+        local.set $i
+        br $loop
+      end
+    end
+    i32.const 1
+  )
+
   (func $__rail_print (param $val i64)
     (local $n i64) (local $pos i32) (local $neg i32) (local $digit i32)
     (local $sptr i32) (local $slen i32)
@@ -201,7 +259,7 @@
       i32.add
       i32.store
       i32.const 4
-      i32.const 131
+      i32.const 130
       local.get $pos
       i32.sub
       i32.store
