@@ -41,7 +41,8 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 -- Comments start with --
 add a b = a + b                       -- named function (BEFORE main)
 main = let _ = print (show (add 3 4)) -- main returns int
-  0
+  0                                       -- newline-based let
+double x = let y = x * 2 in y            -- explicit 'in' also works
 
 type Option = | Some x | None         -- ADT definition
 getOrDefault opt = match opt           -- pattern match (NO 'with' keyword)
@@ -79,8 +80,8 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 
 - **`split` is single-character**: `split "abc" s` splits on `a`, `b`, and `c` individually. Use `str_split` for multi-char delimiters.
 - **Polymorphic show**: `show` works on ints, floats, strings, lists (including nested), and nil. Tuples/closures not yet supported.
-- **WASM backend**: basic programs work but segfaults at runtime on larger programs (heap limit).
-- **Exhaustiveness warnings**: Non-exhaustive `match` emits a warning (not error).
+- **WASM backend**: closures, ADTs, pattern matching, string ops (append/join/show/reverse) all work. 1MB memory, 7 playground demos live. Missing: filter/map/fold/chars/split as WASM builtins.
+- **Exhaustive match**: Non-exhaustive `match` is a compile-time error (not warning). Runtime trap on fallthrough.
 - **`read_line` zero-arg**: Use `read_line 0` (pass dummy arg) — zero-arg dispatch has a codegen quirk in the V-handler.
 - **Cross-function float return inference**: Works via `__fret_` markers, but `show(user_func(1.0))` won't auto-detect float return. Use `show_float` explicitly.
 - **Float self-loop TCO**: Deferred — `body_has_float` guard prevents int-TCO corruption but float-specific d8-d15 TCO not yet implemented.
