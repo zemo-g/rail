@@ -10,9 +10,9 @@ import http.server
 import subprocess
 import tempfile
 import hashlib
+import threading
 import time
 import os
-import json
 from collections import defaultdict
 
 PORT = 8090
@@ -21,17 +21,87 @@ MAX_SOURCE = 65536
 COMPILE_TIMEOUT = 5
 RATE_LIMIT = 10  # per minute per IP
 RATE_WINDOW = 60
+ALLOWED_ORIGINS = {'https://compile.ledatic.org', 'https://ledatic.org'}
 
-# Rate limiting
+# Compile lock — rail_safe writes to fixed /tmp/rail_safe.wasm
+_compile_lock = threading.Lock()
+
+# Rate limiting with cleanup
 _rates = defaultdict(list)
+_rate_cleanup = 0
 
 def rate_ok(ip):
+    global _rate_cleanup
     now = time.time()
+    # Periodic cleanup of stale IPs
+    if now - _rate_cleanup > 300:
+        stale = [k for k, v in _rates.items() if not v or now - v[-1] > RATE_WINDOW]
+        for k in stale:
+            del _rates[k]
+        _rate_cleanup = now
     _rates[ip] = [t for t in _rates[ip] if now - t < RATE_WINDOW]
     if len(_rates[ip]) >= RATE_LIMIT:
         return False
     _rates[ip].append(now)
     return True
+
+def validate_wasm_imports(wasm_bytes):
+    """Verify WASM binary only imports fd_write and proc_exit."""
+    try:
+        if len(wasm_bytes) < 8 or wasm_bytes[:4] != b'\x00asm':
+            return False
+        # Walk sections to find import section (id=2)
+        pos = 8
+        while pos < len(wasm_bytes):
+            section_id = wasm_bytes[pos]
+            pos += 1
+            size, pos = _read_leb128(wasm_bytes, pos)
+            if section_id == 2:  # Import section
+                return _check_imports(wasm_bytes, pos, pos + size)
+            pos += size
+        return True  # No import section = safe
+    except Exception:
+        return False
+
+def _read_leb128(data, pos):
+    result = 0
+    shift = 0
+    while pos < len(data):
+        b = data[pos]
+        pos += 1
+        result |= (b & 0x7f) << shift
+        if (b & 0x80) == 0:
+            break
+        shift += 7
+    return result, pos
+
+def _read_name(data, pos):
+    length, pos = _read_leb128(data, pos)
+    name = data[pos:pos+length].decode('utf-8', errors='replace')
+    return name, pos + length
+
+def _check_imports(data, pos, end):
+    count, pos = _read_leb128(data, pos)
+    allowed = {
+        ('wasi_snapshot_preview1', 'fd_write'),
+        ('wasi_snapshot_preview1', 'proc_exit'),
+    }
+    found = set()
+    for _ in range(count):
+        mod, pos = _read_name(data, pos)
+        name, pos = _read_name(data, pos)
+        kind = data[pos]
+        pos += 1
+        if kind == 0:  # func
+            _, pos = _read_leb128(data, pos)  # type index
+        elif kind == 1:  # table
+            pos += 3  # simplified skip
+        elif kind == 2:  # memory
+            pos += 2
+        elif kind == 3:  # global
+            pos += 2
+        found.add((mod, name))
+    return found.issubset(allowed)
 
 EDITOR_HTML = b"""<!DOCTYPE html><html><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -161,11 +231,17 @@ btn.disabled=false}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    def _cors_origin(self):
+        origin = self.headers.get('Origin', '')
+        if origin in ALLOWED_ORIGINS:
+            return origin
+        return 'https://compile.ledatic.org'
+
     def do_GET(self):
         if self.path == '/' or self.path == '':
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', len(EDITOR_HTML))
+            self.send_header('Content-Length', str(len(EDITOR_HTML)))
             self.end_headers()
             self.wfile.write(EDITOR_HTML)
         else:
@@ -183,7 +259,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         length = int(self.headers.get('Content-Length', 0))
         if length > MAX_SOURCE:
-            self._error(413, f'Source too large ({length} bytes, max {MAX_SOURCE})')
+            self._error(413, 'Source too large (max 64KB)')
             return
         if length == 0:
             self._error(400, 'Empty source')
@@ -191,35 +267,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         source = self.rfile.read(length)
 
-        # Write source to temp file
+        # Unique temp paths per request to avoid race conditions
         with tempfile.NamedTemporaryFile(suffix='.rail', delete=False, mode='wb') as f:
             f.write(source)
             src_path = f.name
 
         try:
-            # Compile with rail_safe
-            result = subprocess.run(
-                [RAIL_SAFE, 'safe', src_path],
-                capture_output=True, text=True,
-                timeout=COMPILE_TIMEOUT
-            )
+            # Serialize compilation — rail_safe writes to fixed /tmp/rail_safe.wasm
+            with _compile_lock:
+                result = subprocess.run(
+                    [RAIL_SAFE, 'safe', src_path],
+                    capture_output=True, text=True,
+                    timeout=COMPILE_TIMEOUT
+                )
 
-            if 'REJECTED' in result.stdout:
-                self._error(400, result.stdout.strip())
+                # Sanitize output — strip temp file paths
+                stdout = result.stdout.replace(src_path, '<source>')
+
+                if 'REJECTED' in stdout:
+                    for line in stdout.split('\n'):
+                        if 'REJECTED' in line:
+                            self._error(400, line.strip())
+                            return
+                    self._error(400, 'Rejected: banned construct')
+                    return
+
+                if 'wat2wasm: OK' not in stdout:
+                    self._error(400, 'Compilation failed')
+                    return
+
+                # Read compiled WASM before releasing lock
+                wasm_path = '/tmp/rail_safe.wasm'
+                if not os.path.exists(wasm_path):
+                    self._error(500, 'Compilation produced no output')
+                    return
+
+                with open(wasm_path, 'rb') as f:
+                    wasm = f.read()
+
+            # Validate WASM imports outside lock (defense-in-depth, Gap C)
+            if not validate_wasm_imports(wasm):
+                print(f'  BLOCKED: {ip} — WASM import validation failed')
+                self._error(500, 'Output validation failed')
                 return
-
-            if 'wat2wasm: OK' not in result.stdout:
-                self._error(400, result.stdout.strip() or 'Compilation failed')
-                return
-
-            # Read the compiled WASM
-            wasm_path = '/tmp/rail_safe.wasm'
-            if not os.path.exists(wasm_path):
-                self._error(500, 'WASM output not found')
-                return
-
-            with open(wasm_path, 'rb') as f:
-                wasm = f.read()
 
             # Log
             src_hash = hashlib.sha256(source).hexdigest()[:12]
@@ -228,21 +318,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/wasm')
-            self.send_header('Content-Length', len(wasm))
-            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Content-Length', str(len(wasm)))
+            self.send_header('Access-Control-Allow-Origin', self._cors_origin())
             self.end_headers()
             self.wfile.write(wasm)
 
         except subprocess.TimeoutExpired:
             self._error(408, 'Compilation timeout (5s)')
-        except Exception as e:
-            self._error(500, f'Internal error')
+        except Exception:
+            self._error(500, 'Internal error')
         finally:
-            os.unlink(src_path)
+            try:
+                os.unlink(src_path)
+            except OSError:
+                pass
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Origin', self._cors_origin())
         self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
@@ -251,13 +344,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = msg.encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'text/plain')
-        self.send_header('Content-Length', len(body))
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Access-Control-Allow-Origin', self._cors_origin())
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, fmt, *args):
+    def log_message(self, format, *args):
         print(f'  {self.client_address[0]} {args[0]}')
+
+
+class ThreadingServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
 
 
 if __name__ == '__main__':
@@ -265,4 +362,5 @@ if __name__ == '__main__':
     print(f'  compiler: {RAIL_SAFE}')
     print(f'  rate limit: {RATE_LIMIT}/min per IP')
     print(f'  compile timeout: {COMPILE_TIMEOUT}s')
-    http.server.HTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
+    print(f'  CORS: {ALLOWED_ORIGINS}')
+    ThreadingServer(('0.0.0.0', PORT), Handler).serve_forever()
