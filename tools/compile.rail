@@ -3191,30 +3191,39 @@ dispatch_wasm path =
 wasm_program decls =
   let strs = wasm_strs_all decls
   let stab = wasm_stab strs 256
-  let hdr = "(module\n  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))\n  (import \"wasi_snapshot_preview1\" \"proc_exit\" (func $proc_exit (param i32)))\n  (memory (export \"memory\") 2 1024)\n\n"
+  let ar = get_arities decls
+  let lams = wasm_collect_lambdas decls 0
+  let nlams = length lams
+  let hdr = "(module\n  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))\n  (import \"wasi_snapshot_preview1\" \"proc_exit\" (func $proc_exit (param i32)))\n  (memory (export \"memory\") 16 1024)\n\n"
+  let tbl = if nlams > 0 then cat ["  (type $clos_t (func (param i64 i64) (result i64)))\n  (table ", show nlams, " funcref)\n  (elem (i32.const 0)", wasm_elem_list nlams 0, ")\n\n"] else ""
   let rt = read_file "tools/wasm_runtime.wat"
-  let fns = wasm_fns decls stab
+  let fns = wasm_fns decls stab ar lams
+  let lam_fns = wasm_lambda_fns lams stab ar
   let start = "  (func $_start (export \"_start\")\n    call $main\n    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    call $proc_exit\n  )\n\n"
   let sd = wasm_sdata stab
-  cat [hdr, rt, fns, start, sd, ")\n"]
+  cat [hdr, tbl, rt, fns, lam_fns, start, sd, ")\n"]
 
-wasm_fns decls stab =
+wasm_elem_list n i =
+  if i >= n then ""
+  else cat [" $__lambda_", show i, wasm_elem_list n (i + 1)]
+
+wasm_fns decls stab ar lams =
   if length decls == 0 then ""
   else
     let tg = head (head decls)
-    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_fns (tail decls) stab
-    else cat [wasm_fn (head decls) stab, wasm_fns (tail decls) stab]
+    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_fns (tail decls) stab ar lams
+    else cat [wasm_fn (head decls) stab ar lams, wasm_fns (tail decls) stab ar lams]
 
-wasm_fn d stab =
+wasm_fn d stab ar lams =
   let nm = head (tail d)
   let ps = head (tail (tail d))
   let bd = head (tail (tail (tail d)))
   let pstr = if length ps == 0 then "" else join " " (wasm_plist ps)
   let env = wasm_env ps 0
-  let locs = wasm_dedup (wasm_locs bd)
+  let locs = wasm_dedup (cons "__ptr" (cons "__scrut" (wasm_locs bd)))
   let rl = wasm_fltr locs ps
   let ld = if length rl == 0 then "" else join "" (wasm_llist rl)
-  let body = wg bd env stab
+  let body = wg bd env stab ar lams
   cat ["  (func $", nm, " ", pstr, " (result i64)\n", ld, body, "  )\n\n"]
 
 wasm_plist ps =
@@ -3237,7 +3246,13 @@ wasm_locs node =
   else if tg == "O" then append (wasm_locs (head (tail (tail node)))) (wasm_locs (head (tail (tail (tail node)))))
   else if tg == "A" then wasm_locs_l (tail node)
   else if tg == "L" then wasm_locs_l (head (tail node))
+  else if tg == "M" then cons "__scrut" (cons "__ptr" (append (wasm_locs (head (tail node))) (wasm_locs_arms (head (tail (tail node))))))
+  else if tg == "F" then wasm_locs (head (tail (tail node)))
   else []
+
+wasm_locs_arms arms =
+  if length arms == 0 then []
+  else append (head (tail (head arms))) (append (wasm_locs (head (tail (tail (head arms))))) (wasm_locs_arms (tail arms)))
 
 wasm_locs_l ns =
   if length ns == 0 then []
@@ -3267,44 +3282,188 @@ wasm_efind n env =
     if k == n then v
     else wasm_efind n (tail env)
 
-wg node env stab =
+wg node env stab ar lams =
   let tg = head node
   if tg == "I" then cat ["    i64.const ", show (str_to_int (head (tail node)) * 2 + 1), "\n"]
   else if tg == "S" then cat ["    i64.const ", show (wasm_sfind (head (tail node)) stab * 2), "\n"]
   else if tg == "B" then if head (tail node) == "true" then "    i64.const 3\n" else "    i64.const 1\n"
   else if tg == "V" then
     let nm = head (tail node)
-    if wasm_efind nm env >= 0 then cat ["    local.get $", nm, "\n"] else "    i64.const 1\n"
+    if wasm_efind nm env >= 0 then cat ["    local.get $", nm, "\n"]
+    else
+      let ar_val = afind nm ar
+      let (cidx, carity) = decode_ctor ar_val
+      if cidx != (0 - 1) then
+        if carity == 0 then
+          cat ["    i32.const 16\n    call $alloc\n    i64.extend_i32_u\n    local.set $__ptr\n    local.get $__ptr\n    i32.wrap_i64\n    i64.const 5\n    i64.store\n    local.get $__ptr\n    i32.wrap_i64\n    i32.const 8\n    i32.add\n    i64.const ", show cidx, "\n    i64.store\n    local.get $__ptr\n    i64.const 1\n    i64.shl\n"]
+        else "    i64.const 1\n"
+      else "    i64.const 1\n"
   else if tg == "O" then
     let op = head (tail node)
-    cat [wg (head (tail (tail node))) env stab, "    i64.const 1\n    i64.shr_s\n", wg (head (tail (tail (tail node)))) env stab, "    i64.const 1\n    i64.shr_s\n", wasm_op op, "    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"]
+    cat [wg (head (tail (tail node))) env stab ar lams, "    i64.const 1\n    i64.shr_s\n", wg (head (tail (tail (tail node)))) env stab ar lams, "    i64.const 1\n    i64.shr_s\n", wasm_op op, "    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"]
   else if tg == "?" then
-    cat [wg (head (tail node)) env stab, "    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    if (result i64)\n", wg (head (tail (tail node))) env stab, "    else\n", wg (head (tail (tail (tail node)))) env stab, "    end\n"]
+    cat [wg (head (tail node)) env stab ar lams, "    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    if (result i64)\n", wg (head (tail (tail node))) env stab ar lams, "    else\n", wg (head (tail (tail (tail node)))) env stab ar lams, "    end\n"]
   else if tg == "D" then
     let nm = head (tail node)
-    cat [wg (head (tail (tail node))) env stab, "    local.set $", nm, "\n", wg (head (tail (tail (tail node)))) (cons (nm, length env) env) stab]
-  else if tg == "TD" then cat [wg (head (tail (tail node))) env stab, "    drop\n", wg (head (tail (tail (tail node)))) env stab]
+    cat [wg (head (tail (tail node))) env stab ar lams, "    local.set $", nm, "\n", wg (head (tail (tail (tail node)))) (cons (nm, length env) env) stab ar lams]
+  else if tg == "TD" then cat [wg (head (tail (tail node))) env stab ar lams, "    drop\n", wg (head (tail (tail (tail node)))) env stab ar lams]
   else if tg == "L" then
-    wg_list (head (tail node)) env stab
+    wg_list (head (tail node)) env stab ar lams
+  else if tg == "M" then
+    let scrut = head (tail node)
+    let arms = head (tail (tail node))
+    cat [wg scrut env stab ar lams, "    local.set $__scrut\n", wg_match arms env stab ar lams]
+  else if tg == "F" then
+    let param = head (tail node)
+    let body = head (tail (tail node))
+    let fvl = fvs body [param]
+    let lam_idx = wasm_find_lambda node lams 0
+    let ncap = length fvl
+    let alloc_size = 16 + ncap * 8
+    cat ["    i32.const ", show alloc_size, "\n    call $alloc\n    i64.extend_i32_u\n    local.set $__ptr\n    local.get $__ptr\n    i32.wrap_i64\n    i64.const 4\n    i64.store\n    local.get $__ptr\n    i32.wrap_i64\n    i32.const 8\n    i32.add\n    i64.const ", show lam_idx, "\n    i64.store\n", wg_store_caps fvl env 0, "    local.get $__ptr\n    i64.const 1\n    i64.shl\n"]
   else if tg == "A" then
     let (fname, fargs) = flat node
-    if fname == "print" then cat [wg (head fargs) env stab, "    call $__rail_print\n    i64.const 1\n"]
-    else if fname == "show" then wg (head fargs) env stab
-    else if fname == "head" then cat [wg (head fargs) env stab, "    call $head\n"]
-    else if fname == "tail" then cat [wg (head fargs) env stab, "    call $tail\n"]
-    else if fname == "length" then cat [wg (head fargs) env stab, "    call $length\n"]
-    else if fname == "cons" then cat [wg (head fargs) env stab, wg (head (tail fargs)) env stab, "    call $cons\n"]
-    else cat [wg_args fargs env stab, "    call $", fname, "\n"]
+    if fname == "print" then cat [wg (head fargs) env stab ar lams, "    call $__rail_print\n    i64.const 1\n"]
+    else if fname == "show" then wg (head fargs) env stab ar lams
+    else if fname == "head" then cat [wg (head fargs) env stab ar lams, "    call $head\n"]
+    else if fname == "tail" then cat [wg (head fargs) env stab ar lams, "    call $tail\n"]
+    else if fname == "length" then cat [wg (head fargs) env stab ar lams, "    call $length\n"]
+    else if fname == "cons" then cat [wg (head fargs) env stab ar lams, wg (head (tail fargs)) env stab ar lams, "    call $cons\n"]
+    else
+      let ar_val = afind fname ar
+      let (cidx, carity) = decode_ctor ar_val
+      if cidx != (0 - 1) then
+        let nargs = length fargs
+        let alloc_size = 16 + nargs * 8
+        cat ["    i32.const ", show alloc_size, "\n    call $alloc\n    i64.extend_i32_u\n    local.set $__ptr\n    local.get $__ptr\n    i32.wrap_i64\n    i64.const 5\n    i64.store\n    local.get $__ptr\n    i32.wrap_i64\n    i32.const 8\n    i32.add\n    i64.const ", show cidx, "\n    i64.store\n", wg_store_fields fargs env stab ar lams 0, "    local.get $__ptr\n    i64.const 1\n    i64.shl\n"]
+      else
+        let voff = wasm_efind fname env
+        if voff >= 0 then
+          cat ["    local.get $", fname, "\n    i64.const 1\n    i64.shr_u\n    local.set $__ptr\n    local.get $__ptr\n    i32.wrap_i64\n    i32.const 8\n    i32.add\n    i64.load\n    local.set $__scrut\n    local.get $", fname, "\n", wg (head fargs) env stab ar lams, "    local.get $__scrut\n    i32.wrap_i64\n    call_indirect (type $clos_t)\n"]
+        else cat [wg_args fargs env stab ar lams, "    call $", fname, "\n"]
   else if tg == "NULL" then "    i64.const 0\n"
   else "    i64.const 1\n"
 
-wg_args fa env stab =
+wg_args fa env stab ar lams =
   if length fa == 0 then ""
-  else cat [wg (head fa) env stab, wg_args (tail fa) env stab]
+  else cat [wg (head fa) env stab ar lams, wg_args (tail fa) env stab ar lams]
 
-wg_list elems env stab =
+wg_list elems env stab ar lams =
   if length elems == 0 then "    call $nil\n"
-  else cat [wg (head elems) env stab, wg_list (tail elems) env stab, "    call $cons\n"]
+  else cat [wg (head elems) env stab ar lams, wg_list (tail elems) env stab ar lams, "    call $cons\n"]
+
+wg_match arms env stab ar lams =
+  if length arms == 0 then "    unreachable\n"
+  else
+    let arm = head arms
+    let ctor = head arm
+    let binds = head (tail arm)
+    let body = head (tail (tail arm))
+    if ctor == "_" then
+      wg body env stab ar lams
+    else if str_starts_with "#int:" ctor then
+      let val = str_after "#int:" ctor
+      cat ["    local.get $__scrut\n    i64.const ", show (str_to_int val * 2 + 1), "\n    i64.eq\n    if (result i64)\n", wg body env stab ar lams, "    else\n", wg_match (tail arms) env stab ar lams, "    end\n"]
+    else if str_starts_with "#str:" ctor then
+      wg_match (tail arms) env stab ar lams
+    else
+      let (cidx, _) = decode_ctor (afind ctor ar)
+      let bind_code = wg_extract_fields binds 0
+      let bind_env = wg_bind_env binds env
+      let is_last = length (tail arms) == 0
+      if is_last then
+        cat ["    local.get $__scrut\n    i64.const 1\n    i64.shr_u\n    local.set $__ptr\n", bind_code, wg body bind_env stab ar lams]
+      else
+        cat ["    local.get $__scrut\n    i64.const 1\n    i64.shr_u\n    local.set $__ptr\n    local.get $__ptr\n    i32.wrap_i64\n    i32.const 8\n    i32.add\n    i64.load\n    i64.const ", show cidx, "\n    i64.eq\n    if (result i64)\n", bind_code, wg body bind_env stab ar lams, "    else\n", wg_match (tail arms) env stab ar lams, "    end\n"]
+
+wg_extract_fields binds idx =
+  if length binds == 0 then ""
+  else
+    let nm = head binds
+    let off = 16 + idx * 8
+    cat ["    local.get $__ptr\n    i32.wrap_i64\n    i32.const ", show off, "\n    i32.add\n    i64.load\n    local.set $", nm, "\n", wg_extract_fields (tail binds) (idx + 1)]
+
+
+wg_bind_env binds env =
+  if length binds == 0 then env
+  else wg_bind_env (tail binds) (cons (head binds, length env) env)
+
+wg_store_fields fargs env stab ar lams idx =
+  if length fargs == 0 then ""
+  else
+    let off = 16 + idx * 8
+    cat ["    local.get $__ptr\n    i32.wrap_i64\n    i32.const ", show off, "\n    i32.add\n", wg (head fargs) env stab ar lams, "    i64.store\n", wg_store_fields (tail fargs) env stab ar lams (idx + 1)]
+
+wg_store_caps fvl env idx =
+  if length fvl == 0 then ""
+  else
+    let nm = head fvl
+    let off = 16 + idx * 8
+    cat ["    local.get $__ptr\n    i32.wrap_i64\n    i32.const ", show off, "\n    i32.add\n    local.get $", nm, "\n    i64.store\n", wg_store_caps (tail fvl) env (idx + 1)]
+
+wasm_collect_lambdas decls idx =
+  if length decls == 0 then []
+  else
+    let tg = head (head decls)
+    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_collect_lambdas (tail decls) idx
+    else
+      let bd = head (tail (tail (tail (head decls))))
+      let found = wcl_node bd
+      let tagged = wcl_tag found idx
+      append tagged (wasm_collect_lambdas (tail decls) (idx + length found))
+
+wcl_node node =
+  let tg = head node
+  if tg == "F" then cons node (wcl_node (head (tail (tail node))))
+  else if tg == "O" then append (wcl_node (head (tail (tail node)))) (wcl_node (head (tail (tail (tail node)))))
+  else if tg == "?" then append (wcl_node (head (tail node))) (append (wcl_node (head (tail (tail node)))) (wcl_node (head (tail (tail (tail node))))))
+  else if tg == "D" then append (wcl_node (head (tail (tail node)))) (wcl_node (head (tail (tail (tail node)))))
+  else if tg == "TD" then append (wcl_node (head (tail (tail node)))) (wcl_node (head (tail (tail (tail node)))))
+  else if tg == "A" then wcl_list (tail node)
+  else if tg == "L" then wcl_list (head (tail node))
+  else if tg == "M" then append (wcl_node (head (tail node))) (wcl_arms (head (tail (tail node))))
+  else []
+
+wcl_list ns =
+  if length ns == 0 then []
+  else append (wcl_node (head ns)) (wcl_list (tail ns))
+
+wcl_arms arms =
+  if length arms == 0 then []
+  else append (wcl_node (head (tail (tail (head arms))))) (wcl_arms (tail arms))
+
+wcl_tag found idx =
+  if length found == 0 then []
+  else cons (head found, idx) (wcl_tag (tail found) (idx + 1))
+
+wasm_find_lambda node lams idx =
+  if length lams == 0 then 0
+  else
+    let (lnode, lidx) = head lams
+    if head (tail lnode) == head (tail node) then lidx
+    else wasm_find_lambda node (tail lams) (idx + 1)
+
+wasm_lambda_fns lams stab ar =
+  if length lams == 0 then ""
+  else
+    let (lnode, lidx) = head lams
+    let param = head (tail lnode)
+    let body = head (tail (tail lnode))
+    let fvl = fvs body [param]
+    let locs = wasm_dedup (append fvl (cons "__ptr" (cons "__scrut" (wasm_locs body))))
+    let rl = wasm_fltr locs [param, "__env"]
+    let ld = if length rl == 0 then "" else join "" (wasm_llist rl)
+    let cap_loads = wg_load_caps fvl 0
+    let env = wasm_env (cons param fvl) 0
+    let bd = wg body env stab ar lams
+    cat ["  (func $__lambda_", show lidx, " (param $__env i64) (param $", param, " i64) (result i64)\n", ld, "    local.get $__env\n    i64.const 1\n    i64.shr_u\n    local.set $__ptr\n", cap_loads, bd, "  )\n\n", wasm_lambda_fns (tail lams) stab ar]
+
+wg_load_caps fvl idx =
+  if length fvl == 0 then ""
+  else
+    let nm = head fvl
+    let off = 16 + idx * 8
+    cat ["    local.get $__ptr\n    i32.wrap_i64\n    i32.const ", show off, "\n    i32.add\n    i64.load\n    local.set $", nm, "\n", wg_load_caps (tail fvl) (idx + 1)]
 
 wasm_op op =
   if op == "+" then "    i64.add\n" else if op == "-" then "    i64.sub\n"
@@ -3327,7 +3486,13 @@ wasm_strs node =
   else if tg == "A" then wasm_strs_l (tail node)
   else if tg == "L" then wasm_strs_l (head (tail node))
   else if tg == "TD" then append (wasm_strs (head (tail (tail node)))) (wasm_strs (head (tail (tail (tail node)))))
+  else if tg == "M" then append (wasm_strs (head (tail node))) (wasm_strs_arms (head (tail (tail node))))
+  else if tg == "F" then wasm_strs (head (tail (tail node)))
   else []
+
+wasm_strs_arms arms =
+  if length arms == 0 then []
+  else append (wasm_strs (head (tail (tail (head arms))))) (wasm_strs_arms (tail arms))
 
 wasm_strs_l ns =
   if length ns == 0 then []
