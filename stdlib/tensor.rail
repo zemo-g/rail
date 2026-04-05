@@ -1,0 +1,437 @@
+-- stdlib/tensor.rail — Tensor type for RailML
+-- Phase 1: CPU tensors with float_arr backend
+-- Import: import "stdlib/tensor.rail"
+--
+-- NOTE: Due to Rail's float TCO limitation, all loops return int (0).
+-- Float results are stored in mutable float arrays and read back after loops.
+-- Use show_float for printing tensor_get/tensor_sum/tensor_mean results
+-- (cross-function float return inference does not propagate through match).
+
+foreign tanh x -> float
+foreign sqrt x -> float
+foreign exp x -> float
+
+-- ADT: flat float array + shape + strides (row-major)
+type Tensor = | Tensor data shape strides
+
+-- ============================================================
+-- Shape utilities
+-- ============================================================
+
+-- Product of a list of ints
+mul_acc a b = a * b
+list_product xs = fold mul_acc 1 xs
+
+-- Compute row-major strides from shape
+-- [2,3,4] -> [12, 4, 1]
+compute_strides_rev rev_shape =
+  if length rev_shape == 0 then []
+  else if length rev_shape == 1 then [1]
+  else
+    let rest = compute_strides_rev (tail rev_shape)
+    let stride = (head rev_shape) * (head rest)
+    cons stride rest
+
+compute_strides shape = compute_strides_rev (reverse shape)
+
+-- Compute flat offset from multi-dim indices and strides
+compute_offset indices strides =
+  if length indices == 0 then 0
+  else (head indices) * (head strides) + compute_offset (tail indices) (tail strides)
+
+-- Nth element of a list (0-indexed)
+list_nth n xs =
+  if n == 0 then head xs
+  else list_nth (n - 1) (tail xs)
+
+-- ============================================================
+-- Constructors
+-- ============================================================
+
+-- Create tensor with given shape, all elements set to init_val
+tensor_new shape init_val =
+  let size = list_product shape
+  let data = float_arr_new size init_val
+  let strides = compute_strides shape
+  Tensor data shape strides
+
+-- Convenience constructors
+tensor_zeros shape = tensor_new shape 0.0
+tensor_ones shape = tensor_new shape 1.0
+
+-- ============================================================
+-- Accessors
+-- ============================================================
+
+-- Get tensor shape
+tensor_shape t = match t
+  | Tensor d s st -> s
+
+-- Get total number of elements
+tensor_size t = match t
+  | Tensor d s st -> list_product s
+
+-- Get size of dimension at axis
+dim t axis = match t
+  | Tensor d s st -> list_nth axis s
+
+-- Get element at multi-dimensional indices (returns float)
+tensor_get t indices = match t
+  | Tensor d s st ->
+    let offset = compute_offset indices st
+    float_arr_get d offset
+
+-- Set element at multi-dimensional indices
+tensor_set t indices val = match t
+  | Tensor d s st ->
+    let offset = compute_offset indices st
+    float_arr_set d offset val
+
+-- Get/set by flat index
+tensor_get_flat t i = match t
+  | Tensor d s st -> float_arr_get d i
+
+tensor_set_flat t i val = match t
+  | Tensor d s st -> float_arr_set d i val
+
+-- ============================================================
+-- Matmul: (M,K) @ (K,N) -> (M,N)
+-- Triple nested loop, naive but correct
+-- ============================================================
+
+-- Innermost loop: accumulate a[i,k]*b[k,j] for k
+matmul_k a_data b_data acc_arr k_dim n_dim i j kk =
+  if kk >= k_dim then 0
+  else
+    let av = float_arr_get a_data (i * k_dim + kk)
+    let bv = float_arr_get b_data (kk * n_dim + j)
+    let cur = float_arr_get acc_arr 0
+    let _ = float_arr_set acc_arr 0 (cur + av * bv)
+    matmul_k a_data b_data acc_arr k_dim n_dim i j (kk + 1)
+
+-- Middle loop: iterate over columns j
+matmul_j a_data b_data c_data acc_arr m_dim n_dim k_dim i j =
+  if j >= n_dim then 0
+  else
+    let _ = float_arr_set acc_arr 0 0.0
+    let _ = matmul_k a_data b_data acc_arr k_dim n_dim i j 0
+    let _ = float_arr_set c_data (i * n_dim + j) (float_arr_get acc_arr 0)
+    matmul_j a_data b_data c_data acc_arr m_dim n_dim k_dim i (j + 1)
+
+-- Outer loop: iterate over rows i
+matmul_i a_data b_data c_data acc_arr m_dim n_dim k_dim i =
+  if i >= m_dim then 0
+  else
+    let _ = matmul_j a_data b_data c_data acc_arr m_dim n_dim k_dim i 0
+    matmul_i a_data b_data c_data acc_arr m_dim n_dim k_dim (i + 1)
+
+-- Matrix multiply: a(M,K) @ b(K,N) -> c(M,N)
+matmul a b = match a
+  | Tensor a_data a_shape a_strides -> match b
+    | Tensor b_data b_shape b_strides ->
+      let m_dim = head a_shape
+      let k_dim = head (tail a_shape)
+      let n_dim = head (tail b_shape)
+      let c = tensor_zeros [m_dim, n_dim]
+      let acc = float_arr_new 1 0.0
+      match c
+        | Tensor c_data c_shape c_strides ->
+          let _ = matmul_i a_data b_data c_data acc m_dim n_dim k_dim 0
+          c
+
+-- ============================================================
+-- Element-wise ops (explicit loops, no function passing)
+-- ============================================================
+
+-- Add loop
+add_loop a_data b_data c_data n i =
+  if i >= n then 0
+  else
+    let av = float_arr_get a_data i
+    let bv = float_arr_get b_data i
+    let _ = float_arr_set c_data i (av + bv)
+    add_loop a_data b_data c_data n (i + 1)
+
+-- Sub loop
+sub_loop a_data b_data c_data n i =
+  if i >= n then 0
+  else
+    let av = float_arr_get a_data i
+    let bv = float_arr_get b_data i
+    let _ = float_arr_set c_data i (av - bv)
+    sub_loop a_data b_data c_data n (i + 1)
+
+-- Hadamard (element-wise multiply) loop
+hmul_loop a_data b_data c_data n i =
+  if i >= n then 0
+  else
+    let av = float_arr_get a_data i
+    let bv = float_arr_get b_data i
+    let _ = float_arr_set c_data i (av * bv)
+    hmul_loop a_data b_data c_data n (i + 1)
+
+-- Scalar multiply loop
+scale_loop src dst n i s =
+  if i >= n then 0
+  else
+    let v = float_arr_get src i
+    let _ = float_arr_set dst i (v * s)
+    scale_loop src dst n (i + 1) s
+
+-- tensor_add: element-wise addition
+tensor_add a b = match a
+  | Tensor a_data a_shape a_st -> match b
+    | Tensor b_data b_shape b_st ->
+      let n = list_product a_shape
+      let c = tensor_zeros a_shape
+      match c
+        | Tensor c_data c_shape c_st ->
+          let _ = add_loop a_data b_data c_data n 0
+          c
+
+-- tensor_sub: element-wise subtraction
+tensor_sub a b = match a
+  | Tensor a_data a_shape a_st -> match b
+    | Tensor b_data b_shape b_st ->
+      let n = list_product a_shape
+      let c = tensor_zeros a_shape
+      match c
+        | Tensor c_data c_shape c_st ->
+          let _ = sub_loop a_data b_data c_data n 0
+          c
+
+-- tensor_mul: element-wise (Hadamard) multiplication
+tensor_mul a b = match a
+  | Tensor a_data a_shape a_st -> match b
+    | Tensor b_data b_shape b_st ->
+      let n = list_product a_shape
+      let c = tensor_zeros a_shape
+      match c
+        | Tensor c_data c_shape c_st ->
+          let _ = hmul_loop a_data b_data c_data n 0
+          c
+
+-- tensor_scale: scalar multiply
+tensor_scale t s = match t
+  | Tensor t_data t_shape t_st ->
+    let n = list_product t_shape
+    let c = tensor_zeros t_shape
+    match c
+      | Tensor c_data c_shape c_st ->
+        let _ = scale_loop t_data c_data n 0 s
+        c
+
+-- ============================================================
+-- Activation functions (element-wise, explicit loops)
+-- ============================================================
+
+-- ReLU loop: max(0, x)
+relu_loop src dst n i =
+  if i >= n then 0
+  else
+    let v = float_arr_get src i
+    let r = if v > 0.0 then v else 0.0
+    let _ = float_arr_set dst i r
+    relu_loop src dst n (i + 1)
+
+tensor_relu t = match t
+  | Tensor t_data t_shape t_st ->
+    let n = list_product t_shape
+    let c = tensor_zeros t_shape
+    match c
+      | Tensor c_data c_shape c_st ->
+        let _ = relu_loop t_data c_data n 0
+        c
+
+-- GELU loop: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+gelu_loop src dst n i =
+  if i >= n then 0
+  else
+    let x = float_arr_get src i
+    let pi_val = 3.14159265358979
+    let coeff = sqrt (2.0 / pi_val)
+    let inner = coeff * (x + 0.044715 * x * x * x)
+    let result = 0.5 * x * (1.0 + tanh inner)
+    let _ = float_arr_set dst i result
+    gelu_loop src dst n (i + 1)
+
+tensor_gelu t = match t
+  | Tensor t_data t_shape t_st ->
+    let n = list_product t_shape
+    let c = tensor_zeros t_shape
+    match c
+      | Tensor c_data c_shape c_st ->
+        let _ = gelu_loop t_data c_data n 0
+        c
+
+-- ============================================================
+-- Reductions
+-- ============================================================
+
+-- Sum all elements (uses mutable accumulator array)
+sum_loop data n i acc_arr =
+  if i >= n then 0
+  else
+    let v = float_arr_get data i
+    let cur = float_arr_get acc_arr 0
+    let _ = float_arr_set acc_arr 0 (cur + v)
+    sum_loop data n (i + 1) acc_arr
+
+tensor_sum t = match t
+  | Tensor t_data t_shape t_st ->
+    let n = list_product t_shape
+    let acc_arr = float_arr_new 1 0.0
+    let _ = sum_loop t_data n 0 acc_arr
+    float_arr_get acc_arr 0
+
+-- Mean of all elements
+tensor_mean t = match t
+  | Tensor t_data t_shape t_st ->
+    let n = list_product t_shape
+    let acc_arr = float_arr_new 1 0.0
+    let _ = sum_loop t_data n 0 acc_arr
+    let s = float_arr_get acc_arr 0
+    s / to_float n
+
+-- ============================================================
+-- Shape operations
+-- ============================================================
+
+-- Transpose: swap last two dimensions (just swap strides + shape, no data copy)
+swap_last_two xs =
+  if length xs == 2 then [head (tail xs), head xs]
+  else cons (head xs) (swap_last_two (tail xs))
+
+tensor_transpose t = match t
+  | Tensor t_data t_shape t_st ->
+    let new_shape = swap_last_two t_shape
+    let new_strides = swap_last_two t_st
+    Tensor t_data new_shape new_strides
+
+-- Reshape: new shape, same data, recompute strides
+-- Caller must ensure same total element count
+tensor_reshape t new_shape = match t
+  | Tensor t_data t_shape t_st ->
+    let new_strides = compute_strides new_shape
+    Tensor t_data new_shape new_strides
+
+-- ============================================================
+-- Print utility for debugging
+-- ============================================================
+
+print_row t n_cols i j =
+  if j >= n_cols then
+    let _ = print ""
+    0
+  else
+    let v = tensor_get t [i, j]
+    let _ = print (cat ["  ", show_float v])
+    print_row t n_cols i (j + 1)
+
+print_rows t n_rows n_cols i =
+  if i >= n_rows then 0
+  else
+    let _ = print_row t n_cols i 0
+    print_rows t n_rows n_cols (i + 1)
+
+tensor_print_2d t =
+  let s = tensor_shape t
+  let rows = head s
+  let cols = head (tail s)
+  print_rows t rows cols 0
+
+-- ============================================================
+-- Test / main
+-- ============================================================
+
+main =
+  -- Create A = [[1,2,3],[4,5,6]] (2x3)
+  let a = tensor_new [2, 3] 0.0
+  let _ = tensor_set a [0, 0] 1.0
+  let _ = tensor_set a [0, 1] 2.0
+  let _ = tensor_set a [0, 2] 3.0
+  let _ = tensor_set a [1, 0] 4.0
+  let _ = tensor_set a [1, 1] 5.0
+  let _ = tensor_set a [1, 2] 6.0
+
+  -- Create B = [[7,8],[9,10],[11,12]] (3x2)
+  let b = tensor_new [3, 2] 0.0
+  let _ = tensor_set b [0, 0] 7.0
+  let _ = tensor_set b [0, 1] 8.0
+  let _ = tensor_set b [1, 0] 9.0
+  let _ = tensor_set b [1, 1] 10.0
+  let _ = tensor_set b [2, 0] 11.0
+  let _ = tensor_set b [2, 1] 12.0
+
+  -- Matmul: A(2,3) @ B(3,2) = C(2,2)
+  -- Expected: [[58, 64], [139, 154]]
+  let c = matmul a b
+  let _ = print "=== Matmul A(2x3) @ B(3x2) ==="
+  let _ = print (cat ["C[0,0] = ", show_float (tensor_get c [0, 0]), " (expect 58)"])
+  let _ = print (cat ["C[0,1] = ", show_float (tensor_get c [0, 1]), " (expect 64)"])
+  let _ = print (cat ["C[1,0] = ", show_float (tensor_get c [1, 0]), " (expect 139)"])
+  let _ = print (cat ["C[1,1] = ", show_float (tensor_get c [1, 1]), " (expect 154)"])
+
+  -- Test element-wise ops
+  let _ = print "=== Element-wise ops ==="
+  let x = tensor_new [2, 2] 3.0
+  let y = tensor_new [2, 2] 2.0
+  let added = tensor_add x y
+  let _ = print (cat ["3+2 = ", show_float (tensor_get added [0, 0]), " (expect 5)"])
+  let subbed = tensor_sub x y
+  let _ = print (cat ["3-2 = ", show_float (tensor_get subbed [0, 0]), " (expect 1)"])
+  let mulled = tensor_mul x y
+  let _ = print (cat ["3*2 = ", show_float (tensor_get mulled [0, 0]), " (expect 6)"])
+  let scaled = tensor_scale x 10.0
+  let _ = print (cat ["3*10 = ", show_float (tensor_get scaled [0, 0]), " (expect 30)"])
+
+  -- Test activations
+  let _ = print "=== Activations ==="
+  let act = tensor_new [4, 1] 0.0
+  let _ = tensor_set act [0, 0] (0.0 - 2.0)
+  let _ = tensor_set act [1, 0] (0.0 - 1.0)
+  let _ = tensor_set act [2, 0] 0.0
+  let _ = tensor_set act [3, 0] 1.0
+  let r = tensor_relu act
+  let _ = print (cat ["relu(-2) = ", show_float (tensor_get r [0, 0]), " (expect 0)"])
+  let _ = print (cat ["relu(1)  = ", show_float (tensor_get r [3, 0]), " (expect 1)"])
+  let g = tensor_gelu act
+  let _ = print (cat ["gelu(1)  = ", show_float (tensor_get g [3, 0]), " (expect ~0.8412)"])
+
+  -- Test reductions
+  let _ = print "=== Reductions ==="
+  let vals = tensor_new [2, 2] 0.0
+  let _ = tensor_set vals [0, 0] 1.0
+  let _ = tensor_set vals [0, 1] 2.0
+  let _ = tensor_set vals [1, 0] 3.0
+  let _ = tensor_set vals [1, 1] 4.0
+  let s = tensor_sum vals
+  let _ = print (cat ["sum([1,2,3,4]) = ", show_float s, " (expect 10)"])
+  let m = tensor_mean vals
+  let _ = print (cat ["mean([1,2,3,4]) = ", show_float m, " (expect 2.5)"])
+
+  -- Test transpose
+  let _ = print "=== Transpose ==="
+  let _ = print (cat ["A shape: ", show (tensor_shape a)])
+  let at = tensor_transpose a
+  let _ = print (cat ["A^T shape: ", show (tensor_shape at)])
+  let _ = print (cat ["A^T[0,0] = ", show_float (tensor_get at [0, 0]), " (expect 1)"])
+  let _ = print (cat ["A^T[0,1] = ", show_float (tensor_get at [0, 1]), " (expect 4)"])
+  let _ = print (cat ["A^T[1,0] = ", show_float (tensor_get at [1, 0]), " (expect 2)"])
+  let _ = print (cat ["A^T[2,0] = ", show_float (tensor_get at [2, 0]), " (expect 3)"])
+
+  -- Test reshape
+  let _ = print "=== Reshape ==="
+  let flat = tensor_reshape vals [4]
+  let _ = print (cat ["reshape shape: ", show (tensor_shape flat)])
+  let _ = print (cat ["flat[2] = ", show_float (tensor_get flat [2]), " (expect 3)"])
+
+  -- Test tensor_zeros / tensor_ones
+  let _ = print "=== Zeros/Ones ==="
+  let z = tensor_zeros [2, 3]
+  let _ = print (cat ["zeros[0,0] = ", show_float (tensor_get z [0, 0]), " (expect 0)"])
+  let o = tensor_ones [2, 3]
+  let _ = print (cat ["ones[1,2] = ", show_float (tensor_get o [1, 2]), " (expect 1)"])
+
+  let _ = print "=== All tests passed ==="
+  0

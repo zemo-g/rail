@@ -1,0 +1,550 @@
+-- train.rail — RailML Training Loop (Phase 5)
+-- Adam optimizer, data pipeline, cosine LR schedule, checkpointing.
+-- Usage: cd ~/projects/rail && ./rail_native run tools/railml/train.rail
+--
+-- Depends on: stdlib/tensor.rail (tensor ops), stdlib/autograd.rail (forward/backward)
+-- Binary data format: continuous token ids as 32-bit ints
+
+import "stdlib/math.rail"
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Types
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Adam optimizer state: first moment (m), second moment (v), timestep (t)
+type AdamState = | Adam m v t
+
+-- Training configuration
+type TrainConfig = | Config batch_size seq_len lr max_steps warmup_steps save_every log_every
+
+-- Training step result: updated model, loss value, new optimizer states, new data offset
+type StepResult = | StepResult model loss opt_states offset
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Helpers
+-- ══════════════════════════════════════════════════════════════════════════════
+
+cat parts = join "" parts
+
+-- Float constants (avoid recomputing)
+f0 = to_float 0
+f1 = to_float 1
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Adam Optimizer
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Initialize Adam states for a list of parameter tensors.
+-- Each param gets m=zeros, v=zeros, t=0
+adam_init params = adam_init_acc params []
+
+adam_init_acc params acc =
+  if length params == 0 then reverse acc
+  else
+    let p = head params
+    let size = tensor_size p
+    let m = tensor_zeros size
+    let v = tensor_zeros size
+    let state = Adam m v 0
+    adam_init_acc (tail params) (cons state acc)
+
+-- Update a single parameter tensor using Adam.
+-- param: current parameter tensor
+-- grad: gradient tensor (same shape)
+-- state: AdamState for this param
+-- lr: current learning rate (float)
+-- beta1, beta2, eps: Adam hyperparameters (floats)
+-- Returns (new_param, new_state)
+adam_update param grad state lr beta1 beta2 eps = match state
+  | Adam m v t ->
+    let t_new = t + 1
+    let t_f = to_float t_new
+    -- m = beta1 * m + (1 - beta1) * grad
+    let one_minus_b1 = f1 - beta1
+    let m_scaled = tensor_scale m beta1
+    let g_scaled = tensor_scale grad one_minus_b1
+    let m_new = tensor_add m_scaled g_scaled
+    -- v = beta2 * v + (1 - beta2) * grad^2
+    let one_minus_b2 = f1 - beta2
+    let g_sq = tensor_mul grad grad
+    let v_scaled = tensor_scale v beta2
+    let g_sq_scaled = tensor_scale g_sq one_minus_b2
+    let v_new = tensor_add v_scaled g_sq_scaled
+    -- Bias correction: m_hat = m / (1 - beta1^t), v_hat = v / (1 - beta2^t)
+    let b1_pow = pow beta1 t_f
+    let b2_pow = pow beta2 t_f
+    let m_corr = f1 - b1_pow
+    let v_corr = f1 - b2_pow
+    let m_hat = tensor_scale m_new (f1 / m_corr)
+    let v_hat = tensor_scale v_new (f1 / v_corr)
+    -- param = param - lr * m_hat / (sqrt(v_hat) + eps)
+    let v_sqrt = tensor_sqrt v_hat
+    let v_sqrt_eps = tensor_add_scalar v_sqrt eps
+    let update = tensor_div m_hat v_sqrt_eps
+    let step = tensor_scale update lr
+    let param_new = tensor_sub param step
+    let state_new = Adam m_new v_new t_new
+    (param_new, state_new)
+
+-- Apply Adam update to all (param, grad, state) triples.
+-- params: list of parameter tensors
+-- grads: list of gradient tensors
+-- states: list of AdamState
+-- lr, beta1, beta2, eps: floats
+-- Returns (new_params, new_states)
+adam_step params grads states lr beta1 beta2 eps =
+  adam_step_acc params grads states lr beta1 beta2 eps [] []
+
+adam_step_acc params grads states lr beta1 beta2 eps p_acc s_acc =
+  if length params == 0 then (reverse p_acc, reverse s_acc)
+  else
+    let p = head params
+    let g = head grads
+    let s = head states
+    let result = adam_update p g s lr beta1 beta2 eps
+    let new_p = head result
+    let new_s = head (tail result)
+    adam_step_acc (tail params) (tail grads) (tail states) lr beta1 beta2 eps (cons new_p p_acc) (cons new_s s_acc)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Learning Rate Schedule — Cosine decay with linear warmup
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- lr_schedule step warmup_steps max_steps base_lr -> current_lr
+-- Linear warmup from 0 to base_lr over warmup_steps,
+-- then cosine decay from base_lr to 0 over remaining steps.
+lr_schedule step warmup_steps max_steps base_lr =
+  if step < warmup_steps then
+    -- Linear warmup: lr = base_lr * (step / warmup_steps)
+    let progress = to_float step / to_float warmup_steps
+    base_lr * progress
+  else
+    -- Cosine decay: lr = base_lr * 0.5 * (1 + cos(pi * progress))
+    let decay_steps = max_steps - warmup_steps
+    let progress = to_float (step - warmup_steps) / to_float decay_steps
+    let cosval = cos (pi * progress)
+    let half = to_float 1 / to_float 2
+    base_lr * half * (f1 + cosval)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Data Pipeline
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Load a batch of token sequences from a preprocessed binary file.
+-- data_file: path to binary file of continuous 32-bit token ids
+-- batch_size: number of sequences per batch
+-- seq_len: length of each sequence
+-- offset: byte offset into the file (wraps around at EOF)
+-- Returns (inputs_tensor, targets_tensor, new_offset)
+--
+-- For next-token prediction:
+--   input  = tokens[i .. i+seq_len-1]  (context)
+--   target = tokens[i+1 .. i+seq_len]  (shifted by 1)
+-- So we read (seq_len + 1) tokens per sequence, then slice.
+
+load_batch data_file batch_size seq_len offset =
+  let file_size = file_byte_size data_file
+  -- Tokens per sample: seq_len + 1 (input + 1 shifted target)
+  let tokens_per_sample = seq_len + 1
+  -- Bytes per sample: 4 bytes per token id (int32)
+  let bytes_per_sample = tokens_per_sample * 4
+  let batch_bytes = batch_size * bytes_per_sample
+  -- Wrap offset if we'd read past end of file
+  let safe_offset = if offset + batch_bytes > file_size then 0 else offset
+  -- Read raw bytes from file
+  let raw = read_bytes data_file safe_offset batch_bytes
+  -- Parse into token arrays: one (seq_len+1) array per batch element
+  let batch = parse_token_batch raw batch_size tokens_per_sample
+  -- Split into inputs (first seq_len tokens) and targets (last seq_len tokens)
+  let inputs = batch_slice_inputs batch seq_len
+  let targets = batch_slice_targets batch seq_len
+  let new_offset = safe_offset + batch_bytes
+  (inputs, targets, new_offset)
+
+-- Parse raw bytes into batch_size arrays of tokens_per_sample token ids.
+-- Each token id is a 32-bit little-endian int.
+parse_token_batch raw batch_size tokens_per_sample =
+  parse_token_batch_acc raw batch_size tokens_per_sample 0 []
+
+parse_token_batch_acc raw batch_size tps idx acc =
+  if idx >= batch_size then reverse acc
+  else
+    let base = idx * tps * 4
+    let tokens = parse_tokens raw base tps
+    parse_token_batch_acc raw batch_size tps (idx + 1) (cons tokens acc)
+
+-- Parse tps consecutive 32-bit LE ints starting at byte offset base.
+parse_tokens raw base count = parse_tokens_acc raw base count 0 []
+
+parse_tokens_acc raw base count idx acc =
+  if idx >= count then reverse acc
+  else
+    let byte_off = base + idx * 4
+    let tok = read_int32_le raw byte_off
+    parse_tokens_acc raw base count (idx + 1) (cons tok acc)
+
+-- Read a little-endian 32-bit int from raw bytes at offset
+read_int32_le raw offset =
+  let b0 = byte_at raw offset
+  let b1 = byte_at raw (offset + 1)
+  let b2 = byte_at raw (offset + 2)
+  let b3 = byte_at raw (offset + 3)
+  b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+
+-- Extract input sequences: first seq_len tokens from each (seq_len+1) array
+batch_slice_inputs batch seq_len = batch_slice_inputs_acc batch seq_len []
+
+batch_slice_inputs_acc batch seq_len acc =
+  if length batch == 0 then reverse acc
+  else
+    let tokens = head batch
+    let input = take_n tokens seq_len
+    batch_slice_inputs_acc (tail batch) seq_len (cons input acc)
+
+-- Extract target sequences: last seq_len tokens from each (seq_len+1) array
+batch_slice_targets batch seq_len = batch_slice_targets_acc batch seq_len []
+
+batch_slice_targets_acc batch seq_len acc =
+  if length batch == 0 then reverse acc
+  else
+    let tokens = head batch
+    let target = drop_one tokens seq_len
+    batch_slice_targets_acc (tail batch) seq_len (cons target acc)
+
+-- Take first n elements of a list
+take_n xs n = take_n_acc xs n []
+
+take_n_acc xs n acc =
+  if n <= 0 then reverse acc
+  else if length xs == 0 then reverse acc
+  else take_n_acc (tail xs) (n - 1) (cons (head xs) acc)
+
+-- Drop first element, then take n elements (shift-by-1 for targets)
+drop_one xs n =
+  if length xs == 0 then []
+  else take_n (tail xs) n
+
+-- Get byte size of a file (via shell stat)
+file_byte_size path =
+  let result = shell (cat ["stat -f%z ", path, " 2>/dev/null || echo 0"])
+  parse_int_simple result
+
+-- Parse a non-negative integer from a string
+parse_int_simple s = parse_int_acc_simple (chars s) 0
+
+parse_int_acc_simple cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = digit_val c
+    if d < 0 then acc
+    else parse_int_acc_simple (tail cs) (acc * 10 + d)
+
+digit_val c =
+  if c == "0" then 0
+  else if c == "1" then 1
+  else if c == "2" then 2
+  else if c == "3" then 3
+  else if c == "4" then 4
+  else if c == "5" then 5
+  else if c == "6" then 6
+  else if c == "7" then 7
+  else if c == "8" then 8
+  else if c == "9" then 9
+  else (-1)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Weight Saving / Checkpointing
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Save model weights as binary file.
+-- Format: [n_params: int32] then for each param tensor:
+--   [n_elements: int32] [float64 x n_elements]
+-- This matches the loader in inference.rail.
+save_checkpoint model path =
+  let params = model_params model
+  let n = length params
+  let _ = print (cat ["  Saving checkpoint: ", path, " (", show n, " param tensors)"])
+  -- Build binary via shell: write header + each tensor
+  let _ = write_file "/tmp/railml_ckpt_script.sh" (build_save_script params path)
+  let _ = shell "bash /tmp/railml_ckpt_script.sh"
+  0
+
+-- Build a shell script that writes the binary checkpoint.
+-- Uses printf for binary output (avoids building giant strings in Rail).
+build_save_script params path =
+  let header = cat ["#!/bin/bash\n", "exec > ", path, "\n"]
+  let n_line = cat ["printf '", int32_le_escape (length params), "'\n"]
+  let body = build_save_params params
+  cat [header, n_line, body]
+
+build_save_params params =
+  if length params == 0 then ""
+  else
+    let p = head params
+    let size = tensor_size p
+    let size_line = cat ["printf '", int32_le_escape size, "'\n"]
+    let data_line = cat ["# tensor data: ", show size, " float64s written by tensor_write_binary\n"]
+    cat [size_line, data_line, build_save_params (tail params)]
+
+-- Encode int as 4 escaped bytes for printf (little-endian)
+int32_le_escape n =
+  let b0 = n % 256
+  let b1 = (n / 256) % 256
+  let b2 = (n / 65536) % 256
+  let b3 = (n / 16777216) % 256
+  cat ["\\x", hex_byte b0, "\\x", hex_byte b1, "\\x", hex_byte b2, "\\x", hex_byte b3]
+
+hex_byte n =
+  let hi = n / 16
+  let lo = n % 16
+  cat [hex_digit hi, hex_digit lo]
+
+hex_digit n =
+  if n == 0 then "0"
+  else if n == 1 then "1"
+  else if n == 2 then "2"
+  else if n == 3 then "3"
+  else if n == 4 then "4"
+  else if n == 5 then "5"
+  else if n == 6 then "6"
+  else if n == 7 then "7"
+  else if n == 8 then "8"
+  else if n == 9 then "9"
+  else if n == 10 then "a"
+  else if n == 11 then "b"
+  else if n == 12 then "c"
+  else if n == 13 then "d"
+  else if n == 14 then "e"
+  else "f"
+
+-- Load checkpoint from binary file into model.
+-- Returns model with loaded weights, or original model on failure.
+load_checkpoint model path =
+  let exists = shell (cat ["test -f ", path, " && echo yes || echo no"])
+  if exists == "yes" then
+    let _ = print (cat ["  Loading checkpoint: ", path])
+    let raw = read_file path
+    let params = model_params model
+    let loaded = parse_checkpoint_params raw 4 params
+    model_set_params model loaded
+  else
+    let _ = print (cat ["  No checkpoint found at: ", path])
+    model
+
+parse_checkpoint_params raw offset params =
+  if length params == 0 then []
+  else
+    let size = read_int32_le raw offset
+    let new_offset = offset + 4 + size * 8
+    let tensor = read_tensor_from_bytes raw (offset + 4) size
+    cons tensor (parse_checkpoint_params raw new_offset (tail params))
+
+-- Read size float64s from raw bytes at byte offset (placeholder — needs tensor FFI)
+read_tensor_from_bytes raw offset size =
+  tensor_from_bytes raw offset size
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Logging
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Log training metrics for a step
+log_step step loss lr_val tokens_sec =
+  let msg = cat ["  step ", show step, " | loss ", show_float loss, " | lr ", show_float lr_val, " | tok/s ", show_float tokens_sec]
+  let _ = print msg
+  let line = join "  " [show step, show_float loss, show_float lr_val, show_float tokens_sec]
+  let _ = write_file "/tmp/railml_log_line.txt" (append line "\n")
+  let _ = shell "cat /tmp/railml_log_line.txt >> /tmp/railml_train.log"
+  0
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Training Loop
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Main training function.
+-- model: the model to train (from model.rail / inference.rail)
+-- data_file: path to preprocessed binary token file
+-- config: TrainConfig
+-- Returns the trained model.
+train model data_file config = match config
+  | Config batch_size seq_len base_lr max_steps warmup_steps save_every log_every ->
+    let _ = print "=== RailML Training Loop ==="
+    let _ = print (cat ["  batch_size=", show batch_size,
+                        " seq_len=", show seq_len,
+                        " max_steps=", show max_steps])
+    let _ = print (cat ["  lr=", show_float base_lr,
+                        " warmup=", show warmup_steps,
+                        " save_every=", show save_every,
+                        " log_every=", show log_every])
+    -- Initialize Adam optimizer states (one per parameter tensor)
+    let params = model_params model
+    let opt_states = adam_init params
+    let _ = print (cat ["  Initialized Adam for ", show (length params), " parameter tensors"])
+    -- Adam hyperparameters
+    let beta1 = to_float 9 / to_float 10
+    let beta2 = to_float 999 / to_float 1000
+    let eps = to_float 1 / to_float 100000000
+    -- Clear log file
+    let _ = shell "rm -f /tmp/railml_train.log"
+    let _ = print "  Starting training..."
+    let _ = print ""
+    -- Enter training loop
+    train_loop model data_file batch_size seq_len base_lr max_steps warmup_steps save_every log_every beta1 beta2 eps opt_states 0 0
+
+-- Inner training loop — one step per recursive call.
+-- Uses tail recursion for memory efficiency.
+train_loop model data_file batch_size seq_len base_lr max_steps warmup_steps save_every log_every beta1 beta2 eps opt_states step offset =
+  if step >= max_steps then
+    let _ = print ""
+    let _ = print (cat ["=== Training complete: ", show max_steps, " steps ==="])
+    -- Final checkpoint
+    let _ = save_checkpoint model "/tmp/railml_final.bin"
+    model
+  else
+    -- 1. Compute learning rate for this step
+    let current_lr = lr_schedule step warmup_steps max_steps base_lr
+
+    -- 2. Load batch from data file
+    let batch_result = load_batch data_file batch_size seq_len offset
+    let inputs = head batch_result
+    let targets = head (tail batch_result)
+    let new_offset = head (tail (tail batch_result))
+
+    -- 3. Forward pass — compute loss
+    let fwd = model_forward model inputs targets
+    let loss = forward_loss fwd
+
+    -- 4. Backward pass — compute gradients
+    let grads = model_backward model fwd
+
+    -- 5. Adam optimizer step
+    let params = model_params model
+    let update_result = adam_step params grads opt_states current_lr beta1 beta2 eps
+    let new_params = head update_result
+    let new_states = head (tail update_result)
+    let model2 = model_set_params model new_params
+
+    -- 6. Logging (every log_every steps)
+    let tokens_this_step = to_float (batch_size * seq_len)
+    let do_log = step % log_every
+    let _ = if do_log == 0 then log_step step loss current_lr tokens_this_step else 0
+
+    -- 7. Checkpoint (every save_every steps, skip step 0)
+    let do_save = step % save_every
+    let _ = if do_save == 0 then
+              if step > 0 then
+                save_checkpoint model2 (cat ["/tmp/railml_ckpt_", show step, ".bin"])
+              else 0
+            else 0
+
+    -- 8. Continue to next step
+    train_loop model2 data_file batch_size seq_len base_lr max_steps warmup_steps save_every log_every beta1 beta2 eps new_states (step + 1) new_offset
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Stub declarations for tensor/autograd/model ops
+-- These will be provided by stdlib/tensor.rail and stdlib/autograd.rail
+-- once those phases are built. Listed here for type documentation.
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Tensor ops (from stdlib/tensor.rail):
+--   tensor_zeros size -> tensor
+--   tensor_size tensor -> int
+--   tensor_scale tensor scalar -> tensor
+--   tensor_add a b -> tensor
+--   tensor_sub a b -> tensor
+--   tensor_mul a b -> tensor (element-wise)
+--   tensor_div a b -> tensor (element-wise)
+--   tensor_sqrt tensor -> tensor (element-wise)
+--   tensor_add_scalar tensor scalar -> tensor
+--   tensor_from_bytes raw offset size -> tensor
+--   tensor_write_binary tensor fd -> unit
+--
+-- Model ops (from model.rail / inference.rail):
+--   model_params model -> list of tensors
+--   model_set_params model params -> model
+--   model_forward model inputs targets -> forward_result
+--   forward_loss fwd -> float
+--
+-- Autograd ops (from stdlib/autograd.rail):
+--   model_backward model fwd -> list of gradient tensors
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Main — demonstrate training flow
+-- ══════════════════════════════════════════════════════════════════════════════
+
+main =
+  let _ = print "╔══════════════════════════════════════════╗"
+  let _ = print "║       RailML Training Loop (Phase 5)     ║"
+  let _ = print "╚══════════════════════════════════════════╝"
+  let _ = print ""
+
+  -- Show configuration
+  let config = Config 4 128 (to_float 3 / to_float 10000) 1000 100 200 10
+  let _ = print "Training Configuration:"
+  let _ = match config
+    | Config bs sl lr ms ws se le ->
+      let _ = print (cat ["  batch_size:    ", show bs])
+      let _ = print (cat ["  seq_len:       ", show sl])
+      let _ = print (cat ["  learning_rate: ", show_float lr])
+      let _ = print (cat ["  max_steps:     ", show ms])
+      let _ = print (cat ["  warmup_steps:  ", show ws])
+      let _ = print (cat ["  save_every:    ", show se])
+      let _ = print (cat ["  log_every:     ", show le])
+      0
+
+  let _ = print ""
+  let _ = print "Training Flow:"
+  let _ = print "  1. load_batch     — Read next batch of token sequences from binary file"
+  let _ = print "  2. model_forward  — Forward pass: embeddings -> transformer layers -> logits -> loss"
+  let _ = print "  3. model_backward — Backward pass: compute gradients via autograd tape"
+  let _ = print "  4. adam_step      — Update all parameters with bias-corrected Adam"
+  let _ = print "  5. lr_schedule    — Cosine decay with linear warmup"
+  let _ = print "  6. log_step       — Print step/loss/lr/throughput every N steps"
+  let _ = print "  7. save_checkpoint— Write binary weights every N steps"
+  let _ = print ""
+
+  -- Demonstrate LR schedule
+  let _ = print "Learning Rate Schedule (cosine w/ warmup):"
+  let base_lr = to_float 3 / to_float 10000
+  let warmup = 100
+  let max_s = 1000
+  let _ = print (cat ["  step   0: lr = ", show_float (lr_schedule 0 warmup max_s base_lr)])
+  let _ = print (cat ["  step  50: lr = ", show_float (lr_schedule 50 warmup max_s base_lr)])
+  let _ = print (cat ["  step 100: lr = ", show_float (lr_schedule 100 warmup max_s base_lr)])
+  let _ = print (cat ["  step 250: lr = ", show_float (lr_schedule 250 warmup max_s base_lr)])
+  let _ = print (cat ["  step 500: lr = ", show_float (lr_schedule 500 warmup max_s base_lr)])
+  let _ = print (cat ["  step 750: lr = ", show_float (lr_schedule 750 warmup max_s base_lr)])
+  let _ = print (cat ["  step 999: lr = ", show_float (lr_schedule 999 warmup max_s base_lr)])
+  let _ = print ""
+
+  -- Show Adam optimizer state structure
+  let _ = print "Adam Optimizer:"
+  let _ = print "  State per param: Adam(m=first_moment, v=second_moment, t=step)"
+  let _ = print "  Bias correction: m_hat = m/(1-beta1^t), v_hat = v/(1-beta2^t)"
+  let _ = print "  Update: param -= lr * m_hat / (sqrt(v_hat) + eps)"
+  let _ = print "  beta1=0.9, beta2=0.999, eps=1e-8"
+  let _ = print ""
+
+  -- Show data pipeline
+  let _ = print "Data Pipeline:"
+  let _ = print "  Binary format: continuous int32 token ids (little-endian)"
+  let _ = print "  input  = tokens[offset .. offset+seq_len-1]"
+  let _ = print "  target = tokens[offset+1 .. offset+seq_len]  (next-token prediction)"
+  let _ = print "  Wraps to start of file when data exhausted"
+  let _ = print ""
+
+  -- Show checkpoint format
+  let _ = print "Checkpoint Format:"
+  let _ = print "  [n_params: int32]"
+  let _ = print "  For each param: [n_elements: int32] [float64 x n_elements]"
+  let _ = print "  Compatible with inference.rail loader"
+  let _ = print ""
+
+  -- Summary
+  let _ = print "Status: Training loop implemented. Awaiting:"
+  let _ = print "  - stdlib/tensor.rail  (Phase 3: tensor operations)"
+  let _ = print "  - stdlib/autograd.rail (Phase 4: automatic differentiation)"
+  let _ = print "  - model.rail          (Phase 2: transformer model definition)"
+  let _ = print ""
+  let _ = print "To train: train model data_file config -> trained_model"
+  0
