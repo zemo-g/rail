@@ -1,0 +1,818 @@
+-- stdlib/autograd.rail — Automatic differentiation for RailML
+-- Import: import "stdlib/autograd.rail"
+--
+-- Phase 4 of 6: Reverse-mode autodiff (backpropagation) over tensor operations.
+--
+-- Design:
+--   Every tracked operation records itself on a "tape" — a list of entries that
+--   store the backward function tag, captured forward values, and parent indices.
+--   The backward pass walks the tape in reverse, applying the chain rule to
+--   accumulate gradients for every parameter.
+--
+-- CRITICAL: Rail lambdas can segfault when used as closures that capture values.
+--   All backward functions are named top-level functions with explicit parameters.
+--   The tape stores a tag string identifying which backward function to call,
+--   plus captured forward values needed by that function.
+--
+-- Tensor representation (assumed from stdlib/tensor.rail):
+--   A Tensor is (shape, data) where shape is a list of ints and data is a float array.
+--   shape = [rows, cols] for 2D, [n] for 1D.
+--   Operations: tensor_new, tensor_get, tensor_set, tensor_shape, tensor_data,
+--               tensor_add, tensor_sub, tensor_mul (elementwise), tensor_matmul,
+--               tensor_transpose, tensor_scale, tensor_zeros, tensor_ones,
+--               tensor_zeros_like, tensor_size, tensor_reshape, tensor_sum,
+--               tensor_map, tensor_map2, tensor_from_list, tensor_to_list,
+--               tensor_fill, tensor_copy, tensor_slice_row
+--
+-- All functions prefixed with ag_ to avoid namespace collisions.
+
+-- ============================================================================
+-- CORE TYPES
+-- ============================================================================
+
+-- TrackedTensor: wraps a Tensor value with its position on the computation tape.
+--   | Tracked value tape_idx
+--     value    : the forward-pass Tensor result
+--     tape_idx : index into the global tape (-1 means leaf / no backward)
+--
+-- We do NOT store a grad_fn closure. Instead, the tape entry at tape_idx holds
+-- a tag string + captured values, and ag_backward dispatches on the tag.
+
+type TrackedTensor = | Tracked value tape_idx
+
+-- TapeEntry: one node in the computation graph.
+--   | TapeEntry tag captures parents
+--     tag      : string identifying the backward operation (e.g. "matmul", "relu")
+--     captures : list of tensors captured from the forward pass (needed by backward)
+--     parents  : list of tape indices for inputs (-1 means leaf, skip)
+
+type TapeEntry = | TapeEntry tag captures parents
+
+-- The tape is built as a plain list. We append to the end (cons + reverse at
+-- the end would work, but for clarity we use an accumulator pattern).
+-- In practice, the caller threads the tape through each operation.
+
+-- ============================================================================
+-- TAPE MANAGEMENT
+-- ============================================================================
+
+-- ag_tape_new: create an empty tape
+ag_tape_new _ = []
+
+-- ag_tape_push: append an entry, return (new_tape, index_of_new_entry)
+-- Index = length of tape before push (0-based).
+ag_tape_push tape entry =
+  let idx = length tape
+  let new_tape = append tape [entry]
+  (new_tape, idx)
+
+-- ag_tape_get: retrieve entry at index i
+ag_tape_get tape i = ag_tape_get_acc tape i 0
+
+ag_tape_get_acc tape i cur =
+  if length tape == 0 then TapeEntry "noop" [] []
+  else if cur == i then head tape
+  else ag_tape_get_acc (tail tape) i (cur + 1)
+
+-- ============================================================================
+-- LEAF CREATION (parameters and inputs)
+-- ============================================================================
+
+-- ag_param: wrap a Tensor as a tracked leaf parameter (no backward, tape_idx = -1).
+-- Leaves are the starting points of the graph. Their gradients are what we want.
+ag_param t = Tracked t (-1)
+
+-- ag_param_on_tape: register a leaf on the tape so we can accumulate its gradient.
+-- Returns (tape, TrackedTensor).
+ag_param_on_tape tape t =
+  let entry = TapeEntry "leaf" [] []
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked t idx)
+
+-- ag_value: extract the raw Tensor from a TrackedTensor
+ag_value tt = match tt
+  | Tracked v _ -> v
+
+-- ag_tape_idx: extract the tape index from a TrackedTensor
+ag_tape_idx tt = match tt
+  | Tracked _ i -> i
+
+-- ============================================================================
+-- FORWARD + RECORD: TRACKED OPERATIONS
+-- ============================================================================
+-- Each tracked_* function:
+--   1. Computes the forward result using tensor ops
+--   2. Pushes a TapeEntry recording tag + captured values + parent indices
+--   3. Returns (tape, TrackedTensor)
+
+-- ----------------------------------------------------------------------------
+-- tracked_matmul: C = A @ B
+-- ----------------------------------------------------------------------------
+-- Forward: C = matmul(A, B)
+--   where A is [m, k], B is [k, n], C is [m, n]
+--
+-- Backward (chain rule for matrix multiply):
+--   dA = dC @ B^T       (gradient w.r.t. left input)
+--   dB = A^T @ dC       (gradient w.r.t. right input)
+--
+-- Captures: [A_value, B_value] — needed to compute the transpose in backward.
+-- Parents: [a_idx, b_idx]
+
+tracked_matmul tape a b =
+  let a_val = ag_value a
+  let b_val = ag_value b
+  let c_val = tensor_matmul a_val b_val
+  let entry = TapeEntry "matmul" [a_val, b_val] [ag_tape_idx a, ag_tape_idx b]
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked c_val idx)
+
+-- Backward for matmul: given upstream gradient dC, produce [dA, dB]
+-- dA = dC @ B^T
+-- dB = A^T @ dC
+ag_backward_matmul captures upstream =
+  let a_val = head captures
+  let b_val = head (tail captures)
+  let da = tensor_matmul upstream (tensor_transpose b_val)
+  let db = tensor_matmul (tensor_transpose a_val) upstream
+  [da, db]
+
+-- ----------------------------------------------------------------------------
+-- tracked_add: C = A + B   (elementwise)
+-- ----------------------------------------------------------------------------
+-- Forward: C_ij = A_ij + B_ij
+--
+-- Backward:
+--   dA = dC   (addition distributes gradient equally)
+--   dB = dC
+--
+-- Captures: [] — addition backward needs no forward values.
+-- Parents: [a_idx, b_idx]
+
+tracked_add tape a b =
+  let a_val = ag_value a
+  let b_val = ag_value b
+  let c_val = tensor_add a_val b_val
+  let entry = TapeEntry "add" [] [ag_tape_idx a, ag_tape_idx b]
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked c_val idx)
+
+-- Backward for add: gradient passes through unchanged to both inputs
+ag_backward_add captures upstream =
+  [upstream, upstream]
+
+-- ----------------------------------------------------------------------------
+-- tracked_sub: C = A - B   (elementwise)
+-- ----------------------------------------------------------------------------
+-- Forward: C_ij = A_ij - B_ij
+--
+-- Backward:
+--   dA = dC
+--   dB = -dC   (subtraction negates the gradient for the right operand)
+--
+-- Captures: [] — subtraction backward needs no forward values.
+-- Parents: [a_idx, b_idx]
+
+tracked_sub tape a b =
+  let a_val = ag_value a
+  let b_val = ag_value b
+  let c_val = tensor_sub a_val b_val
+  let entry = TapeEntry "sub" [] [ag_tape_idx a, ag_tape_idx b]
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked c_val idx)
+
+-- Backward for sub: dA = dC, dB = -dC
+ag_backward_sub captures upstream =
+  let neg_upstream = tensor_scale (to_float (-1)) upstream
+  [upstream, neg_upstream]
+
+-- ----------------------------------------------------------------------------
+-- tracked_mul: C = A * B   (Hadamard / elementwise product)
+-- ----------------------------------------------------------------------------
+-- Forward: C_ij = A_ij * B_ij
+--
+-- Backward (product rule, elementwise):
+--   dA = dC * B   (elementwise: each dA_ij = dC_ij * B_ij)
+--   dB = dC * A   (elementwise: each dB_ij = dC_ij * A_ij)
+--
+-- Captures: [A_value, B_value] — needed to cross-multiply in backward.
+-- Parents: [a_idx, b_idx]
+
+tracked_mul tape a b =
+  let a_val = ag_value a
+  let b_val = ag_value b
+  let c_val = tensor_mul a_val b_val
+  let entry = TapeEntry "mul" [a_val, b_val] [ag_tape_idx a, ag_tape_idx b]
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked c_val idx)
+
+-- Backward for Hadamard product
+-- dA_ij = upstream_ij * B_ij
+-- dB_ij = upstream_ij * A_ij
+ag_backward_mul captures upstream =
+  let a_val = head captures
+  let b_val = head (tail captures)
+  let da = tensor_mul upstream b_val
+  let db = tensor_mul upstream a_val
+  [da, db]
+
+-- ----------------------------------------------------------------------------
+-- tracked_relu: Y = max(0, X)   (elementwise)
+-- ----------------------------------------------------------------------------
+-- Forward: Y_i = max(0, X_i)
+--
+-- Backward:
+--   dX_i = dY_i * 1{X_i > 0}
+--   The gradient passes through where the input was positive, and is zeroed
+--   where the input was zero or negative. This is the "dying ReLU" issue —
+--   once a unit goes negative, it stops learning.
+--
+-- Captures: [X_value] — needed to compute the mask (X > 0).
+-- Parents: [x_idx]
+
+tracked_relu tape x =
+  let x_val = ag_value x
+  let y_val = tensor_relu x_val
+  let entry = TapeEntry "relu" [x_val] [ag_tape_idx x]
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked y_val idx)
+
+-- Backward for ReLU: mask = (X > 0), dX = upstream * mask
+-- tensor_relu_mask returns a tensor of 1.0 where X > 0, 0.0 elsewhere
+ag_backward_relu captures upstream =
+  let x_val = head captures
+  let mask = tensor_relu_mask x_val
+  let dx = tensor_mul upstream mask
+  [dx]
+
+-- ----------------------------------------------------------------------------
+-- tracked_gelu: Y = GELU(X)   (Gaussian Error Linear Unit)
+-- ----------------------------------------------------------------------------
+-- Forward: Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X + 0.044715 * X^3)))
+--   This is the "tanh approximation" of GELU used in GPT-2/BERT.
+--   Exact GELU is x * Phi(x) where Phi is the standard normal CDF.
+--
+-- Backward:
+--   Let u = sqrt(2/pi) * (x + 0.044715 * x^3)
+--   Let s = tanh(u)
+--   GELU'(x) = 0.5 * (1 + s) + 0.5 * x * (1 - s^2) * sqrt(2/pi) * (1 + 0.134145 * x^2)
+--   Note: 0.134145 = 3 * 0.044715
+--   dX = upstream * GELU'(X)   (elementwise)
+--
+-- Captures: [X_value] — needed to recompute the activation derivative.
+-- Parents: [x_idx]
+
+tracked_gelu tape x =
+  let x_val = ag_value x
+  let y_val = tensor_gelu x_val
+  let entry = TapeEntry "gelu" [x_val] [ag_tape_idx x]
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked y_val idx)
+
+-- Backward for GELU: dX = upstream * gelu_derivative(X)
+-- gelu_derivative is computed elementwise by tensor_gelu_backward
+ag_backward_gelu captures upstream =
+  let x_val = head captures
+  let dx = tensor_gelu_backward x_val upstream
+  [dx]
+
+-- ----------------------------------------------------------------------------
+-- tracked_softmax: Y = softmax(X)   (along last axis)
+-- ----------------------------------------------------------------------------
+-- Forward: Y_i = exp(X_i - max(X)) / sum(exp(X_j - max(X)))
+--   The max subtraction is for numerical stability (prevents overflow).
+--   softmax converts logits to a probability distribution (all positive, sums to 1).
+--
+-- Backward:
+--   The Jacobian of softmax is: J_ij = Y_i * (delta_ij - Y_j)
+--   where delta_ij is the Kronecker delta.
+--   dX_i = sum_j (dY_j * J_ji) = Y_i * (dY_i - sum_j(dY_j * Y_j))
+--   Simplified: dX = Y * (dY - dot(dY, Y))
+--   where dot(dY, Y) is broadcast across the row.
+--
+-- Captures: [Y_value] — the softmax OUTPUT (not input) is needed for backward.
+-- Parents: [x_idx]
+
+tracked_softmax tape x =
+  let x_val = ag_value x
+  let y_val = tensor_softmax x_val
+  let entry = TapeEntry "softmax" [y_val] [ag_tape_idx x]
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked y_val idx)
+
+-- Backward for softmax:
+-- dX_i = Y_i * (dY_i - sum_j(dY_j * Y_j))
+-- This is the efficient form that avoids materializing the full Jacobian.
+ag_backward_softmax captures upstream =
+  let y_val = head captures
+  -- dot_val = sum of (upstream * y_val) elementwise, then broadcast
+  let dot_val = tensor_sum_last (tensor_mul upstream y_val)
+  -- dX = y * (upstream - dot_val_broadcast)
+  let dx = tensor_mul y_val (tensor_sub upstream (tensor_broadcast_last dot_val y_val))
+  [dx]
+
+-- ----------------------------------------------------------------------------
+-- tracked_layer_norm: Y = LayerNorm(X, gamma, beta)
+-- ----------------------------------------------------------------------------
+-- Forward:
+--   mu = mean(X, axis=-1)         — mean over last axis
+--   var = mean((X - mu)^2, axis=-1)  — variance over last axis
+--   X_hat = (X - mu) / sqrt(var + eps)  — normalize
+--   Y = gamma * X_hat + beta      — scale and shift
+--
+--   eps is a small constant (1e-5) for numerical stability.
+--   gamma and beta are learnable parameters (same shape as last axis).
+--
+-- Backward:
+--   This is one of the most complex backward passes. Let n = size of last axis.
+--   dX_hat = upstream * gamma
+--   dvar = sum(dX_hat * (X - mu) * (-0.5) * (var + eps)^(-3/2), axis=-1)
+--   dmu = sum(dX_hat * (-1/sqrt(var + eps)), axis=-1) + dvar * mean(-2*(X-mu), axis=-1)
+--   dX = dX_hat / sqrt(var + eps) + dvar * 2*(X - mu)/n + dmu/n
+--   dgamma = sum(upstream * X_hat, axis=batch)
+--   dbeta = sum(upstream, axis=batch)
+--
+-- Captures: [X_value, gamma_value, X_hat, inv_std]
+--   X_hat = (X - mu) / sqrt(var + eps)  — the normalized input
+--   inv_std = 1 / sqrt(var + eps)       — inverse standard deviation
+--   We store these intermediates to avoid recomputation in backward.
+-- Parents: [x_idx, gamma_idx, beta_idx]
+
+tracked_layer_norm tape x gamma beta =
+  let x_val = ag_value x
+  let gamma_val = ag_value gamma
+  let beta_val = ag_value beta
+  -- Forward: compute mean, variance, normalize, then scale+shift
+  let mu = tensor_mean_last x_val
+  let x_centered = tensor_sub x_val (tensor_broadcast_last mu x_val)
+  let var = tensor_mean_last (tensor_mul x_centered x_centered)
+  let eps = to_float 1 /. to_float 100000
+  let inv_std = tensor_map_scalar ag_inv_std_fn var eps
+  let x_hat = tensor_mul x_centered (tensor_broadcast_last inv_std x_val)
+  let y_val = tensor_add (tensor_mul_broadcast gamma_val x_hat) beta_val
+  let entry = TapeEntry "layer_norm" [x_val, gamma_val, x_hat, inv_std] [ag_tape_idx x, ag_tape_idx gamma, ag_tape_idx beta]
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked y_val idx)
+
+-- Helper: compute 1/sqrt(var + eps) for a single element
+ag_inv_std_fn v eps = to_float 1 /. sqrt (v +. eps)
+
+-- Backward for layer_norm:
+-- This implements the full backward pass through the normalization.
+ag_backward_layer_norm captures upstream =
+  let x_val = head captures
+  let gamma_val = head (tail captures)
+  let x_hat = head (tail (tail captures))
+  let inv_std = head (tail (tail (tail captures)))
+  -- n = size of last (normalization) axis
+  let shape = tensor_shape x_val
+  let n_float = to_float (last_dim shape)
+  -- dX_hat = upstream * gamma (broadcast gamma across batch dimension)
+  let dx_hat = tensor_mul_broadcast gamma_val upstream
+  -- dgamma = sum of (upstream * x_hat) across batch dimension
+  let dgamma = tensor_sum_batch (tensor_mul upstream x_hat)
+  -- dbeta = sum of upstream across batch dimension
+  let dbeta = tensor_sum_batch upstream
+  -- dX: use the simplified form for layer norm backward
+  -- dX = (1/n) * inv_std * (n * dx_hat - sum(dx_hat) - x_hat * sum(dx_hat * x_hat))
+  let sum_dx_hat = tensor_sum_last dx_hat
+  let sum_dx_hat_xhat = tensor_sum_last (tensor_mul dx_hat x_hat)
+  let term1 = tensor_scale n_float dx_hat
+  let term2 = tensor_broadcast_last sum_dx_hat dx_hat
+  let term3 = tensor_mul x_hat (tensor_broadcast_last sum_dx_hat_xhat dx_hat)
+  let dx_inner = tensor_sub (tensor_sub term1 term2) term3
+  let dx = tensor_mul (tensor_scale (to_float 1 /. n_float) dx_inner) (tensor_broadcast_last inv_std dx_inner)
+  [dx, dgamma, dbeta]
+
+-- Helper: get last dimension from shape list
+last_dim shape =
+  if length shape == 0 then 1
+  else if length (tail shape) == 0 then head shape
+  else last_dim (tail shape)
+
+-- ----------------------------------------------------------------------------
+-- tracked_cross_entropy: L = CrossEntropy(logits, targets)
+-- ----------------------------------------------------------------------------
+-- Forward:
+--   p = softmax(logits)           — convert logits to probabilities
+--   L = -sum(targets * log(p))    — cross-entropy loss (scalar)
+--
+--   For classification with integer targets (one-hot encoded internally):
+--   L = -log(p[target_class])     — negative log-likelihood
+--
+--   We use the numerically stable "log-sum-exp" form:
+--   L = -logits[target] + log(sum(exp(logits)))
+--
+-- Backward:
+--   The elegant result: dLogits = softmax(logits) - one_hot(targets)
+--   This is the combined gradient of softmax + cross-entropy, which is much
+--   simpler and more numerically stable than computing them separately.
+--   Each element: dLogits_i = p_i - 1{i == target}
+--
+-- Captures: [logits_value, targets_value, softmax_output]
+-- Parents: [logits_idx]
+--
+-- Note: targets is a list of integer class indices (not one-hot).
+
+tracked_cross_entropy tape logits targets =
+  let logits_val = ag_value logits
+  let targets_val = ag_value targets
+  let softmax_out = tensor_softmax logits_val
+  let loss_val = tensor_cross_entropy_loss softmax_out targets_val
+  let entry = TapeEntry "cross_entropy" [logits_val, targets_val, softmax_out] [ag_tape_idx logits]
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked loss_val idx)
+
+-- Backward for cross-entropy:
+-- dLogits = softmax(logits) - one_hot(targets)
+-- This is the famous "softmax - targets" gradient, one of the most elegant
+-- results in all of deep learning. The softmax and cross-entropy losses
+-- cancel out most of their complexity when combined.
+ag_backward_cross_entropy captures upstream =
+  let _logits_val = head captures
+  let targets_val = head (tail captures)
+  let softmax_out = head (tail (tail captures))
+  -- one_hot: tensor with 1.0 at target indices, 0.0 elsewhere
+  let one_hot = tensor_one_hot targets_val (tensor_shape softmax_out)
+  -- dLogits = (softmax_output - one_hot) * upstream_scalar
+  -- upstream is a scalar (loss gradient, typically 1.0), broadcast it
+  let dlogits = tensor_scale_by_loss (tensor_sub softmax_out one_hot) upstream
+  [dlogits]
+
+-- ----------------------------------------------------------------------------
+-- tracked_embedding: Y = Embedding(W, ids)
+-- ----------------------------------------------------------------------------
+-- Forward:
+--   Given weight matrix W of shape [vocab_size, embed_dim] and integer token
+--   ids of shape [seq_len], produce output Y of shape [seq_len, embed_dim]
+--   where Y[i] = W[ids[i]]   (table lookup, one row per token)
+--
+-- Backward:
+--   dW is a sparse gradient: for each position i, scatter-add the upstream
+--   gradient into the row corresponding to ids[i].
+--   dW[j] = sum over {i : ids[i] == j} of upstream[i]
+--
+--   This is the "scatter-add" operation — most rows of dW are zero, only the
+--   rows that were looked up receive gradient. This sparsity is exploited
+--   by optimizers for efficiency.
+--
+-- Captures: [W_value, ids_value, vocab_size]
+-- Parents: [w_idx]
+
+tracked_embedding tape weights ids =
+  let w_val = ag_value weights
+  let ids_val = ag_value ids
+  let y_val = tensor_embedding_lookup w_val ids_val
+  let vocab_size = head (tensor_shape w_val)
+  let entry = TapeEntry "embedding" [w_val, ids_val, tensor_from_int vocab_size] [ag_tape_idx weights]
+  let (tape2, idx) = ag_tape_push tape entry
+  (tape2, Tracked y_val idx)
+
+-- Backward for embedding: scatter-add upstream gradients back to weight rows.
+-- For each token position i, add upstream[i,:] to dW[ids[i],:].
+-- Most rows of dW remain zero (sparse gradient).
+ag_backward_embedding captures upstream =
+  let _w_val = head captures
+  let ids_val = head (tail captures)
+  let vocab_size_tensor = head (tail (tail captures))
+  let vocab_size = tensor_to_int vocab_size_tensor
+  let embed_dim = last_dim (tensor_shape upstream)
+  -- Create zero gradient matrix of shape [vocab_size, embed_dim]
+  let dw = tensor_zeros [vocab_size, embed_dim]
+  -- Scatter-add: for each position, accumulate upstream[pos,:] into dw[id,:]
+  let dw2 = ag_scatter_add dw ids_val upstream 0
+  [dw2]
+
+-- Scatter-add helper: iterate over positions, accumulating gradients
+ag_scatter_add dw ids upstream pos =
+  let seq_len = head (tensor_shape upstream)
+  if pos >= seq_len then dw
+  else
+    let token_id = tensor_get_int ids pos
+    let grad_row = tensor_slice_row upstream pos
+    let dw2 = tensor_accumulate_row dw token_id grad_row
+    ag_scatter_add dw2 ids upstream (pos + 1)
+
+-- ============================================================================
+-- BACKWARD PASS — REVERSE-MODE AUTODIFF
+-- ============================================================================
+
+-- ag_backward: given a tape and the index of the loss node, compute all gradients.
+--
+-- Algorithm:
+--   1. Initialize a gradient accumulator array (one Tensor per tape entry).
+--   2. Set grad[loss_idx] = ones (dL/dL = 1).
+--   3. Walk the tape in reverse order (from loss back to inputs).
+--   4. For each entry with a nonzero gradient:
+--      a. Look up its tag to determine which backward function to call.
+--      b. Call the backward function with (captures, upstream_grad) → [parent_grads].
+--      c. Accumulate each parent_grad into the corresponding parent's slot.
+--   5. Return the full gradient list (indexed by tape position).
+--
+-- This is the standard "tape-based reverse-mode AD" used by PyTorch, JAX, etc.
+-- Time complexity: O(tape_length), one backward call per forward op.
+
+ag_backward tape loss_idx =
+  let n = length tape
+  -- grad_table: mutable array of (Tensor | 0), one per tape entry
+  -- 0 means "no gradient accumulated yet"
+  let grad_table = arr_new n 0
+  -- Seed: dL/dL = 1.0 (scalar 1)
+  let loss_entry = ag_tape_get tape loss_idx
+  let loss_shape = ag_get_output_shape tape loss_idx
+  let _ = arr_set grad_table loss_idx (tensor_ones_like_shape loss_shape)
+  -- Walk tape in reverse
+  let _ = ag_backward_walk tape grad_table (n - 1)
+  -- Collect results: list of (tape_idx, gradient) for all leaves
+  ag_collect_leaf_grads tape grad_table 0 n
+
+-- Walk the tape backwards from index i down to 0
+ag_backward_walk tape grad_table i =
+  if i < 0 then 0
+  else
+    let upstream = arr_get grad_table i
+    -- Only process if this node has accumulated gradient (not 0)
+    let _ = if upstream == 0 then 0
+      else
+        let entry = ag_tape_get tape i
+        let grads = ag_dispatch_backward entry upstream
+        let parents = ag_entry_parents entry
+        let _ = ag_accumulate_grads grad_table parents grads 0
+        0
+    ag_backward_walk tape grad_table (i - 1)
+
+-- Dispatch to the correct backward function based on the tape entry tag
+ag_dispatch_backward entry upstream = match entry
+  | TapeEntry tag captures parents ->
+    if tag == "matmul" then ag_backward_matmul captures upstream
+    else if tag == "add" then ag_backward_add captures upstream
+    else if tag == "sub" then ag_backward_sub captures upstream
+    else if tag == "mul" then ag_backward_mul captures upstream
+    else if tag == "relu" then ag_backward_relu captures upstream
+    else if tag == "gelu" then ag_backward_gelu captures upstream
+    else if tag == "softmax" then ag_backward_softmax captures upstream
+    else if tag == "layer_norm" then ag_backward_layer_norm captures upstream
+    else if tag == "cross_entropy" then ag_backward_cross_entropy captures upstream
+    else if tag == "embedding" then ag_backward_embedding captures upstream
+    else if tag == "leaf" then []
+    else if tag == "noop" then []
+    else []
+
+-- Extract parents list from a TapeEntry
+ag_entry_parents entry = match entry
+  | TapeEntry _ _ parents -> parents
+
+-- Accumulate gradients into parent slots
+-- grads and parents are parallel lists: grads[j] goes to parents[j]
+ag_accumulate_grads grad_table parents grads j =
+  if length parents == 0 then 0
+  else if length grads == 0 then 0
+  else
+    let parent_idx = head parents
+    let grad = head grads
+    -- Only accumulate if parent_idx is valid (>= 0)
+    let _ = if parent_idx < 0 then 0
+      else
+        let existing = arr_get grad_table parent_idx
+        let new_grad = if existing == 0 then grad
+          else tensor_add existing grad
+        arr_set grad_table parent_idx new_grad
+    ag_accumulate_grads grad_table (tail parents) (tail grads) (j + 1)
+
+-- Get the output shape for a tape entry (for seeding the loss gradient)
+ag_get_output_shape tape idx =
+  let entry = ag_tape_get tape idx
+  -- For loss nodes, the output is typically scalar [1] or we infer from tag
+  -- Default to [1] (scalar loss)
+  [1]
+
+-- Collect leaf gradients: iterate through tape, return list of (idx, grad) pairs
+-- for entries tagged "leaf" that have nonzero gradients
+ag_collect_leaf_grads tape grad_table i n =
+  if i >= n then []
+  else
+    let entry = ag_tape_get tape i
+    let grad = arr_get grad_table i
+    let is_leaf = ag_is_leaf entry
+    let rest = ag_collect_leaf_grads tape grad_table (i + 1) n
+    if is_leaf then
+      if grad == 0 then rest
+      else cons (i, grad) rest
+    else rest
+
+-- Check if a tape entry is a leaf
+ag_is_leaf entry = match entry
+  | TapeEntry tag _ _ -> tag == "leaf"
+
+-- ============================================================================
+-- CONVENIENCE: FULL BACKWARD FROM LOSS
+-- ============================================================================
+
+-- ag_backward_loss: given tape and a tracked loss tensor, compute all parameter gradients.
+-- Returns list of (tape_idx, gradient_tensor) pairs for all leaf parameters.
+-- Usage:
+--   let (tape, loss) = tracked_cross_entropy tape logits targets
+--   let grads = ag_backward_loss tape loss
+--   -- grads is [(param1_idx, param1_grad), (param2_idx, param2_grad), ...]
+ag_backward_loss tape loss =
+  let loss_idx = ag_tape_idx loss
+  ag_backward tape loss_idx
+
+-- ag_get_grad: look up the gradient for a specific tracked parameter.
+-- Returns the gradient Tensor, or 0 if no gradient was computed.
+ag_get_grad grads tt =
+  let idx = ag_tape_idx tt
+  ag_find_grad grads idx
+
+ag_find_grad grads target_idx =
+  if length grads == 0 then 0
+  else
+    let (idx, grad) = head grads
+    if idx == target_idx then grad
+    else ag_find_grad (tail grads) target_idx
+
+-- ============================================================================
+-- GRADIENT CHECKING — NUMERICAL VERIFICATION
+-- ============================================================================
+
+-- ag_grad_check: verify analytical gradients against numerical approximation.
+--
+-- Method: Central finite differences
+--   numerical_grad_i = (f(x + eps*e_i) - f(x - eps*e_i)) / (2 * eps)
+--   where e_i is the i-th standard basis vector.
+--
+-- Returns: maximum relative error across all parameters.
+--   relative_error = |analytical - numerical| / max(|analytical|, |numerical|, 1e-8)
+--
+-- A relative error < 1e-5 indicates correct gradients.
+-- A relative error > 1e-3 indicates a bug.
+--
+-- Parameters:
+--   build_graph : function that takes (tape, param_tensor) -> (tape, loss_tracked)
+--                 This rebuilds the computation graph with a perturbed parameter.
+--   param       : the TrackedTensor whose gradient we are checking
+--   tape        : the computation tape
+--   analytical  : the analytically computed gradient (from ag_backward)
+--   eps         : perturbation size (typically 1e-5)
+
+ag_grad_check_param build_graph param tape analytical eps =
+  let param_val = ag_value param
+  let param_size = tensor_size param_val
+  ag_grad_check_loop build_graph param_val param_size analytical eps 0 (to_float 0)
+
+-- Loop over each element, compute numerical gradient, compare
+ag_grad_check_loop build_graph param_val n analytical eps i max_err =
+  if i >= n then max_err
+  else
+    let original = tensor_get_flat param_val i
+    -- f(x + eps)
+    let param_plus = tensor_set_flat (tensor_copy param_val) i (original +. eps)
+    let tape_plus = ag_tape_new 0
+    let (tape_plus2, param_plus_tracked) = ag_param_on_tape tape_plus param_plus
+    let (tape_plus3, loss_plus) = build_graph tape_plus2 param_plus_tracked
+    let f_plus = tensor_scalar_val (ag_value loss_plus)
+    -- f(x - eps)
+    let param_minus = tensor_set_flat (tensor_copy param_val) i (original -. eps)
+    let tape_minus = ag_tape_new 0
+    let (tape_minus2, param_minus_tracked) = ag_param_on_tape tape_minus param_minus
+    let (tape_minus3, loss_minus) = build_graph tape_minus2 param_minus_tracked
+    let f_minus = tensor_scalar_val (ag_value loss_minus)
+    -- Numerical gradient for element i: (f(x+eps) - f(x-eps)) / (2*eps)
+    let numerical_i = (f_plus -. f_minus) /. (to_float 2 *. eps)
+    -- Analytical gradient for element i
+    let analytical_i = tensor_get_flat analytical i
+    -- Relative error: |a - n| / max(|a|, |n|, 1e-8)
+    let diff = fabs (analytical_i -. numerical_i)
+    let denom = ag_max3_float (fabs analytical_i) (fabs numerical_i) (to_float 1 /. to_float 100000000)
+    let rel_err = diff /. denom
+    let new_max = if rel_err >. max_err then rel_err else max_err
+    ag_grad_check_loop build_graph param_val n analytical eps (i + 1) new_max
+
+-- Helper: max of three floats (no short-circuit needed, pure comparison)
+ag_max3_float a b c =
+  if a >. b then
+    if a >. c then a else c
+  else
+    if b >. c then b else c
+
+-- ============================================================================
+-- UTILITY FUNCTIONS
+-- ============================================================================
+
+-- ag_zero_grad: create a zero gradient tensor matching the shape of a TrackedTensor
+ag_zero_grad tt =
+  let shape = tensor_shape (ag_value tt)
+  tensor_zeros shape
+
+-- ag_ones_grad: create a ones gradient tensor (for seeding loss backward)
+ag_ones_grad tt =
+  let shape = tensor_shape (ag_value tt)
+  tensor_ones shape
+
+-- ag_grad_norm: compute L2 norm of a gradient tensor (for gradient clipping)
+-- ||g||_2 = sqrt(sum(g_i^2))
+ag_grad_norm grad =
+  let sq = tensor_mul grad grad
+  sqrt (tensor_sum_all sq)
+
+-- ag_clip_grad_norm: clip gradient by its L2 norm.
+-- If ||g|| > max_norm, scale g by max_norm / ||g||.
+-- This prevents exploding gradients in deep networks.
+ag_clip_grad_norm grad max_norm =
+  let norm = ag_grad_norm grad
+  if norm >. max_norm then
+    let scale = max_norm /. norm
+    tensor_scale scale grad
+  else grad
+
+-- ag_clip_all_grads: clip a list of (idx, grad) pairs by norm
+ag_clip_all_grads grads max_norm =
+  if length grads == 0 then []
+  else
+    let (idx, grad) = head grads
+    let clipped = ag_clip_grad_norm grad max_norm
+    cons (idx, clipped) (ag_clip_all_grads (tail grads) max_norm)
+
+-- ============================================================================
+-- TENSOR INTERFACE STUBS (expected from stdlib/tensor.rail)
+-- ============================================================================
+-- The following functions are expected to exist in stdlib/tensor.rail.
+-- They are listed here as documentation of the autograd contract.
+--
+-- Core:
+--   tensor_new shape data_list -> Tensor
+--   tensor_zeros shape -> Tensor
+--   tensor_ones shape -> Tensor
+--   tensor_ones_like_shape shape -> Tensor
+--   tensor_shape t -> [int]
+--   tensor_size t -> int
+--   tensor_copy t -> Tensor  (deep copy, needed for perturbation in grad_check)
+--   tensor_get_flat t i -> float  (get i-th element in flat storage)
+--   tensor_set_flat t i v -> Tensor  (set i-th element, returns modified tensor)
+--   tensor_scalar_val t -> float  (extract scalar from a [1]-shaped tensor)
+--   tensor_from_int n -> Tensor  (wrap an int as a scalar tensor for captures)
+--   tensor_to_int t -> int  (extract int from scalar tensor)
+--
+-- Arithmetic (elementwise):
+--   tensor_add a b -> Tensor
+--   tensor_sub a b -> Tensor
+--   tensor_mul a b -> Tensor  (Hadamard / elementwise)
+--   tensor_scale s t -> Tensor  (scalar * tensor)
+--
+-- Linear algebra:
+--   tensor_matmul a b -> Tensor  (matrix multiply)
+--   tensor_transpose t -> Tensor  (2D transpose)
+--
+-- Activations:
+--   tensor_relu t -> Tensor  (max(0, x) elementwise)
+--   tensor_relu_mask t -> Tensor  (1.0 where t > 0, 0.0 elsewhere)
+--   tensor_gelu t -> Tensor  (GELU activation)
+--   tensor_gelu_backward x upstream -> Tensor  (GELU derivative * upstream)
+--   tensor_softmax t -> Tensor  (softmax along last axis)
+--
+-- Reductions:
+--   tensor_sum_all t -> float  (sum of all elements)
+--   tensor_sum_last t -> Tensor  (sum along last axis, reducing last dim)
+--   tensor_sum_batch t -> Tensor  (sum along first/batch axis)
+--   tensor_mean_last t -> Tensor  (mean along last axis)
+--
+-- Broadcasting:
+--   tensor_broadcast_last src target -> Tensor  (broadcast reduced tensor back)
+--   tensor_mul_broadcast vec t -> Tensor  (multiply vector across rows)
+--   tensor_scale_by_loss t scalar_tensor -> Tensor  (scale tensor by scalar loss grad)
+--
+-- Embedding:
+--   tensor_embedding_lookup w ids -> Tensor  (table lookup)
+--   tensor_one_hot targets shape -> Tensor  (one-hot encoding)
+--   tensor_slice_row t row -> Tensor  (extract one row)
+--   tensor_accumulate_row t row_idx grad_row -> Tensor  (add grad_row into row)
+--   tensor_get_int t i -> int  (get integer from int tensor)
+--
+-- Misc:
+--   tensor_map_scalar fn t extra -> Tensor  (apply fn(element, extra) to each element)
+--   tensor_from_list shape data -> Tensor
+--   tensor_reshape t shape -> Tensor
+
+-- ============================================================================
+-- END OF AUTOGRAD MODULE
+-- ============================================================================
+-- Usage example (pseudocode):
+--
+--   -- Create tape and parameters
+--   let tape = ag_tape_new 0
+--   let (tape, w1) = ag_param_on_tape tape (tensor_new [784, 256] w1_data)
+--   let (tape, w2) = ag_param_on_tape tape (tensor_new [256, 10] w2_data)
+--   let (tape, x) = ag_param_on_tape tape (tensor_new [batch, 784] input_data)
+--
+--   -- Forward pass
+--   let (tape, h) = tracked_matmul tape x w1         -- hidden = input @ W1
+--   let (tape, h2) = tracked_relu tape h              -- hidden = relu(hidden)
+--   let (tape, logits) = tracked_matmul tape h2 w2    -- logits = hidden @ W2
+--   let (tape, loss) = tracked_cross_entropy tape logits targets
+--
+--   -- Backward pass
+--   let grads = ag_backward_loss tape loss
+--   let w1_grad = ag_get_grad grads w1
+--   let w2_grad = ag_get_grad grads w2
+--
+--   -- Gradient check (optional, for debugging)
+--   let err = ag_grad_check_param my_build_fn w1 tape w1_grad (to_float 1 /. to_float 100000)

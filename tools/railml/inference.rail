@@ -1,0 +1,1038 @@
+-- inference.rail — RailML Transformer Inference Engine (Phase 3)
+--
+-- GPT-2 style transformer with RoPE + SwiGLU + pre-norm.
+-- Uses tensor ops from stdlib/tensor.rail (Phase 1).
+-- All functions defined before main. Named functions for higher-order ops.
+--
+-- Binary weight format:
+--   Header: [n_layers:i32][d_model:i32][n_heads:i32][vocab_size:i32]
+--   Per weight: [name_len:i32][name:bytes][ndim:i32][shape:i32s][data:f64s]
+--
+-- Usage: ./rail_native run tools/railml/inference.rail
+-- Depends on: stdlib/tensor.rail (Phase 1)
+
+import "stdlib/math.rail"
+import "stdlib/tensor.rail"
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 1: Model Types
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Model configuration parsed from weight file header
+type ModelConfig = | ModelConfig n_layers d_model n_heads vocab_size
+
+-- Attention block weights
+type AttnWeights = | AttnWeights wq wk wv wo
+
+-- Feed-forward (SwiGLU) weights
+type FFNWeights = | FFNWeights w_gate w_up w_down
+
+-- Single transformer layer
+type LayerWeights = | LayerWeights norm1 norm2 attn ffn
+
+-- Layer norm parameters (gamma + beta vectors)
+type NormParams = | NormParams gamma beta
+
+-- Full model: config + embedding + layers + final norm
+type Model = | Model config embed layers final_norm
+
+-- BPE merge entry: (pair_a, pair_b) -> merged_id, priority = list position
+type MergeEntry = | MergeEntry pair_a pair_b merged_id
+
+-- Tokenizer: vocab (id->string) + merges (priority-ordered)
+type Tokenizer = | Tokenizer vocab merges vocab_size
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 2: Binary Weight Loading
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Read 4 bytes as a little-endian i32 from a byte array at offset
+-- bytes: flat float_arr of raw bytes, off: byte offset
+read_i32 bytes off =
+  let b0 = float_arr_get bytes off
+  let b1 = float_arr_get bytes (off + 1)
+  let b2 = float_arr_get bytes (off + 2)
+  let b3 = float_arr_get bytes (off + 3)
+  to_int (b0 + b1 * 256.0 + b2 * 65536.0 + b3 * 16777216.0)
+
+-- Read 8 bytes as an f64 (IEEE 754 double, little-endian)
+-- In practice this would use a foreign memcpy or reinterpret
+read_f64 bytes off =
+  float_arr_get bytes off
+
+-- Parse model configuration from first 16 bytes of weight file
+parse_config bytes =
+  let n_layers   = read_i32 bytes 0
+  let d_model    = read_i32 bytes 4
+  let n_heads    = read_i32 bytes 8
+  let vocab_size = read_i32 bytes 12
+  ModelConfig n_layers d_model n_heads vocab_size
+
+-- Parse a single named weight tensor starting at offset
+-- Returns (name, tensor, new_offset)
+parse_one_weight bytes off =
+  let name_len = read_i32 bytes off
+  let off1 = off + 4
+  -- Read name bytes (skip for now, store as length-encoded string)
+  let name = read_name_bytes bytes off1 name_len
+  let off2 = off1 + name_len
+  -- Read ndim
+  let ndim = read_i32 bytes off2
+  let off3 = off2 + 4
+  -- Read shape (ndim i32 values)
+  let shape = read_shape bytes off3 ndim
+  let off4 = off3 + ndim * 4
+  -- Compute total element count
+  let total = shape_product shape
+  -- Read data as tensor
+  let t = tensor_new shape 0.0
+  let _ = fill_tensor_data t bytes off4 total 0
+  let off5 = off4 + total * 8
+  (name, t, off5)
+
+-- Read name as string from byte array
+read_name_bytes bytes off len =
+  read_name_acc bytes off len 0 ""
+
+read_name_acc bytes off len i acc =
+  if i == len then acc
+  else
+    let ch = float_arr_get bytes (off + i)
+    let c = chr (to_int ch)
+    read_name_acc bytes off len (i + 1) (append acc c)
+
+-- Read ndim i32 values as a shape list
+read_shape bytes off ndim =
+  read_shape_acc bytes off ndim 0 []
+
+read_shape_acc bytes off ndim i acc =
+  if i == ndim then reverse acc
+  else
+    let dim = read_i32 bytes (off + i * 4)
+    read_shape_acc bytes off ndim (i + 1) (cons dim acc)
+
+-- Product of all dimensions
+shape_product shape =
+  shape_product_acc shape 1
+
+shape_product_acc shape acc =
+  if length shape == 0 then acc
+  else shape_product_acc (tail shape) (acc * head shape)
+
+-- Fill tensor data buffer from raw bytes
+fill_tensor_data t bytes data_off total i =
+  if i == total then 0
+  else
+    let val = read_f64 bytes (data_off + i * 8)
+    let _ = tensor_set_flat t i val
+    fill_tensor_data t bytes data_off total (i + 1)
+
+-- Parse all weights from file, building a name->tensor map
+parse_all_weights bytes off n_weights =
+  parse_weights_acc bytes off n_weights 0 []
+
+parse_weights_acc bytes off n_weights i acc =
+  if i == n_weights then reverse acc
+  else
+    let (name, tensor, new_off) = parse_one_weight bytes off
+    parse_weights_acc bytes new_off n_weights (i + 1) (cons (name, tensor) acc)
+
+-- Look up a named weight in the weight list
+find_weight weights name =
+  if length weights == 0 then tensor_new [1] 0.0
+  else
+    let (n, t) = head weights
+    if n == name then t
+    else find_weight (tail weights) name
+
+-- Build NormParams from weight list by prefix
+build_norm prefix weights =
+  let gamma = find_weight weights (append prefix ".gamma")
+  let beta  = find_weight weights (append prefix ".beta")
+  NormParams gamma beta
+
+-- Build AttnWeights from weight list by prefix
+build_attn prefix weights =
+  let wq = find_weight weights (append prefix ".wq")
+  let wk = find_weight weights (append prefix ".wk")
+  let wv = find_weight weights (append prefix ".wv")
+  let wo = find_weight weights (append prefix ".wo")
+  AttnWeights wq wk wv wo
+
+-- Build FFNWeights from weight list by prefix
+build_ffn prefix weights =
+  let w_gate = find_weight weights (append prefix ".w_gate")
+  let w_up   = find_weight weights (append prefix ".w_up")
+  let w_down = find_weight weights (append prefix ".w_down")
+  FFNWeights w_gate w_up w_down
+
+-- Build a single layer from weight list
+build_layer layer_idx weights =
+  let prefix = append "layer." (show layer_idx)
+  let norm1 = build_norm (append prefix ".norm1") weights
+  let norm2 = build_norm (append prefix ".norm2") weights
+  let attn  = build_attn (append prefix ".attn") weights
+  let ffn   = build_ffn  (append prefix ".ffn") weights
+  LayerWeights norm1 norm2 attn ffn
+
+-- Build all layers
+build_layers n_layers weights =
+  build_layers_acc n_layers weights 0 []
+
+build_layers_acc n_layers weights i acc =
+  if i == n_layers then reverse acc
+  else
+    let layer = build_layer i weights
+    build_layers_acc n_layers weights (i + 1) (cons layer acc)
+
+-- Top-level model loader
+-- Reads binary weight file, parses header + weights, assembles Model
+load_model path =
+  let bytes = read_binary path
+  let config = parse_config bytes
+  match config
+    | ModelConfig n_layers d_model n_heads vocab_size ->
+      let _ = print (join "" ["  Config: ", show n_layers, " layers, d=", show d_model,
+                               ", heads=", show n_heads, ", vocab=", show vocab_size])
+      -- Count expected weights: embed(1) + per-layer(norm1.g,norm1.b,norm2.g,norm2.b,
+      --   wq,wk,wv,wo,w_gate,w_up,w_down = 11) + final_norm(2) = 3 + 11*n_layers
+      let n_weights = 3 + 11 * n_layers
+      let weights = parse_all_weights bytes 16 n_weights
+      let embed = find_weight weights "embed"
+      let layers = build_layers n_layers weights
+      let final_norm = build_norm "final_norm" weights
+      Model config embed layers final_norm
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 3: BPE Tokenizer
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Load merge table from text file
+-- Format: one merge per line, "token_a token_b" (space-separated)
+-- Line number = priority (lower = higher priority = merged first)
+load_merges path =
+  let content = read_file path
+  let lines = split "\n" content
+  parse_merge_lines lines 256 []
+
+-- Parse merge lines, starting merged IDs after byte range (256)
+parse_merge_lines lines next_id acc =
+  if length lines == 0 then reverse acc
+  else
+    let line = head lines
+    if line == "" then parse_merge_lines (tail lines) next_id acc
+    else
+      let parts = str_split " " line
+      if length parts < 2 then parse_merge_lines (tail lines) next_id acc
+      else
+        let pair_a = to_int (head parts)
+        let pair_b = to_int (head (tail parts))
+        let entry = MergeEntry pair_a pair_b next_id
+        parse_merge_lines (tail lines) (next_id + 1) (cons entry acc)
+
+-- Load vocabulary from text file (one token per line, line number = id)
+load_vocab path =
+  let content = read_file path
+  split "\n" content
+
+-- Build tokenizer from merge and vocab files
+load_tokenizer merge_path vocab_path =
+  let merges = load_merges merge_path
+  let vocab = load_vocab vocab_path
+  let vs = length vocab
+  Tokenizer vocab merges vs
+
+-- Encode text to byte-level token ids (initial: one id per byte)
+text_to_bytes text =
+  let cs = chars text
+  chars_to_bytes cs []
+
+chars_to_bytes cs acc =
+  if length cs == 0 then reverse acc
+  else
+    let c = head cs
+    let byte_val = char_ord c
+    chars_to_bytes (tail cs) (cons byte_val acc)
+
+-- Check if a pair (a, b) exists adjacent in token list
+has_pair tokens pair_a pair_b =
+  if length tokens < 2 then false
+  else
+    let a = head tokens
+    let b = head (tail tokens)
+    if a == pair_a then
+      if b == pair_b then true
+      else has_pair (tail tokens) pair_a pair_b
+    else has_pair (tail tokens) pair_a pair_b
+
+-- Merge one pair throughout the token list
+merge_pair tokens pair_a pair_b merged_id =
+  merge_pair_acc tokens pair_a pair_b merged_id []
+
+merge_pair_acc tokens pair_a pair_b merged_id acc =
+  if length tokens == 0 then reverse acc
+  else if length tokens == 1 then reverse (cons (head tokens) acc)
+  else
+    let a = head tokens
+    let b = head (tail tokens)
+    if a == pair_a then
+      if b == pair_b then
+        merge_pair_acc (tail (tail tokens)) pair_a pair_b merged_id (cons merged_id acc)
+      else
+        merge_pair_acc (tail tokens) pair_a pair_b merged_id (cons a acc)
+    else
+      merge_pair_acc (tail tokens) pair_a pair_b merged_id (cons a acc)
+
+-- Apply all merges in priority order (lowest index = highest priority)
+-- Each merge is applied repeatedly until no more instances of that pair exist
+apply_merges tokens merges =
+  if length merges == 0 then tokens
+  else
+    match (head merges)
+      | MergeEntry pair_a pair_b merged_id ->
+        let tokens2 = apply_single_merge tokens pair_a pair_b merged_id
+        apply_merges tokens2 (tail merges)
+
+-- Apply a single merge rule until the pair no longer appears
+apply_single_merge tokens pair_a pair_b merged_id =
+  if has_pair tokens pair_a pair_b then
+    let tokens2 = merge_pair tokens pair_a pair_b merged_id
+    apply_single_merge tokens2 pair_a pair_b merged_id
+  else tokens
+
+-- Tokenize: text -> list of token ids
+tokenize tokenizer text =
+  match tokenizer
+    | Tokenizer vocab merges vocab_size ->
+      let bytes = text_to_bytes text
+      apply_merges bytes merges
+
+-- Detokenize: list of token ids -> text
+detokenize tokenizer ids =
+  match tokenizer
+    | Tokenizer vocab merges vocab_size ->
+      let strs = map_detok vocab ids
+      join "" strs
+
+-- Map token ids to strings using vocab lookup
+map_detok vocab ids =
+  if length ids == 0 then []
+  else
+    let tok = head ids
+    let s = nth_str vocab tok
+    cons s (map_detok vocab (tail ids))
+
+-- Safe nth for string list (0-indexed)
+nth_str xs n =
+  if length xs == 0 then ""
+  else if n == 0 then head xs
+  else nth_str (tail xs) (n - 1)
+
+-- Character ordinal (ASCII byte value)
+char_ord c =
+  let out = shell (join "" ["printf '%d' \"'", c, "\""])
+  to_int out
+
+-- Character from ordinal
+chr n =
+  shell (join "" ["printf '\\x", hex_byte n, "'"])
+
+-- Convert byte to 2-digit hex string
+hex_byte n =
+  let hi = n / 16
+  let lo = n - hi * 16
+  append (hex_digit hi) (hex_digit lo)
+
+hex_digit n =
+  if n == 0 then "0" else if n == 1 then "1" else if n == 2 then "2"
+  else if n == 3 then "3" else if n == 4 then "4" else if n == 5 then "5"
+  else if n == 6 then "6" else if n == 7 then "7" else if n == 8 then "8"
+  else if n == 9 then "9" else if n == 10 then "a" else if n == 11 then "b"
+  else if n == 12 then "c" else if n == 13 then "d" else if n == 14 then "e"
+  else "f"
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 4: Transformer Math Primitives
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Softmax over last dimension of a 2D tensor (seq_len, dim)
+-- For numerical stability: subtract max before exp
+softmax t =
+  let shape = tensor_shape t
+  let rows = head shape
+  let cols = head (tail shape)
+  let out = tensor_new shape 0.0
+  let _ = softmax_rows t out rows cols 0
+  out
+
+softmax_rows t out rows cols i =
+  if i == rows then 0
+  else
+    -- Find max in row i
+    let mx = row_max t i cols 0 (0.0 - 1.0e30)
+    -- Compute exp(x - max) and sum
+    let sm = row_exp_sum t i cols 0 mx 0.0
+    -- Normalize: out[i,j] = exp(t[i,j] - max) / sum
+    let _ = row_normalize t out i cols 0 mx sm
+    softmax_rows t out rows cols (i + 1)
+
+row_max t row cols j current_max =
+  if j == cols then current_max
+  else
+    let val = tensor_get t [row, j]
+    let new_max = if val > current_max then val else current_max
+    row_max t row cols (j + 1) new_max
+
+row_exp_sum t row cols j mx acc =
+  if j == cols then acc
+  else
+    let val = tensor_get t [row, j]
+    let e = exp (val - mx)
+    row_exp_sum t row cols (j + 1) mx (acc + e)
+
+row_normalize t out row cols j mx sm =
+  if j == cols then 0
+  else
+    let val = tensor_get t [row, j]
+    let normed = exp (val - mx) / sm
+    let _ = tensor_set out [row, j] normed
+    row_normalize t out row cols (j + 1) mx sm
+
+-- SiLU (Sigmoid Linear Unit): x * sigmoid(x) = x / (1 + exp(-x))
+silu_val x = x / (1.0 + exp (0.0 - x))
+
+-- Apply SiLU element-wise to a tensor
+tensor_silu t =
+  let n = tensor_size t
+  let out = tensor_clone t
+  let _ = apply_silu out n 0
+  out
+
+apply_silu t n i =
+  if i == n then 0
+  else
+    let val = tensor_get_flat t i
+    let _ = tensor_set_flat t i (silu_val val)
+    apply_silu t n (i + 1)
+
+-- Layer normalization: normalize + scale(gamma) + shift(beta)
+-- Input: x of shape (seq_len, d_model)
+-- Params: gamma, beta each of shape (d_model,)
+-- eps = 1e-5 for numerical stability
+layer_norm norm x =
+  match norm
+    | NormParams gamma beta ->
+      let shape = tensor_shape x
+      let rows = head shape
+      let cols = head (tail shape)
+      let out = tensor_new shape 0.0
+      let _ = norm_rows x out gamma beta rows cols 0
+      out
+
+norm_rows x out gamma beta rows cols i =
+  if i == rows then 0
+  else
+    -- Compute mean of row i
+    let mu = row_mean x i cols
+    -- Compute variance of row i
+    let var = row_variance x i cols mu
+    -- Normalize: out[i,j] = gamma[j] * (x[i,j] - mu) / sqrt(var + eps) + beta[j]
+    let _ = norm_row_apply x out gamma beta i cols mu var
+    norm_rows x out gamma beta rows cols (i + 1)
+
+row_mean x row cols =
+  row_mean_acc x row cols 0 0.0
+
+row_mean_acc x row cols j acc =
+  if j == cols then acc / to_float cols
+  else
+    let val = tensor_get x [row, j]
+    row_mean_acc x row cols (j + 1) (acc + val)
+
+row_variance x row cols mu =
+  row_var_acc x row cols mu 0 0.0
+
+row_var_acc x row cols mu j acc =
+  if j == cols then acc / to_float cols
+  else
+    let val = tensor_get x [row, j]
+    let diff = val - mu
+    row_var_acc x row cols mu (j + 1) (acc + diff * diff)
+
+norm_row_apply x out gamma beta row cols mu var =
+  let inv_std = 1.0 / sqrt (var + 1.0e-5)
+  norm_row_loop x out gamma beta row cols mu inv_std 0
+
+norm_row_loop x out gamma beta row cols mu inv_std j =
+  if j == cols then 0
+  else
+    let val = tensor_get x [row, j]
+    let normed = (val - mu) * inv_std
+    let g = tensor_get_flat gamma j
+    let b = tensor_get_flat beta j
+    let _ = tensor_set out [row, j] (normed * g + b)
+    norm_row_loop x out gamma beta row cols mu inv_std (j + 1)
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 5: Rotary Position Embeddings (RoPE)
+-- ═══════════════════════════════════════════════════════════════════
+
+-- RoPE encodes position by rotating pairs of dimensions
+-- For position pos and dimension pair (2i, 2i+1):
+--   theta_i = pos / 10000^(2i / d_model)
+--   x'[2i]   = x[2i] * cos(theta) - x[2i+1] * sin(theta)
+--   x'[2i+1] = x[2i] * sin(theta) + x[2i+1] * cos(theta)
+
+-- Apply RoPE to a (seq_len, d_model) tensor
+-- Modifies q or k in-place for each sequence position
+apply_rope x d_model =
+  let shape = tensor_shape x
+  let seq_len = head shape
+  let out = tensor_clone x
+  let _ = rope_positions out seq_len d_model 0
+  out
+
+rope_positions x seq_len d_model pos =
+  if pos == seq_len then 0
+  else
+    let _ = rope_dims x pos d_model 0
+    rope_positions x seq_len d_model (pos + 1)
+
+rope_dims x pos d_model i =
+  if i >= d_model / 2 then 0
+  else
+    let theta = to_float pos / pow 10000.0 (to_float (2 * i) / to_float d_model)
+    let cos_t = cos theta
+    let sin_t = sin theta
+    let idx_re = 2 * i
+    let idx_im = 2 * i + 1
+    let x_re = tensor_get x [pos, idx_re]
+    let x_im = tensor_get x [pos, idx_im]
+    let _ = tensor_set x [pos, idx_re] (x_re * cos_t - x_im * sin_t)
+    let _ = tensor_set x [pos, idx_im] (x_re * sin_t + x_im * cos_t)
+    rope_dims x pos d_model (i + 1)
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 6: Causal Mask
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Apply causal mask to attention scores (seq_len, seq_len)
+-- Set upper triangle to -infinity so future tokens have zero attention
+causal_mask scores =
+  let shape = tensor_shape scores
+  let seq_len = head shape
+  let out = tensor_clone scores
+  let _ = mask_rows out seq_len 0
+  out
+
+mask_rows scores seq_len i =
+  if i == seq_len then 0
+  else
+    let _ = mask_cols scores seq_len i (i + 1)
+    mask_rows scores seq_len (i + 1)
+
+mask_cols scores seq_len row col =
+  if col == seq_len then 0
+  else
+    let _ = tensor_set scores [row, col] (0.0 - 1.0e30)
+    mask_cols scores seq_len row (col + 1)
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 7: Embedding Lookup
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Look up embeddings for a list of token ids
+-- embed: (vocab_size, d_model) weight matrix
+-- tokens: list of ints
+-- Returns: (seq_len, d_model) tensor
+embedding_lookup embed tokens d_model =
+  let seq_len = length tokens
+  let out = tensor_new [seq_len, d_model] 0.0
+  let _ = embed_tokens embed out tokens d_model 0
+  out
+
+embed_tokens embed out tokens d_model pos =
+  if length tokens == 0 then 0
+  else
+    let tok_id = head tokens
+    let _ = copy_embed_row embed out tok_id pos d_model 0
+    embed_tokens embed out (tail tokens) d_model (pos + 1)
+
+copy_embed_row embed out tok_id pos d_model j =
+  if j == d_model then 0
+  else
+    let val = tensor_get embed [tok_id, j]
+    let _ = tensor_set out [pos, j] val
+    copy_embed_row embed out tok_id pos d_model (j + 1)
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 8: Multi-Head Attention
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Full multi-head attention with RoPE
+-- x: (seq_len, d_model)
+-- attn: AttnWeights (wq, wk, wv, wo each (d_model, d_model))
+-- Returns: (seq_len, d_model)
+multi_head_attention attn x n_heads d_model =
+  match attn
+    | AttnWeights wq wk wv wo ->
+      let head_dim = d_model / n_heads
+      -- Project to Q, K, V: (seq, d) @ (d, d) -> (seq, d)
+      let q = matmul x wq
+      let k = matmul x wk
+      let v = matmul x wv
+      -- Apply RoPE to Q and K
+      let q = apply_rope q d_model
+      let k = apply_rope k d_model
+      -- Compute attention per head, then concatenate
+      let out = tensor_new (tensor_shape x) 0.0
+      let _ = compute_heads q k v out n_heads head_dim d_model
+      -- Output projection
+      matmul out wo
+
+-- Process all attention heads
+compute_heads q k v out n_heads head_dim d_model =
+  compute_head_loop q k v out n_heads head_dim d_model 0
+
+compute_head_loop q k v out n_heads head_dim d_model h =
+  if h == n_heads then 0
+  else
+    let offset = h * head_dim
+    -- Extract head slices, compute single-head attention, write back
+    let _ = single_head_attention q k v out offset head_dim
+    compute_head_loop q k v out n_heads head_dim d_model (h + 1)
+
+-- Single head attention on a slice of d_model
+-- q, k, v: full (seq_len, d_model) tensors
+-- offset: start column for this head
+-- head_dim: number of columns per head
+single_head_attention q k v out offset head_dim =
+  let seq_len = head (tensor_shape q)
+  let scale = 1.0 / sqrt (to_float head_dim)
+  -- Compute scores: scores[i,j] = sum(q[i,offset+d] * k[j,offset+d]) / sqrt(head_dim)
+  let scores = tensor_new [seq_len, seq_len] 0.0
+  let _ = compute_scores q k scores seq_len offset head_dim scale 0
+  -- Apply causal mask
+  let scores = causal_mask scores
+  -- Softmax over each row
+  let attn_weights = softmax scores
+  -- Weighted sum of values: out[i, offset+d] += sum_j(attn[i,j] * v[j, offset+d])
+  let _ = apply_attn_values attn_weights v out seq_len offset head_dim 0
+  0
+
+-- Compute Q*K^T scores for one head
+compute_scores q k scores seq_len offset head_dim scale i =
+  if i == seq_len then 0
+  else
+    let _ = compute_scores_row q k scores seq_len offset head_dim scale i 0
+    compute_scores q k scores seq_len offset head_dim scale (i + 1)
+
+compute_scores_row q k scores seq_len offset head_dim scale i j =
+  if j == seq_len then 0
+  else
+    let dot = head_dot q k i j offset head_dim
+    let _ = tensor_set scores [i, j] (dot * scale)
+    compute_scores_row q k scores seq_len offset head_dim scale i (j + 1)
+
+-- Dot product of q[i, offset..offset+head_dim] and k[j, offset..offset+head_dim]
+head_dot q k i j offset head_dim =
+  head_dot_acc q k i j offset head_dim 0 0.0
+
+head_dot_acc q k i j offset head_dim d acc =
+  if d == head_dim then acc
+  else
+    let qv = tensor_get q [i, offset + d]
+    let kv = tensor_get k [j, offset + d]
+    head_dot_acc q k i j offset head_dim (d + 1) (acc + qv * kv)
+
+-- Apply attention weights to values, writing into output
+apply_attn_values attn_weights v out seq_len offset head_dim i =
+  if i == seq_len then 0
+  else
+    let _ = apply_attn_row attn_weights v out seq_len offset head_dim i 0
+    apply_attn_values attn_weights v out seq_len offset head_dim (i + 1)
+
+apply_attn_row attn_weights v out seq_len offset head_dim i d =
+  if d == head_dim then 0
+  else
+    -- out[i, offset+d] = sum_j attn_weights[i,j] * v[j, offset+d]
+    let val = weighted_sum_col attn_weights v i offset d seq_len 0 0.0
+    let _ = tensor_set out [i, offset + d] val
+    apply_attn_row attn_weights v out seq_len offset head_dim i (d + 1)
+
+weighted_sum_col attn_weights v i offset d seq_len j acc =
+  if j == seq_len then acc
+  else
+    let a = tensor_get attn_weights [i, j]
+    let vv = tensor_get v [j, offset + d]
+    weighted_sum_col attn_weights v i offset d seq_len (j + 1) (acc + a * vv)
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 9: SwiGLU Feed-Forward Network
+-- ═══════════════════════════════════════════════════════════════════
+
+-- SwiGLU FFN: gate = SiLU(x @ W_gate), up = x @ W_up, out = (gate * up) @ W_down
+-- x: (seq_len, d_model)
+-- FFN weight shapes: w_gate, w_up: (d_model, d_ff), w_down: (d_ff, d_model)
+swiglu_ffn ffn x =
+  match ffn
+    | FFNWeights w_gate w_up w_down ->
+      -- Gate projection + SiLU activation
+      let gate = matmul x w_gate
+      let gate = tensor_silu gate
+      -- Up projection
+      let up = matmul x w_up
+      -- Element-wise gate: gate * up (Hadamard product)
+      let gated = tensor_mul gate up
+      -- Down projection back to d_model
+      matmul gated w_down
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 10: Transformer Block and Forward Pass
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Single transformer block with pre-norm + residual connections
+-- layer: LayerWeights, x: (seq_len, d_model)
+transformer_block layer x n_heads d_model =
+  match layer
+    | LayerWeights norm1 norm2 attn ffn ->
+      -- Pre-norm attention with residual
+      let normed = layer_norm norm1 x
+      let attn_out = multi_head_attention attn normed n_heads d_model
+      let x2 = tensor_add x attn_out
+      -- Pre-norm FFN with residual
+      let normed2 = layer_norm norm2 x2
+      let ffn_out = swiglu_ffn ffn normed2
+      tensor_add x2 ffn_out
+
+-- Apply all transformer blocks sequentially
+apply_layers layers x n_heads d_model =
+  if length layers == 0 then x
+  else
+    let x2 = transformer_block (head layers) x n_heads d_model
+    apply_layers (tail layers) x2 n_heads d_model
+
+-- Compute logits: final_norm -> matmul with transposed embedding (tied weights)
+-- embed: (vocab_size, d_model), x: (seq_len, d_model)
+-- logits: (seq_len, vocab_size) = x @ embed^T
+compute_logits embed final_norm x =
+  let x = layer_norm final_norm x
+  -- Tied embeddings: logits = x @ embed^T
+  matmul x (tensor_transpose embed)
+
+-- Full transformer forward pass
+-- model: Model, tokens: list of int token ids
+-- Returns: logits tensor of shape (seq_len, vocab_size)
+transformer_forward model tokens =
+  match model
+    | Model config embed layers final_norm ->
+      match config
+        | ModelConfig n_layers d_model n_heads vocab_size ->
+          -- Embedding lookup
+          let x = embedding_lookup embed tokens d_model
+          -- Apply transformer layers
+          let x = apply_layers layers x n_heads d_model
+          -- Final norm + logits
+          compute_logits embed final_norm x
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 11: Token Generation
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Extract logits for the last sequence position
+-- logits: (seq_len, vocab_size) -> last row as (1, vocab_size)
+last_row_logits logits vocab_size =
+  let shape = tensor_shape logits
+  let seq_len = head shape
+  let last_pos = seq_len - 1
+  let out = tensor_new [vocab_size] 0.0
+  let _ = copy_last_row logits out last_pos vocab_size 0
+  out
+
+copy_last_row logits out last_pos vocab_size j =
+  if j == vocab_size then 0
+  else
+    let val = tensor_get logits [last_pos, j]
+    let _ = tensor_set_flat out j val
+    copy_last_row logits out last_pos vocab_size (j + 1)
+
+-- Argmax over a 1D tensor (greedy decoding)
+argmax t =
+  let n = tensor_size t
+  argmax_acc t n 1 0 (tensor_get_flat t 0)
+
+argmax_acc t n i best_idx best_val =
+  if i == n then best_idx
+  else
+    let val = tensor_get_flat t i
+    if val > best_val then argmax_acc t n (i + 1) i val
+    else argmax_acc t n (i + 1) best_idx best_val
+
+-- Temperature-scaled sampling
+-- Divides logits by temperature, applies softmax, samples from distribution
+-- Uses shell-based random for portability (Rail PRNG overflow issue)
+sample_with_temperature logits_1d temperature =
+  if temperature < 0.01 then argmax logits_1d
+  else
+    let scaled = tensor_scale logits_1d (1.0 / temperature)
+    -- Softmax the scaled logits to get probabilities
+    let shape = tensor_shape scaled
+    let n = head shape
+    let probs_2d = tensor_new [1, n] 0.0
+    let _ = copy_to_row probs_2d scaled n 0
+    let probs_2d = softmax probs_2d
+    -- Sample from categorical distribution using uniform random
+    let r = random_uniform 0
+    sample_categorical probs_2d n r 0 0.0
+
+copy_to_row dst src n i =
+  if i == n then 0
+  else
+    let val = tensor_get_flat src i
+    let _ = tensor_set dst [0, i] val
+    copy_to_row dst src n (i + 1)
+
+-- Draw uniform random in [0, 1) from /dev/urandom via shell
+random_uniform _ =
+  let hex = shell "od -An -N4 -tx4 /dev/urandom | tr -d ' '"
+  let dec = shell (join "" ["printf '%d' 0x", hex])
+  let n = to_int dec
+  -- Normalize to [0, 1): n is a 32-bit unsigned int
+  to_float n / 4294967296.0
+
+-- Sample from categorical distribution given cumulative probabilities
+sample_categorical probs n r i cumulative =
+  if i == n then n - 1
+  else
+    let p = tensor_get probs [0, i]
+    let cumulative2 = cumulative + p
+    if r < cumulative2 then i
+    else sample_categorical probs n r (i + 1) cumulative2
+
+-- Generate tokens autoregressively
+-- model: Model, prompt_tokens: initial token list
+-- max_tokens: how many new tokens to generate
+-- temperature: 0.0 = greedy, >0 = sampling
+-- Returns: full token list (prompt + generated)
+generate model prompt_tokens max_tokens temperature =
+  match model
+    | Model config embed layers final_norm ->
+      match config
+        | ModelConfig n_layers d_model n_heads vocab_size ->
+          generate_loop model prompt_tokens max_tokens temperature vocab_size 0
+
+generate_loop model tokens remaining temperature vocab_size step =
+  if remaining == 0 then tokens
+  else
+    let _ = if step > 0 then
+      if (step * 10 / remaining) > ((step - 1) * 10 / remaining) then
+        print (join "" ["  [", show step, "/", show (step + remaining), "] generating..."])
+      else 0
+    else 0
+    -- Forward pass on current tokens
+    let logits = transformer_forward model tokens
+    -- Get logits for last position
+    let last_logits = last_row_logits logits vocab_size
+    -- Sample or greedy-select next token
+    let next_token = sample_with_temperature last_logits temperature
+    -- Append to sequence and continue
+    let tokens2 = append tokens [next_token]
+    generate_loop model tokens2 (remaining - 1) temperature vocab_size (step + 1)
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 12: Utility / Debug
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Pretty-print a small tensor (for debugging)
+print_tensor_2d name t =
+  let shape = tensor_shape t
+  let rows = head shape
+  let cols = head (tail shape)
+  let _ = print (join "" [name, " shape=(", show rows, ",", show cols, ")"])
+  print_rows t rows cols 0
+
+print_rows t rows cols i =
+  if i == rows then 0
+  else
+    let row_str = format_row t i cols 0 "  ["
+    let _ = print (append row_str "]")
+    print_rows t rows cols (i + 1)
+
+format_row t row cols j acc =
+  if j == cols then acc
+  else
+    let val = tensor_get t [row, j]
+    let sep = if j > 0 then ", " else ""
+    format_row t row cols (j + 1) (join "" [acc, sep, show_float val])
+
+-- Print 1D tensor
+print_tensor_1d name t =
+  let n = tensor_size t
+  let _ = print (join "" [name, " shape=(", show n, ")"])
+  let s = format_1d t n 0 "  ["
+  print (append s "]")
+
+format_1d t n i acc =
+  if i == n then acc
+  else
+    let val = tensor_get_flat t i
+    let sep = if i > 0 then ", " else ""
+    format_1d t n (i + 1) (join "" [acc, sep, show_float val])
+
+-- ═══════════════════════════════════════════════════════════════════
+-- SECTION 13: Main — Architecture Demonstration
+-- ═══════════════════════════════════════════════════════════════════
+
+main =
+  let _ = print "============================================"
+  let _ = print "  RailML Inference Engine"
+  let _ = print "  Phase 3: Transformer Forward Pass"
+  let _ = print "  GPT-2 style + RoPE + SwiGLU + Pre-Norm"
+  let _ = print "============================================"
+  let _ = print ""
+
+  -- Demo: show architecture with dummy data
+  let d_model = 8
+  let n_heads = 2
+  let head_dim = d_model / n_heads
+  let d_ff = d_model * 4
+  let vocab_size = 16
+  let seq_len = 4
+  let n_layers = 2
+
+  -- ── 1. Demonstrate tensor creation ──
+  let _ = print "--- 1. Tensor Creation ---"
+  let x = tensor_new [seq_len, d_model] 0.1
+  let _ = print_tensor_2d "x (input)" x
+  let _ = print ""
+
+  -- ── 2. Demonstrate layer norm ──
+  let _ = print "--- 2. Layer Normalization ---"
+  -- Create dummy gamma=1, beta=0 (identity norm initially)
+  let gamma = tensor_new [d_model] 1.0
+  let beta = tensor_new [d_model] 0.0
+  let norm_params = NormParams gamma beta
+  -- Set varying values so norm has something to normalize
+  let _ = tensor_set x [0, 0] 0.5
+  let _ = tensor_set x [0, 1] (0.0 - 0.3)
+  let _ = tensor_set x [0, 2] 1.2
+  let _ = tensor_set x [1, 0] (0.0 - 0.7)
+  let _ = tensor_set x [1, 3] 0.9
+  let normed = layer_norm norm_params x
+  let _ = print_tensor_2d "normed" normed
+  let _ = print ""
+
+  -- ── 3. Demonstrate RoPE ──
+  let _ = print "--- 3. Rotary Position Embeddings ---"
+  let q = tensor_new [seq_len, d_model] 0.5
+  let q_rope = apply_rope q d_model
+  let _ = print_tensor_2d "q after RoPE" q_rope
+  let _ = print ""
+
+  -- ── 4. Demonstrate softmax ──
+  let _ = print "--- 4. Softmax ---"
+  let scores = tensor_new [2, 4] 0.0
+  let _ = tensor_set scores [0, 0] 1.0
+  let _ = tensor_set scores [0, 1] 2.0
+  let _ = tensor_set scores [0, 2] 0.5
+  let _ = tensor_set scores [0, 3] (0.0 - 1.0)
+  let _ = tensor_set scores [1, 0] 0.0
+  let _ = tensor_set scores [1, 1] 0.0
+  let _ = tensor_set scores [1, 2] 3.0
+  let _ = tensor_set scores [1, 3] 1.0
+  let sm = softmax scores
+  let _ = print_tensor_2d "softmax(scores)" sm
+  let _ = print ""
+
+  -- ── 5. Demonstrate causal mask ──
+  let _ = print "--- 5. Causal Mask ---"
+  let attn_scores = tensor_new [4, 4] 1.0
+  let masked = causal_mask attn_scores
+  let _ = print_tensor_2d "causal masked" masked
+  let _ = print ""
+
+  -- ── 6. Demonstrate SiLU ──
+  let _ = print "--- 6. SiLU Activation ---"
+  let gate_vec = tensor_new [1, 4] 0.0
+  let _ = tensor_set gate_vec [0, 0] (0.0 - 2.0)
+  let _ = tensor_set gate_vec [0, 1] (0.0 - 0.5)
+  let _ = tensor_set gate_vec [0, 2] 0.5
+  let _ = tensor_set gate_vec [0, 3] 2.0
+  let silu_out = tensor_silu gate_vec
+  let _ = print_tensor_2d "SiLU output" silu_out
+  let _ = print ""
+
+  -- ── 7. Demonstrate model structure ──
+  let _ = print "--- 7. Model Structure ---"
+  let _ = print (join "" ["  d_model    = ", show d_model])
+  let _ = print (join "" ["  n_heads    = ", show n_heads])
+  let _ = print (join "" ["  head_dim   = ", show head_dim])
+  let _ = print (join "" ["  d_ff       = ", show d_ff])
+  let _ = print (join "" ["  vocab_size = ", show vocab_size])
+  let _ = print (join "" ["  n_layers   = ", show n_layers])
+  let _ = print ""
+
+  -- ── 8. Demonstrate the full pipeline flow ──
+  let _ = print "--- 8. Forward Pass Pipeline ---"
+  let _ = print "  tokens = [1, 5, 3, 12]"
+  let _ = print "    |"
+  let _ = print "    v"
+  let _ = print "  embedding_lookup  -> (4, 8) tensor"
+  let _ = print "    |"
+  let _ = print "    v"
+  let _ = print "  transformer_block x 2"
+  let _ = print "    +-- layer_norm (pre-norm)"
+  let _ = print "    +-- multi_head_attention (2 heads)"
+  let _ = print "    |     +-- Q = x @ Wq, K = x @ Wk, V = x @ Wv"
+  let _ = print "    |     +-- apply_rope(Q), apply_rope(K)"
+  let _ = print "    |     +-- scores = Q @ K^T / sqrt(head_dim)"
+  let _ = print "    |     +-- causal_mask(scores)"
+  let _ = print "    |     +-- attn = softmax(scores) @ V"
+  let _ = print "    |     +-- out = attn @ Wo"
+  let _ = print "    +-- residual connection"
+  let _ = print "    +-- layer_norm (pre-norm)"
+  let _ = print "    +-- swiglu_ffn"
+  let _ = print "    |     +-- gate = SiLU(x @ W_gate)"
+  let _ = print "    |     +-- up   = x @ W_up"
+  let _ = print "    |     +-- out  = (gate * up) @ W_down"
+  let _ = print "    +-- residual connection"
+  let _ = print "    |"
+  let _ = print "    v"
+  let _ = print "  layer_norm (final)"
+  let _ = print "    |"
+  let _ = print "    v"
+  let _ = print "  logits = x @ embed^T  -> (4, 16)"
+  let _ = print "    |"
+  let _ = print "    v"
+  let _ = print "  sample(logits[-1] / temperature) -> next token"
+  let _ = print ""
+
+  -- ── 9. Generation flow ──
+  let _ = print "--- 9. Generation Flow ---"
+  let _ = print "  generate(model, prompt=[1,5,3,12], max_tokens=32, temp=0.7)"
+  let _ = print "    for each step:"
+  let _ = print "      logits = transformer_forward(model, tokens)"
+  let _ = print "      next   = sample(logits[-1] / 0.7)"
+  let _ = print "      tokens = tokens ++ [next]"
+  let _ = print "    return detokenize(tokens)"
+  let _ = print ""
+
+  -- ── 10. Summary ──
+  let _ = print "--- 10. Component Summary ---"
+  let _ = print "  Weight loader:   load_model path -> Model"
+  let _ = print "  BPE tokenizer:   tokenize text -> [int], detokenize [int] -> text"
+  let _ = print "  Layer norm:      layer_norm NormParams x -> x"
+  let _ = print "  RoPE:            apply_rope x d_model -> x"
+  let _ = print "  Attention:       multi_head_attention AttnWeights x n_heads d_model -> x"
+  let _ = print "  SwiGLU FFN:      swiglu_ffn FFNWeights x -> x"
+  let _ = print "  Transformer:     transformer_block LayerWeights x n_heads d_model -> x"
+  let _ = print "  Forward pass:    transformer_forward Model [tokens] -> logits"
+  let _ = print "  Generation:      generate Model [tokens] max_tokens temp -> [tokens]"
+  let _ = print "  Causal mask:     causal_mask scores -> scores"
+  let _ = print "  Softmax:         softmax tensor -> tensor"
+  let _ = print ""
+  let _ = print "============================================"
+  let _ = print "  Awaiting stdlib/tensor.rail (Phase 1)"
+  let _ = print "  to make this executable."
+  let _ = print "============================================"
+  0
