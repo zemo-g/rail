@@ -48,19 +48,57 @@ llm_call sys_msg user_msg temp =
   llm port sys_msg user_msg
 
 -- ══════════════════════════════════════════════════════════════════════════════
--- Compile + Run verification
+-- Compile + Run verification — multi-level error classification
 -- ══════════════════════════════════════════════════════════════════════════════
 
--- Returns: "success", "compile_fail", "runtime_fail", "timeout"
--- Verify: compile, run, check output matches expected
--- expected="" means compile-only check (legacy tasks)
+-- Error severity levels (inspired by The Well's multi-scale loss):
+--   syntax_error  (worst)  — invalid Rail syntax, wrong keywords, invented builtins
+--   type_error    (bad)    — type mismatch, wrong arity, undefined function
+--   linker_error  (medium) — undefined symbols at link time
+--   compile_fail  (catch-all) — other compile failures
+--   runtime_fail  (close)  — compiles but crashes
+--   timeout       (close)  — compiles but hangs
+--   wrong_output  (closest)— compiles, runs, wrong answer
+--   success       (pass)
+--
+-- The retry prompt gets targeted hints based on error class.
+-- Training data weights: syntax_error repairs worth 3x, wrong_output repairs worth 1x.
+
+-- Classify compile errors by examining compiler output
+classify_compile_error err_text code =
+  -- Check for grammar-check pre-validation (if grammar_check.py is available)
+  let grammar_hint = trim (shell "python3 tools/train/grammar_check.py /tmp/rail_st_test.rail --hint 2>/dev/null")
+  if length grammar_hint > 5 then cat ["syntax_error:", grammar_hint]
+  -- Check for known syntax error patterns
+  else if str_contains "parse error" err_text then "syntax_error:parse error in generated code"
+  else if str_contains "unexpected" err_text then "syntax_error:unexpected token"
+  else if str_contains "Undefined" err_text then
+    if str_contains "symbols" err_text then "linker_error:undefined symbols at link time"
+    else "type_error:undefined function or variable"
+  else if str_contains "arity" err_text then "type_error:wrong number of arguments"
+  else if str_contains "type" err_text then "type_error:type mismatch"
+  else "compile_fail:unknown compile error"
+
+-- Extract error class from classified result (before the colon)
+error_class classified =
+  head (split ":" classified)
+
+-- Extract error detail from classified result (after the colon)
+error_detail classified =
+  let parts = split ":" classified
+  if length parts >= 2 then head (tail parts)
+  else ""
+
 verify code expected =
   let _ = write_file "/tmp/rail_st_test.rail" code
   let _ = shell "rm -f /tmp/rail_st_test_bin"
   let compile_out = shell "cd ~/projects/rail && ./rail_native /tmp/rail_st_test.rail 2>&1 && cp /tmp/rail_out /tmp/rail_st_test_bin 2>&1"
   let _ = write_file "/tmp/rail_st_compile_err.txt" compile_out
   let check = trim (shell "test -f /tmp/rail_st_test_bin && echo ok || echo fail")
-  if check == "fail" then "compile_fail"
+  if check == "fail" then
+    -- Multi-level error classification
+    let classified = classify_compile_error compile_out code
+    classified
   else
     -- Run with timeout + timing, capture output + quality metrics
     let _ = shell "{ time perl -e 'alarm 5; exec @ARGV' /tmp/rail_st_test_bin > /tmp/rail_st_run_out.txt 2>&1 ; } 2> /tmp/rail_st_time.txt; echo $? > /tmp/rail_st_exit.txt"
@@ -89,6 +127,7 @@ last_nonempty xs =
 
 -- Generate with retry loop (up to 3 attempts with compiler feedback)
 -- prev_broken/prev_errmsg track the last failed code+error for repair harvesting
+-- Now uses multi-level error classification for targeted retry hints
 gen_with_retry sys task expected prev_err attempt temp prev_broken prev_errmsg =
   if attempt > 3 then ("", "compile_fail")
   else
@@ -103,15 +142,24 @@ gen_with_retry sys task expected prev_err attempt temp prev_broken prev_errmsg =
       let _ = if prev_broken == "" then 0
         else harvest_repair prev_broken prev_errmsg code
       (code, "success")
-    else if result == "compile_fail" then
-      let err_msg = trim (shell "tail -10 /tmp/rail_st_compile_err.txt 2>/dev/null")
-      let err_code = trim (shell "head -10 /tmp/rail_st_test.rail 2>/dev/null")
-      gen_with_retry sys task expected (cat ["Compile error:\n", err_msg, "\n\nYour code:\n", err_code]) (attempt + 1) temp code err_msg
     else if result == "wrong_output" then
       let actual = trim (shell "cat /tmp/rail_st_test.rail 2>/dev/null | head -10")
       let got = trim (shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_st_test_bin 2>&1")
       gen_with_retry sys task expected (cat ["Wrong output. Expected: ", expected, "\nGot: ", got, "\n\nYour code:\n", actual]) (attempt + 1) temp code (cat ["wrong output: got ", got])
-    else (code, result)
+    else
+      -- Multi-level error: extract class and detail for targeted retry
+      let eclass = error_class result
+      let edetail = error_detail result
+      let err_msg = trim (shell "tail -10 /tmp/rail_st_compile_err.txt 2>/dev/null")
+      let err_code = trim (shell "head -10 /tmp/rail_st_test.rail 2>/dev/null")
+      let class_hint = if eclass == "syntax_error" then
+        cat ["\n\nSYNTAX ERROR: ", edetail, "\nRemember: Rail uses 'match expr | Pat -> body' (NO with keyword). NO let rec. NO x::xs. NO where clauses. Functions must be defined before main."]
+      else if eclass == "type_error" then
+        cat ["\n\nTYPE ERROR: ", edetail, "\nCheck: function names are correct, right number of arguments, show converts int to string."]
+      else if eclass == "linker_error" then
+        cat ["\n\nLINKER ERROR: ", edetail, "\nYou used a function that doesn't exist. Available builtins: print show head tail cons length reverse append range map filter fold join split str_split str_find str_contains str_replace str_sub chars read_file write_file shell error is_error arr_new arr_get arr_set arr_len to_int read_line"]
+      else cat ["\n\nCompile error: ", edetail]
+      gen_with_retry sys task expected (cat [class_hint, "\n\nCompiler output:\n", err_msg, "\n\nYour code:\n", err_code]) (attempt + 1) temp code err_msg
 
 -- Single attempt — no temperature sweep. Fail fast, move on.
 try_task sys task expected =
@@ -473,6 +521,10 @@ seeds_25 dummy = [
 progress_file = "training/self_train/progress.txt"
 harvest_file = "training/self_train/harvest.jsonl"
 harvest_dedup_file = "training/self_train/harvest_hashes.txt"
+-- Separate repair files by error class (choice 5C)
+syntax_repairs_file = "training/self_train/syntax_repairs.jsonl"
+type_repairs_file = "training/self_train/type_repairs.jsonl"
+linker_repairs_file = "training/self_train/linker_repairs.jsonl"
 repairs_file = "training/self_train/repairs.jsonl"
 log_file = "training/self_train/log.txt"
 
@@ -574,8 +626,33 @@ repair_entry broken_code err_msg fixed_code =
     "{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, json_esc usr, q, "},",
     "{", q, "role", q, ":", q, "assistant", q, ",", q, "content", q, ":", q, json_esc fixed_code, q, "}]}"]
 
+-- Route repairs to class-specific files (choice 5C)
+-- Classify by examining the error message content
+repair_class err_msg =
+  if str_contains "parse error" err_msg then "syntax"
+  else if str_contains "unexpected" err_msg then "syntax"
+  else if str_contains "SYNTAX" err_msg then "syntax"
+  else if str_contains "where" err_msg then "syntax"
+  else if str_contains "let rec" err_msg then "syntax"
+  else if str_contains "with" err_msg then "syntax"
+  else if str_contains "Undefined symbols" err_msg then "linker"
+  else if str_contains "undefined" err_msg then "type"
+  else if str_contains "arity" err_msg then "type"
+  else if str_contains "type" err_msg then "type"
+  else "other"
+
+repair_file_for_class cls =
+  if cls == "syntax" then syntax_repairs_file
+  else if cls == "type" then type_repairs_file
+  else if cls == "linker" then linker_repairs_file
+  else repairs_file
+
 harvest_repair broken_code err_msg fixed_code =
-  let _ = print "    + repair example harvested"
+  let cls = repair_class err_msg
+  let target = repair_file_for_class cls
+  let _ = print (cat ["    + ", cls, " repair harvested"])
+  -- Write to class-specific file AND general repairs file
+  let _ = write_line target (repair_entry broken_code err_msg fixed_code)
   write_line repairs_file (repair_entry broken_code err_msg fixed_code)
 
 take_str s n =
