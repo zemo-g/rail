@@ -38,14 +38,25 @@ strip_fences code =
     read_file "/tmp/rail_fence_raw.txt"
   else code
 
+-- Grammar pre-check: catch syntax errors before the compiler (fast, targeted hints)
+grammar_precheck file =
+  trim (shell (cat ["python3 tools/train/grammar_check.py ", file, " --hint 2>/dev/null"]))
+
 -- Verify with optional expected output (empty = compile+run only)
+-- Grammar pre-check runs alongside compiler (choice 1B: richer signal, both hints combined)
 verify code expected =
   let clean = strip_fences code
   let _ = write_file "/tmp/rail_bench_test.rail" clean
+  -- Grammar pre-check (if grammar_check.py exists) — saved for retry hint, does NOT block compile
+  let _ = write_file "/tmp/rail_bench_grammar_hint.txt" (grammar_precheck "/tmp/rail_bench_test.rail")
   let _ = shell "rm -f /tmp/rail_bench_bin"
   let compile_out = shell "cd ~/projects/rail && ./rail_native /tmp/rail_bench_test.rail 2>&1 && cp /tmp/rail_out /tmp/rail_bench_bin 2>&1"
   let check = trim (shell "test -f /tmp/rail_bench_bin && echo ok || echo fail")
-  if check == "fail" then "compile_fail"
+  if check == "fail" then
+    -- Combine grammar hint with compiler error for richer retry signal
+    let ghint = trim (shell "cat /tmp/rail_bench_grammar_hint.txt 2>/dev/null")
+    if length ghint > 5 then cat ["syntax_error:", ghint]
+    else "compile_fail"
   else
     let _ = shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_bench_bin > /tmp/rail_bench_out.txt 2>&1; echo $? > /tmp/rail_bench_exit.txt"
     let actual = trim (shell "cat /tmp/rail_bench_out.txt 2>/dev/null")
@@ -66,8 +77,15 @@ last_nonempty xs =
     let last = last_nonempty (tail xs)
     if last == "" then head xs else last
 
+-- Few-shot retrieval: find closest training examples for a task
+-- Writes query to temp file to avoid shell quoting issues
+retrieve_examples task =
+  let _ = write_file "/tmp/rail_bench_query.txt" task
+  trim (shell "python3 tools/train/retrieval.py \"$(cat /tmp/rail_bench_query.txt)\" 2>/dev/null")
+
 -- Try with retry (3 attempts with compiler feedback)
 -- Returns "pass:N" where N is attempt number (1-3), or failure reason
+-- Now uses few-shot retrieval for first attempt (The Well insight: layer scale = start near known good)
 try_task sys port task expected =
   try_task_acc sys port task expected "" 1
 
@@ -75,13 +93,20 @@ try_task_acc sys port task expected prev_err attempt =
   if attempt > 3 then "fail"
   else
     let hint = if expected == "" then "" else cat ["\n\nThe program must print exactly: ", expected]
+    -- On first attempt, prepend retrieved examples for context
+    let examples = if attempt == 1 then retrieve_examples task else ""
+    let example_block = if length examples > 10 then cat ["\n\nHere are similar Rail programs for reference:\n", examples, "\n\n"] else ""
     let user = if prev_err == "" then
-      cat [task, hint, "\n\nOutput ONLY Rail code. No markdown, no explanation. Functions before main."]
+      cat [task, hint, example_block, "\n\nOutput ONLY Rail code. No markdown, no explanation. Functions before main."]
     else
       cat [task, hint, "\n\nYour previous attempt failed:\n", prev_err, "\n\nFix the errors. Output ONLY Rail code."]
     let code = llm_call port sys user
     let result = verify code expected
     if result == "success" then cat ["pass:", show attempt]
+    else if str_contains "syntax_error:" result then
+      -- Grammar pre-check caught it — give the model the specific hint
+      let ghint = head (tail (split ":" result))
+      try_task_acc sys port task expected (cat ["SYNTAX ERROR: ", ghint, "\nRemember: Rail uses 'match expr | Pat -> body' (NO with). NO let rec. NO x::xs. NO where. Functions before main."]) (attempt + 1)
     else if result == "compile_fail" then
       let err_out = trim (shell "cat /tmp/rail_bench_test.rail 2>/dev/null | head -5")
       try_task_acc sys port task expected (cat ["Compile error for:\n", err_out]) (attempt + 1)
@@ -155,11 +180,14 @@ bench_task_expected t =
   if length parts >= 2 then head (tail parts)
   else ""
 
+-- Parse string digit to int
+parse_digit c = if c == "1" then 1 else if c == "2" then 2 else if c == "3" then 3 else 0
+
 -- Extract attempt number from "pass:N" result
 is_pass result = str_contains "pass:" result
 get_attempt result =
   if str_contains "pass:" result then
-    to_int (head (tail (split ":" result)))
+    parse_digit (head (tail (split ":" result)))
   else 0
 
 -- Attempt-weighted score: pass on attempt 1 = 1.0, attempt 2 = 0.67, attempt 3 = 0.33
@@ -249,14 +277,14 @@ main =
   let quality = if max_w > 0 then total_weighted * 100 / max_w else 0
 
   let _ = print "\n═══ RESULTS ═══"
+  let _ = print (cat ["  QUALITY:      ", show quality, "/100 (attempt-weighted, first-shot=100)"])
   let _ = print (cat ["  Fundamentals: ", show p1, "/", show t1, " (w:", show w1, "/", show (t1 * 3), ")"])
   let _ = print (cat ["  Practical IO: ", show p2, "/", show t2, " (w:", show w2, "/", show (t2 * 3), ")"])
   let _ = print (cat ["  Real Tools:   ", show p3, "/", show t3, " (w:", show w3, "/", show (t3 * 3), ")"])
   let _ = print (cat ["  Compiler:     ", show p4, "/", show t4, " (w:", show w4, "/", show (t4 * 3), ")"])
   let _ = print (cat ["  Advanced:     ", show p5, "/", show t5, " (w:", show w5, "/", show (t5 * 3), ")"])
   let _ = print (cat ["  Comprehend:   ", show p6, "/", show t6, " (w:", show w6, "/", show (t6 * 3), ")"])
-  let _ = print (cat ["  TOTAL:        ", show total_pass, "/", show total_tasks, " (", show pct, "%)"])
-  let _ = print (cat ["  QUALITY:      ", show quality, "/100 (attempt-weighted, first-shot=100)"])
+  let _ = print (cat ["  pass rate:    ", show total_pass, "/", show total_tasks, " (", show pct, "%)"])
 
   -- Write results to log (extended format with quality score)
   let timestamp = trim (shell "date +%Y-%m-%dT%H:%M:%S")
