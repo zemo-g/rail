@@ -1249,7 +1249,8 @@ cg2 node env ar lc sl tg tp fs =
     let (va, lc1, sl1) = cg vl env ar lc sl false fs
     let env2 = cons (nm, sl) env
     let env2 = if is_int vl env then cons (cat ["__int_", nm], 1) env2 else env2
-    let env2 = if is_float vl env then cons (cat ["__float_", nm], 1) env2 else env2
+    let vl_is_float = is_float vl env
+    let env2 = if vl_is_float then cons (cat ["__float_", nm], 1) env2 else env2
     let (ba, lc2, sl2) = cg bd env2 ar lc1 (sl + 8) tp fs
     (cat [va, "    str x0, [x29, #", show sl, "]\n", ba], lc2, sl2)
   else if tg == "L" then
@@ -1670,6 +1671,49 @@ self_temps_to_regs n =
 is_float_fn fname =
   fname == "to_float" || fname == "int_to_float" || fname == "float_arr_get" || fname == "fneg" || fname == "fsqrt" || fname == "fabs" || fname == "sqrt" || fname == "sin" || fname == "cos" || fname == "tanh" || fname == "exp" || fname == "log" || fname == "pow" || fname == "floor" || fname == "ceil" || fname == "atan2"
 
+-- returns_float: does the RETURN expression of this AST node yield a float?
+-- Unlike body_has_float, this only checks the return path, not the whole body.
+-- Used to mark user functions as float-returning in the arity map.
+returns_float node fret_list =
+  let tg = head node
+  if tg == "FL" then true
+  else if tg == "I" || tg == "S" || tg == "B" || tg == "NULL" then false
+  else if tg == "V" then false
+  else if tg == "?" then
+    -- if/then/else: both branches must return float
+    returns_float (head (tail (tail node))) fret_list && returns_float (head (tail (tail (tail node)))) fret_list
+  else if tg == "D" || tg == "TD" then
+    -- let binding: check the body (continuation), not the value
+    returns_float (head (tail (tail (tail node)))) fret_list
+  else if tg == "A" then
+    -- function call: check if callee is a known float function
+    let (fname, _) = flat node
+    if is_float_fn fname then true
+    else rf_has fname fret_list
+  else if tg == "O" then
+    -- binary op: +,-,*,/ with float operand returns float
+    let op = head (tail node)
+    if op == "+" || op == "-" || op == "*" || op == "/" then
+      returns_float (head (tail (tail node))) fret_list || returns_float (head (tail (tail (tail node)))) fret_list
+    else false
+  else if tg == "M" then
+    -- match: all arms must return float
+    rf_all_arms (head (tail (tail node))) fret_list
+  else false
+
+rf_all_arms arms fret_list =
+  if length arms == 0 then true
+  else
+    let arm = head arms
+    let arm_body = head (tail (tail arm))
+    if returns_float arm_body fret_list then rf_all_arms (tail arms) fret_list
+    else false
+
+rf_has name lst =
+  if length lst == 0 then false
+  else if head lst == name then true
+  else rf_has name (tail lst)
+
 body_has_float node =
   let tg = head node
   if tg == "FL" then true
@@ -1769,6 +1813,14 @@ mark_int_params params body env =
 
 mark_float_params params body env = env
 
+-- Copy __float_ret_ entries from arity map into local env
+inject_fret_markers ar env =
+  if length ar == 0 then env
+  else
+    let (k, v) = head ar
+    if str_contains "__float_ret_" k then
+      inject_fret_markers (tail ar) (cons (k, v) env)
+    else inject_fret_markers (tail ar) env
 
 max_sl node sl =
   let tg = head node
@@ -1839,7 +1891,29 @@ pop_to_adt n i =
 
 get_arities decls =
   let user_ar = get_arities_acc decls
-  append builtin_foreign_arities user_ar
+  -- Two-pass float return detection: first collect names, then re-scan with the list
+  let fret_pass1 = collect_float_ret_fns decls []
+  let fret_pass2 = collect_float_ret_fns decls fret_pass1
+  let fret_markers = mk_fret_markers fret_pass2
+  append fret_markers (append builtin_foreign_arities user_ar)
+
+-- Scan function declarations: if returns_float, add name to list
+collect_float_ret_fns decls known =
+  if length decls == 0 then known
+  else
+    let d = head decls
+    let dtag = head d
+    if head d == "fn" then
+      let nm = head (tail d)
+      let bd = head (tail (tail (tail d)))
+      let rf = returns_float bd known
+      if rf then collect_float_ret_fns (tail decls) (cons nm known)
+      else collect_float_ret_fns (tail decls) known
+    else collect_float_ret_fns (tail decls) known
+
+mk_fret_markers names =
+  if length names == 0 then []
+  else cons (cat ["__float_ret_", head names], 1) (mk_fret_markers (tail names))
 
 builtin_foreign_arities =
   [("sqrt", 3001), ("sin", 3001), ("cos", 3001), ("tanh", 3001),
@@ -1929,6 +2003,8 @@ compile_func d ar lc =
   let env = if length ps <= 3 then mark_int_params ps bd env else env
   let env = mark_float_params ps bd env
   let env = cons ("__nregs", nregs) env
+  -- Inject global float-return markers from arity map into local env
+  let env = inject_fret_markers ar env
   -- Self tail call → loop: mark function name so cg can detect self-calls
   let env = if use_regs && is_self_rec nm bd then cons (cat ["__self_", nm], 1) (cons ("__self_lbl", lc) env) else env
   let first_sl = 16 + 8 * length ps
