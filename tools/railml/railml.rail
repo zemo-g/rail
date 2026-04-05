@@ -1,0 +1,335 @@
+-- railml.rail — Single-file RailML: tensors + gradient checking
+-- All float ops in one compilation unit (cross-file float inference broken)
+
+-- ══════════════════════════════════════════════════════════════
+-- TENSOR OPS (from stdlib/tensor.rail, proven working)
+-- ══════════════════════════════════════════════════════════════
+
+type Tensor = | Tensor data shape strides
+
+mul_acc a b = a * b
+
+compute_strides shape =
+  let rev = reverse shape
+  compute_strides_acc (tail rev) [1]
+
+compute_strides_acc dims acc =
+  if length dims == 0 then acc
+  else
+    let next = head dims * head acc
+    compute_strides_acc (tail dims) (cons next acc)
+
+tensor_new shape init_val =
+  let size = fold mul_acc 1 shape
+  let data = float_arr_new size init_val
+  Tensor data shape (compute_strides shape)
+
+tensor_get_flat t i =
+  match t | Tensor data shape strides -> float_arr_get data i
+
+tensor_set_flat t i v =
+  match t | Tensor data shape strides -> float_arr_set data i v
+
+tensor_get t indices =
+  match t | Tensor data shape strides ->
+    let off = dot_indices indices strides 0
+    float_arr_get data off
+
+tensor_set t indices v =
+  match t | Tensor data shape strides ->
+    let off = dot_indices indices strides 0
+    float_arr_set data off v
+
+dot_indices indices strides acc =
+  if length indices == 0 then acc
+  else dot_indices (tail indices) (tail strides) (acc + head indices * head strides)
+
+tensor_size t =
+  match t | Tensor data shape strides -> float_arr_len data
+
+tensor_shape t =
+  match t | Tensor data shape strides -> shape
+
+dim t axis =
+  match t | Tensor data shape strides -> nth_int shape axis
+
+nth_int lst n =
+  if n == 0 then head lst else nth_int (tail lst) (n - 1)
+
+-- Sum using mutable accumulator (avoids float recursion segfault)
+tensor_sum t =
+  match t | Tensor data shape strides ->
+    let n = float_arr_len data
+    let acc = float_arr_new 1 0.0
+    let _ = tsum_loop data n 0 acc
+    float_arr_get acc 0
+
+tsum_loop data n i acc =
+  if i >= n then 0
+  else
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + float_arr_get data i)
+    tsum_loop data n (i + 1) acc
+
+tensor_mean t =
+  let s = tensor_sum t
+  let n = tensor_size t
+  s / to_float n
+
+-- Matmul (M,K) @ (K,N) -> (M,N) using mutable accumulator
+matmul a b =
+  match a | Tensor a_data a_shape a_strides ->
+  match b | Tensor b_data b_shape b_strides ->
+    let m = head a_shape
+    let k = head (tail a_shape)
+    let n = head (tail b_shape)
+    let c = tensor_new [m, n] 0.0
+    let _ = mm_i a_data b_data c m n k 0
+    c
+
+mm_i a b c m n k i =
+  if i >= m then 0
+  else
+    let _ = mm_j a b c m n k i 0
+    mm_i a b c m n k (i + 1)
+
+mm_j a b c m n k i j =
+  if j >= n then 0
+  else
+    let acc = float_arr_new 1 0.0
+    let _ = mm_k a b acc k n i j 0
+    let _ = tensor_set c [i, j] (float_arr_get acc 0)
+    mm_j a b c m n k i (j + 1)
+
+mm_k a b acc k n i j ki =
+  if ki >= k then 0
+  else
+    let av = float_arr_get a (i * k + ki + 1)
+    let bv = float_arr_get b (ki * n + j + 1)
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + av * bv)
+    mm_k a b acc k n i j (ki + 1)
+
+-- Element-wise ops
+tensor_add a b =
+  match a | Tensor ad as_ ast ->
+    let n = float_arr_len ad
+    let c = tensor_new as_ 0.0
+    let _ = ew_add_loop ad b c n 0
+    c
+ew_add_loop ad b c n i =
+  if i >= n then 0
+  else
+    match b | Tensor bd bs bst ->
+      let _ = tensor_set_flat c i (float_arr_get ad i + float_arr_get bd i)
+      ew_add_loop ad b c n (i + 1)
+
+tensor_sub a b =
+  match a | Tensor ad as_ ast ->
+    let n = float_arr_len ad
+    let c = tensor_new as_ 0.0
+    let _ = ew_sub_loop ad b c n 0
+    c
+ew_sub_loop ad b c n i =
+  if i >= n then 0
+  else
+    match b | Tensor bd bs bst ->
+      let _ = tensor_set_flat c i (float_arr_get ad i - float_arr_get bd i)
+      ew_sub_loop ad b c n (i + 1)
+
+tensor_mul a b =
+  match a | Tensor ad as_ ast ->
+    let n = float_arr_len ad
+    let c = tensor_new as_ 0.0
+    let _ = ew_mul_loop ad b c n 0
+    c
+ew_mul_loop ad b c n i =
+  if i >= n then 0
+  else
+    match b | Tensor bd bs bst ->
+      let _ = tensor_set_flat c i (float_arr_get ad i * float_arr_get bd i)
+      ew_mul_loop ad b c n (i + 1)
+
+tensor_scale t s =
+  match t | Tensor data shape strides ->
+    let n = float_arr_len data
+    let c = tensor_new shape 0.0
+    let _ = scale_loop data c n s 0
+    c
+scale_loop data c n s i =
+  if i >= n then 0
+  else
+    let _ = tensor_set_flat c i (float_arr_get data i * s)
+    scale_loop data c n s (i + 1)
+
+tensor_transpose t =
+  match t | Tensor data shape strides ->
+    Tensor data (reverse shape) (reverse strides)
+
+-- ══════════════════════════════════════════════════════════════
+-- NUMERICAL GRADIENT CHECKING
+-- All use mutable float_arr accumulators
+-- ══════════════════════════════════════════════════════════════
+
+eps = 0.0001
+
+-- f(x) = sum(x^2)
+sum_sq t =
+  let n = tensor_size t
+  let acc = float_arr_new 1 0.0
+  let _ = sum_sq_loop t n 0 acc
+  float_arr_get acc 0
+
+sum_sq_loop t n i acc =
+  if i >= n then 0
+  else
+    let v = tensor_get_flat t i
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + v * v)
+    sum_sq_loop t n (i + 1) acc
+
+-- f(x) = sum(relu(x))
+sum_relu t =
+  let n = tensor_size t
+  let acc = float_arr_new 1 0.0
+  let _ = sum_relu_loop t n 0 acc
+  float_arr_get acc 0
+
+sum_relu_loop t n i acc =
+  if i >= n then 0
+  else
+    let v = tensor_get_flat t i
+    let r = if v > 0.0 then v else 0.0
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + r)
+    sum_relu_loop t n (i + 1) acc
+
+-- f(x) = sum(exp(x))
+sum_exp t =
+  let n = tensor_size t
+  let acc = float_arr_new 1 0.0
+  let _ = sum_exp_loop t n 0 acc
+  float_arr_get acc 0
+
+sum_exp_loop t n i acc =
+  if i >= n then 0
+  else
+    let v = exp (tensor_get_flat t i)
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + v)
+    sum_exp_loop t n (i + 1) acc
+
+-- Numerical gradient: perturb element i by +/- eps
+numgrad_sq t i =
+  let orig = tensor_get_flat t i
+  let _ = tensor_set_flat t i (orig + eps)
+  let fp = sum_sq t
+  let _ = tensor_set_flat t i (orig - eps)
+  let fm = sum_sq t
+  let _ = tensor_set_flat t i orig
+  (fp - fm) / (2.0 * eps)
+
+numgrad_relu t i =
+  let orig = tensor_get_flat t i
+  let _ = tensor_set_flat t i (orig + eps)
+  let fp = sum_relu t
+  let _ = tensor_set_flat t i (orig - eps)
+  let fm = sum_relu t
+  let _ = tensor_set_flat t i orig
+  (fp - fm) / (2.0 * eps)
+
+numgrad_exp t i =
+  let orig = tensor_get_flat t i
+  let _ = tensor_set_flat t i (orig + eps)
+  let fp = sum_exp t
+  let _ = tensor_set_flat t i (orig - eps)
+  let fm = sum_exp t
+  let _ = tensor_set_flat t i orig
+  (fp - fm) / (2.0 * eps)
+
+-- f(A) = sum(matmul(A, B)) — gradient w.r.t A[i]
+numgrad_matmul_a a b i =
+  let orig = tensor_get_flat a i
+  let _ = tensor_set_flat a i (orig + eps)
+  let fp = tensor_sum (matmul a b)
+  let _ = tensor_set_flat a i (orig - eps)
+  let fm = tensor_sum (matmul a b)
+  let _ = tensor_set_flat a i orig
+  (fp - fm) / (2.0 * eps)
+
+abs_f x = if x > 0.0 then x else 0.0 - x
+
+check_g name i numerical analytical =
+  let diff = abs_f (numerical - analytical)
+  let denom = abs_f analytical + 0.000001
+  let rel = diff / denom
+  let tag = if rel < 0.01 then "PASS" else "FAIL"
+  let _ = print (cat ["  ", name, "[", show i, "]: num=", show_float numerical, " ana=", show_float analytical, " err=", show_float rel, " ", tag])
+  tag
+
+-- ══════════════════════════════════════════════════════════════
+-- MAIN: Run all gradient checks
+-- ══════════════════════════════════════════════════════════════
+
+main =
+  let _ = print "=== RailML Gradient Checks ==="
+  let _ = print ""
+
+  -- Test 1: d/dx sum(x^2) = 2x
+  let _ = print "--- d/dx sum(x^2) = 2x ---"
+  let x1 = tensor_new [4] 0.0
+  let _ = tensor_set_flat x1 0 1.0
+  let _ = tensor_set_flat x1 1 (0.0 - 2.0)
+  let _ = tensor_set_flat x1 2 3.0
+  let _ = tensor_set_flat x1 3 0.5
+  let _ = check_g "sq" 0 (numgrad_sq x1 0) 2.0
+  let _ = check_g "sq" 1 (numgrad_sq x1 1) (0.0 - 4.0)
+  let _ = check_g "sq" 2 (numgrad_sq x1 2) 6.0
+  let _ = check_g "sq" 3 (numgrad_sq x1 3) 1.0
+  let _ = print ""
+
+  -- Test 2: d/dx sum(relu(x)) = 1{x>0}
+  let _ = print "--- d/dx sum(relu(x)) = 1{x>0} ---"
+  let x2 = tensor_new [4] 0.0
+  let _ = tensor_set_flat x2 0 2.0
+  let _ = tensor_set_flat x2 1 (0.0 - 1.0)
+  let _ = tensor_set_flat x2 2 0.5
+  let _ = tensor_set_flat x2 3 (0.0 - 3.0)
+  let _ = check_g "relu" 0 (numgrad_relu x2 0) 1.0
+  let _ = check_g "relu" 1 (numgrad_relu x2 1) 0.0
+  let _ = check_g "relu" 2 (numgrad_relu x2 2) 1.0
+  let _ = check_g "relu" 3 (numgrad_relu x2 3) 0.0
+  let _ = print ""
+
+  -- Test 3: d/dx sum(exp(x)) = exp(x)
+  let _ = print "--- d/dx sum(exp(x)) = exp(x) ---"
+  let x3 = tensor_new [3] 0.0
+  let _ = tensor_set_flat x3 0 0.0
+  let _ = tensor_set_flat x3 1 1.0
+  let _ = tensor_set_flat x3 2 (0.0 - 1.0)
+  let _ = check_g "exp" 0 (numgrad_exp x3 0) (exp 0.0)
+  let _ = check_g "exp" 1 (numgrad_exp x3 1) (exp 1.0)
+  let _ = check_g "exp" 2 (numgrad_exp x3 2) (exp (0.0 - 1.0))
+  let _ = print ""
+
+  -- Test 4: d/dA sum(A @ B) — matmul gradient
+  let _ = print "--- d/dA sum(A @ B) = B^T row sums ---"
+  let a = tensor_new [2, 3] 0.0
+  let _ = tensor_set a [0, 0] 1.0
+  let _ = tensor_set a [0, 1] 2.0
+  let _ = tensor_set a [0, 2] 3.0
+  let _ = tensor_set a [1, 0] 4.0
+  let _ = tensor_set a [1, 1] 5.0
+  let _ = tensor_set a [1, 2] 6.0
+  let b = tensor_new [3, 2] 0.0
+  let _ = tensor_set b [0, 0] 0.1
+  let _ = tensor_set b [0, 1] 0.2
+  let _ = tensor_set b [1, 0] 0.3
+  let _ = tensor_set b [1, 1] 0.4
+  let _ = tensor_set b [2, 0] 0.5
+  let _ = tensor_set b [2, 1] 0.6
+  -- d/dA[0,0] sum(A@B) = sum of B row 0 = 0.1 + 0.2 = 0.3
+  let _ = check_g "mm" 0 (numgrad_matmul_a a b 0) 0.3
+  -- d/dA[0,1] sum(A@B) = sum of B row 1 = 0.3 + 0.4 = 0.7
+  let _ = check_g "mm" 1 (numgrad_matmul_a a b 1) 0.7
+  -- d/dA[0,2] sum(A@B) = sum of B row 2 = 0.5 + 0.6 = 1.1
+  let _ = check_g "mm" 2 (numgrad_matmul_a a b 2) 1.1
+
+  let _ = print ""
+  let _ = print "=== All gradient checks complete ==="
+  0
