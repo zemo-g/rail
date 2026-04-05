@@ -155,3 +155,57 @@ PHASE 5 — ITERATE
 ```
 
 Each cycle should push the bench 2-4 points. Target 20/30 by end of day.
+
+---
+
+## RailML Blockers (2026-04-05)
+
+### BLOCKER: Float codegen regression
+
+Float `+` and `-` do integer arithmetic instead of `fadd`/`fsub`. Float `*` and `/` work correctly. Foreign float calls (`exp`, `sin`, `sqrt`, `cos`, `tanh`) return garbage.
+
+**Evidence:**
+```
+1.5 + 2.5 = 4   (wrong, should be 4.0 via fadd)
+1.5 * 2.5 = 3.75 (correct, fmul works)
+5.0 - 3.0 = 2   (wrong, integer sub)
+5.0 / 3.0 = 1.67 (correct, fdiv works)
+exp(1.0) = 3.4e-314 (garbage)
+sin(1.0) = 4.9e-324 (garbage)
+sqrt(2.0) = 2 (wrong, should be 1.414)
+```
+
+**Root cause:** The `+` and `-` dispatch in `cg_bi2` or `_rail_add`/`_rail_sub` runtime doesn't detect float operands. Probably a regression from recent compiler changes (GC fix, parser `in` fix, WASM additions).
+
+**Fix location:** `tools/compile.rail` — search for `_rail_add`, `cg_bi2`, float detection in arithmetic dispatch. The `*` and `/` paths work, so compare their codegen.
+
+**Impact:** Blocks ALL of RailML Phases 3-6. No softmax, no layer norm, no gradients, no training without working float arithmetic.
+
+### Updated Task List
+
+1. ~~Weight dump script~~ DONE
+2. **Fix float +/- codegen** ← MUST DO FIRST
+3. **Fix foreign float calls (exp/sin/sqrt/etc)** 
+4. Forward pass test (needs #2 + #3)
+5. Gradient check each op
+6. Wire training loop
+7. Train 100 steps
+8. Metal matmul
+
+### BLOCKER 2: Float recursive accumulation segfaults
+
+Recursive functions that accumulate floats via self-calls segfault. The float self-loop TCO is deferred — `body_has_float` guard prevents int-TCO corruption but float-specific d8-d15 TCO not implemented. Workaround: use mutable float_arr cells for accumulation instead of recursive params.
+
+**Evidence:** `sum_sq_acc t n i (acc + v * v)` segfaults. `tensor_sum` (which uses float_arr cells internally) works.
+
+**Impact:** Blocks gradient checking (Item 5), which blocks training (Items 6-7).
+
+**Fix:** Either implement float d8-d15 TCO in compile.rail, or rewrite all recursive accumulators to use mutable float_arr cells (the tensor.rail pattern).
+
+### BLOCKER 3: Cross-file float return inference
+
+`tensor_get_flat` returns float but callers in importing files treat it as int. Known limitation per CLAUDE.md.
+
+**Impact:** Forces all float-heavy code into a single file. Can't use tensor.rail as a library for gradient checks.
+
+**Workaround:** Inline gradient tests inside tensor.rail.
