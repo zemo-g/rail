@@ -99,7 +99,7 @@ static void lxf_step(double *s, double *ns, double dt) {
 
 #define IN_DIM 30
 #define OUT_DIM 6
-#define N_STEPS 50
+#define N_STEPS 100
 #define N_EXAMPLES (NN2 * N_STEPS)
 
 // Extract 5-cell stencil (center + 4 neighbors) × 6 fields = 30 values
@@ -326,6 +326,44 @@ int main(int argc, char **argv) {
             [enc setBytes:&mse_scale length:4 atIndex:3];
             [enc dispatchThreads:MTLSizeMake(loss_n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+
+            // ── CONSERVATION LOSS via batch-mean drift (Raissi/Karniadakis style) ──
+            // For each field j, drift[j] = mean(pred[:,j]) - mean(target[:,j])
+            // Add 2 * lambda * drift[j] / BATCH to each sample's d_out[:,j]
+            {
+                float *pp_c = pred.contents;
+                float *yp_c = Y_batch.contents;
+                float *dp_c = d_out.contents;
+                float drift[OUT_DIM] = {0};
+                float true_mean[OUT_DIM] = {0};
+                for (int i = 0; i < BATCH; i++) {
+                    for (int j = 0; j < OUT_DIM; j++) {
+                        drift[j] += pp_c[i*OUT_DIM+j];
+                        true_mean[j] += yp_c[i*OUT_DIM+j];
+                    }
+                }
+                float inv_B = 1.0f / BATCH;
+                for (int j = 0; j < OUT_DIM; j++) {
+                    drift[j] = (drift[j] - true_mean[j]) * inv_B;
+                }
+                // Loss weights: mass, momx, momy, Bx, By, energy
+                float lambda[OUT_DIM] = { 2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f };
+                // Add 2 * lambda * drift / BATCH to each output gradient
+                for (int i = 0; i < BATCH; i++) {
+                    for (int j = 0; j < OUT_DIM; j++) {
+                        dp_c[i*OUT_DIM+j] += 2.0f * lambda[j] * drift[j] * inv_B;
+                    }
+                }
+                if (step % 2000 == 0) {
+                    printf("  drift: ρ=%+.4f mx=%+.4f my=%+.4f Bx=%+.4f By=%+.4f E=%+.4f\n",
+                        drift[0], drift[1], drift[2], drift[3], drift[4], drift[5]);
+                }
+            }
+
+            // Re-enter command buffer for backward pass
+            cmd = [queue commandBuffer];
 
             // dW2 = A1^T @ d_out  [HIDDEN x OUT_DIM]
             enc = [cmd computeCommandEncoder];
@@ -424,6 +462,106 @@ int main(int argc, char **argv) {
 
             [cmd commit];
             [cmd waitUntilCompleted];
+
+            // ── SPECTRAL NORMALIZATION via power iteration ──
+            // Bound σ(W1) and σ(W2) to enforce Lipschitz constant
+            // Power iteration: v = W^T u / ||W^T u||, u = W v / ||W v||
+            // σ ≈ ||W v||. Run 3 iterations for good convergence.
+            {
+                // W1 is [IN_DIM x HIDDEN], so W1 @ v where v is HIDDEN-dim gives IN_DIM-dim u
+                // We want σ(W1) ≤ 2 (network + residual damping keeps total stable)
+                static float u1_sn[IN_DIM], v1_sn[HIDDEN];
+                static int sn_init = 0;
+                if (!sn_init) {
+                    for (int i = 0; i < IN_DIM; i++) u1_sn[i] = (float)arc4random()/UINT32_MAX - 0.5f;
+                    for (int i = 0; i < HIDDEN; i++) v1_sn[i] = (float)arc4random()/UINT32_MAX - 0.5f;
+                    sn_init = 1;
+                }
+                float *w1c = W1.contents;
+                // 3 power iterations
+                for (int it = 0; it < 3; it++) {
+                    // v = W1^T @ u (W1[i,j] transposed: access w1c[i*HIDDEN+j], give v[j] = sum_i w1c[i*HIDDEN+j]*u[i])
+                    for (int j = 0; j < HIDDEN; j++) {
+                        float s = 0;
+                        for (int i = 0; i < IN_DIM; i++) s += w1c[i*HIDDEN+j] * u1_sn[i];
+                        v1_sn[j] = s;
+                    }
+                    float vn = 0;
+                    for (int j = 0; j < HIDDEN; j++) vn += v1_sn[j]*v1_sn[j];
+                    vn = sqrtf(vn) + 1e-8f;
+                    for (int j = 0; j < HIDDEN; j++) v1_sn[j] /= vn;
+                    // u = W1 @ v : u[i] = sum_j w1c[i*HIDDEN+j]*v[j]
+                    for (int i = 0; i < IN_DIM; i++) {
+                        float s = 0;
+                        for (int j = 0; j < HIDDEN; j++) s += w1c[i*HIDDEN+j] * v1_sn[j];
+                        u1_sn[i] = s;
+                    }
+                    float un = 0;
+                    for (int i = 0; i < IN_DIM; i++) un += u1_sn[i]*u1_sn[i];
+                    un = sqrtf(un) + 1e-8f;
+                    for (int i = 0; i < IN_DIM; i++) u1_sn[i] /= un;
+                }
+                // σ = u^T @ W1 @ v
+                float sigma1 = 0;
+                for (int i = 0; i < IN_DIM; i++) {
+                    float row = 0;
+                    for (int j = 0; j < HIDDEN; j++) row += w1c[i*HIDDEN+j] * v1_sn[j];
+                    sigma1 += u1_sn[i] * row;
+                }
+                sigma1 = fabsf(sigma1);
+                float sigma1_target = 1.3f;
+                if (sigma1 > sigma1_target) {
+                    float s = sigma1_target / sigma1;
+                    for (int i = 0; i < IN_DIM*HIDDEN; i++) w1c[i] *= s;
+                }
+
+                // W2 is [HIDDEN x OUT_DIM]
+                static float u2_sn[HIDDEN], v2_sn[OUT_DIM];
+                static int sn_init2 = 0;
+                if (!sn_init2) {
+                    for (int i = 0; i < HIDDEN; i++) u2_sn[i] = (float)arc4random()/UINT32_MAX - 0.5f;
+                    for (int i = 0; i < OUT_DIM; i++) v2_sn[i] = (float)arc4random()/UINT32_MAX - 0.5f;
+                    sn_init2 = 1;
+                }
+                float *w2c = W2.contents;
+                for (int it = 0; it < 3; it++) {
+                    for (int j = 0; j < OUT_DIM; j++) {
+                        float s = 0;
+                        for (int i = 0; i < HIDDEN; i++) s += w2c[i*OUT_DIM+j] * u2_sn[i];
+                        v2_sn[j] = s;
+                    }
+                    float vn = 0;
+                    for (int j = 0; j < OUT_DIM; j++) vn += v2_sn[j]*v2_sn[j];
+                    vn = sqrtf(vn) + 1e-8f;
+                    for (int j = 0; j < OUT_DIM; j++) v2_sn[j] /= vn;
+                    for (int i = 0; i < HIDDEN; i++) {
+                        float s = 0;
+                        for (int j = 0; j < OUT_DIM; j++) s += w2c[i*OUT_DIM+j] * v2_sn[j];
+                        u2_sn[i] = s;
+                    }
+                    float un = 0;
+                    for (int i = 0; i < HIDDEN; i++) un += u2_sn[i]*u2_sn[i];
+                    un = sqrtf(un) + 1e-8f;
+                    for (int i = 0; i < HIDDEN; i++) u2_sn[i] /= un;
+                }
+                float sigma2 = 0;
+                for (int i = 0; i < HIDDEN; i++) {
+                    float row = 0;
+                    for (int j = 0; j < OUT_DIM; j++) row += w2c[i*OUT_DIM+j] * v2_sn[j];
+                    sigma2 += u2_sn[i] * row;
+                }
+                sigma2 = fabsf(sigma2);
+                float sigma2_target = 1.3f;
+                if (sigma2 > sigma2_target) {
+                    float s = sigma2_target / sigma2;
+                    for (int i = 0; i < HIDDEN*OUT_DIM; i++) w2c[i] *= s;
+                }
+
+                // Log spectral norms every 2000 steps
+                if (step % 2000 == 0) {
+                    printf("  σ(W1)=%.3f  σ(W2)=%.3f\n", sigma1, sigma2);
+                }
+            }
 
             // LR decay: halve every 5000 steps
             if (step > 0 && step % 5000 == 0) lr *= 0.5f;
@@ -537,7 +675,7 @@ int main(int argc, char **argv) {
                     for (int k=0; k<HIDDEN; k++) v += h[k] * w2c[k*OUT_DIM+j];
                     // Denormalize output and add to current state (residual, damped)
                     double delta = (double)(v * y_std[j] + y_mean[j]);
-                    sim_ns[j*NN2+i] = sim_s[j*NN2+i] + 0.7 * delta;
+                    sim_ns[j*NN2+i] = sim_s[j*NN2+i] + 0.5 * delta;
                 }
             }
 
