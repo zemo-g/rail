@@ -1,5 +1,9 @@
 # Rail
 
+[![Rail: 95%](https://img.shields.io/badge/Rail-95%25-ff5500?style=for-the-badge&logo=rust&logoColor=white)](#)
+
+> GitHub's language bar shows this repo as Haskell because `github-linguist` doesn't know Rail exists yet. A [PR is in flight](https://github.com/github-linguist/linguist/pulls?q=rail) to fix that. In the meantime: this is a Rail codebase.
+
 [![tests: 91/92](https://img.shields.io/badge/tests-91%2F92-brightgreen)](#)
 [![self-hosting](https://img.shields.io/badge/self--hosting-fixed%20point-blue)](#)
 [![bench: 43%](https://img.shields.io/badge/RAILGPT%20bench-43%25-yellow)](#the-flywheel)
