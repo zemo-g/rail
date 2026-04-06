@@ -1,0 +1,222 @@
+-- s0.rail — Quintessentially small self-growing seed.
+-- 11-rule PCFG over Rail integer expressions. The compiler is the teacher.
+-- Each round: sample N programs, compile-check, reinforce passing rules.
+-- The whole "model" is 11 integer weights.
+
+-- ============================================================
+-- Utilities
+-- ============================================================
+
+trim s = head (split "\n" s)
+
+dval c =
+  if c == "0" then 0
+  else if c == "1" then 1
+  else if c == "2" then 2
+  else if c == "3" then 3
+  else if c == "4" then 4
+  else if c == "5" then 5
+  else if c == "6" then 6
+  else if c == "7" then 7
+  else if c == "8" then 8
+  else if c == "9" then 9
+  else 0
+
+parse_i s = pi (chars s) 0 1
+pi cs a sg =
+  if length cs == 0 then a * sg
+  else if head cs == "-" then pi (tail cs) a (0 - 1)
+  else pi (tail cs) (a * 10 + dval (head cs)) sg
+
+lcat xs ys =
+  if length xs == 0 then ys
+  else cons (head xs) (lcat (tail xs) ys)
+
+-- ============================================================
+-- RNG: pre-batch from /dev/urandom (single shell call)
+-- ============================================================
+
+rng_make n =
+  let cmd = cat ["od -An -N", show (n * 4), " -tu4 /dev/urandom | tr -s ' \n' ' ' > /tmp/s0_rng.txt"]
+  let _ = shell cmd
+  let parts = split " " (read_file "/tmp/s0_rng.txt")
+  let arr = arr_new n 0
+  let _ = rng_fill arr parts 0 n
+  arr
+
+rng_fill arr parts i n =
+  if i >= n then 0
+  else if length parts == 0 then 0
+  else
+    let s = head parts
+    if length s == 0 then rng_fill arr (tail parts) i n
+    else
+      let _ = arr_set arr i (parse_i s)
+      rng_fill arr (tail parts) (i + 1) n
+
+rng_next rng idx_arr =
+  let i = arr_get idx_arr 0
+  let _ = arr_set idx_arr 0 (i + 1)
+  arr_get rng i
+
+-- ============================================================
+-- Grammar (hardcoded, 13 rules — 11 valid + 2 traps)
+--   0:  Program -> "main = let _ = print (show " Expr ")\n  0\n"
+--   1:  Expr    -> Int
+--   2:  Expr    -> "(" Expr Op Expr ")"
+--   3:  Expr    -> "(if " Expr " > 0 then " Expr " else " Expr ")"
+--   4:  Int     -> "0"
+--   5:  Int     -> "1"
+--   6:  Int     -> "5"
+--   7:  Int     -> "42"
+--   8:  Op      -> " + "
+--   9:  Op      -> " - "
+--   10: Op      -> " * "
+--   11: Expr    -> "x"           (TRAP: undefined variable, always fails)
+--   12: Expr    -> "(" Expr Op ")" (TRAP: missing right operand, always fails)
+-- ============================================================
+
+expr_alts = [1, 2, 3, 11, 12]
+int_alts  = [4, 5, 6, 7]
+op_alts   = [8, 9, 10]
+
+sum_w w rules =
+  if length rules == 0 then 0
+  else (arr_get w (head rules)) + sum_w w (tail rules)
+
+pick_w w rules target acc =
+  if length rules == 0 then 0
+  else
+    let r = head rules
+    let nacc = acc + (arr_get w r)
+    if length (tail rules) == 0 then r
+    else if target < nacc then r
+    else pick_w w (tail rules) target nacc
+
+sample_alt w rules rng idx =
+  let total = sum_w w rules
+  let r = rng_next rng idx
+  let target = r - (r / total) * total
+  pick_w w rules target 0
+
+-- ============================================================
+-- Generation: each gen_X returns (string, used_rules)
+-- ============================================================
+
+gen_int w rng idx =
+  let r = sample_alt w int_alts rng idx
+  let s = if r == 4 then "0"
+          else if r == 5 then "1"
+          else if r == 6 then "5"
+          else "42"
+  (s, [r])
+
+gen_op w rng idx =
+  let r = sample_alt w op_alts rng idx
+  let s = if r == 8 then " + "
+          else if r == 9 then " - "
+          else " * "
+  (s, [r])
+
+gen_expr w rng idx depth =
+  if depth >= 3 then
+    let (s, rs) = gen_int w rng idx
+    (s, cons 1 rs)
+  else
+    let r = sample_alt w expr_alts rng idx
+    if r == 1 then
+      let (s, rs) = gen_int w rng idx
+      (s, cons 1 rs)
+    else if r == 2 then
+      let (e1, rs1) = gen_expr w rng idx (depth + 1)
+      let (op, ros) = gen_op w rng idx
+      let (e2, rs2) = gen_expr w rng idx (depth + 1)
+      (cat ["(", e1, op, e2, ")"], cons 2 (lcat rs1 (lcat ros rs2)))
+    else if r == 3 then
+      let (c, rsc) = gen_expr w rng idx (depth + 1)
+      let (t, rst) = gen_expr w rng idx (depth + 1)
+      let (e, rse) = gen_expr w rng idx (depth + 1)
+      (cat ["(if ", c, " > 0 then ", t, " else ", e, ")"], cons 3 (lcat rsc (lcat rst rse)))
+    else if r == 11 then
+      ("x", [11])
+    else
+      let (e1, rs1) = gen_expr w rng idx (depth + 1)
+      let (op, ros) = gen_op w rng idx
+      (cat ["(", e1, op, ")"], cons 12 (lcat rs1 ros))
+
+gen_program w rng idx =
+  let (e, rs) = gen_expr w rng idx 0
+  let prog = cat ["main = let _ = print (show ", e, ")\n  0\n"]
+  (prog, cons 0 rs)
+
+-- ============================================================
+-- Compile-check via shell
+-- rail_native exits 0 on errors, so we grep stdout
+-- ============================================================
+
+check_compile prog =
+  let _ = write_file "/tmp/s0_gen.rail" prog
+  let raw = shell "./rail_native run /tmp/s0_gen.rail 2>&1 | grep -cE 'error|WARNING|Bus|Segment' || echo 0"
+  let n = parse_i (trim raw)
+  if n == 0 then 1 else 0
+
+-- ============================================================
+-- REINFORCE update
+-- ============================================================
+
+update_weights w used reward =
+  if length used == 0 then 0
+  else
+    let r = head used
+    let cur = arr_get w r
+    let delta = if reward == 1 then 50 else (0 - 5)
+    let new = cur + delta
+    let new2 = if new < 1 then 1 else new
+    let _ = arr_set w r new2
+    update_weights w (tail used) reward
+
+-- ============================================================
+-- Round driver
+-- ============================================================
+
+run_one w rng idx =
+  let (prog, used) = gen_program w rng idx
+  let r = check_compile prog
+  let _ = update_weights w used r
+  r
+
+run_round w rng idx n acc =
+  if n == 0 then acc
+  else
+    let p = run_one w rng idx
+    run_round w rng idx (n - 1) (acc + p)
+
+show_weights w =
+  let _ = print (cat ["  Program: ", show (arr_get w 0)])
+  let _ = print (cat ["  Expr int|bin|if|TRAPx|TRAPmiss: ", show (arr_get w 1), " ", show (arr_get w 2), " ", show (arr_get w 3), " ", show (arr_get w 11), " ", show (arr_get w 12)])
+  let _ = print (cat ["  Int 0|1|5|42: ", show (arr_get w 4), " ", show (arr_get w 5), " ", show (arr_get w 6), " ", show (arr_get w 7)])
+  print (cat ["  Op +|-|*: ", show (arr_get w 8), " ", show (arr_get w 9), " ", show (arr_get w 10)])
+
+round_loop w rng idx i total per =
+  if i >= total then 0
+  else
+    let passes = run_round w rng idx per 0
+    let _ = print (cat ["round ", show i, ": ", show passes, "/", show per, " pass"])
+    round_loop w rng idx (i + 1) total per
+
+main =
+  let _ = print "=== S0: PCFG + REINFORCE ==="
+  let _ = print "  Model: 11 integer weights. Compiler is the teacher."
+  let n_rounds = 10
+  let n_per_round = 30
+  let rng = rng_make 200000
+  let idx = arr_new 1 0
+  let w = arr_new 13 1000
+  let _ = print (cat ["  rounds=", show n_rounds, " samples/round=", show n_per_round])
+  let _ = print "  initial weights:"
+  let _ = show_weights w
+  let _ = round_loop w rng idx 0 n_rounds n_per_round
+  let _ = print "  final weights:"
+  let _ = show_weights w
+  let _ = print "=== DONE ==="
+  0
