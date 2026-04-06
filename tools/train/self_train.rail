@@ -35,6 +35,23 @@ write_line file text =
   shell (cat ["cat /tmp/rail_st_line.txt >> ", file])
 
 -- ══════════════════════════════════════════════════════════════════════════════
+-- Intervention ledger (Empire causal cocoon Phase 1, ported to JSONL)
+-- Append-only flywheel/interventions.jsonl. Each call adds one record.
+-- Caller builds the field fragment with kvi (int) / kvs (string) helpers.
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Build a ',"key":int' fragment
+kvi key val = cat [",", q, key, q, ":", show val]
+
+-- Build a ',"key":"string"' fragment (val must already be JSON-safe)
+kvs key val = cat [",", q, key, q, ":", q, val, q]
+
+-- Append a record to flywheel/interventions.jsonl
+log_intervention kind fields =
+  let ts = trim (shell "date -u +%Y-%m-%dT%H:%M:%S+00:00")
+  write_line "flywheel/interventions.jsonl" (cat ["{", q, "ts", q, ":", q, ts, q, ",", q, "kind", q, ":", q, kind, q, fields, "}"])
+
+-- ══════════════════════════════════════════════════════════════════════════════
 -- LLM interface
 -- ══════════════════════════════════════════════════════════════════════════════
 
@@ -519,6 +536,7 @@ seeds_25 dummy = [
 -- ══════════════════════════════════════════════════════════════════════════════
 
 progress_file = "training/self_train/progress.txt"
+overrides_file = "flywheel/overrides.txt"
 harvest_file = "training/self_train/harvest.jsonl"
 harvest_dedup_file = "training/self_train/harvest_hashes.txt"
 -- Separate repair files by error class (choice 5C)
@@ -549,6 +567,17 @@ parse_kv lines key =
       if head parts == key then to_int_safe (head (tail parts))
       else parse_kv (tail lines) key
     else parse_kv (tail lines) key
+
+-- Read a tunable from flywheel/overrides.txt (Empire transplant Session 4).
+-- Returns default when the file is missing or the key is absent. For the
+-- four current tunables (all positive thresholds) "value is 0" also falls
+-- back to default — none of them legitimately want 0.
+load_override key default =
+  let content = read_file overrides_file
+  if length content == 0 then default
+  else
+    let v = parse_kv (split "\n" content) key
+    if v == 0 then default else v
 
 to_int_safe s =
   let trimmed = trim s
@@ -855,11 +884,19 @@ main =
 run_loop sys all_tasks goals round level harvested since_retrain consecutive_pass consecutive_zero =
   let _ = print (cat ["\n════ ROUND ", show round, " (level ", show level, " cp=", show consecutive_pass, " cz=", show consecutive_zero, ") ════"])
 
+  -- Tunables (Empire transplant Session 4) — read from flywheel/overrides.txt
+  -- each round so an in-flight `override_set` change takes effect immediately.
+  let pass_threshold = load_override "pass_threshold" 20
+  let advance_threshold = load_override "advance_threshold" 2
+  let fallback_threshold = load_override "fallback_threshold" 4
+  let retrain_threshold = load_override "retrain_threshold" 200
+
   -- Health-check MLX server before wasting a round (max 6 retries = 3 min)
   let server_ok = wait_for_healthy_server 0
   if server_ok == false then
     let _ = print "  ✗ MLX server not responding after 3 min — exiting round"
     let _ = write_progress round level harvested since_retrain consecutive_pass consecutive_zero
+    let _ = log_intervention "server_skip" (cat [kvi "round" round, kvi "level" level, kvi "harvested" harvested, kvi "since_retrain" since_retrain, kvi "consecutive_pass" consecutive_pass, kvi "consecutive_zero" consecutive_zero, kvs "reason" "mlx_unhealthy", kvs "attributed_to" "self_train"])
     0
   else
 
@@ -902,19 +939,22 @@ run_loop sys all_tasks goals round level harvested since_retrain consecutive_pas
   let _ = write_line log_file (cat ["round=", show round, " level=", show level, " pass=", show pass, "/", show (pass + fail), " rate=", show pass_rate, "% harvested=", show harvested])
 
   -- Check curriculum advancement (up) or fallback (down)
-  let consecutive_pass = if pass_rate >= 20 then consecutive_pass + 1 else 0
+  let consecutive_pass = if pass_rate >= pass_threshold then consecutive_pass + 1 else 0
   let consecutive_zero = if pass_rate == 0 then consecutive_zero + 1 else 0
 
   -- Save progress with counters BEFORE retrain (so we don't lose state if retrain crashes)
   let _ = write_progress round level harvested since_retrain consecutive_pass consecutive_zero
 
+  -- Intervention ledger: post-round snapshot at the level the round ran at
+  let _ = log_intervention "round_end" (cat [kvi "round" round, kvi "level" level, kvi "pass" pass, kvi "total" (pass + fail), kvi "pass_rate" pass_rate, kvi "new_harvested" new_harvested, kvi "harvested" harvested, kvi "since_retrain" since_retrain, kvi "consecutive_pass" consecutive_pass, kvi "consecutive_zero" consecutive_zero, kvs "attributed_to" "self_train"])
+
   -- Retrain disabled — training happens on Razer via post_train.sh
   -- Just log when we hit the threshold so we know data is accumulating
-  let _ = if since_retrain >= 200 then
+  let _ = if since_retrain >= retrain_threshold then
     print (cat ["  ★ ", show since_retrain, " examples since last retrain — ready for Razer training"])
   else 0
 
-  let (level, consecutive_pass, consecutive_zero, all_tasks) = if consecutive_pass >= 2 then
+  let (level, consecutive_pass, consecutive_zero, all_tasks) = if consecutive_pass >= advance_threshold then
     let new_level = level + 1
     let _ = print (cat ["\n  ★ ADVANCING to level ", show new_level, "!"])
     if new_level > 25 then
@@ -922,20 +962,23 @@ run_loop sys all_tasks goals round level harvested since_retrain consecutive_pas
       let goal = pick_goal goals round
       let _ = print (cat ["  Grinding goal: ", goal])
       let new_tasks = generate_hard_tasks sys 10 goal
+      let _ = log_intervention "goal_grind" (cat [kvi "round" round, kvi "level" 25, kvs "reason" "mastered_25", kvs "attributed_to" "self_train"])
       (25, 0, 0, new_tasks)
     else
       let goal = pick_goal goals round
       -- Load seed tasks for new level + generate extras
       let seeds = seeds_for new_level
       let new_tasks = generate_tasks_with_goal new_level sys 10 goal
+      let _ = log_intervention "level_advance" (cat [kvi "round" round, kvi "old_level" level, kvi "new_level" new_level, kvs "reason" "consecutive_pass_2", kvs "attributed_to" "self_train"])
       (new_level, 0, 0, append seeds new_tasks)
-  else if consecutive_zero >= 4 then
-    -- FALLBACK: 4 consecutive 0% rounds — drop back one level
+  else if consecutive_zero >= fallback_threshold then
+    -- FALLBACK: N consecutive 0% rounds — drop back one level
     let fallback_level = if level > 1 then level - 1 else 1
-    let _ = print (cat ["\n  ⚠ PLATEAU DETECTED — 4 rounds at 0%. Falling back to level ", show fallback_level])
+    let _ = print (cat ["\n  ⚠ PLATEAU DETECTED — ", show fallback_threshold, " rounds at 0%. Falling back to level ", show fallback_level])
     let goal = pick_goal goals round
     let seeds = seeds_for fallback_level
     let new_tasks = generate_tasks_with_goal fallback_level sys 10 goal
+    let _ = log_intervention "level_fallback" (cat [kvi "round" round, kvi "old_level" level, kvi "new_level" fallback_level, kvs "reason" "plateau_4_zeros", kvs "attributed_to" "self_train"])
     (fallback_level, 0, 0, append seeds new_tasks)
   else (level, consecutive_pass, consecutive_zero, all_tasks)
 

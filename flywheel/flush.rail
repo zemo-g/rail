@@ -1,0 +1,152 @@
+-- flywheel/flush.rail — Recovery chain for flywheel data files.
+--
+-- Empire's tools/oversight_db_flush.sh (sqlite VACUUM INTO + integrity
+-- check + size guard + row guard + nvm_backup chain) ported to Rail+JSONL.
+-- For each protected file, atomically copies to <file>.backup and rotates
+-- the previous backup to <file>.backup.prev. Refuses to overwrite a good
+-- backup with an empty or shrunk file.
+--
+-- Protected files (extend the list in `main`):
+--   training/self_train/harvest.jsonl   training corpus, irreplaceable
+--   training/self_train/progress.txt    curriculum state, tiny but critical
+--   flywheel/interventions.jsonl        intervention ledger from Session 1
+--   flywheel/bench_log.txt              bench history
+--
+-- Usage:
+--   ./rail_native run flywheel/flush.rail
+--
+-- Cron-friendly. Idempotent. Each file is processed independently — one
+-- file's failure does not block the others. Exit code is always 0; check
+-- stdout for [REFUSE] or [skip] markers.
+--
+-- Guards (replicates Empire's safeguards):
+--   1. Source must exist + be non-empty (size > 0)
+--   2. Size guard: when old backup > 1024 bytes, new must be ≥ 50% of old
+--   3. Line guard: never overwrite a non-empty backup with a zero-line file
+-- Either guard refusing leaves both <file>.backup and <file>.backup.prev
+-- intact. The bad source is never propagated to the backup chain.
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- parse_int (Rail's `to_int` builtin is float→int, not string→int)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+digit_val c =
+  if c == "0" then 0
+  else if c == "1" then 1
+  else if c == "2" then 2
+  else if c == "3" then 3
+  else if c == "4" then 4
+  else if c == "5" then 5
+  else if c == "6" then 6
+  else if c == "7" then 7
+  else if c == "8" then 8
+  else if c == "9" then 9
+  else 0 - 1
+
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = digit_val (head cs)
+    if d < 0 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+
+parse_int s = parse_int_acc (chars s) 0
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- File metric helpers (shell out — wc/test are POSIX, no extra deps)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Byte count of file (0 if missing). `tr -d ' '` strips macOS wc's leading
+-- whitespace so parse_int can consume the number cleanly.
+file_size path =
+  parse_int (trim (shell (cat ["wc -c < ", path, " 2>/dev/null | tr -d ' ' || echo 0"])))
+
+-- Line count of file (0 if missing).
+file_lines path =
+  parse_int (trim (shell (cat ["wc -l < ", path, " 2>/dev/null | tr -d ' ' || echo 0"])))
+
+-- True if file exists at path.
+file_exists path =
+  length (trim (shell (cat ["test -f ", path, " && echo 1"]))) > 0
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Guard logic — returns "ok" or a refusal reason string
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Returns "ok" when the new file may safely replace the existing backup.
+-- Otherwise returns a human-readable refusal reason.
+--   • size guard fires only when old backup is > 1KB (small files have noisy ratios)
+--   • line guard always fires when old had lines and new has none
+guard_check new_size new_lines old_size old_lines =
+  if old_size > 1024 then
+    if new_size < (old_size / 2) then
+      cat ["size shrunk: ", show new_size, " < 50% of ", show old_size]
+    else if old_lines > 0 then
+      if new_lines == 0 then cat ["lines collapsed: 0 < ", show old_lines]
+      else "ok"
+    else "ok"
+  else if old_lines > 0 then
+    if new_lines == 0 then cat ["lines collapsed: 0 < ", show old_lines]
+    else "ok"
+  else "ok"
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Atomic-ish rotation: prev ← backup ← new
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- The rotation sequence (matches Empire's flush.sh ordering):
+--   1. cp src → tmp                (full file in place, in case src is being
+--                                    written concurrently)
+--   2. mv backup → prev            (only if a current backup exists)
+--   3. mv tmp → backup             (atomic rename on POSIX, indivisible flip)
+-- Returns 1 (success). Caller discards via `let _ =`.
+rotate_backup src backup prev new_size new_lines =
+  let tmp = cat [src, ".backup.tmp"]
+  let _ = shell (cat ["cp -f ", src, " ", tmp])
+  let _ = shell (cat ["test -f ", backup, " && mv -f ", backup, " ", prev, " || true"])
+  let _ = shell (cat ["mv -f ", tmp, " ", backup])
+  let _ = print (cat ["[ok]     ", src, " → ", backup, " (", show new_size, " bytes, ", show new_lines, " lines)"])
+  1
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Per-file flush
+-- ══════════════════════════════════════════════════════════════════════════════
+
+flush_one src =
+  let backup = cat [src, ".backup"]
+  let prev = cat [src, ".backup.prev"]
+  if file_exists src == false then
+    let _ = print (cat ["[skip]   ", src, " — source absent"])
+    1
+  else
+    let new_size = file_size src
+    let new_lines = file_lines src
+    let has_backup = file_exists backup
+    let old_size = if has_backup then file_size backup else 0
+    let old_lines = if has_backup then file_lines backup else 0
+    if new_size == 0 then
+      let _ = print (cat ["[skip]   ", src, " — source empty (0 bytes)"])
+      1
+    else
+      let guard = guard_check new_size new_lines old_size old_lines
+      if guard == "ok" then
+        rotate_backup src backup prev new_size new_lines
+      else
+        let _ = print (cat ["[REFUSE] ", src, " — ", guard])
+        0
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Main: process each protected file
+-- ══════════════════════════════════════════════════════════════════════════════
+
+main =
+  let _ = print "═══ flywheel flush ═══"
+  let _ = flush_one "training/self_train/harvest.jsonl"
+  let _ = flush_one "training/self_train/progress.txt"
+  let _ = flush_one "flywheel/interventions.jsonl"
+  let _ = flush_one "flywheel/bench_log.txt"
+  let _ = print "═══ done ═══"
+  0

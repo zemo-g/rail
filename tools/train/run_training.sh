@@ -33,6 +33,21 @@ if [ "$SRC_HASH" != "$OLD_HASH" ] || [ ! -f /tmp/rail_st_bin ]; then
     fi
 fi
 
+# Compile the recovery-chain flush helper too. Re-uses the same md5 cache
+# pattern as self_train so we only recompile when flywheel/flush.rail changes.
+FLUSH_HASH_FILE="/tmp/rail_flush_hash"
+FLUSH_SRC_HASH=$(md5 -q flywheel/flush.rail 2>/dev/null || md5sum flywheel/flush.rail | cut -d' ' -f1)
+FLUSH_OLD_HASH=$(cat "$FLUSH_HASH_FILE" 2>/dev/null || echo "")
+if [ "$FLUSH_SRC_HASH" != "$FLUSH_OLD_HASH" ] || [ ! -f /tmp/rail_flush_bin ]; then
+    echo "Compiling flush.rail..."
+    ./rail_native flywheel/flush.rail
+    if [ -f /tmp/rail_out ] && [ $(stat -f%z /tmp/rail_out 2>/dev/null || echo 0) -gt 10000 ]; then
+        cp /tmp/rail_out /tmp/rail_flush_bin
+        echo "$FLUSH_SRC_HASH" > "$FLUSH_HASH_FILE"
+        echo "Compiled. ($(stat -f%z /tmp/rail_flush_bin) bytes)"
+    fi
+fi
+
 rm -f /tmp/rail_st_stop
 
 echo "=== SELF-TRAINING LOOP ==="
@@ -50,6 +65,13 @@ while true; do
 
     # Run one round (round counter managed by Rail via progress.txt)
     /tmp/rail_st_bin --port "$PORT" 2>&1 || true
+
+    # Recovery snapshot (Empire transplant Session 2): rotate flywheel
+    # data files into .backup / .backup.prev with size + line guards.
+    # Skipped silently if /tmp/rail_flush_bin is missing.
+    if [ -x /tmp/rail_flush_bin ]; then
+        /tmp/rail_flush_bin 2>&1 || true
+    fi
 
     # Brief pause between rounds (fresh arena on next start)
     sleep $PAUSE
