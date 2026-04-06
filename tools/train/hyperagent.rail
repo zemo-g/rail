@@ -1,0 +1,751 @@
+-- hyperagent.rail — Bench-gated self-improving training agent for RAILGPT
+-- The flywheel head, written in Rail. The agent speaks the language it teaches.
+--
+-- Usage:
+--   cd ~/projects/rail && ./rail_native run tools/train/hyperagent.rail
+--   RAIL_HYPER_MODE=bench ./rail_native run tools/train/hyperagent.rail
+--   RAIL_HYPER_CYCLES=5 ./rail_native run tools/train/hyperagent.rail
+--
+-- Stop: touch /tmp/rail_hyperagent_stop
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Helpers
+-- ═══════════════════════════════════════════════════════════════════════════
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+q = "\""
+
+json_esc_bs s = join "\\\\" (split "\\" s)
+json_esc_q s = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n" (split "\n" s)
+json_esc_tab s = join "\\t" (split "\t" s)
+json_esc_cr s = join "\\r" (split "\r" s)
+json_esc s = json_esc_tab (json_esc_cr (json_esc_nl (json_esc_q (json_esc_bs s))))
+
+write_line file text =
+  let _ = write_file "/tmp/rail_hyper_line.txt" (cat [text, "\n"])
+  shell (cat ["cat /tmp/rail_hyper_line.txt >> ", file])
+
+add_int a b = a + b
+
+take_n xs n = if n <= 0 then [] else if length xs == 0 then [] else cons (head xs) (take_n (tail xs) (n - 1))
+
+-- Truncate string for display
+trunc s n =
+  if length s <= n then s
+  else cat [join "" (take_n (chars s) n), "..."]
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Integer parsing (to_int is broken in Rail — roll our own)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+is_digit c =
+  if c == "0" then 1 else if c == "1" then 1 else if c == "2" then 1
+  else if c == "3" then 1 else if c == "4" then 1 else if c == "5" then 1
+  else if c == "6" then 1 else if c == "7" then 1 else if c == "8" then 1
+  else if c == "9" then 1 else 0
+
+digit_val c =
+  if c == "1" then 1 else if c == "2" then 2 else if c == "3" then 3
+  else if c == "4" then 4 else if c == "5" then 5 else if c == "6" then 6
+  else if c == "7" then 7 else if c == "8" then 8 else if c == "9" then 9
+  else 0
+
+parse_int s = parse_int_acc (chars s) 0
+
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    if is_digit c == 1 then parse_int_acc (tail cs) (acc * 10 + digit_val c)
+    else acc
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Config
+-- ═══════════════════════════════════════════════════════════════════════════
+
+rail_dir = "/Users/ledaticempire/projects/rail"
+mlx_python = "/Users/ledaticempire/homebrew/bin/python3.11"
+model_path = "/Users/ledaticempire/models/Qwen3.5-4B-4bit"
+adapter_dir = "/Users/ledaticempire/projects/rail/training/adapters_local_mlx"
+stop_file = "/tmp/rail_hyperagent_stop"
+log_path = "/tmp/rail_hyperagent.log"
+state_path = "/tmp/rail_hyperagent_state.json"
+targeted_path = "/Users/ledaticempire/projects/rail/training/self_train/targeted.jsonl"
+repairs_path = "/Users/ledaticempire/projects/rail/training/self_train/repairs_9b.jsonl"
+golden_path = "/Users/ledaticempire/projects/rail/training/golden/bench_solutions.jsonl"
+dna_path = "/Users/ledaticempire/projects/rail/training/dna/rail_dna.jsonl"
+harvest_path = "/Users/ledaticempire/projects/rail/training/self_train/harvest.jsonl"
+clean_path = "/Users/ledaticempire/projects/rail/training/clean_verified.jsonl"
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Logging
+-- ═══════════════════════════════════════════════════════════════════════════
+
+hyper_log msg =
+  let ts = trim (shell "date +%H:%M:%S")
+  let line = cat ["[", ts, "] ", msg]
+  let _ = print line
+  write_line log_path line
+
+hyper_section msg =
+  let _ = hyper_log (cat ["════════ ", msg, " ════════"])
+  0
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- LLM interface — completions (fast, thinking bypass) + chat fallback
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- Fast path: completions endpoint with empty <think> block (5x faster, no wasted tokens)
+-- Uses jq --rawfile for safe JSON building (handles all escaping, no python dependency)
+-- Temperature is parameterized for adaptive generation
+llm_fast_t port sys usr temp =
+  let _ = write_file "/tmp/rail_hyper_sys.txt" sys
+  let _ = write_file "/tmp/rail_hyper_usr.txt" usr
+  let _ = write_file "/tmp/rail_hyper_temp.txt" temp
+  let _ = shell "jq -n --rawfile s /tmp/rail_hyper_sys.txt --rawfile u /tmp/rail_hyper_usr.txt --rawfile t /tmp/rail_hyper_temp.txt '{prompt: (\"<|im_start|>system\\n\" + $s + \"<|im_end|>\\n<|im_start|>user\\n\" + $u + \"<|im_end|>\\n<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n\"), temperature: ($t | tonumber), max_tokens: 1024, stop: [\"<|im_end|>\", \"<|endoftext|>\"]}' > /tmp/rail_hyper_req.json"
+  let _ = shell (cat ["curl -s -m 60 http://localhost:", port, "/v1/completions -X POST -H 'Content-Type: application/json' -d @/tmp/rail_hyper_req.json > /tmp/rail_hyper_resp.json 2>/dev/null"])
+  shell "jq -r '.choices[0].text // empty' /tmp/rail_hyper_resp.json 2>/dev/null"
+
+-- Chat fallback with temperature
+llm_chat_t port sys usr temp =
+  let _ = write_file "/tmp/rail_hyper_sys.txt" sys
+  let _ = write_file "/tmp/rail_hyper_usr.txt" usr
+  let _ = write_file "/tmp/rail_hyper_temp.txt" temp
+  let _ = shell "jq -n --rawfile s /tmp/rail_hyper_sys.txt --rawfile u /tmp/rail_hyper_usr.txt --rawfile t /tmp/rail_hyper_temp.txt '{messages: [{role: \"system\", content: $s}, {role: \"user\", content: $u}], temperature: ($t | tonumber), max_tokens: 2048}' > /tmp/rail_hyper_chat_req.json"
+  let _ = shell (cat ["curl -s -m 90 http://localhost:", port, "/v1/chat/completions -X POST -H 'Content-Type: application/json' -d @/tmp/rail_hyper_chat_req.json > /tmp/rail_hyper_chat_resp.json 2>/dev/null"])
+  shell "jq -r '.choices[0].message.content // empty' /tmp/rail_hyper_chat_resp.json 2>/dev/null"
+
+-- Try fast first, fall back to chat (default temp 0.7)
+llm_call port sys usr = llm_call_t port sys usr "0.7"
+
+llm_call_t port sys usr temp =
+  let fast = llm_fast_t port sys usr temp
+  if length fast > 10 then fast
+  else llm_chat_t port sys usr temp
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Adaptive temperature — EMA from pass/fail per band (stolen from G0DM0D3)
+-- Bands scoring well → lower temp (exploit), bands scoring poorly → higher temp (explore)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- Map band score (0-5) to temperature string
+-- 5/5 → 0.3 (exploit), 3-4/5 → 0.5 (balanced), 0-2/5 → 0.8 (explore)
+band_temp score =
+  if score >= 5 then "0.3"
+  else if score >= 3 then "0.5"
+  else "0.8"
+
+-- Get temperature for a band name given current scores [p1..p6]
+temp_for_band name scores =
+  if name == "fundamentals" then band_temp (head scores)
+  else if name == "io" then band_temp (nth scores 1)
+  else if name == "tools" then band_temp (nth scores 2)
+  else if name == "compiler" then band_temp (nth scores 3)
+  else if name == "advanced" then band_temp (nth scores 4)
+  else band_temp (nth scores 5)
+
+nth xs n = if n <= 0 then head xs else nth (tail xs) (n - 1)
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Code extraction — strip markdown fences, XML tags, explanation
+-- ═══════════════════════════════════════════════════════════════════════════
+
+extract_code text =
+  let _ = write_file "/tmp/rail_hyper_raw.txt" text
+  -- Try markdown fence extraction via perl
+  let fenced = shell "perl -0777 -ne 'print $1 if /```(?:rail|haskell|ml)?\\s*\\n(.*?)```/s' /tmp/rail_hyper_raw.txt 2>/dev/null"
+  if length fenced > 10 then fenced
+  else
+    -- No fence: strip XML tags, find first code line
+    let cleaned = shell "sed 's/<[^>]*>//g' /tmp/rail_hyper_raw.txt 2>/dev/null"
+    if length cleaned > 10 then cleaned
+    else text
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Compiler verification — compile + run + check output
+-- ═══════════════════════════════════════════════════════════════════════════
+
+verify code expected =
+  let _ = write_file "/tmp/rail_hyper_test.rail" code
+  let _ = shell "rm -f /tmp/rail_hyper_bin"
+  let _ = shell "cd ~/projects/rail && ./rail_native /tmp/rail_hyper_test.rail 2>&1 && cp /tmp/rail_out /tmp/rail_hyper_bin 2>&1"
+  let check = trim (shell "test -f /tmp/rail_hyper_bin && echo ok || echo fail")
+  if check == "fail" then "compile_fail"
+  else
+    let _ = shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_hyper_bin > /tmp/rail_hyper_out.txt 2>&1; echo $? > /tmp/rail_hyper_exit.txt"
+    let actual = trim (shell "cat /tmp/rail_hyper_out.txt 2>/dev/null")
+    let exit_code = trim (shell "cat /tmp/rail_hyper_exit.txt 2>/dev/null")
+    if exit_code != "0" then
+      if exit_code == "142" then "timeout"
+      else "runtime_fail"
+    else if expected == "" then
+      if actual != "" then "success" else "runtime_fail"
+    else
+      if actual == expected then "success"
+      else "wrong_output"
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- JSONL training entry builder
+-- ═══════════════════════════════════════════════════════════════════════════
+
+entry usr asst =
+  cat ["{", q, "messages", q, ":[",
+    "{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, "You write Rail code. Output ONLY code, no explanation.", q, "},",
+    "{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, json_esc usr, q, "},",
+    "{", q, "role", q, ":", q, "assistant", q, ",", q, "content", q, ":", q, json_esc asst, q, "}]}"]
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Bench tasks — 30 fixed tasks, 6 bands (NEVER CHANGE THESE)
+-- Tab-separated: "task description\texpected output"
+-- ═══════════════════════════════════════════════════════════════════════════
+
+bench_fundamentals _ = [
+  "Write a Rail program that computes the 8th triangular number (sum of 1..8) using recursion and prints it\t36",
+  "Write a Rail program that builds a list [1,2,3,4,5] then drops the last element using reverse and tail and reverse again, printing the head\t1",
+  "Write a Rail program with a Vehicle ADT (Car seats | Bike) that returns seats for Car and 0 for Bike, prints seats for Car 4\t4",
+  "Write a Rail program that implements insertion sort on [5,1,4,2,3] and prints the head of the sorted list\t1",
+  "Write a Rail program using fold with a named max function to find the largest in [12,7,25,3,18] and prints it\t25"]
+
+bench_io _ = [
+  "Write a Rail program that splits hello-world on - and prints the second element\tworld",
+  "Write a Rail program that joins [a,b,c] with commas and prints it\ta,b,c",
+  "Write a Rail program that splits GET /health HTTP/1.1 on space and prints the second element\t/health",
+  "Write a Rail program that writes test42 to /tmp/rail_bench_io.txt then reads it back and prints it\ttest42",
+  "Write a Rail program that takes the string hello world, splits on space, reverses each word using chars reverse join, and prints the first reversed word\tolleh"]
+
+bench_tools _ = [
+  "Write a Rail program that writes port=9000 to /tmp/rail_bench_cfg.txt, reads it, splits on =, and prints the value\t9000",
+  "Write a Rail program that writes hello and world on separate lines to /tmp/rail_bench_lines.txt, reads and prints the line count\t2",
+  "Write a Rail program with type Result = | Ok x | Err x, create Ok 42, match it, and print the value\t42",
+  "Write a Rail program with type State = | Init | Run | Done, transition Init to Run to Done, and print Done\tDone",
+  "Write a Rail program that writes abc to /tmp/rail_bench_cp.txt, copies via shell cp to /tmp/rail_bench_cp2.txt, reads the copy, and prints it\tabc"]
+
+bench_compiler _ = [
+  "Write a Rail program with type Expr = | Num x | Add a b, evaluate Add (Num 3) (Num 4), and print the result\t7",
+  "Write a Rail program with type Op = | Push x | Mul | Halt, execute [Push 6, Push 7, Mul, Halt] on a stack list, and print the top\t42",
+  "Write a Rail program with type Expr = | Num x | Mul a b, write eval_expr that computes Mul (Num 6) (Num 7), print the value\t42",
+  "Write a Rail program that generates the ARM64 string ldr x0, [sp] for a Load instruction from a stack frame and prints it\tldr x0, [sp]",
+  "Write a Rail program that takes the token list [if, x, then, y, else, z] and pretty-prints it as if x then y else z\tif x then y else z"]
+
+bench_advanced _ = [
+  "Write a Rail program that writes three JSONL lines ({\"a\":1}, {\"b\":2,\"error\":true}, {\"c\":3}) to /tmp/rail_bench_jsonl.txt, reads it, filters lines containing the string error, and prints the count\t1",
+  "Write a Rail program that generates a Rail function definition string for a function named double with param x and body x * 2, and prints it\tdouble x = x * 2",
+  "Write a Rail program that writes score=70 to /tmp/rail_bench_score.txt, reads it, extracts the score, adds 5, writes score=75 back, reads again, and prints the final file contents\tscore=75",
+  "Write a Rail program that writes k1=v1 and k2=v2 on separate lines to /tmp/rail_bench_kv.txt, reads the file, splits on newline, finds the line starting with k2, splits on =, and prints the value\tv2",
+  "Write a Rail program that writes three lines (OK: start, ERROR: fail, ERROR: crash) to /tmp/rail_bench_log.txt, reads the file, splits on newline, counts lines containing ERROR, and prints the count\t2"]
+
+bench_comprehension _ = [
+  "Fix this broken Rail program so it compiles and prints 120:\nfact n = if n <= 1 then 1 else n * fact n - 1\nmain = let _ = print (show (fact 5))\n  0\nThe bug is in the recursive call. Output ONLY the fixed Rail code.\t120",
+  "Complete this partial Rail program by writing the missing flatten function that turns [[1,2],[3,4]] into [1,2,3,4]:\nflatten xs = ???\nmain =\n  let r = flatten [[1,2],[3,4]]\n  let _ = print (show (length r))\n  0\nReplace ??? with working code. Output ONLY the complete Rail program.\t4",
+  "Refactor this Rail program to use fold instead of manual recursion. It must still print 15:\nsum_list xs = if length xs == 0 then 0 else head xs + sum_list (tail xs)\nmain =\n  let _ = print (show (sum_list [1,2,3,4,5]))\n  0\nOutput ONLY the refactored Rail code.\t15",
+  "Fix this Rail program that has a type error — it tries to print a list directly. Make it print the sum of the doubled values instead:\nmain =\n  let xs = map (\\x -> x * 2) [1,2,3]\n  let _ = print xs\n  0\nOutput ONLY the fixed Rail code that prints 12.\t12",
+  "This Rail program should read /tmp/bench_kv.txt (which contains key=val per line), find the value for key name, and print it. The current version crashes. Fix it:\nmain =\n  let _ = write_file \"/tmp/bench_kv.txt\" \"name=rail\\nversion=1\\n\"\n  let contents = read_file \"/tmp/bench_kv.txt\"\n  let lines = split \"\\n\" contents\n  let val = find_key lines \"name\"\n  let _ = print val\n  0\nYou need to write the find_key function. Output ONLY the complete fixed Rail program.\trail"]
+
+bench_task_desc t = head (split "\t" t)
+bench_task_expected t =
+  let parts = split "\t" t
+  if length parts >= 2 then head (tail parts)
+  else ""
+
+band_names _ = ["fundamentals", "io", "tools", "compiler", "advanced", "comprehension"]
+
+band_tasks name =
+  if name == "fundamentals" then bench_fundamentals 0
+  else if name == "io" then bench_io 0
+  else if name == "tools" then bench_tools 0
+  else if name == "compiler" then bench_compiler 0
+  else if name == "advanced" then bench_advanced 0
+  else bench_comprehension 0
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- System prompt
+-- ═══════════════════════════════════════════════════════════════════════════
+
+mk_sys _ =
+  let grammar = read_file "grammar/rail.ebnf"
+  cat ["You are a Rail language expert. Rail compiles to native ARM64.\n\nGRAMMAR:\n", grammar, "\n\nCRITICAL RULES:\n- Functions: name params = body (top-level only, no 'let rec')\n- Let uses NEWLINES not 'in': let x = 5\\n  x + 1\n- If: if cond then a else b (always both branches)\n- Match: match expr | Pat args -> expr (NO 'with', NO '::')\n- Lambda: \\x -> expr (single arg only)\n- Lists: [1,2,3], head, tail, cons, map, filter, fold, length, reverse, range\n- Tuples: (a,b), let (x,y) = expr\n- ADTs: type T = | A x | B\\nmatch val | A x -> ... | B -> ...\n- Strings: \"hello\", NO char literals (no 'a'), NO string indexing\n- print outputs value, show converts int to string\n- join sep list, split sep str, chars str, append str1 str2\n- main must exist and return an int\n- Use let _ = print expr for side effects\n- NO: let rec, match...with, x::xs, [x], arr[i], where, in (at end of let)"]
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Bench runner — try task with retry, run bands, score
+-- ═══════════════════════════════════════════════════════════════════════════
+
+try_task sys port task expected =
+  try_task_acc sys port task expected "" 1
+
+try_task_acc sys port task expected prev_err attempt =
+  if attempt > 3 then "fail"
+  else
+    let hint = if expected == "" then "" else cat ["\n\nThe program must print exactly: ", expected]
+    let user = if prev_err == "" then
+      cat [task, hint, "\n\nOutput ONLY Rail code. No markdown, no explanation. Functions before main."]
+    else
+      cat [task, hint, "\n\nYour previous attempt failed:\n", prev_err, "\n\nFix the errors. Output ONLY Rail code."]
+    let raw = llm_call port sys user
+    let code = extract_code raw
+    let result = verify code expected
+    if result == "success" then
+      -- Harvest error-repair pair when retry succeeds (teaches model to debug)
+      let _ = if attempt > 1 then
+        let repair_user = cat [task, hint, "\n\nYour previous attempt failed:\n", prev_err, "\n\nFix the errors. Output ONLY Rail code."]
+        write_line repairs_path (entry repair_user code)
+      else 0
+      "pass"
+    else if result == "compile_fail" then
+      let err_out = trim (shell "head -5 /tmp/rail_hyper_test.rail 2>/dev/null")
+      try_task_acc sys port task expected (cat ["Compile error for:\n", err_out]) (attempt + 1)
+    else if result == "wrong_output" then
+      let actual = trim (shell "cat /tmp/rail_hyper_out.txt 2>/dev/null")
+      try_task_acc sys port task expected (cat ["Wrong output. Expected: ", expected, " Got: ", actual]) (attempt + 1)
+    else "fail"
+
+run_band sys port band_name tasks =
+  let _ = hyper_log (cat ["── ", band_name, " ──"])
+  run_band_acc sys port tasks 0 0
+
+run_band_acc sys port tasks pass total =
+  if length tasks == 0 then (pass, total)
+  else
+    let task_line = head tasks
+    let task = bench_task_desc task_line
+    let expected = bench_task_expected task_line
+    let m = arena_mark 0
+    let result = try_task sys port task expected
+    let _ = arena_reset m
+    let tag = if result == "pass" then "PASS" else "FAIL"
+    let _ = hyper_log (cat ["  ", tag, ": ", trunc task 55])
+    run_band_acc sys port (tail tasks) (if result == "pass" then pass + 1 else pass) (total + 1)
+
+-- Run all 6 bands, return [p1, p2, p3, p4, p5, p6]
+run_bench sys port =
+  let _ = hyper_section "BENCH"
+  let (p1, _) = run_band sys port "fundamentals" (bench_fundamentals 0)
+  let (p2, _) = run_band sys port "io" (bench_io 0)
+  let (p3, _) = run_band sys port "tools" (bench_tools 0)
+  let (p4, _) = run_band sys port "compiler" (bench_compiler 0)
+  let (p5, _) = run_band sys port "advanced" (bench_advanced 0)
+  let (p6, _) = run_band sys port "comprehension" (bench_comprehension 0)
+  let total = p1 + p2 + p3 + p4 + p5 + p6
+  let _ = hyper_log (cat ["SCORE: ", show total, "/30  fund=", show p1, " io=", show p2, " tools=", show p3, " comp=", show p4, " adv=", show p5, " compr=", show p6])
+  [p1, p2, p3, p4, p5, p6]
+
+-- Best of N bench runs
+run_bench_best sys port n =
+  run_bench_best_acc sys port n [] 0
+
+run_bench_best_acc sys port remaining best best_total =
+  if remaining <= 0 then
+    if length best == 0 then run_bench sys port else best
+  else
+    let scores = run_bench sys port
+    let total = fold add_int 0 scores
+    if length best == 0 then
+      run_bench_best_acc sys port (remaining - 1) scores total
+    else if total > best_total then
+      run_bench_best_acc sys port (remaining - 1) scores total
+    else
+      run_bench_best_acc sys port (remaining - 1) best best_total
+
+bench_total scores = fold add_int 0 scores
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Analysis — find weak bands (score < threshold out of 5)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+find_weaknesses scores threshold =
+  find_weak_acc (band_names 0) scores threshold
+
+find_weak_acc names scores threshold =
+  if length names == 0 then []
+  else if length scores == 0 then []
+  else
+    let name = head names
+    let score = head scores
+    if score < threshold then cons name (find_weak_acc (tail names) (tail scores) threshold)
+    else find_weak_acc (tail names) (tail scores) threshold
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Targeted data generation — task templates + verify + harvest
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- Arithmetic helpers for expected outputs
+fact n = if n <= 1 then 1 else n * fact (n - 1)
+tri n = n * (n + 1) / 2
+
+-- Generate one task instance for a band (tab-separated task\texpected)
+gen_one_task band seed =
+  let v = seed % 6
+  if band == "fundamentals" then gen_fund seed v
+  else if band == "io" then gen_io seed v
+  else if band == "tools" then gen_tool seed v
+  else if band == "compiler" then gen_comp seed v
+  else if band == "advanced" then gen_adv seed v
+  else gen_compr seed v
+
+gen_fund seed v =
+  let n = (seed % 8) + 3
+  if v == 0 then cat ["Write a Rail program that computes the ", show n, "th triangular number (sum of 1..", show n, ") using recursion and prints it\t", show (tri n)]
+  else if v == 1 then cat ["Write a Rail program that computes factorial of ", show n, " using recursion and prints it\t", show (fact n)]
+  else if v == 2 then
+    let a = (seed % 10) + 1
+    let b = (seed % 7) + 2
+    cat ["Write a Rail program that defines add a b = a + b and prints fold add 0 [", show a, ",", show b, ",", show (a + 1), "]\t", show (a + b + a + 1)]
+  else if v == 3 then
+    let a = (seed % 15) + 5
+    let b = (seed % 12) + 3
+    let c = (seed % 20) + 1
+    let mx = if a > b then (if a > c then a else c) else (if b > c then b else c)
+    cat ["Write a Rail program that defines max2 a b = if a > b then a else b and prints fold max2 0 [", show a, ",", show b, ",", show c, "]\t", show mx]
+  else if v == 4 then
+    let a = (seed % 5) + 2
+    let b = (seed % 5) + 2
+    cat ["Write a Rail program that prints the result of ", show a, " + ", show b, "\t", show (a + b)]
+  else
+    let a = (seed % 5) + 2
+    let b = (seed % 5) + 2
+    cat ["Write a Rail program that prints the result of ", show a, " * ", show b, "\t", show (a * b)]
+
+gen_io seed v =
+  if v == 0 then "Write a Rail program that splits hello-world on - and prints the second element\tworld"
+  else if v == 1 then "Write a Rail program that joins [x,y,z] with commas and prints it\tx,y,z"
+  else if v == 2 then "Write a Rail program that writes test99 to /tmp/rail_hyper_io.txt then reads it back and prints it\ttest99"
+  else if v == 3 then "Write a Rail program that splits name=alice on = and prints the second element\talice"
+  else if v == 4 then "Write a Rail program that joins [hello,world] with - and prints it\thello-world"
+  else "Write a Rail program that splits POST /api HTTP/1.1 on space and prints the second element\t/api"
+
+gen_tool seed v =
+  let n = (seed % 9000) + 1000
+  if v == 0 then cat ["Write a Rail program that writes port=", show n, " to /tmp/rail_hyper_cfg.txt, reads it, splits on =, and prints the value\t", show n]
+  else if v == 1 then cat ["Write a Rail program with type Result = | Ok x | Err x, create Ok ", show n, ", match it, and print the value\t", show n]
+  else if v == 2 then "Write a Rail program with type State = | Off | On, transition Off to On, print On\tOn"
+  else if v == 3 then "Write a Rail program that writes foo to /tmp/rail_hyper_cp1.txt, copies via shell cp to /tmp/rail_hyper_cp2.txt, reads the copy, and prints it\tfoo"
+  else if v == 4 then "Write a Rail program that writes one and two and three on separate lines to /tmp/rail_hyper_cnt.txt, reads and prints the line count\t3"
+  else cat ["Write a Rail program with type Config = | Cfg host port, create Cfg localhost ", show n, ", match it, print the port using show\t", show n]
+
+gen_comp seed v =
+  let a = (seed % 8) + 1
+  let b = (seed % 8) + 1
+  if v == 0 then cat ["Write a Rail program with type Expr = | Num x | Add a b, evaluate Add (Num ", show a, ") (Num ", show b, "), and print the result\t", show (a + b)]
+  else if v == 1 then cat ["Write a Rail program with type Expr = | Num x | Mul a b, write eval_expr that computes Mul (Num ", show a, ") (Num ", show b, "), print the value\t", show (a * b)]
+  else if v == 2 then cat ["Write a Rail program that generates the ARM64 string mov x0, #", show a, " and prints it\tmov x0, #", show a]
+  else if v == 3 then "Write a Rail program that takes the token list [let, x, =, 5] and pretty-prints it as let x = 5\tlet x = 5"
+  else if v == 4 then cat ["Write a Rail program with type Expr = | Num x | Add a b, simplify Add (Num ", show a, ") (Num ", show b, ") to Num ", show (a + b), ", match result print value\t", show (a + b)]
+  else "Write a Rail program with type Op = | Push x | Add | Halt, execute [Push 3, Push 4, Add, Halt] on a stack list, and print the top\t7"
+
+-- Advanced templates — matched to actual bench complexity (JSONL filter, read-modify-write, KV lookup, error counting)
+gen_adv seed v =
+  let n = (seed % 5) + 1
+  if v == 0 then cat ["Write a Rail program that writes ", show n, " JSONL lines to /tmp/rail_hyper_jsonl.txt where one line contains the string error, reads the file, splits on newline, filters lines containing error using a named predicate with str_contains, counts matches, and prints the count\t1"]
+  else if v == 1 then "Write a Rail program that writes score=70 to /tmp/rail_hyper_sc.txt, reads it, splits on =, gets the number as second element, uses show and append to build a new string score=75, writes it back, reads again, and prints the final file contents\tscore=75"
+  else if v == 2 then "Write a Rail program that writes k1=v1 and k2=v2 on separate lines to /tmp/rail_hyper_kv.txt, reads the file, splits on newline, defines a find_line function that recursively searches for a line starting with a given prefix, finds k2, splits on =, and prints the value\tv2"
+  else if v == 3 then cat ["Write a Rail program that writes three lines (OK: start, ERROR: fail, ERROR: crash) to /tmp/rail_hyper_log.txt, reads the file, splits on newline, defines a count_matches function that recursively counts lines containing ERROR using str_contains, and prints the count\t2"]
+  else if v == 4 then "Write a Rail program that generates a Rail function definition string for a function named double with param x and body x * 2, using append to build the string, and prints it\tdouble x = x * 2"
+  else "Write a Rail program that writes three lines of key=value pairs (name=rail, version=2, type=compiler) to /tmp/rail_hyper_cfg3.txt, reads the file, defines a lookup function that takes a key and a list of lines and returns the value, looks up version, and prints it\t2"
+
+-- Comprehension templates — harder: flatten, map+fold, fix broken code, refactor, KV lookup
+gen_compr seed v =
+  let n = (seed % 5) + 4
+  if v == 0 then cat ["Fix this broken Rail program so it compiles and prints ", show (fact n), ":\nfact n = if n <= 1 then 1 else n * fact n - 1\nmain = let _ = print (show (fact ", show n, "))\n  0\nThe bug is in the recursive call — add parentheses around (n - 1). Output ONLY the fixed Rail code.\t", show (fact n)]
+  else if v == 1 then "Complete this partial Rail program by writing the missing flatten function that turns [[1,2],[3,4]] into [1,2,3,4]. Use fold with a named append_lists function:\nappend_lists acc xs = ???\nflatten xs = fold append_lists [] xs\nmain =\n  let r = flatten [[1,2],[3,4]]\n  let _ = print (show (length r))\n  0\nReplace ??? with the body. append_lists should use fold and cons to append. Output ONLY the complete Rail program.\t4"
+  else if v == 2 then "Fix this Rail program that has a type error — it tries to print a list directly instead of converting to a value first:\nadd a b = a + b\ndbl x = x * 2\nmain =\n  let xs = map dbl [1,2,3]\n  let _ = print xs\n  0\nFix it to print the sum of the doubled values using fold. Output ONLY the fixed Rail code that prints 12.\t12"
+  else if v == 3 then "Refactor this Rail program to use fold instead of manual recursion. The result must be identical:\nsum_list xs = if length xs == 0 then 0 else head xs + sum_list (tail xs)\nmain =\n  let _ = print (show (sum_list [1,2,3,4,5]))\n  0\nDefine add a b = a + b and use fold add 0. Output ONLY the refactored Rail code.\t15"
+  else if v == 4 then "This Rail program should read a KV file and find a value by key. Write the missing find_key function that takes a list of lines and a key, splits each line on =, and returns the matching value:\nmain =\n  let _ = write_file \"/tmp/hyper_kv.txt\" \"name=rail\\nversion=1\\n\"\n  let contents = read_file \"/tmp/hyper_kv.txt\"\n  let lines = split \"\\n\" contents\n  let val = find_key lines \"name\"\n  let _ = print val\n  0\nfind_key should recursively search the list. Output ONLY the complete Rail program.\trail"
+  else
+    let a = (seed % 3) + 2
+    let b = (seed % 3) + 3
+    let s = a * a + b * b
+    cat ["Write a Rail program that defines square x = x * x, applies it to both ", show a, " and ", show b, ", adds the results, and prints ", show s, "\t", show s]
+
+-- Generate N tasks for a band
+gen_tasks band seed count =
+  gen_tasks_acc band seed count []
+
+gen_tasks_acc band seed remaining acc =
+  if remaining <= 0 then acc
+  else
+    let task = gen_one_task band seed
+    gen_tasks_acc band (seed + 7) (remaining - 1) (cons task acc)
+
+-- Generate and verify targeted training data for weak bands
+-- Uses adaptive temperature per band + multi-candidate racing (3 attempts per task)
+generate_targeted sys port weaknesses num_per_band seed scores =
+  let _ = hyper_section "GENERATE"
+  let _ = hyper_log (cat ["Weak bands: ", join ", " weaknesses])
+  gen_for_bands sys port weaknesses num_per_band seed 0 scores
+
+gen_for_bands sys port bands num_per_band seed total scores =
+  if length bands == 0 then
+    let _ = hyper_log (cat ["Generated ", show total, " verified examples"])
+    total
+  else
+    let band = head bands
+    let temp = temp_for_band band scores
+    let tasks = gen_tasks band seed num_per_band
+    let _ = hyper_log (cat ["  ", band, " (temp=", temp, "): ", show (length tasks), " tasks"])
+    let harvested = try_gen_multi sys port tasks 0 temp
+    let _ = hyper_log (cat ["  ", band, ": ", show harvested, " harvested"])
+    gen_for_bands sys port (tail bands) num_per_band (seed + 100) (total + harvested) scores
+
+-- Multi-candidate racing: for each task, try up to 3 candidates at the given temperature
+-- First candidate that compiles + passes gets harvested
+try_gen_multi sys port tasks harvested temp =
+  if length tasks == 0 then harvested
+  else
+    let m = arena_mark 0
+    let task_line = head tasks
+    let task = bench_task_desc task_line
+    let expected = bench_task_expected task_line
+    let hint = if expected == "" then "" else cat ["\n\nThe program must print exactly: ", expected]
+    let user = cat [task, hint, "\n\nOutput ONLY Rail code. No markdown, no explanation. Functions before main."]
+    let got = try_candidates sys port user task hint expected temp 1
+    let _ = arena_reset m
+    try_gen_multi sys port (tail tasks) (harvested + got) temp
+
+-- Try up to 3 candidates for a single task
+try_candidates sys port user task hint expected temp attempt =
+  if attempt > 3 then 0
+  else
+    let raw = llm_call_t port sys user temp
+    let code = extract_code raw
+    let result = verify code expected
+    if result == "success" then
+      let _ = write_line targeted_path (entry (cat [task, hint]) code)
+      1
+    else try_candidates sys port user task hint expected temp (attempt + 1)
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Training — server management, data merge, run training
+-- ═══════════════════════════════════════════════════════════════════════════
+
+kill_gpu _ =
+  let _ = shell "pkill -f 'mlx_lm.server' 2>/dev/null; pkill -f 'mlx_lm.lora' 2>/dev/null || true"
+  let _ = shell "sleep 3"
+  let _ = shell "pkill -9 -f 'mlx_lm.server' 2>/dev/null; pkill -9 -f 'mlx_lm.lora' 2>/dev/null || true"
+  shell "sleep 10"
+
+start_server port =
+  let _ = kill_gpu 0
+  let has_adapter = trim (shell (cat ["test -f ", adapter_dir, "/adapters.safetensors && echo yes || echo no"]))
+  let adapter_flag = if has_adapter == "yes" then cat [" --adapter-path ", adapter_dir] else ""
+  let cmd = cat [mlx_python, " -m mlx_lm.server --model ", model_path, adapter_flag, " --host 0.0.0.0 --port ", port, " --trust-remote-code --max-tokens 2048"]
+  let _ = shell (cat ["nohup ", cmd, " > /tmp/rail_mlx_server.log 2>&1 &"])
+  let _ = hyper_log (cat ["Starting MLX server on :", port, if has_adapter == "yes" then " (adapter)" else " (base)"])
+  wait_server port 0
+
+wait_server port attempt =
+  if attempt >= 30 then
+    let _ = hyper_log "ERROR: Server failed to start after 60s"
+    0
+  else
+    let _ = shell "sleep 2"
+    let check = trim (shell (cat ["curl -s -m 2 http://localhost:", port, "/v1/models 2>/dev/null | head -c 5"]))
+    if length check > 2 then
+      let _ = hyper_log "Server ready"
+      1
+    else wait_server port (attempt + 1)
+
+-- Merge training data — quality over quantity
+-- Golden 3x, DNA 2x, recent harvest only (tail 200), Targeted 1x, Repairs 1x
+merge_data _ =
+  let _ = hyper_log "Merging training data..."
+  let _ = shell (cat ["rm -f ", clean_path])
+  -- Golden at 3x weight (highest quality — bench-verified solutions)
+  let _ = shell (cat ["cat ", golden_path, " >> ", clean_path, " 2>/dev/null; cat ", golden_path, " >> ", clean_path, " 2>/dev/null; cat ", golden_path, " >> ", clean_path, " 2>/dev/null"])
+  -- DNA at 2x weight (compiler patterns)
+  let _ = shell (cat ["cat ", dna_path, " >> ", clean_path, " 2>/dev/null; cat ", dna_path, " >> ", clean_path, " 2>/dev/null"])
+  -- Recent harvest only (last 200 lines — skip stale low-quality data)
+  let _ = shell (cat ["tail -200 ", harvest_path, " >> ", clean_path, " 2>/dev/null"])
+  -- Targeted at 1x
+  let _ = shell (cat ["cat ", targeted_path, " >> ", clean_path, " 2>/dev/null"])
+  -- Repairs at 1x
+  let _ = shell (cat ["cat ", repairs_path, " >> ", clean_path, " 2>/dev/null"])
+  let count = trim (shell (cat ["wc -l < ", clean_path, " 2>/dev/null || echo 0"]))
+  let _ = hyper_log (cat ["Merged: ", count, " examples"])
+  0
+
+-- Run LoRA training
+run_training iters lr =
+  let _ = hyper_section "TRAIN"
+  -- Always resume from the best known adapter (gen archive), not from wherever training drifted
+  let best_gen_dir = trim (shell "ls -d ~/projects/rail/training/adapters_local_mlx_gen_* 2>/dev/null | sort -t_ -k5 -n | tail -1")
+  let _ = if length best_gen_dir > 5 then
+    let _ = shell (cat ["cp ", best_gen_dir, "/adapters.safetensors ", adapter_dir, "/adapters.safetensors 2>/dev/null"])
+    shell (cat ["cp ", best_gen_dir, "/adapter_config.json ", adapter_dir, "/adapter_config.json 2>/dev/null"])
+  else 0
+  let res_flag = "--resume"
+  let cmd = cat ["cd ", rail_dir, " && bash tools/train/train_local.sh --iters ", show iters, " --lr ", lr, " ", res_flag]
+  let _ = hyper_log (cat ["Training: ", show iters, " iters, lr=", lr])
+  let _ = shell cmd
+  -- Extract final val loss
+  let val_loss = trim (shell "grep 'Val loss' /tmp/rail_mlx_train.log 2>/dev/null | tail -1 | grep -oE '[0-9]+\\.[0-9]+' | head -1")
+  let _ = hyper_log (cat ["Training done. Val loss: ", val_loss])
+  val_loss
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- State management — persist cycle/best_score/best_gen across restarts
+-- ═══════════════════════════════════════════════════════════════════════════
+
+load_state _ =
+  let exists = trim (shell (cat ["test -f ", state_path, " && echo yes || echo no"]))
+  if exists == "yes" then
+    let cycle_s = trim (shell (cat ["jq -r '.cycle // 0' ", state_path, " 2>/dev/null"]))
+    let best_s = trim (shell (cat ["jq -r '.best_score // 0' ", state_path, " 2>/dev/null"]))
+    let gen_s = trim (shell (cat ["jq -r '.best_gen // 0' ", state_path, " 2>/dev/null"]))
+    (parse_int cycle_s, parse_int best_s, parse_int gen_s)
+  else (0, 0, 0)
+
+save_state cycle best_score best_gen =
+  let json_str = cat ["{", q, "cycle", q, ":", show cycle, ",",
+    q, "best_score", q, ":", show best_score, ",",
+    q, "best_gen", q, ":", show best_gen, "}"]
+  write_file state_path json_str
+
+-- Simple archive: copy adapter to versioned dir, return new gen id
+archive_adapter old_gen =
+  let new_gen = old_gen + 1
+  let backup = cat [adapter_dir, "_gen_", show new_gen]
+  let _ = shell (cat ["cp -r ", adapter_dir, " ", backup, " 2>/dev/null"])
+  let _ = hyper_log (cat ["Archived adapter as gen ", show new_gen])
+  new_gen
+
+-- Rollback: restore adapter from versioned dir
+rollback_adapter gen_id =
+  let backup = cat [adapter_dir, "_gen_", show gen_id]
+  let exists = trim (shell (cat ["test -d ", backup, " && echo yes || echo no"]))
+  let _ = if exists == "yes" then
+    let _ = shell (cat ["rm -rf ", adapter_dir])
+    shell (cat ["cp -r ", backup, " ", adapter_dir])
+  else hyper_log (cat ["WARNING: Gen ", show gen_id, " backup not found"])
+  let _ = hyper_log (cat ["Rolled back to gen ", show gen_id])
+  0
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Decision — keep only if improved, rollback otherwise
+-- ═══════════════════════════════════════════════════════════════════════════
+
+decide cycle scores val_loss old_best old_gen =
+  let new_score = bench_total scores
+  if new_score > old_best then
+    let _ = hyper_log (cat ["IMPROVED: ", show old_best, " -> ", show new_score, "/30"])
+    let gen_id = archive_adapter old_gen
+    let _ = save_state cycle new_score gen_id
+    (new_score, gen_id)
+  else if new_score == old_best then
+    let _ = hyper_log (cat ["TIED at ", show new_score, "/30 — keeping"])
+    let gen_id = archive_adapter old_gen
+    let _ = save_state cycle new_score gen_id
+    (new_score, gen_id)
+  else
+    let _ = hyper_log (cat ["REGRESSED: ", show old_best, " -> ", show new_score, "/30 — rolling back"])
+    let _ = if old_gen > 0 then rollback_adapter old_gen else 0
+    let _ = save_state cycle old_best old_gen
+    (old_best, old_gen)
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Main loop
+-- ═══════════════════════════════════════════════════════════════════════════
+
+should_stop _ =
+  let check = trim (shell (cat ["test -f ", stop_file, " && echo yes || echo no"]))
+  check == "yes"
+
+-- One full cycle: bench -> analyze -> generate -> train -> re-bench -> decide
+run_cycle sys port cycle_num best_score best_gen iters lr bench_runs gen_per_band =
+  let _ = hyper_section (cat ["CYCLE ", show cycle_num])
+
+  -- Phase 1: Bench current adapter
+  let scores = if bench_runs > 1 then run_bench_best sys port bench_runs
+    else run_bench sys port
+  let current = bench_total scores
+
+  -- Phase 2: Analyze weaknesses
+  let weaknesses = find_weaknesses scores 4
+  let _ = hyper_log (cat ["Score: ", show current, "/30 | Weak: ", if length weaknesses == 0 then "none" else join ", " weaknesses])
+
+  -- Phase 3: Generate targeted training data (adaptive temp + multi-candidate racing)
+  let seed_val = parse_int (trim (shell "date +%s"))
+  let _ = if length weaknesses > 0 then
+    generate_targeted sys port weaknesses gen_per_band seed_val scores
+  else
+    let _ = hyper_log "No weak bands — skipping generation"
+    0
+
+  -- Phase 4: Merge data + Train (kills server, runs LoRA)
+  -- Adaptive: gentle training when score is high to avoid catastrophic forgetting
+  let train_iters = if best_score >= 15 then 100 else iters
+  let train_lr = if best_score >= 15 then "1e-6" else lr
+  let _ = hyper_log (cat ["Training: ", show train_iters, " iters, lr=", train_lr, if best_score >= 15 then " (gentle)" else ""])
+  let _ = merge_data 0
+  let val_loss = run_training train_iters train_lr
+
+  -- Phase 5: Restart server + Re-bench
+  let _ = start_server port
+  let new_scores = if bench_runs > 1 then run_bench_best sys port bench_runs
+    else run_bench sys port
+
+  -- Phase 6: Decide keep/rollback
+  let (final_score, final_gen) = decide cycle_num new_scores val_loss best_score best_gen
+  let _ = hyper_log (cat ["Cycle ", show cycle_num, " done. Best: ", show final_score, "/30 gen=", show final_gen])
+  (final_score, final_gen)
+
+-- Loop over cycles
+run_loop sys port cycle max_cycles best_score best_gen iters lr bench_runs gen_per_band =
+  if cycle > max_cycles then
+    let _ = hyper_log (cat ["Done. ", show max_cycles, " cycles complete. Best: ", show best_score, "/30"])
+    0
+  else if should_stop 0 == 1 then
+    let _ = hyper_log "Stop file detected. Halting."
+    0
+  else
+    let (new_best, new_gen) = run_cycle sys port cycle best_score best_gen iters lr bench_runs gen_per_band
+    run_loop sys port (cycle + 1) max_cycles new_best new_gen iters lr bench_runs gen_per_band
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Main — entry point
+-- ═══════════════════════════════════════════════════════════════════════════
+
+main =
+  let _ = print "╔══════════════════════════════════════════════════════╗"
+  let _ = print "║  RAIL HYPERAGENT v1 — the flywheel, in Rail         ║"
+  let _ = print "╚══════════════════════════════════════════════════════╝"
+
+  -- Config from env vars (defaults if unset)
+  let mode = trim (shell "echo $RAIL_HYPER_MODE")
+  let port_str = trim (shell "echo $RAIL_HYPER_PORT")
+  let port = if port_str == "" then "8080" else port_str
+  let cycles_str = trim (shell "echo $RAIL_HYPER_CYCLES")
+  let max_cycles = if cycles_str == "" then 999 else parse_int cycles_str
+  let bench_runs_str = trim (shell "echo $RAIL_HYPER_BENCH_RUNS")
+  let bench_runs = if bench_runs_str == "" then 3 else parse_int bench_runs_str
+  let iters = 300
+  let lr = "5e-6"
+  let gen_per_band = 10
+
+  -- Check server
+  let check = trim (shell (cat ["curl -s -m 3 http://localhost:", port, "/v1/models 2>/dev/null | head -c 5"]))
+  let _ = if length check < 3 then
+    let _ = print (cat ["No MLX server on :", port, " — starting..."])
+    start_server port
+  else
+    let _ = print (cat ["Connected to :", port])
+    1
+
+  let sys = mk_sys 0
+  let (cycle_start, best_score, best_gen) = load_state 0
+  let _ = hyper_log (cat ["State: cycle=", show cycle_start, " best=", show best_score, "/30 gen=", show best_gen])
+
+  -- Mode dispatch
+  if mode == "bench" then
+    let scores = if bench_runs > 1 then run_bench_best sys port bench_runs else run_bench sys port
+    let _ = hyper_log (cat ["Bench complete: ", show (bench_total scores), "/30"])
+    0
+  else if mode == "generate" then
+    let scores = run_bench sys port
+    let weaknesses = find_weaknesses scores 4
+    let seed_val = parse_int (trim (shell "date +%s"))
+    let _ = generate_targeted sys port weaknesses gen_per_band seed_val scores
+    0
+  else
+    -- Full evolution loop
+    run_loop sys port (cycle_start + 1) (cycle_start + max_cycles) best_score best_gen iters lr bench_runs gen_per_band
