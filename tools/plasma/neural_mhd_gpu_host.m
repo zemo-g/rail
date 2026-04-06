@@ -139,7 +139,7 @@ static void generate_data(float *X, float *Y) {
 // METAL TRAINING
 // ═══════════════════════════════════════════════════════════
 
-#define HIDDEN 128
+#define HIDDEN 32
 #define BATCH 256
 #define TILE 16
 #define LR 0.001f
@@ -536,6 +536,14 @@ int main(int argc, char **argv) {
                 double nm=0, lm=0;
                 for (int i=0; i<NN2; i++) { nm+=sim_ns[i]; lm+=lxf_ns2[i]; }
                 printf("  t=%3d  neural_mass=%.2f  lxf_mass=%.2f\n", t, nm, lm);
+            }
+
+            // Clamp to physical ranges (prevents exponential divergence)
+            for (int i = 0; i < NN2; i++) {
+                sim_ns[0*NN2+i] = fmax(0.01, fmin(5.0, sim_ns[0*NN2+i]));   // density
+                sim_ns[5*NN2+i] = fmax(0.1, fmin(50.0, sim_ns[5*NN2+i]));   // energy
+                for (int f = 1; f < 5; f++)
+                    sim_ns[f*NN2+i] = fmax(-10.0, fmin(10.0, sim_ns[f*NN2+i])); // momentum, B
             }
 
             // Swap
