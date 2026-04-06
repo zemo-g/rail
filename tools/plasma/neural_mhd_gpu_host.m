@@ -431,6 +431,26 @@ int main(int argc, char **argv) {
             }
         }
 
+        // ── SAVE WEIGHTS ──
+        {
+            FILE *wf = fopen("/tmp/neural_mhd_weights.bin", "wb");
+            // Header: in_dim, hidden, out_dim
+            int dims[3] = {IN_DIM, HIDDEN, OUT_DIM};
+            fwrite(dims, sizeof(int), 3, wf);
+            // Weights and biases
+            fwrite(W1.contents, sizeof(float), IN_DIM*HIDDEN, wf);
+            fwrite(b1.contents, sizeof(float), HIDDEN, wf);
+            fwrite(W2.contents, sizeof(float), HIDDEN*OUT_DIM, wf);
+            fwrite(b2.contents, sizeof(float), OUT_DIM, wf);
+            // Normalization stats
+            fwrite(x_mean, sizeof(float), IN_DIM, wf);
+            fwrite(x_std, sizeof(float), IN_DIM, wf);
+            fwrite(y_mean, sizeof(float), OUT_DIM, wf);
+            fwrite(y_std, sizeof(float), OUT_DIM, wf);
+            fclose(wf);
+            printf("Weights saved to /tmp/neural_mhd_weights.bin\n\n");
+        }
+
         // ── CONSERVATION EVALUATION ──
         printf("\nConservation evaluation...\n");
         double *eval_s = calloc(STATE_SIZE, sizeof(double));
