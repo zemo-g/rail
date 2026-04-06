@@ -96,7 +96,7 @@ static void neural_predict(int x, int y) {
         for (int k=0; k<HIDDEN; k++) v += h[k] * W2[k*OUT_DIM+j];
         // Denormalize + residual
         double delta = (double)(v * y_std[j] + y_mean[j]);
-        next_state[j*NN2+i] = state[j*NN2+i] + 0.7 * delta;
+        next_state[j*NN2+i] = state[j*NN2+i] + 0.5 * delta;
     }
     // Clamp
     next_state[0*NN2+i] = MAX(0.01, MIN(5.0, next_state[0*NN2+i]));
