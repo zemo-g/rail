@@ -344,6 +344,58 @@ Caught the hard way. The Rail parser treats a top-level `if` in the
 middle of `main` as the function's tail expression and considers the
 function done. Wrap in `let _ = if ... then ... else ...` to keep going.
 
+### Bug 5: New program shapes drop the round-0 baseline (the p^k effect)
+
+When you add a new program shape to the grammar — call it shape S with k
+internal expression slots — and reset the state file, the round-0 baseline
+strict pass rate **drops** in proportion to how many expression slots S
+has. This caught me by surprise three times in this session (G1, G2, G3).
+The pattern is reproducible:
+
+| Grammar | Shapes | Round-0 baseline |
+|---|---|---|
+| 13 rules (1 shape, 1 slot) | inline | 46% |
+| 20 rules (2 shapes, both 1-slot) | + named binding | 53% |
+| 21 rules (3 shapes, chain has 2 slots) | + chain | 53% |
+| 22 rules (4 shapes, fn has 2 slots) | + fn | **26%** |
+| 23 rules (5 shapes, adt has 2 slots) | + adt | **33%** |
+
+The math is straightforward: if `p` is the per-expression pass rate
+(roughly 0.85 for the depth-3 expression generator with all rules at
+uniform weight), then a k-slot program shape has a per-program pass
+rate of approximately `p^k`. For k=1 that's 0.85. For k=2 that's 0.72.
+For k=3 that's 0.61. **Each independent expression slot multiplies
+the failure surface area.**
+
+Add a 2-slot shape to a grammar that previously had only 1-slot shapes,
+and the average baseline drops because (a) the new shape has lower per-
+sample pass rate, and (b) sample_alt picks it ~1/N of the time at uniform
+weights, so it pulls the average down by `(1/N) × (p - p^2)`.
+
+REINFORCE recovers within 5-10 ticks because the new shape's rule
+weight ALSO benefits from successful samples — but the round-0 number
+looks bad. **This is expected, not a regression.** The forward
+regression bisector (`flywheel/regress.rail`) will flag it as a drop;
+ignore the flag if it coincides with a state-file reset.
+
+**Mitigation options for future grammar extensions:**
+
+- (a) **Don't reset state.** Add the new rule, let `load_w_loop` default
+  the new weight to 1000, accept that the new rule starts at parity with
+  trained existing rules. The new shape will be picked more often than
+  it deserves at first but REINFORCE corrects fast.
+- (b) **Reset state and accept the optics drop.** Document the expected
+  baseline, run a few warmup ticks before reporting. (What I did this
+  session.)
+- (c) **Initialize new shapes at a fraction of existing average.** Hacky
+  but preserves the curve. Not recommended — same problem as Bug 1, just
+  with the sign flipped.
+
+**The principle**: program-level pass rate is `p^k` where p is the
+per-expression rate and k is the shape's expression count. New shapes
+with k > 1 will look worse than they are at uniform-weight initialization.
+Don't be surprised by it next time.
+
 ---
 
 ## Performance
