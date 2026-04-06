@@ -1,0 +1,722 @@
+-- neural_mhd_v2.rail — Neural MHD Surrogate (MLP)
+-- 2-layer MLP with ReLU, analytical backprop
+-- Architecture: 30 → 32 (ReLU) → 6
+--
+-- Usage: ./rail_native run tools/plasma/neural_mhd_v2.rail
+
+cat parts = join "" parts
+
+-- ═══════════════════════════════════════════════════════════
+-- CONSTANTS
+-- ═══════════════════════════════════════════════════════════
+
+nn = 32
+nn2 = 1024
+nfields = 6
+state_size = 6144
+in_dim = 30
+hidden = 32
+out_dim = 6
+n_data_steps = 20
+batch_sz = 32
+n_total = 20480
+-- W1: 30×32=960, b1: 32, W2: 32×6=192, b2: 6 → 1190 params
+w1_size = 960
+w2_size = 192
+
+-- ═══════════════════════════════════════════════════════════
+-- MHD CORE (32×32 Orszag-Tang, Lax-Friedrichs)
+-- dx = 2*pi/32 = 0.19634954084936207
+-- 2*dx = 0.39269908169872414
+-- gamma = 5/3, gamma-1 = 2/3
+-- ═══════════════════════════════════════════════════════════
+
+wrap i = if i < 0 then i + nn else if i >= nn then i - nn else i
+idx f x y = f * nn2 + wrap y * nn + wrap x
+get s f x y = float_arr_get s (idx f x y)
+put s f x y v = float_arr_set s (idx f x y) v
+
+init_cell s i =
+  let x = i % nn
+  let y = i / nn
+  let xp = to_float x * 0.19634954084936207
+  let yp = to_float y * 0.19634954084936207
+  let rho = 2.77777777777778
+  let vx = 0.0 - sin yp
+  let vy = sin xp
+  let bx = 0.0 - sin yp
+  let by = sin (2.0 * xp)
+  let ke = 0.5 * rho * (vx * vx + vy * vy)
+  let me = 0.5 * (bx * bx + by * by)
+  let e = 1.6666666666666667 / 0.6666666666666667 + ke + me
+  let _ = put s 0 x y rho
+  let _ = put s 1 x y (rho * vx)
+  let _ = put s 2 x y (rho * vy)
+  let _ = put s 3 x y bx
+  let _ = put s 4 x y by
+  put s 5 x y e
+
+init_loop s i =
+  if i >= nn2 then 0
+  else let _ = init_cell s i
+       init_loop s (i + 1)
+
+init_state =
+  let s = float_arr_new state_size 0.0
+  let _ = init_loop s 0
+  s
+
+pressure s x y =
+  let rho = get s 0 x y
+  let mx = get s 1 x y
+  let my = get s 2 x y
+  let bx = get s 3 x y
+  let by = get s 4 x y
+  let e = get s 5 x y
+  let v2 = (mx * mx + my * my) / (rho * rho)
+  let b2 = bx * bx + by * by
+  let p = 0.6666666666666667 * (e - 0.5 * rho * v2 - 0.5 * b2)
+  if p < 0.0000000001 then 0.0000000001 else p
+
+x_flux s x y fa =
+  let rho = get s 0 x y
+  let mx = get s 1 x y
+  let my = get s 2 x y
+  let bx = get s 3 x y
+  let by = get s 4 x y
+  let e = get s 5 x y
+  let vx = mx / rho
+  let vy = my / rho
+  let b2 = bx * bx + by * by
+  let p = pressure s x y
+  let pt = p + 0.5 * b2
+  let vdb = vx * bx + vy * by
+  let _ = float_arr_set fa 0 mx
+  let _ = float_arr_set fa 1 (mx * vx + pt - bx * bx)
+  let _ = float_arr_set fa 2 (mx * vy - bx * by)
+  let _ = float_arr_set fa 3 0.0
+  let _ = float_arr_set fa 4 (vx * by - vy * bx)
+  float_arr_set fa 5 ((e + pt) * vx - bx * vdb)
+
+y_flux s x y fa =
+  let rho = get s 0 x y
+  let mx = get s 1 x y
+  let my = get s 2 x y
+  let bx = get s 3 x y
+  let by = get s 4 x y
+  let e = get s 5 x y
+  let vx = mx / rho
+  let vy = my / rho
+  let b2 = bx * bx + by * by
+  let p = pressure s x y
+  let pt = p + 0.5 * b2
+  let vdb = vx * bx + vy * by
+  let _ = float_arr_set fa 0 my
+  let _ = float_arr_set fa 1 (my * vx - bx * by)
+  let _ = float_arr_set fa 2 (my * vy + pt - by * by)
+  let _ = float_arr_set fa 3 (vy * bx - vx * by)
+  let _ = float_arr_set fa 4 0.0
+  float_arr_set fa 5 ((e + pt) * vy - by * vdb)
+
+speed_cell s x y =
+  let rho = get s 0 x y
+  let mx = get s 1 x y
+  let my = get s 2 x y
+  let bx = get s 3 x y
+  let by = get s 4 x y
+  let p = pressure s x y
+  let b2 = bx * bx + by * by
+  let cf = sqrt (1.6666666666666667 * p / rho + b2 / rho)
+  sqrt ((mx * mx + my * my) / (rho * rho)) + cf
+
+max_speed_loop s i acc =
+  if i >= nn2 then 0
+  else
+    let sp = speed_cell s (i % nn) (i / nn)
+    let cur = float_arr_get acc 0
+    let _ = if sp > cur then float_arr_set acc 0 sp else 0
+    max_speed_loop s (i + 1) acc
+
+max_speed s =
+  let acc = float_arr_new 1 0.0
+  let _ = max_speed_loop s 0 acc
+  float_arr_get acc 0
+
+lxf_fields s ns coeffs fxr fxl fyu fyd x y f =
+  if f >= 6 then 0
+  else
+    let avg = (get s f (x-1) y + get s f (x+1) y + get s f x (y-1) + get s f x (y+1)) / 4.0
+    let dfx = float_arr_get fxr f - float_arr_get fxl f
+    let dfy = float_arr_get fyu f - float_arr_get fyd f
+    let cx = float_arr_get coeffs 0
+    let cy = float_arr_get coeffs 1
+    let _ = float_arr_set ns (idx f x y) (avg - cx * dfx - cy * dfy)
+    lxf_fields s ns coeffs fxr fxl fyu fyd x y (f + 1)
+
+lxf_cell s ns coeffs fxr fxl fyu fyd i =
+  let x = i % nn
+  let y = i / nn
+  let _ = x_flux s (x+1) y fxr
+  let _ = x_flux s (x-1) y fxl
+  let _ = y_flux s x (y+1) fyu
+  let _ = y_flux s x (y-1) fyd
+  lxf_fields s ns coeffs fxr fxl fyu fyd x y 0
+
+lxf_loop s ns coeffs fxr fxl fyu fyd i =
+  if i >= nn2 then 0
+  else
+    let _ = lxf_cell s ns coeffs fxr fxl fyu fyd i
+    lxf_loop s ns coeffs fxr fxl fyu fyd (i + 1)
+
+lxf_step s dt =
+  let coeffs = float_arr_new 2 0.0
+  let _ = float_arr_set coeffs 0 (dt / 0.39269908169872414)
+  let _ = float_arr_set coeffs 1 (dt / 0.39269908169872414)
+  let ns = float_arr_new state_size 0.0
+  let fxr = float_arr_new 6 0.0
+  let fxl = float_arr_new 6 0.0
+  let fyu = float_arr_new 6 0.0
+  let fyd = float_arr_new 6 0.0
+  let _ = lxf_loop s ns coeffs fxr fxl fyu fyd 0
+  ns
+
+compute_dt s =
+  let smax = max_speed s
+  0.03926990816987241 / smax
+
+-- ═══════════════════════════════════════════════════════════
+-- DATA COLLECTION
+-- 5-cell stencil: center + 4 neighbors, 30 inputs → 6 outputs
+-- ═══════════════════════════════════════════════════════════
+
+extract_stencil s x y buf f =
+  if f >= 6 then 0
+  else
+    let _ = float_arr_set buf f        (get s f x y)
+    let _ = float_arr_set buf (f + 6)  (get s f (x-1) y)
+    let _ = float_arr_set buf (f + 12) (get s f (x+1) y)
+    let _ = float_arr_set buf (f + 18) (get s f x (y-1))
+    let _ = float_arr_set buf (f + 24) (get s f x (y+1))
+    extract_stencil s x y buf (f + 1)
+
+copy_n src s_off dst d_off n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set dst (d_off + i) (float_arr_get src (s_off + i))
+    copy_n src s_off dst d_off n (i + 1)
+
+collect_step s ns dx dy step buf i =
+  if i >= nn2 then 0
+  else
+    let x = i % nn
+    let y = i / nn
+    let ex = step * nn2 + i
+    let _ = extract_stencil s x y buf 0
+    let _ = copy_n buf 0 dx (ex * 30) 30 0
+    -- Target: center cell from next state
+    let _ = float_arr_set dy (ex * 6 + 0) (get ns 0 x y)
+    let _ = float_arr_set dy (ex * 6 + 1) (get ns 1 x y)
+    let _ = float_arr_set dy (ex * 6 + 2) (get ns 2 x y)
+    let _ = float_arr_set dy (ex * 6 + 3) (get ns 3 x y)
+    let _ = float_arr_set dy (ex * 6 + 4) (get ns 4 x y)
+    let _ = float_arr_set dy (ex * 6 + 5) (get ns 5 x y)
+    collect_step s ns dx dy step buf (i + 1)
+
+gen_data dx dy =
+  let buf = float_arr_new 30 0.0
+  let s = init_state
+  gen_loop s dx dy buf 0
+
+gen_loop s dx dy buf step =
+  if step >= n_data_steps then 0
+  else
+    let dt = compute_dt s
+    let ns = lxf_step s dt
+    let _ = collect_step s ns dx dy step buf 0
+    let _ = if step % 5 == 0 then print (cat ["  step ", show step, "/", show n_data_steps]) else 0
+    gen_loop ns dx dy buf (step + 1)
+
+-- ═══════════════════════════════════════════════════════════
+-- MODEL: MLP 30 → 32 (ReLU) → 6
+-- ═══════════════════════════════════════════════════════════
+
+clear_arr a n i =
+  if i >= n then 0
+  else let _ = float_arr_set a i 0.0
+       clear_arr a n (i + 1)
+
+init_w_arr w n i =
+  if i >= n then 0
+  else
+    let v = to_float ((i * 7 + 3) % 21 - 10) / 500.0
+    let _ = float_arr_set w i v
+    init_w_arr w n (i + 1)
+
+-- General matmul: C[b*N+j] = sum_k X[b*K+k] * W[k*N+j]
+-- Args ≤ 8: X W C K N acc j k  (b handled by caller)
+mm_k x xo w k n acc j ki =
+  if ki >= k then 0
+  else
+    let v = float_arr_get x (xo + ki) * float_arr_get w (ki * n + j)
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + v)
+    mm_k x xo w k n acc j (ki + 1)
+
+mm_j x xo w c co k n acc j =
+  if j >= n then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = mm_k x xo w k n acc j 0
+    let _ = float_arr_set c (co + j) (float_arr_get acc 0)
+    mm_j x xo w c co k n acc (j + 1)
+
+mm_batch x w c bs k n acc bi =
+  if bi >= bs then 0
+  else
+    let _ = mm_j x (bi * k) w c (bi * n) k n acc 0
+    mm_batch x w c bs k n acc (bi + 1)
+
+-- Add bias: Z[b*N+j] += bias[j]
+add_bias z bias bs n bi =
+  if bi >= bs then 0
+  else
+    let _ = add_bias_j z bias bi n 0
+    add_bias z bias bs n (bi + 1)
+
+add_bias_j z bias bi n j =
+  if j >= n then 0
+  else
+    let _ = float_arr_set z (bi * n + j) (float_arr_get z (bi * n + j) + float_arr_get bias j)
+    add_bias_j z bias bi n (j + 1)
+
+-- ReLU forward: a[i] = max(0, z[i]), saves z for backward
+relu_fwd z a n i =
+  if i >= n then 0
+  else
+    let v = float_arr_get z i
+    let _ = float_arr_set a i (if v > 0.0 then v else 0.0)
+    relu_fwd z a n (i + 1)
+
+-- ReLU backward: dz[i] = da[i] * (z[i] > 0 ? 1 : 0)
+relu_bk da z dz n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set dz i (if float_arr_get z i > 0.0 then float_arr_get da i else 0.0)
+    relu_bk da z dz n (i + 1)
+
+-- MLP Forward: X → Z1=X@W1+b1 → A1=relu(Z1) → pred=A1@W2+b2
+-- mdl: arr [W1, b1, W2, b2]
+-- buf: arr [z1, a1, pred, acc]
+mlp_fwd dx bs bstart mdl buf =
+  let z1 = arr_get buf 0
+  let a1 = arr_get buf 1
+  let pred = arr_get buf 2
+  let acc = arr_get buf 3
+  -- Build batch input (contiguous in dx already)
+  -- Z1 = X @ W1 (batch x 30) @ (30 x 32) → batch x 32
+  let _ = mm_batch_offset dx (arr_get mdl 0) z1 bs bstart in_dim hidden acc 0
+  let _ = add_bias z1 (arr_get mdl 1) bs hidden 0
+  let _ = relu_fwd z1 a1 (bs * hidden) 0
+  -- pred = A1 @ W2 (batch x 32) @ (32 x 6) → batch x 6
+  let _ = mm_batch a1 (arr_get mdl 2) pred bs hidden out_dim acc 0
+  add_bias pred (arr_get mdl 3) bs out_dim 0
+
+-- mm_batch with offset into X: X[bstart+bi, :] not X[bi, :]
+mm_batch_offset x w c bs xstart k n acc bi =
+  if bi >= bs then 0
+  else
+    let _ = mm_j x ((xstart + bi) * k) w c (bi * n) k n acc 0
+    mm_batch_offset x w c bs xstart k n acc (bi + 1)
+
+-- MLP Backward
+-- d_out[b,j] = pred[b,j] - target[b,j] (MSE gradient, unnormalized)
+compute_d_out pred dy bstart bs d_out i =
+  if i >= bs * out_dim then 0
+  else
+    let bi = i / out_dim
+    let j = i % out_dim
+    let t_idx = (bstart + bi) * out_dim + j
+    let _ = float_arr_set d_out i (float_arr_get pred i - float_arr_get dy t_idx)
+    compute_d_out pred dy bstart bs d_out (i + 1)
+
+-- dW[k,j] += A[b,k] * dY[b,j] — transposed matmul for weight gradients
+mm_t_k a dY dW bs k n acc ki =
+  if ki >= k then 0
+  else
+    let _ = mm_t_j a dY dW bs k n acc ki 0
+    mm_t_k a dY dW bs k n acc (ki + 1)
+
+mm_t_j a dY dW bs k n acc ki j =
+  if j >= n then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = mm_t_b a dY bs k n acc ki j 0
+    let _ = float_arr_set dW (ki * n + j) (float_arr_get dW (ki * n + j) + float_arr_get acc 0)
+    mm_t_j a dY dW bs k n acc ki (j + 1)
+
+mm_t_b a dY bs k n acc ki j bi =
+  if bi >= bs then 0
+  else
+    let v = float_arr_get a (bi * k + ki) * float_arr_get dY (bi * n + j)
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + v)
+    mm_t_b a dY bs k n acc ki j (bi + 1)
+
+-- dX[b,k] += dY[b,j] * W[k,j] — matmul with W transposed for input gradients
+mm_wt_b dY w dX bs k n acc bi =
+  if bi >= bs then 0
+  else
+    let _ = mm_wt_k dY w dX bs k n acc bi 0
+    mm_wt_b dY w dX bs k n acc (bi + 1)
+
+mm_wt_k dY w dX bs k n acc bi ki =
+  if ki >= k then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = mm_wt_j dY w n acc bi ki 0
+    let _ = float_arr_set dX (bi * k + ki) (float_arr_get acc 0)
+    mm_wt_k dY w dX bs k n acc bi (ki + 1)
+
+mm_wt_j dY w n acc bi ki j =
+  if j >= n then 0
+  else
+    let v = float_arr_get dY (bi * n + j) * float_arr_get w (ki * n + j)
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + v)
+    mm_wt_j dY w n acc bi ki (j + 1)
+
+-- Sum rows for bias gradient: db[j] = sum_b dY[b,j]
+sum_rows dY db bs n acc j =
+  if j >= n then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = sum_rows_b dY bs n acc j 0
+    let _ = float_arr_set db j (float_arr_get db j + float_arr_get acc 0)
+    sum_rows dY db bs n acc (j + 1)
+
+sum_rows_b dY bs n acc j bi =
+  if bi >= bs then 0
+  else
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + float_arr_get dY (bi * n + j))
+    sum_rows_b dY bs n acc j (bi + 1)
+
+-- Full MLP backward pass
+-- mdl: [W1, b1, W2, b2], grads: [dW1, db1, dW2, db2], buf: [z1, a1, pred, acc]
+-- extra: [d_out, d_a1, d_z1]
+mlp_bk dx dy bs bstart mdl grads buf extra =
+  let pred = arr_get buf 2
+  let acc = arr_get buf 3
+  let d_out = arr_get extra 0
+  let d_a1 = arr_get extra 1
+  let d_z1 = arr_get extra 2
+
+  -- d_out = pred - target
+  let _ = compute_d_out pred dy bstart bs d_out 0
+
+  -- Layer 2 backward: dW2 = A1^T @ d_out, db2 = sum(d_out), d_a1 = d_out @ W2^T
+  let _ = mm_t_k (arr_get buf 1) d_out (arr_get grads 2) bs hidden out_dim acc 0
+  let _ = sum_rows d_out (arr_get grads 3) bs out_dim acc 0
+  let _ = mm_wt_b d_out (arr_get mdl 2) d_a1 bs hidden out_dim acc 0
+
+  -- ReLU backward: d_z1 = d_a1 ⊙ (z1 > 0)
+  let _ = relu_bk d_a1 (arr_get buf 0) d_z1 (bs * hidden) 0
+
+  -- Layer 1 backward: dW1 = X^T @ d_z1, db1 = sum(d_z1)
+  let _ = mm_t_k_offset dx d_z1 (arr_get grads 0) bs bstart in_dim hidden acc 0
+  sum_rows d_z1 (arr_get grads 1) bs hidden acc 0
+
+-- mm_t_k with offset into X (X rows start at bstart)
+mm_t_k_offset x dY dW bs xstart k n acc ki =
+  if ki >= k then 0
+  else
+    let _ = mm_t_j_offset x dY dW bs xstart k n acc ki 0
+    mm_t_k_offset x dY dW bs xstart k n acc (ki + 1)
+
+mm_t_j_offset x dY dW bs xstart k n acc ki j =
+  if j >= n then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = mm_t_b_offset x dY bs xstart k n acc ki j 0
+    let _ = float_arr_set dW (ki * n + j) (float_arr_get dW (ki * n + j) + float_arr_get acc 0)
+    mm_t_j_offset x dY dW bs xstart k n acc ki (j + 1)
+
+mm_t_b_offset x dY bs xstart k n acc ki j bi =
+  if bi >= bs then 0
+  else
+    let v = float_arr_get x ((xstart + bi) * k + ki) * float_arr_get dY (bi * n + j)
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + v)
+    mm_t_b_offset x dY bs xstart k n acc ki j (bi + 1)
+
+-- SGD update
+sgd_loop a g lr_arr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set a i (float_arr_get a i - float_arr_get lr_arr 0 * float_arr_get g i)
+    sgd_loop a g lr_arr n (i + 1)
+
+sgd_all mdl grads lr_arr =
+  let _ = sgd_loop (arr_get mdl 0) (arr_get grads 0) lr_arr w1_size 0
+  let _ = sgd_loop (arr_get mdl 1) (arr_get grads 1) lr_arr hidden 0
+  let _ = sgd_loop (arr_get mdl 2) (arr_get grads 2) lr_arr w2_size 0
+  sgd_loop (arr_get mdl 3) (arr_get grads 3) lr_arr out_dim 0
+
+-- earr[0] = temp for error, earr[1] = temp for e²
+simple_mse pred dy dy_off larr earr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set earr 0 (float_arr_get pred i - float_arr_get dy (dy_off + i))
+    let _ = float_arr_set earr 1 (float_arr_get earr 0 * float_arr_get earr 0)
+    let _ = float_arr_set larr 0 (float_arr_get larr 0 + float_arr_get earr 1)
+    simple_mse pred dy dy_off larr earr n (i + 1)
+
+-- MSE loss → stored in larr[0]
+compute_mse pred dy bs bstart larr i =
+  if i >= bs * out_dim then 0
+  else
+    let bi = i / out_dim
+    let j = i % out_dim
+    let e = float_arr_get pred i - float_arr_get dy ((bstart + bi) * out_dim + j)
+    let _ = float_arr_set larr 0 (float_arr_get larr 0 + e * e)
+    compute_mse pred dy bs bstart larr (i + 1)
+
+-- ═══════════════════════════════════════════════════════════
+-- CONSERVATION EVALUATION
+-- ═══════════════════════════════════════════════════════════
+
+sum_field s f acc i =
+  if i >= nn2 then 0
+  else
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + float_arr_get s (f * nn2 + i))
+    sum_field s f acc (i + 1)
+
+total_mass s =
+  let acc = float_arr_new 1 0.0
+  let _ = sum_field s 0 acc 0
+  float_arr_get acc 0
+
+total_energy s =
+  let acc = float_arr_new 1 0.0
+  let _ = sum_field s 5 acc 0
+  float_arr_get acc 0
+
+max_divb s acc i =
+  if i >= nn2 then 0
+  else
+    let x = i % nn
+    let y = i / nn
+    let dbx = (get s 3 (x+1) y - get s 3 (x-1) y) / 0.39269908169872414
+    let dby = (get s 4 x (y+1) - get s 4 x (y-1)) / 0.39269908169872414
+    let d = dbx + dby
+    let ad = if d < 0.0 then 0.0 - d else d
+    let cur = float_arr_get acc 0
+    let _ = if ad > cur then float_arr_set acc 0 ad else 0
+    max_divb s acc (i + 1)
+
+-- Predict full grid: run MLP on every cell (one at a time)
+-- Uses mm_j for single-example matmul
+predict_grid s mdl ps buf z1b a1b acc i =
+  if i >= nn2 then 0
+  else
+    let x = i % nn
+    let y = i / nn
+    let _ = extract_stencil s x y buf 0
+    -- Layer 1: z1 = buf @ W1 + b1, a1 = relu(z1)
+    let _ = mm_j buf 0 (arr_get mdl 0) z1b 0 in_dim hidden acc 0
+    let _ = add_bias_j z1b (arr_get mdl 1) 0 hidden 0
+    let _ = relu_fwd z1b a1b hidden 0
+    -- Layer 2: ps[i*6..] = a1 @ W2 + b2
+    let _ = mm_j a1b 0 (arr_get mdl 2) ps (i * 6) hidden out_dim acc 0
+    let _ = add_bias_j ps (arr_get mdl 3) i out_dim 0
+    predict_grid s mdl ps buf z1b a1b acc (i + 1)
+
+-- Unpack pred_flat[i*6..i*6+5] → pred_state[f*nn2+i] (field-major layout)
+unpack_pred pf ps i =
+  if i >= nn2 then 0
+  else
+    let _ = float_arr_set ps (0 * nn2 + i) (float_arr_get pf (i * 6 + 0))
+    let _ = float_arr_set ps (1 * nn2 + i) (float_arr_get pf (i * 6 + 1))
+    let _ = float_arr_set ps (2 * nn2 + i) (float_arr_get pf (i * 6 + 2))
+    let _ = float_arr_set ps (3 * nn2 + i) (float_arr_get pf (i * 6 + 3))
+    let _ = float_arr_set ps (4 * nn2 + i) (float_arr_get pf (i * 6 + 4))
+    let _ = float_arr_set ps (5 * nn2 + i) (float_arr_get pf (i * 6 + 5))
+    unpack_pred pf ps (i + 1)
+
+eval_conservation s w b =
+  let dt = compute_dt s
+  let truth = lxf_step s dt
+  let m0 = total_mass s
+  let e0 = total_energy s
+
+  -- Ground truth conservation
+  let m_lxf = total_mass truth
+  let e_lxf = total_energy truth
+  let db_acc = float_arr_new 1 0.0
+  let _ = max_divb truth db_acc 0
+  let db_lxf = float_arr_get db_acc 0
+
+  -- Neural prediction
+  let pred_flat = float_arr_new (nn2 * 6) 0.0
+  let pred_state = float_arr_new state_size 0.0
+  let buf = float_arr_new 30 0.0
+  let acc = float_arr_new 1 0.0
+  let _ = predict_grid s w b pred_flat buf acc 0
+  let _ = unpack_pred pred_flat pred_state 0
+  let m_nn = total_mass pred_state
+  let e_nn = total_energy pred_state
+  let _ = float_arr_set db_acc 0 0.0
+  let _ = max_divb pred_state db_acc 0
+  let db_nn = float_arr_get db_acc 0
+
+  let _ = print ""
+  let _ = print "Conservation evaluation (1-step prediction):"
+  let _ = print (cat ["  Initial:    mass=", show_float m0, "  energy=", show_float e0])
+  let _ = print (cat ["  LxF truth:  mass=", show_float m_lxf, "  energy=", show_float e_lxf, "  divB=", show_float db_lxf])
+  let _ = print (cat ["  Neural:     mass=", show_float m_nn, "  energy=", show_float e_nn, "  divB=", show_float db_nn])
+  let dm_lxf = (m_lxf - m0) / m0
+  let dm_nn = (m_nn - m0) / m0
+  let de_lxf = (e_lxf - e0) / e0
+  let de_nn = (e_nn - e0) / e0
+  let _ = print (cat ["  Mass err:   LxF=", show_float dm_lxf, "  Neural=", show_float dm_nn])
+  print (cat ["  Energy err: LxF=", show_float de_lxf, "  Neural=", show_float de_nn])
+
+-- ═══════════════════════════════════════════════════════════
+-- TRAINING LOOP
+-- mdl: [W1,b1,W2,b2], grads: [dW1,db1,dW2,db2]
+-- buf: [z1,a1,pred,acc], extra: [d_out,d_a1,d_z1]
+-- ═══════════════════════════════════════════════════════════
+
+-- extra: [d_out, d_a1, d_z1, lr_arr, larr]
+train_mlp dx dy mdl grads buf extra n_ex step =
+  if step >= 1000 then 0
+  else
+    let bs = (step * batch_sz) % n_ex
+    let lr_arr = arr_get extra 3
+    -- Forward
+    let _ = mlp_fwd dx batch_sz bs mdl buf
+    let _ = if step == 0 then print (cat ["  [loop] pred[0]=", show_float (float_arr_get (arr_get buf 2) 0), " dy_off=", show (bs * 6)]) else 0
+    -- Loss: sum (pred[i] - dy[bs*6+i])^2 / 192
+    let larr = float_arr_new 1 0.0
+    let mse_tmp = float_arr_new 2 0.0
+    let _ = simple_mse (arr_get buf 2) dy (bs * 6) larr mse_tmp 192 0
+    -- Division by literal broken in TCO — use multiply by reciprocal
+    let _ = float_arr_set larr 0 (float_arr_get larr 0 * 0.00520833333333333)
+    -- Backward
+    let _ = clear_arr (arr_get grads 0) w1_size 0
+    let _ = clear_arr (arr_get grads 1) hidden 0
+    let _ = clear_arr (arr_get grads 2) w2_size 0
+    let _ = clear_arr (arr_get grads 3) out_dim 0
+    let _ = mlp_bk dx dy batch_sz bs mdl grads buf extra
+    -- SGD
+    let _ = sgd_all mdl grads lr_arr
+    -- Print
+    let _ = if step % 100 == 0 then print (cat ["  step ", show step, "  loss=", show_float (float_arr_get larr 0)]) else 0
+    train_mlp dx dy mdl grads buf extra n_ex (step + 1)
+
+-- ═══════════════════════════════════════════════════════════
+-- MAIN
+-- ═══════════════════════════════════════════════════════════
+
+main =
+  let _ = print ""
+  let _ = print "  NEURAL MHD SURROGATE v2"
+  let _ = print "  MLP: 30 -> 32 (ReLU) -> 6"
+  let _ = print "  Analytical backprop, 1190 parameters"
+  let _ = print ""
+
+  -- Generate data
+  let _ = print "Generating data (32x32, 20 steps)..."
+  let dx = float_arr_new 614400 0.0
+  let dy = float_arr_new 122880 0.0
+  let _ = gen_data dx dy
+  let _ = print "  20480 examples"
+  let _ = print ""
+
+  -- Init model: [W1, b1, W2, b2]
+  let mdl = arr_new 4 0
+  let w1 = float_arr_new w1_size 0.0
+  let _ = init_w_arr w1 w1_size 0
+  let _ = arr_set mdl 0 w1
+  let b1 = float_arr_new hidden 0.0
+  let _ = arr_set mdl 1 b1
+  let w2 = float_arr_new w2_size 0.0
+  let _ = init_w_arr w2 w2_size 0
+  let _ = arr_set mdl 2 w2
+  let b2 = float_arr_new out_dim 0.0
+  let _ = arr_set mdl 3 b2
+
+  -- Gradient buffers: [dW1, db1, dW2, db2]
+  let grads = arr_new 4 0
+  let _ = arr_set grads 0 (float_arr_new w1_size 0.0)
+  let _ = arr_set grads 1 (float_arr_new hidden 0.0)
+  let _ = arr_set grads 2 (float_arr_new w2_size 0.0)
+  let _ = arr_set grads 3 (float_arr_new out_dim 0.0)
+
+  -- Forward buffers: [z1, a1, pred, acc]
+  let buf = arr_new 4 0
+  let _ = arr_set buf 0 (float_arr_new (batch_sz * hidden) 0.0)
+  let _ = arr_set buf 1 (float_arr_new (batch_sz * hidden) 0.0)
+  let _ = arr_set buf 2 (float_arr_new (batch_sz * out_dim) 0.0)
+  let _ = arr_set buf 3 (float_arr_new 1 0.0)
+
+  -- Extra: [d_out, d_a1, d_z1, lr_arr, larr]
+  let extra = arr_new 5 0
+  let _ = arr_set extra 0 (float_arr_new (batch_sz * out_dim) 0.0)
+  let _ = arr_set extra 1 (float_arr_new (batch_sz * hidden) 0.0)
+  let _ = arr_set extra 2 (float_arr_new (batch_sz * hidden) 0.0)
+  let lr_arr = float_arr_new 1 0.0
+  let _ = float_arr_set lr_arr 0 0.0000001
+  let _ = arr_set extra 3 lr_arr
+  let larr = float_arr_new 1 0.0
+  let _ = arr_set extra 4 larr
+
+  -- Debug: test forward pass
+  let _ = mlp_fwd dx batch_sz 0 mdl buf
+  let _ = print (cat ["  pred[0]=", show_float (float_arr_get (arr_get buf 2) 0)])
+  let _ = print (cat ["  pred[1]=", show_float (float_arr_get (arr_get buf 2) 1)])
+  let _ = print (cat ["  target[0]=", show_float (float_arr_get dy 0)])
+  let _ = print (cat ["  z1[0]=", show_float (float_arr_get (arr_get buf 0) 0)])
+  let _ = print (cat ["  a1[0]=", show_float (float_arr_get (arr_get buf 1) 0)])
+
+  -- Manual loss check
+  let _ = float_arr_set larr 0 0.0
+  let _ = compute_mse (arr_get buf 2) dy batch_sz 0 larr 0
+  let manual_loss = float_arr_get larr 0 / 192.0
+  let _ = print (cat ["  manual loss=", show_float manual_loss])
+  let _ = print (cat ["  raw sum=", show_float (float_arr_get larr 0)])
+
+  -- Train
+  let _ = print "Training (1000 steps, lr=5e-6)..."
+  let _ = train_mlp dx dy mdl grads buf extra 20480 0
+  let _ = print ""
+
+  -- Conservation evaluation
+  let _ = print "Conservation evaluation..."
+  let cs = init_state
+  let cdt = compute_dt cs
+  let truth = lxf_step cs cdt
+
+  let m0 = total_mass cs
+  let e0 = total_energy cs
+  let m_lxf = total_mass truth
+  let e_lxf = total_energy truth
+  let _ = print (cat ["  Initial:   mass=", show_float m0, "  energy=", show_float e0])
+  let _ = print (cat ["  LxF truth: mass=", show_float m_lxf, "  energy=", show_float e_lxf])
+
+  let _ = print "  Neural prediction on full grid..."
+  let pf = float_arr_new (nn2 * 6) 0.0
+  let ps = float_arr_new state_size 0.0
+  let cbuf = float_arr_new 30 0.0
+  let z1b = float_arr_new hidden 0.0
+  let a1b = float_arr_new hidden 0.0
+  let cacc = float_arr_new 1 0.0
+  let _ = predict_grid cs mdl pf cbuf z1b a1b cacc 0
+  let _ = unpack_pred pf ps 0
+  let m_nn = total_mass ps
+  let e_nn = total_energy ps
+  let _ = print (cat ["  Neural:    mass=", show_float m_nn, "  energy=", show_float e_nn])
+
+  let dm_nn = (m_nn - m0) / m0
+  let de_nn = (e_nn - e0) / e0
+  let _ = print (cat ["  Mass err:  LxF=", show_float ((m_lxf - m0) / m0), "  Neural=", show_float dm_nn])
+  let _ = print (cat ["  Energy err:LxF=", show_float ((e_lxf - e0) / e0), "  Neural=", show_float de_nn])
+
+  let _ = print ""
+  let _ = print "Done."
+  0
