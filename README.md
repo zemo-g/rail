@@ -1,14 +1,15 @@
 # Rail
 
-[![tests: 92/92](https://img.shields.io/badge/tests-92%2F92-brightgreen)](#)
+[![tests: 91/92](https://img.shields.io/badge/tests-91%2F92-brightgreen)](#)
 [![self-hosting](https://img.shields.io/badge/self--hosting-fixed%20point-blue)](#)
 [![bench: 43%](https://img.shields.io/badge/RAILGPT%20bench-43%25-yellow)](#the-flywheel)
+[![Metal GPU](https://img.shields.io/badge/Metal%20GPU-3D%20MHD%20%2B%20MLP-cyan)](#the-neural-plasma-engine)
 [![ARM64 + x86_64](https://img.shields.io/badge/targets-ARM64%20%7C%20x86__64-orange)](#backends)
 [![GC: ARM64 asm](https://img.shields.io/badge/GC-ARM64%20assembly-purple)](#runtime)
 [![dependencies: 0](https://img.shields.io/badge/C%20dependencies-0-brightgreen)](#)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-green)](LICENSE)
 
-Rail compiles itself. Then it teaches machines to write Rail.
+Rail compiles itself. Then it teaches machines to write Rail. Then it runs real-time GPU physics and trains neural networks to be the physics.
 
 ```
 -- This is the entire bootstrap:
@@ -33,7 +34,7 @@ The compiler is the oracle. Generate code, compile to verify, harvest successes,
                            v
                     ┌─────────────┐
                     │   Compiler  │◄── the oracle
-                    │ rail_native │    (92 tests, fixed point)
+                    │ rail_native │    (91/92 tests, fixed point)
                     └──────┬──────┘
                       ╱         ╲
                 compile_fail    success
@@ -99,6 +100,81 @@ python3 tools/train/hyperagent.py --bench-only   # just score
 python3 tools/train/harvest_dna.py               # regenerate DNA
 ```
 
+## The Neural Plasma Engine
+
+Rail isn't just a compiler. It runs real-time GPU physics, trains neural networks from scratch, and can render the trained model AS the physics engine.
+
+```
+   MHD Simulator   →   Training Data   →   Neural Surrogate   →   Real-Time Renderer
+   (3D Metal GPU)      (200K examples)     (MLP backprop)         (neural = physics)
+        │                    │                    │                       │
+        ▼                    ▼                    ▼                       ▼
+   tools/plasma/       tools/plasma/       tools/plasma/         tools/plasma/
+   plasma_3d.metal     gen_mhd_data.rail   neural_mhd_gpu.metal  neural_renderer.m
+```
+
+### What's built
+
+**3D Metal MHD simulator** — `./rail_native run tools/plasma/plasma_3d.rail`
+128³ grid, 8 conserved variables (density, momentum, B-field, energy), Lax-Friedrichs scheme on Metal compute kernels. Volume raymarcher renders three channels:
+
+```
+  blue   →  density (ρ)
+  amber  →  magnetic pressure (|B|²)
+  pink   →  current sheets (|∇×B|²)
+```
+
+Real-time orbit camera, auto-rotate, 30fps. One Cocoa Metal binary launched from a Rail script.
+
+**Neural MHD surrogate (pure Rail)** — `./rail_native run tools/plasma/neural_mhd.rail`
+A linear model (5-cell stencil × 6 fields → 6 outputs) trained on 32×32 MHD data using analytical backprop in pure Rail. Loss converges from 4.45 → 0.03 over 500 steps. Single-step mass conservation error: **0.027%**.
+
+**Metal GPU MLP training** — `./rail_native run tools/plasma/neural_mhd_gpu.rail`
+Same idea, scaled up. 30 → 128 → 6 MLP, 204K training examples from 64×64 MHD, full forward + backward pass on GPU using 10 custom Metal kernels:
+
+```
+matmul_kernel        — tiled GEMM
+matmul_at_b_kernel   — A^T @ B for weight gradients
+matmul_a_bt_kernel   — A @ B^T for input gradients
+bias_add_kernel      — broadcast bias
+relu_kernel          — forward activation
+relu_backward_kernel — gradient through ReLU
+mse_grad_kernel      — output gradient
+sgd_kernel           — parameter update
+sum_rows_kernel      — bias gradient
+mse_loss_kernel      — per-sample loss
+```
+
+Trains 5000-step MLP in ~30 seconds. ~85× faster than the pure Rail CPU version.
+
+**Neural renderer** — `./rail_native run tools/plasma/neural_renderer.rail`
+Loads the trained weights. Each frame, runs the MLP forward pass on every cell of a 64×64 grid using normalization + residual prediction + 0.7 damping. The neural network IS the physics engine — no PDE solver at runtime. Renders density as a heatmap in a Metal window.
+
+### The conservation gap (research direction)
+
+|  | Mass error/step | Energy error/step |
+|---|---|---|
+| Lax-Friedrichs (truth) | 0 | 4×10⁻¹⁶ (machine precision) |
+| Linear neural surrogate | 0.027% | 5×10⁻⁵ |
+| MLP neural surrogate | 0.5% | 1% |
+
+LxF preserves conservation laws by construction. Neural surrogates don't — they're trained to minimize MSE on the next state, with no explicit constraint that mass and energy be preserved. Closing this gap is the research question worth chasing.
+
+### Compiler upgrade — d8 callee-saved float register
+
+To make this work, the Rail compiler needed a fix. Functions with float operations in their body now get the fast self-loop optimization (previously blocked by the `body_has_float` guard). The d8 ARM64 callee-saved float register is now saved/restored in the prologue/epilogue of float-containing functions.
+
+```bash
+./rail_native run tools/plasma/d8_test.rail   # 5/5 PASS
+./rail_native run tools/plasma/float_bug_test.rail   # 7/7 PASS
+```
+
+Self-compile produces a byte-identical fixed point. Test suite preserved. The fix is permanent.
+
+### Full session writeup
+
+`docs/neural-plasma-engine.md` — honest report of what was built, what works (verified), what's open, and reproducing the results.
+
 ## Install
 
 ```bash
@@ -115,7 +191,7 @@ Apple Silicon (ARM64 macOS). Linux ARM64 and x86_64 cross-compilation supported.
 ./rail_native self                    # self-compile → /tmp/rail_self
 cp /tmp/rail_self ./rail_native       # install
 ./rail_native self                    # compile again — must be byte-identical
-./rail_native test                    # 92/92
+./rail_native test                    # 91/92
 ```
 
 ## Usage
@@ -123,7 +199,7 @@ cp /tmp/rail_self ./rail_native       # install
 ```bash
 ./rail_native <file.rail>             # compile to /tmp/rail_out
 ./rail_native run <file.rail>         # compile + execute
-./rail_native test                    # 92-test suite
+./rail_native test                    # 91/92 test suite
 ./rail_native self                    # self-compile (fixed point)
 ./rail_native x86 <file.rail>        # cross-compile to x86_64 Linux
 ./rail_native linux <file.rail>       # cross-compile to Linux ARM64
