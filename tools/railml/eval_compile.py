@@ -45,18 +45,30 @@ def generate(ckpt, prompt_tokens, n, temp, seed, real_vocab):
     return [int(t) for t in proc.stdout.strip().split()]
 
 def try_compile(rail_src):
-    """Run rail_native on the source. Return (ok, error_or_empty)."""
+    """Strict compile + run via rail_native run.
+    rail_native exits 0 even on parse errors and typecheck warnings, so we
+    must scan stdout/stderr for failure signatures."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".rail", delete=False) as f:
         f.write(rail_src)
         path = f.name
     try:
         proc = subprocess.run(
-            [RAIL_NATIVE, path],
+            [RAIL_NATIVE, "run", path],
             capture_output=True, text=True, timeout=10,
         )
-        if proc.returncode == 0:
-            return True, ""
-        return False, (proc.stderr or proc.stdout).strip()[:200]
+        out = (proc.stdout + proc.stderr)
+        if proc.returncode != 0:
+            return False, out.strip()[:200]
+        # rail_native exits 0 on errors — scan output text for failure markers
+        bad_markers = (
+            "error:", "error(s) found", "WARNING", "Bus error",
+            "Segmentation fault", "Abort trap", "expected decl",
+            "as: ERR", "ld: ERR",
+        )
+        for m in bad_markers:
+            if m in out:
+                return False, f"{m}: " + out.strip()[:140]
+        return True, ""
     except subprocess.TimeoutExpired:
         return False, "TIMEOUT"
     finally:
