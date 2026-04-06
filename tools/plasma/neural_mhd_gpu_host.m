@@ -139,12 +139,12 @@ static void generate_data(float *X, float *Y) {
 // METAL TRAINING
 // ═══════════════════════════════════════════════════════════
 
-#define HIDDEN 32
+#define HIDDEN 128
 #define BATCH 256
 #define TILE 16
 #define LR 0.001f
 #define MIN(a,b) ((a)<(b)?(a):(b))
-#define N_TRAIN 10000
+#define N_TRAIN 20000
 
 int main(int argc, char **argv) {
     @autoreleasepool {
@@ -247,6 +247,10 @@ int main(int argc, char **argv) {
             int offset = (step * BATCH) % N_EXAMPLES;
             memcpy(X_batch.contents, X_all + offset*IN_DIM, BATCH*IN_DIM*sizeof(float));
             memcpy(Y_batch.contents, Y_all + offset*OUT_DIM, BATCH*OUT_DIM*sizeof(float));
+            // Constant noise injection: ±5% of 1 std
+            float *xb = X_batch.contents;
+            for (int i = 0; i < BATCH*IN_DIM; i++)
+                xb[i] += ((float)arc4random()/UINT32_MAX - 0.5f) * 0.1f;
 
             id<MTLCommandBuffer> cmd = [queue commandBuffer];
 
@@ -421,8 +425,11 @@ int main(int argc, char **argv) {
             [cmd commit];
             [cmd waitUntilCompleted];
 
+            // LR decay: halve every 5000 steps
+            if (step > 0 && step % 5000 == 0) lr *= 0.5f;
+
             // Print loss (CPU reduce)
-            if (step % 100 == 0) {
+            if (step % 500 == 0) {
                 float *lp = loss_buf.contents;
                 float total = 0;
                 for (int i = 0; i < BATCH*OUT_DIM; i++) total += lp[i];
@@ -528,9 +535,9 @@ int main(int argc, char **argv) {
                 for (int j=0; j<OUT_DIM; j++) {
                     float v = b2c[j];
                     for (int k=0; k<HIDDEN; k++) v += h[k] * w2c[k*OUT_DIM+j];
-                    // Denormalize output and add to current state (residual)
+                    // Denormalize output and add to current state (residual, damped)
                     double delta = (double)(v * y_std[j] + y_mean[j]);
-                    sim_ns[j*NN2+i] = sim_s[j*NN2+i] + delta;
+                    sim_ns[j*NN2+i] = sim_s[j*NN2+i] + 0.7 * delta;
                 }
             }
 
@@ -558,12 +565,10 @@ int main(int argc, char **argv) {
                 printf("  t=%3d  neural_mass=%.2f  lxf_mass=%.2f\n", t, nm, lm);
             }
 
-            // Clamp to physical ranges (prevents exponential divergence)
+            // Minimal physics clamp: prevent negative density/energy (causes NaN)
             for (int i = 0; i < NN2; i++) {
-                sim_ns[0*NN2+i] = fmax(0.01, fmin(5.0, sim_ns[0*NN2+i]));   // density
-                sim_ns[5*NN2+i] = fmax(0.1, fmin(50.0, sim_ns[5*NN2+i]));   // energy
-                for (int f = 1; f < 5; f++)
-                    sim_ns[f*NN2+i] = fmax(-10.0, fmin(10.0, sim_ns[f*NN2+i])); // momentum, B
+                sim_ns[0*NN2+i] = fmax(0.001, sim_ns[0*NN2+i]);   // density > 0
+                sim_ns[5*NN2+i] = fmax(0.01, sim_ns[5*NN2+i]);     // energy > 0
             }
 
             // Swap
