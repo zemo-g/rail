@@ -349,16 +349,104 @@ Tail-recursive loops match C `-O2`: 5 instructions per iteration.
 | **Targets** | 1 (x86_64) | 3 (ARM64, x86_64, WASM) |
 | **Self-training** | N/A | 10K+ verified examples, 43% bench |
 
-## Evolution
+## Releases
+
+### v2.0.0 — 2026-04-06
+
+**The version where Rail stops being just a self-hosting compiler and becomes a self-improving system.**
+
+121 commits since v1.4.0. Three independent training lineages now run on the same machine, all driven by the same compiler as the binary fitness function: a 4B-parameter LoRA on Gemma, a Metal-GPU MLP that learns to be a physics engine, and a 23-integer probabilistic context-free grammar trained by REINFORCE. The operational discipline to keep all three honest — intervention ledger, recovery chain, runtime overrides, forward regression bisector, domain plugin spine — is built in pure Rail with zero Python. The compiler that runs all of this is itself self-hosting at a byte-identical fixed point, with native floats, effect handlers, and a working garbage collector in ARM64 assembly.
+
+#### Compiler & runtime
+
+- **Native floats** — unboxed IEEE 754 in ARM64 d-registers. Foreign FFI for `sin`/`cos`/`sqrt`/`tanh`/`exp`/`log`/`pow`. Auto int→float promotion. ~10× speedup vs boxed.
+- **Effect handlers** — `try body handler` via setjmp/longjmp. Deep unwinding, nested handlers, restartable error recovery.
+- **GC bootstrapped** — conservative mark-sweep in ARM64 assembly. 256 MB bump arena + free list + malloc fallback. 10/10 stress self-compiles, byte-identical fixed point.
+- **d8 callee-saved float register** — float operations inside recursive functions now get the fast self-loop optimization. Unblocked the neural plasma MLP training.
+- **FFI strdup wrap** — string-returning foreign calls strdup-wrapped through the runtime. Fixed the memory bug holding tests at 91/92 → **92/92 for the first time.**
+- **Polymorphic show**, **exhaustive match enforcement**, **parser `in` keyword**.
+- Tail-recursive loops match C `-O2` (5 instructions per iteration).
+
+#### Four stable backends
+
+| Backend | Status | Target |
+|---|---|---|
+| **macOS ARM64** | primary, 92 tests, fixed point | M-series Macs |
+| **Linux ARM64** | working | Pi Zero 2 W (fleet display) |
+| **Linux x86_64** | working | Razer (WSL training node) |
+| **WASM** | closures, ADTs, match, lists, strings | browser, edge — 6 demos at compile.ledatic.org |
+
+#### The self-improving flywheel — three lineages
+
+Rail now drives three independent training systems, each using the compiler as the binary fitness function:
+
+1. **LLM-LoRA lineage** — Gemma 4 E4B with a Rail LoRA adapter reaches **14/30 on the README bench**, up from 1/30 baseline. Hyperagent makes bench-gated decisions: keep an adapter only if the bench improves, rollback otherwise. DNA harvester pulls 199 verified examples directly from `compile.rail` itself. The LLM trains on data the compiler has personally verified.
+
+2. **Neural plasma lineage** — A 3D Metal MHD simulator generates training data for a neural surrogate. A pure-Rail linear model converges from loss 4.45 → 0.03 in 500 steps with single-step mass conservation error of 0.027%. A Metal GPU MLP (30→128→6) trains 85× faster than the CPU version using 10 custom Metal kernels. The neural renderer runs the trained MLP forward pass on every cell of a 64×64 grid each frame — **the neural network IS the physics engine**, no PDE solver at runtime. STABLE 200-step simulation via spectral normalization + conservation drift loss.
+
+3. **PCFG-REINFORCE lineage** — `tools/domains/s0_pcfg/` is a 23-rule probabilistic context-free grammar trained by REINFORCE on compile-pass reward. The whole "model" is 23 integer weights, ~120 bytes. Reaches **92% lifetime strict pass rate** in 30 ticks. Generates 5 distinct program shapes (inline, named-binding, statement chain, function definition, ADT + match) — and discovered Rail's runtime tolerances by trial and error before the implementer knew them. **The compiler is the teacher in 720 lines of pure Rail.**
+
+#### Empire → Rail transplant (4 sessions, all pure Rail, zero Python)
+
+Operational discipline patterns from the paused Empire trading system, ported as Rail-native infrastructure:
+
+- **Intervention ledger** (`flywheel/interventions.jsonl`) — append-only audit log. Every round_end, level transition, override write, MLX skip, and goal grind is one JSON record. Read with `flywheel/interventions_tail.rail`.
+- **Recovery chain** (`flywheel/flush.rail`) — pure Rail rotator. Per protected file: cp src→tmp, mv backup→prev, mv tmp→backup. Three guards (source-empty, size-shrunk, line-collapse). Protects 5 files per round.
+- **Domain plugin spine** (`tools/domains/`) — filesystem-as-registry. No dispatcher, no manifest, no registry file. Two domains live: `neural_plasma` and `s0_pcfg`. Discovered with `find`.
+- **Runtime overrides** (`flywheel/overrides.txt`) — bounded tunables read fresh every round. Every override write logged to the same ledger. Closes the audit loop.
+
+#### Loop closure
+
+The flywheel now runs continuously without human intervention. `tools/train/run_training.sh` per-round sequence:
+
+```
+1. self_train_bin    LLM round → harvest
+2. flush_bin         rotate backups
+3. s0d_tick_bin      PCFG REINFORCE round → state file
+4. s0d_xfeed_bin     translate PCFG-verified programs into LLM harvest
+5. sleep + repeat
+```
+
+`cross_feed.rail` translates s0_pcfg's verified programs into the chat-completion format the LLM flywheel expects, with SHA-256 dedup. **Two oracles, one corpus.**
+
+#### Forward regression bisector
+
+`flywheel/regress.rail` reads the intervention ledger and reports any pass-rate drop bigger than a threshold, plus the suspect events (override_write, level_fallback, server_skip, goal_grind) that occurred in the window before each drop. Threshold configurable. The level 25 → 6 historical regression that motivated the ledger is gone (pre-ledger), so this tool runs **forward**: it watches for the next drop and tells you what changed.
+
+#### Public sandbox
+
+- **[compile.ledatic.org](https://compile.ledatic.org)** — public sandboxed Rail compiler. AST whitelist, WASM import validation, 19-test adversarial suite, Cloudflare Tunnel.
+- **[ledatic.org](https://ledatic.org)** v2.0 — main site redeployed with 6 in-browser WASM demos: hello, fib, math, lists, ADTs, closures, string ops.
+
+#### By the numbers
+
+| | v1.4 (2026-03-22) | **v2.0 (2026-04-06)** |
+|---|---|---|
+| Tests | 70 | **92** |
+| Backends | 1 | **4** |
+| Stdlib modules | ~22 | **38** |
+| Compiler (lines of Rail) | 1,979 | **3,865** |
+| Self-improving lineages | 1 (LLM-LoRA) | **3** (LoRA + Metal-MLP + PCFG-REINFORCE) |
+| Domain plugins | 0 | **2** (neural_plasma, s0_pcfg) |
+| Operational discipline | manual | **full** (ledger + recovery + spine + overrides + bisector) |
+| Compiler-verified training corpus | small | 3.67 MB curated, deduped, quality-weighted |
+
+#### What's next
+
+The big swing for the next session lives at **`docs/reinforce-lora-plan.md`** — a 364-line scoping doc for a half-day Razer-side spike that replaces the cross-entropy LoRA training loop with REINFORCE on compile-pass reward. The same training signal that drove s0_pcfg from 46% → 92% strict pass rate, applied to the 4B LLM that currently sits at 14/30. Six phases with abort criteria, five risks with mitigations, honest 50% confidence on the make-or-break phase. If it works, the bench moves measurably; if it doesn't, the negative result tells us something about LLM-scale RL on binary compile rewards.
+
+Full release notes: **[CHANGELOG.md](CHANGELOG.md)**
+
+### History
 
 | Version | Date | What |
-|---------|------|------|
-| **v1.0** | 2026-03-17 | Self-hosting. Rust deleted. 67 tests. |
-| **v1.1** | 2026-03-20 | Metal GPU, WASM, x86_64, fibers, flywheel |
-| **v1.3** | 2026-03-21 | MCP server, 32-layer LoRA, open source |
-| **v1.4** | 2026-03-22 | GC in assembly, nested lambdas, exhaustiveness, 70 tests |
+|---|---|---|
+| **v2.0** | 2026-04-06 | See highlights above. **121 commits.** |
 | **v1.5** | 2026-03-25 | 92 tests, C-matching performance, hyperagent, DNA training, 3 architectures |
-| **v2.0** | 2026-04-06 | Native floats, effect handlers, 4 backends, Empire-transplant operational discipline (intervention ledger, recovery chain, domain plugin spine, runtime overrides), Neural Plasma Engine (3D Metal MHD + neural surrogate), s0_pcfg compiler-as-teacher seed, REINFORCE-LoRA scoping. **121 commits.** See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.4** | 2026-03-22 | GC in assembly, nested lambdas, exhaustiveness, 70 tests |
+| **v1.3** | 2026-03-21 | MCP server, 32-layer LoRA, open source |
+| **v1.1** | 2026-03-20 | Metal GPU, WASM, x86_64, fibers, flywheel |
+| **v1.0** | 2026-03-17 | Self-hosting. Rust deleted. 67 tests. |
 
 ## License
 
