@@ -1,0 +1,182 @@
+-- tools/domains/s0_pcfg/cross_feed.rail
+--
+-- Cross-feed: take entries from training/s0_pcfg_harvest.jsonl and append
+-- them to training/self_train/harvest.jsonl in the chat-completion format
+-- the LLM flywheel expects. SHA-256 dedup against harvest_hashes.txt so
+-- we never insert a duplicate of an existing entry.
+--
+-- This closes the loop. The PCFG verifies programs by compiling them.
+-- Those verified programs become training data for the LLM flywheel.
+-- Two oracles, one corpus.
+--
+-- Usage:
+--   ./rail_native run tools/domains/s0_pcfg/cross_feed.rail        # real run
+--   ./rail_native run tools/domains/s0_pcfg/cross_feed.rail dry    # dry run
+--
+-- Tunables (overrides.txt):
+--   s0_xfeed_max         default 60   max programs to cross-feed per run
+
+import "stdlib/file.rail"
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+q = "\""
+
+file_exists path =
+  length (trim (shell (cat ["test -f ", path, " && echo 1"]))) > 0
+
+-- ── parse_int ─────────────────────────────────────────────────────────
+digit_val c =
+  if c == "0" then 0
+  else if c == "1" then 1
+  else if c == "2" then 2
+  else if c == "3" then 3
+  else if c == "4" then 4
+  else if c == "5" then 5
+  else if c == "6" then 6
+  else if c == "7" then 7
+  else if c == "8" then 8
+  else if c == "9" then 9
+  else 0 - 1
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = digit_val (head cs)
+    if d < 0 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+parse_int s = parse_int_acc (chars s) 0
+
+parse_kv lines key =
+  if length lines == 0 then 0
+  else
+    let parts = split "=" (head lines)
+    if length parts >= 2 then
+      if head parts == key then parse_int (head (tail parts))
+      else parse_kv (tail lines) key
+    else parse_kv (tail lines) key
+
+load_override key default =
+  let path = "flywheel/overrides.txt"
+  if file_exists path then
+    let v = parse_kv (split "\n" (read_file path)) key
+    if v == 0 then default else v
+  else default
+
+-- ── Source extraction from s0_pcfg JSONL ──────────────────────────────
+-- Each line: {"sha":"...","ts":"...","source":"main = ...\n  0\n"}
+-- We need to extract the source field and unescape \n / \" / \\.
+-- Hand-rolled because Rail's stdlib json doesn't support unescape.
+
+extract_source line =
+  let marker = "\"source\":\""
+  let i = str_find marker line
+  if i < 0 then ""
+  else
+    let after = str_sub line (i + length marker) (length line)
+    -- find the closing quote that is NOT preceded by a backslash
+    take_until_unescaped_quote (chars after) ""
+
+take_until_unescaped_quote cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    if c == "\\" then
+      let cs2 = tail cs
+      if length cs2 == 0 then acc
+      else
+        let esc = head cs2
+        let translated = if esc == "n" then "\n"
+                         else if esc == "t" then "\t"
+                         else if esc == "r" then "\r"
+                         else if esc == "\\" then "\\"
+                         else if esc == "\"" then "\""
+                         else esc
+        take_until_unescaped_quote (tail cs2) (cat [acc, translated])
+    else if c == "\"" then acc
+    else take_until_unescaped_quote (tail cs) (cat [acc, c])
+
+-- ── JSON-escape for re-emission into chat-completion entry ────────────
+json_escape_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let esc = if c == "\\" then "\\\\"
+              else if c == "\"" then "\\\""
+              else if c == "\n" then "\\n"
+              else if c == "\r" then "\\r"
+              else if c == "\t" then "\\t"
+              else c
+    json_escape_acc (tail cs) (cat [acc, esc])
+json_escape s = json_escape_acc (chars s) ""
+
+-- ── SHA-256 of a string (full 64-char hex) ────────────────────────────
+sha256 text =
+  let _ = write_file "/tmp/s0d_xfeed_sha.txt" text
+  trim (shell "shasum -a 256 /tmp/s0d_xfeed_sha.txt | cut -d' ' -f1")
+
+-- ── Check if a hash is already in the dedup file ──────────────────────
+hash_exists hash hashes_path =
+  let r = trim (shell (cat ["grep -c ", q, "^", hash, "$", q, " ", hashes_path, " 2>/dev/null || echo 0"]))
+  parse_int r > 0
+
+-- ── Build the chat-completion entry for self_train ────────────────────
+-- Format matches existing harvest.jsonl entries:
+--   {"messages": [{"role": "system", ...}, {"role": "user", ...}, {"role": "assistant", ...}]}
+build_chat_entry source =
+  let escaped = json_escape source
+  let sys_msg = "You write Rail code. Output only code, no explanation."
+  let usr_msg = "Generate a Rail program."
+  cat ["{\"messages\": [{\"role\": \"system\", \"content\": \"", sys_msg, "\"}, {\"role\": \"user\", \"content\": \"", usr_msg, "\"}, {\"role\": \"assistant\", \"content\": \"", escaped, "\"}]}"]
+
+-- ── Main loop ─────────────────────────────────────────────────────────
+process_lines lines i max_n harvest_path hashes_path dry kept skipped =
+  if length lines == 0 then (kept, skipped)
+  else if kept >= max_n then (kept, skipped)
+  else
+    let line = head lines
+    if length line == 0 then process_lines (tail lines) (i + 1) max_n harvest_path hashes_path dry kept skipped
+    else
+      let source = extract_source line
+      if length source == 0 then process_lines (tail lines) (i + 1) max_n harvest_path hashes_path dry kept skipped
+      else
+        let h = sha256 source
+        if hash_exists h hashes_path then
+          process_lines (tail lines) (i + 1) max_n harvest_path hashes_path dry kept (skipped + 1)
+        else
+          let entry = build_chat_entry source
+          let _ = if dry == 0 then
+            let _ = append_line harvest_path entry
+            let _ = append_line hashes_path h
+            0
+          else 0
+          process_lines (tail lines) (i + 1) max_n harvest_path hashes_path dry (kept + 1) skipped
+
+main =
+  let args_list = args
+  let dry = if length args_list >= 2 then if (head (tail args_list)) == "dry" then 1 else 0 else 0
+  let _ = print "═══ s0_pcfg — cross_feed ═══"
+  let _ = if dry == 1 then print "  MODE: dry-run (no writes)" else print "  MODE: real (will append to harvest.jsonl + harvest_hashes.txt)"
+  let max_n = load_override "s0_xfeed_max" 60
+  let _ = print (cat ["  cap: ", show max_n, " programs per run"])
+  let src_path = "training/s0_pcfg_harvest.jsonl"
+  let dst_path = "training/self_train/harvest.jsonl"
+  let hashes_path = "training/self_train/harvest_hashes.txt"
+  if file_exists src_path == false then
+    let _ = print (cat ["  ERROR: source file missing: ", src_path])
+    0
+  else
+    let _ = if file_exists dst_path then 0 else
+      let _ = print (cat ["  ERROR: destination missing: ", dst_path])
+      0
+    let lines = split "\n" (read_file src_path)
+    let _ = print (cat ["  source: ", show (length lines), " lines from ", src_path])
+    let (kept, skipped) = process_lines lines 0 max_n dst_path hashes_path dry 0 0
+    let _ = print ""
+    let _ = print (cat ["  appended: ", show kept])
+    let _ = print (cat ["  skipped (dup): ", show skipped])
+    let _ = print (cat ["  destination: ", dst_path])
+    let _ = if dry == 0 then
+      let new_total = trim (shell (cat ["wc -l < ", dst_path]))
+      print (cat ["  total entries in destination after: ", new_total])
+    else print "  (dry-run — destination unchanged)"
+    0
