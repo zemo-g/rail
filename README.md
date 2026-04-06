@@ -358,6 +358,7 @@ Tail-recursive loops match C `-O2`: 5 instructions per iteration.
 | **v1.3** | 2026-03-21 | MCP server, 32-layer LoRA, open source |
 | **v1.4** | 2026-03-22 | GC in assembly, nested lambdas, exhaustiveness, 70 tests |
 | **v1.5** | 2026-03-25 | 92 tests, C-matching performance, hyperagent, DNA training, 3 architectures |
+| **v2.0** | 2026-04-06 | Native floats, effect handlers, 4 backends, Empire-transplant operational discipline (intervention ledger, recovery chain, domain plugin spine, runtime overrides), Neural Plasma Engine (3D Metal MHD + neural surrogate), s0_pcfg compiler-as-teacher seed, REINFORCE-LoRA scoping. **121 commits.** See [CHANGELOG.md](CHANGELOG.md). |
 
 ## License
 
