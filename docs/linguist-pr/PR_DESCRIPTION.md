@@ -21,7 +21,7 @@ This PR adds [Rail](https://github.com/zemo-g/rail) as a recognized programming 
 
 Rail is a self-hosting programming language. Its compiler is written in Rail, compiles itself to a ~640KB ARM64 binary, and produces byte-identical output on second-compile (fixed point). Zero C dependencies — the garbage collector and runtime are hand-written ARM64 assembly.
 
-**[HUMAN: add one sentence here about why you built Rail or what it's for. This is where maintainers get a sense of the project vs. just seeing a spec.]**
+**My name is Reilly Gomez, I built RAIL as a project that will help me build however I want and or need with hopefully, no outside dependencies.**
 
 ## Checklist
 
@@ -43,7 +43,7 @@ I'm opening this PR anyway because:
 2. Getting added to Linguist would let the main repo's language bar show "Rail" instead of defaulting to Haskell (via a `.gitattributes` override we have in place now).
 3. I'd rather start the conversation and hear what's needed than sit on it.
 
-**[HUMAN: if you want to make a case for bending the 200-repo rule, this is the place. A sentence about the research / neural plasma stuff, or who's using it, or where it's going. Or leave it alone and let the maintainers decide — that's fine too.]**
+**RAIL is completely open source. I haven't focused on sharing or getting attention to my project as it mostly consumes my time building it. I am unsure of the path I am headed, but if it were to be added I would have another step done.**
 
 Happy to close this PR and revisit in N months if the preferred path is "come back when adoption grows."
 
@@ -77,6 +77,6 @@ The diversity should give the grammar coverage for comments, strings, numbers, k
 - Language design notes: https://github.com/zemo-g/rail/blob/master/README.md
 - EBNF grammar: https://github.com/zemo-g/rail/blob/master/grammar/rail.ebnf
 
-**[HUMAN: if there's anything else you want maintainers to know — thanks, context, a specific maintainer to tag, etc. — put it here.]**
+**Im just looking to have a good start to my learning and this will help greatly. When professionals look at the repo and see it says RAIL, it will make a difference for me. them seeing a toy, vs a language. Thanks!**
 
 Thanks for reviewing.
