@@ -1,6 +1,8 @@
-# The `foreign ... -> str` bug (91/92 → 92/92)
+# The `foreign ... -> str` bug (91/92 → 92/92) ✅ FIXED 2026-04-06
 
-**The failing test:** `ffi_getenv` — has been failing on master since before the current session's work.
+**The failing test:** `ffi_getenv` — was failing on master since before the current session's work. **Now passes.** First 92/92 in the repo's history.
+
+**The fix:** Option A (below) — wrap `str`-returning foreign call return values in `_strdup` so they land in an 8-byte aligned malloc'd buffer. Self-compile: byte-identical fixed point. All stress tests pass. Applied in commit where the README badge flipped to 92/92.
 
 **TL;DR:** Rail's pointer-tagging convention is `LSB=0 → heap pointer, LSB=1 → tagged integer`. This assumes all "heap" values (including strings) are 8-byte or at least 2-byte aligned. But `getenv(3)` returns a pointer into the process's environment strings (`char **environ`), and those pointers can land at **odd byte offsets** inside the environment page. When that pointer has `LSB=1`, Rail's `_rail_print` / `_rail_show` mistakenly dispatch to the integer path, shift the pointer right by 1, and print the mangled "number" instead of the string.
 

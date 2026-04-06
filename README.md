@@ -4,7 +4,7 @@
 
 > GitHub's language bar shows this repo as Haskell because `github-linguist` doesn't know Rail exists yet. A [PR is in flight](https://github.com/github-linguist/linguist/pulls?q=rail) to fix that. In the meantime: this is a Rail codebase.
 
-[![tests: 91/92](https://img.shields.io/badge/tests-91%2F92-brightgreen)](#)
+[![tests: 92/92](https://img.shields.io/badge/tests-92%2F92-brightgreen)](#)
 [![self-hosting](https://img.shields.io/badge/self--hosting-fixed%20point-blue)](#)
 [![bench: 43%](https://img.shields.io/badge/RAILGPT%20bench-43%25-yellow)](#the-flywheel)
 [![Metal GPU](https://img.shields.io/badge/Metal%20GPU-3D%20MHD%20%2B%20MLP-cyan)](#the-neural-plasma-engine)
@@ -38,7 +38,7 @@ The compiler is the oracle. Generate code, compile to verify, harvest successes,
                            v
                     ┌─────────────┐
                     │   Compiler  │◄── the oracle
-                    │ rail_native │    (91/92 tests, fixed point)
+                    │ rail_native │    (92/92 tests, fixed point)
                     └──────┬──────┘
                       ╱         ╲
                 compile_fail    success
@@ -195,7 +195,7 @@ Apple Silicon (ARM64 macOS). Linux ARM64 and x86_64 cross-compilation supported.
 ./rail_native self                    # self-compile → /tmp/rail_self
 cp /tmp/rail_self ./rail_native       # install
 ./rail_native self                    # compile again — must be byte-identical
-./rail_native test                    # 91/92
+./rail_native test                    # 92/92
 ```
 
 ## Usage
@@ -203,7 +203,7 @@ cp /tmp/rail_self ./rail_native       # install
 ```bash
 ./rail_native <file.rail>             # compile to /tmp/rail_out
 ./rail_native run <file.rail>         # compile + execute
-./rail_native test                    # 91/92 test suite
+./rail_native test                    # 92/92 test suite
 ./rail_native self                    # self-compile (fixed point)
 ./rail_native x86 <file.rail>        # cross-compile to x86_64 Linux
 ./rail_native linux <file.rail>       # cross-compile to Linux ARM64
