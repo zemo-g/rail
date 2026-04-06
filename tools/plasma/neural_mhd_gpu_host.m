@@ -356,6 +356,19 @@ int main(int argc, char **argv) {
                         dp_c[i*OUT_DIM+j] += 2.0f * lambda[j] * drift[j] * inv_B;
                     }
                 }
+
+                // Positivity penalty for density (field 0): L_pos = max(0, -ρ_pred)²
+                // Prevents autoregressive blowup from negative density → sqrt(negative)
+                // Recall targets are DELTAS in normalized space; the model's raw field 0
+                // output isn't directly ρ, but a very negative value is still a red flag.
+                float lambda_pos = 5.0f;
+                for (int i = 0; i < BATCH; i++) {
+                    float p0 = pp_c[i*OUT_DIM+0];
+                    if (p0 < -0.5f) { // threshold in normalized space
+                        // ∂/∂p0 of (p0+0.5)² = 2·(p0+0.5) when p0 < -0.5
+                        dp_c[i*OUT_DIM+0] += 2.0f * lambda_pos * (p0 + 0.5f);
+                    }
+                }
                 if (step % 2000 == 0) {
                     printf("  drift: ρ=%+.4f mx=%+.4f my=%+.4f Bx=%+.4f By=%+.4f E=%+.4f\n",
                         drift[0], drift[1], drift[2], drift[3], drift[4], drift[5]);
