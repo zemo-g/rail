@@ -6,10 +6,9 @@
 
 [![tests: 92/92](https://img.shields.io/badge/tests-92%2F92-brightgreen)](#)
 [![self-hosting](https://img.shields.io/badge/self--hosting-fixed%20point-blue)](#)
-[![bench: 43%](https://img.shields.io/badge/RAILGPT%20bench-43%25-yellow)](#the-flywheel)
-[![Metal GPU](https://img.shields.io/badge/Metal%20GPU-3D%20MHD%20%2B%20MLP-cyan)](#the-neural-plasma-engine)
-[![ARM64 + x86_64](https://img.shields.io/badge/targets-ARM64%20%7C%20x86__64-orange)](#backends)
-[![GC: ARM64 asm](https://img.shields.io/badge/GC-ARM64%20assembly-purple)](#runtime)
+[![bench: 14/30](https://img.shields.io/badge/RAILGPT%20bench-14%2F30-yellow)](#releases)
+[![backends: 4](https://img.shields.io/badge/backends-4-orange)](#releases)
+[![GC: ARM64 asm](https://img.shields.io/badge/GC-ARM64%20assembly-purple)](#how-it-works)
 [![dependencies: 0](https://img.shields.io/badge/C%20dependencies-0-brightgreen)](#)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-green)](LICENSE)
 
@@ -24,160 +23,6 @@ Rail compiles itself. Then it teaches machines to write Rail. Then it runs real-
 -- The output is byte-identical. Fixed point.
 -- Zero C dependencies. GC in assembly. Everything is Rail.
 ```
-
-## The Flywheel
-
-The compiler is the oracle. Generate code, compile to verify, harvest successes, retrain.
-
-```
-                    ┌─────────────┐
-                    │  LLM Model  │
-                    │  (Qwen 4B)  │
-                    └──────┬──────┘
-                           │ generate Rail code
-                           v
-                    ┌─────────────┐
-                    │   Compiler  │◄── the oracle
-                    │ rail_native │    (92/92 tests, fixed point)
-                    └──────┬──────┘
-                      ╱         ╲
-                compile_fail    success
-                  (discard)       │
-                                  v
-                          ┌──────────────┐
-                          │   Harvester  │
-                          │ 199 DNA + 10K│
-                          └──────┬───────┘
-                                 │ verified examples
-                                 v
-                          ┌──────────────┐
-                          │    Trainer   │
-                          │  LoRA QLoRA  │
-                          └──────┬───────┘
-                                 │ better model
-                                 └──────► back to top
-```
-
-The model doesn't just learn to write valid code — it learns to write code verified by the compiler it's being trained to write for.
-
-### Bench
-
-30 fixed tasks across 6 bands. Scores comparable across models and time.
-
-```
-Band                  Base Qwen 4B     + Rail Adapter
-─────────────────────────────────────────────────────
-Fundamentals (1-4)       0/5              3/5
-Practical I/O (5-6)      0/5              2/5
-Real Tools (7-8)         0/5              1/5
-Compiler (9-10)          0/5              3/5
-Advanced (11+)           1/5              1/5
-Comprehension            0/5              3/5
-─────────────────────────────────────────────────────
-TOTAL                    1/30 (3%)       13/30 (43%)
-```
-
-### DNA
-
-Training data harvested from Rail's own codebase. Zero LLM involvement.
-
-- **67 compiler tests** extracted from `compile.rail` — code + expected output
-- **15 stdlib patterns** — real list/string/math idioms from `stdlib/`
-- **117 compositions** — known-good patterns recombined and verified
-
-Every example compiles. Every output is checked. Pure from birth.
-
-### Hyperagent
-
-Bench-gated evolution replaces blind grinding:
-
-1. **Bench** — run 30 tasks, score per band
-2. **Analyze** — find weak bands
-3. **Generate** — targeted training data for weaknesses
-4. **Train** — LoRA from best known adapter
-5. **Re-bench** — score the new adapter
-6. **Decide** — keep only if bench improves, rollback otherwise
-
-```bash
-python3 tools/train/hyperagent.py --cycles 5    # full loop
-python3 tools/train/hyperagent.py --bench-only   # just score
-python3 tools/train/harvest_dna.py               # regenerate DNA
-```
-
-## The Neural Plasma Engine
-
-Rail isn't just a compiler. It runs real-time GPU physics, trains neural networks from scratch, and can render the trained model AS the physics engine.
-
-```
-   MHD Simulator   →   Training Data   →   Neural Surrogate   →   Real-Time Renderer
-   (3D Metal GPU)      (200K examples)     (MLP backprop)         (neural = physics)
-        │                    │                    │                       │
-        ▼                    ▼                    ▼                       ▼
-   tools/plasma/       tools/plasma/       tools/plasma/         tools/plasma/
-   plasma_3d.metal     gen_mhd_data.rail   neural_mhd_gpu.metal  neural_renderer.m
-```
-
-### What's built
-
-**3D Metal MHD simulator** — `./rail_native run tools/plasma/plasma_3d.rail`
-128³ grid, 8 conserved variables (density, momentum, B-field, energy), Lax-Friedrichs scheme on Metal compute kernels. Volume raymarcher renders three channels:
-
-```
-  blue   →  density (ρ)
-  amber  →  magnetic pressure (|B|²)
-  pink   →  current sheets (|∇×B|²)
-```
-
-Real-time orbit camera, auto-rotate, 30fps. One Cocoa Metal binary launched from a Rail script.
-
-**Neural MHD surrogate (pure Rail)** — `./rail_native run tools/plasma/neural_mhd.rail`
-A linear model (5-cell stencil × 6 fields → 6 outputs) trained on 32×32 MHD data using analytical backprop in pure Rail. Loss converges from 4.45 → 0.03 over 500 steps. Single-step mass conservation error: **0.027%**.
-
-**Metal GPU MLP training** — `./rail_native run tools/plasma/neural_mhd_gpu.rail`
-Same idea, scaled up. 30 → 128 → 6 MLP, 204K training examples from 64×64 MHD, full forward + backward pass on GPU using 10 custom Metal kernels:
-
-```
-matmul_kernel        — tiled GEMM
-matmul_at_b_kernel   — A^T @ B for weight gradients
-matmul_a_bt_kernel   — A @ B^T for input gradients
-bias_add_kernel      — broadcast bias
-relu_kernel          — forward activation
-relu_backward_kernel — gradient through ReLU
-mse_grad_kernel      — output gradient
-sgd_kernel           — parameter update
-sum_rows_kernel      — bias gradient
-mse_loss_kernel      — per-sample loss
-```
-
-Trains 5000-step MLP in ~30 seconds. ~85× faster than the pure Rail CPU version.
-
-**Neural renderer** — `./rail_native run tools/plasma/neural_renderer.rail`
-Loads the trained weights. Each frame, runs the MLP forward pass on every cell of a 64×64 grid using normalization + residual prediction + 0.7 damping. The neural network IS the physics engine — no PDE solver at runtime. Renders density as a heatmap in a Metal window.
-
-### The conservation gap (research direction)
-
-|  | Mass error/step | Energy error/step |
-|---|---|---|
-| Lax-Friedrichs (truth) | 0 | 4×10⁻¹⁶ (machine precision) |
-| Linear neural surrogate | 0.027% | 5×10⁻⁵ |
-| MLP neural surrogate | 0.5% | 1% |
-
-LxF preserves conservation laws by construction. Neural surrogates don't — they're trained to minimize MSE on the next state, with no explicit constraint that mass and energy be preserved. Closing this gap is the research question worth chasing.
-
-### Compiler upgrade — d8 callee-saved float register
-
-To make this work, the Rail compiler needed a fix. Functions with float operations in their body now get the fast self-loop optimization (previously blocked by the `body_has_float` guard). The d8 ARM64 callee-saved float register is now saved/restored in the prologue/epilogue of float-containing functions.
-
-```bash
-./rail_native run tools/plasma/d8_test.rail   # 5/5 PASS
-./rail_native run tools/plasma/float_bug_test.rail   # 7/7 PASS
-```
-
-Self-compile produces a byte-identical fixed point. Test suite preserved. The fix is permanent.
-
-### Full session writeup
-
-`docs/neural-plasma-engine.md` — honest report of what was built, what works (verified), what's open, and reproducing the results.
 
 ## Install
 
@@ -306,15 +151,6 @@ Tail-recursive loops match C `-O2`: 5 instructions per iteration.
 --   type guard elimination, fused compare-and-branch
 ```
 
-## Backends
-
-| Backend | Status | Target |
-|---------|--------|--------|
-| **ARM64 native** | Stable, 92 tests | macOS, Linux (Pi Zero) |
-| **x86_64** | Working | Linux via WSL |
-| **Metal GPU** | Working | Apple Silicon compute shaders |
-| **WASM** | Compiles, runtime WIP | Browser/edge |
-
 ## Builtins
 
 | Category | Functions |
@@ -329,25 +165,6 @@ Tail-recursive loops match C `-O2`: 5 instructions per iteration.
 | **Errors** | `error`, `is_error`, `err_msg` |
 | **FFI** | `foreign` declarations, `llm` builtin |
 | **System** | `args`, `import`, pipe operator `|>` |
-
-## Stdlib
-
-25 modules in `stdlib/`:
-
-`json` `http` `sqlite` `regex` `base64` `socket` `crypto` `csv` `datetime` `env` `fs` `hash` `math` `net` `os` `path` `process` `random` `sort` `string` `test` `toml` `list` `strbuf` `fmt`
-
-## Numbers
-
-| | Before | After |
-|---|--------|-------|
-| **Compiler** | 21,086 lines (Rust) | 3,865 lines (Rail) |
-| **Binary** | ~8MB (Rust + Cranelift) | 631K (pure ARM64) |
-| **Dependencies** | Cargo, Cranelift, Rayon | `as` + `ld` |
-| **Build time** | ~30s (cargo build) | ~5s (self-compile) |
-| **Tests** | 141 (Rust) | 92 (self-testing) |
-| **GC** | 295 lines of C | ARM64 assembly (zero C) |
-| **Targets** | 1 (x86_64) | 3 (ARM64, x86_64, WASM) |
-| **Self-training** | N/A | 10K+ verified examples, 43% bench |
 
 ## Releases
 
@@ -386,9 +203,9 @@ Rail now drives three independent training systems, each using the compiler as t
 
 3. **PCFG-REINFORCE lineage** — `tools/domains/s0_pcfg/` is a 23-rule probabilistic context-free grammar trained by REINFORCE on compile-pass reward. The whole "model" is 23 integer weights, ~120 bytes. Reaches **92% lifetime strict pass rate** in 30 ticks. Generates 5 distinct program shapes (inline, named-binding, statement chain, function definition, ADT + match) — and discovered Rail's runtime tolerances by trial and error before the implementer knew them. **The compiler is the teacher in 720 lines of pure Rail.**
 
-#### Empire → Rail transplant (4 sessions, all pure Rail, zero Python)
+#### Operational discipline (pure Rail, zero Python)
 
-Operational discipline patterns from the paused Empire trading system, ported as Rail-native infrastructure:
+Patterns from the paused Empire trading system, ported as Rail-native infrastructure:
 
 - **Intervention ledger** (`flywheel/interventions.jsonl`) — append-only audit log. Every round_end, level transition, override write, MLX skip, and goal grind is one JSON record. Read with `flywheel/interventions_tail.rail`.
 - **Recovery chain** (`flywheel/flush.rail`) — pure Rail rotator. Per protected file: cp src→tmp, mv backup→prev, mv tmp→backup. Three guards (source-empty, size-shrunk, line-collapse). Protects 5 files per round.
@@ -397,17 +214,14 @@ Operational discipline patterns from the paused Empire trading system, ported as
 
 #### Loop closure
 
-The flywheel now runs continuously without human intervention. `tools/train/run_training.sh` per-round sequence:
+The flywheel runs continuously without human intervention. Each round:
 
 ```
-1. self_train_bin    LLM round → harvest
-2. flush_bin         rotate backups
-3. s0d_tick_bin      PCFG REINFORCE round → state file
-4. s0d_xfeed_bin     translate PCFG-verified programs into LLM harvest
-5. sleep + repeat
+LLM training round  →  rotate backups  →  PCFG REINFORCE round  →
+  cross-feed PCFG-verified programs into LLM harvest  →  repeat
 ```
 
-`cross_feed.rail` translates s0_pcfg's verified programs into the chat-completion format the LLM flywheel expects, with SHA-256 dedup. **Two oracles, one corpus.**
+PCFG-verified programs get translated into the chat-completion format the LLM flywheel expects, with SHA-256 dedup against the LLM's existing harvest. **Two oracles, one corpus.**
 
 #### Forward regression bisector
 
@@ -430,10 +244,6 @@ The flywheel now runs continuously without human intervention. `tools/train/run_
 | Domain plugins | 0 | **2** (neural_plasma, s0_pcfg) |
 | Operational discipline | manual | **full** (ledger + recovery + spine + overrides + bisector) |
 | Compiler-verified training corpus | small | 3.67 MB curated, deduped, quality-weighted |
-
-#### What's next
-
-The big swing for the next session lives at **`docs/reinforce-lora-plan.md`** — a 364-line scoping doc for a half-day Razer-side spike that replaces the cross-entropy LoRA training loop with REINFORCE on compile-pass reward. The same training signal that drove s0_pcfg from 46% → 92% strict pass rate, applied to the 4B LLM that currently sits at 14/30. Six phases with abort criteria, five risks with mitigations, honest 50% confidence on the make-or-break phase. If it works, the bench moves measurably; if it doesn't, the negative result tells us something about LLM-scale RL on binary compile rewards.
 
 Full release notes: **[CHANGELOG.md](CHANGELOG.md)**
 
