@@ -1,0 +1,379 @@
+-- gen_mhd_data.rail — Generate large MHD training dataset
+-- 64×64 Orszag-Tang vortex, 50 LxF steps → 204,800 training examples
+-- Output: /tmp/mhd_train.txt (space-separated, 36 values per line)
+--   30 input values (5-cell stencil × 6 fields) + 6 target values
+--
+-- Usage: ./rail_native run tools/plasma/gen_mhd_data.rail
+--
+-- WORKAROUNDS for Rail compiler limitations:
+-- 1. No top-level float globals — inline all float literals
+-- 2. No float args in self-recursive TCO loops — use float_arr
+-- 3. 1D loops only for reliable TCO
+-- 4. arena_mark/arena_reset in long-running loops
+-- 5. Chunked file writes via shell append (not giant string concat)
+-- 6. Float division in TCO loops → multiply by reciprocal
+
+cat parts = join "" parts
+
+-- ═══════════════════════════════════════════════════════════
+-- CONSTANTS (all integer, safe at top level)
+-- ═══════════════════════════════════════════════════════════
+
+nn = 64
+nn2 = 4096
+nfields = 6
+state_size = 24576
+n_steps = 50
+out_file = "/tmp/mhd_train.txt"
+
+-- ═══════════════════════════════════════════════════════════
+-- GRID ACCESS
+-- dx = 2*pi/64 = 0.09817477042468103
+-- 2*dx = 0.19634954084936207
+-- gamma = 5/3, gamma-1 = 2/3
+-- ═══════════════════════════════════════════════════════════
+
+wrap i = if i < 0 then i + nn else if i >= nn then i - nn else i
+idx f x y = f * nn2 + wrap y * nn + wrap x
+get s f x y = float_arr_get s (idx f x y)
+put s f x y v = float_arr_set s (idx f x y) v
+
+-- ═══════════════════════════════════════════════════════════
+-- INITIAL CONDITIONS: ORSZAG-TANG VORTEX (64×64)
+-- ═══════════════════════════════════════════════════════════
+
+init_cell s i =
+  let x = i % nn
+  let y = i / nn
+  let xp = to_float x * 0.09817477042468103
+  let yp = to_float y * 0.09817477042468103
+  let rho = 2.77777777777778
+  let vx = 0.0 - sin yp
+  let vy = sin xp
+  let bx = 0.0 - sin yp
+  let by = sin (2.0 * xp)
+  let ke = 0.5 * rho * (vx * vx + vy * vy)
+  let me = 0.5 * (bx * bx + by * by)
+  let e = 1.6666666666666667 / 0.6666666666666667 + ke + me
+  let _ = put s 0 x y rho
+  let _ = put s 1 x y (rho * vx)
+  let _ = put s 2 x y (rho * vy)
+  let _ = put s 3 x y bx
+  let _ = put s 4 x y by
+  put s 5 x y e
+
+init_loop s i =
+  if i >= nn2 then 0
+  else let _ = init_cell s i
+       init_loop s (i + 1)
+
+init_state =
+  let s = float_arr_new state_size 0.0
+  let _ = init_loop s 0
+  s
+
+-- ═══════════════════════════════════════════════════════════
+-- PRESSURE + FLUXES
+-- ═══════════════════════════════════════════════════════════
+
+pressure s x y =
+  let rho = get s 0 x y
+  let mx = get s 1 x y
+  let my = get s 2 x y
+  let bx = get s 3 x y
+  let by = get s 4 x y
+  let e = get s 5 x y
+  let v2 = (mx * mx + my * my) / (rho * rho)
+  let b2 = bx * bx + by * by
+  let p = 0.6666666666666667 * (e - 0.5 * rho * v2 - 0.5 * b2)
+  if p < 0.0000000001 then 0.0000000001 else p
+
+x_flux s x y fa =
+  let rho = get s 0 x y
+  let mx = get s 1 x y
+  let my = get s 2 x y
+  let bx = get s 3 x y
+  let by = get s 4 x y
+  let e = get s 5 x y
+  let vx = mx / rho
+  let vy = my / rho
+  let b2 = bx * bx + by * by
+  let p = pressure s x y
+  let pt = p + 0.5 * b2
+  let vdb = vx * bx + vy * by
+  let _ = float_arr_set fa 0 mx
+  let _ = float_arr_set fa 1 (mx * vx + pt - bx * bx)
+  let _ = float_arr_set fa 2 (mx * vy - bx * by)
+  let _ = float_arr_set fa 3 0.0
+  let _ = float_arr_set fa 4 (vx * by - vy * bx)
+  float_arr_set fa 5 ((e + pt) * vx - bx * vdb)
+
+y_flux s x y fa =
+  let rho = get s 0 x y
+  let mx = get s 1 x y
+  let my = get s 2 x y
+  let bx = get s 3 x y
+  let by = get s 4 x y
+  let e = get s 5 x y
+  let vx = mx / rho
+  let vy = my / rho
+  let b2 = bx * bx + by * by
+  let p = pressure s x y
+  let pt = p + 0.5 * b2
+  let vdb = vx * bx + vy * by
+  let _ = float_arr_set fa 0 my
+  let _ = float_arr_set fa 1 (my * vx - bx * by)
+  let _ = float_arr_set fa 2 (my * vy + pt - by * by)
+  let _ = float_arr_set fa 3 (vy * bx - vx * by)
+  let _ = float_arr_set fa 4 0.0
+  float_arr_set fa 5 ((e + pt) * vy - by * vdb)
+
+-- ═══════════════════════════════════════════════════════════
+-- MAX WAVE SPEED + TIMESTEP
+-- ═══════════════════════════════════════════════════════════
+
+speed_cell s x y =
+  let rho = get s 0 x y
+  let mx = get s 1 x y
+  let my = get s 2 x y
+  let bx = get s 3 x y
+  let by = get s 4 x y
+  let p = pressure s x y
+  let b2 = bx * bx + by * by
+  let cf = sqrt (1.6666666666666667 * p / rho + b2 / rho)
+  sqrt ((mx * mx + my * my) / (rho * rho)) + cf
+
+max_speed_loop s i acc =
+  if i >= nn2 then 0
+  else
+    let sp = speed_cell s (i % nn) (i / nn)
+    let cur = float_arr_get acc 0
+    let _ = if sp > cur then float_arr_set acc 0 sp else 0
+    max_speed_loop s (i + 1) acc
+
+max_speed s =
+  let acc = float_arr_new 1 0.0
+  let _ = max_speed_loop s 0 acc
+  float_arr_get acc 0
+
+-- CFL = 0.2 * dx = 0.2 * 0.09817477042468103 = 0.01963495408493621
+compute_dt s =
+  let smax = max_speed s
+  0.01963495408493621 / smax
+
+-- ═══════════════════════════════════════════════════════════
+-- LAX-FRIEDRICHS STEP
+-- ═══════════════════════════════════════════════════════════
+
+lxf_fields s ns coeffs fxr fxl fyu fyd x y f =
+  if f >= 6 then 0
+  else
+    let avg = (get s f (x-1) y + get s f (x+1) y + get s f x (y-1) + get s f x (y+1)) / 4.0
+    let dfx = float_arr_get fxr f - float_arr_get fxl f
+    let dfy = float_arr_get fyu f - float_arr_get fyd f
+    let cx = float_arr_get coeffs 0
+    let cy = float_arr_get coeffs 1
+    let _ = float_arr_set ns (idx f x y) (avg - cx * dfx - cy * dfy)
+    lxf_fields s ns coeffs fxr fxl fyu fyd x y (f + 1)
+
+lxf_cell s ns coeffs fxr fxl fyu fyd i =
+  let x = i % nn
+  let y = i / nn
+  let _ = x_flux s (x+1) y fxr
+  let _ = x_flux s (x-1) y fxl
+  let _ = y_flux s x (y+1) fyu
+  let _ = y_flux s x (y-1) fyd
+  lxf_fields s ns coeffs fxr fxl fyu fyd x y 0
+
+lxf_loop s ns coeffs fxr fxl fyu fyd i =
+  if i >= nn2 then 0
+  else
+    let _ = lxf_cell s ns coeffs fxr fxl fyu fyd i
+    lxf_loop s ns coeffs fxr fxl fyu fyd (i + 1)
+
+lxf_step s dt =
+  let coeffs = float_arr_new 2 0.0
+  let _ = float_arr_set coeffs 0 (dt / 0.19634954084936207)
+  let _ = float_arr_set coeffs 1 (dt / 0.19634954084936207)
+  let ns = float_arr_new state_size 0.0
+  let fxr = float_arr_new 6 0.0
+  let fxl = float_arr_new 6 0.0
+  let fyu = float_arr_new 6 0.0
+  let fyd = float_arr_new 6 0.0
+  let _ = lxf_loop s ns coeffs fxr fxl fyu fyd 0
+  ns
+
+-- ═══════════════════════════════════════════════════════════
+-- STENCIL EXTRACTION
+-- 5-cell stencil: center + 4 neighbors × 6 fields = 30 values
+-- Layout: [center(6), left(6), right(6), down(6), up(6)]
+-- ═══════════════════════════════════════════════════════════
+
+extract_stencil s x y buf f =
+  if f >= 6 then 0
+  else
+    let _ = float_arr_set buf f        (get s f x y)
+    let _ = float_arr_set buf (f + 6)  (get s f (x-1) y)
+    let _ = float_arr_set buf (f + 12) (get s f (x+1) y)
+    let _ = float_arr_set buf (f + 18) (get s f x (y-1))
+    let _ = float_arr_set buf (f + 24) (get s f x (y+1))
+    extract_stencil s x y buf (f + 1)
+
+-- ═══════════════════════════════════════════════════════════
+-- FORMAT ONE LINE: 30 inputs + 6 targets = 36 space-separated floats
+-- Build string in chunks to avoid giant concatenation
+-- ═══════════════════════════════════════════════════════════
+
+-- Format float_arr values from index start to start+count-1 as space-separated string
+fmt_vals arr start count acc i =
+  if i >= count then acc
+  else
+    let v = float_arr_get arr (start + i)
+    let s = show_float v
+    let next = if i == 0 then cat [acc, s] else cat [acc, " ", s]
+    fmt_vals arr start count next (i + 1)
+
+-- Format one training example line: 30 stencil inputs + 6 target outputs
+fmt_line buf tgt =
+  let inp = fmt_vals buf 0 30 "" 0
+  let out = fmt_vals tgt 0 6 "" 0
+  cat [inp, " ", out]
+
+-- ═══════════════════════════════════════════════════════════
+-- DATA COLLECTION: Write lines in chunks via shell append
+-- Each step: extract all 4096 cells, write to file
+-- Uses arena_mark/arena_reset to prevent arena exhaustion
+-- ═══════════════════════════════════════════════════════════
+
+-- Collect lines for a batch of cells into an arr of strings
+-- Then join and write all at once (reduces shell calls)
+collect_batch s ns buf tgt lines x0 count i =
+  if i >= count then 0
+  else
+    let ci = x0 + i
+    let x = ci % nn
+    let y = ci / nn
+    let _ = extract_stencil s x y buf 0
+    -- Extract target: center cell from next state
+    let _ = float_arr_set tgt 0 (get ns 0 x y)
+    let _ = float_arr_set tgt 1 (get ns 1 x y)
+    let _ = float_arr_set tgt 2 (get ns 2 x y)
+    let _ = float_arr_set tgt 3 (get ns 3 x y)
+    let _ = float_arr_set tgt 4 (get ns 4 x y)
+    let _ = float_arr_set tgt 5 (get ns 5 x y)
+    let line = fmt_line buf tgt
+    let _ = arr_set lines i line
+    collect_batch s ns buf tgt lines x0 count (i + 1)
+
+-- Join arr of strings with newlines
+join_lines lines count acc i =
+  if i >= count then acc
+  else
+    let line = arr_get lines i
+    let next = if i == 0 then line else cat [acc, "\n", line]
+    join_lines lines count next (i + 1)
+
+-- Write a batch of lines to file via temp file + cat append
+-- Chunk size: 256 cells per write (balances string size vs shell calls)
+chunk_size = 256
+n_chunks = 16
+tmp_chunk = "/tmp/mhd_chunk.txt"
+
+write_step s ns buf tgt lines chunk =
+  if chunk >= n_chunks then 0
+  else
+    let mark = arena_mark 0
+    let x0 = chunk * chunk_size
+    let _ = collect_batch s ns buf tgt lines x0 chunk_size 0
+    let block = join_lines lines chunk_size "" 0
+    let _ = write_file tmp_chunk (cat [block, "\n"])
+    let _ = shell (cat ["cat ", tmp_chunk, " >> ", out_file])
+    let _ = arena_reset mark
+    write_step s ns buf tgt lines (chunk + 1)
+
+-- ═══════════════════════════════════════════════════════════
+-- CONSERVATION DIAGNOSTICS (quick sanity check)
+-- ═══════════════════════════════════════════════════════════
+
+sum_field s f acc i =
+  if i >= nn2 then 0
+  else
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + float_arr_get s (f * nn2 + i))
+    sum_field s f acc (i + 1)
+
+total_mass s =
+  let acc = float_arr_new 1 0.0
+  let _ = sum_field s 0 acc 0
+  float_arr_get acc 0
+
+total_energy s =
+  let acc = float_arr_new 1 0.0
+  let _ = sum_field s 5 acc 0
+  float_arr_get acc 0
+
+-- ═══════════════════════════════════════════════════════════
+-- MAIN SIMULATION LOOP
+-- ═══════════════════════════════════════════════════════════
+
+sim_loop s buf tgt lines step =
+  if step >= n_steps then s
+  else
+    let dt = compute_dt s
+    let ns = lxf_step s dt
+    let _ = write_step s ns buf tgt lines 0
+    let _ = print (cat ["  step ", show step, "/", show n_steps, "  dt=", show_float dt])
+    sim_loop ns buf tgt lines (step + 1)
+
+-- ═══════════════════════════════════════════════════════════
+-- MAIN
+-- ═══════════════════════════════════════════════════════════
+
+main =
+  let _ = print ""
+  let _ = print "  MHD TRAINING DATA GENERATOR"
+  let _ = print "  64x64 Orszag-Tang, 50 LxF steps"
+  let _ = print "  5-cell stencil x 6 fields = 30 inputs -> 6 targets"
+  let _ = print "  204,800 total examples"
+  let _ = print ""
+
+  -- Clear output file
+  let _ = shell (cat ["rm -f ", out_file])
+  let _ = shell (cat ["touch ", out_file])
+
+  -- Initialize state
+  let _ = print "Initializing 64x64 grid..."
+  let s = init_state
+  let m0 = total_mass s
+  let e0 = total_energy s
+  let _ = print (cat ["  Initial mass=", show_float m0, "  energy=", show_float e0])
+  let _ = print ""
+
+  -- Allocate reusable buffers
+  let buf = float_arr_new 30 0.0
+  let tgt = float_arr_new 6 0.0
+  let lines = arr_new chunk_size ""
+
+  -- Run simulation + data collection
+  let _ = print "Running simulation and collecting data..."
+  let final_s = sim_loop s buf tgt lines 0
+
+  -- Final diagnostics
+  let mf = total_mass final_s
+  let ef = total_energy final_s
+  let _ = print ""
+  let _ = print (cat ["  Final mass=", show_float mf, "  energy=", show_float ef])
+  let dm = (mf - m0) / m0
+  let de = (ef - e0) / e0
+  let _ = print (cat ["  Mass conservation: ", show_float dm])
+  let _ = print (cat ["  Energy conservation: ", show_float de])
+
+  -- Count lines
+  let wc = shell (cat ["wc -l < ", out_file])
+  let _ = print ""
+  let _ = print (cat ["  Output: ", out_file])
+  let _ = print (cat ["  Lines: ", wc])
+  let _ = print (cat ["  Format: 36 space-separated float64 per line"])
+  let _ = print (cat ["          (30 stencil inputs + 6 target outputs)"])
+  let _ = print ""
+  let _ = print "Done."
+  0

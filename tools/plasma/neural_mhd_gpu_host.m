@@ -125,8 +125,9 @@ static void generate_data(float *X, float *Y) {
             int x=i%NN, y=i/NN;
             int ex = step*NN2 + i;
             extract_stencil(s, x, y, X + ex*IN_DIM);
+            // RESIDUAL: target = next_state - current_state (learn the delta)
             for (int f = 0; f < 6; f++)
-                Y[ex*OUT_DIM + f] = (float)ns[f*NN2 + i];
+                Y[ex*OUT_DIM + f] = (float)(ns[f*NN2 + i] - s[f*NN2 + i]);
         }
         if (step % 10 == 0) printf("  data step %d/%d\n", step, N_STEPS);
         double *tmp = s; s = ns; ns = tmp;
@@ -143,7 +144,7 @@ static void generate_data(float *X, float *Y) {
 #define TILE 16
 #define LR 0.001f
 #define MIN(a,b) ((a)<(b)?(a):(b))
-#define N_TRAIN 5000
+#define N_TRAIN 10000
 
 int main(int argc, char **argv) {
     @autoreleasepool {
@@ -157,7 +158,32 @@ int main(int argc, char **argv) {
         float *X_all = calloc(N_EXAMPLES * IN_DIM, sizeof(float));
         float *Y_all = calloc(N_EXAMPLES * OUT_DIM, sizeof(float));
         generate_data(X_all, Y_all);
-        printf("  %d examples generated\n\n", N_EXAMPLES);
+        printf("  %d examples generated\n", N_EXAMPLES);
+
+        // Normalize data: compute mean/std for inputs and outputs
+        float x_mean[IN_DIM], x_std[IN_DIM], y_mean[OUT_DIM], y_std[OUT_DIM];
+        memset(x_mean, 0, sizeof(x_mean)); memset(y_mean, 0, sizeof(y_mean));
+        for (int i = 0; i < N_EXAMPLES; i++) {
+            for (int j = 0; j < IN_DIM; j++) x_mean[j] += X_all[i*IN_DIM+j];
+            for (int j = 0; j < OUT_DIM; j++) y_mean[j] += Y_all[i*OUT_DIM+j];
+        }
+        for (int j = 0; j < IN_DIM; j++) x_mean[j] /= N_EXAMPLES;
+        for (int j = 0; j < OUT_DIM; j++) y_mean[j] /= N_EXAMPLES;
+
+        memset(x_std, 0, sizeof(x_std)); memset(y_std, 0, sizeof(y_std));
+        for (int i = 0; i < N_EXAMPLES; i++) {
+            for (int j = 0; j < IN_DIM; j++) { float d=X_all[i*IN_DIM+j]-x_mean[j]; x_std[j]+=d*d; }
+            for (int j = 0; j < OUT_DIM; j++) { float d=Y_all[i*OUT_DIM+j]-y_mean[j]; y_std[j]+=d*d; }
+        }
+        for (int j = 0; j < IN_DIM; j++) x_std[j] = sqrtf(x_std[j]/N_EXAMPLES) + 1e-8f;
+        for (int j = 0; j < OUT_DIM; j++) y_std[j] = sqrtf(y_std[j]/N_EXAMPLES) + 1e-8f;
+
+        // Apply normalization
+        for (int i = 0; i < N_EXAMPLES; i++) {
+            for (int j = 0; j < IN_DIM; j++) X_all[i*IN_DIM+j] = (X_all[i*IN_DIM+j]-x_mean[j])/x_std[j];
+            for (int j = 0; j < OUT_DIM; j++) Y_all[i*OUT_DIM+j] = (Y_all[i*OUT_DIM+j]-y_mean[j])/y_std[j];
+        }
+        printf("  Data normalized (zero mean, unit variance)\n\n");
 
         // Metal setup
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -425,28 +451,124 @@ int main(int argc, char **argv) {
         for (int i = 0; i < NN2; i++) {
             int x=i%NN, y=i/NN;
             extract_stencil(eval_s, x, y, stencil);
-            // Single-example forward pass on CPU (for conservation eval)
+            // Normalize input
+            for (int j=0; j<IN_DIM; j++) stencil[j] = (stencil[j]-x_mean[j])/x_std[j];
             float *w1c = W1.contents, *b1c = b1.contents;
             float *w2c = W2.contents, *b2c = b2.contents;
             float h[HIDDEN], out[OUT_DIM];
             for (int j=0; j<HIDDEN; j++) {
                 float s = b1c[j];
                 for (int k=0; k<IN_DIM; k++) s += stencil[k] * w1c[k*HIDDEN+j];
-                h[j] = fmaxf(0, s); // relu
+                h[j] = fmaxf(0, s);
             }
             for (int j=0; j<OUT_DIM; j++) {
                 float s = b2c[j];
                 for (int k=0; k<HIDDEN; k++) s += h[k] * w2c[k*OUT_DIM+j];
                 out[j] = s;
             }
-            m_nn += out[0];  // density
-            e_nn += out[5];  // energy
+            // Denormalize and add residual
+            m_nn += eval_s[0*NN2+i] + (double)(out[0]*y_std[0]+y_mean[0]);
+            e_nn += eval_s[5*NN2+i] + (double)(out[5]*y_std[5]+y_mean[5]);
         }
         printf("  Neural:    mass=%.6f  energy=%.6f\n", m_nn, e_nn);
         printf("  Mass err:  LxF=%.2e  Neural=%.2e\n", (m_lxf-m0)/m0, (m_nn-m0)/m0);
         printf("  Energy err:LxF=%.2e  Neural=%.2e\n", (e_lxf-e0)/e0, (e_nn-e0)/e0);
 
+        // ── NEURAL SIMULATION: run trained model as physics engine ──
+        printf("\nNeural simulation (200 steps)...\n");
+        system("mkdir -p /tmp/neural_mhd_frames");
+
+        // Start from initial conditions
+        double *sim_s = calloc(STATE_SIZE, sizeof(double));
+        double *sim_ns = calloc(STATE_SIZE, sizeof(double));
+        init_state(sim_s);
+
+        // Also run LxF in parallel for comparison
+        double *lxf_s = calloc(STATE_SIZE, sizeof(double));
+        double *lxf_ns2 = calloc(STATE_SIZE, sizeof(double));
+        init_state(lxf_s);
+
+        float *w1c = W1.contents, *b1c = b1.contents;
+        float *w2c = W2.contents, *b2c = b2.contents;
+
+        for (int t = 0; t < 200; t++) {
+            // Neural step: predict next state for each cell
+            for (int i = 0; i < NN2; i++) {
+                int x=i%NN, y=i/NN;
+                float st[IN_DIM];
+                extract_stencil(sim_s, x, y, st);
+                // Normalize input
+                for (int j=0; j<IN_DIM; j++) st[j] = (st[j]-x_mean[j])/x_std[j];
+                float h[HIDDEN], out[OUT_DIM];
+                for (int j=0; j<HIDDEN; j++) {
+                    float v = b1c[j];
+                    for (int k=0; k<IN_DIM; k++) v += st[k] * w1c[k*HIDDEN+j];
+                    h[j] = fmaxf(0, v);
+                }
+                for (int j=0; j<OUT_DIM; j++) {
+                    float v = b2c[j];
+                    for (int k=0; k<HIDDEN; k++) v += h[k] * w2c[k*OUT_DIM+j];
+                    // Denormalize output and add to current state (residual)
+                    double delta = (double)(v * y_std[j] + y_mean[j]);
+                    sim_ns[j*NN2+i] = sim_s[j*NN2+i] + delta;
+                }
+            }
+
+            // LxF step for comparison
+            double lxf_dt = 0.2 * DX / max_speed(lxf_s);
+            lxf_step(lxf_s, lxf_ns2, lxf_dt);
+
+            // Dump density frames every 10 steps
+            if (t % 10 == 0) {
+                char path_nn[256], path_lxf[256];
+                snprintf(path_nn, 256, "/tmp/neural_mhd_frames/neural_%03d.dat", t);
+                snprintf(path_lxf, 256, "/tmp/neural_mhd_frames/lxf_%03d.dat", t);
+                FILE *fn = fopen(path_nn, "w");
+                FILE *fl = fopen(path_lxf, "w");
+                for (int y=0; y<NN; y++) {
+                    for (int x=0; x<NN; x++) {
+                        fprintf(fn, "%.6f%s", sim_ns[y*NN+x], x<NN-1?" ":"\n");
+                        fprintf(fl, "%.6f%s", lxf_ns2[y*NN+x], x<NN-1?" ":"\n");
+                    }
+                }
+                fclose(fn); fclose(fl);
+
+                double nm=0, lm=0;
+                for (int i=0; i<NN2; i++) { nm+=sim_ns[i]; lm+=lxf_ns2[i]; }
+                printf("  t=%3d  neural_mass=%.2f  lxf_mass=%.2f\n", t, nm, lm);
+            }
+
+            // Swap
+            double *tmp;
+            tmp = sim_s; sim_s = sim_ns; sim_ns = tmp;
+            tmp = lxf_s; lxf_s = lxf_ns2; lxf_ns2 = tmp;
+        }
+
+        printf("\nFrames saved to /tmp/neural_mhd_frames/\n");
+
+        // Generate comparison visualization
+        FILE *viz = fopen("/tmp/neural_mhd_viz.py", "w");
+        fprintf(viz, "import numpy as np\nimport matplotlib.pyplot as plt\n");
+        fprintf(viz, "fig, axes = plt.subplots(2, 5, figsize=(20,8))\n");
+        fprintf(viz, "fig.suptitle('Neural MHD Surrogate vs Lax-Friedrichs', fontsize=16)\n");
+        fprintf(viz, "for i, t in enumerate([0, 20, 50, 100, 190]):\n");
+        fprintf(viz, "    nn = np.loadtxt(f'/tmp/neural_mhd_frames/neural_{t:03d}.dat')\n");
+        fprintf(viz, "    lf = np.loadtxt(f'/tmp/neural_mhd_frames/lxf_{t:03d}.dat')\n");
+        fprintf(viz, "    vmin, vmax = min(nn.min(), lf.min()), max(nn.max(), lf.max())\n");
+        fprintf(viz, "    axes[0,i].imshow(nn, cmap='inferno', vmin=vmin, vmax=vmax)\n");
+        fprintf(viz, "    axes[0,i].set_title(f'Neural t={t}')\n");
+        fprintf(viz, "    axes[0,i].axis('off')\n");
+        fprintf(viz, "    axes[1,i].imshow(lf, cmap='inferno', vmin=vmin, vmax=vmax)\n");
+        fprintf(viz, "    axes[1,i].set_title(f'LxF t={t}')\n");
+        fprintf(viz, "    axes[1,i].axis('off')\n");
+        fprintf(viz, "plt.tight_layout()\nplt.savefig('/tmp/neural_vs_lxf.png', dpi=150)\n");
+        fprintf(viz, "print('Saved /tmp/neural_vs_lxf.png')\nplt.show()\n");
+        fclose(viz);
+
+        printf("Run: python3 /tmp/neural_mhd_viz.py\n");
+
         free(X_all); free(Y_all); free(eval_s); free(eval_ns);
+        free(sim_s); free(sim_ns); free(lxf_s); free(lxf_ns2);
         printf("\nDone.\n");
     }
     return 0;
