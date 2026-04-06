@@ -1,0 +1,242 @@
+-- flywheel/regress.rail — Forward regression bisector for the ledger.
+--
+-- Reads flywheel/interventions.jsonl and reports any round-over-round
+-- pass_pct drop bigger than a threshold, plus the suspect events
+-- (override_write, level_fallback, server_skip) that occurred in the
+-- window before the drop.
+--
+-- This is the tooling promised by docs/empire-transplant-plan.md:
+--   "the next regression we'll be able to bisect."
+--
+-- The level 25→6 regression that motivated the ledger is gone (pre-
+-- ledger), so this tool runs FORWARD: it watches for the next drop
+-- and tells you what happened.
+--
+-- Usage:
+--   ./rail_native run flywheel/regress.rail              # default scan
+--   ./rail_native run flywheel/regress.rail 5            # threshold = 5pp
+--   ./rail_native run flywheel/regress.rail 10 verbose   # show all events
+--
+-- Reads stdout-only — does not modify the ledger or any state.
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+q = "\""
+
+file_exists path =
+  length (trim (shell (cat ["test -f ", path, " && echo 1"]))) > 0
+
+-- ── parse_int ─────────────────────────────────────────────────────────
+digit_val c =
+  if c == "0" then 0
+  else if c == "1" then 1
+  else if c == "2" then 2
+  else if c == "3" then 3
+  else if c == "4" then 4
+  else if c == "5" then 5
+  else if c == "6" then 6
+  else if c == "7" then 7
+  else if c == "8" then 8
+  else if c == "9" then 9
+  else 0 - 1
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = digit_val (head cs)
+    if d < 0 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+parse_int s = parse_int_acc (chars s) 0
+
+-- ── Field extraction from a JSON line ─────────────────────────────────
+-- Returns the value as a string (raw, no quote-stripping).
+-- For numeric fields, caller passes through parse_int.
+
+extract_field line key =
+  let marker = cat ["\"", key, "\":"]
+  let i = str_find marker line
+  if i < 0 then ""
+  else
+    let after = str_sub line (i + length marker) (length line)
+    let cs = chars after
+    take_value cs ""
+
+-- Take a JSON value (string or number) up to the next , or } or ]
+take_value cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    if c == "\"" then
+      -- string value: take until next unescaped quote
+      take_string (tail cs) acc
+    else if c == "," then acc
+    else if c == "}" then acc
+    else if c == "]" then acc
+    else if c == " " then take_value (tail cs) acc
+    else take_value (tail cs) (cat [acc, c])
+
+take_string cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    if c == "\\" then
+      -- skip the escape + next char
+      let cs2 = tail cs
+      if length cs2 == 0 then acc
+      else take_string (tail cs2) (cat [acc, head cs2])
+    else if c == "\"" then acc
+    else take_string (tail cs) (cat [acc, c])
+
+-- ── Helpers to read int / string fields ───────────────────────────────
+get_int line key = parse_int (extract_field line key)
+get_str line key = extract_field line key
+
+-- ── Event classification ──────────────────────────────────────────────
+is_round_end line =
+  let k = get_str line "kind"
+  if k == "round_end" then 1
+  else if k == "s0_round_end" then 1
+  else 0
+
+is_suspect line =
+  let k = get_str line "kind"
+  if k == "override_write" then 1
+  else if k == "level_fallback" then 1
+  else if k == "server_skip" then 1
+  else if k == "goal_grind" then 1
+  else 0
+
+-- ── Format an event line for printing ─────────────────────────────────
+fmt_event line =
+  let ts = get_str line "ts"
+  let k = get_str line "kind"
+  if k == "round_end" then
+    cat ["    [", ts, "] round_end r=", show (get_int line "round"), " level=", show (get_int line "level"), " pass=", show (get_int line "pass_rate"), "%"]
+  else if k == "s0_round_end" then
+    cat ["    [", ts, "] s0_round_end r=", show (get_int line "round"), " pass=", show (get_int line "pass_pct"), "% lifetime=", show (get_int line "lifetime_pct"), "%"]
+  else if k == "override_write" then
+    cat ["    [", ts, "] override_write key=", get_str line "key", " ", show (get_int line "old_value"), "→", show (get_int line "new_value"), " (", get_str line "reason", ")"]
+  else if k == "level_fallback" then
+    cat ["    [", ts, "] level_fallback r=", show (get_int line "round"), " level ", show (get_int line "old_level"), "→", show (get_int line "new_level"), " (", get_str line "reason", ")"]
+  else if k == "level_advance" then
+    cat ["    [", ts, "] level_advance r=", show (get_int line "round"), " level ", show (get_int line "old_level"), "→", show (get_int line "new_level"), " (", get_str line "reason", ")"]
+  else if k == "server_skip" then
+    cat ["    [", ts, "] server_skip r=", show (get_int line "round"), " (", get_str line "reason", ")"]
+  else if k == "goal_grind" then
+    cat ["    [", ts, "] goal_grind r=", show (get_int line "round"), " (", get_str line "reason", ")"]
+  else
+    cat ["    [", ts, "] ", k]
+
+-- ── Pull pass_pct from any round_end variant ──────────────────────────
+get_pct line =
+  let k = get_str line "kind"
+  if k == "round_end" then get_int line "pass_rate"
+  else if k == "s0_round_end" then get_int line "pass_pct"
+  else 0 - 1
+
+-- ── Walk the lines, finding regressions and reporting context ─────────
+-- Strategy: keep a sliding "previous round_end pct" per kind. On each
+-- round_end, compare to previous of same kind. If drop > threshold, emit
+-- a regression report including the recent suspect events.
+
+-- Print suspect events that occurred BETWEEN two line indices.
+print_suspects lines from_idx to_idx i =
+  if i >= to_idx then 0
+  else if i >= length lines then 0
+  else
+    let line = head lines
+    if i >= from_idx then
+      if is_suspect line == 1 then
+        let _ = print (fmt_event line)
+        print_suspects (tail lines) from_idx to_idx (i + 1)
+      else print_suspects (tail lines) from_idx to_idx (i + 1)
+    else print_suspects (tail lines) from_idx to_idx (i + 1)
+
+-- Walk: track per-kind previous pct and previous index for context.
+walk lines i prev_se_pct prev_se_idx prev_re_pct prev_re_idx threshold all_lines n_regress =
+  if length lines == 0 then n_regress
+  else
+    let line = head lines
+    if length line == 0 then walk (tail lines) (i + 1) prev_se_pct prev_se_idx prev_re_pct prev_re_idx threshold all_lines n_regress
+    else
+      let k = get_str line "kind"
+      if k == "s0_round_end" then
+        let cur = get_int line "pass_pct"
+        let drop = prev_se_pct - cur
+        if prev_se_pct >= 0 then
+          if drop >= threshold then
+            let _ = print ""
+            let _ = print (cat ["⚠ REGRESSION (s0_pcfg): pass_pct ", show prev_se_pct, "% → ", show cur, "% (drop ", show drop, "pp) at round ", show (get_int line "round")])
+            let _ = print "  context (suspect events since previous round_end):"
+            let _ = print_suspects all_lines (prev_se_idx + 1) i 0
+            let _ = print (cat ["  current: ", fmt_event line])
+            walk (tail lines) (i + 1) cur i prev_re_pct prev_re_idx threshold all_lines (n_regress + 1)
+          else walk (tail lines) (i + 1) cur i prev_re_pct prev_re_idx threshold all_lines n_regress
+        else walk (tail lines) (i + 1) cur i prev_re_pct prev_re_idx threshold all_lines n_regress
+      else if k == "round_end" then
+        let cur = get_int line "pass_rate"
+        let drop = prev_re_pct - cur
+        if prev_re_pct >= 0 then
+          if drop >= threshold then
+            let _ = print ""
+            let _ = print (cat ["⚠ REGRESSION (self_train): pass_rate ", show prev_re_pct, "% → ", show cur, "% (drop ", show drop, "pp) at round ", show (get_int line "round")])
+            let _ = print "  context (suspect events since previous round_end):"
+            let _ = print_suspects all_lines (prev_re_idx + 1) i 0
+            let _ = print (cat ["  current: ", fmt_event line])
+            walk (tail lines) (i + 1) prev_se_pct prev_se_idx cur i threshold all_lines (n_regress + 1)
+          else walk (tail lines) (i + 1) prev_se_pct prev_se_idx cur i threshold all_lines n_regress
+        else walk (tail lines) (i + 1) prev_se_pct prev_se_idx cur i threshold all_lines n_regress
+      else if k == "level_fallback" then
+        let _ = print ""
+        let _ = print (cat ["⚠ LEVEL FALLBACK at round ", show (get_int line "round"), ": level ", show (get_int line "old_level"), "→", show (get_int line "new_level")])
+        let _ = print (cat ["  reason: ", get_str line "reason"])
+        walk (tail lines) (i + 1) prev_se_pct prev_se_idx prev_re_pct prev_re_idx threshold all_lines (n_regress + 1)
+      else walk (tail lines) (i + 1) prev_se_pct prev_se_idx prev_re_pct prev_re_idx threshold all_lines n_regress
+
+count_kind lines key acc =
+  if length lines == 0 then acc
+  else
+    let line = head lines
+    if length line == 0 then count_kind (tail lines) key acc
+    else if get_str line "kind" == key then count_kind (tail lines) key (acc + 1)
+    else count_kind (tail lines) key acc
+
+main =
+  let path = "flywheel/interventions.jsonl"
+  let _ = print "═══ flywheel — regress (forward bisector) ═══"
+  if file_exists path == false then
+    let _ = print (cat ["  ledger missing: ", path])
+    0
+  else
+    let args_list = args
+    let threshold = if length args_list >= 2 then parse_int (head (tail args_list)) else 10
+    let safe_threshold = if threshold < 1 then 10 else threshold
+    let _ = print (cat ["  ledger: ", path])
+    let _ = print (cat ["  drop threshold: ", show safe_threshold, "pp"])
+    let content = read_file path
+    let lines = split "\n" content
+    let n_total = length lines
+    let n_se = count_kind lines "s0_round_end" 0
+    let n_re = count_kind lines "round_end" 0
+    let n_lf = count_kind lines "level_fallback" 0
+    let n_la = count_kind lines "level_advance" 0
+    let n_ow = count_kind lines "override_write" 0
+    let n_ss = count_kind lines "server_skip" 0
+    let _ = print ""
+    let _ = print "  ledger summary:"
+    let _ = print (cat ["    total lines:     ", show n_total])
+    let _ = print (cat ["    s0_round_end:    ", show n_se])
+    let _ = print (cat ["    round_end:       ", show n_re])
+    let _ = print (cat ["    level_advance:   ", show n_la])
+    let _ = print (cat ["    level_fallback:  ", show n_lf])
+    let _ = print (cat ["    override_write:  ", show n_ow])
+    let _ = print (cat ["    server_skip:     ", show n_ss])
+    let _ = print ""
+    let _ = print "  scanning for regressions..."
+    let n_regress = walk lines 0 (0 - 1) (0 - 1) (0 - 1) (0 - 1) safe_threshold lines 0
+    let _ = print ""
+    if n_regress == 0 then
+      let _ = print "  ✓ no regressions detected"
+      0
+    else
+      let _ = print (cat ["  ⚠ ", show n_regress, " regression(s) reported above"])
+      0
