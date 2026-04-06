@@ -137,6 +137,8 @@ ls -la training/self_train/*.backup* flywheel/*.backup*
 
 **Why no dispatcher:** Any Rail-level dispatcher would introduce a registry (which file lives where, what verbs are valid, etc.) — that's the abstraction layer the warning was about. Each verb is just a normal Rail program runnable via `./rail_native run tools/domains/<name>/<verb>.rail`. When the second domain proves the shape, generalize. Until then, don't.
 
+**The shape was proved within hours.** A parallel session built `tools/domains/s0_pcfg/` — a 13-integer PCFG trained via REINFORCE on compiler feedback — without any spine modification. Six ticks: 43% → 81% lifetime pass rate, every round writing `s0_round_end` events to `flywheel/interventions.jsonl` using the exact `kvi`/`kvs`/`log_intervention` pattern from Session 1. The new domain reads the 4 tunables from `flywheel/overrides.txt` (Session 4) and persists state to `flywheel/s0_state.txt` (now in flush.rail's protected list, Session 2). All four crown jewels lit up at once.
+
 **Output of `./rail_native run tools/domains/neural_plasma/bench.rail`:**
 ```
 ═══ neural_plasma — bench ═══
