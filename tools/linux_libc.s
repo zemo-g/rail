@@ -477,3 +477,92 @@ _atoi:
 _atof:
     fmov d0, xzr
     ret
+
+// ============ Networking syscalls (added for dns-sink, 2026-04-07) ============
+//
+// All Linux ARM64 syscalls follow the convention:
+//   syscall nr in x8, args in x0..x5, svc #0, return in x0.
+// The Rail FFI ABI already places call args in x0..x5 (System V on Linux),
+// so each wrapper just sets x8 and traps. Return value flows back in x0
+// where Rail's FFI codegen will retag it as a tagged int.
+//
+// Syscall numbers from /usr/include/asm-generic/unistd.h:
+//   close=57  socket=198  bind=200  listen=201  accept4=242  connect=203
+//   sendto=206  recvfrom=207  setsockopt=208  clock_gettime=113
+
+_close:
+    mov x8, #57
+    svc #0
+    ret
+
+_socket:
+    mov x8, #198
+    svc #0
+    ret
+
+_bind:
+    mov x8, #200
+    svc #0
+    ret
+
+_listen:
+    mov x8, #201
+    svc #0
+    ret
+
+_connect:
+    mov x8, #203
+    svc #0
+    ret
+
+_accept4:
+    mov x8, #242
+    svc #0
+    ret
+
+_sendto:
+    mov x8, #206
+    svc #0
+    ret
+
+_recvfrom:
+    mov x8, #207
+    svc #0
+    ret
+
+_setsockopt:
+    mov x8, #208
+    svc #0
+    ret
+
+// ============ Byte-order helpers (not syscalls) ============
+
+// htons(x): swap the low 16 bits of x.
+// rev16 reverses bytes within each 16-bit halfword of the source.
+_htons:
+    and x0, x0, #0xFFFF
+    rev16 w0, w0
+    and x0, x0, #0xFFFF
+    ret
+
+// htonl(x): swap the bytes of the low 32 bits of x.
+_htonl:
+    and x0, x0, #0xFFFFFFFF
+    rev w0, w0
+    and x0, x0, #0xFFFFFFFF
+    ret
+
+// ============ time wrapper ============
+//
+// Linux ARM64 has no time() syscall — use clock_gettime(CLOCK_REALTIME, &ts)
+// and return ts.tv_sec. Caller's t arg (x0) is ignored (we never write
+// it back; Rail callers always pass NULL).
+_time:
+    sub sp, sp, #16          // 16-byte aligned timespec on stack
+    mov x0, #0               // CLOCK_REALTIME
+    mov x1, sp               // &timespec
+    mov x8, #113             // clock_gettime
+    svc #0
+    ldr x0, [sp]             // tv_sec
+    add sp, sp, #16
+    ret
