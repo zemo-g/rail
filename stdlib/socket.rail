@@ -1,27 +1,139 @@
 -- stdlib/socket.rail — BSD sockets via FFI
 -- Import: import "stdlib/socket.rail"
--- Uses socket/bind/listen/accept/connect/send/recv from libSystem
+-- Uses libSystem (macOS) / linux_libc shim (Linux — UDP not yet wired there).
 
-foreign socket domain type protocol -> int
+-- ============ low-level FFI ============
+
+foreign socket domain sktype protocol -> int
 foreign bind fd addr addrlen -> int
 foreign listen fd backlog -> int
 foreign accept fd addr addrlen -> int
 foreign connect fd addr addrlen -> int
 foreign send fd buf len flags -> int
 foreign recv fd buf len flags -> int
+foreign sendto fd buf len flags to tolen -> int
+foreign recvfrom fd buf len flags from fromlen -> int
 foreign close fd -> int
 foreign htons port -> int
+foreign htonl addr -> int
+foreign malloc size -> ptr
+foreign free p -> int
 
--- Constants
+-- ============ constants ============
+
 af_inet = 2
 sock_stream = 1
 sock_dgram = 2
+sockaddr_in_size = 16
 
--- Create a TCP socket
+-- ============ ip address helpers ============
+
+-- Parse "127.0.0.1" → 0x7F000001 (host byte order int)
+parse_ip s =
+  let parts = split "." s
+  if length parts != 4 then 0
+  else
+    let a = to_int (head parts)
+    let b = to_int (head (tail parts))
+    let c = to_int (head (tail (tail parts)))
+    let d = to_int (head (tail (tail (tail parts))))
+    a * 16777216 + b * 65536 + c * 256 + d
+
+-- Render an int (host order) → "a.b.c.d"
+render_ip n =
+  let a = n / 16777216
+  let b = (n / 65536) % 256
+  let c = (n / 256) % 256
+  let d = n % 256
+  join "." [show a, show b, show c, show d]
+
+-- ============ sockaddr_in builder ============
+
+-- Allocate a 16-byte sockaddr_in for the given (port, "a.b.c.d") pair.
+-- Caller owns the pointer. Free with `free` when done.
+-- Layout (16 bytes):
+--   offset 0-1: sin_family (host order, AF_INET)
+--   offset 2-3: sin_port   (network order)
+--   offset 4-7: sin_addr   (network order)
+--   offset 8-15: sin_zero  (zeros)
+make_sockaddr_in port ip_str =
+  let p = malloc sockaddr_in_size
+  let _ = sa_init_zero p 0
+  let _ = byte_set p 0 af_inet
+  let _ = byte_set p 1 0
+  let port_net = htons port
+  let _ = byte_set p 2 (port_net % 256)
+  let _ = byte_set p 3 ((port_net / 256) % 256)
+  let addr_host = parse_ip ip_str
+  let addr_net = htonl addr_host
+  let _ = byte_set p 4 (addr_net % 256)
+  let _ = byte_set p 5 ((addr_net / 256) % 256)
+  let _ = byte_set p 6 ((addr_net / 65536) % 256)
+  let _ = byte_set p 7 ((addr_net / 16777216) % 256)
+  p
+
+sa_init_zero p i =
+  if i >= sockaddr_in_size then 0
+  else
+    let _ = byte_set p i 0
+    sa_init_zero p (i + 1)
+
+-- Inverse: read port (host order) out of a sockaddr_in
+sa_port sa =
+  let lo = byte_at sa 2
+  let hi = byte_at sa 3
+  -- network order: byte 2 is high byte of port, byte 3 is low byte
+  -- so host port = lo * 256 + hi  (because lo is the network high byte)
+  lo * 256 + hi
+
+-- Read addr (host order int) out of a sockaddr_in
+sa_addr sa =
+  let b0 = byte_at sa 4
+  let b1 = byte_at sa 5
+  let b2 = byte_at sa 6
+  let b3 = byte_at sa 7
+  -- network order: byte 4..7 are MSB..LSB of address
+  b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+
+-- ============ TCP convenience (existing API kept) ============
+
 tcp_socket _ = socket af_inet sock_stream 0
-
--- Create a UDP socket
 udp_socket _ = socket af_inet sock_dgram 0
-
--- Close socket
 close_socket fd = close fd
+
+-- ============ UDP convenience ============
+
+-- Open a UDP socket and bind it to the given address+port.
+-- Returns fd on success, -1 on failure.
+bind_udp ip_str port =
+  let fd = udp_socket 0
+  if fd < 0 then 0 - 1
+  else
+    let sa = make_sockaddr_in port ip_str
+    let r = bind fd sa sockaddr_in_size
+    let _ = free sa
+    if r == 0 then fd else 0 - 1
+
+-- Send `buf` (a Rail string — its bytes are the wire payload) to `(ip, port)`.
+-- Returns bytes sent on success, -1 on failure.
+send_to fd buf ip_str port =
+  let sa = make_sockaddr_in port ip_str
+  let n = sendto fd buf (length buf) 0 sa sockaddr_in_size
+  let _ = free sa
+  n
+
+-- Receive a UDP datagram into a freshly malloc'd byte buffer.
+-- Returns (bytes_received, buf_ptr, src_sa_ptr).
+-- Caller MUST free both buf_ptr and src_sa_ptr when done.
+-- bufsize is the max bytes the caller will accept (e.g. 512 for DNS).
+recv_from fd bufsize =
+  let buf = malloc bufsize
+  let sa = make_sockaddr_in 0 "0.0.0.0"
+  let alen_buf = malloc 8
+  let _ = byte_set alen_buf 0 sockaddr_in_size
+  let _ = byte_set alen_buf 1 0
+  let _ = byte_set alen_buf 2 0
+  let _ = byte_set alen_buf 3 0
+  let n = recvfrom fd buf bufsize 0 sa alen_buf
+  let _ = free alen_buf
+  (n, buf, sa)
