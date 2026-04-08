@@ -60,17 +60,9 @@ _strcat:
     ret
 
 // ---- Memory ----
-
-_malloc:
-    mov x1, x0
-    mov x0, #0
-    mov x2, #3          // PROT_READ|PROT_WRITE
-    mov x3, #0x22       // MAP_PRIVATE|MAP_ANONYMOUS
-    mov x4, #-1
-    mov x5, #0
-    mov x8, #222        // mmap
-    svc #0
-    ret
+// _malloc moved further down: it now bump-allocates from _rail_heap.
+// _free remains a no-op (the bump arena does not support per-object free;
+// reclamation only happens via _rail_gc, which dns-sink never triggers).
 
 _free:
     ret
@@ -635,6 +627,59 @@ _longjmp:
     // continue executing with corrupted control flow.
     mov x0, #1
     mov x8, #93
+    svc #0
+    ret
+
+// ============ Bump-allocated _malloc replacement ============
+//
+// Patched 2026-04-08: the original _malloc was a thin mmap wrapper —
+// every call did its own syscall, getting a fresh 4 KB page minimum.
+// _rail_split allocates one buffer per substring. For an oisd 56 k-domain
+// blocklist that meant 56 k * 4 KB = 224 MB physical, OOM-killing the Pi.
+//
+// The Rail-compiled binary already has a 512 MB virtual bump arena
+// (_rail_heap + _rail_heap_ptr) used by _rail_alloc for cons cells / tuples
+// / closures. We share that same arena for _malloc.
+//
+// We deliberately do NOT write a size header (unlike _rail_alloc), because
+// _malloc callers expect raw bytes starting at the returned pointer.
+// Side effect: if the GC ever runs a sweep, it cant walk past these
+// header-less buffers. dns-sink stays well under 512 MB so GC never runs;
+// for any program that does, this fast _malloc would be unsafe.
+//
+// Overflow falls back to the original mmap path so we still work when the
+// bump arena is exhausted.
+_malloc:
+    // x0 = requested size, in bytes.
+    // Align up to 8 (matching _rail_allocs alignment so the shared
+    // bump pointer stays 8-aligned for both allocators). Stash in x9
+    // and keep x0 intact for the mmap fallback path below.
+    add x9, x0, #7
+    and x9, x9, #-8
+    // Load current bump pointer.
+    adrp x10, _rail_heap_ptr
+    add x10, x10, :lo12:_rail_heap_ptr
+    ldr x11, [x10]
+    add x12, x11, x9            // new bump pointer
+    // Boundary check against _rail_heap_end.
+    adrp x13, _rail_heap_end
+    add x13, x13, :lo12:_rail_heap_end
+    ldr x13, [x13]
+    cmp x12, x13
+    b.hi .Lmalloc_mmap_fallback
+    // Fast path: commit and return.
+    str x12, [x10]
+    mov x0, x11
+    ret
+.Lmalloc_mmap_fallback:
+    // Slow path: original mmap-per-call. x0 still has original requested size.
+    mov x1, x0
+    mov x0, #0
+    mov x2, #3                  // PROT_READ|PROT_WRITE
+    mov x3, #0x22               // MAP_PRIVATE|MAP_ANONYMOUS
+    mov x4, #-1
+    mov x5, #0
+    mov x8, #222                // mmap
     svc #0
     ret
 
