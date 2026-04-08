@@ -250,6 +250,8 @@ _fopen:
     ldrb w2, [x1]
     cmp w2, #119          // 'w'
     b.eq .Lfop_w
+    cmp w2, #97           // 'a'
+    b.eq .Lfop_a
     // default: read
     mov x1, x0
     mov x0, #-100         // AT_FDCWD
@@ -262,6 +264,14 @@ _fopen:
     mov x1, x0
     mov x0, #-100
     mov x2, #0x241        // O_WRONLY|O_CREAT|O_TRUNC
+    mov x3, #0x1a4        // 0644
+    mov x8, #56
+    svc #0
+    b .Lfop_done
+.Lfop_a:
+    mov x1, x0
+    mov x0, #-100
+    mov x2, #0x441        // O_WRONLY|O_CREAT|O_APPEND
     mov x3, #0x1a4        // 0644
     mov x8, #56
     svc #0
@@ -565,4 +575,83 @@ _time:
     svc #0
     ldr x0, [sp]             // tv_sec
     add sp, sp, #16
+    ret
+
+// ============ strstr (needed by Rail's split / str_find / etc.) ============
+//
+// char *strstr(const char *haystack, const char *needle)
+// Returns pointer to first occurrence, or NULL.
+_strstr:
+    ldrb w2, [x1]
+    cbz w2, .Lstrstr_match    // empty needle -> haystack
+.Lstrstr_outer:
+    ldrb w2, [x0]
+    cbz w2, .Lstrstr_notfound
+    mov x3, x0
+    mov x4, x1
+.Lstrstr_inner:
+    ldrb w5, [x4]
+    cbz w5, .Lstrstr_match    // needle exhausted -> match
+    ldrb w6, [x3]
+    cbz w6, .Lstrstr_advance  // haystack exhausted -> no match here
+    cmp w5, w6
+    b.ne .Lstrstr_advance
+    add x3, x3, #1
+    add x4, x4, #1
+    b .Lstrstr_inner
+.Lstrstr_advance:
+    add x0, x0, #1
+    b .Lstrstr_outer
+.Lstrstr_match:
+    ret
+.Lstrstr_notfound:
+    mov x0, #0
+    ret
+
+// ============ Stubs for symbols dns-sink doesnt use ============
+//
+// Rails runtime emits these unconditionally (spawn_thread, try-handle).
+// dns-sink never calls them. We provide stubs so the link succeeds.
+// If anyone actually invokes them at runtime, the program will misbehave.
+
+_pthread_create:
+    mov x0, #-1
+    ret
+
+_pthread_join:
+    mov x0, #-1
+    ret
+
+_pthread_mutex_init:
+    mov x0, #-1
+    ret
+
+_setjmp:
+    mov x0, #0
+    ret
+
+_longjmp:
+    // We should never get here. If we do, exit cleanly so we dont
+    // continue executing with corrupted control flow.
+    mov x0, #1
+    mov x8, #93
+    svc #0
+    ret
+
+// ============ fputs (used by dns/log.rail) ============
+//
+// int fputs(const char *s, FILE *fp)
+// Writes the C string to fp via fwrite. Returns whatever fwrite returns.
+_fputs:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x0, [x29, #16]   // save s
+    str x1, [x29, #24]   // save fp
+    bl _strlen            // x0 = strlen(s)
+    mov x2, x0            // count = strlen(s)
+    ldr x0, [x29, #16]    // ptr = s
+    mov x1, #1            // size = 1
+    ldr x3, [x29, #24]    // FILE* = fp
+    bl _fwrite
+    ldp x29, x30, [sp], #32
     ret
