@@ -533,7 +533,7 @@ Rail uses a conservative mark-sweep garbage collector (`runtime/gc.c`). The GC:
 3. Traces tagged objects (Cons, Tuple, Closure, ADT, Float)
 4. Sweeps unmarked objects into a free list
 
-The GC is triggered automatically when the 1GB bump allocator runs out of space. Programs can allocate well beyond 1GB total because the GC reclaims dead objects.
+The GC is triggered automatically when the 512MB bump allocator runs out of space. Programs can allocate well beyond 512MB total because the GC reclaims dead objects.
 
 ### Arena Mark/Reset
 

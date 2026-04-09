@@ -4,7 +4,7 @@
 
 > GitHub's language bar shows this repo as Haskell because `github-linguist` doesn't know Rail exists yet. A [PR is in flight](https://github.com/github-linguist/linguist/pulls?q=rail) to fix that. In the meantime: this is a Rail codebase.
 
-[![tests: 92/92](https://img.shields.io/badge/tests-92%2F92-brightgreen)](#)
+[![tests: 98/98](https://img.shields.io/badge/tests-98%2F98-brightgreen)](#)
 [![self-hosting](https://img.shields.io/badge/self--hosting-fixed%20point-blue)](#)
 [![bench: 14/30](https://img.shields.io/badge/RAILGPT%20bench-14%2F30-yellow)](#releases)
 [![backends: 4](https://img.shields.io/badge/backends-4-orange)](#releases)
@@ -18,7 +18,7 @@ Rail compiles itself. Then it teaches machines to write Rail. Then it runs real-
 -- This is the entire bootstrap:
 ./rail_native self && cp /tmp/rail_self ./rail_native
 
--- 3,865 lines of Rail compile to a 631K ARM64 binary.
+-- 4,687 lines of Rail compile to a 729K ARM64 binary.
 -- That binary compiles the compiler again.
 -- The output is byte-identical. Fixed point.
 -- Zero C dependencies. GC in assembly. Everything is Rail.
@@ -40,7 +40,7 @@ Apple Silicon (ARM64 macOS). Linux ARM64 and x86_64 cross-compilation supported.
 ./rail_native self                    # self-compile → /tmp/rail_self
 cp /tmp/rail_self ./rail_native       # install
 ./rail_native self                    # compile again — must be byte-identical
-./rail_native test                    # 92/92
+./rail_native test                    # 98/98
 ```
 
 ## Usage
@@ -48,7 +48,7 @@ cp /tmp/rail_self ./rail_native       # install
 ```bash
 ./rail_native <file.rail>             # compile to /tmp/rail_out
 ./rail_native run <file.rail>         # compile + execute
-./rail_native test                    # 92/92 test suite
+./rail_native test                    # 98/98 test suite
 ./rail_native self                    # self-compile (fixed point)
 ./rail_native x86 <file.rail>        # cross-compile to x86_64 Linux
 ./rail_native linux <file.rail>       # cross-compile to Linux ARM64
@@ -121,7 +121,7 @@ main =
 
 ## How It Works
 
-The compiler (`tools/compile.rail`, 3,865 lines) does:
+The compiler (`tools/compile.rail`, 4,687 lines) does:
 
 1. **Lexer** — tokenizes Rail source with position tracking
 2. **Parser** — builds AST from tokens (tagged lists)
@@ -133,7 +133,7 @@ The compiler (`tools/compile.rail`, 3,865 lines) does:
 
 | Component | Implementation | Detail |
 |-----------|---------------|--------|
-| **Allocator** | ARM64 assembly | 256MB bump arena + free list + malloc fallback |
+| **Allocator** | ARM64 assembly | 512MB bump arena + free list + malloc fallback |
 | **GC** | ARM64 assembly | Conservative mark-sweep. Scans stack frames, traces tagged objects, sweeps into free list. |
 | **Tagged pointers** | Inline | Integers: `(v << 1) \| 1`. Heap: raw pointer. Tag bit 0 distinguishes. |
 | **Objects** | 8-byte size header | Tags: 1=Cons, 2=Nil, 3=Tuple, 4=Closure, 5=ADT, 6=Float. Mark bit at bit 63. |
