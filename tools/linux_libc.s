@@ -1,8 +1,7 @@
 // linux_libc.s — Syscall-based C library for Rail Linux ARM64 binaries
 // No external dependencies. Pure syscalls + assembly string ops.
 // Syscalls: write=64, read=63, openat=56, close=57, lseek=62, exit=93, mmap=222
-
-// ---- String functions ----
+// ---- String functions (pure assembly, all platforms) ----
 
 _strlen:
     mov x1, x0
@@ -59,12 +58,79 @@ _strcat:
     ldp x29, x30, [sp], #32
     ret
 
+_atoi:
+    mov x1, #0
+    mov x2, #0
+    ldrb w3, [x0]
+    cmp w3, #45
+    b.ne .Latoi_loop
+    mov x2, #1
+    add x0, x0, #1
+.Latoi_loop:
+    ldrb w3, [x0], #1
+    cbz w3, .Latoi_done
+    cmp w3, #48
+    b.lt .Latoi_done
+    cmp w3, #57
+    b.gt .Latoi_done
+    sub w3, w3, #48
+    mov x4, #10
+    mul x1, x1, x4
+    add x1, x1, x3
+    b .Latoi_loop
+.Latoi_done:
+    cbz x2, .Latoi_pos
+    neg x1, x1
+.Latoi_pos:
+    mov x0, x1
+    ret
+
+_strstr:
+    ldrb w2, [x1]
+    cbz w2, .Lstrstr_match
+.Lstrstr_outer:
+    ldrb w2, [x0]
+    cbz w2, .Lstrstr_notfound
+    mov x3, x0
+    mov x4, x1
+.Lstrstr_inner:
+    ldrb w5, [x4]
+    cbz w5, .Lstrstr_match
+    ldrb w6, [x3]
+    cbz w6, .Lstrstr_advance
+    cmp w5, w6
+    b.ne .Lstrstr_advance
+    add x3, x3, #1
+    add x4, x4, #1
+    b .Lstrstr_inner
+.Lstrstr_advance:
+    add x0, x0, #1
+    b .Lstrstr_outer
+.Lstrstr_match:
+    ret
+.Lstrstr_notfound:
+    mov x0, #0
+    ret
+
+
 // ---- Memory ----
 // _malloc moved further down: it now bump-allocates from _rail_heap.
 // _free remains a no-op (the bump arena does not support per-object free;
 // reclamation only happens via _rail_gc, which dns-sink never triggers).
 
 _free:
+    ret
+
+// read(fd, buf, count) — syscall 63
+_read:
+    mov x8, #63               // read
+    svc #0
+    ret
+
+// write(fd, buf, count) — syscall 64
+_write:
+    mov x8, #64               // write
+    svc #0
     ret
 
 // ---- Printf: handles %ld\n, %s\n, raw strings ----
@@ -446,35 +512,6 @@ _pclose:
     svc #0
     ret
 
-// ---- Conversions ----
-
-// atoi: x0=string → x0=int
-_atoi:
-    mov x1, #0            // result
-    mov x2, #0            // neg flag
-    ldrb w3, [x0]
-    cmp w3, #45           // '-'
-    b.ne .Latoi_loop
-    mov x2, #1
-    add x0, x0, #1
-.Latoi_loop:
-    ldrb w3, [x0], #1
-    cbz w3, .Latoi_done
-    cmp w3, #48
-    b.lt .Latoi_done
-    cmp w3, #57
-    b.gt .Latoi_done
-    sub w3, w3, #48
-    mov x4, #10
-    mul x1, x1, x4
-    add x1, x1, x3
-    b .Latoi_loop
-.Latoi_done:
-    cbz x2, .Latoi_pos
-    neg x1, x1
-.Latoi_pos:
-    mov x0, x1
-    ret
 
 _atof:
     fmov d0, xzr
@@ -569,35 +606,40 @@ _time:
     add sp, sp, #16
     ret
 
-// ============ strstr (needed by Rail's split / str_find / etc.) ============
+// ============ sleep (proper kernel sleep, no fork) ============
 //
-// char *strstr(const char *haystack, const char *needle)
-// Returns pointer to first occurrence, or NULL.
-_strstr:
-    ldrb w2, [x1]
-    cbz w2, .Lstrstr_match    // empty needle -> haystack
-.Lstrstr_outer:
-    ldrb w2, [x0]
-    cbz w2, .Lstrstr_notfound
-    mov x3, x0
-    mov x4, x1
-.Lstrstr_inner:
-    ldrb w5, [x4]
-    cbz w5, .Lstrstr_match    // needle exhausted -> match
-    ldrb w6, [x3]
-    cbz w6, .Lstrstr_advance  // haystack exhausted -> no match here
-    cmp w5, w6
-    b.ne .Lstrstr_advance
-    add x3, x3, #1
-    add x4, x4, #1
-    b .Lstrstr_inner
-.Lstrstr_advance:
-    add x0, x0, #1
-    b .Lstrstr_outer
-.Lstrstr_match:
+// sleep(seconds) — blocks for N seconds via nanosleep(2).
+// Used by dns-sink LCD instead of shell "sleep N" which forks.
+_sleep:
+    sub sp, sp, #16
+    str x0, [sp]              // req.tv_sec = seconds
+    str xzr, [sp, #8]        // req.tv_nsec = 0
+    mov x0, sp               // req
+    mov x1, #0               // rem = NULL
+    mov x8, #101             // nanosleep
+    svc #0
+    add sp, sp, #16
+    mov x0, #0               // return 0
     ret
-.Lstrstr_notfound:
-    mov x0, #0
+
+// ============ clock_ms (monotonic millisecond clock) ============
+//
+// clock_ms() — returns current time in milliseconds (CLOCK_MONOTONIC).
+// Used by dns-sink to measure upstream query latency.
+_clock_ms:
+    sub sp, sp, #16
+    mov x0, #1               // CLOCK_MONOTONIC
+    mov x1, sp               // &timespec
+    mov x8, #113             // clock_gettime
+    svc #0
+    ldr x0, [sp]             // tv_sec
+    ldr x1, [sp, #8]         // tv_nsec
+    add sp, sp, #16
+    mov x2, #1000
+    mul x0, x0, x2           // sec * 1000
+    udiv x1, x1, x2          // nsec / 1000 = usec
+    udiv x1, x1, x2          // usec / 1000 = ms remainder
+    add x0, x0, x1           // total ms
     ret
 
 // ============ Stubs for symbols dns-sink doesnt use ============
