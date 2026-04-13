@@ -403,12 +403,24 @@ int main(int argc, char *argv[]) {
             }
 
             double elapsed = now_ms() - t0;
+
+            // Adaptive steps_per_frame: target ~25ms compute budget per frame
+            // If frame was fast, double the step count (up to 200)
+            // If frame was slow, halve it (down to 5)
+            if (elapsed < 10 && steps_per_frame < 200) {
+                steps_per_frame = (int)(steps_per_frame * 1.5f);
+                if (steps_per_frame > 200) steps_per_frame = 200;
+            } else if (elapsed > 30 && steps_per_frame > 5) {
+                steps_per_frame = steps_per_frame / 2;
+                if (steps_per_frame < 5) steps_per_frame = 5;
+            }
+
             // Target ~33ms per frame (30fps)
             if (elapsed < 33) usleep((uint32_t)((33 - elapsed) * 1000));
 
             if (frame_id % 60 == 0) {
-                NSLog(@"Frame %u  t=%.3es  dt=%.2e  %.1fms/frame",
-                      frame_id, sim_time, dt, elapsed);
+                NSLog(@"Frame %u  t=%.3es  dt=%.2e  %.1fms/frame  steps=%d",
+                      frame_id, sim_time, dt, elapsed, steps_per_frame);
             }
         }
     }
