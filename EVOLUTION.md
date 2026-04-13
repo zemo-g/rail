@@ -5,23 +5,23 @@ Started 2026-04-13. Every upgrade, ranked and tracked.
 ## TRIVIAL (under 30 min)
 
 - [x] CSP-split thruster_engine.html for ledatic.org (done 2026-04-13)
-- [ ] CSP-split plasma_lab.html
-- [ ] CSP-split mhd_web.html
-- [ ] CSP-split ramjet.html
-- [ ] parse_float input validation (empty/malformed → 0.0)
+- [x] CSP-split plasma_lab.html (done 2026-04-13)
+- [x] CSP-split mhd_web.html (done 2026-04-13)
+- [x] CSP-split ramjet.html (done 2026-04-13)
+- [x] parse_float input validation — _atof("") returns 0.0, already safe (2026-04-13)
 - [ ] Landing page preview thumbnails (CSS-only)
 - [x] GPU dispatch for matmul in tensor.rail (done 2026-04-13)
 - [x] GPU dispatch for relu in tensor.rail (done 2026-04-13)
 - [ ] GPU dispatch for tensor_add, tensor_mul, tensor_scale
-- [ ] Cache gpu_available check (flag in float_arr)
-- [ ] Clean /tmp/rail_tg_*.txt after GPU ops
+- [x] Cache gpu_available check (float_arr flag, checks once) (2026-04-13)
+- [x] Clean /tmp/rail_tg_*.txt after GPU ops (2026-04-13)
 
 ## EASY (1-4 hours)
 
 - [ ] GPU dispatch for ALL remaining tensor ops (sigmoid, tanh, exp, softmax, transpose, SGD, cross-entropy, relu_backward)
 - [ ] tensor_gpu as persistent daemon (named pipe, eliminate Metal init per call)
 - [ ] Binary pipe GPU protocol from Rail (byte_at/byte_set headers)
-- [ ] Deploy ramjet_3d.html to ledatic.org/plasma/thruster3d
+- [x] Deploy ramjet_3d.html to ledatic.org/plasma/thruster3d (2026-04-13)
 - [ ] MHD solver: adaptive steps_per_frame (if frame <10ms, double steps)
 - [ ] Validation scatter plot in thruster engine Validate tab
 - [ ] parse_int as compiler builtin (call _strtol, 10x faster)
