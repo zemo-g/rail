@@ -18,12 +18,16 @@ Started 2026-04-13. Every upgrade, ranked and tracked.
 
 ## EASY (1-4 hours)
 
-- [ ] GPU dispatch for ALL remaining tensor ops (sigmoid, tanh, exp, softmax, transpose, SGD, cross-entropy, relu_backward)
+- [x] GPU dispatch for remaining tensor ops — exp, tanh, sigmoid, softmax,
+      transpose all dispatch to Metal (2026-04-13). Still CPU-only: SGD,
+      cross_entropy, relu_backward (autograd internal ops).
 - [x] tensor_gpu as persistent daemon — TCP on :9300, auto-fallback to file mode (2026-04-13)
 - [ ] Binary pipe GPU protocol from Rail (byte_at/byte_set headers)
 - [x] Deploy ramjet_3d.html to ledatic.org/plasma/thruster3d (2026-04-13)
-- [ ] MHD solver: adaptive steps_per_frame (if frame <10ms, double steps)
-- [ ] Validation scatter plot in thruster engine Validate tab
+- [x] MHD solver: adaptive steps_per_frame — doubles when frame <10ms,
+      halves when frame >30ms, range [5..200] (2026-04-13)
+- [x] Validation scatter plot in thruster engine Validate tab —
+      measured vs predicted thrust with ±30% error band (2026-04-13)
 - [x] parse_int as compiler builtin — _strtol via _str_unwrap (2026-04-13)
 - [x] Float self-loop TCO — removed body_has_float guard from mark_int_params;
       int counter params now get register allocation even in float-op bodies.

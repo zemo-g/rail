@@ -127,6 +127,99 @@ int main(int argc, char *argv[]) {
             return 0;
         }
 
+        // ── Softmax file mode: ./tensor_gpu softmax ROWS COLS a.txt c.txt ──
+        if (argc >= 6 && strcmp(argv[1], "softmax") == 0) {
+            uint32_t rows = atoi(argv[2]), cols = atoi(argv[3]);
+            const char *pathA = argv[4], *pathC = argv[5];
+            uint32_t n = rows * cols;
+
+            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
+            (void)rc;
+
+            NSError *err = nil;
+            id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/tmp/tensor_gpu.metallib"] error:&err];
+            if (!lib) return 1;
+            id<MTLComputePipelineState> pipeMax = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"softmax_max"] error:&err];
+            id<MTLComputePipelineState> pipeExp = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"softmax_exp_sum"] error:&err];
+            id<MTLComputePipelineState> pipeNorm = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"softmax_normalize"] error:&err];
+            id<MTLCommandQueue> queue = [device newCommandQueue];
+
+            id<MTLBuffer> bufA = [device newBufferWithLength:n*4 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> bufC = [device newBufferWithLength:n*4 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> bufMax = [device newBufferWithLength:rows*4 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> bufSum = [device newBufferWithLength:rows*4 options:MTLResourceStorageModeShared];
+            read_text_floats(pathA, (float*)bufA.contents, n);
+
+            id<MTLCommandBuffer> cmd = [queue commandBuffer];
+            // Pass 1: find max per row
+            id<MTLComputeCommandEncoder> e1 = [cmd computeCommandEncoder];
+            [e1 setComputePipelineState:pipeMax];
+            [e1 setBuffer:bufA offset:0 atIndex:0];
+            [e1 setBuffer:bufMax offset:0 atIndex:1];
+            [e1 setBytes:&rows length:4 atIndex:2];
+            [e1 setBytes:&cols length:4 atIndex:3];
+            [e1 dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [e1 endEncoding];
+            // Pass 2: exp(x - max) and sum
+            id<MTLComputeCommandEncoder> e2 = [cmd computeCommandEncoder];
+            [e2 setComputePipelineState:pipeExp];
+            [e2 setBuffer:bufA offset:0 atIndex:0];
+            [e2 setBuffer:bufC offset:0 atIndex:1];
+            [e2 setBuffer:bufSum offset:0 atIndex:2];
+            [e2 setBuffer:bufMax offset:0 atIndex:3];
+            [e2 setBytes:&rows length:4 atIndex:4];
+            [e2 setBytes:&cols length:4 atIndex:5];
+            [e2 dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [e2 endEncoding];
+            // Pass 3: normalize
+            id<MTLComputeCommandEncoder> e3 = [cmd computeCommandEncoder];
+            [e3 setComputePipelineState:pipeNorm];
+            [e3 setBuffer:bufC offset:0 atIndex:0];
+            [e3 setBuffer:bufSum offset:0 atIndex:1];
+            [e3 setBytes:&rows length:4 atIndex:2];
+            [e3 setBytes:&cols length:4 atIndex:3];
+            [e3 dispatchThreads:MTLSizeMake(cols, rows, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [e3 endEncoding];
+
+            [cmd commit]; [cmd waitUntilCompleted];
+            write_text_floats(pathC, (float*)bufC.contents, n);
+            return 0;
+        }
+
+        // ── Transpose file mode: ./tensor_gpu transpose M N a.txt c.txt ──
+        if (argc >= 6 && strcmp(argv[1], "transpose") == 0) {
+            uint32_t M = atoi(argv[2]), N = atoi(argv[3]);
+            const char *pathA = argv[4], *pathC = argv[5];
+            uint32_t n = M * N;
+
+            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
+            (void)rc;
+
+            NSError *err = nil;
+            id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/tmp/tensor_gpu.metallib"] error:&err];
+            if (!lib) return 1;
+            id<MTLComputePipelineState> pipe = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"tensor_transpose"] error:&err];
+            id<MTLCommandQueue> queue = [device newCommandQueue];
+
+            id<MTLBuffer> bufA = [device newBufferWithLength:n*4 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> bufC = [device newBufferWithLength:n*4 options:MTLResourceStorageModeShared];
+            read_text_floats(pathA, (float*)bufA.contents, n);
+
+            id<MTLCommandBuffer> cmd = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipe];
+            [enc setBuffer:bufA offset:0 atIndex:0];
+            [enc setBuffer:bufC offset:0 atIndex:1];
+            [enc setBytes:&M length:4 atIndex:2];
+            [enc setBytes:&N length:4 atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [enc endEncoding];
+            [cmd commit]; [cmd waitUntilCompleted];
+
+            write_text_floats(pathC, (float*)bufC.contents, n);
+            return 0;
+        }
+
         // ── Binary elementwise file mode: ./tensor_gpu add N a.txt b.txt c.txt ──
         if (argc >= 6 && (strcmp(argv[1], "add") == 0 || strcmp(argv[1], "mul") == 0)) {
             uint32_t n = atoi(argv[2]);
