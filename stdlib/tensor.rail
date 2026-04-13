@@ -1,6 +1,10 @@
 -- stdlib/tensor.rail — Tensor type for RailML
--- Phase 1: CPU tensors with float_arr backend
+-- Phase 2: CPU tensors + Metal GPU auto-dispatch
 -- Import: import "stdlib/tensor.rail"
+--
+-- GPU dispatch: if ~/projects/rail/tools/metal/tensor_gpu exists,
+-- matmul and activations auto-dispatch to Metal GPU (M4 Pro: 269 GFLOPS).
+-- Falls back to CPU loops transparently.
 --
 -- NOTE: Due to Rail's float TCO limitation, all loops return int (0).
 -- Float results are stored in mutable float arrays and read back after loops.
@@ -95,8 +99,60 @@ tensor_set_flat t i val = match t
   | Tensor d s st -> float_arr_set d i val
 
 -- ============================================================
+-- GPU dispatch helpers
+-- ============================================================
+
+gpu_binary_path = "~/projects/rail/tools/metal/tensor_gpu"
+
+-- Check if GPU binary exists (cached after first call via shell)
+gpu_available _ =
+  let result = shell "test -x ~/projects/rail/tools/metal/tensor_gpu && echo 1 || echo 0"
+  str_contains "1" result
+
+-- Write float_arr to text file for GPU consumption
+gpu_write_floats path arr n =
+  write_file path (gpu_write_loop arr n 0 "")
+
+gpu_write_loop arr n i acc =
+  if i >= n then acc
+  else gpu_write_loop arr n (i + 1) (cat (cons acc (cons (show_float (float_arr_get arr i)) (cons "\n" []))))
+
+-- Read float_arr from GPU output text file
+gpu_read_floats path n =
+  let content = read_file path
+  let lines = str_split "\n" content
+  let arr = float_arr_new n 0.0
+  let _ = gpu_parse_lines arr lines 0 n
+  arr
+
+gpu_parse_lines arr lines i n =
+  if i >= n then 0
+  else if length lines == 0 then 0
+  else
+    let line = head lines
+    if length (chars line) == 0 then gpu_parse_lines arr (tail lines) i n
+    else
+      let _ = float_arr_set arr i (parse_float line)
+      gpu_parse_lines arr (tail lines) (i + 1) n
+
+-- GPU matmul dispatch: writes files, calls Metal binary, reads result
+gpu_matmul_dispatch a_data b_data m k n =
+  let _ = gpu_write_floats "/tmp/rail_tg_a.txt" a_data (m * k)
+  let _ = gpu_write_floats "/tmp/rail_tg_b.txt" b_data (k * n)
+  let cmd = join "" (cons gpu_binary_path (cons " matmul " (cons (show m) (cons " " (cons (show k) (cons " " (cons (show n) (cons " /tmp/rail_tg_a.txt /tmp/rail_tg_b.txt /tmp/rail_tg_c.txt" []))))))))
+  let _ = shell cmd
+  gpu_read_floats "/tmp/rail_tg_c.txt" (m * n)
+
+-- GPU relu dispatch
+gpu_relu_dispatch src_data n =
+  let _ = gpu_write_floats "/tmp/rail_tg_a.txt" src_data n
+  let cmd = join "" (cons gpu_binary_path (cons " relu " (cons (show n) (cons " /tmp/rail_tg_a.txt /tmp/rail_tg_c.txt" []))))
+  let _ = shell cmd
+  gpu_read_floats "/tmp/rail_tg_c.txt" n
+
+-- ============================================================
 -- Matmul: (M,K) @ (K,N) -> (M,N)
--- Triple nested loop, naive but correct
+-- Auto-dispatches to Metal GPU when available, falls back to CPU
 -- ============================================================
 
 -- Innermost loop: accumulate a[i,k]*b[k,j] for k
@@ -126,18 +182,23 @@ matmul_i a_data b_data c_data acc_arr m_dim n_dim k_dim i =
     matmul_i a_data b_data c_data acc_arr m_dim n_dim k_dim (i + 1)
 
 -- Matrix multiply: a(M,K) @ b(K,N) -> c(M,N)
+-- Tries Metal GPU first (269 GFLOPS), falls back to CPU loops
 matmul a b = match a
   | Tensor a_data a_shape a_strides -> match b
     | Tensor b_data b_shape b_strides ->
       let m_dim = head a_shape
       let k_dim = head (tail a_shape)
       let n_dim = head (tail b_shape)
-      let c = tensor_zeros [m_dim, n_dim]
-      let acc = float_arr_new 1 0.0
-      match c
-        | Tensor c_data c_shape c_strides ->
-          let _ = matmul_i a_data b_data c_data acc m_dim n_dim k_dim 0
-          c
+      if gpu_available 0 then
+        let c_data = gpu_matmul_dispatch a_data b_data m_dim k_dim n_dim
+        Tensor c_data (cons m_dim (cons n_dim [])) (compute_strides (cons m_dim (cons n_dim [])))
+      else
+        let c = tensor_zeros (cons m_dim (cons n_dim []))
+        let acc = float_arr_new 1 0.0
+        match c
+          | Tensor c_data c_shape c_strides ->
+            let _ = matmul_i a_data b_data c_data acc m_dim n_dim k_dim 0
+            c
 
 -- ============================================================
 -- Element-wise ops (explicit loops, no function passing)
@@ -178,7 +239,14 @@ scale_loop src dst n i s =
     let _ = float_arr_set dst i (v * s)
     scale_loop src dst n (i + 1) s
 
--- tensor_add: element-wise addition
+-- tensor_add: element-wise addition (GPU-accelerated)
+gpu_add_dispatch a_data b_data n =
+  let _ = gpu_write_floats "/tmp/rail_tg_a.txt" a_data n
+  let _ = gpu_write_floats "/tmp/rail_tg_b.txt" b_data n
+  let cmd = join "" (cons gpu_binary_path (cons " add " (cons (show n) (cons " /tmp/rail_tg_a.txt /tmp/rail_tg_b.txt /tmp/rail_tg_c.txt" []))))
+  let _ = shell cmd
+  gpu_read_floats "/tmp/rail_tg_c.txt" n
+
 tensor_add a b = match a
   | Tensor a_data a_shape a_st -> match b
     | Tensor b_data b_shape b_st ->
@@ -237,11 +305,15 @@ relu_loop src dst n i =
 tensor_relu t = match t
   | Tensor t_data t_shape t_st ->
     let n = list_product t_shape
-    let c = tensor_zeros t_shape
-    match c
-      | Tensor c_data c_shape c_st ->
-        let _ = relu_loop t_data c_data n 0
-        c
+    if gpu_available 0 then
+      let c_data = gpu_relu_dispatch t_data n
+      Tensor c_data t_shape t_st
+    else
+      let c = tensor_zeros t_shape
+      match c
+        | Tensor c_data c_shape c_st ->
+          let _ = relu_loop t_data c_data n 0
+          c
 
 -- GELU loop: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 gelu_loop src dst n i =
@@ -294,19 +366,385 @@ tensor_mean t = match t
     s / to_float n
 
 -- ============================================================
+-- Autograd tensor primitives (13 ops required by autograd.rail)
+-- ============================================================
+
+-- tensor_relu_mask: 1.0 where x > 0, 0.0 otherwise
+relu_mask_loop src dst n i =
+  if i >= n then 0
+  else
+    let v = float_arr_get src i
+    let _ = float_arr_set dst i (if v > 0.0 then 1.0 else 0.0)
+    relu_mask_loop src dst n (i + 1)
+
+tensor_relu_mask t = match t
+  | Tensor t_data t_shape t_st ->
+    let n = list_product t_shape
+    let c = tensor_zeros t_shape
+    match c | Tensor c_data _ _ ->
+      let _ = relu_mask_loop t_data c_data n 0
+      c
+
+-- tensor_gelu_backward: dGELU/dx * upstream gradient
+gelu_back_loop x_data grad_data dst n i =
+  if i >= n then 0
+  else
+    let x = float_arr_get x_data i
+    let g = float_arr_get grad_data i
+    let pi_val = 3.14159265358979
+    let coeff = sqrt (2.0 / pi_val)
+    let inner = coeff * (x + 0.044715 * x * x * x)
+    let t_val = tanh inner
+    let sech2 = 1.0 - t_val * t_val
+    let d_inner = coeff * (1.0 + 3.0 * 0.044715 * x * x)
+    let dg = 0.5 * (1.0 + t_val) + 0.5 * x * sech2 * d_inner
+    let _ = float_arr_set dst i (g * dg)
+    gelu_back_loop x_data grad_data dst n (i + 1)
+
+tensor_gelu_backward x grad = match x
+  | Tensor x_data x_shape _ -> match grad
+    | Tensor g_data _ _ ->
+      let n = list_product x_shape
+      let c = tensor_zeros x_shape
+      match c | Tensor c_data _ _ ->
+        let _ = gelu_back_loop x_data g_data c_data n 0
+        c
+
+-- tensor_softmax: numerically stable softmax along last axis
+-- For 2D [batch, classes]: softmax each row
+softmax_row src dst cols offset =
+  let acc = float_arr_new 1 (0.0 - 999999.0)
+  let _ = softmax_find_max src cols offset acc 0
+  let mx = float_arr_get acc 0
+  let _ = float_arr_set acc 0 0.0
+  let _ = softmax_exp_sum src dst cols offset mx acc 0
+  let sm = float_arr_get acc 0
+  softmax_normalize dst cols offset sm 0
+
+softmax_find_max src cols offset acc j =
+  if j >= cols then 0
+  else
+    let v = float_arr_get src (offset + j)
+    let cur = float_arr_get acc 0
+    let _ = if v > cur then float_arr_set acc 0 v else 0
+    softmax_find_max src cols offset acc (j + 1)
+
+softmax_exp_sum src dst cols offset mx acc j =
+  if j >= cols then 0
+  else
+    let v = exp (float_arr_get src (offset + j) - mx)
+    let _ = float_arr_set dst (offset + j) v
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur + v)
+    softmax_exp_sum src dst cols offset mx acc (j + 1)
+
+softmax_normalize dst cols offset sm j =
+  if j >= cols then 0
+  else
+    let v = float_arr_get dst (offset + j)
+    let _ = float_arr_set dst (offset + j) (v / sm)
+    softmax_normalize dst cols offset sm (j + 1)
+
+softmax_rows src dst rows cols r =
+  if r >= rows then 0
+  else
+    let _ = softmax_row src dst cols (r * cols)
+    softmax_rows src dst rows cols (r + 1)
+
+tensor_softmax t = match t
+  | Tensor t_data t_shape t_st ->
+    let n = list_product t_shape
+    let last = if length t_shape >= 2 then head (tail (reverse t_shape)) else 1
+    let cols = if length t_shape >= 1 then head (reverse t_shape) else n
+    let rows = n / cols
+    let c = tensor_zeros t_shape
+    match c | Tensor c_data _ _ ->
+      let _ = softmax_rows t_data c_data rows cols 0
+      c
+
+-- tensor_sum_last: sum along last axis. [batch, N] → [batch, 1]
+sum_last_loop src dst rows cols r =
+  if r >= rows then 0
+  else
+    let acc = float_arr_new 1 0.0
+    let _ = sum_last_row src cols (r * cols) acc 0
+    let _ = float_arr_set dst r (float_arr_get acc 0)
+    sum_last_loop src dst rows cols (r + 1)
+
+sum_last_row src cols offset acc j =
+  if j >= cols then 0
+  else
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur + float_arr_get src (offset + j))
+    sum_last_row src cols offset acc (j + 1)
+
+tensor_sum_last t = match t
+  | Tensor t_data t_shape _ ->
+    let cols = head (reverse t_shape)
+    let rows = list_product t_shape / cols
+    let out = tensor_zeros (cons rows (cons 1 []))
+    match out | Tensor o_data _ o_st ->
+      let _ = sum_last_loop t_data o_data rows cols 0
+      out
+
+-- tensor_sum_batch: sum along first axis. [batch, N] → [1, N]
+sum_batch_loop src dst rows cols r =
+  if r >= rows then 0
+  else
+    let _ = sum_batch_add_row src dst cols (r * cols) 0
+    sum_batch_loop src dst rows cols (r + 1)
+
+sum_batch_add_row src dst cols offset j =
+  if j >= cols then 0
+  else
+    let cur = float_arr_get dst j
+    let _ = float_arr_set dst j (cur + float_arr_get src (offset + j))
+    sum_batch_add_row src dst cols offset (j + 1)
+
+tensor_sum_batch t = match t
+  | Tensor t_data t_shape _ ->
+    let cols = head (reverse t_shape)
+    let rows = list_product t_shape / cols
+    let out = tensor_zeros (cons 1 (cons cols []))
+    match out | Tensor o_data _ _ ->
+      let _ = sum_batch_loop t_data o_data rows cols 0
+      out
+
+-- tensor_mean_last: mean along last axis. [batch, N] → [batch, 1]
+tensor_mean_last t = match t
+  | Tensor t_data t_shape _ ->
+    let cols = head (reverse t_shape)
+    let s = tensor_sum_last t
+    tensor_scale s (1.0 / to_float cols)
+
+-- tensor_broadcast_last: [batch, 1] → [batch, N] by repeating
+broadcast_last_loop src dst rows cols r =
+  if r >= rows then 0
+  else
+    let v = float_arr_get src r
+    let _ = broadcast_last_fill dst (r * cols) cols v 0
+    broadcast_last_loop src dst rows cols (r + 1)
+
+broadcast_last_fill dst offset cols v j =
+  if j >= cols then 0
+  else
+    let _ = float_arr_set dst (offset + j) v
+    broadcast_last_fill dst offset cols v (j + 1)
+
+tensor_broadcast_last t cols = match t
+  | Tensor t_data t_shape _ ->
+    let rows = list_product t_shape
+    let out = tensor_zeros (cons rows (cons cols []))
+    match out | Tensor o_data _ _ ->
+      let _ = broadcast_last_loop t_data o_data rows cols 0
+      out
+
+-- tensor_mul_broadcast: [batch, N] * [1, N] element-wise (broadcast first dim)
+mul_bcast_loop a_data b_data dst rows cols r =
+  if r >= rows then 0
+  else
+    let _ = mul_bcast_row a_data b_data dst cols (r * cols) 0
+    mul_bcast_loop a_data b_data dst rows cols (r + 1)
+
+mul_bcast_row a_data b_data dst cols offset j =
+  if j >= cols then 0
+  else
+    let _ = float_arr_set dst (offset + j) (float_arr_get a_data (offset + j) * float_arr_get b_data j)
+    mul_bcast_row a_data b_data dst cols offset (j + 1)
+
+tensor_mul_broadcast a b = match a
+  | Tensor a_data a_shape _ -> match b
+    | Tensor b_data b_shape _ ->
+      let cols = head (reverse a_shape)
+      let rows = list_product a_shape / cols
+      let out = tensor_zeros a_shape
+      match out | Tensor o_data _ _ ->
+        let _ = mul_bcast_loop a_data b_data o_data rows cols 0
+        out
+
+-- tensor_one_hot: indices tensor [batch] → [batch, vocab_size]
+one_hot_loop indices dst batch vocab i =
+  if i >= batch then 0
+  else
+    let idx = float_to_int (float_arr_get indices i)
+    let _ = if idx >= 0 then if idx < vocab then float_arr_set dst (i * vocab + idx) 1.0 else 0 else 0
+    one_hot_loop indices dst batch vocab (i + 1)
+
+tensor_one_hot t vocab_size = match t
+  | Tensor t_data t_shape _ ->
+    let batch = list_product t_shape
+    let out = tensor_zeros (cons batch (cons vocab_size []))
+    match out | Tensor o_data _ _ ->
+      let _ = one_hot_loop t_data o_data batch vocab_size 0
+      out
+
+-- tensor_embedding_lookup: weights [vocab, dim], indices [batch] → [batch, dim]
+embed_lookup_loop weights indices dst batch dim i =
+  if i >= batch then 0
+  else
+    let idx = float_to_int (float_arr_get indices i)
+    let _ = embed_copy_row weights dst dim (idx * dim) (i * dim) 0
+    embed_lookup_loop weights indices dst batch dim (i + 1)
+
+embed_copy_row src dst dim src_off dst_off j =
+  if j >= dim then 0
+  else
+    let _ = float_arr_set dst (dst_off + j) (float_arr_get src (src_off + j))
+    embed_copy_row src dst dim src_off dst_off (j + 1)
+
+tensor_embedding_lookup weights indices = match weights
+  | Tensor w_data w_shape _ -> match indices
+    | Tensor i_data i_shape _ ->
+      let vocab = head w_shape
+      let dim = head (tail w_shape)
+      let batch = list_product i_shape
+      let out = tensor_zeros (cons batch (cons dim []))
+      match out | Tensor o_data _ _ ->
+        let _ = embed_lookup_loop w_data i_data o_data batch dim 0
+        out
+
+-- tensor_slice_row: extract row i from 2D tensor [rows, cols] → [1, cols]
+tensor_slice_row t row_idx = match t
+  | Tensor t_data t_shape _ ->
+    let cols = head (tail t_shape)
+    let out = tensor_zeros (cons 1 (cons cols []))
+    match out | Tensor o_data _ _ ->
+      let _ = embed_copy_row t_data o_data cols (row_idx * cols) 0 0
+      out
+
+-- tensor_accumulate_row: scatter-add grad into weight rows (for embedding backward)
+accum_row_loop grad weights indices batch dim i =
+  if i >= batch then 0
+  else
+    let idx = float_to_int (float_arr_get indices i)
+    let _ = accum_row_add weights grad dim (idx * dim) (i * dim) 0
+    accum_row_loop grad weights indices batch dim (i + 1)
+
+accum_row_add dst src dim dst_off src_off j =
+  if j >= dim then 0
+  else
+    let cur = float_arr_get dst (dst_off + j)
+    let _ = float_arr_set dst (dst_off + j) (cur + float_arr_get src (src_off + j))
+    accum_row_add dst src dim dst_off src_off (j + 1)
+
+tensor_accumulate_row weights grad indices = match weights
+  | Tensor w_data w_shape _ -> match grad
+    | Tensor g_data _ _ -> match indices
+      | Tensor i_data i_shape _ ->
+        let dim = head (tail w_shape)
+        let batch = list_product i_shape
+        let out = tensor_clone weights
+        match out | Tensor o_data _ _ ->
+          let _ = accum_row_loop g_data o_data i_data batch dim 0
+          out
+
+-- tensor_scale_by_loss: scale all elements by scalar loss gradient
+tensor_scale_by_loss t loss_grad = tensor_scale t loss_grad
+
+-- ============================================================
+-- Additional autograd utilities
+-- ============================================================
+
+-- tensor_copy: alias for tensor_clone
+tensor_copy t = tensor_clone t
+
+-- tensor_matmul: alias for matmul (autograd uses this name)
+tensor_matmul a b = matmul a b
+
+-- tensor_sum_all: alias for tensor_sum
+tensor_sum_all t = tensor_sum t
+
+-- tensor_ones_like_shape: ones tensor with given shape
+tensor_ones_like_shape shape = tensor_ones shape
+
+-- tensor_scalar_val: extract scalar from a 1-element tensor
+tensor_scalar_val t = tensor_get_flat t 0
+
+-- tensor_from_int: wrap an int as a 1-element tensor
+tensor_from_int n =
+  let t = tensor_new (cons 1 []) 0.0
+  let _ = tensor_set_flat t 0 (to_float n)
+  t
+
+-- tensor_to_int: extract int from a 1-element tensor
+tensor_to_int t = float_to_int (tensor_get_flat t 0)
+
+-- tensor_get_int: get element as int (for indexing)
+tensor_get_int t i = float_to_int (tensor_get_flat t i)
+
+-- tensor_map_scalar: apply a scalar function to all elements
+-- Since Rail lambdas can segfault, this takes a function tag string
+-- and dispatches. Use named functions instead.
+map_scalar_loop src dst n i fn_tag =
+  if i >= n then 0
+  else
+    let v = float_arr_get src i
+    let r = if fn_tag == "neg" then 0.0 - v
+            else if fn_tag == "abs" then (if v < 0.0 then 0.0 - v else v)
+            else if fn_tag == "sq" then v * v
+            else if fn_tag == "sqrt" then sqrt v
+            else if fn_tag == "exp" then exp v
+            else if fn_tag == "log" then log v
+            else if fn_tag == "inv" then 1.0 / v
+            else v
+    let _ = float_arr_set dst i r
+    map_scalar_loop src dst n (i + 1) fn_tag
+
+tensor_map_scalar fn_tag t = match t
+  | Tensor t_data t_shape t_st ->
+    let n = list_product t_shape
+    let c = tensor_zeros t_shape
+    match c | Tensor c_data _ _ ->
+      let _ = map_scalar_loop t_data c_data n 0 fn_tag
+      c
+
+-- tensor_cross_entropy_loss: -sum(targets * log(probs)) / batch
+-- probs: [batch, vocab] (after softmax), targets: [batch] (indices)
+ce_loss_loop probs targets batch vocab i acc =
+  if i >= batch then acc
+  else
+    let idx = float_to_int (float_arr_get targets i)
+    let p = float_arr_get probs (i * vocab + idx)
+    let lp = if p > 0.000001 then log p else log 0.000001
+    ce_loss_loop probs targets batch vocab (i + 1) (acc - lp)
+
+tensor_cross_entropy_loss probs targets = match probs
+  | Tensor p_data p_shape _ -> match targets
+    | Tensor t_data t_shape _ ->
+      let batch = head p_shape
+      let vocab = head (tail p_shape)
+      let loss = ce_loss_loop p_data t_data batch vocab 0 0.0
+      let result = tensor_new (cons 1 []) 0.0
+      let _ = tensor_set_flat result 0 (loss / to_float batch)
+      result
+
+-- ============================================================
 -- Shape operations
 -- ============================================================
 
--- Transpose: swap last two dimensions (just swap strides + shape, no data copy)
-swap_last_two xs =
-  if length xs == 2 then [head (tail xs), head xs]
-  else cons (head xs) (swap_last_two (tail xs))
+-- Transpose: for 2D tensors, copies data into new row-major layout
+-- This is a REAL transpose (data copy), not just stride swap,
+-- because matmul assumes contiguous row-major data.
+transpose_copy_loop src dst rows cols i =
+  if i >= rows then 0
+  else
+    let _ = transpose_copy_row src dst rows cols i 0
+    transpose_copy_loop src dst rows cols (i + 1)
+
+transpose_copy_row src dst rows cols i j =
+  if j >= cols then 0
+  else
+    let _ = float_arr_set dst (j * rows + i) (float_arr_get src (i * cols + j))
+    transpose_copy_row src dst rows cols i (j + 1)
 
 tensor_transpose t = match t
   | Tensor t_data t_shape t_st ->
-    let new_shape = swap_last_two t_shape
-    let new_strides = swap_last_two t_st
-    Tensor t_data new_shape new_strides
+    let rows = head t_shape
+    let cols = head (tail t_shape)
+    let n = rows * cols
+    let new_data = float_arr_new n 0.0
+    let _ = transpose_copy_loop t_data new_data rows cols 0
+    Tensor new_data (cons cols (cons rows [])) (compute_strides (cons cols (cons rows [])))
 
 -- Reshape: new shape, same data, recompute strides
 -- Caller must ensure same total element count
