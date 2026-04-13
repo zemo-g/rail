@@ -19,12 +19,12 @@ Started 2026-04-13. Every upgrade, ranked and tracked.
 ## EASY (1-4 hours)
 
 - [ ] GPU dispatch for ALL remaining tensor ops (sigmoid, tanh, exp, softmax, transpose, SGD, cross-entropy, relu_backward)
-- [ ] tensor_gpu as persistent daemon (named pipe, eliminate Metal init per call)
+- [x] tensor_gpu as persistent daemon — TCP on :9300, auto-fallback to file mode (2026-04-13)
 - [ ] Binary pipe GPU protocol from Rail (byte_at/byte_set headers)
 - [x] Deploy ramjet_3d.html to ledatic.org/plasma/thruster3d (2026-04-13)
 - [ ] MHD solver: adaptive steps_per_frame (if frame <10ms, double steps)
 - [ ] Validation scatter plot in thruster engine Validate tab
-- [ ] parse_int as compiler builtin (call _strtol, 10x faster)
+- [x] parse_int as compiler builtin — _strtol via _str_unwrap (2026-04-13)
 - [ ] Float self-loop TCO for d8-d15 callee-saved registers
 
 ## MEDIUM (1-2 days) — THE 13 TENSOR PRIMITIVES
