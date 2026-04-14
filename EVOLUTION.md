@@ -64,7 +64,11 @@ First training run: XOR MLP loss 0.425→0.043 on Metal GPU.
 
 ## MEDIUM (1-2 days) — OTHER
 
-- [ ] dlopen GPU dispatch (tensor_gpu.dylib, zero-copy via unified memory)
+- [x] dlopen GPU dispatch — libtensor_gpu.dylib with C ABI, tensor.rail
+      auto-detects and uses FFI path when dylib present. Zero-copy for
+      float_arr payload. Fixed ObjC runtime init with `__attribute__((constructor))`
+      and absolute install_name. XOR network converges to machine precision
+      in 500 steps (loss 0.38 → 8.88e-16). (2026-04-13)
 - [ ] Wire self_train.rail to tensor.rail (kill Python/MLX dependency)
 - [ ] WASM: add float_arr support to WASM backend, port mhd.rail
 - [ ] Full 2D MHD replacing parametric model in thruster_engine.html (WebGL compute)
