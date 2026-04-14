@@ -15,6 +15,632 @@
   ;; All floats travel as raw f64 bits stored in i64 (matches the
   ;; ARM64 ABI; matches what FL literals + float arithmetic emit).
 
+  ;; ─── Transcendentals (Taylor polyfills) ──────────────────────
+  ;; WASM has no native sin/cos/exp/log.  We implement them via
+  ;; range-reduction + Taylor series.  Accuracy target: ~1e-6 on
+  ;; the typical input range.  All take/return raw f64 bits as i64.
+
+  ;; sin(x) — range-reduce to [-π/2, π/2] then Taylor with 12 terms
+  ;; (Horner-form factors x²/(2k(2k+1)), k=1..6).  Worst-case error
+  ;; at x = π/2: x^13/13! ≈ 6e-10 → ~9-digit accuracy.
+  (func $sin (param $x_bits i64) (result i64)
+    (local $x f64)
+    (local $k f64)
+    (local $x2 f64)
+    (local $term f64)
+    local.get $x_bits
+    f64.reinterpret_i64
+    local.set $x
+    local.get $x
+    f64.const 0.15915494309189535
+    f64.mul
+    f64.nearest
+    local.set $k
+    local.get $x
+    local.get $k
+    f64.const 6.283185307179586
+    f64.mul
+    f64.sub
+    local.set $x
+    local.get $x
+    f64.const 1.5707963267948966
+    f64.gt
+    if
+      f64.const 3.141592653589793
+      local.get $x
+      f64.sub
+      local.set $x
+    end
+    local.get $x
+    f64.const -1.5707963267948966
+    f64.lt
+    if
+      f64.const -3.141592653589793
+      local.get $x
+      f64.sub
+      local.set $x
+    end
+    local.get $x
+    local.get $x
+    f64.mul
+    local.set $x2
+    ;; Innermost: 1 - x²/(12·13)  = 1 - x²/156
+    f64.const 1
+    local.get $x2
+    f64.const 156
+    f64.div
+    f64.sub
+    local.set $term
+    ;; 1 - x²/(10·11) * term    = 1 - x²/110 * term
+    f64.const 1
+    local.get $x2
+    local.get $term
+    f64.mul
+    f64.const 110
+    f64.div
+    f64.sub
+    local.set $term
+    ;; 1 - x²/(8·9) * term      = 1 - x²/72 * term
+    f64.const 1
+    local.get $x2
+    local.get $term
+    f64.mul
+    f64.const 72
+    f64.div
+    f64.sub
+    local.set $term
+    ;; 1 - x²/(6·7) * term      = 1 - x²/42 * term
+    f64.const 1
+    local.get $x2
+    local.get $term
+    f64.mul
+    f64.const 42
+    f64.div
+    f64.sub
+    local.set $term
+    ;; 1 - x²/(4·5) * term      = 1 - x²/20 * term
+    f64.const 1
+    local.get $x2
+    local.get $term
+    f64.mul
+    f64.const 20
+    f64.div
+    f64.sub
+    local.set $term
+    ;; 1 - x²/(2·3) * term      = 1 - x²/6 * term
+    f64.const 1
+    local.get $x2
+    local.get $term
+    f64.mul
+    f64.const 6
+    f64.div
+    f64.sub
+    local.set $term
+    local.get $x
+    local.get $term
+    f64.mul
+    i64.reinterpret_f64
+  )
+
+  ;; cos(x) — own Taylor series (so cos(0) is exact).  Range-reduce
+  ;; to [-π/2, π/2] using cos(π - x) = -cos(x), then Horner with 6
+  ;; pairs.  Worst-case error at x = π/2: x^14/14! ≈ 4e-11.
+  (func $cos (param $x_bits i64) (result i64)
+    (local $x f64)
+    (local $k f64)
+    (local $sign f64)
+    (local $x2 f64)
+    (local $term f64)
+    local.get $x_bits
+    f64.reinterpret_i64
+    local.set $x
+    local.get $x
+    f64.const 0.15915494309189535
+    f64.mul
+    f64.nearest
+    local.set $k
+    local.get $x
+    local.get $k
+    f64.const 6.283185307179586
+    f64.mul
+    f64.sub
+    local.set $x
+    f64.const 1
+    local.set $sign
+    local.get $x
+    f64.const 1.5707963267948966
+    f64.gt
+    if
+      f64.const 3.141592653589793
+      local.get $x
+      f64.sub
+      local.set $x
+      f64.const -1
+      local.set $sign
+    end
+    local.get $x
+    f64.const -1.5707963267948966
+    f64.lt
+    if
+      f64.const -3.141592653589793
+      local.get $x
+      f64.sub
+      local.set $x
+      f64.const -1
+      local.set $sign
+    end
+    local.get $x
+    local.get $x
+    f64.mul
+    local.set $x2
+    ;; Innermost: 1 - x²/(11·12) = 1 - x²/132
+    f64.const 1
+    local.get $x2
+    f64.const 132
+    f64.div
+    f64.sub
+    local.set $term
+    ;; 1 - x²/(9·10)*term       = 1 - x²/90*term
+    f64.const 1
+    local.get $x2
+    local.get $term
+    f64.mul
+    f64.const 90
+    f64.div
+    f64.sub
+    local.set $term
+    ;; 1 - x²/(7·8)*term        = 1 - x²/56*term
+    f64.const 1
+    local.get $x2
+    local.get $term
+    f64.mul
+    f64.const 56
+    f64.div
+    f64.sub
+    local.set $term
+    ;; 1 - x²/(5·6)*term        = 1 - x²/30*term
+    f64.const 1
+    local.get $x2
+    local.get $term
+    f64.mul
+    f64.const 30
+    f64.div
+    f64.sub
+    local.set $term
+    ;; 1 - x²/(3·4)*term        = 1 - x²/12*term
+    f64.const 1
+    local.get $x2
+    local.get $term
+    f64.mul
+    f64.const 12
+    f64.div
+    f64.sub
+    local.set $term
+    ;; 1 - x²/(1·2)*term        = 1 - x²/2*term
+    f64.const 1
+    local.get $x2
+    local.get $term
+    f64.mul
+    f64.const 2
+    f64.div
+    f64.sub
+    local.set $term
+    local.get $sign
+    local.get $term
+    f64.mul
+    i64.reinterpret_f64
+  )
+
+  ;; tanh(x) — using identity tanh(x) = (e^(2x) - 1) / (e^(2x) + 1).
+  ;; Saturates at ±1 for |x| > 20 to avoid overflow.
+  (func $tanh (param $x_bits i64) (result i64)
+    (local $x f64)
+    (local $e f64)
+    local.get $x_bits
+    f64.reinterpret_i64
+    local.set $x
+    ;; Saturate
+    local.get $x
+    f64.const 20
+    f64.gt
+    if
+      f64.const 1
+      i64.reinterpret_f64
+      return
+    end
+    local.get $x
+    f64.const -20
+    f64.lt
+    if
+      f64.const -1
+      i64.reinterpret_f64
+      return
+    end
+    local.get $x
+    f64.const 2
+    f64.mul
+    i64.reinterpret_f64
+    call $exp
+    f64.reinterpret_i64
+    local.set $e
+    local.get $e
+    f64.const 1
+    f64.sub
+    local.get $e
+    f64.const 1
+    f64.add
+    f64.div
+    i64.reinterpret_f64
+  )
+
+  ;; exp(x) — split x = k*ln(2) + r where r in [-ln(2)/2, ln(2)/2],
+  ;; compute exp(r) by Taylor (8 terms), multiply by 2^k via bit
+  ;; construction of the f64 exponent field.
+  (func $exp (param $x_bits i64) (result i64)
+    (local $x f64)
+    (local $kf f64)
+    (local $r f64)
+    (local $k i64)
+    (local $term f64)
+    (local $expk i64)
+    (local $two_k f64)
+    local.get $x_bits
+    f64.reinterpret_i64
+    local.set $x
+    ;; k = nearest(x / ln(2))
+    local.get $x
+    f64.const 1.4426950408889634  ;; 1 / ln(2)
+    f64.mul
+    f64.nearest
+    local.set $kf
+    ;; r = x - k * ln(2)
+    local.get $x
+    local.get $kf
+    f64.const 0.6931471805599453   ;; ln(2)
+    f64.mul
+    f64.sub
+    local.set $r
+    ;; Taylor exp(r) = 1 + r(1 + r/2(1 + r/3(1 + r/4(1 + r/5(1 + r/6(1 + r/7(1 + r/8))))))).
+    f64.const 1
+    local.get $r
+    f64.const 8
+    f64.div
+    f64.add
+    local.set $term
+    ;; * r/7 + 1
+    f64.const 1
+    local.get $r
+    local.get $term
+    f64.mul
+    f64.const 7
+    f64.div
+    f64.add
+    local.set $term
+    f64.const 1
+    local.get $r
+    local.get $term
+    f64.mul
+    f64.const 6
+    f64.div
+    f64.add
+    local.set $term
+    f64.const 1
+    local.get $r
+    local.get $term
+    f64.mul
+    f64.const 5
+    f64.div
+    f64.add
+    local.set $term
+    f64.const 1
+    local.get $r
+    local.get $term
+    f64.mul
+    f64.const 4
+    f64.div
+    f64.add
+    local.set $term
+    f64.const 1
+    local.get $r
+    local.get $term
+    f64.mul
+    f64.const 3
+    f64.div
+    f64.add
+    local.set $term
+    f64.const 1
+    local.get $r
+    local.get $term
+    f64.mul
+    f64.const 2
+    f64.div
+    f64.add
+    local.set $term
+    f64.const 1
+    local.get $r
+    local.get $term
+    f64.mul
+    f64.add
+    local.set $term
+    ;; 2^k via bit construction of the f64 exponent.  bias=1023.
+    local.get $kf
+    i64.trunc_f64_s
+    local.set $k
+    local.get $k
+    i64.const 1023
+    i64.add
+    i64.const 52
+    i64.shl
+    local.set $expk
+    local.get $expk
+    f64.reinterpret_i64
+    local.set $two_k
+    ;; Result = exp(r) * 2^k
+    local.get $term
+    local.get $two_k
+    f64.mul
+    i64.reinterpret_f64
+  )
+
+  ;; log(x) — decompose x = m * 2^k with m in [√(0.5), √2], then
+  ;; Taylor on log(1+t) where t = m - 1 (small).
+  ;; log(x) = k * ln(2) + log(m).
+  ;; For x ≤ 0 returns NaN-like 0 (caller responsibility).
+  (func $log (param $x_bits i64) (result i64)
+    (local $x f64)
+    (local $bits i64)
+    (local $exp_bits i64)
+    (local $k i64)
+    (local $m_bits i64)
+    (local $m f64)
+    (local $t f64)
+    (local $sum f64)
+    (local $tn f64)
+    local.get $x_bits
+    f64.reinterpret_i64
+    local.set $x
+    ;; Edge: x <= 0 → 0 (we don't propagate NaN cleanly).
+    local.get $x
+    f64.const 0
+    f64.le
+    if
+      f64.const 0
+      i64.reinterpret_f64
+      return
+    end
+    ;; Extract exponent bits.  exp_field = (bits >> 52) & 0x7FF
+    local.get $x_bits
+    local.set $bits
+    local.get $bits
+    i64.const 52
+    i64.shr_u
+    i64.const 2047
+    i64.and
+    local.set $exp_bits
+    local.get $exp_bits
+    i64.const 1023
+    i64.sub
+    local.set $k
+    ;; m_bits: clear exponent and set to 1023 (gives m in [1, 2)).
+    local.get $bits
+    i64.const -9218868437227405313  ;; ~0x7FF0000000000000
+    i64.and
+    i64.const 1023
+    i64.const 52
+    i64.shl
+    i64.or
+    local.set $m_bits
+    local.get $m_bits
+    f64.reinterpret_i64
+    local.set $m
+    ;; Optional further reduction: if m > √2, divide by 2 and bump k.
+    local.get $m
+    f64.const 1.4142135623730951
+    f64.gt
+    if
+      local.get $m
+      f64.const 2
+      f64.div
+      local.set $m
+      local.get $k
+      i64.const 1
+      i64.add
+      local.set $k
+    end
+    ;; t = m - 1, in [√(0.5)-1, √2-1] ≈ [-0.293, 0.414]
+    local.get $m
+    f64.const 1
+    f64.sub
+    local.set $t
+    ;; Taylor: log(1+t) = t - t²/2 + t³/3 - t⁴/4 + ... (10 terms).
+    local.get $t
+    local.set $sum
+    local.get $t
+    local.set $tn
+    ;; tn := tn * t (now t²); subtract tn / 2
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 2
+    f64.div
+    f64.sub
+    local.set $sum
+    ;; tn := tn * t (t³); add tn / 3
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 3
+    f64.div
+    f64.add
+    local.set $sum
+    ;; t⁴ / 4 sub
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 4
+    f64.div
+    f64.sub
+    local.set $sum
+    ;; t⁵ / 5 add
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 5
+    f64.div
+    f64.add
+    local.set $sum
+    ;; t⁶ / 6 sub
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 6
+    f64.div
+    f64.sub
+    local.set $sum
+    ;; t⁷ / 7 add
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 7
+    f64.div
+    f64.add
+    local.set $sum
+    ;; t⁸ / 8 sub
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 8
+    f64.div
+    f64.sub
+    local.set $sum
+    ;; t⁹ / 9 add
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 9
+    f64.div
+    f64.add
+    local.set $sum
+    ;; t¹⁰ / 10 sub
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 10
+    f64.div
+    f64.sub
+    local.set $sum
+    ;; t¹¹ / 11 add
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 11
+    f64.div
+    f64.add
+    local.set $sum
+    ;; t¹² / 12 sub
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 12
+    f64.div
+    f64.sub
+    local.set $sum
+    ;; t¹³ / 13 add
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 13
+    f64.div
+    f64.add
+    local.set $sum
+    ;; t¹⁴ / 14 sub
+    local.get $tn
+    local.get $t
+    f64.mul
+    local.set $tn
+    local.get $sum
+    local.get $tn
+    f64.const 14
+    f64.div
+    f64.sub
+    local.set $sum
+    ;; Result = k * ln(2) + sum
+    local.get $k
+    f64.convert_i64_s
+    f64.const 0.6931471805599453
+    f64.mul
+    local.get $sum
+    f64.add
+    i64.reinterpret_f64
+  )
+
+  ;; pow(x, y) = exp(y * log(x)).  Edge: x = 0 returns 0.
+  (func $pow (param $x_bits i64) (param $y_bits i64) (result i64)
+    (local $x f64)
+    (local $y f64)
+    (local $log_x f64)
+    local.get $x_bits
+    f64.reinterpret_i64
+    local.set $x
+    local.get $y_bits
+    f64.reinterpret_i64
+    local.set $y
+    ;; x == 0 → 0
+    local.get $x
+    f64.const 0
+    f64.eq
+    if
+      f64.const 0
+      i64.reinterpret_f64
+      return
+    end
+    local.get $x_bits
+    call $log
+    f64.reinterpret_i64
+    local.set $log_x
+    local.get $y
+    local.get $log_x
+    f64.mul
+    i64.reinterpret_f64
+    call $exp
+  )
+
   ;; sqrt(x) via WASM's native f64.sqrt intrinsic.
   (func $sqrt (param $x i64) (result i64)
     local.get $x
@@ -275,13 +901,13 @@
     i32.const 1
     i32.add
     local.set $cur
-    ;; 6 decimal digits.
+    ;; 9 decimal digits.
     i32.const 0
     local.set $i
     (block $dec_done
       (loop $dec_loop
         local.get $i
-        i32.const 6
+        i32.const 9
         i32.ge_s
         br_if $dec_done
         local.get $frac

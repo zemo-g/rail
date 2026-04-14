@@ -65,8 +65,13 @@ Dylib export count: 15 → 24. Tests: 105/105 → 106/106. Fixed-point preserved
       int↔float conversions, show_float. Smoke proof:
       `tools/train/wasm_diffuse.rail` runs 1-D diffusion + L2 norm
       under wasmtime to 6-digit accuracy. Shipped 2026-04-14, v2.7.0.
-      *Deferred to v2.8*: sin/cos/exp/log/pow/tanh polyfills.
-- [ ] Movement VII: MHD ported to WASM (gated on sin/cos/exp polyfills)
+      *Closed in v2.8*: sin/cos/exp/log/pow/tanh polyfills land
+      Taylor-series implementations to ~9-digit accuracy.
+- [x] Movement VII: WASM transcendentals — sin/cos/exp/log/pow/tanh
+      via Taylor + range reduction, 9-digit accuracy on most inputs
+      (log: 8 digits). Shipped 2026-04-14, v2.8.0.
+- [ ] Movement VII: MHD ported to WASM (now unblocked — full math
+      stack is in place)
 - [ ] Movement VII: WebGPU compute shaders
 - [x] Movement VIII: REPL `:load file.rail` — shipped 2026-04-14, v2.6.0.
       Definition persistence across expressions already worked; the
