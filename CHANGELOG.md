@@ -2,6 +2,64 @@
 
 All notable changes to Rail are documented here.
 
+## v2.5.0 (2026-04-14) — *Pre-norm transformer block*
+
+Adds the missing transformer infrastructure: **LayerNorm forward+backward,
+residual connections, and FFN block**.  All gradients verified against
+finite differences (LN 9/9, attention 18/18).  The v2.4 single-head
+attention LM grows into a proper pre-norm transformer block.
+
+### LayerNorm
+- **`stdlib/transformer.rail::layernorm_save`** — forward variant that
+  returns `(y, mean, rstd)`, populating two extra float_arrs of length
+  `n_rows` for use by backward.
+- **`stdlib/transformer.rail::layernorm_backward_dx`** — Rail wrapper
+  around the existing `tgl_layernorm_backward_f64` dylib export.
+  Returns dx as a Tensor.  γ/β fixed at (1, 0) for v2.5; learnable
+  γ/β + dgamma/dbeta accumulation queued for v2.6.
+- **Hot fix in `layernorm_rows`.**  Same `0.0 + dim` bug pattern as
+  `head_dim` in v2.4 — `dim` extracted from the shape list via
+  `head (reverse x_shape)` was being passed to `+` as a tagged int,
+  producing subnormal-bit divisions.  All forward LN was returning nan
+  before this.  Replaced with explicit `int_to_float`.
+- **`tools/train/layernorm_gradcheck.rail`** — central-difference
+  gradcheck on dx for n_rows=3, dim=3.  All 9 slots PASS at f32
+  tolerance (analytic and numerical agree to ~1e-13 absolute).
+
+### Pre-norm transformer block
+- **`tools/train/lm_transformer.rail`** — full pre-norm block:
+  ```
+  ln1   = LayerNorm(x_pe)
+  attn  = causal_self_attention(ln1)
+  x_attn = x_pe + attn          ← residual #1
+  ln2   = LayerNorm(x_attn)
+  ffn   = ReLU(ln2 @ W_F1) @ W_F2
+  x_blk = x_attn + ffn          ← residual #2
+  logits = x_blk @ W_O
+  ```
+  7 trainable parameter tensors (W_E, W_Q, W_K, W_V, W_O, W_F1, W_F2),
+  Adam updates on every one.  Backward chains through residuals, FFN,
+  LN2, attention, LN1, and embedding — all composing existing
+  primitives, no new GPU kernels.
+
+### Result on the v2.3/v2.4 test bench
+| Run | Loss | vs uniform 3.47 | vs bigram 2.10 | vs v2.4 attn-only 2.62 |
+|---|---|---|---|---|
+| v2.5 pre-norm + LN + FFN, 500 steps, lr=0.05 | **2.90** | beats | does not beat | does not beat |
+
+The architecture is mathematically correct (gradchecks pass) and trains
+stably, but on this 383-char corpus the added LN + FFN complexity does
+not outperform the simpler v2.4 architecture.  This is a known
+small-data / small-model phenomenon — closing the gap is queued for
+v2.6+ (learnable γ/β, multi-head attention, larger d_model, regular
+weight decay, longer training).
+
+### Counters
+- Dylib export count: 25 (unchanged).
+- Tests: 106/106.
+- Fixed-point self-compile: preserved.
+- Numerical gradchecks: attention 18/18, LN 9/9.
+
 ## v2.4.0 (2026-04-14) — *Movement V: attention end-to-end*
 
 Closes the transformer-training spine: **attention backward + a

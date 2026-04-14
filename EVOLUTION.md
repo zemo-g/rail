@@ -34,6 +34,9 @@ Dylib export count: 15 → 24. Tests: 105/105 → 106/106. Fixed-point preserved
 - [x] Movement V: single-head causal transformer LM trains end-to-end
       on Shakespeare — `tools/train/lm_transformer.rail`, loss
       15.2→2.62 in 300 Adam steps, beats uniform 3.47 (2026-04-14)
+- [x] Movement V.5: layernorm fwd+bwd + residual + FFN composing into
+      the LM. LN backward 9/9 gradcheck. Loss 2.90 (plateaus above v2.4
+      on tiny corpus — optimization not architecture) (2026-04-14, v2.5.0)
 - [x] Movement III.1: Adam optimizer — fused GPU kernel, `stdlib/optim.rail`,
       XOR → 3.78e-10 in 200 steps (2026-04-14)
 - [x] Movement III.2: cosine_decay LR schedule + clip_grad_norm in
