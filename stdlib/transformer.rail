@@ -130,7 +130,7 @@ scaled_dot_attention q k v = match q
         let head_dim = head (tail q_shape)
         let k_t = tensor_transpose k                    -- [head_dim, seq]
         let scores = matmul q k_t                       -- [seq, seq]
-        let scale = 1.0 / sqrt (0.0 + head_dim)
+        let scale = 1.0 / sqrt (int_to_float head_dim)
         let scaled = tensor_scale scores scale
         let attn = tensor_softmax scaled
         matmul attn v                                    -- [seq, head_dim]
@@ -155,12 +155,65 @@ scaled_dot_attention_causal q k v = match q
         let head_dim = head (tail q_shape)
         let k_t = tensor_transpose k
         let scores = matmul q k_t
-        let scale = 1.0 / sqrt (0.0 + head_dim)
+        let scale = 1.0 / sqrt (int_to_float head_dim)
         let scaled = tensor_scale scores scale
         match scaled | Tensor sd_data sd_shape sd_st ->
           let _ = apply_causal_mask_loop sd_data seq 0 0
           let attn = tensor_softmax scaled
           matmul attn v
+
+-- ────────────────────────────────────────────────────────
+-- Attention backward (single head, no mask)
+-- Given the saved forward activations and the upstream gradient dO,
+-- produce dQ, dK, dV.  Assumes `attn` is the softmax output (not
+-- scores or logits).  All tensors are 2D [seq, head_dim] except
+-- `attn` which is [seq, seq].
+--
+--   dV     = attn^T @ dO
+--   dAttn  = dO @ V^T
+--   dScaled = softmax_backward(attn, dAttn)   (row-wise softmax Jacobian)
+--   dScores = dScaled * scale                 (scale = 1/√head_dim)
+--   dQ      = dScores @ K
+--   dK      = dScores^T @ Q
+--
+-- For causal attention the mask sends masked positions' `attn` to 0,
+-- which makes their dScaled rows also 0 — no explicit backward mask
+-- needed.
+-- ────────────────────────────────────────────────────────
+
+attention_backward q k v attn d_out = match q
+  | Tensor q_data q_shape q_st -> match k
+    | Tensor k_data k_shape k_st -> match v
+      | Tensor v_data v_shape v_st -> match attn
+        | Tensor attn_data attn_shape attn_st -> match d_out
+          | Tensor do_data do_shape do_st ->
+            let seq = head q_shape
+            let head_dim = head (tail q_shape)
+            let scale = 1.0 / sqrt (int_to_float head_dim)
+
+            -- dV = attn^T @ dO
+            let attn_t = tensor_transpose attn
+            let d_v = matmul attn_t d_out
+
+            -- dAttn = dO @ V^T
+            let v_t = tensor_transpose v
+            let d_attn = matmul d_out v_t
+
+            -- dScaled = softmax_backward(attn, dAttn) row-wise.
+            let dscaled_data = float_arr_new (seq * seq) 0.0
+            match d_attn | Tensor dattn_data _ _ ->
+              let _ = tgl_softmax_backward_f64 attn_data dattn_data dscaled_data seq seq
+              let d_scaled = Tensor dscaled_data (cons seq (cons seq [])) (compute_strides (cons seq (cons seq [])))
+
+              -- dScores = dScaled * scale (Jacobian of the scalar scaling)
+              let d_scores = tensor_scale d_scaled scale
+
+              -- dQ = dScores @ K ; dK = dScores^T @ Q
+              let d_q = matmul d_scores k
+              let d_scores_t = tensor_transpose d_scores
+              let d_k = matmul d_scores_t q
+
+              (d_q, d_k, d_v)
 
 -- ────────────────────────────────────────────────────────
 -- Feedforward: 2-layer MLP with GELU

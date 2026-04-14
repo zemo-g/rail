@@ -25,8 +25,15 @@ Dylib export count: 15 → 24. Tests: 105/105 → 106/106. Fixed-point preserved
 
 - [ ] Overture #3: float self-loop TCO — the properly-scheduled version
 - [ ] Movement I: f16 half-precision variants of every unary op
-- [ ] Movement II: attention backward (full Q/K/V chain)
-- [ ] Movement II: embedding scatter-add backward
+- [x] Movement II: attention backward (full Q/K/V chain) — pure-Rail
+      composition over softmax_backward + matmul + transpose, no new
+      kernel; gradcheck 18/18 (2026-04-14, v2.4.0)
+- [x] Movement II: embedding scatter-add backward — *not needed*; the
+      v2.4 transformer uses one-hot @ W_E embedding so matmul
+      backward IS the scatter-add (2026-04-14)
+- [x] Movement V: single-head causal transformer LM trains end-to-end
+      on Shakespeare — `tools/train/lm_transformer.rail`, loss
+      15.2→2.62 in 300 Adam steps, beats uniform 3.47 (2026-04-14)
 - [x] Movement III.1: Adam optimizer — fused GPU kernel, `stdlib/optim.rail`,
       XOR → 3.78e-10 in 200 steps (2026-04-14)
 - [x] Movement III.2: cosine_decay LR schedule + clip_grad_norm in

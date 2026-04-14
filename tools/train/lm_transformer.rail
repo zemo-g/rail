@@ -1,0 +1,290 @@
+-- lm_transformer.rail — single-head causal transformer LM on Shakespeare.
+-- Architecture:  embed → +sin/cos PE → causal self-attention → output proj
+-- Trains via Adam + cosine LR.  Goal: beat the v2.3 bigram baseline (2.10).
+--
+-- Shapes:  V=vocab, d=embed_dim, seq=corpus_length
+--   tokens   [seq]              integer ids (one big sequence — batch=1)
+--   X (one-hot)  [seq, V]       sparse, used to drive the embedding matmul
+--   E = X @ W_E  [seq, d]
+--   X_pe = E + PE                shape unchanged
+--   Q = X_pe @ W_Q   K = X_pe @ W_K   V = X_pe @ W_V    each [seq, d]
+--   attn = softmax(causal_mask(Q@K^T/√d))
+--   A = attn @ V                              [seq, d]
+--   logits = A @ W_O                          [seq, V]
+--   loss = mean_t cross_entropy(softmax(logits[t]), targets[t])
+import "stdlib/transformer.rail"
+import "stdlib/optim.rail"
+import "stdlib/tokenizer.rail"
+
+corpus _ =
+  cat ["To be, or not to be, that is the question.\n",
+       "Whether tis nobler in the mind to suffer\n",
+       "the slings and arrows of outrageous fortune,\n",
+       "or to take arms against a sea of troubles\n",
+       "and by opposing end them. To die, to sleep,\n",
+       "no more; and by a sleep to say we end\n",
+       "the heart-ache and the thousand natural shocks\n",
+       "that flesh is heir to: tis a consummation\n",
+       "devoutly to be wished. To die, to sleep;\n"]
+
+-- ── Weight init ──
+init_weight arr n seed =
+  init_w_loop arr n seed 0
+
+init_w_loop arr n seed i =
+  if i >= n then 0
+  else
+    let raw = ((i * 97 + seed * 13) % 100) - 50
+    let _ = float_arr_set arr i (0.05 * int_to_float raw)
+    init_w_loop arr n (seed + 1) (i + 1)
+
+-- ── Build [seq, V] one-hot input from a list of int ids ──
+fill_onehot dst ids V seq i =
+  if i >= seq then 0
+  else
+    let c = list_nth i ids
+    let _ = float_arr_set dst (i * V + c) 1.0
+    fill_onehot dst (tail ids) V seq (i + 1)
+
+-- ── Sinusoidal positional encoding [seq, d], computed once ──
+pe_loop arr seq d p k =
+  if p >= seq then 0
+  else if k >= d then pe_loop arr seq d (p + 1) 0
+  else
+    -- denom = pow(10000, 2k/d), angle = p/denom
+    let exp_arg = int_to_float (k - (k % 2)) / int_to_float d
+    let denom = pow 10000.0 exp_arg
+    let angle = int_to_float p / denom
+    let v = if (k % 2) == 0 then sin angle else cos angle
+    let _ = float_arr_set arr (p * d + k) v
+    pe_loop arr seq d p (k + 1)
+
+build_pe seq d =
+  let arr = float_arr_new (seq * d) 0.0
+  let _ = pe_loop arr seq d 0 0
+  arr
+
+-- ── Element-wise add a fixed buffer to a tensor's data (in place) ──
+add_buf_inplace dst src n i =
+  if i >= n then 0
+  else
+    let cur = float_arr_get dst i
+    let s = float_arr_get src i
+    let _ = float_arr_set dst i (cur + s)
+    add_buf_inplace dst src n (i + 1)
+
+-- ── Cross-entropy loss + grad over [seq, V] logits/probs and [seq] targets ──
+lm_ce_loss_loop pd ld seq V acc i =
+  if i >= seq then 0
+  else
+    let target = float_to_int (float_arr_get ld i)
+    let p = float_arr_get pd (i * V + target)
+    let p2 = if p < 0.00000001 then 0.00000001 else p
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur - log p2)
+    lm_ce_loss_loop pd ld seq V acc (i + 1)
+
+ce_loss probs labels seq V = match probs
+  | Tensor pd _ _ -> match labels
+    | Tensor ld _ _ ->
+      let acc = float_arr_new 1 0.0
+      let _ = lm_ce_loss_loop pd ld seq V acc 0
+      (float_arr_get acc 0) / int_to_float seq
+
+ce_grad_loop dst probs labels seq V invN i =
+  if i >= seq * V then 0
+  else
+    let row = i / V
+    let col = i % V
+    let target = float_to_int (float_arr_get labels row)
+    let p = float_arr_get probs i
+    let g = if col == target then (p - 1.0) * invN else p * invN
+    let _ = float_arr_set dst i g
+    ce_grad_loop dst probs labels seq V invN (i + 1)
+
+unwrap t = match t | Tensor d _ _ -> d
+
+-- ── Forward pass.  Returns a 7-element list:
+--   [probs, attn, A, X_pe, Q, K, V]
+-- in that order, so backward can index by tail-chaining.  All matches
+-- are funneled through `unwrap` to keep the function body a flat let
+-- stream (Rail's parser bails on nested mid-body matches).
+forward x w_e w_q w_k w_v w_o pe seq V d =
+  let e = matmul x w_e
+  let ed = unwrap e
+  let _ = add_buf_inplace ed pe (seq * d) 0
+  let x_pe = e
+  let q = matmul x_pe w_q
+  let k = matmul x_pe w_k
+  let v = matmul x_pe w_v
+  let kt = tensor_transpose k
+  let scores = matmul q kt
+  let scale = 1.0 / sqrt (int_to_float d)
+  let scaled = tensor_scale scores scale
+  let sd_data = unwrap scaled
+  let _ = apply_causal_mask_loop sd_data seq 0 0
+  let attn = tensor_softmax scaled
+  let a = matmul attn v
+  let logits = matmul a w_o
+  let probs = tensor_softmax logits
+  cons probs (cons attn (cons a (cons x_pe (cons q (cons k (cons v []))))))
+
+-- ── One training step with Adam ──
+train_step x labels w_e w_q w_k w_v w_o pe seq V d dlog_buf st_we st_wq st_wk st_wv st_wo lr =
+  let result = forward x w_e w_q w_k w_v w_o pe seq V d
+  let probs = head result
+  let attn = head (tail result)
+  let a = head (tail (tail result))
+  let x_pe = head (tail (tail (tail result)))
+  let q = head (tail (tail (tail (tail result))))
+  let k = head (tail (tail (tail (tail (tail result)))))
+  let v = head (tail (tail (tail (tail (tail (tail result))))))
+
+  let loss = ce_loss probs labels seq V
+
+  -- dLogits = (probs - one_hot(label)) / seq
+  match probs | Tensor pd _ _ -> match labels | Tensor ld _ _ ->
+    let invN = 1.0 / int_to_float seq
+    let _ = ce_grad_loop dlog_buf pd ld seq V invN 0
+    let dlog_t = Tensor dlog_buf (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+
+    -- dW_O = A^T @ dLogits ;  dA = dLogits @ W_O^T
+    let a_t = tensor_transpose a
+    let d_wo = matmul a_t dlog_t
+    let wo_t = tensor_transpose w_o
+    let d_a = matmul dlog_t wo_t
+
+    -- attention backward
+    let (d_q, d_k, d_v) = attention_backward q k v attn d_a
+
+    -- dW_Q = X_pe^T @ dQ etc. ;  dX_pe = dQ @ W_Q^T + dK @ W_K^T + dV @ W_V^T
+    let xt = tensor_transpose x_pe
+    let d_wq = matmul xt d_q
+    let d_wk = matmul xt d_k
+    let d_wv = matmul xt d_v
+
+    let wq_t = tensor_transpose w_q
+    let wk_t = tensor_transpose w_k
+    let wv_t = tensor_transpose w_v
+    let dx_q = matmul d_q wq_t
+    let dx_k = matmul d_k wk_t
+    let dx_v = matmul d_v wv_t
+    let dx_pe = tensor_add (tensor_add dx_q dx_k) dx_v
+
+    -- dW_E = X^T @ dX_pe (X is one-hot, so this is a sparse scatter-add, but
+    -- matmul handles it).  Positional encoding has no params.
+    let xT = tensor_transpose x
+    let d_we = matmul xT dx_pe
+
+    -- Adam updates on all parameter tensors.
+    let we_d = unwrap w_e
+    let wq_d = unwrap w_q
+    let wk_d = unwrap w_k
+    let wv_d = unwrap w_v
+    let wo_d = unwrap w_o
+    let dwe_d = unwrap d_we
+    let dwq_d = unwrap d_wq
+    let dwk_d = unwrap d_wk
+    let dwv_d = unwrap d_wv
+    let dwo_d = unwrap d_wo
+    let _ = adam_update_raw we_d dwe_d st_we lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wq_d dwq_d st_wq lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wk_d dwk_d st_wk lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wv_d dwv_d st_wv lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wo_d dwo_d st_wo lr adam_default_b1 adam_default_b2 adam_default_eps
+    loss
+
+train_loop x labels w_e w_q w_k w_v w_o pe seq V d dlog_buf st_we st_wq st_wk st_wv st_wo base_lr warmup max_steps step =
+  if step >= max_steps then 0
+  else
+    let lr = cosine_decay step warmup max_steps base_lr
+    let loss = train_step x labels w_e w_q w_k w_v w_o pe seq V d dlog_buf st_we st_wq st_wk st_wv st_wo lr
+    let _ = if step % 10 == 0 then
+      let _ = print (cat ["step ", show step, "  lr=", show_float lr, "  loss=", show_float loss])
+      0
+    else 0
+    train_loop x labels w_e w_q w_k w_v w_o pe seq V d dlog_buf st_we st_wq st_wk st_wv st_wo base_lr warmup max_steps (step + 1)
+
+eval_loss x labels w_e w_q w_k w_v w_o pe seq V d =
+  let result = forward x w_e w_q w_k w_v w_o pe seq V d
+  let probs = head result
+  ce_loss probs labels seq V
+
+main =
+  let _ = print "=== Single-head causal transformer LM on Shakespeare ==="
+
+  let text = corpus 0
+  let vocab = build_vocab text
+  let V = vocab_size vocab
+  let ids = encode vocab text
+  let total = length ids
+  let seq = total - 1
+  let _ = print (cat ["corpus=", show total, " chars, vocab=", show V, ", seq=", show seq])
+
+  -- Inputs: ids[0..seq-1], targets: ids[1..seq]
+  let x_data = float_arr_new (seq * V) 0.0
+  let _ = fill_onehot x_data ids V seq 0
+  let x = Tensor x_data (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+
+  let labels_data = float_arr_new seq 0.0
+  let _ = fill_labels labels_data (tail ids) seq 0
+  let labels = Tensor labels_data (cons seq []) (cons 1 [])
+
+  -- Architecture knobs.
+  let d = 16
+
+  -- Weights.
+  let we_data = float_arr_new (V * d) 0.0
+  let _ = init_weight we_data (V * d) 1
+  let w_e = Tensor we_data (cons V (cons d [])) (compute_strides (cons V (cons d [])))
+
+  let wq_data = float_arr_new (d * d) 0.0
+  let _ = init_weight wq_data (d * d) 2
+  let w_q = Tensor wq_data (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+
+  let wk_data = float_arr_new (d * d) 0.0
+  let _ = init_weight wk_data (d * d) 3
+  let w_k = Tensor wk_data (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+
+  let wv_data = float_arr_new (d * d) 0.0
+  let _ = init_weight wv_data (d * d) 4
+  let w_v = Tensor wv_data (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+
+  let wo_data = float_arr_new (d * V) 0.0
+  let _ = init_weight wo_data (d * V) 5
+  let w_o = Tensor wo_data (cons d (cons V [])) (compute_strides (cons d (cons V [])))
+
+  -- Positional encoding (fixed, no params).
+  let pe = build_pe seq d
+
+  -- Adam states.
+  let st_we = adam_state (V * d)
+  let st_wq = adam_state (d * d)
+  let st_wk = adam_state (d * d)
+  let st_wv = adam_state (d * d)
+  let st_wo = adam_state (d * V)
+
+  let dlog_buf = float_arr_new (seq * V) 0.0
+
+  let loss0 = eval_loss x labels w_e w_q w_k w_v w_o pe seq V d
+  let _ = print (cat ["initial loss=", show_float loss0])
+  let _ = print (cat ["uniform-baseline loss (log V)=", show_float (log (int_to_float V))])
+  let _ = print (cat ["v2.3 bigram baseline=2.10"])
+
+  let _ = print "\nTraining 300 steps, cosine(warmup=20, peak_lr=0.05):"
+  let _ = train_loop x labels w_e w_q w_k w_v w_o pe seq V d dlog_buf st_we st_wq st_wk st_wv st_wo 0.05 20 300 0
+
+  let loss1 = eval_loss x labels w_e w_q w_k w_v w_o pe seq V d
+  let _ = print (cat ["\nfinal loss=", show_float loss1])
+
+  let beat_uniform = if loss1 < (log (int_to_float V)) then "YES" else "NO"
+  let beat_bigram = if loss1 < 2.10 then "YES" else "NO"
+  let _ = print (cat ["beats uniform: ", beat_uniform])
+  let _ = print (cat ["beats v2.3 bigram (2.10): ", beat_bigram])
+  0
+
+fill_labels arr ids seq i =
+  if i >= seq then 0
+  else
+    let _ = float_arr_set arr i (int_to_float (head ids))
+    fill_labels arr (tail ids) seq (i + 1)
