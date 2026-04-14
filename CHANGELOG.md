@@ -2,6 +2,88 @@
 
 All notable changes to Rail are documented here.
 
+## v2.7.0 (2026-04-14) — *WASM floats end-to-end*
+
+The WASM backend gains real floating-point support.  Before this
+release `grep -c "f64\|float" tools/wasm_runtime.wat` returned 0.
+Now Rail compiles float-heavy programs (literals, arithmetic on
+variables, float arrays, sqrt) to standalone .wasm and they
+execute correctly under `wasmtime` with no runtime imports.
+
+### Calling convention
+- Rail's WASM backend uses i64 throughout the operand stack — same
+  as the rest of the v2.6 codegen.  Float values travel as **raw f64
+  bits stored in i64** (`i64.reinterpret_f64` round-trips).  This
+  matches the ARM64 backend's convention where float values pass as
+  raw bits in x-registers.
+
+### Float literal `FL`
+- New WASM codegen case in `compile.rail::wg`:
+  `f64.const <literal>; i64.reinterpret_f64`.  A Rail `3.14` lands
+  on the i64 stack as the bit pattern of `3.14` in IEEE 754.
+
+### Float arithmetic with variable-aware type inference
+- New `is_float_w node env` mirrors the ARM64 `is_float`.  V nodes
+  (variable references) are flagged as float when the env contains
+  a synthetic `__wfloat_<name>` marker, which the let-binding (D)
+  emitter inserts whenever the bound expression is structurally
+  float.  This lets `let x = 3.0 in let y = 4.0 in x + y` compile
+  to f64 arithmetic without manual annotations.
+- New `wasm_fop` table emits `f64.add / sub / mul / div` for
+  arithmetic and `f64.eq / ne / lt / gt / le / ge` for comparisons.
+  Comparisons return tagged-int booleans so they slot back into the
+  existing if/then/else machinery.
+- Mixed-type promotion: when one operand is float and the other is
+  a tagged int, `wg_as_float` promotes via `i64.shr_s + f64.convert_i64_s`.
+
+### Float arrays in WASM memory
+- New `$float_arr_new`, `$float_arr_get`, `$float_arr_set`,
+  `$float_arr_len` in `tools/wasm_runtime.wat`.  Layout matches
+  ARM64: bytes [0..7] hold the length as raw i64, bytes [8..]
+  hold the f64 payload.  The Rail handle is `(byte_ptr << 1)` so
+  the LSB tag bit reads as 0 (pointer), matching cons cells.
+
+### Conversions
+- `$int_to_float` (= `$to_float`) — `i64.shr_s + f64.convert_i64_s
+  + i64.reinterpret_f64`.
+- `$float_to_int` — `f64.reinterpret_i64 + i64.trunc_f64_s + tag`.
+
+### Math intrinsics
+- `$sqrt`, `$fabs`, `$floor`, `$ceil` ship as native WASM intrinsics
+  (`f64.sqrt`, `f64.abs`, `f64.floor`, `f64.ceil`) wrapped to take
+  i64-bits and return i64-bits.
+- `$show_float` formats an f64 to a `<int>.<6 decimal digits>`
+  string with sign handling, by reusing the WASM heap allocator.
+- **Deferred to v2.8**: `sin / cos / exp / log / pow / tanh`.  These
+  have no native WASM intrinsics and need Taylor-series polyfills
+  with proper range reduction (~150 lines of WAT each).
+
+### Smoke proof
+- **`tools/train/wasm_diffuse.rail`** — 1-D box-filter diffusion on
+  a 16-cell float_arr, 50 passes, with L2 norm via sqrt.  Steady
+  state of a linear ramp matches analytic prediction:
+  `[0, 8, 15]` invariant, `‖[0..15]‖₂ = √1240 = 35.213633` (6
+  digits agree).  Compiles to a 31KB .wat, runs in wasmtime.
+
+### Tooling fix
+- `dispatch_wasm` now prepends `/opt/homebrew/bin:/usr/local/bin`
+  to the shell `PATH` before invoking `wat2wasm` and `wasmtime`,
+  since the Rail `shell` builtin doesn't inherit the user's
+  interactive PATH.
+
+### Known limitations (v2.7 → v2.8)
+- Recursive float function parameters not auto-inferred.  Use a
+  1-element float_arr accumulator (the same idiom that works
+  around the equivalent ARM64 limitation).
+- Non-ASCII chars in string literals fail wat2wasm escape.
+- Transcendental math foreigns (sin/cos/exp/log/pow/tanh) absent.
+
+### Counters
+- Dylib export count: 25 (unchanged — WASM is a separate backend).
+- Tests: 106/106.
+- Fixed-point self-compile: preserved.
+- Adam XOR + three_class_mlp regression: still pass.
+
 ## v2.6.0 (2026-04-14) — *Compiler/REPL polish*
 
 Two small but high-leverage quality-of-life improvements.  No new GPU

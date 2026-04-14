@@ -3604,11 +3604,13 @@ dispatch_wasm path =
   let wat = wasm_program decls
   let _ = write_file "/tmp/rail_out.wat" wat
   let _ = print (cat ["  WAT: ", show (length wat), " bytes"])
-  let w2w = trim (shell "wat2wasm /tmp/rail_out.wat -o /tmp/rail_out.wasm 2>&1")
+  -- Search common Homebrew + system paths since shell builtin doesn't
+  -- inherit the user's $PATH.
+  let w2w = trim (shell "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH wat2wasm /tmp/rail_out.wat -o /tmp/rail_out.wasm 2>&1")
   let _ = if w2w != "" then print (cat ["  wat2wasm: ", w2w]) else print "  wat2wasm: OK"
-  let wt = trim (shell "which wasmtime 2>/dev/null")
+  let wt = trim (shell "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH command -v wasmtime 2>/dev/null")
   if length wt > 0 then
-    let r = shell "wasmtime /tmp/rail_out.wasm 2>&1"
+    let r = shell "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH wasmtime /tmp/rail_out.wasm 2>&1"
     let _ = print r
     0
   else
@@ -3709,11 +3711,44 @@ wasm_efind n env =
     if k == n then v
     else wasm_efind n (tail env)
 
+-- WASM-side is-float check.  Mirrors the ARM64 is_float but operates
+-- on the WASM env (a list of (name, slot)).  V nodes are detected as
+-- float when there's a synthetic "__wfloat_<name>" entry in the env,
+-- which the let-binding emitter inserts whenever the bound expression
+-- is structurally float.
+is_float_w node env =
+  let tg = head node
+  if tg == "FL" then true
+  else if tg == "V" then
+    wasm_efind (cat ["__wfloat_", head (tail node)]) env >= 0
+  else if tg == "A" then
+    let (fname, _) = flat node
+    if fname == "to_float" || fname == "int_to_float" || fname == "float_arr_get" || fname == "parse_float" then true
+    else if fname == "sqrt" || fname == "sin" || fname == "cos" || fname == "tanh" || fname == "exp" || fname == "log" || fname == "pow" || fname == "fabs" || fname == "floor" || fname == "ceil" || fname == "atan2" then true
+    else false
+  else if tg == "O" then
+    let op = head (tail node)
+    if op == "+" || op == "-" || op == "*" || op == "/" then
+      is_float_w (head (tail (tail node))) env || is_float_w (head (tail (tail (tail node)))) env
+    else false
+  else if tg == "?" then
+    is_float_w (head (tail (tail node))) env || is_float_w (head (tail (tail (tail node)))) env
+  else false
+
+-- Float promotion: if a node is structurally float, leave the WASM
+-- code as-is (already produces raw f64 bits as i64); otherwise the
+-- value is a tagged int and we need to untag (>>1) and convert
+-- (i64→f64) before the f64 op.
+wg_as_float node env stab ar lams =
+  if is_float_w node env then wg node env stab ar lams
+  else cat [wg node env stab ar lams, "    i64.const 1\n    i64.shr_s\n    f64.convert_i64_s\n    i64.reinterpret_f64\n"]
+
 wg node env stab ar lams =
   let tg = head node
   if tg == "I" then cat ["    i64.const ", show (str_to_int (head (tail node)) * 2 + 1), "\n"]
   else if tg == "S" then cat ["    i64.const ", show (wasm_sfind (head (tail node)) stab * 2), "\n"]
   else if tg == "B" then if head (tail node) == "true" then "    i64.const 3\n" else "    i64.const 1\n"
+  else if tg == "FL" then cat ["    f64.const ", head (tail node), "\n    i64.reinterpret_f64\n"]
   else if tg == "V" then
     let nm = head (tail node)
     if wasm_efind nm env >= 0 then cat ["    local.get $", nm, "\n"]
@@ -3727,12 +3762,29 @@ wg node env stab ar lams =
       else "    i64.const 1\n"
   else if tg == "O" then
     let op = head (tail node)
-    cat [wg (head (tail (tail node))) env stab ar lams, "    i64.const 1\n    i64.shr_s\n", wg (head (tail (tail (tail node)))) env stab ar lams, "    i64.const 1\n    i64.shr_s\n", wasm_op op, "    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"]
+    let lhs = head (tail (tail node))
+    let rhs = head (tail (tail (tail node)))
+    let any_float = is_float_w lhs env || is_float_w rhs env
+    if any_float then
+      -- Float path.  wg_as_float leaves raw f64 bits as an i64 on
+      -- the stack; we reinterpret to f64 for the actual op.
+      -- Arithmetic returns raw f64 bits as i64; comparisons return
+      -- tagged-int booleans (3 = true, 1 = false).
+      let l_code = wg_as_float lhs env stab ar lams
+      let r_code = wg_as_float rhs env stab ar lams
+      cat [l_code, "    f64.reinterpret_i64\n", r_code, "    f64.reinterpret_i64\n", wasm_fop op]
+    else
+      cat [wg lhs env stab ar lams, "    i64.const 1\n    i64.shr_s\n", wg rhs env stab ar lams, "    i64.const 1\n    i64.shr_s\n", wasm_op op, "    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"]
   else if tg == "?" then
     cat [wg (head (tail node)) env stab ar lams, "    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    if (result i64)\n", wg (head (tail (tail node))) env stab ar lams, "    else\n", wg (head (tail (tail (tail node)))) env stab ar lams, "    end\n"]
   else if tg == "D" then
     let nm = head (tail node)
-    cat [wg (head (tail (tail node))) env stab ar lams, "    local.set $", nm, "\n", wg (head (tail (tail (tail node)))) (cons (nm, length env) env) stab ar lams]
+    let val_node = head (tail (tail node))
+    let body_node = head (tail (tail (tail node)))
+    let new_env = if is_float_w val_node env then
+                    cons (cat ["__wfloat_", nm], length env) (cons (nm, length env) env)
+                  else cons (nm, length env) env
+    cat [wg val_node env stab ar lams, "    local.set $", nm, "\n", wg body_node new_env stab ar lams]
   else if tg == "TD" then cat [wg (head (tail (tail node))) env stab ar lams, "    drop\n", wg (head (tail (tail (tail node)))) env stab ar lams]
   else if tg == "L" then
     wg_list (head (tail node)) env stab ar lams
@@ -3913,6 +3965,23 @@ wasm_op op =
   else if op == "<=" then "    i64.le_s\n    i64.extend_i32_u\n"
   else if op == ">=" then "    i64.ge_s\n    i64.extend_i32_u\n"
   else "    i64.add\n"
+
+-- Float operator emit.  Assumes two f64 values on the stack.
+-- Arithmetic ops leave raw f64 bits as i64 (so subsequent code can
+-- treat the result as a Rail float).  Comparisons leave a tagged-int
+-- boolean (1 = false, 3 = true).
+wasm_fop op =
+  if op == "+" then "    f64.add\n    i64.reinterpret_f64\n"
+  else if op == "-" then "    f64.sub\n    i64.reinterpret_f64\n"
+  else if op == "*" then "    f64.mul\n    i64.reinterpret_f64\n"
+  else if op == "/" then "    f64.div\n    i64.reinterpret_f64\n"
+  else if op == "==" then "    f64.eq\n    i64.extend_i32_u\n    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"
+  else if op == "!=" then "    f64.ne\n    i64.extend_i32_u\n    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"
+  else if op == "<" then "    f64.lt\n    i64.extend_i32_u\n    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"
+  else if op == ">" then "    f64.gt\n    i64.extend_i32_u\n    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"
+  else if op == "<=" then "    f64.le\n    i64.extend_i32_u\n    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"
+  else if op == ">=" then "    f64.ge\n    i64.extend_i32_u\n    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"
+  else "    f64.add\n    i64.reinterpret_f64\n"
 
 wasm_strs node =
   let tg = head node
