@@ -1,17 +1,23 @@
--- lm_transformer.rail — single-head causal transformer LM on Shakespeare.
--- Architecture:  embed → +sin/cos PE → causal self-attention → output proj
--- Trains via Adam + cosine LR.  Goal: beat the v2.3 bigram baseline (2.10).
+-- lm_transformer.rail — single-block pre-norm causal transformer LM.
 --
--- Shapes:  V=vocab, d=embed_dim, seq=corpus_length
---   tokens   [seq]              integer ids (one big sequence — batch=1)
---   X (one-hot)  [seq, V]       sparse, used to drive the embedding matmul
---   E = X @ W_E  [seq, d]
---   X_pe = E + PE                shape unchanged
---   Q = X_pe @ W_Q   K = X_pe @ W_K   V = X_pe @ W_V    each [seq, d]
---   attn = softmax(causal_mask(Q@K^T/√d))
---   A = attn @ V                              [seq, d]
---   logits = A @ W_O                          [seq, V]
---   loss = mean_t cross_entropy(softmax(logits[t]), targets[t])
+-- v2.5 upgrade: adds layernorm (forward + backward via dylib), residual
+-- connections, and an FFN block on top of the v2.4 attention spine.
+--
+-- Architecture (single block, single head):
+--   x_pe   = embed(X) + sin/cos PE
+--   ln1    = LayerNorm(x_pe)                          ← stats saved
+--   attn   = causal_self_attention(ln1)
+--   x_attn = x_pe + attn                              ← residual #1
+--   ln2    = LayerNorm(x_attn)                        ← stats saved
+--   ffn    = ReLU(ln2 @ W_F1) @ W_F2
+--   x_blk  = x_attn + ffn                             ← residual #2
+--   logits = x_blk @ W_O
+--
+-- Trains with Adam + cosine LR.  Goal: beat the v2.3 bigram baseline
+-- (loss 2.10) on the same 383-char Shakespeare excerpt.
+--
+-- LayerNorm gamma/beta are fixed (γ=1, β=0) — making them learnable
+-- adds dgamma/dbeta accumulation loops but no fundamental capacity.
 import "stdlib/transformer.rail"
 import "stdlib/optim.rail"
 import "stdlib/tokenizer.rail"
@@ -27,7 +33,7 @@ corpus _ =
        "that flesh is heir to: tis a consummation\n",
        "devoutly to be wished. To die, to sleep;\n"]
 
--- ── Weight init ──
+-- ── Weight init (deterministic scatter) ──
 init_weight arr n seed =
   init_w_loop arr n seed 0
 
@@ -38,7 +44,7 @@ init_w_loop arr n seed i =
     let _ = float_arr_set arr i (0.05 * int_to_float raw)
     init_w_loop arr n (seed + 1) (i + 1)
 
--- ── Build [seq, V] one-hot input from a list of int ids ──
+-- ── One-hot input fill ──
 fill_onehot dst ids V seq i =
   if i >= seq then 0
   else
@@ -46,12 +52,17 @@ fill_onehot dst ids V seq i =
     let _ = float_arr_set dst (i * V + c) 1.0
     fill_onehot dst (tail ids) V seq (i + 1)
 
--- ── Sinusoidal positional encoding [seq, d], computed once ──
+fill_labels arr ids seq i =
+  if i >= seq then 0
+  else
+    let _ = float_arr_set arr i (int_to_float (head ids))
+    fill_labels arr (tail ids) seq (i + 1)
+
+-- ── Sinusoidal positional encoding [seq, d] ──
 pe_loop arr seq d p k =
   if p >= seq then 0
   else if k >= d then pe_loop arr seq d (p + 1) 0
   else
-    -- denom = pow(10000, 2k/d), angle = p/denom
     let exp_arg = int_to_float (k - (k % 2)) / int_to_float d
     let denom = pow 10000.0 exp_arg
     let angle = int_to_float p / denom
@@ -64,7 +75,7 @@ build_pe seq d =
   let _ = pe_loop arr seq d 0 0
   arr
 
--- ── Element-wise add a fixed buffer to a tensor's data (in place) ──
+-- ── Helpers ──
 add_buf_inplace dst src n i =
   if i >= n then 0
   else
@@ -73,7 +84,29 @@ add_buf_inplace dst src n i =
     let _ = float_arr_set dst i (cur + s)
     add_buf_inplace dst src n (i + 1)
 
--- ── Cross-entropy loss + grad over [seq, V] logits/probs and [seq] targets ──
+unwrap t = match t | Tensor d _ _ -> d
+
+-- ReLU forward + mask save in one pass.  mask[i] = 1 if x[i]>0 else 0.
+-- mask is what backward needs (no need to keep x around).
+relu_fwd src dst mask n i =
+  if i >= n then 0
+  else
+    let v = float_arr_get src i
+    let pos = if v > 0.0 then 1.0 else 0.0
+    let _ = float_arr_set mask i pos
+    let _ = float_arr_set dst i (v * pos)
+    relu_fwd src dst mask n (i + 1)
+
+-- ReLU backward: dx = dy * mask
+relu_bwd dy mask dx n i =
+  if i >= n then 0
+  else
+    let g = float_arr_get dy i
+    let m = float_arr_get mask i
+    let _ = float_arr_set dx i (g * m)
+    relu_bwd dy mask dx (n + 0) (i + 1)
+
+-- ── Cross-entropy loss + grad over [seq, V] probs ──
 lm_ce_loss_loop pd ld seq V acc i =
   if i >= seq then 0
   else
@@ -102,116 +135,210 @@ ce_grad_loop dst probs labels seq V invN i =
     let _ = float_arr_set dst i g
     ce_grad_loop dst probs labels seq V invN (i + 1)
 
-unwrap t = match t | Tensor d _ _ -> d
-
--- ── Forward pass.  Returns a 7-element list:
---   [probs, attn, A, X_pe, Q, K, V]
--- in that order, so backward can index by tail-chaining.  All matches
--- are funneled through `unwrap` to keep the function body a flat let
--- stream (Rail's parser bails on nested mid-body matches).
-forward x w_e w_q w_k w_v w_o pe seq V d =
+-- ── Forward pass.  Returns a 13-element list:
+-- [probs, attn, x_blk, ln2_out, x_attn, ln1_out, x_pe, q, k, v,
+--  ffn_h_pre, ffn_h_relu_mask, ln1_mean+rstd-pair, ln2_mean+rstd-pair]
+-- We pack the LN stats inline:
+--   slot 12 = ln1_mean_arr   slot 13 = ln1_rstd_arr
+--   slot 14 = ln2_mean_arr   slot 15 = ln2_rstd_arr
+-- Everything is funneled through `unwrap` to keep the body a flat let
+-- stream. ──
+forward x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff =
   let e = matmul x w_e
   let ed = unwrap e
   let _ = add_buf_inplace ed pe (seq * d) 0
   let x_pe = e
-  let q = matmul x_pe w_q
-  let k = matmul x_pe w_k
-  let v = matmul x_pe w_v
+
+  -- LN1
+  let ln1_pack = layernorm_save x_pe ln_g ln_b
+  let ln1_out = head ln1_pack
+  let ln1_mean = head (tail ln1_pack)
+  let ln1_rstd = head (tail (tail ln1_pack))
+
+  -- Self-attention from ln1_out
+  let q = matmul ln1_out w_q
+  let k = matmul ln1_out w_k
+  let v = matmul ln1_out w_v
   let kt = tensor_transpose k
   let scores = matmul q kt
   let scale = 1.0 / sqrt (int_to_float d)
   let scaled = tensor_scale scores scale
-  let sd_data = unwrap scaled
-  let _ = apply_causal_mask_loop sd_data seq 0 0
+  let sd = unwrap scaled
+  let _ = apply_causal_mask_loop sd seq 0 0
   let attn = tensor_softmax scaled
-  let a = matmul attn v
-  let logits = matmul a w_o
-  let probs = tensor_softmax logits
-  cons probs (cons attn (cons a (cons x_pe (cons q (cons k (cons v []))))))
+  let attn_out = matmul attn v
 
--- ── One training step with Adam ──
-train_step x labels w_e w_q w_k w_v w_o pe seq V d dlog_buf st_we st_wq st_wk st_wv st_wo lr =
-  let result = forward x w_e w_q w_k w_v w_o pe seq V d
-  let probs = head result
-  let attn = head (tail result)
-  let a = head (tail (tail result))
-  let x_pe = head (tail (tail (tail result)))
-  let q = head (tail (tail (tail (tail result))))
-  let k = head (tail (tail (tail (tail (tail result)))))
-  let v = head (tail (tail (tail (tail (tail (tail result))))))
+  -- Residual #1
+  let x_attn = tensor_add x_pe attn_out
+
+  -- LN2
+  let ln2_pack = layernorm_save x_attn ln_g ln_b
+  let ln2_out = head ln2_pack
+  let ln2_mean = head (tail ln2_pack)
+  let ln2_rstd = head (tail (tail ln2_pack))
+
+  -- FFN: ln2_out @ W_F1 → ReLU → @ W_F2
+  let ffn_h_pre = matmul ln2_out w_f1
+  let ffn_h_pre_d = unwrap ffn_h_pre
+  let ffn_h_data = float_arr_new (seq * d_ff) 0.0
+  let ffn_mask = float_arr_new (seq * d_ff) 0.0
+  let _ = relu_fwd ffn_h_pre_d ffn_h_data ffn_mask (seq * d_ff) 0
+  let ffn_h = Tensor ffn_h_data (cons seq (cons d_ff [])) (compute_strides (cons seq (cons d_ff [])))
+  let ffn_out = matmul ffn_h w_f2
+
+  -- Residual #2
+  let x_blk = tensor_add x_attn ffn_out
+
+  let logits = matmul x_blk w_o
+  let probs = tensor_softmax logits
+
+  let r0 = cons ln2_rstd []
+  let r1 = cons ln2_mean r0
+  let r2 = cons ln1_rstd r1
+  let r3 = cons ln1_mean r2
+  let r4 = cons ffn_mask r3
+  let r5 = cons ffn_h r4
+  let r6 = cons v r5
+  let r7 = cons k r6
+  let r8 = cons q r7
+  let r9 = cons x_pe r8
+  let r10 = cons ln1_out r9
+  let r11 = cons x_attn r10
+  let r12 = cons ln2_out r11
+  let r13 = cons x_blk r12
+  let r14 = cons attn r13
+  cons probs r14
+
+-- ── Training step ──
+train_step x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 lr =
+  let result = forward x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
+  let probs = list_nth 0 result
+  let attn = list_nth 1 result
+  let x_blk = list_nth 2 result
+  let ln2_out = list_nth 3 result
+  let x_attn = list_nth 4 result
+  let ln1_out = list_nth 5 result
+  let x_pe = list_nth 6 result
+  let q = list_nth 7 result
+  let k = list_nth 8 result
+  let v = list_nth 9 result
+  let ffn_h = list_nth 10 result
+  let ffn_mask = list_nth 11 result
+  let ln1_mean = list_nth 12 result
+  let ln1_rstd = list_nth 13 result
+  let ln2_mean = list_nth 14 result
+  let ln2_rstd = list_nth 15 result
 
   let loss = ce_loss probs labels seq V
 
-  -- dLogits = (probs - one_hot(label)) / seq
   match probs | Tensor pd _ _ -> match labels | Tensor ld _ _ ->
     let invN = 1.0 / int_to_float seq
     let _ = ce_grad_loop dlog_buf pd ld seq V invN 0
     let dlog_t = Tensor dlog_buf (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
 
-    -- dW_O = A^T @ dLogits ;  dA = dLogits @ W_O^T
-    let a_t = tensor_transpose a
-    let d_wo = matmul a_t dlog_t
+    -- dW_O = x_blk^T @ dLogits ;  dx_blk = dLogits @ W_O^T
+    let xblk_t = tensor_transpose x_blk
+    let d_wo = matmul xblk_t dlog_t
     let wo_t = tensor_transpose w_o
-    let d_a = matmul dlog_t wo_t
+    let dx_blk = matmul dlog_t wo_t
 
-    -- attention backward
-    let (d_q, d_k, d_v) = attention_backward q k v attn d_a
+    -- Residual #2: dx_attn += dx_blk ; dffn_out = dx_blk
+    let dffn_out = dx_blk
 
-    -- dW_Q = X_pe^T @ dQ etc. ;  dX_pe = dQ @ W_Q^T + dK @ W_K^T + dV @ W_V^T
-    let xt = tensor_transpose x_pe
-    let d_wq = matmul xt d_q
-    let d_wk = matmul xt d_k
-    let d_wv = matmul xt d_v
+    -- FFN backward:  ffn_out = ffn_h @ W_F2
+    --   dW_F2 = ffn_h^T @ dffn_out ;  dffn_h = dffn_out @ W_F2^T
+    let ffn_h_t = tensor_transpose ffn_h
+    let d_wf2 = matmul ffn_h_t dffn_out
+    let wf2_t = tensor_transpose w_f2
+    let dffn_h = matmul dffn_out wf2_t
 
+    -- ReLU backward to get dffn_h_pre
+    let dffn_h_pre = float_arr_new (seq * d_ff) 0.0
+    let dffn_h_d = unwrap dffn_h
+    let _ = relu_bwd dffn_h_d ffn_mask dffn_h_pre (seq * d_ff) 0
+    let dffn_h_pre_t = Tensor dffn_h_pre (cons seq (cons d_ff [])) (compute_strides (cons seq (cons d_ff [])))
+
+    -- Linear backward of ffn_h_pre = ln2_out @ W_F1
+    --   dW_F1 = ln2_out^T @ dffn_h_pre ;  dln2_out = dffn_h_pre @ W_F1^T
+    let ln2_t = tensor_transpose ln2_out
+    let d_wf1 = matmul ln2_t dffn_h_pre_t
+    let wf1_t = tensor_transpose w_f1
+    let dln2_out = matmul dffn_h_pre_t wf1_t
+
+    -- LN2 backward: dx_attn (LN contribution) = layernorm_backward_dx
+    let dx_attn_ln = layernorm_backward_dx x_attn ln2_mean ln2_rstd ln_g dln2_out
+    -- Total dx_attn = residual contribution (dx_blk) + LN contribution
+    let dx_attn = tensor_add dx_blk dx_attn_ln
+
+    -- Residual #1: dx_pe += dx_attn ; dattn_out = dx_attn
+    let dattn_out = dx_attn
+
+    -- Attention backward
+    let (d_q, d_k, d_v) = attention_backward q k v attn dattn_out
+
+    -- dW_Q etc., dln1_out (via QKV)
+    let ln1_t = tensor_transpose ln1_out
+    let d_wq = matmul ln1_t d_q
+    let d_wk = matmul ln1_t d_k
+    let d_wv = matmul ln1_t d_v
     let wq_t = tensor_transpose w_q
     let wk_t = tensor_transpose w_k
     let wv_t = tensor_transpose w_v
     let dx_q = matmul d_q wq_t
     let dx_k = matmul d_k wk_t
     let dx_v = matmul d_v wv_t
-    let dx_pe = tensor_add (tensor_add dx_q dx_k) dx_v
+    let dln1_out = tensor_add (tensor_add dx_q dx_k) dx_v
 
-    -- dW_E = X^T @ dX_pe (X is one-hot, so this is a sparse scatter-add, but
-    -- matmul handles it).  Positional encoding has no params.
+    -- LN1 backward → dx_pe (LN contribution); add to residual contribution dx_attn
+    let dx_pe_ln = layernorm_backward_dx x_pe ln1_mean ln1_rstd ln_g dln1_out
+    let dx_pe = tensor_add dx_attn dx_pe_ln
+
+    -- Embedding gradient: dW_E = X^T @ dx_pe (X is one-hot → scatter-add)
     let xT = tensor_transpose x
     let d_we = matmul xT dx_pe
 
-    -- Adam updates on all parameter tensors.
+    -- Adam updates on every parameter tensor.
     let we_d = unwrap w_e
     let wq_d = unwrap w_q
     let wk_d = unwrap w_k
     let wv_d = unwrap w_v
     let wo_d = unwrap w_o
+    let wf1_d = unwrap w_f1
+    let wf2_d = unwrap w_f2
     let dwe_d = unwrap d_we
     let dwq_d = unwrap d_wq
     let dwk_d = unwrap d_wk
     let dwv_d = unwrap d_wv
     let dwo_d = unwrap d_wo
+    let dwf1_d = unwrap d_wf1
+    let dwf2_d = unwrap d_wf2
     let _ = adam_update_raw we_d dwe_d st_we lr adam_default_b1 adam_default_b2 adam_default_eps
     let _ = adam_update_raw wq_d dwq_d st_wq lr adam_default_b1 adam_default_b2 adam_default_eps
     let _ = adam_update_raw wk_d dwk_d st_wk lr adam_default_b1 adam_default_b2 adam_default_eps
     let _ = adam_update_raw wv_d dwv_d st_wv lr adam_default_b1 adam_default_b2 adam_default_eps
     let _ = adam_update_raw wo_d dwo_d st_wo lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wf1_d dwf1_d st_wf1 lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wf2_d dwf2_d st_wf2 lr adam_default_b1 adam_default_b2 adam_default_eps
     loss
 
-train_loop x labels w_e w_q w_k w_v w_o pe seq V d dlog_buf st_we st_wq st_wk st_wv st_wo base_lr warmup max_steps step =
+train_loop x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 base_lr warmup max_steps step =
   if step >= max_steps then 0
   else
     let lr = cosine_decay step warmup max_steps base_lr
-    let loss = train_step x labels w_e w_q w_k w_v w_o pe seq V d dlog_buf st_we st_wq st_wk st_wv st_wo lr
+    let loss = train_step x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 lr
     let _ = if step % 10 == 0 then
       let _ = print (cat ["step ", show step, "  lr=", show_float lr, "  loss=", show_float loss])
       0
     else 0
-    train_loop x labels w_e w_q w_k w_v w_o pe seq V d dlog_buf st_we st_wq st_wk st_wv st_wo base_lr warmup max_steps (step + 1)
+    train_loop x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 base_lr warmup max_steps (step + 1)
 
-eval_loss x labels w_e w_q w_k w_v w_o pe seq V d =
-  let result = forward x w_e w_q w_k w_v w_o pe seq V d
-  let probs = head result
+eval_loss x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff =
+  let result = forward x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
+  let probs = list_nth 0 result
   ce_loss probs labels seq V
 
 main =
-  let _ = print "=== Single-head causal transformer LM on Shakespeare ==="
+  let _ = print "=== Pre-norm transformer LM (LN + residual + FFN) ==="
 
   let text = corpus 0
   let vocab = build_vocab text
@@ -221,7 +348,6 @@ main =
   let seq = total - 1
   let _ = print (cat ["corpus=", show total, " chars, vocab=", show V, ", seq=", show seq])
 
-  -- Inputs: ids[0..seq-1], targets: ids[1..seq]
   let x_data = float_arr_new (seq * V) 0.0
   let _ = fill_onehot x_data ids V seq 0
   let x = Tensor x_data (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
@@ -230,61 +356,73 @@ main =
   let _ = fill_labels labels_data (tail ids) seq 0
   let labels = Tensor labels_data (cons seq []) (cons 1 [])
 
-  -- Architecture knobs.
   let d = 16
+  let d_ff = 64
 
-  -- Weights.
+  -- Weight tensors.
   let we_data = float_arr_new (V * d) 0.0
   let _ = init_weight we_data (V * d) 1
   let w_e = Tensor we_data (cons V (cons d [])) (compute_strides (cons V (cons d [])))
-
   let wq_data = float_arr_new (d * d) 0.0
   let _ = init_weight wq_data (d * d) 2
   let w_q = Tensor wq_data (cons d (cons d [])) (compute_strides (cons d (cons d [])))
-
   let wk_data = float_arr_new (d * d) 0.0
   let _ = init_weight wk_data (d * d) 3
   let w_k = Tensor wk_data (cons d (cons d [])) (compute_strides (cons d (cons d [])))
-
   let wv_data = float_arr_new (d * d) 0.0
   let _ = init_weight wv_data (d * d) 4
   let w_v = Tensor wv_data (cons d (cons d [])) (compute_strides (cons d (cons d [])))
-
   let wo_data = float_arr_new (d * V) 0.0
   let _ = init_weight wo_data (d * V) 5
   let w_o = Tensor wo_data (cons d (cons V [])) (compute_strides (cons d (cons V [])))
+  let wf1_data = float_arr_new (d * d_ff) 0.0
+  let _ = init_weight wf1_data (d * d_ff) 6
+  let w_f1 = Tensor wf1_data (cons d (cons d_ff [])) (compute_strides (cons d (cons d_ff [])))
+  let wf2_data = float_arr_new (d_ff * d) 0.0
+  let _ = init_weight wf2_data (d_ff * d) 7
+  let w_f2 = Tensor wf2_data (cons d_ff (cons d [])) (compute_strides (cons d_ff (cons d [])))
 
-  -- Positional encoding (fixed, no params).
+  -- LayerNorm parameters: gamma=1, beta=0 (fixed, no training).
+  let lng_data = float_arr_new d 1.0
+  let _ = ones_loop lng_data d 0
+  let ln_g = Tensor lng_data (cons d []) (cons 1 [])
+  let lnb_data = float_arr_new d 0.0
+  let ln_b = Tensor lnb_data (cons d []) (cons 1 [])
+
   let pe = build_pe seq d
 
-  -- Adam states.
   let st_we = adam_state (V * d)
   let st_wq = adam_state (d * d)
   let st_wk = adam_state (d * d)
   let st_wv = adam_state (d * d)
   let st_wo = adam_state (d * V)
+  let st_wf1 = adam_state (d * d_ff)
+  let st_wf2 = adam_state (d_ff * d)
 
   let dlog_buf = float_arr_new (seq * V) 0.0
 
-  let loss0 = eval_loss x labels w_e w_q w_k w_v w_o pe seq V d
+  let loss0 = eval_loss x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
   let _ = print (cat ["initial loss=", show_float loss0])
-  let _ = print (cat ["uniform-baseline loss (log V)=", show_float (log (int_to_float V))])
+  let _ = print (cat ["uniform-baseline (log V)=", show_float (log (int_to_float V))])
   let _ = print (cat ["v2.3 bigram baseline=2.10"])
+  let _ = print (cat ["v2.4 attention-only baseline=2.62"])
 
-  let _ = print "\nTraining 300 steps, cosine(warmup=20, peak_lr=0.05):"
-  let _ = train_loop x labels w_e w_q w_k w_v w_o pe seq V d dlog_buf st_we st_wq st_wk st_wv st_wo 0.05 20 300 0
+  let _ = print "\nTraining 500 steps, cosine(warmup=30, peak_lr=0.05):"
+  let _ = train_loop x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 0.05 30 500 0
 
-  let loss1 = eval_loss x labels w_e w_q w_k w_v w_o pe seq V d
+  let loss1 = eval_loss x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
   let _ = print (cat ["\nfinal loss=", show_float loss1])
 
   let beat_uniform = if loss1 < (log (int_to_float V)) then "YES" else "NO"
   let beat_bigram = if loss1 < 2.10 then "YES" else "NO"
+  let beat_v24 = if loss1 < 2.62 then "YES" else "NO"
   let _ = print (cat ["beats uniform: ", beat_uniform])
   let _ = print (cat ["beats v2.3 bigram (2.10): ", beat_bigram])
+  let _ = print (cat ["beats v2.4 attn-only (2.62): ", beat_v24])
   0
 
-fill_labels arr ids seq i =
-  if i >= seq then 0
+ones_loop arr n i =
+  if i >= n then 0
   else
-    let _ = float_arr_set arr i (int_to_float (head ids))
-    fill_labels arr (tail ids) seq (i + 1)
+    let _ = float_arr_set arr i 1.0
+    ones_loop arr n (i + 1)
