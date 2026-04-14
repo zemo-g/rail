@@ -1,0 +1,315 @@
+-- three_class_mlp.rail — train a 2→32→3 MLP to classify 3 clusters
+-- in 2D. Goes beyond XOR: multi-class softmax + cross-entropy.
+--
+-- Data: 3 circular clusters centered at (-2,0), (2,0), (0,2), 30 pts each.
+-- Architecture: input(2) → linear+relu(32) → linear(3) → softmax
+-- Loss: cross-entropy per sample, averaged
+-- Optimizer: SGD, lr=0.1, 200 steps
+-- Expected: >95% accuracy after convergence
+
+import tensor
+
+-- ── Synthetic cluster data ──
+fill_cluster data labels N cx cy label_id start =
+  fill_cluster_loop data labels N cx cy label_id start 0
+
+fill_cluster_loop data labels N cx cy label_id start i =
+  if i >= N then 0
+  else
+    -- Deterministic "scatter" around cluster center
+    let phase = (i * 37) % 20
+    let rx = 0.1 * int_to_float (phase - 10)
+    let ry = 0.1 * int_to_float (((i * 53) % 20) - 10)
+    let row = start + i
+    let _ = float_arr_set data (row * 2) (cx + rx)
+    let _ = float_arr_set data (row * 2 + 1) (cy + ry)
+    let _ = float_arr_set labels row (int_to_float label_id)
+    fill_cluster_loop data labels N cx cy label_id start (i + 1)
+
+-- ── Weight init: small gaussian-ish via deterministic pattern ──
+init_weight arr n seed =
+  init_weight_loop arr n seed 0
+
+init_weight_loop arr n seed i =
+  if i >= n then 0
+  else
+    let raw = ((i * 97 + seed * 13) % 100) - 50
+    let v = 0.05 * int_to_float raw
+    let _ = float_arr_set arr i v
+    init_weight_loop arr n (seed + 1) (i + 1)
+
+-- ── Forward pass: X(90,2) → H=relu(X@W1+b1)(90,32) → Y=H@W2+b2(90,3) → probs=softmax(Y) ──
+
+mlp_forward x w1 b1 w2 b2 =
+  let h = linear_relu x w1 b1
+  let y = linear2 h w2 b2
+  tensor_softmax y
+
+-- linear and linear_relu are defined in transformer.rail style but inline here
+-- to avoid deeper imports.
+add_bias_loop dst bias cols n i =
+  if i >= n then 0
+  else
+    let col = i % cols
+    let bv = float_arr_get bias col
+    let cur = float_arr_get dst i
+    let _ = float_arr_set dst i (cur + bv)
+    add_bias_loop dst bias cols n (i + 1)
+
+linear2 x w b = match x
+  | Tensor xd xs xt -> match w
+    | Tensor wd ws wt -> match b
+      | Tensor bd bs bt ->
+        let y = matmul x w
+        match y | Tensor yd ys yt ->
+          let cols = head (tail ys)
+          let n = list_product ys
+          let _ = add_bias_loop yd bd cols n 0
+          y
+
+linear_relu x w b = match x
+  | Tensor xd xs xt -> match w
+    | Tensor wd ws wt -> match b
+      | Tensor bd bs bt ->
+        let m = head xs
+        let k = head (tail xs)
+        let nn = head (tail ws)
+        if gpu_available 0 then
+          let out = gpu_matmul_relu_ffi xd wd bd m k nn
+          Tensor out (cons m (cons nn [])) (compute_strides (cons m (cons nn [])))
+        else
+          let y = linear2 x w b
+          tensor_relu y
+
+-- ── Cross-entropy loss (mean over batch) ──
+-- probs: [N, C], labels: [N]  → scalar loss
+cross_entropy_mean probs labels N C = match probs
+  | Tensor pd _ _ -> match labels
+    | Tensor ld _ _ ->
+      let acc = float_arr_new 1 0.0
+      let _ = ce_loop pd ld N C acc 0
+      (float_arr_get acc 0) / int_to_float N
+
+ce_loop pd ld N C acc i =
+  if i >= N then 0
+  else
+    let target = float_to_int (float_arr_get ld i)
+    let p = float_arr_get pd (i * C + target)
+    let p2 = if p < 0.00000001 then 0.00000001 else p
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur - log p2)
+    ce_loop pd ld N C acc (i + 1)
+
+-- ── Gradient of cross-entropy + softmax wrt logits: (probs - onehot)/N ──
+-- logits_grad[i,c] = (probs[i,c] - (c == labels[i] ? 1 : 0)) / N
+ce_grad_loop dst probs labels N C invN i =
+  if i >= N * C then 0
+  else
+    let row = i / C
+    let col = i % C
+    let target = float_to_int (float_arr_get labels row)
+    let p = float_arr_get probs i
+    let g = if col == target then (p - 1.0) * invN else p * invN
+    let _ = float_arr_set dst i g
+    ce_grad_loop dst probs labels N C invN (i + 1)
+
+-- ── Simple training loop (forward → loss → grads → SGD) ──
+-- For brevity, implement just the key gradient path:
+-- dW2 = H^T @ dY
+-- db2 = sum(dY, dim=0)
+-- dH  = dY @ W2^T
+-- dH_relu = dH * (H > 0)
+-- dW1 = X^T @ dH_relu
+-- db1 = sum(dH_relu, dim=0)
+
+sum_axis0 src N C out =
+  sum_axis0_loop src N C out 0 0
+
+sum_axis0_loop src N C out c i =
+  if c >= C then 0
+  else if i >= N then
+    sum_axis0_loop src N C out (c + 1) 0
+  else
+    let cur = float_arr_get out c
+    let _ = float_arr_set out c (cur + float_arr_get src (i * C + c))
+    sum_axis0_loop src N C out c (i + 1)
+
+-- Split the train step so the deeply-nested match chain doesn't trip
+-- Rail's parser. Each helper returns once the weights are mutated.
+compute_grads_backward x hidden probs labels w1 w2 dy_buf dh_relu_buf N D H C lr =
+  match probs | Tensor pd _ _ ->
+    match labels | Tensor ld _ _ -> match hidden | Tensor hd _ _ -> match x | Tensor xd _ _ ->
+      let invN = 1.0 / int_to_float N
+      let _ = ce_grad_loop dy_buf pd ld N C invN 0
+      let dy_t = Tensor dy_buf (cons N (cons C [])) (compute_strides (cons N (cons C [])))
+      let ht_t = tensor_transpose hidden
+      let dw2 = matmul ht_t dy_t
+      let w2_t = tensor_transpose w2
+      let dh = matmul dy_t w2_t
+      let dhd = unwrap_data dh
+      let _ = relu_bwd_loop dhd hd dh_relu_buf (N * H) 0
+      let dh_relu_t = Tensor dh_relu_buf (cons N (cons H [])) (compute_strides (cons N (cons H [])))
+      let xt_t = tensor_transpose x
+      let dw1 = matmul xt_t dh_relu_t
+      let db1 = float_arr_new H 0.0
+      let _ = sum_axis0 dh_relu_buf N H db1
+      let db2 = float_arr_new C 0.0
+      let _ = sum_axis0 dy_buf N C db2
+      let _ = sgd_step w1 dw1 lr (D * H)
+      let _ = sgd_step w2 dw2 lr (H * C)
+      let _ = sgd_step_raw (unwrap_data_of w1 b1_sentinel) db1 lr H
+      0
+
+-- Helpers to pull float_arr out of a Tensor without nesting match blocks
+unwrap_data t = match t | Tensor d _ _ -> d
+
+-- Placeholder — the real biases are passed in and unwrapped via match in caller.
+b1_sentinel = 0
+unwrap_data_of w1 _ = match w1 | Tensor d _ _ -> d
+
+train_step x labels w1 b1 w2 b2 dy_buf dh_buf dh_relu_buf N D H C lr =
+  let hidden = linear_relu x w1 b1
+  let logits = linear2 hidden w2 b2
+  let probs = tensor_softmax logits
+  let loss = cross_entropy_mean probs labels N C
+
+  match probs | Tensor pd _ _ ->
+    match labels | Tensor ld _ _ -> match hidden | Tensor hd _ _ -> match x | Tensor xd _ _ ->
+      match b1 | Tensor b1d _ _ -> match b2 | Tensor b2d _ _ ->
+        let invN = 1.0 / int_to_float N
+        let _ = ce_grad_loop dy_buf pd ld N C invN 0
+        let dy_t = Tensor dy_buf (cons N (cons C [])) (compute_strides (cons N (cons C [])))
+        let ht_t = tensor_transpose hidden
+        let dw2 = matmul ht_t dy_t
+        let w2_t = tensor_transpose w2
+        let dh = matmul dy_t w2_t
+        let dhd = unwrap_data dh
+        let _ = relu_bwd_loop dhd hd dh_relu_buf (N * H) 0
+        let dh_relu_t = Tensor dh_relu_buf (cons N (cons H [])) (compute_strides (cons N (cons H [])))
+        let xt_t = tensor_transpose x
+        let dw1 = matmul xt_t dh_relu_t
+        let db1 = float_arr_new H 0.0
+        let _ = sum_axis0 dh_relu_buf N H db1
+        let db2 = float_arr_new C 0.0
+        let _ = sum_axis0 dy_buf N C db2
+        let _ = sgd_step w1 dw1 lr (D * H)
+        let _ = sgd_step w2 dw2 lr (H * C)
+        let _ = sgd_step_raw b1d db1 lr H
+        let _ = sgd_step_raw b2d db2 lr C
+        loss
+
+relu_bwd_loop dh_data h_data out N i =
+  if i >= N then 0
+  else
+    let hv = float_arr_get h_data i
+    let g = if hv > 0.0 then float_arr_get dh_data i else 0.0
+    let _ = float_arr_set out i g
+    relu_bwd_loop dh_data h_data out N (i + 1)
+
+-- SGD update: takes a Tensor (for weights) and a Tensor (for grads)
+sgd_step w_tensor g_tensor lr n = match w_tensor
+  | Tensor wd _ _ -> match g_tensor
+    | Tensor gd _ _ -> sgd_raw_loop wd gd lr n 0
+
+sgd_step_raw w_data g_data lr n =
+  sgd_raw_loop w_data g_data lr n 0
+
+sgd_raw_loop wd gd lr n i =
+  if i >= n then 0
+  else
+    let w = float_arr_get wd i
+    let g = float_arr_get gd i
+    let _ = float_arr_set wd i (w - lr * g)
+    sgd_raw_loop wd gd lr n (i + 1)
+
+-- ── Main ──
+main =
+  let _ = print "=== 3-class MLP on Metal ==="
+  let N = 90
+  let D = 2
+  let H = 32
+  let C = 3
+
+  -- Data buffers
+  let x_data = float_arr_new (N * D) 0.0
+  let labels_data = float_arr_new N 0.0
+  let _ = fill_cluster x_data labels_data 30 (0.0 - 2.0) 0.0 0 0
+  let _ = fill_cluster x_data labels_data 30 2.0 0.0 1 30
+  let _ = fill_cluster x_data labels_data 30 0.0 2.0 2 60
+  let x = Tensor x_data (cons N (cons D [])) (compute_strides (cons N (cons D [])))
+  let labels = Tensor labels_data (cons N []) (cons 1 [])
+
+  -- Weights
+  let w1_data = float_arr_new (D * H) 0.0
+  let _ = init_weight w1_data (D * H) 7
+  let w1 = Tensor w1_data (cons D (cons H [])) (compute_strides (cons D (cons H [])))
+  let b1_data = float_arr_new H 0.0
+  let b1 = Tensor b1_data (cons H []) (cons 1 [])
+
+  let w2_data = float_arr_new (H * C) 0.0
+  let _ = init_weight w2_data (H * C) 13
+  let w2 = Tensor w2_data (cons H (cons C [])) (compute_strides (cons H (cons C [])))
+  let b2_data = float_arr_new C 0.0
+  let b2 = Tensor b2_data (cons C []) (cons 1 [])
+
+  -- Gradient buffers (reused across steps)
+  let dy_buf = float_arr_new (N * C) 0.0
+  let dh_buf = float_arr_new (N * H) 0.0
+  let dh_relu_buf = float_arr_new (N * H) 0.0
+
+  let _ = print "training 200 steps lr=0.1"
+  let _ = train_loop x labels w1 b1 w2 b2 dy_buf dh_buf dh_relu_buf N D H C 0.1 0 200
+
+  let _ = print "=== final loss ==="
+  let final_loss = eval_loss x labels w1 b1 w2 b2 N C
+  let _ = print (show_float final_loss)
+
+  -- Accuracy
+  let _ = print "=== accuracy ==="
+  let acc = eval_accuracy x labels w1 b1 w2 b2 N C
+  let _ = print (join "" (cons (show_float (acc * 100.0)) (cons "%" [])))
+  0
+
+train_loop x labels w1 b1 w2 b2 dy_buf dh_buf dh_relu_buf N D H C lr step max_steps =
+  if step >= max_steps then 0
+  else
+    let loss = train_step x labels w1 b1 w2 b2 dy_buf dh_buf dh_relu_buf N D H C lr
+    let _ = if step % 20 == 0 then
+      let _ = print (join "" (cons "step " (cons (show step) (cons " loss=" (cons (show_float loss) [])))))
+      0
+    else 0
+    train_loop x labels w1 b1 w2 b2 dy_buf dh_buf dh_relu_buf N D H C lr (step + 1) max_steps
+
+eval_loss x labels w1 b1 w2 b2 N C =
+  let h = linear_relu x w1 b1
+  let y = linear2 h w2 b2
+  let p = tensor_softmax y
+  cross_entropy_mean p labels N C
+
+eval_accuracy x labels w1 b1 w2 b2 N C =
+  let h = linear_relu x w1 b1
+  let y = linear2 h w2 b2
+  let p = tensor_softmax y
+  match p | Tensor pd _ _ -> match labels | Tensor ld _ _ ->
+    let correct = float_arr_new 1 0.0
+    let _ = acc_loop pd ld N C correct 0
+    (float_arr_get correct 0) / int_to_float N
+
+acc_loop pd ld N C correct i =
+  if i >= N then 0
+  else
+    let target = float_to_int (float_arr_get ld i)
+    let best = argmax_row pd (i * C) C 0 0 (0.0 - 1.0)
+    let _ = if best == target then
+      let cur = float_arr_get correct 0
+      let _ = float_arr_set correct 0 (cur + 1.0)
+      0
+    else 0
+    acc_loop pd ld N C correct (i + 1)
+
+argmax_row pd offset C i best_i best_v =
+  if i >= C then best_i
+  else
+    let v = float_arr_get pd (offset + i)
+    if v > best_v then argmax_row pd offset C (i + 1) i v
+    else argmax_row pd offset C (i + 1) best_i best_v

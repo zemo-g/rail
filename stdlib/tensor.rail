@@ -185,11 +185,26 @@ gpu_parse_inline_loop arr parts i n =
       let _ = float_arr_set arr i (parse_float p)
       gpu_parse_inline_loop arr (tail parts) (i + 1) n
 
--- GPU matmul via dylib FFI (fastest, zero-copy) — declared here.
+-- GPU via dylib FFI (fastest, zero-copy).
 -- dylib path: /Users/ledaticempire/projects/rail/tools/metal/libtensor_gpu.dylib
 -- absolute install_name makes it discoverable without DYLD env vars.
+-- Every foreign float_arr argument is passed as a pointer; the dylib
+-- skips the 8-byte Rail count header internally.
 foreign tgl_init dummy -> int
 foreign tgl_matmul_f64 a b c m k n -> int
+foreign tgl_matmul_relu_f64 a b bias c m k n -> int
+foreign tgl_add_f64 a b c n -> int
+foreign tgl_mul_f64 a b c n -> int
+foreign tgl_scale_f64 a c scalar_arr n -> int
+foreign tgl_relu_f64 x y n -> int
+foreign tgl_relu_backward_f64 x g o n -> int
+foreign tgl_sigmoid_f64 x y n -> int
+foreign tgl_exp_f64 x y n -> int
+foreign tgl_tanh_f64 x y n -> int
+foreign tgl_softmax_rows_f64 x y rows cols -> int
+foreign tgl_transpose_f64 a b m n -> int
+foreign tgl_sgd_update_f64 w g lr_arr n -> int
+foreign tgl_cross_entropy_f64 p t l batch vocab -> int
 
 -- Has dylib been initialized this process?
 gpu_dylib_flag = float_arr_new 1 0.0
@@ -241,6 +256,97 @@ gpu_relu_dispatch src_data n =
     let result = gpu_read_floats "/tmp/rail_tg_c.txt" n
     let _ = gpu_cleanup 0
     result
+
+-- ============================================================
+-- dylib FFI path for every op — zero-copy, amortized allocation.
+-- Each helper: if dylib is up, call it; else fall back to file/daemon.
+-- Callers that hit these do NOT have to do their own ensure_dylib
+-- gate — the helper handles it.
+-- ============================================================
+
+-- Unary activation (relu, sigmoid, exp, tanh). Op string maps to FFI.
+gpu_unop_ffi op src_data n =
+  if ensure_dylib 0 then
+    let result = float_arr_new n 0.0
+    let rc = if op == "relu"     then tgl_relu_f64    src_data result n
+             else if op == "sigmoid" then tgl_sigmoid_f64 src_data result n
+             else if op == "exp"      then tgl_exp_f64     src_data result n
+             else if op == "tanh_fwd" then tgl_tanh_f64    src_data result n
+             else 0 - 1
+    if rc >= 0 then result
+    else gpu_unop_dispatch op src_data n
+  else
+    gpu_unop_dispatch op src_data n
+
+-- Binary elementwise (add, mul).
+gpu_binop_ffi op a_data b_data n =
+  if ensure_dylib 0 then
+    let result = float_arr_new n 0.0
+    let rc = if op == "add" then tgl_add_f64 a_data b_data result n
+             else if op == "mul" then tgl_mul_f64 a_data b_data result n
+             else 0 - 1
+    if rc >= 0 then result
+    else gpu_binop_dispatch op a_data b_data n
+  else
+    gpu_binop_dispatch op a_data b_data n
+
+-- Scalar multiply. Scalar wrapped into a tiny float_arr so we can pass by pointer.
+gpu_scale_ffi src_data s n =
+  if ensure_dylib 0 then
+    let sarr = float_arr_new 1 s
+    let result = float_arr_new n 0.0
+    let rc = tgl_scale_f64 src_data result sarr n
+    if rc >= 0 then result
+    else src_data   -- fallback callers always have CPU loop nearby
+  else
+    src_data
+
+-- Softmax (row-wise). 2D input [rows,cols]. Shape-preserving.
+gpu_softmax_ffi src_data rows cols =
+  if ensure_dylib 0 then
+    let result = float_arr_new (rows * cols) 0.0
+    let rc = tgl_softmax_rows_f64 src_data result rows cols
+    if rc >= 0 then result
+    else gpu_unop_dispatch "softmax" src_data (rows * cols)
+  else
+    gpu_unop_dispatch "softmax" src_data (rows * cols)
+
+-- Transpose: A[M,N]^T returns a new flat buffer of shape [N,M].
+gpu_transpose_ffi src_data m n =
+  if ensure_dylib 0 then
+    let result = float_arr_new (m * n) 0.0
+    let rc = tgl_transpose_f64 src_data result m n
+    if rc >= 0 then result
+    else gpu_unop_dispatch "transpose" src_data (m * n)
+  else
+    gpu_unop_dispatch "transpose" src_data (m * n)
+
+-- ReLU backward: ∂L/∂x = (x > 0) ? ∂L/∂y : 0
+gpu_relu_backward_ffi x_data grad_data n =
+  if ensure_dylib 0 then
+    let result = float_arr_new n 0.0
+    let rc = tgl_relu_backward_f64 x_data grad_data result n
+    if rc >= 0 then result
+    else x_data
+  else x_data
+
+-- In-place SGD step: w -= lr * grad
+gpu_sgd_ffi w_data g_data lr n =
+  if ensure_dylib 0 then
+    let larr = float_arr_new 1 lr
+    let rc = tgl_sgd_update_f64 w_data g_data larr n
+    rc
+  else 0 - 1
+
+-- Fused matmul+bias+relu
+gpu_matmul_relu_ffi a_data b_data bias_data m k n =
+  if ensure_dylib 0 then
+    let result = float_arr_new (m * n) 0.0
+    let rc = tgl_matmul_relu_f64 a_data b_data bias_data result m k n
+    if rc >= 0 then result
+    else result
+  else
+    gpu_matmul_dispatch a_data b_data m k n
 
 -- ============================================================
 -- Matmul: (M,K) @ (K,N) -> (M,N)
@@ -361,16 +467,19 @@ gpu_unop_dispatch op src_data n =
     let _ = gpu_cleanup 0
     result
 
--- tensor_add: element-wise addition
+-- tensor_add: element-wise addition (GPU via dylib, CPU fallback)
 tensor_add a b = match a
   | Tensor a_data a_shape a_st -> match b
     | Tensor b_data b_shape b_st ->
       let n = list_product a_shape
-      let c = tensor_zeros a_shape
-      match c
-        | Tensor c_data c_shape c_st ->
-          let _ = add_loop a_data b_data c_data n 0
-          c
+      if gpu_available 0 then
+        Tensor (gpu_binop_ffi "add" a_data b_data n) a_shape a_st
+      else
+        let c = tensor_zeros a_shape
+        match c
+          | Tensor c_data c_shape c_st ->
+            let _ = add_loop a_data b_data c_data n 0
+            c
 
 -- tensor_sub: element-wise subtraction
 tensor_sub a b = match a
@@ -383,26 +492,32 @@ tensor_sub a b = match a
           let _ = sub_loop a_data b_data c_data n 0
           c
 
--- tensor_mul: element-wise (Hadamard) multiplication
+-- tensor_mul: element-wise (Hadamard) multiplication (GPU via dylib, CPU fallback)
 tensor_mul a b = match a
   | Tensor a_data a_shape a_st -> match b
     | Tensor b_data b_shape b_st ->
       let n = list_product a_shape
-      let c = tensor_zeros a_shape
-      match c
-        | Tensor c_data c_shape c_st ->
-          let _ = hmul_loop a_data b_data c_data n 0
-          c
+      if gpu_available 0 then
+        Tensor (gpu_binop_ffi "mul" a_data b_data n) a_shape a_st
+      else
+        let c = tensor_zeros a_shape
+        match c
+          | Tensor c_data c_shape c_st ->
+            let _ = hmul_loop a_data b_data c_data n 0
+            c
 
--- tensor_scale: scalar multiply
+-- tensor_scale: scalar multiply (GPU via dylib, CPU fallback)
 tensor_scale t s = match t
   | Tensor t_data t_shape t_st ->
     let n = list_product t_shape
-    let c = tensor_zeros t_shape
-    match c
-      | Tensor c_data c_shape c_st ->
-        let _ = scale_loop t_data c_data n 0 s
-        c
+    if gpu_available 0 then
+      Tensor (gpu_scale_ffi t_data s n) t_shape t_st
+    else
+      let c = tensor_zeros t_shape
+      match c
+        | Tensor c_data c_shape c_st ->
+          let _ = scale_loop t_data c_data n 0 s
+          c
 
 -- ============================================================
 -- Activation functions (element-wise, explicit loops)
@@ -421,7 +536,7 @@ tensor_relu t = match t
   | Tensor t_data t_shape t_st ->
     let n = list_product t_shape
     if gpu_available 0 then
-      let c_data = gpu_unop_dispatch "relu" t_data n
+      let c_data = gpu_unop_ffi "relu" t_data n
       Tensor c_data t_shape t_st
     else
       let c = tensor_zeros t_shape
@@ -456,7 +571,7 @@ tensor_exp_gpu t = match t
   | Tensor t_data t_shape t_st ->
     let n = list_product t_shape
     if gpu_available 0 then
-      Tensor (gpu_unop_dispatch "exp" t_data n) t_shape t_st
+      Tensor (gpu_unop_ffi "exp" t_data n) t_shape t_st
     else
       let c = tensor_zeros t_shape
       match c | Tensor c_data _ _ ->
@@ -473,7 +588,7 @@ tensor_tanh_gpu t = match t
   | Tensor t_data t_shape t_st ->
     let n = list_product t_shape
     if gpu_available 0 then
-      Tensor (gpu_unop_dispatch "tanh_fwd" t_data n) t_shape t_st
+      Tensor (gpu_unop_ffi "tanh_fwd" t_data n) t_shape t_st
     else
       let c = tensor_zeros t_shape
       match c | Tensor c_data _ _ ->
@@ -490,7 +605,7 @@ tensor_sigmoid t = match t
   | Tensor t_data t_shape t_st ->
     let n = list_product t_shape
     if gpu_available 0 then
-      Tensor (gpu_unop_dispatch "sigmoid" t_data n) t_shape t_st
+      Tensor (gpu_unop_ffi "sigmoid" t_data n) t_shape t_st
     else
       let c = tensor_zeros t_shape
       match c | Tensor c_data _ _ ->
@@ -640,7 +755,7 @@ tensor_softmax t = match t
     let cols = if length t_shape >= 1 then head (reverse t_shape) else n
     let rows = n / cols
     if gpu_available 0 then
-      Tensor (gpu_softmax_dispatch t_data rows cols) t_shape t_st
+      Tensor (gpu_softmax_ffi t_data rows cols) t_shape t_st
     else
       let c = tensor_zeros t_shape
       match c | Tensor c_data _ _ ->
@@ -947,7 +1062,7 @@ tensor_transpose t = match t
     let cols = head (tail t_shape)
     let n = rows * cols
     if gpu_available 0 then
-      let new_data = gpu_transpose_dispatch t_data rows cols
+      let new_data = gpu_transpose_ffi t_data rows cols
       Tensor new_data (cons cols (cons rows [])) (compute_strides (cons cols (cons rows [])))
     else
       let new_data = float_arr_new n 0.0

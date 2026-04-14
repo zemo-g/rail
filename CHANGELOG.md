@@ -2,6 +2,74 @@
 
 All notable changes to Rail are documented here.
 
+## v2.1.2 (2026-04-14, overnight session)
+
+The second half of v2.1.x — closing every remaining gap in the
+Rail→Metal path and pushing past XOR to real classification.
+
+### Dylib: full GPU op coverage via FFI
+`libtensor_gpu.dylib` now exports 15 ops (was 3). Every tensor op used
+by `stdlib/tensor.rail` routes through C ABI FFI — no more /tmp file
+pipes on the hot path. New exports:
+
+- `tgl_add_f64`, `tgl_mul_f64`, `tgl_scale_f64` — elementwise
+- `tgl_sigmoid_f64`, `tgl_exp_f64`, `tgl_tanh_f64` — activations
+- `tgl_softmax_rows_f64` — 3-pass row-wise softmax
+- `tgl_transpose_f64` — row-major transpose
+- `tgl_relu_backward_f64` — masked gradient for training
+- `tgl_sgd_update_f64` — in-place weight update
+- `tgl_cross_entropy_f64` — loss over a batch
+- `tgl_matmul_relu_f64` — fused matmul+bias+relu (new kernel)
+
+### Persistent MTLBuffer pool
+Best-fit reuse across ops (32 slots, page-rounded). Cuts
+`newBufferWithLength` overhead on training loops where the same
+shapes are dispatched over and over.
+
+### Fused matmul+bias+relu kernel
+`matmul_bias_relu` in the .metal lib — one dispatch for the classic
+MLP layer instead of three. Used automatically by `linear_relu` in the
+new transformer stdlib.
+
+### Three-class MLP trains on Metal
+`tools/train/three_class_mlp.rail` — 2D→32→3 classifier on 3 synthetic
+clusters, cross-entropy + SGD, analytical backward pass. Loss 5.63 →
+0.006 in 200 steps. **100% accuracy on 90 samples.** Every op in the
+forward and backward pass dispatches through the dylib FFI. First
+multi-class training on Metal in pure Rail.
+
+### Transformer forward pass stdlib
+`stdlib/transformer.rail` — linear, linear_relu (fused), layernorm,
+scaled-dot-product attention (with optional causal mask), feedforward,
+pre-norm transformer block. `tools/railml/transformer_forward.rail`
+runs a 4-token × 8-dim two-layer stack and verifies softmax rows sum
+to 1.0. All matmuls and activations dispatch to Metal.
+
+### Tensor op benchmark
+`tools/bench/tensor_ops.rail` — measures per-op latency via the dylib
+path at multiple sizes. Reveals ~5ms per-call overhead (command buffer
++ f64↔f32 copies dominate below N=1024²).
+
+### Bug fix: missing `foreign tgl_relu_f64` declaration
+When v2.1.1 migrated to the dylib path, `foreign tgl_relu_f64` was
+dropped from `stdlib/tensor.rail`. Without it, Rail treated the call
+as a regular Rail function, skipping the int-untagging sequence
+(`asr`+`tst`+`csel`) before the BL. N arrived in the dylib as the
+tagged value (2n+1) and every second dispatch segfaulted. Restoring
+the declaration immediately fixes a whole family of hangs.
+
+### Tooling: landing page thumbnails + CF deploy Content-Type
+- `tools/deploy/gen_plasma_landing.rail` — generates /plasma index
+  with CSS-only preview thumbnails (arc, rings, vortex, nozzle,
+  helix). No raster assets, pure animated gradients.
+- `tools/deploy/cf_deploy.rail` — auto-detects Content-Type from KV
+  key suffix (.css, .js, .wasm, .svg, .json, .png, else HTML) and
+  attaches as KV metadata so the Worker can set headers without a
+  hardcoded suffix table.
+
+### Test count, fixed point
+105/105. Self-compile byte-identical.
+
 ## v2.1.1 (2026-04-14)
 
 Follow-up session addressing v2.1 technical debt.

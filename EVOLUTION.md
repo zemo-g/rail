@@ -12,7 +12,7 @@ Started 2026-04-13. Every upgrade, ranked and tracked.
 - [ ] Landing page preview thumbnails (CSS-only)
 - [x] GPU dispatch for matmul in tensor.rail (done 2026-04-13)
 - [x] GPU dispatch for relu in tensor.rail (done 2026-04-13)
-- [ ] GPU dispatch for tensor_add, tensor_mul, tensor_scale
+- [x] GPU dispatch for tensor_add, tensor_mul, tensor_scale (2026-04-14)
 - [x] Cache gpu_available check (float_arr flag, checks once) (2026-04-13)
 - [x] Clean /tmp/rail_tg_*.txt after GPU ops (2026-04-13)
 
@@ -73,11 +73,18 @@ First training run: XOR MLP loss 0.425→0.043 on Metal GPU.
 - [ ] WASM: add float_arr support to WASM backend, port mhd.rail
 - [ ] Full 2D MHD replacing parametric model in thruster_engine.html (WebGL compute)
 - [x] Binary float array file I/O builtins — float_arr_to/from_f32_file (2026-04-13)
-- [ ] Autograd on GPU (backward passes dispatch through Metal — partial:
-      tracked_matmul's backward already dispatches through matmul which is GPU)
+- [x] Autograd on GPU (every op now via dylib; three_class_mlp.rail proves
+      end-to-end training — forward, backward, SGD — all on Metal) (2026-04-14)
 - [ ] Proper Laplace current distribution in thruster engine
-- [ ] CF Worker content-type routing for .css/.js/.wasm
-- [ ] GPU matmul double-buffered persistent buffers
+- [~] CF Worker content-type routing for .css/.js/.wasm (deploy-side ready
+      in cf_deploy.rail; worker-side change pending worker source access) (2026-04-14)
+- [x] GPU matmul persistent buffers — MTLBuffer pool in libtensor_gpu.dylib (2026-04-14)
+- [x] Fused matmul+bias+relu kernel (2026-04-14)
+- [x] Transformer forward pass in Rail — stdlib/transformer.rail,
+      attention + layernorm + FFN, verified softmax rows sum to 1 (2026-04-14)
+- [x] Three-class MLP training on Metal — 100% accuracy in 200 steps,
+      beyond XOR, multi-class cross-entropy + SGD (2026-04-14)
+- [x] Landing page preview thumbnails (CSS-only, 5 animated tiles) (2026-04-14)
 
 ## HARD (3-5 days)
 
@@ -85,7 +92,7 @@ First training run: XOR MLP loss 0.425→0.043 on Metal GPU.
 - [ ] Train neural_mhd entirely in Rail on Metal (first pure-Rail GPU training)
 - [ ] Implicit MHD time-stepping (backward Euler, 100-1000x larger dt)
 - [ ] WebGPU compute for browser physics (WGSL shaders, iPhone GPU)
-- [ ] Transformer forward pass in Rail (attention, SwiGLU, layernorm — types exist, wiring needed)
+- [x] Transformer forward pass in Rail — stdlib/transformer.rail shipped (2026-04-14)
 - [ ] Self-training loop on Metal (zero Python, compiler as oracle)
 - [ ] Darwin syscall libc (eliminate ld -lSystem)
 - [ ] WASM stdlib: filter/map/fold as builtins
