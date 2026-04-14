@@ -852,3 +852,88 @@ int tgl_cross_entropy_f64(const double *probs, const double *targets,
     }
     return 1;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Metal IR — JIT-compiled user kernels from Rail source.
+//
+// tgl_unary_from_source(src, name, X, Y, N):
+//   Compile Metal source at runtime (cached by pointer identity of
+//   src, assumed to be a compile-time-baked string literal) into a
+//   library, look up `name` as a compute kernel, and dispatch it
+//   over N float_arr elements.
+//
+// Kernel signature expected:
+//   kernel void <name>(device const float *X [[buffer(0)]],
+//                      device float *Y [[buffer(1)]],
+//                      constant uint &n [[buffer(2)]],
+//                      uint gid [[thread_position_in_grid]]);
+//
+// Caching: we key a NSMutableDictionary by the Metal source string.
+// Recompile only on first sight; subsequent calls reuse the cached
+// MTLLibrary and pipeline.
+// ────────────────────────────────────────────────────────────────────
+
+static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_src_libs = nil;
+static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_src_pipes = nil;
+
+int tgl_unary_from_source(const char *src, const char *kname,
+                           const double *X, double *Y, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Xp = X + 1;
+    double *Yp = Y + 1;
+    @autoreleasepool {
+        if (!g_src_libs) g_src_libs = [NSMutableDictionary dictionary];
+        if (!g_src_pipes) g_src_pipes = [NSMutableDictionary dictionary];
+
+        NSString *nsSrc = [NSString stringWithUTF8String:src];
+        NSString *nsName = [NSString stringWithUTF8String:kname];
+        NSString *pipeKey = [nsSrc stringByAppendingString:nsName];
+
+        id<MTLComputePipelineState> p = g_src_pipes[pipeKey];
+        if (!p) {
+            id<MTLLibrary> lib = g_src_libs[nsSrc];
+            if (!lib) {
+                NSError *err = nil;
+                lib = [g_device newLibraryWithSource:nsSrc options:nil error:&err];
+                if (!lib) {
+                    fprintf(stderr, "tgl_unary_from_source: compile failed: %s\n",
+                            err ? [[err localizedDescription] UTF8String] : "(null)");
+                    return -1;
+                }
+                g_src_libs[nsSrc] = lib;
+            }
+            id<MTLFunction> fn = [lib newFunctionWithName:nsName];
+            if (!fn) {
+                fprintf(stderr, "tgl_unary_from_source: function `%s` not found\n", kname);
+                return -1;
+            }
+            NSError *err = nil;
+            p = [g_device newComputePipelineStateWithFunction:fn error:&err];
+            if (!p) {
+                fprintf(stderr, "tgl_unary_from_source: pipeline failed: %s\n",
+                        err ? [[err localizedDescription] UTF8String] : "(null)");
+                return -1;
+            }
+            g_src_pipes[pipeKey] = p;
+        }
+
+        id<MTLBuffer> bX = pool_acquire(N * 4);
+        id<MTLBuffer> bY = pool_acquire(N * 4);
+        f64_to_f32(Xp, (float *)bX.contents, N);
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bX offset:0 atIndex:0];
+        [enc setBuffer:bY offset:0 atIndex:1];
+        uint32_t nu = N;
+        [enc setBytes:&nu length:4 atIndex:2];
+        dispatch_1d(enc, N);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f32_to_f64((float *)bY.contents, Yp, N);
+        pool_release(bX); pool_release(bY);
+    }
+    return 1;
+}
