@@ -1,0 +1,561 @@
+-- lm_mh.rail — multi-head transformer LM with learnable LayerNorm.
+--
+-- v2.12 upgrade over v2.5 (lm_transformer.rail):
+--   • Multi-head causal attention (4 heads × head_dim=8, d_model=32)
+--   • Learnable LayerNorm γ,β (dgamma/dbeta + Adam state)
+--   • Separate attention output projection W_AO (d→d) and
+--     language-modeling head W_LM (d→V)
+--
+-- Weights list layout (index → name):
+--   0 w_e    1 w_q    2 w_k    3 w_v    4 w_ao
+--   5 w_f1   6 w_f2   7 w_lm   8 ln1_g  9 ln1_b
+--  10 ln2_g 11 ln2_b
+-- States list mirrors weights (same indices).
+-- Config: [seq, V, d, d_ff, n_heads, head_dim].
+--
+-- Goal: beat v2.3 bigram baseline (loss 2.10).
+
+import "stdlib/transformer.rail"
+import "stdlib/optim.rail"
+import "stdlib/tokenizer.rail"
+
+corpus _ =
+  cat ["To be, or not to be, that is the question.\n",
+       "Whether tis nobler in the mind to suffer\n",
+       "the slings and arrows of outrageous fortune,\n",
+       "or to take arms against a sea of troubles\n",
+       "and by opposing end them. To die, to sleep,\n",
+       "no more; and by a sleep to say we end\n",
+       "the heart-ache and the thousand natural shocks\n",
+       "that flesh is heir to: tis a consummation\n",
+       "devoutly to be wished. To die, to sleep;\n"]
+
+-- ── Init helpers ──
+-- Xavier-style: weights drawn from [-scale, scale] where
+--   scale = sqrt(6 / (fan_in + fan_out))
+-- Then sampled deterministically via hash scatter.
+init_weight arr n seed scale = init_w_loop arr n seed scale 0
+init_w_loop arr n seed scale i =
+  if i >= n then 0
+  else
+    let raw = ((i * 97 + seed * 13) % 100) - 50
+    let v = scale * (int_to_float raw / 50.0)
+    let _ = float_arr_set arr i v
+    init_w_loop arr n (seed + 1) scale (i + 1)
+
+ones_loop arr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set arr i 1.0
+    ones_loop arr n (i + 1)
+
+-- Xavier: scale = sqrt(6 / (fan_in + fan_out))
+xavier_scale fan_in fan_out =
+  sqrt (6.0 / int_to_float (fan_in + fan_out))
+
+make_weight rows cols seed =
+  let data = float_arr_new (rows * cols) 0.0
+  let scale = xavier_scale rows cols
+  let _ = init_weight data (rows * cols) seed scale
+  Tensor data (cons rows (cons cols [])) (compute_strides (cons rows (cons cols [])))
+
+make_gamma d =
+  let data = float_arr_new d 1.0
+  let _ = ones_loop data d 0
+  Tensor data (cons d []) (cons 1 [])
+
+make_beta d =
+  let data = float_arr_new d 0.0
+  Tensor data (cons d []) (cons 1 [])
+
+-- ── One-hot + labels ──
+fill_onehot dst ids V seq i =
+  if i >= seq then 0
+  else
+    let c = list_nth i ids
+    let _ = float_arr_set dst (i * V + c) 1.0
+    fill_onehot dst (tail ids) V seq (i + 1)
+
+fill_labels arr ids seq i =
+  if i >= seq then 0
+  else
+    let _ = float_arr_set arr i (int_to_float (head ids))
+    fill_labels arr (tail ids) seq (i + 1)
+
+-- ── Sinusoidal PE ──
+pe_loop arr seq d p k =
+  if p >= seq then 0
+  else if k >= d then pe_loop arr seq d (p + 1) 0
+  else
+    let exp_arg = int_to_float (k - (k % 2)) / int_to_float d
+    let denom = pow 10000.0 exp_arg
+    let angle = int_to_float p / denom
+    let v = if (k % 2) == 0 then sin angle else cos angle
+    let _ = float_arr_set arr (p * d + k) v
+    pe_loop arr seq d p (k + 1)
+
+build_pe seq d =
+  let arr = float_arr_new (seq * d) 0.0
+  let _ = pe_loop arr seq d 0 0
+  arr
+
+add_buf_inplace dst src n i =
+  if i >= n then 0
+  else
+    let cur = float_arr_get dst i
+    let s = float_arr_get src i
+    let _ = float_arr_set dst i (cur + s)
+    add_buf_inplace dst src n (i + 1)
+
+unwrap t = match t | Tensor d _ _ -> d
+
+relu_fwd src dst mask n i =
+  if i >= n then 0
+  else
+    let v = float_arr_get src i
+    let pos = if v > 0.0 then 1.0 else 0.0
+    let _ = float_arr_set mask i pos
+    let _ = float_arr_set dst i (v * pos)
+    relu_fwd src dst mask n (i + 1)
+
+relu_bwd dy mask dx n i =
+  if i >= n then 0
+  else
+    let g = float_arr_get dy i
+    let m = float_arr_get mask i
+    let _ = float_arr_set dx i (g * m)
+    relu_bwd dy mask dx n (i + 1)
+
+-- ── Cross-entropy ──
+lm_ce_loss_loop pd ld seq V acc i =
+  if i >= seq then 0
+  else
+    let target = float_to_int (float_arr_get ld i)
+    let p = float_arr_get pd (i * V + target)
+    let p2 = if p < 0.00000001 then 0.00000001 else p
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur - log p2)
+    lm_ce_loss_loop pd ld seq V acc (i + 1)
+
+ce_loss probs labels seq V = match probs
+  | Tensor pd _ _ -> match labels
+    | Tensor ld _ _ ->
+      let acc = float_arr_new 1 0.0
+      let _ = lm_ce_loss_loop pd ld seq V acc 0
+      (float_arr_get acc 0) / int_to_float seq
+
+ce_grad_loop dst probs labels seq V invN i =
+  if i >= seq * V then 0
+  else
+    let row = i / V
+    let col = i % V
+    let target = float_to_int (float_arr_get labels row)
+    let p = float_arr_get probs i
+    let g = if col == target then (p - 1.0) * invN else p * invN
+    let _ = float_arr_set dst i g
+    ce_grad_loop dst probs labels seq V invN (i + 1)
+
+-- ── Multi-head attention ──
+mh_head_forward q k v concat_out seq d_model head_dim h =
+  let q_h = extract_head q seq d_model head_dim h
+  let k_h = extract_head k seq d_model head_dim h
+  let v_h = extract_head v seq d_model head_dim h
+  let k_h_t = tensor_transpose k_h
+  let scores = matmul q_h k_h_t
+  let scale = 1.0 / sqrt (int_to_float head_dim)
+  let scaled = tensor_scale scores scale
+  let sd = unwrap scaled
+  let _ = apply_causal_mask_loop sd seq 0 0
+  let attn_h = tensor_softmax scaled
+  let out_h = matmul attn_h v_h
+  let _ = insert_head concat_out seq d_model head_dim h out_h
+  cons q_h (cons k_h (cons v_h (cons attn_h [])))
+
+mh_forward_loop q k v concat_out seq d_model n_heads head_dim acc h =
+  if h >= n_heads then acc
+  else
+    let t = mh_head_forward q k v concat_out seq d_model head_dim h
+    mh_forward_loop q k v concat_out seq d_model n_heads head_dim (cons t acc) (h + 1)
+
+-- Returns [concat_out, per_head_list].  per_head_list is in reverse
+-- order (head N-1 first) — backward reverses again.
+mh_forward q k v seq d_model n_heads head_dim =
+  let concat_data = float_arr_new (seq * d_model) 0.0
+  let concat_out = Tensor concat_data (cons seq (cons d_model [])) (compute_strides (cons seq (cons d_model [])))
+  let per_head = mh_forward_loop q k v concat_out seq d_model n_heads head_dim [] 0
+  cons concat_out (cons per_head [])
+
+mh_head_backward d_concat d_q d_k d_v per_head_tuple seq d_model head_dim h =
+  let q_h = list_nth 0 per_head_tuple
+  let k_h = list_nth 1 per_head_tuple
+  let v_h = list_nth 2 per_head_tuple
+  let attn_h = list_nth 3 per_head_tuple
+  let d_out_h = extract_head d_concat seq d_model head_dim h
+  let (d_q_h, d_k_h, d_v_h) = attention_backward q_h k_h v_h attn_h d_out_h
+  let _ = insert_head d_q seq d_model head_dim h d_q_h
+  let _ = insert_head d_k seq d_model head_dim h d_k_h
+  let _ = insert_head d_v seq d_model head_dim h d_v_h
+  0
+
+mh_backward_loop d_concat d_q d_k d_v per_head_fwd seq d_model n_heads head_dim h =
+  if h >= n_heads then 0
+  else
+    let t = list_nth (n_heads - 1 - h) per_head_fwd
+    let _ = mh_head_backward d_concat d_q d_k d_v t seq d_model head_dim h
+    mh_backward_loop d_concat d_q d_k d_v per_head_fwd seq d_model n_heads head_dim (h + 1)
+
+mh_backward d_concat per_head_fwd seq d_model n_heads head_dim =
+  let dq_data = float_arr_new (seq * d_model) 0.0
+  let dk_data = float_arr_new (seq * d_model) 0.0
+  let dv_data = float_arr_new (seq * d_model) 0.0
+  let d_q = Tensor dq_data (cons seq (cons d_model [])) (compute_strides (cons seq (cons d_model [])))
+  let d_k = Tensor dk_data (cons seq (cons d_model [])) (compute_strides (cons seq (cons d_model [])))
+  let d_v = Tensor dv_data (cons seq (cons d_model [])) (compute_strides (cons seq (cons d_model [])))
+  let _ = mh_backward_loop d_concat d_q d_k d_v per_head_fwd seq d_model n_heads head_dim 0
+  (d_q, d_k, d_v)
+
+-- ── Forward pass.  ws = weight list; cfg = [seq, V, d, d_ff, n_heads, head_dim]; pe = raw float_arr ──
+-- Activations returned as a list (slot → name):
+--   0 probs     1 x_blk    2 ln2_out   3 x_attn    4 ln1_out   5 x_pe
+--   6 Q         7 K        8 V         9 concat_attn  10 ffn_h   11 relu_mask
+--  12 ln1_mean 13 ln1_rstd 14 ln2_mean 15 ln2_rstd 16 mh_per_head
+forward x ws cfg pe =
+  let seq      = list_nth 0 cfg
+  let d        = list_nth 2 cfg
+  let d_ff     = list_nth 3 cfg
+  let n_heads  = list_nth 4 cfg
+  let head_dim = list_nth 5 cfg
+
+  let w_e    = list_nth 0 ws
+  let w_q    = list_nth 1 ws
+  let w_k    = list_nth 2 ws
+  let w_v    = list_nth 3 ws
+  let w_ao   = list_nth 4 ws
+  let w_f1   = list_nth 5 ws
+  let w_f2   = list_nth 6 ws
+  let w_lm   = list_nth 7 ws
+  let ln1_g  = list_nth 8 ws
+  let ln1_b  = list_nth 9 ws
+  let ln2_g  = list_nth 10 ws
+  let ln2_b  = list_nth 11 ws
+
+  let e = matmul x w_e
+  let ed = unwrap e
+  let _ = add_buf_inplace ed pe (seq * d) 0
+  let x_pe = e
+
+  let ln1_pack = layernorm_save x_pe ln1_g ln1_b
+  let ln1_out  = head ln1_pack
+  let ln1_mean = head (tail ln1_pack)
+  let ln1_rstd = head (tail (tail ln1_pack))
+
+  let q = matmul ln1_out w_q
+  let k = matmul ln1_out w_k
+  let v = matmul ln1_out w_v
+
+  let mh_pack = mh_forward q k v seq d n_heads head_dim
+  let concat_attn = head mh_pack
+  let mh_per_head = head (tail mh_pack)
+
+  let attn_proj = matmul concat_attn w_ao
+  let x_attn = tensor_add x_pe attn_proj
+
+  let ln2_pack = layernorm_save x_attn ln2_g ln2_b
+  let ln2_out  = head ln2_pack
+  let ln2_mean = head (tail ln2_pack)
+  let ln2_rstd = head (tail (tail ln2_pack))
+
+  let ffn_h_pre = matmul ln2_out w_f1
+  let ffn_h_pre_d = unwrap ffn_h_pre
+  let ffn_h_data = float_arr_new (seq * d_ff) 0.0
+  let ffn_mask = float_arr_new (seq * d_ff) 0.0
+  let _ = relu_fwd ffn_h_pre_d ffn_h_data ffn_mask (seq * d_ff) 0
+  let ffn_h = Tensor ffn_h_data (cons seq (cons d_ff [])) (compute_strides (cons seq (cons d_ff [])))
+  let ffn_out = matmul ffn_h w_f2
+  let x_blk = tensor_add x_attn ffn_out
+
+  let logits = matmul x_blk w_lm
+  let probs = tensor_softmax logits
+
+  let a0  = cons mh_per_head []
+  let a1  = cons ln2_rstd a0
+  let a2  = cons ln2_mean a1
+  let a3  = cons ln1_rstd a2
+  let a4  = cons ln1_mean a3
+  let a5  = cons ffn_mask a4
+  let a6  = cons ffn_h a5
+  let a7  = cons concat_attn a6
+  let a8  = cons v a7
+  let a9  = cons k a8
+  let a10 = cons q a9
+  let a11 = cons x_pe a10
+  let a12 = cons ln1_out a11
+  let a13 = cons x_attn a12
+  let a14 = cons ln2_out a13
+  let a15 = cons x_blk a14
+  cons probs a15
+
+-- ── Compute gradients w.r.t. all 12 parameter tensors.
+-- Returns a list (same indexing as ws):
+--   0 d_we  1 d_wq  2 d_wk  3 d_wv  4 d_wao  5 d_wf1  6 d_wf2  7 d_wlm
+--   8 d_ln1g  9 d_ln1b  10 d_ln2g  11 d_ln2b
+backward x labels ws cfg act dlog_buf =
+  let seq      = list_nth 0 cfg
+  let V        = list_nth 1 cfg
+  let d        = list_nth 2 cfg
+  let d_ff     = list_nth 3 cfg
+  let n_heads  = list_nth 4 cfg
+  let head_dim = list_nth 5 cfg
+
+  let probs       = list_nth 0 act
+  let x_blk       = list_nth 1 act
+  let ln2_out     = list_nth 2 act
+  let x_attn      = list_nth 3 act
+  let ln1_out     = list_nth 4 act
+  let x_pe        = list_nth 5 act
+  let q           = list_nth 6 act
+  let k           = list_nth 7 act
+  let v           = list_nth 8 act
+  let concat_attn = list_nth 9 act
+  let ffn_h       = list_nth 10 act
+  let ffn_mask    = list_nth 11 act
+  let ln1_mean    = list_nth 12 act
+  let ln1_rstd    = list_nth 13 act
+  let ln2_mean    = list_nth 14 act
+  let ln2_rstd    = list_nth 15 act
+  let mh_per_head = list_nth 16 act
+
+  let w_q  = list_nth 1 ws
+  let w_k  = list_nth 2 ws
+  let w_v  = list_nth 3 ws
+  let w_ao = list_nth 4 ws
+  let w_f1 = list_nth 5 ws
+  let w_f2 = list_nth 6 ws
+  let w_lm = list_nth 7 ws
+  let ln1_g = list_nth 8 ws
+  let ln2_g = list_nth 10 ws
+
+  match probs | Tensor pd _ _ -> match labels | Tensor ld _ _ ->
+    let invN = 1.0 / int_to_float seq
+    let _ = ce_grad_loop dlog_buf pd ld seq V invN 0
+    let dlog_t = Tensor dlog_buf (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+
+    let xblk_t = tensor_transpose x_blk
+    let d_wlm = matmul xblk_t dlog_t
+    let wlm_t = tensor_transpose w_lm
+    let dx_blk = matmul dlog_t wlm_t
+
+    let dffn_out = dx_blk
+    let ffn_h_t = tensor_transpose ffn_h
+    let d_wf2 = matmul ffn_h_t dffn_out
+    let wf2_t = tensor_transpose w_f2
+    let dffn_h = matmul dffn_out wf2_t
+
+    let dffn_h_pre = float_arr_new (seq * d_ff) 0.0
+    let dffn_h_d = unwrap dffn_h
+    let _ = relu_bwd dffn_h_d ffn_mask dffn_h_pre (seq * d_ff) 0
+    let dffn_h_pre_t = Tensor dffn_h_pre (cons seq (cons d_ff [])) (compute_strides (cons seq (cons d_ff [])))
+
+    let ln2_t = tensor_transpose ln2_out
+    let d_wf1 = matmul ln2_t dffn_h_pre_t
+    let wf1_t = tensor_transpose w_f1
+    let dln2_out = matmul dffn_h_pre_t wf1_t
+
+    let dx_attn_ln = layernorm_backward_dx x_attn ln2_mean ln2_rstd ln2_g dln2_out
+    let ln2_gb = layernorm_backward_gb x_attn ln2_mean ln2_rstd dln2_out
+    let d_ln2_g = head ln2_gb
+    let d_ln2_b = head (tail ln2_gb)
+    let dx_attn = tensor_add dx_blk dx_attn_ln
+
+    let dattn_proj = dx_attn
+    let concat_t = tensor_transpose concat_attn
+    let d_wao = matmul concat_t dattn_proj
+    let wao_t = tensor_transpose w_ao
+    let d_concat = matmul dattn_proj wao_t
+
+    let (d_q, d_k, d_v) = mh_backward d_concat mh_per_head seq d n_heads head_dim
+
+    let ln1_t = tensor_transpose ln1_out
+    let d_wq = matmul ln1_t d_q
+    let d_wk = matmul ln1_t d_k
+    let d_wv = matmul ln1_t d_v
+    let wq_t = tensor_transpose w_q
+    let wk_t = tensor_transpose w_k
+    let wv_t = tensor_transpose w_v
+    let dx_q = matmul d_q wq_t
+    let dx_k = matmul d_k wk_t
+    let dx_v = matmul d_v wv_t
+    let dln1_out = tensor_add (tensor_add dx_q dx_k) dx_v
+
+    let dx_pe_ln = layernorm_backward_dx x_pe ln1_mean ln1_rstd ln1_g dln1_out
+    let ln1_gb = layernorm_backward_gb x_pe ln1_mean ln1_rstd dln1_out
+    let d_ln1_g = head ln1_gb
+    let d_ln1_b = head (tail ln1_gb)
+    let dx_pe = tensor_add dx_attn dx_pe_ln
+
+    let xT = tensor_transpose x
+    let d_we = matmul xT dx_pe
+
+    let g0  = cons d_ln2_b []
+    let g1  = cons d_ln2_g g0
+    let g2  = cons d_ln1_b g1
+    let g3  = cons d_ln1_g g2
+    let g4  = cons d_wlm g3
+    let g5  = cons d_wf2 g4
+    let g6  = cons d_wf1 g5
+    let g7  = cons d_wao g6
+    let g8  = cons d_wv g7
+    let g9  = cons d_wk g8
+    let g10 = cons d_wq g9
+    cons d_we g10
+
+-- ── Apply Adam to all 12 params ──
+apply_adam_loop ws grads states lr i =
+  if i >= 12 then 0
+  else
+    let w_d = unwrap (list_nth i ws)
+    let g_d = unwrap (list_nth i grads)
+    let st = list_nth i states
+    let _ = adam_update_raw w_d g_d st lr adam_default_b1 adam_default_b2 adam_default_eps
+    apply_adam_loop ws grads states lr (i + 1)
+
+-- ── Training step ──
+train_step x labels ws states cfg pe dlog_buf lr =
+  let act = forward x ws cfg pe
+  let probs = list_nth 0 act
+  let V = list_nth 1 cfg
+  let seq = list_nth 0 cfg
+  let loss = ce_loss probs labels seq V
+  let grads = backward x labels ws cfg act dlog_buf
+  let _ = apply_adam_loop ws grads states lr 0
+  loss
+
+train_loop x labels ws states cfg pe dlog_buf base_lr warmup max_steps step =
+  if step >= max_steps then 0
+  else
+    let lr = cosine_decay step warmup max_steps base_lr
+    let loss = train_step x labels ws states cfg pe dlog_buf lr
+    let _ = if step % 10 == 0 then
+      let _ = print (cat ["step ", show step, "  lr=", show_float lr, "  loss=", show_float loss])
+      0
+    else 0
+    train_loop x labels ws states cfg pe dlog_buf base_lr warmup max_steps (step + 1)
+
+eval_loss x labels ws cfg pe =
+  let act = forward x ws cfg pe
+  let probs = list_nth 0 act
+  let V = list_nth 1 cfg
+  let seq = list_nth 0 cfg
+  ce_loss probs labels seq V
+
+-- Build weights list in slot order.
+build_weights V d d_ff =
+  let w_e   = make_weight V d 1
+  let w_q   = make_weight d d 2
+  let w_k   = make_weight d d 3
+  let w_v   = make_weight d d 4
+  let w_ao  = make_weight d d 5
+  let w_f1  = make_weight d d_ff 6
+  let w_f2  = make_weight d_ff d 7
+  let w_lm  = make_weight d V 8
+  let ln1_g = make_gamma d
+  let ln1_b = make_beta d
+  let ln2_g = make_gamma d
+  let ln2_b = make_beta d
+  let w11 = cons ln2_b []
+  let w10 = cons ln2_g w11
+  let w9  = cons ln1_b w10
+  let w8  = cons ln1_g w9
+  let w7  = cons w_lm w8
+  let w6  = cons w_f2 w7
+  let w5  = cons w_f1 w6
+  let w4  = cons w_ao w5
+  let w3  = cons w_v w4
+  let w2  = cons w_k w3
+  let w1  = cons w_q w2
+  cons w_e w1
+
+build_states V d d_ff =
+  let s_we   = adam_state (V * d)
+  let s_wq   = adam_state (d * d)
+  let s_wk   = adam_state (d * d)
+  let s_wv   = adam_state (d * d)
+  let s_wao  = adam_state (d * d)
+  let s_wf1  = adam_state (d * d_ff)
+  let s_wf2  = adam_state (d_ff * d)
+  let s_wlm  = adam_state (d * V)
+  let s_ln1g = adam_state d
+  let s_ln1b = adam_state d
+  let s_ln2g = adam_state d
+  let s_ln2b = adam_state d
+  let s11 = cons s_ln2b []
+  let s10 = cons s_ln2g s11
+  let s9  = cons s_ln1b s10
+  let s8  = cons s_ln1g s9
+  let s7  = cons s_wlm s8
+  let s6  = cons s_wf2 s7
+  let s5  = cons s_wf1 s6
+  let s4  = cons s_wao s5
+  let s3  = cons s_wv s4
+  let s2  = cons s_wk s3
+  let s1  = cons s_wq s2
+  cons s_we s1
+
+build_cfg seq V d d_ff n_heads head_dim =
+  let c5 = cons head_dim []
+  let c4 = cons n_heads c5
+  let c3 = cons d_ff c4
+  let c2 = cons d c3
+  let c1 = cons V c2
+  cons seq c1
+
+main =
+  let _ = print "=== Multi-head transformer LM (learnable LN, 4 heads × 8) ==="
+
+  let text = corpus 0
+  let vocab = build_vocab text
+  let V = vocab_size vocab
+  let ids = encode vocab text
+  let total = length ids
+  let seq = total - 1
+  let _ = print (cat ["corpus=", show total, " chars, vocab=", show V, ", seq=", show seq])
+
+  let x_data = float_arr_new (seq * V) 0.0
+  let _ = fill_onehot x_data ids V seq 0
+  let x = Tensor x_data (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+
+  let labels_data = float_arr_new seq 0.0
+  let _ = fill_labels labels_data (tail ids) seq 0
+  let labels = Tensor labels_data (cons seq []) (cons 1 [])
+
+  let d = 32
+  let d_ff = 64
+  let n_heads = 4
+  let head_dim = 8
+
+  let ws = build_weights V d d_ff
+  let states = build_states V d d_ff
+  let cfg = build_cfg seq V d d_ff n_heads head_dim
+
+  let pe = build_pe seq d
+  let dlog_buf = float_arr_new (seq * V) 0.0
+
+  let loss0 = eval_loss x labels ws cfg pe
+  let _ = print (cat ["initial loss=", show_float loss0])
+  let _ = print (cat ["uniform-baseline (log V)=", show_float (log (int_to_float V))])
+  let _ = print (cat ["v2.3 bigram baseline=2.10"])
+  let _ = print (cat ["v2.5 single-head baseline=2.90"])
+
+  let _ = print "\nTraining 200 steps (smoke), cosine(warmup=20, peak_lr=0.03):"
+  let _ = train_loop x labels ws states cfg pe dlog_buf 0.03 20 200 0
+
+  let loss1 = eval_loss x labels ws cfg pe
+  let _ = print (cat ["\nfinal loss=", show_float loss1])
+
+  let beat_uniform = if loss1 < (log (int_to_float V)) then "YES" else "NO"
+  let beat_bigram = if loss1 < 2.10 then "YES" else "NO"
+  let beat_v25 = if loss1 < 2.90 then "YES" else "NO"
+  let _ = print (cat ["beats uniform:                ", beat_uniform])
+  let _ = print (cat ["beats v2.3 bigram (2.10):     ", beat_bigram])
+  let _ = print (cat ["beats v2.5 singlehead (2.90): ", beat_v25])
+  0

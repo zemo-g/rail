@@ -2,6 +2,66 @@
 
 All notable changes to Rail are documented here.
 
+## v2.12.0 (2026-04-14) — *Multi-head attention, learnable LayerNorm*
+
+Closes the v2.5 transformer plateau.  A single-block, **4-head
+causal transformer** with **learnable γ/β LayerNorm** and
+Xavier-initialized weights trains to **loss 0.00433** on the
+383-char Shakespeare corpus in 200 steps — crushing every prior
+baseline:
+
+|               | loss  |
+|---------------|-------|
+| uniform (log V) | 3.47 |
+| v2.3 bigram    | 2.10 |
+| v2.5 single-head | 2.90 |
+| **v2.12 4-head + learnable LN** | **0.004** |
+
+### `stdlib/transformer.rail` additions
+- **`layernorm_backward_gb x mean rstd dy`** → `[dgamma_t, dbeta_t]`.
+  Pure-Rail reduction; no new Metal kernel.  Gradients for γ and β
+  come from the standard LN derivation:
+  `dgamma[j] = Σ_r dy[r,j] · x̂[r,j]`,
+  `dbeta[j]  = Σ_r dy[r,j]`, with
+  `x̂[r,j] = (x[r,j] − mean[r]) · rstd[r]`.
+- **`extract_head t n_rows full_dim head_dim h`** — copy column
+  block `[h·head_dim .. (h+1)·head_dim)` out of `[n_rows, full_dim]`
+  into a fresh `[n_rows, head_dim]` tensor.
+- **`insert_head dst n_rows full_dim head_dim h src`** — scatter
+  the per-head `[n_rows, head_dim]` buffer back into its column
+  block of the full tensor (in place).
+
+Used by forward/backward on a per-head basis; `attention_backward`
+already composes softmax/matmul so multi-head reuses it as-is.
+
+### `tools/train/lm_mh.rail` — v2.12 proof
+End-to-end multi-head transformer LM:
+- `d_model = 32, n_heads = 4, head_dim = 8, d_ff = 64`.
+- Pre-norm block: LN → attn → residual → LN → FFN → residual.
+- Separate attention-output projection `W_AO` (d→d) and LM head
+  `W_LM` (d→V), both trained.
+- Both LayerNorms have learnable γ and β, updated by Adam.
+- Xavier init: `scale = sqrt(6 / (fan_in + fan_out))`.
+- Weights + Adam states bundled into lists (12 parameter tensors
+  each) to stay under the ARM64 register-spill budget.
+
+Cosine-decay LR (peak 0.03, warmup 20) over 200 steps drives
+cross-entropy loss from 4.30 → 0.004 on the 383-char corpus.
+
+### Tribal knowledge
+**ARM64 register spill limit**: functions with >30 parameters blow
+up the frame-pointer-relative spill scheme (`str x31` is not a
+valid ARM64 instruction).  **Workaround**: bundle weights/states
+into lists, pass configuration as a small int list, and index via
+`list_nth`.  Keeps parameter count well under 10 per function.
+
+**Xavier init is essential**: the v2.11 init pattern
+(`0.05 · raw`, `raw ∈ [−50, 49]`) gives weights in `[−2.5, 2.5]`
+— huge for `d_model ≥ 16`.  Initial logits explode (loss 16 vs
+uniform 3.5) and Adam can't recover in 200 steps.  Replacement:
+`scale = sqrt(6 / (fan_in + fan_out))`, sampled as
+`scale · (raw / 50)`, gives initial loss ≈ uniform.
+
 ## v2.11.0 (2026-04-14) — *WASM MHD to t=π*
 
 Closes the last v2.10 caveat.  **The 2D Ideal MHD Orszag-Tang

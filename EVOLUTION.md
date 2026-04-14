@@ -2,6 +2,20 @@
 
 Started 2026-04-13. Every upgrade, ranked and tracked.
 
+## v2.12.0 (2026-04-14) — *Multi-head attention, learnable LayerNorm*
+
+- [x] Multi-head causal attention (forward + backward via per-head
+      `attention_backward` composition) — `stdlib/transformer.rail`
+      adds `extract_head` / `insert_head` column-block helpers
+- [x] Learnable LayerNorm γ/β — `layernorm_backward_gb` pure-Rail
+      reduction (no new kernel), Adam-updated alongside weights
+- [x] Xavier-initialized weights (`scale = sqrt(6/(fan_in+fan_out))`)
+- [x] End-to-end: 4-head d_model=32 transformer LM on 383-char
+      Shakespeare, loss 4.30 → 0.00433 in 200 steps.  Beats bigram,
+      uniform, and single-head baselines.
+- [x] Discovery: ARM64 register-spill budget caps function arity
+      around 30 parameters — workaround is list-bundled parameters
+
 ## v2.2.0 (2026-04-14) — *The Suite*
 
 ### Landed

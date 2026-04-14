@@ -174,6 +174,85 @@ layernorm_backward_dx x mean_arr rstd_arr gamma dy = match x
         let _ = tgl_layernorm_backward_f64 x_data mean_arr rstd_arr g_data dy_data dx_data n_rows dim
         Tensor dx_data x_shape (compute_strides x_shape)
 
+-- dgamma[j] = Σ_r dy[r,j] * x_hat[r,j]   where x_hat = (x - mean) * rstd
+-- dbeta[j]  = Σ_r dy[r,j]
+ln_gb_row x_data dy_data dg_data db_data mean_arr rstd_arr dim n_rows r =
+  if r >= n_rows then 0
+  else
+    let mean = float_arr_get mean_arr r
+    let rstd = float_arr_get rstd_arr r
+    let _ = ln_gb_inner x_data dy_data dg_data db_data (r * dim) dim mean rstd 0
+    ln_gb_row x_data dy_data dg_data db_data mean_arr rstd_arr dim n_rows (r + 1)
+
+ln_gb_inner x_data dy_data dg_data db_data off dim mean rstd j =
+  if j >= dim then 0
+  else
+    let xv = float_arr_get x_data (off + j)
+    let dv = float_arr_get dy_data (off + j)
+    let xhat = (xv - mean) * rstd
+    let dg = float_arr_get dg_data j
+    let db = float_arr_get db_data j
+    let _ = float_arr_set dg_data j (dg + dv * xhat)
+    let _ = float_arr_set db_data j (db + dv)
+    ln_gb_inner x_data dy_data dg_data db_data off dim mean rstd (j + 1)
+
+-- Compute dgamma AND dbeta in one pass.  Returns [dgamma_t, dbeta_t].
+layernorm_backward_gb x mean_arr rstd_arr dy = match x
+  | Tensor x_data x_shape _ -> match dy
+    | Tensor dy_data _ _ ->
+      let total = list_product x_shape
+      let dim = head (reverse x_shape)
+      let n_rows = total / dim
+      let dg_data = float_arr_new dim 0.0
+      let db_data = float_arr_new dim 0.0
+      let _ = ln_gb_row x_data dy_data dg_data db_data mean_arr rstd_arr dim n_rows 0
+      let dg_t = Tensor dg_data (cons dim []) (cons 1 [])
+      let db_t = Tensor db_data (cons dim []) (cons 1 [])
+      cons dg_t (cons db_t [])
+
+-- ────────────────────────────────────────────────────────
+-- Column-block copy helpers for multi-head attention.
+-- Treats data as [n_rows, full_dim] row-major; copies a rectangular
+-- column block [:, col_start .. col_start+block_dim) in or out of
+-- a per-head [n_rows, block_dim] buffer.
+-- ────────────────────────────────────────────────────────
+
+copy_cols_out src_data n_rows full_dim col_start block_dim dst_data r =
+  if r >= n_rows then 0
+  else
+    let _ = copy_cols_row src_data (r * full_dim + col_start) dst_data (r * block_dim) block_dim 0
+    copy_cols_out src_data n_rows full_dim col_start block_dim dst_data (r + 1)
+
+copy_cols_row src_data src_off dst_data dst_off len j =
+  if j >= len then 0
+  else
+    let v = float_arr_get src_data (src_off + j)
+    let _ = float_arr_set dst_data (dst_off + j) v
+    copy_cols_row src_data src_off dst_data dst_off len (j + 1)
+
+-- Scatter a [n_rows, block_dim] buffer INTO column block of [n_rows, full_dim].
+-- Overwrites the destination columns.
+copy_cols_in dst_data n_rows full_dim col_start block_dim src_data r =
+  if r >= n_rows then 0
+  else
+    let _ = copy_cols_row src_data (r * block_dim) dst_data (r * full_dim + col_start) block_dim 0
+    copy_cols_in dst_data n_rows full_dim col_start block_dim src_data (r + 1)
+
+-- Extract head h (columns [h*head_dim .. (h+1)*head_dim)) from a
+-- [n_rows, full_dim] tensor into a fresh [n_rows, head_dim] tensor.
+extract_head t n_rows full_dim head_dim h = match t
+  | Tensor src_data _ _ ->
+    let out_data = float_arr_new (n_rows * head_dim) 0.0
+    let _ = copy_cols_out src_data n_rows full_dim (h * head_dim) head_dim out_data 0
+    Tensor out_data (cons n_rows (cons head_dim [])) (compute_strides (cons n_rows (cons head_dim [])))
+
+-- Scatter a per-head result tensor into column block h of a
+-- [n_rows, full_dim] destination tensor (in place).
+insert_head dst n_rows full_dim head_dim h src = match dst
+  | Tensor dst_data _ _ -> match src
+    | Tensor src_data _ _ ->
+      copy_cols_in dst_data n_rows full_dim (h * head_dim) head_dim src_data 0
+
 -- ────────────────────────────────────────────────────────
 -- Scaled dot-product attention (single head, no mask)
 -- Q, K, V: [seq, head_dim]
