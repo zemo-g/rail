@@ -70,11 +70,12 @@ Dylib export count: 15 → 24. Tests: 105/105 → 106/106. Fixed-point preserved
 - [x] Movement VII: WASM transcendentals — sin/cos/exp/log/pow/tanh
       via Taylor + range reduction, 9-digit accuracy on most inputs
       (log: 8 digits). Shipped 2026-04-14, v2.8.0.
-- [~] Movement VII: MHD ported to WASM — `tools/plasma/mhd_wasm.rail`
-      compiles + initializes correctly (mass/energy/divB match
-      analytic conservation) under wasmtime. Full 800-step
-      simulation is gated on cross-function float PARAM inference
-      (still missing in v2.9). Shipped 2026-04-14, v2.9.0.
+- [x] Movement VII: MHD simulates under WASM — 128×128 Orszag-Tang
+      vortex, 100 Lax-Friedrichs steps, exact mass/energy/divB
+      conservation. Gated on v2.10's float PARAM inference + WASM
+      tail-call elimination, both now shipped. 800-step run to t=π
+      still needs WASM-side GC (future work). Shipped 2026-04-14,
+      v2.10.0.
 - [ ] Movement VII: WebGPU compute shaders
 - [x] Movement VIII: REPL `:load file.rail` — shipped 2026-04-14, v2.6.0.
       Definition persistence across expressions already worked; the
