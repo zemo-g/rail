@@ -65,6 +65,8 @@ str_replace "old" "new" str           -- replaces all occurrences
 str_sub str start len                 -- substring extraction
 read_line                             -- read line from stdin
 show n                                -- int to string
+int_to_float n                         -- tagged int → raw f64 bits (scvtf)
+float_to_int x                         -- raw f64 → tagged int (fcvtzs, truncation)
 x |> f                                -- pipe operator (f x)
 error "msg", is_error x, err_msg x   -- error handling
 arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
@@ -85,6 +87,8 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 - **`read_line` zero-arg**: Use `read_line 0` (pass dummy arg) — zero-arg dispatch has a codegen quirk in the V-handler.
 - **Cross-function float return inference**: Works via `__fret_` markers, but `show(user_func(1.0))` won't auto-detect float return. Use `show_float` explicitly.
 - **Float self-loop TCO**: Deferred — `body_has_float` guard prevents int-TCO corruption but float-specific d8-d15 TCO not yet implemented.
+- **Deeply-nested `match` chains**: A `match | ADT -> match | ADT -> ...` chain 5+ levels deep inside a function body with side-effecting `let`s after it triggers "expected decl" parse errors. **Workaround**: flatten multiple `match`es into a single chained form on one indent level — all ADT destructures at the top of the function body followed by a linear `let` stream. See `tools/train/three_class_mlp.rail:train_step` for the pattern that works.
+- **Mixed float+int arithmetic (v2.1.2)**: `0.0 + int_expr` now promotes correctly even when the int operand's type can't be statically inferred. The O-handler emits a runtime `tst x, #1` path that picks scvtf or fmov based on the tag bit. Regression test: `t106 mixed_float_int_op`.
 
 ### Performance Optimizations (in compile.rail)
 

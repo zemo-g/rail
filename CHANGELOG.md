@@ -2,6 +2,74 @@
 
 All notable changes to Rail are documented here.
 
+## v2.2.0 (2026-04-14) — *The Suite*
+
+A multi-movement session performed live. Overture fixed two parser/codegen
+burrs. Movement I expanded the Metal kernel library. Movement II put
+backward passes on the GPU. Movement IV added positional encodings.
+Movement VI sketched the fifth backend. Movements III / V / VII / VIII / IX
+are designed and queued in EVOLUTION.md with full specs.
+
+### Compiler (Overture)
+- **`0.0 + int_expr` miscompile fixed.** When one operand is a float
+  literal and the other is an int expression whose type can't be
+  statically inferred (because `body_has_float` blocks
+  `mark_int_params`), the O-handler now detects int-producing O-nodes
+  on the mixed side and emits `asr`+`scvtf` for promotion. Surgical
+  (no runtime type check, no false positives on raw float bits with
+  LSB=1). New regression test `t106 mixed_float_int_op`. 106/106.
+- **Deeply-nested `match` chains** — documented workaround pattern in
+  CLAUDE.md: flatten to a single indentation level at the top of the
+  function body, followed by a linear `let` stream. Parser fix deferred.
+- **`int_to_float` / `float_to_int`** promoted into the documented
+  builtin quick-reference.
+
+### Metal kernels (Movement I)
+- **`matmul_bias_gelu`** — transformer-FFN native, fused matmul +
+  bias + GELU in one dispatch.
+- **`matmul_batched`** — `[B, M, K] @ [B, K, N] → [B, M, N]`. One
+  3D threadgroup per output element, z-index is batch.
+- **`tensor_sum_partials`** — race-free parallel reduction. Each
+  threadgroup writes one partial; host sums the partials. Replaces
+  the atomic-add note that was racy under multi-threadgroup dispatch.
+
+### Backward kernels (Movement II)
+- **`softmax_backward`** — `dx_i = y_i(dy_i − Σ y_k dy_k)`, one row
+  per thread, inner dot product inline.
+- **`ce_softmax_backward`** — fused CE gradient `(probs − onehot)/batch`
+  replaces the Rail-side loop in `three_class_mlp.rail`.
+- **`layernorm_backward`** — mean/var-aware, computes `∂L/∂x` in a
+  single kernel given precomputed `mean` and `rstd` from forward.
+
+### Transformer stdlib (Movement IV)
+- **Sinusoidal positional encodings.** `sinusoidal_pe seq dim`
+  returns a `[seq, dim]` Tensor whose even columns are `sin(pos/10000^(2i/d))`
+  and odd columns are `cos(...)`. `apply_pe x pe = tensor_add x pe`.
+  Smoke test verifies `sin(0)=0, cos(0)=1, sin(1)≈0.841, cos(1)≈0.540`.
+- `linear_gelu` wrapper on top of the fused `matmul_bias_gelu` kernel.
+
+### Metal IR backend scaffold (Movement VI)
+- **`tools/metal/rail_to_metal.rail`** — minimal Rail AST → `.metal`
+  kernel emitter for pure float→float lambdas. Demo emits a working
+  `relu2` kernel; `xcrun metal -c /tmp/rail_emitted.metal` compiles
+  clean. Proves the path; `#metal_kernel` directive integration next.
+
+### Dylib exports
+3 → 15 → **24**. Persistent MTLBuffer pool still amortizing allocation
+across the full set. `smoke_test.c` still passes its 29 checks.
+
+### Numbers
+| | v2.1.2 | v2.2.0 |
+|---|---|---|
+| Tests | 105 | 106 |
+| Metal kernels | 14 | 20 |
+| Dylib exports | 15 | 24 |
+| Backward-on-GPU | only via matmul path | softmax+CE+LN fused |
+| Transformer PE | — | sinusoidal |
+| Backends | 4 | 4½ (Metal-emitter scaffold) |
+
+Self-compile byte-identical. Nothing in the Mozart piece needed red ink.
+
 ## v2.1.2 (2026-04-14, overnight session)
 
 The second half of v2.1.x — closing every remaining gap in the

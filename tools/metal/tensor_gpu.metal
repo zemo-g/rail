@@ -185,6 +185,105 @@ kernel void matmul_bias_relu(
 }
 
 // ═══════════════════════════════════════════════════════════
+// FUSED MATMUL + BIAS + GELU — transformer FFN's bread and butter
+// C[M×N] = gelu(A[M×K] × B[K×N] + bias[N])
+//   gelu(x) = 0.5 * x * (1 + tanh(√(2/π)·(x + 0.044715·x³)))
+// ═══════════════════════════════════════════════════════════
+
+kernel void matmul_bias_gelu(
+    device const float *A    [[buffer(0)]],
+    device const float *B    [[buffer(1)]],
+    device const float *bias [[buffer(2)]],
+    device float       *C    [[buffer(3)]],
+    constant uint      &M    [[buffer(4)]],
+    constant uint      &K    [[buffer(5)]],
+    constant uint      &N    [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint row = gid.y;
+    uint col = gid.x;
+
+    threadgroup float As[TILE][TILE];
+    threadgroup float Bs[TILE][TILE];
+
+    float sum = 0.0f;
+    uint numTiles = (K + TILE - 1) / TILE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        uint aCol = t * TILE + lid.x;
+        uint bRow = t * TILE + lid.y;
+        As[lid.y][lid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
+        Bs[lid.y][lid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < TILE; i++) sum += As[lid.y][i] * Bs[i][lid.x];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row >= M || col >= N) return;
+    float x = sum + bias[col];
+    const float c = 0.7978845608f;  // sqrt(2/pi)
+    float inner = c * (x + 0.044715f * x * x * x);
+    C[row * N + col] = 0.5f * x * (1.0f + tanh(inner));
+}
+
+// ═══════════════════════════════════════════════════════════
+// BATCHED MATMUL — C[b, m, n] = A[b, m, k] × B[b, k, n]
+// Dispatches one 2D group per batch slice; z-index = batch.
+// ═══════════════════════════════════════════════════════════
+
+kernel void matmul_batched(
+    device const float *A [[buffer(0)]],
+    device const float *B [[buffer(1)]],
+    device float       *C [[buffer(2)]],
+    constant uint      &B_DIM [[buffer(3)]],
+    constant uint      &M [[buffer(4)]],
+    constant uint      &K [[buffer(5)]],
+    constant uint      &N [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint batch = gid.z;
+    uint row = gid.y;
+    uint col = gid.x;
+    if (batch >= B_DIM || row >= M || col >= N) return;
+
+    uint a_base = batch * M * K;
+    uint b_base = batch * K * N;
+    uint c_base = batch * M * N;
+
+    float s = 0.0f;
+    for (uint k = 0; k < K; k++) {
+        s += A[a_base + row * K + k] * B[b_base + k * N + col];
+    }
+    C[c_base + row * N + col] = s;
+}
+
+// ═══════════════════════════════════════════════════════════
+// CORRECT PARALLEL SUM — writes partial results to a per-threadgroup
+// slot; host (or a second dispatch) sums the partials. No atomics.
+// ═══════════════════════════════════════════════════════════
+
+kernel void tensor_sum_partials(
+    device const float *A      [[buffer(0)]],
+    device float       *partials [[buffer(1)]],
+    constant uint      &n      [[buffer(2)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tgSize [[threads_per_threadgroup]])
+{
+    threadgroup float shared[256];
+    shared[lid] = (gid < n) ? A[gid] : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = tgSize / 2; s > 0; s >>= 1) {
+        if (lid < s) shared[lid] += shared[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0) partials[tgid] = shared[0];
+}
+
+// ═══════════════════════════════════════════════════════════
 // ELEMENT-WISE OPERATIONS
 // ═══════════════════════════════════════════════════════════
 
@@ -402,6 +501,94 @@ kernel void cross_entropy(
     uint target = targets[gid];
     float p = max(probs[gid * vocab + target], 1e-8f);
     losses[gid] = -log(p);
+}
+
+// ═══════════════════════════════════════════════════════════
+// SOFTMAX BACKWARD (row-wise)
+// Given y = softmax(x) and dL/dy, compute dL/dx.
+//   dL/dx_i = y_i * (dL/dy_i - Σ_k y_k * dL/dy_k)
+// One dispatch per row; inner loop computes the dot product.
+// ═══════════════════════════════════════════════════════════
+
+kernel void softmax_backward(
+    device const float *y      [[buffer(0)]],
+    device const float *dy     [[buffer(1)]],
+    device float       *dx     [[buffer(2)]],
+    constant uint      &rows   [[buffer(3)]],
+    constant uint      &cols   [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= rows) return;
+    uint base = gid * cols;
+    float dot = 0.0f;
+    for (uint j = 0; j < cols; j++) dot += y[base + j] * dy[base + j];
+    for (uint j = 0; j < cols; j++) {
+        dx[base + j] = y[base + j] * (dy[base + j] - dot);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// CROSS-ENTROPY BACKWARD fused with softmax.
+// Given probs = softmax(logits) and integer targets,
+// d/d_logits = (probs - one_hot(target)) / N.
+// Produces the gradient directly without materialising one-hot.
+// targets are packed as f32 (caller converts).
+// ═══════════════════════════════════════════════════════════
+
+kernel void ce_softmax_backward(
+    device const float *probs   [[buffer(0)]],
+    device const float *targets [[buffer(1)]],   // [batch], each is class idx
+    device float       *grad    [[buffer(2)]],
+    constant uint      &batch   [[buffer(3)]],
+    constant uint      &vocab   [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= batch * vocab) return;
+    uint row = gid / vocab;
+    uint col = gid % vocab;
+    uint target = (uint)targets[row];
+    float p = probs[gid];
+    float onehot = (col == target) ? 1.0f : 0.0f;
+    grad[gid] = (p - onehot) / (float)batch;
+}
+
+// ═══════════════════════════════════════════════════════════
+// LAYERNORM BACKWARD (last-axis)
+// Given input x [rows, dim], precomputed mean[rows], rstd[rows]=1/√(var+ε),
+// gamma [dim], and dy [rows, dim], compute:
+//   dx_i = (1/dim) * rstd * (dim*dy_i - Σdy - x_hat_i*Σ(dy*x_hat))
+// Partials sum per row; one threadgroup per row.
+// ═══════════════════════════════════════════════════════════
+
+kernel void layernorm_backward(
+    device const float *x      [[buffer(0)]],
+    device const float *mean   [[buffer(1)]],
+    device const float *rstd   [[buffer(2)]],
+    device const float *gamma  [[buffer(3)]],
+    device const float *dy     [[buffer(4)]],
+    device float       *dx     [[buffer(5)]],
+    constant uint      &rows   [[buffer(6)]],
+    constant uint      &dim    [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= rows) return;
+    uint base = gid * dim;
+    float m = mean[gid];
+    float rs = rstd[gid];
+    float sum_dy = 0.0f;
+    float sum_dy_xhat = 0.0f;
+    for (uint j = 0; j < dim; j++) {
+        float x_hat = (x[base + j] - m) * rs;
+        float g = gamma[j] * dy[base + j];
+        sum_dy += g;
+        sum_dy_xhat += g * x_hat;
+    }
+    float inv_dim = 1.0f / (float)dim;
+    for (uint j = 0; j < dim; j++) {
+        float x_hat = (x[base + j] - m) * rs;
+        float g = gamma[j] * dy[base + j];
+        dx[base + j] = inv_dim * rs * ((float)dim * g - sum_dy - x_hat * sum_dy_xhat);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════

@@ -2,6 +2,48 @@
 
 Started 2026-04-13. Every upgrade, ranked and tracked.
 
+## v2.2.0 (2026-04-14) — *The Suite*
+
+### Landed
+
+- [x] Overture #1: `0.0 + int_expr` miscompile fixed (t106 regression)
+- [x] Overture #2: deeply-nested-`match` workaround documented in CLAUDE.md
+- [x] Overture #4: `int_to_float` / `float_to_int` formalized in quick-ref
+- [x] Movement I: fused matmul+bias+GELU kernel + `linear_gelu` wrapper
+- [x] Movement I: batched matmul `[B,M,K]@[B,K,N]`
+- [x] Movement I: race-free parallel sum (`tensor_sum_partials` + `tgl_sum_f64`)
+- [x] Movement II: `softmax_backward` kernel + dylib export
+- [x] Movement II: fused `ce_softmax_backward` kernel + dylib export
+- [x] Movement II: `layernorm_backward` kernel + dylib export
+- [x] Movement IV: sinusoidal positional encodings in `stdlib/transformer.rail`
+- [x] Movement VI: Rail AST → `.metal` kernel emitter scaffold (relu2 demo)
+- [x] Finale: CHANGELOG + tag + push
+
+Dylib export count: 15 → 24. Tests: 105/105 → 106/106. Fixed-point preserved.
+
+### Queued for v2.3 (design intact, code deferred)
+
+- [ ] Overture #3: float self-loop TCO — the properly-scheduled version
+- [ ] Movement I: f16 half-precision variants of every unary op
+- [ ] Movement II: attention backward (full Q/K/V chain)
+- [ ] Movement II: embedding scatter-add backward
+- [ ] Movement III: Adam + LR schedule + grad clip + mini-batching + checkpoints
+- [ ] Movement IV: tokenizer in Rail (BPE)
+- [ ] Movement IV: end-to-end LM training on char-level Shakespeare
+- [ ] Movement IV: generation (argmax / top-k / temperature)
+- [ ] Movement V: `self_train.rail` cutover to Rail-native inference
+- [ ] Movement V: compiler-as-teacher in-process (no `shell` round-trip)
+- [ ] Movement VI: `#metal_kernel` directive / compile-time kernel gen
+- [ ] Movement VII: float_arr support in WASM backend
+- [ ] Movement VII: MHD ported to WASM, replaces parametric model at /plasma/mhd
+- [ ] Movement VII: WebGPU compute shaders
+- [ ] Movement VIII: REPL persistent definitions + `:load`
+- [ ] Movement VIII: LSP hover + jump-to-def
+- [ ] Movement VIII: did-you-mean suggestions for unbound names
+- [ ] Movement IX: implicit MHD time stepping (backward Euler on Metal)
+- [ ] Movement IX: Laplace current distribution in thruster engine
+- [ ] Movement IX: full 2D MHD in thruster_engine.html (WebGL compute)
+
 ## TRIVIAL (under 30 min)
 
 - [x] CSP-split thruster_engine.html for ledatic.org (done 2026-04-13)

@@ -248,6 +248,231 @@ int tgl_matmul_relu_f64(const double *A, const double *B, const double *bias,
     return 1;
 }
 
+// Fused matmul+bias+gelu — transformer FFN hidden layer.
+int tgl_matmul_gelu_f64(const double *A, const double *B, const double *bias,
+                        double *C, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A+1, *Bptr = B+1, *Bsptr = bias+1;
+    double *Cptr = C+1;
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bA = pool_acquire(sA*4);
+        id<MTLBuffer> bB = pool_acquire(sB*4);
+        id<MTLBuffer> bBias = pool_acquire(N*4);
+        id<MTLBuffer> bC = pool_acquire(sC*4);
+        f64_to_f32(Aptr, (float*)bA.contents, sA);
+        f64_to_f32(Bptr, (float*)bB.contents, sB);
+        f64_to_f32(Bsptr, (float*)bBias.contents, N);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_bias_gelu");
+        if (!p) return -1;
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bA offset:0 atIndex:0];
+        [enc setBuffer:bB offset:0 atIndex:1];
+        [enc setBuffer:bBias offset:0 atIndex:2];
+        [enc setBuffer:bC offset:0 atIndex:3];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:4];
+        [enc setBytes:&ku length:4 atIndex:5];
+        [enc setBytes:&nu length:4 atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16,(M+15)/16,1)
+           threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f32_to_f64((float*)bC.contents, Cptr, sC);
+        pool_release(bA); pool_release(bB); pool_release(bBias); pool_release(bC);
+    }
+    return 1;
+}
+
+// Batched matmul: C[b] = A[b] @ B[b] for b in 0..B_DIM-1.
+int tgl_matmul_batched_f64(const double *A, const double *B, double *C,
+                           int B_DIM, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A+1, *Bptr = B+1;
+    double *Cptr = C+1;
+    @autoreleasepool {
+        uint32_t sA = B_DIM*M*K, sB = B_DIM*K*N, sC = B_DIM*M*N;
+        id<MTLBuffer> bA = pool_acquire(sA*4);
+        id<MTLBuffer> bB = pool_acquire(sB*4);
+        id<MTLBuffer> bC = pool_acquire(sC*4);
+        f64_to_f32(Aptr, (float*)bA.contents, sA);
+        f64_to_f32(Bptr, (float*)bB.contents, sB);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_batched");
+        if (!p) return -1;
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bA offset:0 atIndex:0];
+        [enc setBuffer:bB offset:0 atIndex:1];
+        [enc setBuffer:bC offset:0 atIndex:2];
+        uint32_t bu=B_DIM, mu=M, ku=K, nu=N;
+        [enc setBytes:&bu length:4 atIndex:3];
+        [enc setBytes:&mu length:4 atIndex:4];
+        [enc setBytes:&ku length:4 atIndex:5];
+        [enc setBytes:&nu length:4 atIndex:6];
+        [enc dispatchThreads:MTLSizeMake(N, M, B_DIM)
+          threadsPerThreadgroup:MTLSizeMake(N<8?N:8, M<8?M:8, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f32_to_f64((float*)bC.contents, Cptr, sC);
+        pool_release(bA); pool_release(bB); pool_release(bC);
+    }
+    return 1;
+}
+
+// Correct parallel sum: one threadgroup per 256 elements produces a
+// partial; host finishes on the few remaining.
+int tgl_sum_f64(const double *X, double *result_out, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Xp = X+1;
+    uint32_t n_tg = (N + 255) / 256;
+    @autoreleasepool {
+        id<MTLBuffer> bX = pool_acquire(N*4);
+        id<MTLBuffer> bP = pool_acquire(n_tg*4);
+        f64_to_f32(Xp, (float*)bX.contents, N);
+        // Zero the partials buffer (pool may hand back stale memory).
+        memset(bP.contents, 0, n_tg*4);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_sum_partials");
+        if (!p) return -1;
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bX offset:0 atIndex:0];
+        [enc setBuffer:bP offset:0 atIndex:1];
+        uint32_t nu = N;
+        [enc setBytes:&nu length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        float *pP = (float*)bP.contents;
+        double total = 0.0;
+        for (uint32_t i = 0; i < n_tg; i++) total += pP[i];
+        result_out[0] = total;  // single-element output, not a float_arr
+        pool_release(bX); pool_release(bP);
+    }
+    return 1;
+}
+
+// Softmax backward: dx = y * (dy - Σ y_k dy_k)
+int tgl_softmax_backward_f64(const double *y, const double *dy, double *dx,
+                             int rows, int cols) {
+    if (ensure_init() != 1) return -1;
+    const double *yp = y+1, *dyp = dy+1;
+    double *dxp = dx+1;
+    uint32_t n = rows * cols;
+    @autoreleasepool {
+        id<MTLBuffer> by = pool_acquire(n*4);
+        id<MTLBuffer> bdy = pool_acquire(n*4);
+        id<MTLBuffer> bdx = pool_acquire(n*4);
+        f64_to_f32(yp, (float*)by.contents, n);
+        f64_to_f32(dyp, (float*)bdy.contents, n);
+        id<MTLComputePipelineState> p = pso(@"softmax_backward");
+        if (!p) return -1;
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:by offset:0 atIndex:0];
+        [enc setBuffer:bdy offset:0 atIndex:1];
+        [enc setBuffer:bdx offset:0 atIndex:2];
+        uint32_t ru=rows, cu=cols;
+        [enc setBytes:&ru length:4 atIndex:3];
+        [enc setBytes:&cu length:4 atIndex:4];
+        dispatch_1d(enc, rows);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        f32_to_f64((float*)bdx.contents, dxp, n);
+        pool_release(by); pool_release(bdy); pool_release(bdx);
+    }
+    return 1;
+}
+
+// Fused softmax→CE backward: (probs - one_hot(targets)) / batch.
+int tgl_ce_softmax_backward_f64(const double *probs, const double *targets,
+                                double *grad, int batch, int vocab) {
+    if (ensure_init() != 1) return -1;
+    const double *pp = probs+1, *tp = targets+1;
+    double *gp = grad+1;
+    uint32_t n = batch * vocab;
+    @autoreleasepool {
+        id<MTLBuffer> bP = pool_acquire(n*4);
+        id<MTLBuffer> bT = pool_acquire(batch*4);
+        id<MTLBuffer> bG = pool_acquire(n*4);
+        f64_to_f32(pp, (float*)bP.contents, n);
+        f64_to_f32(tp, (float*)bT.contents, batch);
+        id<MTLComputePipelineState> p = pso(@"ce_softmax_backward");
+        if (!p) return -1;
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bP offset:0 atIndex:0];
+        [enc setBuffer:bT offset:0 atIndex:1];
+        [enc setBuffer:bG offset:0 atIndex:2];
+        uint32_t bu=batch, vu=vocab;
+        [enc setBytes:&bu length:4 atIndex:3];
+        [enc setBytes:&vu length:4 atIndex:4];
+        dispatch_1d(enc, n);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        f32_to_f64((float*)bG.contents, gp, n);
+        pool_release(bP); pool_release(bT); pool_release(bG);
+    }
+    return 1;
+}
+
+// LayerNorm backward. Caller precomputes mean + rstd per row on forward.
+int tgl_layernorm_backward_f64(const double *x, const double *mean,
+                               const double *rstd, const double *gamma,
+                               const double *dy, double *dx,
+                               int rows, int dim) {
+    if (ensure_init() != 1) return -1;
+    const double *xp = x+1, *mp = mean+1, *rp = rstd+1, *gp = gamma+1, *dyp = dy+1;
+    double *dxp = dx+1;
+    uint32_t n = rows * dim;
+    @autoreleasepool {
+        id<MTLBuffer> bX = pool_acquire(n*4);
+        id<MTLBuffer> bM = pool_acquire(rows*4);
+        id<MTLBuffer> bR = pool_acquire(rows*4);
+        id<MTLBuffer> bG = pool_acquire(dim*4);
+        id<MTLBuffer> bDy = pool_acquire(n*4);
+        id<MTLBuffer> bDx = pool_acquire(n*4);
+        f64_to_f32(xp, (float*)bX.contents, n);
+        f64_to_f32(mp, (float*)bM.contents, rows);
+        f64_to_f32(rp, (float*)bR.contents, rows);
+        f64_to_f32(gp, (float*)bG.contents, dim);
+        f64_to_f32(dyp, (float*)bDy.contents, n);
+        id<MTLComputePipelineState> p = pso(@"layernorm_backward");
+        if (!p) return -1;
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bX offset:0 atIndex:0];
+        [enc setBuffer:bM offset:0 atIndex:1];
+        [enc setBuffer:bR offset:0 atIndex:2];
+        [enc setBuffer:bG offset:0 atIndex:3];
+        [enc setBuffer:bDy offset:0 atIndex:4];
+        [enc setBuffer:bDx offset:0 atIndex:5];
+        uint32_t ru=rows, du=dim;
+        [enc setBytes:&ru length:4 atIndex:6];
+        [enc setBytes:&du length:4 atIndex:7];
+        dispatch_1d(enc, rows);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        f32_to_f64((float*)bDx.contents, dxp, n);
+        pool_release(bX); pool_release(bM); pool_release(bR);
+        pool_release(bG); pool_release(bDy); pool_release(bDx);
+    }
+    return 1;
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Generic 1-in-1-out kernel dispatch (relu/sigmoid/exp/tanh_fwd)
 // ────────────────────────────────────────────────────────────────────
