@@ -2,6 +2,76 @@
 
 All notable changes to Rail are documented here.
 
+## v2.1.0 (2026-04-13)
+
+The GPU session. Rail now drives its own Metal GPU, trains neural
+networks end-to-end, and hosts a deployed physics platform.
+
+### Compiler
+- **`parse_float`** builtin: string → float via `_atof` + `_str_unwrap`
+- **`parse_int`** builtin: string → int via `_strtol` + `_str_unwrap`
+- **Null-safe `==` / `!=`**: `_rail_eq` / `_rail_ne` now guard against
+  null dereferences and type-mismatch comparisons. `tensor == 0` no
+  longer segfaults.
+- **Float self-loop TCO**: `mark_int_params` no longer blocked by
+  `body_has_float`. Tensor CPU loops now get register-allocated int
+  counters while preserving d8 save/restore.
+- **Scientific notation literals**: lexer extended to parse `1e6`,
+  `1.5e-3`, `6.022e23`, `2.5E+4`.
+- **Binary f32 I/O**: `float_arr_to_f32_file` / `float_arr_from_f32_file`
+  as builtins. Direct Darwin syscalls (open/write/read/close).
+- Self-compiles byte-identical. 98/98 tests.
+
+### Tensor stdlib (stdlib/tensor.rail — 1004 lines)
+- 13 autograd primitives unblock `stdlib/autograd.rail`: `tensor_relu_mask`,
+  `tensor_gelu_backward`, `tensor_softmax`, `tensor_sum_last`,
+  `tensor_sum_batch`, `tensor_mean_last`, `tensor_broadcast_last`,
+  `tensor_mul_broadcast`, `tensor_one_hot`, `tensor_embedding_lookup`,
+  `tensor_slice_row`, `tensor_accumulate_row`, `tensor_scale_by_loss`.
+- 10 utilities: `tensor_matmul`, `tensor_copy`, `tensor_cross_entropy_loss`,
+  `tensor_from_int`, `tensor_to_int`, `tensor_get_int`, `tensor_map_scalar`,
+  `tensor_ones_like_shape`, `tensor_scalar_val`, `tensor_sum_all`.
+- GPU auto-dispatch for matmul, relu, exp, tanh, sigmoid, softmax, transpose.
+- Binary f32 pipe for matmul (no text parsing overhead).
+- Data-copying `tensor_transpose` (matmul requires row-major contiguous).
+
+### Autograd (stdlib/autograd.rail)
+- Links for the first time. All dependencies resolved.
+- Forward graph and backward pass both verified correct.
+- Reverse-mode tape-based AD with 11 tracked ops.
+
+### Metal GPU (tools/metal/)
+- `tensor_gpu.metal` — 13 compute kernels (tiled matmul, elementwise,
+  activations, softmax 3-pass, transpose, SGD update, cross-entropy).
+  **269 GFLOPS** matmul 512×512 on M4 Pro.
+- `tensor_gpu.m` — host with file-mode CLI, binary matmul mode,
+  stdin binary protocol, benchmark.
+- `tensor_daemon.py` — persistent TCP daemon on :9300 for lower-latency
+  dispatch. tensor.rail auto-detects and uses if running.
+
+### First neural network training (tools/train/first_gpu_train.rail)
+- 2-layer MLP learns XOR via autograd + SGD.
+- Every matmul in forward and backward dispatches to Metal GPU.
+- Loss: **0.425 → 0.043** in 50 steps. First pure-Rail GPU training.
+
+### RAIL PLASMA (tools/plasma/)
+- `thruster_engine.html` (1,365 lines): SI-calibrated 2D axisymmetric MPD
+  thruster design tool. Maecker analytical thrust model with self-field +
+  applied-field + gasdynamic components. Validates against 12 published
+  data points from Stuttgart SX3 + JPL AF-MPDT. Optimizer sweeps,
+  hardware spec generator.
+- `mhd_axisym.metal` + `mhd_live.m`: real-time 2D axisymmetric MHD solver,
+  256×512 grid, adaptive time-stepping on M4 Pro Metal.
+- `mhd_server.py` + `thruster_live.html`: HTTP frame streaming at 30fps
+  for remote (mobile) viewing.
+- All tools mobile-responsive with touch support.
+- Deployed public: `ledatic.org/plasma/{engine,lab,mhd,ramjet,thruster3d}`,
+  CSP-compliant split CSS/JS/HTML.
+
+### Runtime
+- Compiled Metal host binaries (`tensor_gpu`, `mhd_live`) now gitignored;
+  rebuilt from source on demand.
+
 ## v2.0.0 (2026-04-06)
 
 121 commits since v1.4.0. The biggest release since v1.0.
