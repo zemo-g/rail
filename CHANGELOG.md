@@ -2,6 +2,36 @@
 
 All notable changes to Rail are documented here.
 
+## v2.16.0 (2026-04-14) — *WASM: fold with bare named functions*
+
+Closes the last v2.15-deferred item.  Passing a bare **arity-2**
+named function to `fold` now works under WASM.
+
+### Change
+`nf_rewrite_node` — the WASM pre-pass that η-expands named-fn
+value references — gained an arity-2 branch.  It rewrites
+`name` (for `name a b = ...`) into the curried form
+`\__nfa -> \__nfb -> name __nfa __nfb`, matching the shape
+`$fold` expects: `f(acc)` returns a 1-arg closure, which is
+then called with the element.
+
+### Proof
+```rail
+add a b = a + b
+maxi a b = if a > b then a else b
+mul a b = a * b
+
+main =
+  let xs = [3,1,4,1,5,9,2,6]
+  fold add 0 xs                  -- 31
+  fold maxi 0 xs                 -- 9
+  fold mul 1 [1,2,3,4,5]         -- 120
+```
+
+All three run under `wasmtime`.  Higher-order ops
+(`map`/`filter`/`fold`) now accept bare named fns of the
+relevant arity in WASM.
+
 ## v2.15.0 (2026-04-14) — *WASM: named-fn map/filter + closure-capture fix*
 
 Closes the last v2.13 caveat and an adjacent pre-existing bug.

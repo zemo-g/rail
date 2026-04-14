@@ -2,6 +2,14 @@
 
 Started 2026-04-13. Every upgrade, ranked and tracked.
 
+## v2.16.0 (2026-04-14) — *WASM fold with bare named functions*
+
+- [x] Arity-2 η-expansion in `nf_rewrite_node`: `name` →
+      `\__nfa -> \__nfb -> name __nfa __nfb`, matches `$fold`'s
+      curried calling convention
+- [x] `fold add 0 xs`, `fold maxi 0 xs`, `fold mul 1 xs` all run
+      under wasmtime with bare named fns (no lambda wrap needed)
+
 ## v2.15.0 (2026-04-14) — *WASM named-fn map/filter + closure-capture fix*
 
 - [x] η-expansion rewrite for named-fn value references (arity 1)
