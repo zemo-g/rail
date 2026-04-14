@@ -2,6 +2,17 @@
 
 Started 2026-04-13. Every upgrade, ranked and tracked.
 
+## v2.13.0 (2026-04-14) — *WASM map / filter / fold*
+
+- [x] `$map`, `$filter`, `$fold` as WASM runtime builtins
+      (closures only; named functions still require a lambda wrap)
+- [x] `$call_closure` canonical closure-invocation helper
+- [x] Body-structure lambda lookup — distinguishes `\x -> x * 2`
+      from `\x -> x > 2` (both had been colliding on same slot)
+- [x] `$clos_t` + function table always emitted (size-1 stub
+      when no lambdas), unblocking the runtime helpers when
+      programs do use higher-order ops
+
 ## v2.12.0 (2026-04-14) — *Multi-head attention, learnable LayerNorm*
 
 - [x] Multi-head causal attention (forward + backward via per-head

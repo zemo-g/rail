@@ -1565,6 +1565,178 @@
     local.get $acc
   )
 
+  ;; ─── map / filter / fold ─────────────────────────────────────
+  ;; Closure signature (in $clos_t): (closure, arg) → result.
+  ;; Calls the closure tagged-pointer by loading its fn index
+  ;; from offset 8 of the unshifted heap address.
+  (func $call_closure (param $clos i64) (param $arg i64) (result i64)
+    local.get $clos
+    local.get $arg
+    local.get $clos
+    i64.const 1
+    i64.shr_u
+    i32.wrap_i64
+    i32.const 8
+    i32.add
+    i64.load
+    i32.wrap_i64
+    call_indirect (type $clos_t)
+  )
+
+  ;; map f xs — build a new list by applying f to each element.
+  ;; Builds result reversed then reverses at the end to preserve
+  ;; input order.
+  (func $map (param $f i64) (param $lst i64) (result i64)
+    (local $ptr i32) (local $acc i64) (local $hd i64)
+    call $nil
+    local.set $acc
+    block $done
+      loop $loop
+        local.get $lst
+        i64.const 1
+        i64.and
+        i64.const 1
+        i64.eq
+        br_if $done
+        local.get $lst
+        i64.const 1
+        i64.shr_u
+        i32.wrap_i64
+        local.set $ptr
+        local.get $ptr
+        i64.load
+        i64.const 2
+        i64.eq
+        br_if $done
+        local.get $ptr
+        i32.const 8
+        i32.add
+        i64.load
+        local.set $hd
+        local.get $f
+        local.get $hd
+        call $call_closure
+        local.get $acc
+        call $cons
+        local.set $acc
+        local.get $ptr
+        i32.const 16
+        i32.add
+        i64.load
+        local.set $lst
+        br $loop
+      end
+    end
+    local.get $acc
+    call $reverse
+  )
+
+  ;; filter p xs — keep elements where p returns a truthy tagged
+  ;; int (anything ≠ tagged 0 / tagged-int 1).  Truthy here means
+  ;; the tagged-int result is NOT equal to 1 (= tagged 0).
+  (func $filter (param $p i64) (param $lst i64) (result i64)
+    (local $ptr i32) (local $acc i64) (local $hd i64) (local $res i64)
+    call $nil
+    local.set $acc
+    block $done
+      loop $loop
+        local.get $lst
+        i64.const 1
+        i64.and
+        i64.const 1
+        i64.eq
+        br_if $done
+        local.get $lst
+        i64.const 1
+        i64.shr_u
+        i32.wrap_i64
+        local.set $ptr
+        local.get $ptr
+        i64.load
+        i64.const 2
+        i64.eq
+        br_if $done
+        local.get $ptr
+        i32.const 8
+        i32.add
+        i64.load
+        local.set $hd
+        local.get $p
+        local.get $hd
+        call $call_closure
+        local.set $res
+        local.get $res
+        i64.const 1
+        i64.ne
+        if
+          local.get $hd
+          local.get $acc
+          call $cons
+          local.set $acc
+        end
+        local.get $ptr
+        i32.const 16
+        i32.add
+        i64.load
+        local.set $lst
+        br $loop
+      end
+    end
+    local.get $acc
+    call $reverse
+  )
+
+  ;; fold f init xs — left fold: result = f (… (f (f init x0) x1) …) xN.
+  ;; The 2-arg closure is curried at the Rail level as `\acc -> \x -> ...`,
+  ;; which compiles to a nested closure.  We implement the Rail calling
+  ;; convention: call(f, acc) returns a 1-arg closure, then call that
+  ;; with x to get the next acc.
+  (func $fold (param $f i64) (param $init i64) (param $lst i64) (result i64)
+    (local $ptr i32) (local $acc i64) (local $hd i64) (local $inner i64)
+    local.get $init
+    local.set $acc
+    block $done
+      loop $loop
+        local.get $lst
+        i64.const 1
+        i64.and
+        i64.const 1
+        i64.eq
+        br_if $done
+        local.get $lst
+        i64.const 1
+        i64.shr_u
+        i32.wrap_i64
+        local.set $ptr
+        local.get $ptr
+        i64.load
+        i64.const 2
+        i64.eq
+        br_if $done
+        local.get $ptr
+        i32.const 8
+        i32.add
+        i64.load
+        local.set $hd
+        local.get $f
+        local.get $acc
+        call $call_closure
+        local.set $inner
+        local.get $inner
+        local.get $hd
+        call $call_closure
+        local.set $acc
+        local.get $ptr
+        i32.const 16
+        i32.add
+        i64.load
+        local.set $lst
+        br $loop
+      end
+    end
+    local.get $acc
+  )
+
   (func $str_eq (param $a i64) (param $b i64) (result i32)
     (local $pa i32) (local $pb i32) (local $la i32) (local $i i32)
     local.get $a
