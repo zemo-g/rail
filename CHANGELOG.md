@@ -2,6 +2,63 @@
 
 All notable changes to Rail are documented here.
 
+## v2.13.0 (2026-04-14) — *WASM map / filter / fold*
+
+Closes the last `CLAUDE.md`-documented WASM gap.  Higher-order
+list operations **`map`**, **`filter`**, and **`fold`** now work
+in the WASM backend exactly as they do on ARM64 — as long as the
+function argument is a lambda.
+
+### Runtime (`tools/wasm_runtime.wat`)
+- **`$call_closure (clos, arg) → result`** — the canonical
+  closure-invocation helper: loads the function index from offset
+  8 of the unshifted heap address and dispatches via
+  `call_indirect (type $clos_t)`.
+- **`$map (f, xs) → [f(x) | x ← xs]`** — iterates the list,
+  reverses at the end to preserve input order.
+- **`$filter (p, xs) → [x | x ← xs, p(x) ≠ tagged_false]`** —
+  keeps elements where `p` returns anything other than tagged 0.
+- **`$fold (f, init, xs) → acc`** — left fold.  The 2-arg
+  function `f` is expected to be curried (`\a -> \x -> ...`),
+  matching Rail's native calling convention: `f(acc)` returns a
+  1-arg closure which is then called with the element.
+
+### Compiler (`tools/compile.rail`)
+- **Body-structure lambda lookup** — `wasm_find_lambda` now
+  compares serialized bodies via `show` in addition to the
+  parameter name + free-variable set.  Before, two lambdas with
+  matching param names and identical captures (e.g. `\x -> x * 2`
+  and `\x -> x > 2`) collided onto the same function-table slot;
+  `filter` would then dispatch to `map`'s body or vice versa.
+- **Type-and-table always emitted** — `$clos_t` and the element
+  table are declared unconditionally (size-1 stub table when the
+  program has no lambdas).  Previously the WASM module header
+  skipped them entirely when `nlams == 0`, so any reference to
+  `$call_closure` failed at `wat2wasm` time.
+
+### Proof
+```rail
+main =
+  let xs = [1, 2, 3, 4, 5]
+  let doubled = map (\x -> x * 2) xs         -- [2,4,6,8,10]
+  let bigs    = filter (\x -> x > 2) xs       -- [3,4,5]
+  let sum     = fold (\a -> \x -> a + x) 0 xs -- 15
+  0
+```
+
+### Tribal knowledge
+**Lambda identity by body structure**: a structurally-identical
+lambda at the source level (same param + same captures) maps to
+ONE function-table slot; distinct bodies stay distinct.  If you
+see a higher-order dispatch calling the wrong lambda, the
+symptom is "my filter kept everything" or "my map squared instead
+of doubled" — start at `wasm_find_lambda`.
+
+**Named functions via map/filter/fold**: still not supported in
+WASM.  Passing a bare named function (e.g. `map double xs`)
+produces a tagged-int sentinel, not a closure.  Workaround: wrap
+in a lambda (`map (\x -> double x) xs`).
+
 ## v2.12.0 (2026-04-14) — *Multi-head attention, learnable LayerNorm*
 
 Closes the v2.5 transformer plateau.  A single-block, **4-head
