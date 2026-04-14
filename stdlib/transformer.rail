@@ -35,6 +35,22 @@ linear x w b = match x
           let _ = add_bias_row_loop y_data b_data cols n 0
           y
 
+-- Fused linear+gelu using the matmul_bias_gelu kernel.
+-- x: [rows, in_dim], w: [in_dim, out_dim], b: [out_dim] -> [rows, out_dim]
+linear_gelu x w b = match x
+  | Tensor x_data x_shape x_st -> match w
+    | Tensor w_data w_shape w_st -> match b
+      | Tensor b_data b_shape b_st ->
+        let m = head x_shape
+        let k = head (tail x_shape)
+        let n = head (tail w_shape)
+        if gpu_available 0 then
+          let out = float_arr_new (m * n) 0.0
+          let _ = tgl_matmul_gelu_f64 x_data w_data b_data out m k n
+          Tensor out (cons m (cons n [])) (compute_strides (cons m (cons n [])))
+        else
+          tensor_gelu (linear x w b)
+
 -- Fused linear+relu using the matmul_bias_relu kernel.
 -- x: [rows, in_dim], w: [in_dim, out_dim], b: [out_dim] -> [rows, out_dim]
 linear_relu x w b = match x
@@ -163,6 +179,50 @@ feedforward x w1 b1 w2 b2 =
 -- Transformer block (pre-norm, no mask): attn → add → ffn → add
 -- x: [seq, model_dim]
 -- All weights are passed explicitly; this stdlib has no parameter state.
+-- ────────────────────────────────────────────────────────
+
+-- ────────────────────────────────────────────────────────
+-- Positional encodings
+-- ────────────────────────────────────────────────────────
+
+-- Sinusoidal PE (Vaswani-style):
+--   PE[pos, 2i]   = sin(pos / 10000^(2i/d))
+--   PE[pos, 2i+1] = cos(pos / 10000^(2i/d))
+sinusoidal_pe_fill arr seq dim p =
+  if p >= seq then 0
+  else sinusoidal_pe_row arr dim p 0
+sinusoidal_pe_row arr dim p i =
+  if i >= dim then sinusoidal_pe_fill_next arr p
+  else
+    let k = i / 2
+    let exp_arg = int_to_float (2 * k) / int_to_float dim
+    let denom = exp (exp_arg * log 10000.0)
+    let angle = int_to_float p / denom
+    let v = if i % 2 == 0 then sin angle else cos angle
+    let _ = float_arr_set arr (p * dim + i) v
+    sinusoidal_pe_row arr dim p (i + 1)
+sinusoidal_pe_fill_next arr p = 0
+
+-- Build a sinusoidal PE tensor of shape [seq, dim].
+-- Note: relies on Rail's arena. Compute once, reuse per forward pass.
+foreign sin x -> float
+foreign cos x -> float
+foreign log x -> float
+
+sinusoidal_pe seq dim =
+  let arr = float_arr_new (seq * dim) 0.0
+  let _ = sinusoidal_pe_build arr seq dim 0
+  Tensor arr (cons seq (cons dim [])) (compute_strides (cons seq (cons dim [])))
+
+sinusoidal_pe_build arr seq dim p =
+  if p >= seq then 0
+  else
+    let _ = sinusoidal_pe_row arr dim p 0
+    sinusoidal_pe_build arr seq dim (p + 1)
+
+-- Apply: x[seq, dim] + pe[seq, dim]
+apply_pe x pe = tensor_add x pe
+
 -- ────────────────────────────────────────────────────────
 
 transformer_block_prenorm x wq wk wv wo ln1_g ln1_b ln2_g ln2_b w1 b1 w2 b2 =
