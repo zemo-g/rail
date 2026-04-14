@@ -10,7 +10,7 @@ using namespace metal;
 
 // ═══════════════════════════════════════════════════════════
 // MATRIX MULTIPLY: C[M×N] = A[M×K] × B[K×N]
-// Tiled for shared memory efficiency
+// Tiled for shared memory efficiency (basic version)
 // ═══════════════════════════════════════════════════════════
 
 #define TILE 16
@@ -38,7 +38,6 @@ kernel void matmul(
         uint aCol = t * TILE + lid.x;
         uint bRow = t * TILE + lid.y;
 
-        // All threads load (even out-of-bounds ones) to avoid shared memory races
         As[lid.y][lid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
         Bs[lid.y][lid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
 
@@ -53,6 +52,88 @@ kernel void matmul(
 
     if (row >= M || col >= N) return;
     C[row * N + col] = sum;
+}
+
+// ═══════════════════════════════════════════════════════════
+// MATRIX MULTIPLY (optimized with register blocking)
+// Each thread computes a 4×4 output tile. 16×16 threadgroup covers
+// a 64×64 output block. Significantly higher throughput for larger
+// matrices by amortizing shared memory loads across more FMAs.
+// ═══════════════════════════════════════════════════════════
+
+#define BTILE 64
+#define BT 16     // threads per side of threadgroup
+#define BP 4      // output elements per thread per dim (BTILE/BT)
+
+kernel void matmul_blocked(
+    device const float *A     [[buffer(0)]],
+    device const float *B     [[buffer(1)]],
+    device float       *C     [[buffer(2)]],
+    constant uint      &M     [[buffer(3)]],
+    constant uint      &K     [[buffer(4)]],
+    constant uint      &N     [[buffer(5)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    // Threadgroup handles a BTILE×BTILE output block starting at (gid.y*BTILE, gid.x*BTILE)
+    uint block_row = gid.y * BTILE;
+    uint block_col = gid.x * BTILE;
+
+    // This thread handles BP×BP outputs starting at (block_row + lid.y*BP, block_col + lid.x*BP)
+    uint row_base = block_row + lid.y * BP;
+    uint col_base = block_col + lid.x * BP;
+
+    // Accumulator registers
+    float acc[BP][BP];
+    for (uint i = 0; i < BP; i++)
+        for (uint j = 0; j < BP; j++)
+            acc[i][j] = 0.0f;
+
+    threadgroup float As[BTILE][BTILE];
+    threadgroup float Bs[BTILE][BTILE];
+
+    uint numTiles = (K + BTILE - 1) / BTILE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        uint tile_k = t * BTILE;
+
+        // Each thread loads BP×BP elements into shared memory (cooperative load)
+        for (uint i = 0; i < BP; i++) {
+            for (uint j = 0; j < BP; j++) {
+                uint ar = block_row + lid.y * BP + i;
+                uint ac = tile_k + lid.x * BP + j;
+                As[lid.y * BP + i][lid.x * BP + j] = (ar < M && ac < K) ? A[ar * K + ac] : 0.0f;
+
+                uint br = tile_k + lid.y * BP + i;
+                uint bc = block_col + lid.x * BP + j;
+                Bs[lid.y * BP + i][lid.x * BP + j] = (br < K && bc < N) ? B[br * N + bc] : 0.0f;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Compute: each thread does BP*BP*BTILE FMAs
+        for (uint k = 0; k < BTILE; k++) {
+            float a_col[BP];
+            float b_row[BP];
+            for (uint i = 0; i < BP; i++) a_col[i] = As[lid.y * BP + i][k];
+            for (uint j = 0; j < BP; j++) b_row[j] = Bs[k][lid.x * BP + j];
+            for (uint i = 0; i < BP; i++)
+                for (uint j = 0; j < BP; j++)
+                    acc[i][j] += a_col[i] * b_row[j];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write results
+    for (uint i = 0; i < BP; i++) {
+        for (uint j = 0; j < BP; j++) {
+            uint r = row_base + i;
+            uint c = col_base + j;
+            if (r < M && c < N) C[r * N + c] = acc[i][j];
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
