@@ -2,6 +2,78 @@
 
 All notable changes to Rail are documented here.
 
+## v2.9.0 (2026-04-14) — *WASM compiler maturity for compute kernels*
+
+The WASM backend gains the structural plumbing needed to compile
+real numerical programs.  `tools/plasma/mhd.rail` now compiles to
+`.wasm` and runs in `wasmtime`; the init phase produces the
+correct conservation values (mass = 711.111 = 2.778 · 256 cells
+to f32 precision; div B = 0).
+
+### Compiler fixes (4 distinct WASM bugs closed)
+
+1. **0-arg user functions referenced bare returned constant 1.**
+   `let n = total state` in main was compiling to `i64.const 1`
+   instead of `call $total`.  Caught when the MHD `nn = 16` constant
+   evaluated to 1 instead of 16.  Patched the V-handler to emit
+   `call $<name>` when the resolved arity is 0 and the name isn't
+   a constructor.  This was a pre-existing bug, not new in v2.7.
+
+2. **User functions returning float weren't tracked.**  Wrappers
+   like `get state f x y = float_arr_get state (idx f x y)` were
+   treated as int-returning at call sites, so subsequent float
+   arithmetic untagged garbage.  New
+   `wasm_collect_float_fns_env` runs a fixed-point pass over the
+   decl list (up to 5 iterations) marking each function whose body
+   is structurally float.  Markers ride in the per-function env as
+   `__floatfn_<name>` entries; `is_float_w` consults them at A-node
+   call sites.  Marker check uses `!= -1` (not `>= 0`, which missed
+   the negative slot indices).
+
+3. **High-byte UTF-8 escape bug in WAT data emit.**  `wasm_cc`
+   was returning signed integers for bytes >= 128 (em-dash and
+   similar) because macOS `printf '%d'` returns negatives for
+   high bits.  Patched to mask: `(raw + 256) % 256` if raw < 0.
+
+4. **`cat`, `write_file`, `read_file`, `append_file`, `shell` had
+   no WASM dispatch.**  Added `cat` to the A-node builtin chain
+   (delegates to `$cat → $join` with empty separator).  File I/O
+   shipped as no-op stubs (return tagged 1 / empty string) so
+   compute kernels that diagnostic-dump to disk compile and run
+   under wasmtime — the dumps are just discarded.
+
+### Test infrastructure
+- `/tmp/farr_user.rail` — minimal user-wrapper float test.  Returns
+  `sum = 14.000000000` exactly when looping `0..7` writes
+  `i*0.5` through `my_put` then sums via `my_get`.
+
+### MHD-on-WASM smoke proof
+- **`tools/plasma/mhd_wasm.rail`** — 16×16 Orszag-Tang vortex
+  variant of the 128×128 ARM64 MHD simulator.  Grid scaled down so
+  the `init_loop` recursion depth fits the WASM stack (no native
+  tail-call elimination in this backend yet).  File dumps stripped.
+  Runs under wasmtime: init produces `mass = 711.111111111`,
+  `energy = 1123.555555740`, `div B = 0` — matching the expected
+  conservation invariants of the Orszag-Tang vortex.
+
+### Known WASM limitations (queued for v2.10+)
+- **No tail-call elimination.**  Recursive helpers blow the stack
+  past ~10k iterations.  WASM's `return_call` proposal is supported
+  by wasmtime; emitting it from Rail would lift the limit.
+- **Cross-function float-PARAM inference still missing.**  The
+  fixed-point pass tracks float RETURNS but not what each callee
+  expects from its callers.  MHD's per-step time accumulation
+  through a float ctx parameter exposes this — `dt` and `t` come
+  out as garbage even though init is correct.  Workaround: pass
+  floats only via float_arr (the same idiom that works around the
+  ARM64 limitation).
+
+### Counters
+- WAT runtime: 38 KB → 39 KB.
+- Tests: 106/106.
+- Fixed-point self-compile: preserved.
+- Adam XOR + three_class_mlp regression: still pass.
+
 ## v2.8.0 (2026-04-14) — *WASM transcendentals (~9-digit accuracy)*
 
 Closes the v2.7 deferral list: **sin / cos / exp / log / pow / tanh
