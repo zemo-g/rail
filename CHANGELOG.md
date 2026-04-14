@@ -2,6 +2,93 @@
 
 All notable changes to Rail are documented here.
 
+## v2.3.0 (2026-04-14) — *Movement III: the training stack*
+
+Closes the training-loop spine: **Adam + cosine LR + grad clipping +
+checkpoint save/load + char-level tokenizer + generation (argmax /
+top-k / temperature)**.  All five queued critical-path items from the
+v2.2 handoff now compose end to end on a real language-model
+objective — `tools/train/lm_shakespeare.rail` trains a char-level
+bigram LM to below-uniform loss in 200 Adam steps and
+`tools/train/lm_generate.rail` samples text back out of the saved
+checkpoint.
+
+Proof write-up: `docs/first_lm.md`.
+
+### Adam optimizer (fused GPU kernel)
+- **`kernel void adam_update`** in `tools/metal/tensor_gpu.metal` — one
+  dispatch per parameter tensor per step. Reads `w, g, m, v` plus a
+  6-element hyperparameter array `[lr, β1, β2, ε, bc1, bc2]`; mutates
+  `w, m, v` in place. Bias correction terms computed host-side so the
+  kernel stays scalar-allocation-free.
+- **`tgl_adam_update_f64`** dylib export. Six register args (four
+  `float_arr` pointers + hyp pointer + N), follows the scalar-packing
+  idiom of `tgl_scale_f64`. Smoke test in `tools/metal/smoke_test.c`.
+- **`stdlib/optim.rail::AdamState`** — m/v float_arrs plus mutable step
+  counter.  `adam_state n` builds fresh state; `adam_update_raw` is the
+  hot path on raw float_arrs (used by manual backward loops);
+  `adam_update` wraps `Tensor` destructure.
+- **`tools/train/adam_xor.rail`** — XOR loss 0.425 → 3.78e-10 in 200
+  steps, lr=0.05. One fused GPU dispatch per parameter per step
+  (vs ≈12 dispatches in the pure-Rail tensor-op chain of
+  `tools/railml/train.rail`).
+
+### LR schedule + grad clipping
+- **`cosine_decay step warmup max_steps base_lr`** in
+  `stdlib/optim.rail` — linear warmup to `base_lr` over the first
+  `warmup` steps, then half-cosine decay to 0.0.  Clamped to 0.0
+  after `max_steps` to avoid negative lrs.  Verified at 5 canonical
+  points (`tools/train/lr_clip_test.rail`).
+- **`clip_grad_norm grads max_norm`** — computes the global L2 norm
+  of a list of gradient tensors via GPU dispatch (tensor_mul for
+  squaring, CPU reduce for the sum — cheap compared to the
+  element-wise square), scales every tensor by `max_norm / norm`
+  when the threshold fires, returns `(clipped_grads, pre_norm)`.
+  The running total is accumulated through a `float_arr` slot
+  instead of a recursive float param to side-step Rail's
+  cross-function float-inference gap.
+
+### Checkpoint save/load
+- **`stdlib/checkpoint.rail`** — `save_model prefix tensors` writes a
+  text manifest (`<prefix>.manifest`, one line per tensor with
+  rank and dims) plus per-tensor f32 payload files
+  (`<prefix>.<i>.f32`).  `load_model prefix` reads them back into
+  fresh Tensors.  Round-trip verified bit-identical in
+  `tools/train/ckpt_test.rail`; reload of the LM checkpoint produces
+  the same forward-pass loss to 1e-10.
+
+### Tokenizer
+- **`stdlib/tokenizer.rail::Vocab`** — char-level vocab built by
+  first-appearance order.  `build_vocab text` returns a `Vocab`,
+  `encode / decode` round-trip exactly.  Verified on 10,320 chars
+  (`tools/train/tokenizer_test.rail`).  Byte-level BPE with merge
+  rules is queued for v2.4 — the v2.3 shape is the BPE-floor char
+  vocab.
+
+### End-to-end LM training
+- **`tools/train/lm_shakespeare.rail`** — 2-layer MLP bigram LM,
+  `one_hot(32) → Linear(32) → ReLU → Linear(32) → softmax`.  Trains on
+  a 383-char Shakespeare excerpt for 200 steps with Adam + cosine
+  schedule.  Loss drops 15.02 → 2.10 vs uniform baseline 3.47.
+  Checkpoint save + reload + eval gives bit-identical loss.
+
+### Generation
+- **`stdlib/sampling.rail`** — `sample_argmax`, `sample_topk`,
+  `sample_temperature`, plus `fill_uniforms` (awk-backed PRNG — Rail's
+  int PRNG overflows on multiplicative LCGs, so we lean on shell).
+  Top-k selection is O(V·k), adequate for small vocabs.
+- **`tools/train/lm_generate.rail`** — loads the saved LM checkpoint,
+  rebuilds the vocab from the same corpus, generates 80 tokens with
+  each of the three strategies.  Argmax converges to a high-probability
+  bigram cycle ("To the the the..."); top-k k=3 produces more varied
+  Shakespeare-ish text ("To an tha the toro...").
+
+### Counters
+- Dylib export count: 24 → 25.
+- Tests: 106/106 (unchanged — all additions are stdlib + demos, not
+  compiler changes).
+- Fixed-point self-compile: preserved.
+
 ## v2.2.0 (2026-04-14) — *The Suite*
 
 A multi-movement session performed live. Overture fixed two parser/codegen

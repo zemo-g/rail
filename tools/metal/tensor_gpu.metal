@@ -486,6 +486,43 @@ kernel void sgd_update(
 }
 
 // ═══════════════════════════════════════════════════════════
+// ADAM UPDATE (fused, in-place)
+//   m = β1*m + (1-β1)*g
+//   v = β2*v + (1-β2)*g²
+//   m̂ = m / bc1            (bc1 = 1 - β1^t, computed host-side)
+//   v̂ = v / bc2            (bc2 = 1 - β2^t, computed host-side)
+//   w -= lr * m̂ / (√v̂ + ε)
+// All scalars packed into hyp[0..5] = {lr, β1, β2, ε, bc1, bc2}.
+// ═══════════════════════════════════════════════════════════
+
+kernel void adam_update(
+    device       float *w   [[buffer(0)]],
+    device const float *g   [[buffer(1)]],
+    device       float *m   [[buffer(2)]],
+    device       float *v   [[buffer(3)]],
+    constant     float *hyp [[buffer(4)]],   // [lr, β1, β2, ε, bc1, bc2]
+    constant     uint  &n   [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    float lr  = hyp[0];
+    float b1  = hyp[1];
+    float b2  = hyp[2];
+    float eps = hyp[3];
+    float bc1 = hyp[4];
+    float bc2 = hyp[5];
+
+    float gi = g[gid];
+    float mi = b1 * m[gid] + (1.0f - b1) * gi;
+    float vi = b2 * v[gid] + (1.0f - b2) * gi * gi;
+    m[gid] = mi;
+    v[gid] = vi;
+    float mhat = mi / bc1;
+    float vhat = vi / bc2;
+    w[gid] -= lr * mhat / (sqrt(vhat) + eps);
+}
+
+// ═══════════════════════════════════════════════════════════
 // CROSS-ENTROPY LOSS
 // ═══════════════════════════════════════════════════════════
 

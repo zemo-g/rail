@@ -21,6 +21,7 @@ int tgl_tanh_f64(const double*, double*, int);
 int tgl_softmax_rows_f64(const double*, double*, int, int);
 int tgl_transpose_f64(const double*, double*, int, int);
 int tgl_sgd_update_f64(double*, const double*, const double*, int);
+int tgl_adam_update_f64(double*, const double*, double*, double*, const double*, int);
 int tgl_cross_entropy_f64(const double*, const double*, double*, int, int);
 
 // Allocate a Rail-style float_arr: [count, v0, v1, ...]. Count is stored
@@ -187,6 +188,31 @@ int main(void) {
         ok &= check("fused[1,0]", C[3], 0, 1e-4);
         ok &= check("fused[1,1]", C[4], 4, 1e-4);
         free(A); free(B); free(bias); free(C);
+    }
+
+    // ── adam: single-step sanity
+    //   w=[1,2,3], g=[0.1,0.2,0.3], m=v=[0,0,0]
+    //   β1=0.9, β2=0.999, ε=1e-8, lr=0.01, t=1 → bc1=0.1, bc2=0.001
+    //   m1 = 0.1*g = [0.01,0.02,0.03]   v1 = 0.001*g² = [1e-6,4e-6,9e-6]
+    //   m̂ = m/bc1 = g ; v̂ = v/bc2 = g² ; w -= lr*g/(|g|+ε) ≈ w - 0.01
+    {
+        double *W = arr(3), *G = arr(3), *M = arr(3), *V = arr(3), *H = arr(6);
+        W[1]=1.0; W[2]=2.0; W[3]=3.0;
+        G[1]=0.1; G[2]=0.2; G[3]=0.3;
+        // m,v already zero
+        H[1]=0.01;   // lr
+        H[2]=0.9;    // β1
+        H[3]=0.999;  // β2
+        H[4]=1e-8;   // ε
+        H[5]=0.1;    // bc1 = 1 - 0.9^1
+        H[6]=0.001;  // bc2 = 1 - 0.999^1
+        tgl_adam_update_f64(W, G, M, V, H, 3);
+        ok &= check("adam w[0]", W[1], 1.0 - 0.01, 1e-4);
+        ok &= check("adam w[1]", W[2], 2.0 - 0.01, 1e-4);
+        ok &= check("adam w[2]", W[3], 3.0 - 0.01, 1e-4);
+        ok &= check("adam m[0]", M[1], 0.01, 1e-4);
+        ok &= check("adam v[0]", V[1], 1e-5, 1e-7);
+        free(W); free(G); free(M); free(V); free(H);
     }
 
     // ── stress: 10k relu, 5 times

@@ -27,7 +27,18 @@ Dylib export count: 15 → 24. Tests: 105/105 → 106/106. Fixed-point preserved
 - [ ] Movement I: f16 half-precision variants of every unary op
 - [ ] Movement II: attention backward (full Q/K/V chain)
 - [ ] Movement II: embedding scatter-add backward
-- [ ] Movement III: Adam + LR schedule + grad clip + mini-batching + checkpoints
+- [x] Movement III.1: Adam optimizer — fused GPU kernel, `stdlib/optim.rail`,
+      XOR → 3.78e-10 in 200 steps (2026-04-14)
+- [x] Movement III.2: cosine_decay LR schedule + clip_grad_norm in
+      `stdlib/optim.rail` (2026-04-14)
+- [x] Movement III.3: checkpoint save/load — `stdlib/checkpoint.rail`,
+      manifest + per-tensor f32 binaries, round-trip verified (2026-04-14)
+- [x] Movement IV.1: char-level tokenizer — `stdlib/tokenizer.rail`,
+      10,320-char round-trip exact (2026-04-14)
+- [x] Movement IV.2: end-to-end LM training — `tools/train/lm_shakespeare.rail`,
+      loss 15.02 → 2.10 on Shakespeare, uniform baseline 3.47 (2026-04-14)
+- [x] Movement IV.3: generation — `stdlib/sampling.rail` argmax/top-k/temperature
+      + `tools/train/lm_generate.rail` (2026-04-14)
 - [ ] Movement IV: tokenizer in Rail (BPE)
 - [ ] Movement IV: end-to-end LM training on char-level Shakespeare
 - [ ] Movement IV: generation (argmax / top-k / temperature)

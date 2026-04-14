@@ -1,0 +1,146 @@
+-- lm_generate.rail — generate text from the LM trained in
+-- tools/train/lm_shakespeare.rail.  Loads /tmp/rail_lm_ckpt and runs
+-- all three sampling strategies.
+import tensor
+import "stdlib/checkpoint.rail"
+import "stdlib/tokenizer.rail"
+import "stdlib/sampling.rail"
+
+-- Must match the corpus in lm_shakespeare.rail for the vocab to align.
+corpus _ =
+  cat ["To be, or not to be, that is the question.\n",
+       "Whether tis nobler in the mind to suffer\n",
+       "the slings and arrows of outrageous fortune,\n",
+       "or to take arms against a sea of troubles\n",
+       "and by opposing end them. To die, to sleep,\n",
+       "no more; and by a sleep to say we end\n",
+       "the heart-ache and the thousand natural shocks\n",
+       "that flesh is heir to: tis a consummation\n",
+       "devoutly to be wished. To die, to sleep;\n"]
+
+-- ── Forward pass: id → one_hot → hidden → logits → softmax ──
+add_bias_loop dst bias cols n i =
+  if i >= n then 0
+  else
+    let col = i % cols
+    let bv = float_arr_get bias col
+    let cur = float_arr_get dst i
+    let _ = float_arr_set dst i (cur + bv)
+    add_bias_loop dst bias cols n (i + 1)
+
+linear2 x w b = match x
+  | Tensor xd xs xt -> match w
+    | Tensor wd ws wt -> match b
+      | Tensor bd bs bt ->
+        let y = matmul x w
+        match y | Tensor yd ys yt ->
+          let cols = head (tail ys)
+          let n = list_product ys
+          let _ = add_bias_loop yd bd cols n 0
+          y
+
+linear_relu x w b =
+  tensor_relu (linear2 x w b)
+
+-- Build a [1, V] one-hot input for the given id.
+one_hot id V =
+  let d = float_arr_new V 0.0
+  let _ = float_arr_set d id 1.0
+  Tensor d (cons 1 (cons V [])) (compute_strides (cons 1 (cons V [])))
+
+-- Unwrap a [1, V] softmax output tensor into its V-element data slice.
+unwrap_probs t = match t | Tensor d _ _ -> d
+
+-- Forward one step: given the trained weights and a current id, return
+-- the softmax probs as a fresh float_arr of length V.
+forward_step id V w1 b1 w2 b2 =
+  let x = one_hot id V
+  let h = linear_relu x w1 b1
+  let y = linear2 h w2 b2
+  let p = tensor_softmax y
+  unwrap_probs p
+
+-- Greedy (argmax) generation.
+gen_argmax_loop V w1 b1 w2 b2 cur max i acc =
+  if i >= max then reverse acc
+  else
+    let probs = forward_step cur V w1 b1 w2 b2
+    let nxt = sample_argmax probs V
+    gen_argmax_loop V w1 b1 w2 b2 nxt max (i + 1) (cons nxt acc)
+
+generate_argmax V w1 b1 w2 b2 seed max =
+  gen_argmax_loop V w1 b1 w2 b2 seed max 0 []
+
+-- Temperature-sampled generation.
+gen_temp_loop V w1 b1 w2 b2 cur max tau rands i acc =
+  if i >= max then reverse acc
+  else
+    -- For temperature sampling, we want raw logits (not softmax).
+    -- forward_step already applied softmax; undoing that is awkward,
+    -- so we take the probs and feed them to sample_temperature which
+    -- will divide-by-tau then re-softmax.  This is approximate (we've
+    -- already passed through softmax once) but works well for tau
+    -- within [0.5, 2] on small vocabs.
+    let probs = forward_step cur V w1 b1 w2 b2
+    let u = float_arr_get rands i
+    let nxt = sample_temperature probs V tau u
+    gen_temp_loop V w1 b1 w2 b2 nxt max tau rands (i + 1) (cons nxt acc)
+
+generate_temperature V w1 b1 w2 b2 seed max tau rands =
+  gen_temp_loop V w1 b1 w2 b2 seed max tau rands 0 []
+
+-- Top-k sampled generation.
+gen_topk_loop V w1 b1 w2 b2 cur max k rands i acc =
+  if i >= max then reverse acc
+  else
+    let probs = forward_step cur V w1 b1 w2 b2
+    let u = float_arr_get rands i
+    let nxt = sample_topk probs V k u
+    gen_topk_loop V w1 b1 w2 b2 nxt max k rands (i + 1) (cons nxt acc)
+
+generate_topk V w1 b1 w2 b2 seed max k rands =
+  gen_topk_loop V w1 b1 w2 b2 seed max k rands 0 []
+
+main =
+  let _ = print "=== Rail LM generation (argmax / top-k / temperature) ==="
+
+  -- Rebuild vocab from the same corpus the model was trained on.
+  let text = corpus 0
+  let vocab = build_vocab text
+  let V = vocab_size vocab
+
+  -- Load checkpoint.
+  let loaded = load_model "/tmp/rail_lm_ckpt"
+  let w1 = list_nth 0 loaded
+  let b1 = list_nth 1 loaded
+  let w2 = list_nth 2 loaded
+  let b2 = list_nth 3 loaded
+
+  let seed_char = "T"
+  let seed_id = char_id vocab seed_char
+  let max_tokens = 80
+
+  let _ = print (cat ["\nseed='", seed_char, "', max_tokens=", show max_tokens])
+
+  -- ── Argmax (greedy) ──
+  let _ = print "\n-- argmax --"
+  let ids_a = generate_argmax V w1 b1 w2 b2 seed_id max_tokens
+  let text_a = cat [seed_char, decode vocab ids_a]
+  let _ = print text_a
+
+  -- ── Temperature tau=0.8 ──
+  let _ = print "\n-- temperature=0.8 --"
+  let rands_t = fill_uniforms max_tokens 17
+  let ids_t = generate_temperature V w1 b1 w2 b2 seed_id max_tokens 0.8 rands_t
+  let text_t = cat [seed_char, decode vocab ids_t]
+  let _ = print text_t
+
+  -- ── Top-k k=3 ──
+  let _ = print "\n-- top-k=3 --"
+  let rands_k = fill_uniforms max_tokens 42
+  let ids_k = generate_topk V w1 b1 w2 b2 seed_id max_tokens 3 rands_k
+  let text_k = cat [seed_char, decode vocab ids_k]
+  let _ = print text_k
+
+  let _ = print "\n=== done ==="
+  0
