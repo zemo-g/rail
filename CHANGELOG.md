@@ -2,6 +2,40 @@
 
 All notable changes to Rail are documented here.
 
+## v2.6.0 (2026-04-14) — *Compiler/REPL polish*
+
+Two small but high-leverage quality-of-life improvements.  No new GPU
+kernels, no new training math.
+
+### Did-you-mean for unbound identifiers
+- **`compile.rail::find_closest_name` + `edit_dist`** — Levenshtein
+  edit distance over the arity-map keys.  When code generation
+  reaches the user-function fallthrough with a name that's neither
+  in the arity map, the local env, nor a self-call, the compiler
+  emits a `WARNING: 'foo' is not defined; did you mean 'bar'?`
+  before the assembler produces its cryptic linker error.
+  Threshold: edit distance ≤ 2.  Skips compiler-internal names
+  (those starting with `_`).  Cold path only — zero cost on
+  successful compiles.
+- Confirmed: a typo'd `doubel 21` against a defined `double` now
+  prints `WARNING: 'doubel' is not defined; did you mean 'double'?`.
+
+### REPL `:load file.rail`
+- **`tools/repl.rail::repl_load`** — `:load <path>` reads a source
+  file, drops bare `--` comments and the trailing `main = ...`
+  block, and appends the remaining top-level decls to the running
+  REPL session.  Subsequent expressions can call any function
+  defined in the loaded file.  Verified by piping
+  `:load /tmp/foo.rail` followed by `double 21`, `square 7`,
+  `triple 5` — all return correct results.
+- The REPL's per-expression definition persistence already worked
+  in v2.0; this release just adds the file-slurp shortcut.
+
+### Counters
+- Dylib export count: 25 (unchanged).
+- Tests: 106/106.
+- Fixed-point self-compile: preserved.
+
 ## v2.5.0 (2026-04-14) — *Pre-norm transformer block*
 
 Adds the missing transformer infrastructure: **LayerNorm forward+backward,

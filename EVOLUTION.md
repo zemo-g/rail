@@ -58,9 +58,12 @@ Dylib export count: 15 → 24. Tests: 105/105 → 106/106. Fixed-point preserved
 - [ ] Movement VII: float_arr support in WASM backend
 - [ ] Movement VII: MHD ported to WASM, replaces parametric model at /plasma/mhd
 - [ ] Movement VII: WebGPU compute shaders
-- [ ] Movement VIII: REPL persistent definitions + `:load`
-- [ ] Movement VIII: LSP hover + jump-to-def
-- [ ] Movement VIII: did-you-mean suggestions for unbound names
+- [x] Movement VIII: REPL `:load file.rail` — shipped 2026-04-14, v2.6.0.
+      Definition persistence across expressions already worked; the
+      `:load` slurp is the new piece.
+- [ ] Movement VIII: LSP hover + jump-to-def (no progress)
+- [x] Movement VIII: did-you-mean suggestions for unbound names —
+      Levenshtein ≤ 2 over arity-map keys, shipped 2026-04-14, v2.6.0.
 - [ ] Movement IX: implicit MHD time stepping (backward Euler on Metal)
 - [ ] Movement IX: Laplace current distribution in thruster engine
 - [ ] Movement IX: full 2D MHD in thruster_engine.html (WebGL compute)
