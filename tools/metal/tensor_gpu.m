@@ -127,6 +127,46 @@ int main(int argc, char *argv[]) {
             return 0;
         }
 
+        // ── Binary matmul: ./tensor_gpu matmul_bin M K N a.bin b.bin c.bin ──
+        // Files are raw float32 arrays. Skips text parsing entirely.
+        if (argc >= 8 && strcmp(argv[1], "matmul_bin") == 0) {
+            uint32_t M = atoi(argv[2]), K = atoi(argv[3]), N = atoi(argv[4]);
+            const char *pathA = argv[5], *pathB = argv[6], *pathC = argv[7];
+
+            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
+            (void)rc;
+
+            NSError *err = nil;
+            id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/tmp/tensor_gpu.metallib"] error:&err];
+            if (!lib) return 1;
+            id<MTLComputePipelineState> pipe = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matmul"] error:&err];
+            id<MTLCommandQueue> queue = [device newCommandQueue];
+
+            id<MTLBuffer> bufA = [device newBufferWithLength:M*K*4 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> bufB = [device newBufferWithLength:K*N*4 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> bufC = [device newBufferWithLength:M*N*4 options:MTLResourceStorageModeShared];
+
+            // Read raw binary
+            FILE *fa = fopen(pathA, "rb"); fread(bufA.contents, 4, M*K, fa); fclose(fa);
+            FILE *fb = fopen(pathB, "rb"); fread(bufB.contents, 4, K*N, fb); fclose(fb);
+
+            id<MTLCommandBuffer> cmd = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipe];
+            [enc setBuffer:bufA offset:0 atIndex:0];
+            [enc setBuffer:bufB offset:0 atIndex:1];
+            [enc setBuffer:bufC offset:0 atIndex:2];
+            [enc setBytes:&M length:4 atIndex:3];
+            [enc setBytes:&K length:4 atIndex:4];
+            [enc setBytes:&N length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [enc endEncoding];
+            [cmd commit]; [cmd waitUntilCompleted];
+
+            FILE *fc = fopen(pathC, "wb"); fwrite(bufC.contents, 4, M*N, fc); fclose(fc);
+            return 0;
+        }
+
         // ── Softmax file mode: ./tensor_gpu softmax ROWS COLS a.txt c.txt ──
         if (argc >= 6 && strcmp(argv[1], "softmax") == 0) {
             uint32_t rows = atoi(argv[2]), cols = atoi(argv[3]);
