@@ -22,7 +22,12 @@ Started 2026-04-13. Every upgrade, ranked and tracked.
       transpose all dispatch to Metal (2026-04-13). Still CPU-only: SGD,
       cross_entropy, relu_backward (autograd internal ops).
 - [x] tensor_gpu as persistent daemon — TCP on :9300, auto-fallback to file mode (2026-04-13)
-- [ ] Binary pipe GPU protocol from Rail (byte_at/byte_set headers)
+- [x] Binary pipe GPU protocol — float_arr_to_f32_file + float_arr_from_f32_file
+      as compiler builtins. tensor.rail matmul uses binary path (no text
+      parsing). Metal host adds matmul_bin file mode (2026-04-13)
+- [x] Scientific notation in float literals — 1e6, 1.5e-3, 6.022e23 all parse
+      correctly. Lexer extended to consume optional e[+-]?digits suffix
+      after integer or fractional part (2026-04-13)
 - [x] Deploy ramjet_3d.html to ledatic.org/plasma/thruster3d (2026-04-13)
 - [x] MHD solver: adaptive steps_per_frame — doubles when frame <10ms,
       halves when frame >30ms, range [5..200] (2026-04-13)
