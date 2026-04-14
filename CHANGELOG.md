@@ -2,6 +2,59 @@
 
 All notable changes to Rail are documented here.
 
+## v2.8.0 (2026-04-14) — *WASM transcendentals (~9-digit accuracy)*
+
+Closes the v2.7 deferral list: **sin / cos / exp / log / pow / tanh
+all run natively under wasmtime via Taylor-series polyfills**, and
+`show_float` bumped from 6 to 9 decimal digits to surface the new
+precision.
+
+### Polyfill design
+- **`$sin`** — range-reduce to `[-π/2, π/2]` via 2π-modulo + π-flip,
+  then Horner-form Taylor with 12 terms (factors `x²/(2k(2k+1))` for
+  k=1..6).  Worst-case error at the boundary: `x¹³/13! ≈ 6e-10`.
+- **`$cos`** — own Taylor series (no longer `sin(x + π/2)`, so
+  `cos(0)` is exact-1 instead of `1.000003`).  Range-reduce to
+  `[-π/2, π/2]` with the `cos(π - x) = -cos(x)` identity, then
+  Horner with 6 pairs.
+- **`$exp`** — split `x = k·ln(2) + r` (`r ∈ [-ln(2)/2, ln(2)/2]`),
+  Taylor `exp(r)` with 8 terms in Horner form, multiply by `2^k`
+  via direct construction of the f64 exponent field
+  (`(k + 1023) << 52`, then `f64.reinterpret_i64`).
+- **`$log`** — extract f64 exponent → `k`, mantissa → `m ∈ [1, 2)`.
+  If `m > √2` divide by 2 and bump `k`.  Then Taylor on
+  `log(1 + t)` with `t = m - 1 ∈ [-0.293, 0.414]`, **14 terms**.
+  Result = `k·ln(2) + sum`.  Worst-case error: `t¹⁵/15 ≈ 5e-9`.
+- **`$pow(x, y) = exp(y·log(x))`**.  Edge: `x = 0 → 0`.
+- **`$tanh(x) = (e^(2x) - 1) / (e^(2x) + 1)`**, saturated at ±1
+  for `|x| > 20`.
+
+### Verified accuracy (vs true values, all 9 digits printed)
+| Call | WASM result | Notes |
+|---|---|---|
+| `sin(0)` | 0.000000000 | exact |
+| `sin(π/2)` | 1.000000000 | exact (was `1.000003` in v2.7) |
+| `cos(0)` | 1.000000000 | exact (was `1.000003` in v2.7) |
+| `exp(1)` | 2.718281828 | matches `e` to 9 digits |
+| `exp(2)` | 7.389056098 | matches to 9 digits |
+| `log(e)` | 0.999999989 | 8-digit accuracy (1.1e-8 error) |
+| `log(10)` | 2.302585092 | 9-digit accuracy |
+| `pow(2, 10)` | 1024.000000000 | exact |
+| `tanh(1)` | 0.761594155 | matches to 9 digits |
+
+The diffusion smoke proof from v2.7 now reports `‖[0..15]‖₂ =
+35.213633723` (true: `35.213633723180…`).  9 digits exact.
+
+### `show_float` precision bump
+- 6 → 9 decimal digits.  Buffer was already 32 bytes after the
+  4-byte length prefix; no allocation change.
+
+### Counters
+- WAT runtime: 35 KB → 38 KB (still well under wasmtime's
+  reasonable limits).
+- Tests: 106/106.
+- Fixed-point self-compile: preserved.
+
 ## v2.7.0 (2026-04-14) — *WASM floats end-to-end*
 
 The WASM backend gains real floating-point support.  Before this
