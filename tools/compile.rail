@@ -3606,7 +3606,7 @@ dispatch_wasm path =
   let _ = print (cat ["  WAT: ", show (length wat), " bytes"])
   -- Search common Homebrew + system paths since shell builtin doesn't
   -- inherit the user's $PATH.
-  let w2w = trim (shell "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH wat2wasm /tmp/rail_out.wat -o /tmp/rail_out.wasm 2>&1")
+  let w2w = trim (shell "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH wat2wasm --enable-tail-call /tmp/rail_out.wat -o /tmp/rail_out.wasm 2>&1")
   let _ = if w2w != "" then print (cat ["  wat2wasm: ", w2w]) else print "  wat2wasm: OK"
   let wt = trim (shell "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH command -v wasmtime 2>/dev/null")
   if length wt > 0 then
@@ -3623,14 +3623,15 @@ wasm_program decls =
   let ar = get_arities decls
   let lams = wasm_collect_lambdas decls 0
   let nlams = length lams
-  let hdr = "(module\n  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))\n  (import \"wasi_snapshot_preview1\" \"proc_exit\" (func $proc_exit (param i32)))\n  (memory (export \"memory\") 16 1024)\n\n"
+  let hdr = "(module\n  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))\n  (import \"wasi_snapshot_preview1\" \"proc_exit\" (func $proc_exit (param i32)))\n  (memory (export \"memory\") 4096 65536)\n\n"
   let tbl = if nlams > 0 then cat ["  (type $clos_t (func (param i64 i64) (result i64)))\n  (table ", show nlams, " funcref)\n  (elem (i32.const 0)", wasm_elem_list nlams 0, ")\n\n"] else ""
   let rt = read_file "tools/wasm_runtime.wat"
   -- Iterate to fixed point so transitively-float-returning user
   -- functions all get marked before we start emitting bodies.
   let float_fns = wasm_float_fns_fixpoint decls 0
   let float_env = float_fn_markers float_fns []
-  let fns = wasm_fns decls stab ar lams float_env
+  let sites = all_call_sites decls float_env
+  let fns = wasm_fns decls stab ar lams float_env sites
   let lam_fns = wasm_lambda_fns lams stab ar
   let start = "  (func $_start (export \"_start\")\n    call $main\n    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    call $proc_exit\n  )\n\n"
   let sd = wasm_sdata stab
@@ -3640,23 +3641,27 @@ wasm_elem_list n i =
   if i >= n then ""
   else cat [" $__lambda_", show i, wasm_elem_list n (i + 1)]
 
-wasm_fns decls stab ar lams float_env =
+wasm_fns decls stab ar lams float_env sites =
   if length decls == 0 then ""
   else
     let tg = head (head decls)
-    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_fns (tail decls) stab ar lams float_env
-    else cat [wasm_fn (head decls) stab ar lams float_env, wasm_fns (tail decls) stab ar lams float_env]
+    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_fns (tail decls) stab ar lams float_env sites
+    else cat [wasm_fn (head decls) stab ar lams float_env sites, wasm_fns (tail decls) stab ar lams float_env sites]
 
-wasm_fn d stab ar lams float_env =
+wasm_fn d stab ar lams float_env sites =
   let nm = head (tail d)
   let ps = head (tail (tail d))
   let bd = head (tail (tail (tail d)))
   let pstr = if length ps == 0 then "" else join " " (wasm_plist ps)
-  let env = append (wasm_env ps 0) float_env
+  -- Pre-seed env with float markers for params that any caller flags
+  -- as float.  Lets the body's is_float_w resolve V references to
+  -- float params correctly.
+  let pmarks = param_float_markers nm ps 0 sites []
+  let env = append (wasm_env ps 0) (append pmarks float_env)
   let locs = wasm_dedup (cons "__ptr" (cons "__scrut" (wasm_locs bd)))
   let rl = wasm_fltr locs ps
   let ld = if length rl == 0 then "" else join "" (wasm_llist rl)
-  let body = wg bd env stab ar lams
+  let body = wg_tail bd env stab ar lams
   cat ["  (func $", nm, " ", pstr, " (result i64)\n", ld, body, "  )\n\n"]
 
 wasm_plist ps =
@@ -3726,7 +3731,7 @@ is_float_w node env =
   let tg = head node
   if tg == "FL" then true
   else if tg == "V" then
-    wasm_efind (cat ["__wfloat_", head (tail node)]) env >= 0
+    wasm_efind (cat ["__wfloat_", head (tail node)]) env != (0 - 1)
   else if tg == "A" then
     let (fname, _) = flat node
     if fname == "to_float" || fname == "int_to_float" || fname == "float_arr_get" || fname == "parse_float" then true
@@ -3739,7 +3744,27 @@ is_float_w node env =
     else false
   else if tg == "?" then
     is_float_w (head (tail (tail node))) env || is_float_w (head (tail (tail (tail node)))) env
+  else if tg == "D" then
+    -- let nm = val in body — the EXPRESSION's type is the body's.
+    -- Extend env with a float marker if the bound value is float.
+    let nm = head (tail node)
+    let val_node = head (tail (tail node))
+    let body_node = head (tail (tail (tail node)))
+    let new_env = if is_float_w val_node env then
+                    cons (cat ["__wfloat_", nm], 0 - 100) env
+                  else env
+    is_float_w body_node new_env
+  else if tg == "TD" then
+    is_float_w (head (tail (tail (tail node)))) env
+  else if tg == "M" then
+    match_is_float (head (tail (tail node))) env
   else false
+
+-- Any arm body is float → the match expression is float.
+match_is_float arms env =
+  if length arms == 0 then false
+  else if is_float_w (head (tail (tail (head arms)))) env then true
+  else match_is_float (tail arms) env
 
 -- Decide whether a function returns float by checking its body with
 -- no env (V nodes pessimistically int).  Used to seed __floatfn_
@@ -3803,6 +3828,94 @@ wasm_float_fns_fixpoint_iter decls names iters =
     if length next == length names then next
     else wasm_float_fns_fixpoint_iter decls next (iters + 1)
 
+-- ── Float PARAM inference ─────────────────────────────────────
+-- Walk a node tracking the local let-binding env so is_float_w
+-- resolves V references to let-bound floats.  Records each call
+-- site as (fname, list-of-bool-arg-is-float).  Bool flags are
+-- precomputed; caller_passes_float just inspects.
+collect_calls_env node env acc =
+  let tg = head node
+  if tg == "A" then
+    let (fname, fargs) = flat node
+    let flags = arg_float_flags fargs env []
+    let acc1 = cons (cons fname (cons flags [])) acc
+    collect_calls_env_l fargs env acc1
+  else if tg == "O" then
+    collect_calls_env (head (tail (tail node))) env (collect_calls_env (head (tail (tail (tail node)))) env acc)
+  else if tg == "?" then
+    collect_calls_env (head (tail node)) env (collect_calls_env (head (tail (tail node))) env (collect_calls_env (head (tail (tail (tail node)))) env acc))
+  else if tg == "D" then
+    let nm = head (tail node)
+    let val_node = head (tail (tail node))
+    let body_node = head (tail (tail (tail node)))
+    let new_env = if is_float_w val_node env then
+                    cons (cat ["__wfloat_", nm], 0 - 100) env
+                  else env
+    collect_calls_env val_node env (collect_calls_env body_node new_env acc)
+  else if tg == "TD" then
+    collect_calls_env (head (tail (tail node))) env (collect_calls_env (head (tail (tail (tail node)))) env acc)
+  else if tg == "L" then collect_calls_env_l (head (tail node)) env acc
+  else if tg == "M" then collect_calls_env (head (tail node)) env (collect_calls_env_arms (head (tail (tail node))) env acc)
+  else if tg == "F" then collect_calls_env (head (tail (tail node))) env acc
+  else acc
+
+collect_calls_env_l nodes env acc =
+  if length nodes == 0 then acc
+  else collect_calls_env (head nodes) env (collect_calls_env_l (tail nodes) env acc)
+
+collect_calls_env_arms arms env acc =
+  if length arms == 0 then acc
+  else collect_calls_env (head (tail (tail (head arms)))) env (collect_calls_env_arms (tail arms) env acc)
+
+arg_float_flags fargs env acc =
+  if length fargs == 0 then reverse acc
+  else
+    let flag = if is_float_w (head fargs) env then 1 else 0
+    arg_float_flags (tail fargs) env (cons flag acc)
+
+-- Sweep all decls for call sites.  Each function's body is walked
+-- with the global float_env seeded so is_float_w can resolve A-node
+-- returns through __floatfn_ markers.
+all_call_sites decls float_env =
+  if length decls == 0 then []
+  else
+    let d = head decls
+    if head d == "fn" then
+      append (collect_calls_env (head (tail (tail (tail d)))) float_env []) (all_call_sites (tail decls) float_env)
+    else all_call_sites (tail decls) float_env
+
+-- Was any call site to `fname` flagged as passing a float at slot i?
+caller_passes_float fname i sites =
+  if length sites == 0 then false
+  else
+    let site = head sites
+    let call_name = head site
+    let flags = head (tail site)
+    if call_name == fname then
+      if i < length flags then
+        if list_nth flags i == 1 then true
+        else caller_passes_float fname i (tail sites)
+      else caller_passes_float fname i (tail sites)
+    else caller_passes_float fname i (tail sites)
+
+dbg_print_sites sites =
+  if length sites == 0 then 0
+  else
+    let s = head sites
+    let nm = head s
+    let args = head (tail s)
+    let _ = print (cat ["  site: ", nm, " (", show (length args), " args)"])
+    dbg_print_sites (tail sites)
+
+-- Build float-marker env entries for the params of one function.
+param_float_markers fname params i sites acc =
+  if length params == 0 then acc
+  else
+    let acc1 = if caller_passes_float fname i sites then
+                 cons (cat ["__wfloat_", head params], 0 - 100) acc
+               else acc
+    param_float_markers fname (tail params) (i + 1) sites acc1
+
 -- Float promotion: if a node is structurally float, leave the WASM
 -- code as-is (already produces raw f64 bits as i64); otherwise the
 -- value is a tagged int and we need to untag (>>1) and convert
@@ -3810,6 +3923,79 @@ wasm_float_fns_fixpoint_iter decls names iters =
 wg_as_float node env stab ar lams =
   if is_float_w node env then wg node env stab ar lams
   else cat [wg node env stab ar lams, "    i64.const 1\n    i64.shr_s\n    f64.convert_i64_s\n    i64.reinterpret_f64\n"]
+
+-- Tail-position variant of wg.  Propagates tail position through if/let/
+-- match/let-discard so the leaf user-function call can emit return_call
+-- instead of call.  WASM's return_call is a direct tail-call (frame
+-- replacement) — eliminates the stack growth that otherwise kills
+-- recursive Rail loops past ~10k iterations.
+wg_tail node env stab ar lams =
+  let tg = head node
+  if tg == "?" then
+    cat [wg (head (tail node)) env stab ar lams, "    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    if (result i64)\n", wg_tail (head (tail (tail node))) env stab ar lams, "    else\n", wg_tail (head (tail (tail (tail node)))) env stab ar lams, "    end\n"]
+  else if tg == "D" then
+    let nm = head (tail node)
+    let val_node = head (tail (tail node))
+    let body_node = head (tail (tail (tail node)))
+    let new_env = if is_float_w val_node env then
+                    cons (cat ["__wfloat_", nm], length env) (cons (nm, length env) env)
+                  else cons (nm, length env) env
+    cat [wg val_node env stab ar lams, "    local.set $", nm, "\n", wg_tail body_node new_env stab ar lams]
+  else if tg == "TD" then
+    cat [wg (head (tail (tail node))) env stab ar lams, "    drop\n", wg_tail (head (tail (tail (tail node)))) env stab ar lams]
+  else if tg == "M" then
+    let scrut = head (tail node)
+    let arms = head (tail (tail node))
+    cat [wg scrut env stab ar lams, "    local.set $__scrut\n", wg_match_tail arms env stab ar lams]
+  else if tg == "A" then
+    let (fname, fargs) = flat node
+    -- Only convert genuine user-function tail calls.  Builtins,
+    -- foreign calls (1000+ arity), and constructor allocations
+    -- aren't tail-optimizable and just defer to the regular wg
+    -- emitter (which then handles the standard call conventions).
+    if wasm_efind fname env != (0 - 1) then wg node env stab ar lams
+    else
+      let ar_val = afind fname ar
+      let (cidx, _) = decode_ctor ar_val
+      if cidx != (0 - 1) then wg node env stab ar lams
+      else if ar_val >= 1000 then wg node env stab ar lams
+      else if ar_val == (0 - 1) then wg node env stab ar lams
+      else if fname == "print" || fname == "show" || fname == "head" || fname == "tail" || fname == "length" || fname == "cons" || fname == "append" || fname == "join" || fname == "cat" || fname == "reverse" then wg node env stab ar lams
+      -- Genuine user-function call: emit return_call for tail-call.
+      -- Args are pushed in order using regular wg (not tail) so each
+      -- arg evaluates in non-tail position.
+      else cat [wg_args_for_tail fargs env stab ar lams, "    return_call $", fname, "\n"]
+  else wg node env stab ar lams
+
+wg_args_for_tail args env stab ar lams =
+  if length args == 0 then ""
+  else cat [wg (head args) env stab ar lams, wg_args_for_tail (tail args) env stab ar lams]
+
+-- Tail-position variant of wg_match: propagates tail to each arm body.
+wg_match_tail arms env stab ar lams =
+  if length arms == 0 then "    unreachable\n"
+  else
+    let arm = head arms
+    let ctor = head arm
+    let binds = head (tail arm)
+    let body = head (tail (tail arm))
+    if ctor == "_" then
+      wg_tail body env stab ar lams
+    else if str_starts_with "#int:" ctor then
+      let val = str_after "#int:" ctor
+      cat ["    local.get $__scrut\n    i64.const ", show (str_to_int val * 2 + 1), "\n    i64.eq\n    if (result i64)\n", wg_tail body env stab ar lams, "    else\n", wg_match_tail (tail arms) env stab ar lams, "    end\n"]
+    else if str_starts_with "#str:" ctor then
+      let val = str_after "#str:" ctor
+      cat ["    local.get $__scrut\n    i64.const ", show (wasm_sfind val stab * 2), "\n    call $str_eq\n    if (result i64)\n", wg_tail body env stab ar lams, "    else\n", wg_match_tail (tail arms) env stab ar lams, "    end\n"]
+    else
+      let (cidx, _) = decode_ctor (afind ctor ar)
+      let bind_code = wg_extract_fields binds 0
+      let bind_env = wg_bind_env binds env
+      let is_last = length (tail arms) == 0
+      if is_last then
+        cat ["    local.get $__scrut\n    i64.const 1\n    i64.shr_u\n    local.set $__ptr\n", bind_code, wg_tail body bind_env stab ar lams]
+      else
+        cat ["    local.get $__scrut\n    i64.const 1\n    i64.shr_u\n    local.set $__ptr\n    local.get $__ptr\n    i32.const 8\n    i32.add\n    i64.load\n    i64.const 1\n    i64.shr_u\n    i64.const ", show cidx, "\n    i64.eq\n    if (result i64)\n", bind_code, wg_tail body bind_env stab ar lams, "    else\n", wg_match_tail (tail arms) env stab ar lams, "    end\n"]
 
 wg node env stab ar lams =
   let tg = head node

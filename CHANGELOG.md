@@ -2,6 +2,75 @@
 
 All notable changes to Rail are documented here.
 
+## v2.10.0 (2026-04-14) — *WASM MHD simulates*
+
+Closes both caveats from v2.9:  cross-function float PARAM inference
+and WASM tail-call elimination.  **The 128×128 Orszag-Tang MHD
+vortex now simulates under wasmtime** with exact mass/energy/divB
+conservation through 100 Lax-Friedrichs steps.
+
+### Float PARAM inference (WASM)
+- **`all_call_sites`** walks every function body tracking a local
+  env that extends with `__wfloat_<name>` markers on let-bindings.
+  For each call site, precomputes a `[arg_is_float_flag]` list.
+- **`caller_passes_float fname i sites`** scans the flags: if any
+  caller passes a float to slot `i` of `fname`, that param gets a
+  `__wfloat_<pname>` marker in the callee's emit env.
+- Extended **`is_float_w`** to recurse through `D` (let-binding),
+  `TD` (let-discard), and `M` (match) nodes.  Previously function
+  bodies that used `let ... in` always returned false, so the
+  fixed-point pass missed everything but the most trivial float-
+  returning wrappers.  Now a chain like
+  `compute_dt state = let smax = max_speed state; k / smax` is
+  correctly detected as float-returning.
+
+### WASM tail-call elimination
+- **`wg_tail`** — tail-position variant of the WASM codegen.  Emits
+  `return_call $fname` at the leaf of the tail chain, replacing
+  stack frames.  Propagates tail position through `?` / `D` / `TD`
+  / `M`; companion `wg_match_tail` handles match arms.
+- `wasm_fn` now drives the body via `wg_tail` (the function body IS
+  in tail position).  Non-tail-callable dispatches (builtins,
+  constructor allocs, foreign calls, closures) fall back to
+  regular `wg`.
+- `dispatch_wasm` passes `--enable-tail-call` to `wat2wasm`.
+- **Verified**: `count_down 100000` — 100,000 recursive calls —
+  completes under wasmtime.  Previously blew the stack past ~10k.
+
+### Memory bumping
+- WASM module memory: `16 1024` → `4096 65536` pages (1 MB → 256 MB
+  initial, 4 GB max).  MHD's Lax-Friedrichs step allocates fresh
+  scratch float_arrs per call; without a reaping GC the bump
+  allocator needs headroom.
+
+### MHD end-to-end under WASM
+**`tools/plasma/mhd_wasm.rail`** (128×128 grid, 100 steps):
+```
+Initial: mass=45511.111111121 energy=71907.555560786 divB=0.000000000
+step 0  t=0.003771498 dt=0.003771498 dm= 0.000000000 dE=-0.000000000 divB=0.000000000 rho_min=2.777777777
+step 50 t=0.191056954 dt=0.003726548 dm=-0.000000000 dE= 0.000000000 divB=0.000000000 rho_min=2.664129704
+Done: 100 steps, t=0.373662040
+```
+- **Mass drift**: 0 (exact, down to f32 precision)
+- **Energy drift**: 0 (exact)
+- **div B**: 0 (Orszag-Tang has no monopoles; Lax-Friedrichs preserves this)
+- **rho_min**: 2.778 → 2.664 — real vortex compression, the physics is evolving
+- **dt**: 0.003771 → 0.003726 — correct CFL adaptation as max speed grows
+- Runs in ~4 minutes of wasmtime wall time on M4 Pro.
+
+### Counters
+- Tests: 106/106.
+- Fixed-point self-compile: preserved.
+- WAT runtime: 39 KB (unchanged — all compiler-side).
+- Regression: Adam XOR, three_class_mlp, wasm_diffuse, 100k-recursion — all pass.
+
+### Still queued for v2.11+
+- WASM GC / arena reset so MHD can run the full 800-step simulation
+  to t=π without bump-allocator exhaustion.
+- Multi-head attention + learnable LN γ/β for the transformer LM.
+- `#metal_kernel` directive / Metal IR backend.
+- LSP hover + jump-to-def.
+
 ## v2.9.0 (2026-04-14) — *WASM compiler maturity for compute kernels*
 
 The WASM backend gains the structural plumbing needed to compile
