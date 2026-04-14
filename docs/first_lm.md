@@ -79,11 +79,34 @@ cd ~/projects/rail
 
 ## What this does NOT prove yet (gated on v2.3+)
 
-- **Transformer decoder** — the architecture here is a bigram MLP.
-  Full causal attention requires `tgl_attention_backward_f64` and
-  `tgl_embedding_scatter_add_f64`, both queued.
 - **Sampling / generation** — see `tools/train/lm_generate.rail`
   (task 5 in the v2.3 queue) for argmax / top-k / temperature.
 - **Long-context perplexity** — context length here is 1.  A sliding
   window variant on this same stack would be ~10 lines; left as a
   v2.3.1 cleanup.
+
+## v2.4 follow-up — single-head causal transformer
+
+`tools/train/lm_transformer.rail` extends this stack to a real
+transformer:  embedding → sinusoidal PE → causal self-attention →
+output projection.  Attention backward composes from existing
+primitives (matmul, transpose, `tgl_softmax_backward_f64`,
+`tensor_scale`) — **no new kernels required**.  Embedding gradient is
+just `X^T @ dX_pe` because the embedding is implemented as a one-hot
+matmul, so the matmul backward already does the scatter-add for free.
+
+Math is verified by `tools/train/attention_gradcheck.rail` —
+finite-difference gradcheck on dQ, dK, dV passes 18/18 to f32
+tolerance.
+
+Trains end to end on the same 383-char Shakespeare excerpt:
+
+| Run | Final loss | vs uniform (3.47) | vs bigram (2.10) |
+|---|---|---|---|
+| 300 steps, d=16, no LN, no residual | **2.62** | beats | does not beat |
+
+The transformer beats the uniform baseline but plateaus above the
+bigram baseline.  Closing that gap is gated on v2.5 work — layernorm
+forward+backward, residual connection (verified hurts without LN), and
+an FFN block.  Scope held to "single-head attention works end to end"
+for v2.4.

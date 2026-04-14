@@ -1,0 +1,111 @@
+-- attention_gradcheck.rail — finite-difference verification of
+-- stdlib/transformer.rail::attention_backward.
+--
+-- Scalar loss L = Σ out = Σ (attn @ V) → dO = ones[seq, head_dim].
+-- For each parameter we compare the analytic gradient against
+-- the central difference (L(θ+ε) - L(θ-ε)) / 2ε.
+import "stdlib/transformer.rail"
+
+-- Fill a tensor with a deterministic pattern so every run reproduces.
+fill_deterministic data n seed =
+  fill_deterministic_loop data n seed 0
+
+fill_deterministic_loop data n seed i =
+  if i >= n then 0
+  else
+    let raw = ((i * 53 + seed * 7) % 40) - 20
+    let v = 0.1 * int_to_float raw
+    let _ = float_arr_set data i v
+    fill_deterministic_loop data n seed (i + 1)
+
+-- Forward pass + scalar loss L = Σ (attn @ V).
+attn_loss q k v =
+  let out = scaled_dot_attention q k v
+  tensor_sum out
+
+-- Recompute attention weights for backward input.  (scaled_dot_attention
+-- returns only `out`, so we mirror its first stages here.)
+attention_probs q k = match q
+  | Tensor qd qs _ -> match k
+    | Tensor kd ks _ ->
+      let head_dim = head (tail qs)
+      let k_t = tensor_transpose k
+      let scores = matmul q k_t
+      let scale = 1.0 / sqrt (int_to_float head_dim)
+      let scaled = tensor_scale scores scale
+      tensor_softmax scaled
+
+-- Numerical and analytic comparison.  eps and tol are baked in (0.001
+-- and 0.01) because Rail's cross-function float-parameter inference
+-- still mishandles a float passed deeply through helpers.
+check_slot name idx analytic q k v tensor_data =
+  let orig = float_arr_get tensor_data idx
+  let _ = float_arr_set tensor_data idx (orig + 0.001)
+  let l_plus = attn_loss q k v
+  let _ = float_arr_set tensor_data idx (orig - 0.001)
+  let l_minus = attn_loss q k v
+  let _ = float_arr_set tensor_data idx orig
+  let numerical = (l_plus - l_minus) / 0.002
+  let diff1 = analytic - numerical
+  let diff = if diff1 < 0.0 then 0.0 - diff1 else diff1
+  let ok = diff < 0.01
+  let tag = if ok then "PASS " else "FAIL "
+  let _ = print (cat [tag, name, "[", show idx, "] analytic=", show_float analytic, " num=", show_float numerical])
+  if ok then 1 else 0
+
+check_loop name n grad_data param_data q k v i acc =
+  if i >= n then acc
+  else
+    let a = float_arr_get grad_data i
+    let p = check_slot name i a q k v param_data
+    check_loop name n grad_data param_data q k v (i + 1) (acc + p)
+
+main =
+  let _ = print "=== attention_backward finite-difference gradcheck ==="
+
+  let seq = 3
+  let d = 2
+  let n = seq * d    -- 6 elements per Q/K/V
+
+  let q_data = float_arr_new n 0.0
+  let k_data = float_arr_new n 0.0
+  let v_data = float_arr_new n 0.0
+  let _ = fill_deterministic q_data n 1
+  let _ = fill_deterministic k_data n 2
+  let _ = fill_deterministic v_data n 3
+  let q = Tensor q_data (cons seq (cons d [])) (compute_strides (cons seq (cons d [])))
+  let k = Tensor k_data (cons seq (cons d [])) (compute_strides (cons seq (cons d [])))
+  let v = Tensor v_data (cons seq (cons d [])) (compute_strides (cons seq (cons d [])))
+
+  -- Upstream gradient: dO = ones[seq, d]
+  let d_out_data = float_arr_new n 1.0
+  let _ = ones_loop d_out_data n 0
+  let d_out = Tensor d_out_data (cons seq (cons d [])) (compute_strides (cons seq (cons d [])))
+
+  -- Forward to get attn, then analytic backward.
+  let _ = print "computing attn"
+  let attn = attention_probs q k
+  let _ = print "got attn"
+  let (d_q, d_k, d_v) = attention_backward q k v attn d_out
+  let _ = print "got grads"
+
+  let dq_data = match d_q | Tensor x _ _ -> x
+  let dk_data = match d_k | Tensor x _ _ -> x
+  let dv_data = match d_v | Tensor x _ _ -> x
+  let _ = print "unwrapped"
+
+  let pq = check_loop "dQ" n dq_data q_data q k v 0 0
+  let pk = check_loop "dK" n dk_data k_data q k v 0 0
+  let pv = check_loop "dV" n dv_data v_data q k v 0 0
+
+  let total = pq + pk + pv
+  let expected = 3 * n
+  let _ = print (cat ["\nTOTAL PASS: ", show total, " / ", show expected])
+  if total == expected then 0 else 1
+
+-- Fill every slot with 1.0 (for the upstream ones gradient).
+ones_loop arr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set arr i 1.0
+    ones_loop arr n (i + 1)

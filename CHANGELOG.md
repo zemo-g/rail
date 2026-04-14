@@ -2,6 +2,64 @@
 
 All notable changes to Rail are documented here.
 
+## v2.4.0 (2026-04-14) — *Movement V: attention end-to-end*
+
+Closes the transformer-training spine: **attention backward + a
+single-head causal transformer LM that trains end to end on
+Shakespeare**.  No new GPU kernels — all of attention's backward chain
+composes from existing primitives (matmul, transpose,
+`tgl_softmax_backward_f64`, `tensor_scale`).  Embedding gradients use a
+one-hot matmul, so `dW_E = X^T @ dX_pe` falls out for free without a
+dedicated scatter-add kernel.
+
+### Compiler / stdlib hot fix
+- **`stdlib/transformer.rail` int→float coercion bug.**  Three call
+  sites used `0.0 + head_dim` to promote the int extracted from
+  `head (tail q_shape)` into a float for `sqrt`.  The Overture #1 fix
+  in v2.2.0 covers most cases of this pattern but the deeply-nested
+  match position was still emitting raw tagged-int bits — `sqrt(2)`
+  was being passed `4.94e-323` (the subnormal that bits-cast to
+  tagged-int 5) and returning `4.97e-162`.  Replaced all three sites
+  with explicit `int_to_float head_dim`.  All forward-attention
+  callers were producing nan before this fix.
+
+### Attention backward
+- **`stdlib/transformer.rail::attention_backward`** — pure-Rail
+  composition.  Given the saved forward `attn` (post-softmax) and the
+  upstream `dO`, returns `(dQ, dK, dV)` via:
+  ```
+  dV     = attn^T @ dO
+  dAttn  = dO @ V^T
+  dScaled = softmax_backward(attn, dAttn)
+  dScores = dScaled * (1/√d)
+  dQ      = dScores @ K
+  dK      = dScores^T @ Q
+  ```
+  Causal-mask attention reuses the same routine — masked positions get
+  `attn=0` from the forward, which makes their `dScaled` rows
+  identically zero through softmax_backward (no explicit backward
+  mask needed).
+- **`tools/train/attention_gradcheck.rail`** — central-difference
+  gradcheck on dQ, dK, dV at seq=3, d=2.  Tolerance 0.01 (f32 noise
+  floor).  All 18 slots PASS.
+
+### Single-head causal transformer LM
+- **`tools/train/lm_transformer.rail`** — `embed → +sin/cos PE →
+  causal self-attention → output projection`.  Adam + cosine LR
+  schedule + tokenizer + 5-tensor parameter set (W_E, W_Q, W_K, W_V,
+  W_O).  No layernorm, no residual, no FFN — minimum-viable
+  transformer, 300 Adam steps, d=16.  Loss 15.20 → **2.62** on the
+  same 383-char Shakespeare excerpt; beats uniform baseline (3.47)
+  but does not beat the v2.3 bigram baseline (2.10).  Closing that
+  gap is queued for v2.5 (layernorm forward+backward, residuals, FFN
+  block).
+
+### Counters
+- Dylib export count: 25 (unchanged — no new kernels).
+- Tests: 106/106 (unchanged).
+- Fixed-point self-compile: preserved.
+- Numerical attention gradcheck: 18/18 PASS.
+
 ## v2.3.0 (2026-04-14) — *Movement III: the training stack*
 
 Closes the training-loop spine: **Adam + cosine LR + grad clipping +
