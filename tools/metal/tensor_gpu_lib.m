@@ -15,6 +15,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <stdio.h>
 
 static id<MTLDevice>         g_device = nil;
 static id<MTLCommandQueue>   g_queue = nil;
@@ -23,22 +24,31 @@ static id<MTLComputePipelineState> g_matmul = nil;
 static id<MTLComputePipelineState> g_relu = nil;
 static int g_initialized = 0;
 
+// Force ObjC runtime init at dylib load time (before any Rail call).
+// Without this, MTLCreateSystemDefaultDevice crashes when the dylib is
+// loaded into Rail's process because Rail doesn't set up ObjC like a
+// Cocoa app does.
+__attribute__((constructor))
+static void _tgl_ctor(void) {
+    // Touching an NSString constant forces __objc_classlist to be processed
+    // which triggers ObjC class registration.
+    volatile NSString *s = @"tgl_init_warmup";
+    (void)s;
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Initialization: compile shader, create pipelines
 // ────────────────────────────────────────────────────────────────────
 
 int tgl_init(void) {
     if (g_initialized) return 0;
-    fprintf(stderr, "tgl_init: step 1 - MTLCreateSystemDefaultDevice\n");
 
     g_device = MTLCreateSystemDefaultDevice();
     if (!g_device) return -1;
-    fprintf(stderr, "tgl_init: step 2 - shader compile check\n");
 
     // Compile shader if not cached
     int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
     (void)rc;
-    fprintf(stderr, "tgl_init: step 3 - load library\n");
 
     NSError *err = nil;
     g_lib = [g_device newLibraryWithURL:[NSURL fileURLWithPath:@"/tmp/tensor_gpu.metallib"] error:&err];
@@ -63,14 +73,10 @@ int tgl_init(void) {
 // count header, or we add the offset here.
 // ────────────────────────────────────────────────────────────────────
 
-int tgl_matmul_f64(const double *A, const double *B, double *C, long Mt, long Kt, long Nt) {
+int tgl_matmul_f64(const double *A, const double *B, double *C, int M, int K, int N) {
     if (!g_initialized) { if (tgl_init() != 0) return -1; }
 
-    // Rail passes tagged ints: n*2+1. Untag by (n-1)/2.
-    int M = (int)((Mt - 1) >> 1);
-    int K = (int)((Kt - 1) >> 1);
-    int N = (int)((Nt - 1) >> 1);
-
+    // Rail's foreign call convention untags ints before passing — receive raw.
     // Rail float_arr layout: [count@0, double@8, double@16, ...]
     // Skip 8 bytes (count header) to get to the actual data.
     const double *Aptr = A + 1;
@@ -113,10 +119,9 @@ int tgl_matmul_f64(const double *A, const double *B, double *C, long Mt, long Kt
 // ReLU: Y[N] = max(0, X[N])
 // ────────────────────────────────────────────────────────────────────
 
-int tgl_relu_f64(const double *X, double *Y, long Nt) {
+int tgl_relu_f64(const double *X, double *Y, int N) {
     if (!g_initialized) { if (tgl_init() != 0) return -1; }
 
-    int N = (int)((Nt - 1) >> 1);
     const double *Xptr = X + 1;
     double *Yptr = Y + 1;
 
