@@ -1,0 +1,180 @@
+-- stdlib/transformer.rail — Transformer building blocks on GPU.
+--
+-- All operations dispatch through stdlib/tensor.rail, so they run
+-- on Metal via the libtensor_gpu.dylib FFI path when available.
+-- Shapes follow standard notation: [batch, seq, dim] or [batch, heads, seq, head_dim].
+--
+-- This is a FORWARD-PASS-ONLY stdlib. Training/backward lives separately.
+
+import tensor
+
+-- ────────────────────────────────────────────────────────
+-- Linear layer:   out = X @ W + bias_broadcast
+-- X: [rows, in_dim]    W: [in_dim, out_dim]    bias: [out_dim]
+-- Output: [rows, out_dim]
+-- ────────────────────────────────────────────────────────
+
+-- Add a row-shaped bias to every row of a 2D tensor (in place via new arr).
+add_bias_row_loop dst bias cols n i =
+  if i >= n then 0
+  else
+    let col = i % cols
+    let bv = float_arr_get bias col
+    let cur = float_arr_get dst i
+    let _ = float_arr_set dst i (cur + bv)
+    add_bias_row_loop dst bias cols n (i + 1)
+
+linear x w b = match x
+  | Tensor x_data x_shape x_st -> match w
+    | Tensor w_data w_shape w_st -> match b
+      | Tensor b_data b_shape b_st ->
+        let y = matmul x w
+        match y | Tensor y_data y_shape y_st ->
+          let cols = head (tail y_shape)
+          let n = list_product y_shape
+          let _ = add_bias_row_loop y_data b_data cols n 0
+          y
+
+-- Fused linear+relu using the matmul_bias_relu kernel.
+-- x: [rows, in_dim], w: [in_dim, out_dim], b: [out_dim] -> [rows, out_dim]
+linear_relu x w b = match x
+  | Tensor x_data x_shape x_st -> match w
+    | Tensor w_data w_shape w_st -> match b
+      | Tensor b_data b_shape b_st ->
+        let m = head x_shape
+        let k = head (tail x_shape)
+        let n = head (tail w_shape)
+        if gpu_available 0 then
+          let out = gpu_matmul_relu_ffi x_data w_data b_data m k n
+          Tensor out (cons m (cons n [])) (compute_strides (cons m (cons n [])))
+        else
+          tensor_relu (linear x w b)
+
+-- ────────────────────────────────────────────────────────
+-- LayerNorm:   y = gamma * (x - mean) / sqrt(var + eps) + beta
+-- Expects x: [..., dim] — normalizes along the last axis.
+-- gamma, beta: [dim]
+-- ────────────────────────────────────────────────────────
+
+layernorm_row_accum data offset dim j sum sum_sq =
+  if j >= dim then cons sum (cons sum_sq [])
+  else
+    let v = float_arr_get data (offset + j)
+    layernorm_row_accum data offset dim (j + 1) (sum + v) (sum_sq + v * v)
+
+layernorm_row_apply dst src offset dim j mean std gamma beta =
+  if j >= dim then 0
+  else
+    let x = float_arr_get src (offset + j)
+    let g = float_arr_get gamma j
+    let bb = float_arr_get beta j
+    let norm = (x - mean) / std
+    let _ = float_arr_set dst (offset + j) (g * norm + bb)
+    layernorm_row_apply dst src offset dim (j + 1) mean std gamma beta
+
+layernorm_rows src dst gamma beta dim eps n_rows r =
+  if r >= n_rows then 0
+  else
+    let offset = r * dim
+    let stats = layernorm_row_accum src offset dim 0 0.0 0.0
+    let sum = head stats
+    let sum_sq = head (tail stats)
+    let mean = sum / (0.0 + dim)
+    let var = sum_sq / (0.0 + dim) - mean * mean
+    let std = sqrt (var + eps)
+    let _ = layernorm_row_apply dst src offset dim 0 mean std gamma beta
+    layernorm_rows src dst gamma beta dim eps n_rows (r + 1)
+
+layernorm x gamma beta = match x
+  | Tensor x_data x_shape x_st -> match gamma
+    | Tensor g_data g_shape g_st -> match beta
+      | Tensor b_data b_shape b_st ->
+        let total = list_product x_shape
+        let dim = head (reverse x_shape)
+        let n_rows = total / dim
+        let out_data = float_arr_new total 0.0
+        let _ = layernorm_rows x_data out_data g_data b_data dim 0.00001 n_rows 0
+        Tensor out_data x_shape x_st
+
+-- ────────────────────────────────────────────────────────
+-- Scaled dot-product attention (single head, no mask)
+-- Q, K, V: [seq, head_dim]
+-- out:     [seq, head_dim]
+--
+--   scores = Q @ K^T / sqrt(head_dim)
+--   attn   = softmax(scores)
+--   out    = attn @ V
+-- ────────────────────────────────────────────────────────
+
+scaled_dot_attention q k v = match q
+  | Tensor q_data q_shape q_st -> match k
+    | Tensor k_data k_shape k_st -> match v
+      | Tensor v_data v_shape v_st ->
+        let seq = head q_shape
+        let head_dim = head (tail q_shape)
+        let k_t = tensor_transpose k                    -- [head_dim, seq]
+        let scores = matmul q k_t                       -- [seq, seq]
+        let scale = 1.0 / sqrt (0.0 + head_dim)
+        let scaled = tensor_scale scores scale
+        let attn = tensor_softmax scaled
+        matmul attn v                                    -- [seq, head_dim]
+
+-- Causal mask: sets upper-triangle (future positions) to -1e9 so softmax
+-- assigns them ~0. Applied to scores before softmax.
+apply_causal_mask_loop data seq i j =
+  if i >= seq then 0
+  else if j >= seq then apply_causal_mask_loop data seq (i + 1) 0
+  else
+    -- For auto-regressive decoding: token i attends to tokens 0..i only.
+    if j > i then
+      let _ = float_arr_set data (i * seq + j) (0.0 - 1000000000.0)
+      apply_causal_mask_loop data seq i (j + 1)
+    else apply_causal_mask_loop data seq i (j + 1)
+
+scaled_dot_attention_causal q k v = match q
+  | Tensor q_data q_shape q_st -> match k
+    | Tensor k_data k_shape k_st -> match v
+      | Tensor v_data v_shape v_st ->
+        let seq = head q_shape
+        let head_dim = head (tail q_shape)
+        let k_t = tensor_transpose k
+        let scores = matmul q k_t
+        let scale = 1.0 / sqrt (0.0 + head_dim)
+        let scaled = tensor_scale scores scale
+        match scaled | Tensor sd_data sd_shape sd_st ->
+          let _ = apply_causal_mask_loop sd_data seq 0 0
+          let attn = tensor_softmax scaled
+          matmul attn v
+
+-- ────────────────────────────────────────────────────────
+-- Feedforward: 2-layer MLP with GELU
+-- x: [rows, model_dim]
+-- w1, b1: [model_dim, hidden_dim], [hidden_dim]
+-- w2, b2: [hidden_dim, model_dim], [model_dim]
+-- out: [rows, model_dim]
+-- ────────────────────────────────────────────────────────
+
+feedforward x w1 b1 w2 b2 =
+  let h1 = linear x w1 b1
+  let h2 = tensor_gelu h1
+  linear h2 w2 b2
+
+-- ────────────────────────────────────────────────────────
+-- Transformer block (pre-norm, no mask): attn → add → ffn → add
+-- x: [seq, model_dim]
+-- All weights are passed explicitly; this stdlib has no parameter state.
+-- ────────────────────────────────────────────────────────
+
+transformer_block_prenorm x wq wk wv wo ln1_g ln1_b ln2_g ln2_b w1 b1 w2 b2 =
+  -- Pre-norm attention path
+  let x_norm = layernorm x ln1_g ln1_b
+  let q = matmul x_norm wq
+  let k = matmul x_norm wk
+  let v = matmul x_norm wv
+  let attn_out = scaled_dot_attention q k v
+  let attn_proj = matmul attn_out wo
+  let x_after_attn = tensor_add x attn_proj
+  -- Pre-norm FFN path
+  let x_after_attn_norm = layernorm x_after_attn ln2_g ln2_b
+  let ffn_out = feedforward x_after_attn_norm w1 b1 w2 b2
+  tensor_add x_after_attn ffn_out
