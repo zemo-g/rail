@@ -1,0 +1,158 @@
+-- stdlib/optim.rail — Optimizers for Rail tensor training
+-- Import: import "stdlib/optim.rail"
+--
+-- Currently exports: Adam (fused GPU kernel, one dispatch per tensor per step).
+-- Queued for v2.3: cosine_decay LR schedule, clip_norm, mini-batch iterator.
+--
+-- All scalars travel as raw doubles through Rail's foreign ABI; Adam's six
+-- hyperparameters are packed into a float_arr of length 6 to keep the FFI
+-- signature inside the 8-register window.
+--
+--   hyp[0] = lr      learning rate
+--   hyp[1] = β1      first-moment decay
+--   hyp[2] = β2      second-moment decay
+--   hyp[3] = ε       numerical stability floor
+--   hyp[4] = bc1     1 - β1^t  (bias correction for m, computed host-side)
+--   hyp[5] = bc2     1 - β2^t  (bias correction for v)
+--
+-- The kernel mutates w, m, v in place; g is read-only.
+--
+-- Prereq: import "stdlib/tensor.rail" (or autograd.rail, which pulls tensor)
+-- BEFORE importing this module. Rail imports do not dedupe, so optim does
+-- not re-import tensor. The tgl_adam_update_f64 foreign decl lives in
+-- tensor.rail alongside the other GPU op foreigns.
+
+foreign pow x y -> float
+foreign cos x -> float
+foreign sqrt x -> float
+
+-- ─────────────────────────────────────────────────────────────
+-- AdamState: persistent first/second moment + step counter.
+-- m and v are float_arrs, same size as the parameter tensor data.
+-- step is a 1-element int array so we can mutate it across calls
+-- without allocating a new state record each update.
+-- ─────────────────────────────────────────────────────────────
+
+type AdamState = | AdamState m v step_arr
+
+-- Build a fresh AdamState matching an existing float_arr (weights) in size.
+-- m and v start at zeros; step counter starts at 0.
+adam_state n =
+  let m = float_arr_new n 0.0
+  let v = float_arr_new n 0.0
+  let step_arr = arr_new 1 0
+  AdamState m v step_arr
+
+-- Pack the six hyperparameters for this step into a float_arr the dylib
+-- can read. Bias correction is recomputed every step because pow is cheap.
+adam_hyp lr b1 b2 eps t =
+  let t_f = int_to_float t
+  let bc1 = 1.0 - (pow b1 t_f)
+  let bc2 = 1.0 - (pow b2 t_f)
+  let h = float_arr_new 6 0.0
+  let _ = float_arr_set h 0 lr
+  let _ = float_arr_set h 1 b1
+  let _ = float_arr_set h 2 b2
+  let _ = float_arr_set h 3 eps
+  let _ = float_arr_set h 4 bc1
+  let _ = float_arr_set h 5 bc2
+  h
+
+-- One fused Adam update on a raw float_arr (weights data). Mutates w, m, v.
+-- Returns the new step counter. Requires the dylib; CPU fallback is not
+-- provided here because the optimizer exists to pair with GPU training.
+adam_update_raw w g state lr b1 b2 eps = match state
+  | AdamState m v step_arr ->
+    let t = arr_get step_arr 0 + 1
+    let _ = arr_set step_arr 0 t
+    let n = float_arr_len w
+    let h = adam_hyp lr b1 b2 eps t
+    let _ = tgl_adam_update_f64 w g m v h n
+    t
+
+-- Tensor-level wrapper: unwraps the Tensor ADT and calls the raw path.
+-- param and grad must share shape; state must have been built with
+-- adam_state matching that shape's element count.
+adam_update param grad state lr b1 b2 eps = match param
+  | Tensor pd _ _ -> match grad
+    | Tensor gd _ _ ->
+      let _ = adam_update_raw pd gd state lr b1 b2 eps
+      param
+
+-- Default hyperparameters (Kingma & Ba 2015). Use as:
+--   let lr = adam_default_lr
+--   let b1 = adam_default_b1
+-- etc. Not a record because Rail lacks record-of-floats destructure.
+adam_default_lr = 0.001
+adam_default_b1 = 0.9
+adam_default_b2 = 0.999
+adam_default_eps = 1e-8
+
+-- ─────────────────────────────────────────────────────────────
+-- Learning rate schedule — linear warmup → half-cosine decay to 0.
+--   step 0..warmup-1       : lr = base_lr * (step/warmup)
+--   step warmup..max_steps : lr = base_lr * 0.5 * (1 + cos(π * p))
+--     where p = (step - warmup) / (max_steps - warmup)
+-- Clamps at 0.0 after max_steps to avoid negative lrs from overshoots.
+-- ─────────────────────────────────────────────────────────────
+
+cosine_decay step warmup max_steps base_lr =
+  if step >= max_steps then 0.0
+  else if step < warmup then
+    let p = int_to_float step / int_to_float warmup
+    base_lr * p
+  else
+    let decay_steps = max_steps - warmup
+    let p = int_to_float (step - warmup) / int_to_float decay_steps
+    let pi_val = 3.14159265358979323846
+    let c = cos (pi_val * p)
+    base_lr * 0.5 * (1.0 + c)
+
+-- ─────────────────────────────────────────────────────────────
+-- Gradient global-norm clipping.
+--   Given a list of gradient Tensors and a max_norm threshold,
+--   compute the global L2 norm (sqrt of sum of all squared entries)
+--   and if it exceeds max_norm, return a new list of tensors scaled
+--   by max_norm/norm. Returns the PRE-clip norm so callers can log
+--   gradient magnitudes regardless of whether clipping fired.
+--
+-- Per-tensor sum of squares is implemented as tensor_mul(g,g) then
+-- tensor_sum; the mul dispatches to GPU, sum runs on CPU (the reduce
+-- is cheap compared to the element-wise square).
+-- ─────────────────────────────────────────────────────────────
+
+sum_sq_tensor g =
+  let g2 = tensor_mul g g
+  tensor_sum g2
+
+-- Accumulate sum-of-squares across a list of tensors into a mutable
+-- float_arr slot. Rail's cross-function float-param inference can
+-- misclassify a float accumulator passed recursively, so we route
+-- the running total through a float_arr instead of an `acc` arg.
+total_sq_into grads acc_arr =
+  if length grads == 0 then 0
+  else
+    let cur = float_arr_get acc_arr 0
+    let contrib = sum_sq_tensor (head grads)
+    let _ = float_arr_set acc_arr 0 (cur + contrib)
+    total_sq_into (tail grads) acc_arr
+
+-- Fold helper: scale every tensor in a list by a constant factor.
+-- `factor` is a float but only participates in arithmetic inside
+-- tensor_scale, which already handles float scalars correctly via
+-- its own float_arr dispatch.
+scale_each grads factor acc =
+  if length grads == 0 then reverse acc
+  else scale_each (tail grads) factor (cons (tensor_scale (head grads) factor) acc)
+
+-- Returns (clipped_grads, total_norm).
+clip_grad_norm grads max_norm =
+  let acc_arr = float_arr_new 1 0.0
+  let _ = total_sq_into grads acc_arr
+  let total_sq = float_arr_get acc_arr 0
+  let norm = sqrt total_sq
+  if norm <= max_norm then (grads, norm)
+  else
+    let factor = max_norm / norm
+    let clipped = scale_each grads factor []
+    (clipped, norm)

@@ -20,6 +20,7 @@
 //   tgl_softmax_rows_f64 (X,Y, rows, cols)              — row-wise softmax
 //   tgl_transpose_f64    (A,B, M,N)                     — B = A^T, shape N×M
 //   tgl_sgd_update_f64   (w, grad, lr, N)               — w -= lr*grad (in place)
+//   tgl_adam_update_f64  (w, g, m, v, hyp, N)           — fused Adam; hyp=[lr,β1,β2,ε,bc1,bc2], m/v updated in place
 //   tgl_cross_entropy_f64(probs, targets_f64, losses, batch, vocab)
 //
 // All *_f64 entry points accept pointers into Rail float_arr payload.
@@ -752,6 +753,61 @@ int tgl_sgd_update_f64(double *weights, const double *grad, const double *lr_ptr
 
         f32_to_f64((float*)bW.contents, wp, N);
         pool_release(bW); pool_release(bG);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Adam fused in-place update.
+//   hyp is a Rail float_arr of length ≥6: [lr, β1, β2, ε, bc1, bc2]
+//   m and v are mutated in place (same side as weights).
+//   One GPU dispatch per parameter tensor per step.
+// ────────────────────────────────────────────────────────────────────
+
+int tgl_adam_update_f64(double *w, const double *g,
+                        double *m, double *v,
+                        const double *hyp, int N) {
+    if (ensure_init() != 1) return -1;
+    double *wp = w + 1;
+    const double *gp = g + 1;
+    double *mp = m + 1;
+    double *vp = v + 1;
+    const double *hp = hyp + 1;
+
+    float hyp_f[6];
+    for (int i = 0; i < 6; i++) hyp_f[i] = (float)hp[i];
+
+    @autoreleasepool {
+        id<MTLBuffer> bW = pool_acquire(N*4);
+        id<MTLBuffer> bG = pool_acquire(N*4);
+        id<MTLBuffer> bM = pool_acquire(N*4);
+        id<MTLBuffer> bV = pool_acquire(N*4);
+        f64_to_f32(wp, (float*)bW.contents, N);
+        f64_to_f32(gp, (float*)bG.contents, N);
+        f64_to_f32(mp, (float*)bM.contents, N);
+        f64_to_f32(vp, (float*)bV.contents, N);
+
+        id<MTLComputePipelineState> p = pso(@"adam_update");
+        if (!p) return -1;
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bG offset:0 atIndex:1];
+        [enc setBuffer:bM offset:0 atIndex:2];
+        [enc setBuffer:bV offset:0 atIndex:3];
+        [enc setBytes:hyp_f length:sizeof(hyp_f) atIndex:4];
+        uint32_t nu = N;
+        [enc setBytes:&nu length:4 atIndex:5];
+        dispatch_1d(enc, N);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f32_to_f64((float*)bW.contents, wp, N);
+        f32_to_f64((float*)bM.contents, mp, N);
+        f32_to_f64((float*)bV.contents, vp, N);
+        pool_release(bW); pool_release(bG);
+        pool_release(bM); pool_release(bV);
     }
     return 1;
 }

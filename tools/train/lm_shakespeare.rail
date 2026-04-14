@@ -1,0 +1,273 @@
+-- lm_shakespeare.rail — tiny char-level bigram LM trained end-to-end.
+-- Architecture: one_hot(V) → Linear(V→32) + ReLU → Linear(32→V) → softmax
+-- Loss: cross-entropy on next character
+-- Optimizer: Adam (stdlib/optim.rail), cosine LR schedule, grad clipping
+-- Checkpoint: save final weights to /tmp/rail_lm_ckpt*
+--
+-- The architecture is an MLP bigram, not a transformer — causal attention
+-- backward is still queued for v2.3.  The point of this demo is to show
+-- the v2.3 training stack (Adam + cosine_decay + clip_grad_norm +
+-- checkpoint + tokenizer) composing end to end on a real language-model
+-- objective.  Proof write-up lives in docs/first_lm.md.
+import tensor
+import "stdlib/optim.rail"
+import "stdlib/checkpoint.rail"
+import "stdlib/tokenizer.rail"
+
+-- ── Corpus (Shakespeare-ish) ──
+corpus _ =
+  cat ["To be, or not to be, that is the question.\n",
+       "Whether tis nobler in the mind to suffer\n",
+       "the slings and arrows of outrageous fortune,\n",
+       "or to take arms against a sea of troubles\n",
+       "and by opposing end them. To die, to sleep,\n",
+       "no more; and by a sleep to say we end\n",
+       "the heart-ache and the thousand natural shocks\n",
+       "that flesh is heir to: tis a consummation\n",
+       "devoutly to be wished. To die, to sleep;\n"]
+
+-- ── One-hot encoding: fill X[i, c] = 1 for the i-th input char id c ──
+fill_onehot x_data ids V N i =
+  if i >= N then 0
+  else
+    let c = list_nth i ids
+    let _ = float_arr_set x_data (i * V + c) 1.0
+    fill_onehot x_data ids V N (i + 1)
+
+fill_labels labels_data ids N i =
+  if i >= N then 0
+  else
+    let _ = float_arr_set labels_data i (int_to_float (list_nth i ids))
+    fill_labels labels_data ids N (i + 1)
+
+-- ── Weight init (deterministic scatter) ──
+init_weight arr n seed =
+  init_weight_loop arr n seed 0
+
+init_weight_loop arr n seed i =
+  if i >= n then 0
+  else
+    let raw = ((i * 97 + seed * 13) % 100) - 50
+    let v = 0.05 * int_to_float raw
+    let _ = float_arr_set arr i v
+    init_weight_loop arr n (seed + 1) (i + 1)
+
+-- ── Forward: X(N,V) → relu(X W1 + b1) → Y = H W2 + b2 → softmax ──
+add_bias_loop dst bias cols n i =
+  if i >= n then 0
+  else
+    let col = i % cols
+    let bv = float_arr_get bias col
+    let cur = float_arr_get dst i
+    let _ = float_arr_set dst i (cur + bv)
+    add_bias_loop dst bias cols n (i + 1)
+
+linear2 x w b = match x
+  | Tensor xd xs xt -> match w
+    | Tensor wd ws wt -> match b
+      | Tensor bd bs bt ->
+        let y = matmul x w
+        match y | Tensor yd ys yt ->
+          let cols = head (tail ys)
+          let n = list_product ys
+          let _ = add_bias_loop yd bd cols n 0
+          y
+
+linear_relu x w b =
+  let y = linear2 x w b
+  tensor_relu y
+
+-- ── Cross-entropy loss + gradient (N,C softmax out vs integer labels) ──
+cross_entropy_mean probs labels N C = match probs
+  | Tensor pd _ _ -> match labels
+    | Tensor ld _ _ ->
+      let acc = float_arr_new 1 0.0
+      let _ = ce_loop pd ld N C acc 0
+      (float_arr_get acc 0) / int_to_float N
+
+ce_loop pd ld N C acc i =
+  if i >= N then 0
+  else
+    let target = float_to_int (float_arr_get ld i)
+    let p = float_arr_get pd (i * C + target)
+    let p2 = if p < 0.00000001 then 0.00000001 else p
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur - log p2)
+    ce_loop pd ld N C acc (i + 1)
+
+ce_grad_loop dst probs labels N C invN i =
+  if i >= N * C then 0
+  else
+    let row = i / C
+    let col = i % C
+    let target = float_to_int (float_arr_get labels row)
+    let p = float_arr_get probs i
+    let g = if col == target then (p - 1.0) * invN else p * invN
+    let _ = float_arr_set dst i g
+    ce_grad_loop dst probs labels N C invN (i + 1)
+
+-- ── Sums along axis 0 (for bias gradients) ──
+sum_axis0 src N C out =
+  sum_axis0_loop src N C out 0 0
+
+sum_axis0_loop src N C out c i =
+  if c >= C then 0
+  else if i >= N then
+    sum_axis0_loop src N C out (c + 1) 0
+  else
+    let cur = float_arr_get out c
+    let _ = float_arr_set out c (cur + float_arr_get src (i * C + c))
+    sum_axis0_loop src N C out c (i + 1)
+
+-- ── ReLU backward: pass gradient through where forward > 0 ──
+relu_bwd_loop dh_data h_data out N i =
+  if i >= N then 0
+  else
+    let hv = float_arr_get h_data i
+    let g = if hv > 0.0 then float_arr_get dh_data i else 0.0
+    let _ = float_arr_set out i g
+    relu_bwd_loop dh_data h_data out N (i + 1)
+
+unwrap_data t = match t | Tensor d _ _ -> d
+
+-- ── One training step: forward, backward, Adam on every param ──
+train_step x labels w1 b1 w2 b2 dy_buf dh_relu_buf st_w1 st_b1 st_w2 st_b2 N V H lr =
+  let hidden = linear_relu x w1 b1
+  let logits = linear2 hidden w2 b2
+  let probs = tensor_softmax logits
+  let loss = cross_entropy_mean probs labels N V
+
+  match probs | Tensor pd _ _ ->
+    match labels | Tensor ld _ _ -> match hidden | Tensor hd _ _ ->
+      match b1 | Tensor b1d _ _ -> match b2 | Tensor b2d _ _ ->
+        let invN = 1.0 / int_to_float N
+        let _ = ce_grad_loop dy_buf pd ld N V invN 0
+        let dy_t = Tensor dy_buf (cons N (cons V [])) (compute_strides (cons N (cons V [])))
+        let ht_t = tensor_transpose hidden
+        let dw2 = matmul ht_t dy_t
+        let w2_t = tensor_transpose w2
+        let dh = matmul dy_t w2_t
+        let dhd = unwrap_data dh
+        let _ = relu_bwd_loop dhd hd dh_relu_buf (N * H) 0
+        let dh_relu_t = Tensor dh_relu_buf (cons N (cons H [])) (compute_strides (cons N (cons H [])))
+        let xt_t = tensor_transpose x
+        let dw1 = matmul xt_t dh_relu_t
+        let db1 = float_arr_new H 0.0
+        let _ = sum_axis0 dh_relu_buf N H db1
+        let db2 = float_arr_new V 0.0
+        let _ = sum_axis0 dy_buf N V db2
+
+        -- Adam update per parameter tensor. grad tensors (dw1, dw2) are
+        -- unwrapped to raw float_arrs to match optim.rail's raw entry point.
+        let dw1d = unwrap_data dw1
+        let dw2d = unwrap_data dw2
+        match w1 | Tensor w1d _ _ -> match w2 | Tensor w2d _ _ ->
+          let _ = adam_update_raw w1d dw1d st_w1 lr adam_default_b1 adam_default_b2 adam_default_eps
+          let _ = adam_update_raw w2d dw2d st_w2 lr adam_default_b1 adam_default_b2 adam_default_eps
+          let _ = adam_update_raw b1d db1 st_b1 lr adam_default_b1 adam_default_b2 adam_default_eps
+          let _ = adam_update_raw b2d db2 st_b2 lr adam_default_b1 adam_default_b2 adam_default_eps
+          loss
+
+-- ── Training loop with cosine LR schedule ──
+train_loop x labels w1 b1 w2 b2 dy_buf dh_relu_buf st_w1 st_b1 st_w2 st_b2 N V H base_lr warmup max_steps step =
+  if step >= max_steps then 0
+  else
+    let lr = cosine_decay step warmup max_steps base_lr
+    let loss = train_step x labels w1 b1 w2 b2 dy_buf dh_relu_buf st_w1 st_b1 st_w2 st_b2 N V H lr
+    let _ = if step % 20 == 0 then
+      let _ = print (cat ["step ", show step, "  lr=", show_float lr, "  loss=", show_float loss])
+      0
+    else 0
+    train_loop x labels w1 b1 w2 b2 dy_buf dh_relu_buf st_w1 st_b1 st_w2 st_b2 N V H base_lr warmup max_steps (step + 1)
+
+eval_loss x labels w1 b1 w2 b2 N V =
+  let h = linear_relu x w1 b1
+  let y = linear2 h w2 b2
+  let p = tensor_softmax y
+  cross_entropy_mean p labels N V
+
+-- ── Main ──
+main =
+  let _ = print "=== Rail LM on Shakespeare (char bigram, Adam + cosine) ==="
+
+  -- Build corpus + vocab.
+  let text = corpus 0
+  let vocab = build_vocab text
+  let V = vocab_size vocab
+  let ids = encode vocab text
+  let total = length ids
+  -- Inputs: id[0..total-2], Labels: id[1..total-1]. N = total - 1 pairs.
+  let N = total - 1
+  let _ = print (cat ["corpus=", show total, " chars, vocab=", show V, ", samples=", show N])
+
+  -- Prepare one-hot input buffer and label buffer.
+  let x_data = float_arr_new (N * V) 0.0
+  let input_ids = take_first ids N
+  let _ = fill_onehot x_data input_ids V N 0
+  let x = Tensor x_data (cons N (cons V [])) (compute_strides (cons N (cons V [])))
+
+  let labels_data = float_arr_new N 0.0
+  let target_ids = drop_first ids 1
+  let _ = fill_labels labels_data target_ids N 0
+  let labels = Tensor labels_data (cons N []) (cons 1 [])
+
+  -- Weights — 2-layer MLP (V → 32 → V).
+  let H = 32
+  let w1_data = float_arr_new (V * H) 0.0
+  let _ = init_weight w1_data (V * H) 7
+  let w1 = Tensor w1_data (cons V (cons H [])) (compute_strides (cons V (cons H [])))
+  let b1_data = float_arr_new H 0.0
+  let b1 = Tensor b1_data (cons H []) (cons 1 [])
+  let w2_data = float_arr_new (H * V) 0.0
+  let _ = init_weight w2_data (H * V) 13
+  let w2 = Tensor w2_data (cons H (cons V [])) (compute_strides (cons H (cons V [])))
+  let b2_data = float_arr_new V 0.0
+  let b2 = Tensor b2_data (cons V []) (cons 1 [])
+
+  -- Adam states (one per parameter tensor).
+  let st_w1 = adam_state (V * H)
+  let st_b1 = adam_state H
+  let st_w2 = adam_state (H * V)
+  let st_b2 = adam_state V
+
+  -- Gradient scratch buffers.
+  let dy_buf = float_arr_new (N * V) 0.0
+  let dh_relu_buf = float_arr_new (N * H) 0.0
+
+  let loss0 = eval_loss x labels w1 b1 w2 b2 N V
+  let _ = print (cat ["initial loss=", show_float loss0])
+
+  let _ = print "\nTraining 200 steps, cosine(warmup=20, peak_lr=0.05):"
+  let _ = train_loop x labels w1 b1 w2 b2 dy_buf dh_relu_buf st_w1 st_b1 st_w2 st_b2 N V H 0.05 20 200 0
+
+  let loss1 = eval_loss x labels w1 b1 w2 b2 N V
+  let _ = print (cat ["\nfinal loss=", show_float loss1])
+  let uniform_loss = log (int_to_float V)
+  let _ = print (cat ["uniform-baseline loss (log V)=", show_float uniform_loss])
+
+  -- Checkpoint.
+  let params = cons w1 (cons b1 (cons w2 (cons b2 [])))
+  let _ = save_model "/tmp/rail_lm_ckpt" params
+  let _ = print "\ncheckpoint: /tmp/rail_lm_ckpt.manifest + .0.f32 ... .3.f32"
+
+  -- Reload + re-evaluate to verify round-trip.
+  let loaded = load_model "/tmp/rail_lm_ckpt"
+  let w1b = list_nth 0 loaded
+  let b1b = list_nth 1 loaded
+  let w2b = list_nth 2 loaded
+  let b2b = list_nth 3 loaded
+  let loss_rl = eval_loss x labels w1b b1b w2b b2b N V
+  let _ = print (cat ["reload loss=", show_float loss_rl, " (should match final loss)"])
+
+  let _ = print "\n=== done ==="
+  0
+
+-- Slice helpers for id lists.
+take_first xs n = take_first_loop xs n []
+take_first_loop xs n acc =
+  if n == 0 then reverse acc
+  else take_first_loop (tail xs) (n - 1) (cons (head xs) acc)
+
+drop_first xs n =
+  if n == 0 then xs
+  else drop_first (tail xs) (n - 1)

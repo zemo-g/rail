@@ -1,0 +1,154 @@
+-- stdlib/sampling.rail — Sampling utilities for generation from a softmax
+-- distribution.  Import: import "stdlib/sampling.rail"
+--
+-- Prereqs: import "stdlib/tensor.rail" first.
+--
+-- Three strategies:
+--   sample_argmax  probs V               — deterministic (no RNG)
+--   sample_topk    probs V k u           — top-k then categorical, u∈[0,1)
+--   sample_temperature probs V tau u     — divide logits by tau then sample
+--
+-- `probs` is expected to be a float_arr of length V already normalised
+-- (softmax output).  `u` is a single uniform sample in [0,1).  For
+-- temperature sampling the caller should pass raw logits as `probs` and
+-- the function applies tau + softmax itself.
+--
+-- Random uniforms come from awk: fill_uniforms n seed -> float_arr.
+
+foreign exp x -> float
+
+-- Categorical sample via cumulative-sum binary walk.
+-- Returns the smallest index i where prefix_sum >= u.
+cumul_walk probs V target i cum =
+  if i >= V then V - 1
+  else
+    let new_cum = cum + float_arr_get probs i
+    if new_cum >= target then i
+    else cumul_walk probs V target (i + 1) new_cum
+
+sample_argmax probs V =
+  argmax_loop probs V 0 0 (0.0 - 1.0)
+
+argmax_loop probs V i best best_v =
+  if i >= V then best
+  else
+    let v = float_arr_get probs i
+    if v > best_v then argmax_loop probs V (i + 1) i v
+    else argmax_loop probs V (i + 1) best best_v
+
+sample_categorical probs V u =
+  cumul_walk probs V u 0 0.0
+
+-- Top-k sampling: find the k largest probabilities, renormalise over
+-- them, sample one.  k must be ≥ 1.  For k=1 this reduces to argmax.
+-- The simple O(V·k) selection is fine for small vocabs (≤256).
+find_kth_largest probs V k =
+  find_kth_loop probs V k 0.0 0
+
+find_kth_loop probs V k prev_max iters =
+  if iters >= k then prev_max
+  else
+    let m = max_below probs V prev_max 0 (0.0 - 1.0) iters
+    find_kth_loop probs V k m (iters + 1)
+
+-- First iteration (iters=0): ignore prev_max, take global max.
+-- Later iterations: take largest value strictly less than prev_max.
+max_below probs V prev_max i best_v iters =
+  if i >= V then best_v
+  else
+    let v = float_arr_get probs i
+    let qualifies = if iters == 0 then true else v < prev_max
+    if qualifies then
+      if v > best_v then max_below probs V prev_max (i + 1) v iters
+      else max_below probs V prev_max (i + 1) best_v iters
+    else max_below probs V prev_max (i + 1) best_v iters
+
+sample_topk probs V k u =
+  let threshold = find_kth_largest probs V k
+  -- Build renormalised distribution over entries ≥ threshold.
+  let tmp = float_arr_new V 0.0
+  let total_arr = float_arr_new 1 0.0
+  let _ = topk_mask probs tmp V threshold total_arr 0
+  let total = float_arr_get total_arr 0
+  let safe = if total < 1e-12 then 1.0 else total
+  let _ = renorm_loop tmp V safe 0
+  sample_categorical tmp V u
+
+topk_mask src dst V thresh tot_arr i =
+  if i >= V then 0
+  else
+    let v = float_arr_get src i
+    let keep = if v >= thresh then v else 0.0
+    let _ = float_arr_set dst i keep
+    let cur = float_arr_get tot_arr 0
+    let _ = float_arr_set tot_arr 0 (cur + keep)
+    topk_mask src dst V thresh tot_arr (i + 1)
+
+renorm_loop arr V tot i =
+  if i >= V then 0
+  else
+    let v = float_arr_get arr i
+    let _ = float_arr_set arr i (v / tot)
+    renorm_loop arr V tot (i + 1)
+
+-- Temperature sampling: rescale raw LOGITS by tau, softmax, sample.
+-- Caller passes logits (not probs). tau<1 sharpens, tau>1 flattens.
+sample_temperature logits V tau u =
+  let tmp = float_arr_new V 0.0
+  let _ = temp_div logits tmp V tau 0
+  -- Softmax via max-subtract for stability.
+  let m = max_val tmp V
+  let sum_arr = float_arr_new 1 0.0
+  let _ = exp_shift tmp V m sum_arr 0
+  let s = float_arr_get sum_arr 0
+  let safe = if s < 1e-12 then 1.0 else s
+  let _ = renorm_loop tmp V safe 0
+  sample_categorical tmp V u
+
+temp_div src dst V tau i =
+  if i >= V then 0
+  else
+    let v = float_arr_get src i
+    let _ = float_arr_set dst i (v / tau)
+    temp_div src dst V tau (i + 1)
+
+max_val arr V =
+  max_val_loop arr V 0 (0.0 - 1e30)
+
+max_val_loop arr V i best =
+  if i >= V then best
+  else
+    let v = float_arr_get arr i
+    if v > best then max_val_loop arr V (i + 1) v
+    else max_val_loop arr V (i + 1) best
+
+exp_shift arr V m sum_arr i =
+  if i >= V then 0
+  else
+    let v = float_arr_get arr i
+    let e = exp (v - m)
+    let _ = float_arr_set arr i e
+    let cur = float_arr_get sum_arr 0
+    let _ = float_arr_set sum_arr 0 (cur + e)
+    exp_shift arr V m sum_arr (i + 1)
+
+-- Pre-generate n uniform samples in [0,1) via awk.  Deterministic given
+-- the seed.  awk's rand() is seeded once, produces doubles in [0,1).
+-- Output parses as one float per line; empty trailing line tolerated.
+fill_uniforms n seed =
+  let cmd = cat ["awk 'BEGIN{srand(", show seed, "); for(i=0;i<", show n, ";i++) print rand()}'"]
+  let raw = shell cmd
+  let parts = split "\n" raw
+  let arr = float_arr_new n 0.0
+  let _ = parse_uniforms_loop parts arr n 0
+  arr
+
+parse_uniforms_loop parts arr n i =
+  if i >= n then 0
+  else if length parts == 0 then 0
+  else
+    let p = head parts
+    if length (chars p) == 0 then parse_uniforms_loop (tail parts) arr n i
+    else
+      let _ = float_arr_set arr i (parse_float p)
+      parse_uniforms_loop (tail parts) arr n (i + 1)
