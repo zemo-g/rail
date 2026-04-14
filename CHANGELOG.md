@@ -2,6 +2,42 @@
 
 All notable changes to Rail are documented here.
 
+## v2.1.1 (2026-04-14)
+
+Follow-up session addressing v2.1 technical debt.
+
+### Tests
+- 7 new regression tests for v2.1 compiler features: parse_float,
+  parse_int, scientific notation (int and fractional), null-safe ==,
+  binary f32 I/O, and tensor primitives. Suite: 98 → 105.
+- Float self-loop TCO fix REVERTED — initial `mark_int_params` guard
+  removal caused segfaults in self-recursive float functions. Proper
+  fix deferred to HARD tier (requires float-param-aware TCO scheduler).
+
+### Dlopen GPU path
+- `libtensor_gpu.dylib` with C ABI (tgl_init, tgl_matmul_f64, tgl_relu_f64).
+- Fixed ObjC runtime init: `__attribute__((constructor))` warmup forces
+  class registration before Rail calls the dylib.
+- Absolute install_name so dyld finds the dylib without DYLD_LIBRARY_PATH
+  (macOS SIP strips that env var through /bin/sh).
+- tensor.rail auto-detects dylib and uses FFI path for matmul; falls
+  back to binary file I/O if missing.
+- Discovered Rail's foreign ABI untags ints before passing — dylib
+  receives raw ints, not tagged.
+- First full neural-network convergence: XOR MLP 500 steps, lr=0.8,
+  loss 0.38 → 8.88e-16 (machine epsilon). Max prediction error 1.2e-7.
+
+### Metal matmul optimization
+- New `matmul_blocked` kernel with 4×4 register blocking.
+- N=1024: 741 → 1734 GFLOPS (2.3x). Previous v2.1: 269 GFLOPS.
+- Overall 6.5x improvement at that size.
+- Byte-identical outputs vs basic kernel.
+- dylib uses blocked kernel by default; falls back to basic if missing.
+
+### Autograd design note
+- Added documentation explaining the `slot == 0` sentinel pattern and
+  the compiler invariant it relies on (test t103 pins it).
+
 ## v2.1.0 (2026-04-13)
 
 The GPU session. Rail now drives its own Metal GPU, trains neural
