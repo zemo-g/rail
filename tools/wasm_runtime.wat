@@ -1376,6 +1376,61 @@
   )
 
   ;; join: join list of strings with separator
+  ;; ─── File I/O stubs ──────────────────────────────────────────
+  ;; WASM standalone has no file system without WASI host wiring.
+  ;; These stubs let Rail programs that call write_file / append_file
+  ;; / read_file compile and run; they're no-ops returning empty.
+  ;; Useful for porting compute kernels (e.g. MHD) where the file
+  ;; dumps are diagnostic-only.
+
+  (func $write_file (param $path i64) (param $content i64) (result i64)
+    i64.const 3  ;; tagged 1
+  )
+
+  (func $append_file (param $path i64) (param $content i64) (result i64)
+    i64.const 3
+  )
+
+  (func $read_file (param $path i64) (result i64)
+    ;; Return empty string (4-byte len=0 header).
+    (local $p i32)
+    i32.const 4
+    call $alloc
+    local.tee $p
+    i32.const 0
+    i32.store
+    local.get $p
+    i64.extend_i32_u
+    i64.const 1
+    i64.shl
+  )
+
+  (func $shell (param $cmd i64) (result i64)
+    local.get $cmd
+    call $read_file  ;; same empty-string shape
+  )
+
+  ;; cat lst — equivalent to join "" lst.  Builds an empty-string sep
+  ;; on the heap and dispatches to $join.  Used everywhere Rail code
+  ;; writes `cat [a, b, c]` for string concatenation.
+  (func $cat (param $lst i64) (result i64)
+    (local $sep_ptr i32)
+    (local $sep i64)
+    i32.const 4
+    call $alloc
+    local.tee $sep_ptr
+    i32.const 0
+    i32.store
+    local.get $sep_ptr
+    i64.extend_i32_u
+    i64.const 1
+    i64.shl
+    local.set $sep
+    local.get $sep
+    local.get $lst
+    call $join
+  )
+
   (func $join (param $sep i64) (param $lst i64) (result i64)
     (local $ptr i32) (local $result i64) (local $first i32)
     ;; start with empty string: alloc 4 bytes, length=0

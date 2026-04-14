@@ -3626,7 +3626,11 @@ wasm_program decls =
   let hdr = "(module\n  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))\n  (import \"wasi_snapshot_preview1\" \"proc_exit\" (func $proc_exit (param i32)))\n  (memory (export \"memory\") 16 1024)\n\n"
   let tbl = if nlams > 0 then cat ["  (type $clos_t (func (param i64 i64) (result i64)))\n  (table ", show nlams, " funcref)\n  (elem (i32.const 0)", wasm_elem_list nlams 0, ")\n\n"] else ""
   let rt = read_file "tools/wasm_runtime.wat"
-  let fns = wasm_fns decls stab ar lams
+  -- Iterate to fixed point so transitively-float-returning user
+  -- functions all get marked before we start emitting bodies.
+  let float_fns = wasm_float_fns_fixpoint decls 0
+  let float_env = float_fn_markers float_fns []
+  let fns = wasm_fns decls stab ar lams float_env
   let lam_fns = wasm_lambda_fns lams stab ar
   let start = "  (func $_start (export \"_start\")\n    call $main\n    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    call $proc_exit\n  )\n\n"
   let sd = wasm_sdata stab
@@ -3636,19 +3640,19 @@ wasm_elem_list n i =
   if i >= n then ""
   else cat [" $__lambda_", show i, wasm_elem_list n (i + 1)]
 
-wasm_fns decls stab ar lams =
+wasm_fns decls stab ar lams float_env =
   if length decls == 0 then ""
   else
     let tg = head (head decls)
-    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_fns (tail decls) stab ar lams
-    else cat [wasm_fn (head decls) stab ar lams, wasm_fns (tail decls) stab ar lams]
+    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_fns (tail decls) stab ar lams float_env
+    else cat [wasm_fn (head decls) stab ar lams float_env, wasm_fns (tail decls) stab ar lams float_env]
 
-wasm_fn d stab ar lams =
+wasm_fn d stab ar lams float_env =
   let nm = head (tail d)
   let ps = head (tail (tail d))
   let bd = head (tail (tail (tail d)))
   let pstr = if length ps == 0 then "" else join " " (wasm_plist ps)
-  let env = wasm_env ps 0
+  let env = append (wasm_env ps 0) float_env
   let locs = wasm_dedup (cons "__ptr" (cons "__scrut" (wasm_locs bd)))
   let rl = wasm_fltr locs ps
   let ld = if length rl == 0 then "" else join "" (wasm_llist rl)
@@ -3715,7 +3719,9 @@ wasm_efind n env =
 -- on the WASM env (a list of (name, slot)).  V nodes are detected as
 -- float when there's a synthetic "__wfloat_<name>" entry in the env,
 -- which the let-binding emitter inserts whenever the bound expression
--- is structurally float.
+-- is structurally float.  A nodes (function calls) check the env for
+-- "__floatfn_<fname>" markers — those are pre-seeded per function by
+-- a global pass over all top-level decls (wasm_collect_float_fns).
 is_float_w node env =
   let tg = head node
   if tg == "FL" then true
@@ -3725,7 +3731,7 @@ is_float_w node env =
     let (fname, _) = flat node
     if fname == "to_float" || fname == "int_to_float" || fname == "float_arr_get" || fname == "parse_float" then true
     else if fname == "sqrt" || fname == "sin" || fname == "cos" || fname == "tanh" || fname == "exp" || fname == "log" || fname == "pow" || fname == "fabs" || fname == "floor" || fname == "ceil" || fname == "atan2" then true
-    else false
+    else wasm_efind (cat ["__floatfn_", fname]) env != (0 - 1)
   else if tg == "O" then
     let op = head (tail node)
     if op == "+" || op == "-" || op == "*" || op == "/" then
@@ -3734,6 +3740,68 @@ is_float_w node env =
   else if tg == "?" then
     is_float_w (head (tail (tail node))) env || is_float_w (head (tail (tail (tail node)))) env
   else false
+
+-- Decide whether a function returns float by checking its body with
+-- no env (V nodes pessimistically int).  Used to seed __floatfn_
+-- markers before the per-function compile.  Misses some cases (e.g.
+-- a user function that calls another user float function) but is
+-- adequate for the wrapper-style code in tools/plasma/mhd.rail.
+wasm_decl_returns_float decl =
+  let tg = head decl
+  if tg == "fn" then
+    let body = head (tail (tail (tail decl)))
+    is_float_w body []
+  else false
+
+wasm_collect_float_fns decls =
+  if length decls == 0 then []
+  else
+    let d = head decls
+    if head d == "fn" then
+      if wasm_decl_returns_float d then cons (head (tail d)) (wasm_collect_float_fns (tail decls))
+      else wasm_collect_float_fns (tail decls)
+    else wasm_collect_float_fns (tail decls)
+
+-- Iterate to a fixed point so functions that call other float-returning
+-- user functions also get marked.  Body is checked against an env
+-- containing the markers from the previous iteration.
+wasm_decl_returns_float_env decl env =
+  let tg = head decl
+  if tg == "fn" then
+    let body = head (tail (tail (tail decl)))
+    is_float_w body env
+  else false
+
+wasm_collect_float_fns_env decls env acc =
+  if length decls == 0 then reverse acc
+  else
+    let d = head decls
+    if head d == "fn" then
+      if wasm_decl_returns_float_env d env then wasm_collect_float_fns_env (tail decls) env (cons (head (tail d)) acc)
+      else wasm_collect_float_fns_env (tail decls) env acc
+    else wasm_collect_float_fns_env (tail decls) env acc
+
+float_fn_markers names acc =
+  if length names == 0 then acc
+  else float_fn_markers (tail names) (cons (cat ["__floatfn_", head names], 0 - 100) acc)
+
+wasm_float_fns_fixpoint decls prev_count =
+  let env = float_fn_markers (wasm_collect_float_fns_env decls [] []) []
+  let names = wasm_collect_float_fns_env decls env []
+  if length names == prev_count then names
+  else
+    let env2 = float_fn_markers names []
+    let names2 = wasm_collect_float_fns_env decls env2 []
+    if length names2 == length names then names2
+    else wasm_float_fns_fixpoint_iter decls names2 0
+
+wasm_float_fns_fixpoint_iter decls names iters =
+  if iters > 4 then names
+  else
+    let env = float_fn_markers names []
+    let next = wasm_collect_float_fns_env decls env []
+    if length next == length names then next
+    else wasm_float_fns_fixpoint_iter decls next (iters + 1)
 
 -- Float promotion: if a node is structurally float, leave the WASM
 -- code as-is (already produces raw f64 bits as i64); otherwise the
@@ -3759,7 +3827,10 @@ wg node env stab ar lams =
         if carity == 0 then
           cat ["    i32.const 16\n    call $alloc\n    i64.extend_i32_u\n    local.set $__ptr\n    local.get $__ptr\n    i32.wrap_i64\n    i64.const 5\n    i64.store\n    local.get $__ptr\n    i32.wrap_i64\n    i32.const 8\n    i32.add\n    i64.const ", show cidx, "\n    i64.store\n    local.get $__ptr\n    i64.const 1\n    i64.shl\n"]
         else "    i64.const 1\n"
-      else "    i64.const 1\n"
+      else
+        -- 0-arg user function referenced bare (no parens) — call it.
+        if ar_val == 0 then cat ["    call $", nm, "\n"]
+        else "    i64.const 1\n"
   else if tg == "O" then
     let op = head (tail node)
     let lhs = head (tail (tail node))
@@ -3810,6 +3881,12 @@ wg node env stab ar lams =
     else if fname == "cons" then cat [wg (head fargs) env stab ar lams, wg (head (tail fargs)) env stab ar lams, "    call $cons\n"]
     else if fname == "append" then cat [wg (head fargs) env stab ar lams, wg (head (tail fargs)) env stab ar lams, "    call $append\n"]
     else if fname == "join" then cat [wg (head fargs) env stab ar lams, wg (head (tail fargs)) env stab ar lams, "    call $join\n"]
+    else if fname == "cat" then
+      -- cat lst ≡ join "" lst.  The empty-string literal is at stab
+      -- offset 0 (or wherever wasm_sfind "" returns); we embed an
+      -- inline empty-string constant pointing at the always-present
+      -- empty data slot.  Use $cat directly via the runtime helper.
+      cat [wg (head fargs) env stab ar lams, "    call $cat\n"]
     else if fname == "reverse" then cat [wg (head fargs) env stab ar lams, "    call $reverse\n"]
     else
       let ar_val = afind fname ar
@@ -4043,7 +4120,13 @@ wasm_esc_c cs =
 wasm_cc c =
   if c == "\n" then 10
   else if c == "\t" then 9
-  else str_to_int (trim (shell (cat ["printf '%d' \"'", c, "\""])))
+  else
+    -- macOS `printf '%d' "'X"` returns SIGNED values for high bytes
+    -- (\xe2 → -30); WAT `\hh` escapes need unsigned [0,255].  Mask to
+    -- the low byte to handle multi-byte UTF-8 prefixes correctly.
+    let raw = str_to_int (trim (shell (cat ["printf '%d' \"'", c, "\""])))
+    let nonneg = if raw < 0 then raw + 256 else raw
+    nonneg % 256
 
 is_safe_pkg_name name =
   let check = trim (shell (cat ["printf '%s' '", name, "' | grep -qE '^[a-zA-Z0-9_./-]+$' && echo yes || echo no"]))
