@@ -49,9 +49,13 @@ Dylib export count: 15 → 24. Tests: 105/105 → 106/106. Fixed-point preserved
       loss 15.02 → 2.10 on Shakespeare, uniform baseline 3.47 (2026-04-14)
 - [x] Movement IV.3: generation — `stdlib/sampling.rail` argmax/top-k/temperature
       + `tools/train/lm_generate.rail` (2026-04-14)
-- [ ] Movement IV: tokenizer in Rail (BPE)
-- [ ] Movement IV: end-to-end LM training on char-level Shakespeare
-- [ ] Movement IV: generation (argmax / top-k / temperature)
+- [x] Movement IV: tokenizer in Rail — `stdlib/tokenizer.rail`,
+      char-level (BPE-floor), shipped 2026-04-14, v2.3.0
+- [x] Movement IV: end-to-end LM training on char-level Shakespeare —
+      shipped twice: v2.3.0 (bigram MLP) and v2.4.0/v2.5.0 (transformer)
+- [x] Movement IV: generation (argmax / top-k / temperature) —
+      `stdlib/sampling.rail` + `tools/train/lm_generate.rail`,
+      shipped 2026-04-14, v2.3.0
 - [ ] Movement V: `self_train.rail` cutover to Rail-native inference
 - [ ] Movement V: compiler-as-teacher in-process (no `shell` round-trip)
 - [ ] Movement VI: `#metal_kernel` directive / compile-time kernel gen
