@@ -2,6 +2,21 @@
 
 Started 2026-04-13. Every upgrade, ranked and tracked.
 
+## v2.14.0 (2026-04-14) — *Metal IR scaffold*
+
+- [x] Runtime `tgl_unary_from_source` — JIT-compile Metal source +
+      dispatch, with library-and-pipeline caching
+- [x] `stdlib/metal_kernel.rail` — `metal_kernel_header`,
+      `emit_metal_unary`, `metal_apply_unary` helpers
+- [x] `tools/metal/rail_to_metal.rail` — AST → Metal
+      C-expression translator (FL / V / O / ?)
+- [x] End-to-end proof: three user kernels (`relu2`, `squared`,
+      `shifted`) JIT-compiled from Rail source and dispatched on
+      GPU in a single Rail process
+- [ ] v2.15+: wire Rail parser so `\x -> expr` lambdas become
+      GPU kernels automatically; extend to multi-input kernels
+      and reductions
+
 ## v2.13.0 (2026-04-14) — *WASM map / filter / fold*
 
 - [x] `$map`, `$filter`, `$fold` as WASM runtime builtins

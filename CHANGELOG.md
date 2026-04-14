@@ -2,6 +2,62 @@
 
 All notable changes to Rail are documented here.
 
+## v2.14.0 (2026-04-14) — *Metal IR scaffold — JIT-compiled GPU kernels from Rail*
+
+Ships the first cut of Rail's fifth backend: GPU compute kernels
+defined in Rail (or hand-written Metal), compiled at runtime, and
+dispatched on the Apple GPU.  The end-to-end pipeline runs today.
+
+### `tools/metal/tensor_gpu_lib.m`
+- **`tgl_unary_from_source(src, name, X, Y, N)`** — JIT entry
+  point.  Takes a Metal source string and kernel name, compiles
+  via `[MTLDevice newLibraryWithSource:]`, looks up the function,
+  builds a pipeline state, and dispatches `N` float_arr elements.
+  Both the `MTLLibrary` (keyed by source) and the
+  `MTLComputePipelineState` (keyed by source+name) are cached —
+  first call pays the ~ms compile cost, subsequent calls are pure
+  dispatch.
+
+### `stdlib/metal_kernel.rail`
+- **`metal_kernel_header`** — boilerplate `#include
+  <metal_stdlib>` + `using namespace metal;`.
+- **`metal_kernel_sig`** — the canonical unary parameter list.
+- **`emit_metal_unary name body_expr`** — splices a Metal C
+  expression (`x > 0.0f ? x : 0.0f`, `(x * 2.0f) + 1.0f`, etc.)
+  into the full kernel boilerplate.
+- **`metal_apply_unary src name x_arr`** — JIT-compile + dispatch
+  one call.  Returns a fresh `float_arr` of the same length.
+
+### `tools/metal/rail_to_metal.rail`
+- **`node_to_metal_expr node`** — translates a Rail AST subtree
+  (FL / V / O / ?) into the equivalent Metal C-expression string.
+- **`emit_unary_kernel name body_ast`** — full kernel boilerplate
+  around a Rail-AST-derived expression.
+- Demo emits `relu2` and `shifted` kernel sources from hand-built
+  ASTs.  The next version will wire this to the Rail parser so
+  `\x -> expr` lambdas become GPU kernels automatically.
+
+### End-to-end proof
+`tools/train/metal_kernel_demo.rail` JIT-compiles and dispatches
+three kernels from Rail source strings:
+- `relu2`: `x > 0.0f ? x : 0.0f` on `[-4..3]` → `[0,0,0,0,0,1,2,3]`
+- `squared`: `x * x` on `[0..7]` → `[0,1,4,9,16,25,36,49]`
+- `shifted`: `(x * 2.0f) + 1.0f` on `[0..7]` → `[1,3,5,7,9,11,13,15]`
+
+All three compile and run on the Mini's Apple GPU in a single
+Rail process.
+
+### Tribal knowledge
+**Reserved Metal identifiers**: `quad` collides with a private
+typedef in the Metal SDK (`__Reserved_Name__Do_not_use_quad`).
+When naming user kernels, avoid common graphics-primitive words
+(`quad`, `tri`, `line`, `point`).  Error text is
+`redefinition of 'quad' as different kind of symbol`.
+
+**Scope for v2.14**: unary float-in float-out only.  Multi-input
+kernels (N-ary matmul-style), reductions, and let-bindings are
+deferred to v2.15+.
+
 ## v2.13.0 (2026-04-14) — *WASM map / filter / fold*
 
 Closes the last `CLAUDE.md`-documented WASM gap.  Higher-order
