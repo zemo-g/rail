@@ -73,9 +73,11 @@ Dylib export count: 15 → 24. Tests: 105/105 → 106/106. Fixed-point preserved
 - [x] Movement VII: MHD simulates under WASM — 128×128 Orszag-Tang
       vortex, 100 Lax-Friedrichs steps, exact mass/energy/divB
       conservation. Gated on v2.10's float PARAM inference + WASM
-      tail-call elimination, both now shipped. 800-step run to t=π
-      still needs WASM-side GC (future work). Shipped 2026-04-14,
-      v2.10.0.
+      tail-call elimination, both now shipped. Shipped 2026-04-14, v2.10.0.
+- [x] Movement VII: MHD full run to t=π under WASM — 749 steps,
+      arena_mark/arena_reset in WASM runtime keeps memory flat.
+      Full vortex physics: ρ_min 2.778→1.269→2.363. Shipped
+      2026-04-14, v2.11.0.
 - [ ] Movement VII: WebGPU compute shaders
 - [x] Movement VIII: REPL `:load file.rail` — shipped 2026-04-14, v2.6.0.
       Definition persistence across expressions already worked; the

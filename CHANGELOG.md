@@ -2,6 +2,69 @@
 
 All notable changes to Rail are documented here.
 
+## v2.11.0 (2026-04-14) — *WASM MHD to t=π*
+
+Closes the last v2.10 caveat.  **The 2D Ideal MHD Orszag-Tang
+vortex now runs to full completion under wasmtime**, 749 Lax-
+Friedrichs steps to t=π, with exact mass/energy/divB conservation
+throughout and real vortex physics (ρ_min: 2.778 → 1.269 → 2.363).
+
+### Arena mark/reset in WASM runtime
+- **`$arena_mark (dummy) → tagged_i32`** — snapshot `$heap_ptr` as
+  a tagged-int handle.
+- **`$arena_reset (handle) → tagged_1`** — restore `$heap_ptr`
+  from the handle.  Everything allocated between mark and reset
+  is reclaimed.
+
+Matches the ARM64 arena API.  No Rail compiler changes needed —
+the names dispatch through the user-function fallthrough to the
+new runtime helpers.
+
+### MHD sim loop pattern
+```rail
+sim_loop state ctx step max_steps =
+  ...
+  else
+    let mk = arena_mark 0
+    let ns = do_step state ctx step       -- allocates scratch + ns
+    let _ = copy_state ns state state_size 0
+    let _ = arena_reset mk                -- frees scratch + ns
+    sim_loop state ctx (step + 1) max_steps
+```
+The persistent `state` buffer (allocated once in main) holds the
+updated fields; everything else in the step is transient.  ctx
+also lives outside the arena bracket, so t/m0/e0 survive.
+
+### Verified under wasmtime (tools/plasma/mhd_wasm.rail, 128×128)
+```
+step   0: t=0.003771 dt=0.003771 divB=0    ρ_min=2.778
+step 100: t=0.377    dt=0.003737 divB=0    ρ_min=2.418
+step 200: t=0.759    dt=0.003927 divB=0    ρ_min=1.802
+step 300: t=1.166    dt=0.004144 divB=0    ρ_min=1.381
+step 400: t=1.582    dt=0.004193 divB=0    ρ_min=1.269  ← peak compression
+step 500: t=2.009    dt=0.004371 divB=0    ρ_min=1.509
+step 600: t=2.455    dt=0.004528 divB=0    ρ_min=2.183
+step 700: t=2.916    dt=0.004715 divB=0    ρ_min=2.363
+Reached t=π at step 749
+```
+- **dm** (mass drift): exactly 0 to f32 precision at every reported step
+- **dE** (energy drift): exactly 0
+- **divB**: 0 throughout (Lax-Friedrichs preserves Orszag-Tang's initial divergence-free magnetic field)
+- **dt** adapts via CFL 0.003771 → 0.004715 as max speed drops
+- **ρ_min** follows the full compression–bounce cycle of the vortex
+- 50 frames dumped (no-op under WASM file stubs, but the print hooks fired)
+- Runtime: ~6 minutes wasmtime wall time on M4 Pro
+
+### Counters
+- WAT runtime: 39 KB (unchanged — runtime grew by ~20 lines, compile.rail unchanged).
+- Tests: 106/106.
+- Fixed-point self-compile: preserved.
+
+### Session close
+This closes the v2.9 WASM-MHD chain of deferrals:
+  v2.7 (float stack) → v2.8 (transcendentals) → v2.9 (compiler bugs)
+  → v2.10 (param inference + tail calls) → **v2.11 (arena + full sim)**.
+
 ## v2.10.0 (2026-04-14) — *WASM MHD simulates*
 
 Closes both caveats from v2.9:  cross-function float PARAM inference

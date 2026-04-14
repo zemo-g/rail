@@ -11,6 +11,31 @@
     local.get $ptr
   )
 
+  ;; Arena mark/reset — snapshot and restore the bump pointer.
+  ;; Usage from Rail:
+  ;;   let mk = arena_mark 0
+  ;;   ... allocate scratch ...
+  ;;   let _ = arena_reset mk
+  ;; Everything allocated after arena_mark is freed by arena_reset.
+  ;; Returns the bump pointer as a tagged int.
+  (func $arena_mark (param $dummy i64) (result i64)
+    global.get $heap_ptr
+    i64.extend_i32_u
+    i64.const 1
+    i64.shl
+    i64.const 1
+    i64.or
+  )
+
+  (func $arena_reset (param $mk i64) (result i64)
+    local.get $mk
+    i64.const 1
+    i64.shr_s
+    i32.wrap_i64
+    global.set $heap_ptr
+    i64.const 3  ;; tagged 1
+  )
+
   ;; ─── Float intrinsics and conversions ────────────────────────
   ;; All floats travel as raw f64 bits stored in i64 (matches the
   ;; ARM64 ABI; matches what FL literals + float arithmetic emit).
