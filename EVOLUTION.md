@@ -2,6 +2,14 @@
 
 Started 2026-04-13. Every upgrade, ranked and tracked.
 
+## v2.15.0 (2026-04-14) — *WASM named-fn map/filter + closure-capture fix*
+
+- [x] η-expansion rewrite for named-fn value references (arity 1)
+- [x] `wasm_fvs_filter` — exclude top-level names from closure
+      captures, unblocking lambdas that reference named functions
+- [ ] Fold with bare named fns — deferred to v2.16 (needs a 2-arg
+      curry-wrapper generator)
+
 ## v2.14.0 (2026-04-14) — *Metal IR scaffold*
 
 - [x] Runtime `tgl_unary_from_source` — JIT-compile Metal source +

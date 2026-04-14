@@ -2,6 +2,55 @@
 
 All notable changes to Rail are documented here.
 
+## v2.15.0 (2026-04-14) — *WASM: named-fn map/filter + closure-capture fix*
+
+Closes the last v2.13 caveat and an adjacent pre-existing bug.
+Passing a bare named function to `map` / `filter` now works in
+the WASM backend, and lambdas can now call top-level named
+functions from their bodies.
+
+### Changes
+
+- **η-expansion pass** for named-fn value references.  During
+  WASM compilation, a pre-pass rewrites every `V name` node
+  (when `name` is a user function of arity 1 and the node is not
+  in function-call position) into a synthetic lambda
+  `\__nfx -> name __nfx`.  The existing lambda collection then
+  assigns a function-table slot, so higher-order ops dispatch
+  via `call_indirect` exactly as they do for user lambdas.
+
+- **Top-level names excluded from closure captures.**
+  `wasm_fvs_filter` drops arity-map entries (user fns,
+  constructors, builtins) from a lambda's free-variable set.
+  Before, a lambda that referenced a top-level name (e.g.
+  `\x -> double x`) tried to capture `$double` as a local,
+  producing `undefined local variable "$double"` at `wat2wasm`
+  time.
+
+### Scope
+
+Arity-1 named fns only.  Fold and other higher-arity consumers
+still need an explicit curry wrapper — the 2-arg curried form
+expected by `$fold` requires a nested wrapper generator that's
+deferred to v2.16+.
+
+### Proof
+
+```rail
+double x = x * 2
+big x = x > 3
+square x = x * x
+
+main =
+  let xs = [1, 2, 3, 4, 5]
+  map double xs                        -- [2,4,6,8,10]
+  filter big xs                        -- [4,5]
+  map (\x -> 0 - square x) xs          -- [-1,-4,-9,-16,-25]
+  fold (\a -> \x -> a + x) 0 xs        -- 15
+```
+
+All four run under `wasmtime`.
+
 ## v2.14.0 (2026-04-14) — *Metal IR scaffold — JIT-compiled GPU kernels from Rail*
 
 Ships the first cut of Rail's fifth backend: GPU compute kernels

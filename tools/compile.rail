@@ -3620,6 +3620,11 @@ dispatch_wasm path =
 wasm_program decls =
   let strs = wasm_strs_all decls
   let stab = wasm_stab strs 256
+  let pre_ar = get_arities decls
+  -- Rewrite named-function value references to synthetic lambdas
+  -- so the existing lambda machinery gives them function-table
+  -- slots.  Lets `map foo xs` work when `foo` is a 1-arg user fn.
+  let decls = nf_rewrite_decls decls pre_ar
   let ar = get_arities decls
   let lams = wasm_collect_lambdas decls 0
   let nlams = length lams
@@ -4053,7 +4058,7 @@ wg node env stab ar lams =
   else if tg == "F" then
     let param = head (tail node)
     let body = head (tail (tail node))
-    let fvl = fvs body [param]
+    let fvl = wasm_fvs_filter (fvs body [param]) ar
     let lam_idx = wasm_find_lambda node lams 0
     let ncap = length fvl
     let alloc_size = 16 + ncap * 8
@@ -4148,6 +4153,111 @@ wg_store_caps fvl env idx =
     let off = 16 + idx * 8
     cat ["    local.get $__ptr\n    i32.wrap_i64\n    i32.const ", show off, "\n    i32.add\n    local.get $", nm, "\n    i64.store\n", wg_store_caps (tail fvl) env (idx + 1)]
 
+-- Filter a free-variable list to exclude top-level names (user
+-- functions, constructors, or builtins) that live in the arity
+-- map.  WASM closures only capture true locals; top-level names
+-- are resolved directly via `call $<name>`.
+wasm_fvs_filter lst ar =
+  if length lst == 0 then []
+  else
+    let nm = head lst
+    let av = afind nm ar
+    if av != (0 - 1) then wasm_fvs_filter (tail lst) ar
+    else cons nm (wasm_fvs_filter (tail lst) ar)
+
+-- ─── Named-function value-reference rewrite ────────────────────
+-- When a user function with arity ≥ 1 is passed as a value (not
+-- in function-call position), replace the `V name` node with an
+-- η-expansion `\__nfx -> name __nfx`.  The existing lambda
+-- collection pass then assigns a function-table slot so
+-- higher-order ops (map, filter, fold) can dispatch via
+-- call_indirect.  Currently supports arity 1 (map/filter);
+-- higher arities fall through (user must wrap manually).
+nf_rewrite_decls decls ar =
+  if length decls == 0 then []
+  else
+    let d = head decls
+    let tg = head d
+    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then
+      cons d (nf_rewrite_decls (tail decls) ar)
+    else
+      let nm = head (tail d)
+      let ps = head (tail (tail d))
+      let body = head (tail (tail (tail d)))
+      let nb = nf_rewrite_node body ar
+      cons (cons tg (cons nm (cons ps (cons nb [])))) (nf_rewrite_decls (tail decls) ar)
+
+nf_rewrite_node node ar =
+  let tg = head node
+  if tg == "V" then
+    let nm = head (tail node)
+    let av = afind nm ar
+    let (cidx, _) = decode_ctor av
+    if cidx == (0 - 1) && av == 1 then
+      cons "F" (cons "__nfx" (cons (cons "A" (cons (cons "V" (cons nm [])) (cons (cons "V" (cons "__nfx" [])) []))) []))
+    else node
+  else if tg == "A" then nf_rewrite_a node ar
+  else if tg == "O" then
+    let op = head (tail node)
+    let l = nf_rewrite_node (head (tail (tail node))) ar
+    let r = nf_rewrite_node (head (tail (tail (tail node)))) ar
+    cons "O" (cons op (cons l (cons r [])))
+  else if tg == "?" then
+    let c = nf_rewrite_node (head (tail node)) ar
+    let t = nf_rewrite_node (head (tail (tail node))) ar
+    let e = nf_rewrite_node (head (tail (tail (tail node)))) ar
+    cons "?" (cons c (cons t (cons e [])))
+  else if tg == "F" then
+    let p = head (tail node)
+    let b = nf_rewrite_node (head (tail (tail node))) ar
+    cons "F" (cons p (cons b []))
+  else if tg == "D" then
+    let n = head (tail node)
+    let v = nf_rewrite_node (head (tail (tail node))) ar
+    let b = nf_rewrite_node (head (tail (tail (tail node)))) ar
+    cons "D" (cons n (cons v (cons b [])))
+  else if tg == "TD" then
+    let n = head (tail node)
+    let v = nf_rewrite_node (head (tail (tail node))) ar
+    let b = nf_rewrite_node (head (tail (tail (tail node)))) ar
+    cons "TD" (cons n (cons v (cons b [])))
+  else if tg == "L" then
+    cons "L" (cons (nf_rewrite_list (head (tail node)) ar) [])
+  else if tg == "M" then
+    let scrut = nf_rewrite_node (head (tail node)) ar
+    let arms = nf_rewrite_arms (head (tail (tail node))) ar
+    cons "M" (cons scrut (cons arms []))
+  else node
+
+-- Rewrite an A node.  The function-slot chain (A (A (A name a1) a2) a3)
+-- has a V at its leftmost position — don't rewrite that V.  Args
+-- in value position ARE rewritten.  If the leftmost isn't a V
+-- (e.g. a lambda or if-expression being applied), recurse into it
+-- as a value.
+nf_rewrite_a node ar =
+  let lhs = head (tail node)
+  let arg = head (tail (tail node))
+  let ltg = head lhs
+  let new_lhs = if ltg == "A" then nf_rewrite_a lhs ar
+                else if ltg == "V" then lhs
+                else nf_rewrite_node lhs ar
+  let new_arg = nf_rewrite_node arg ar
+  cons "A" (cons new_lhs (cons new_arg []))
+
+nf_rewrite_list lst ar =
+  if length lst == 0 then []
+  else cons (nf_rewrite_node (head lst) ar) (nf_rewrite_list (tail lst) ar)
+
+nf_rewrite_arms arms ar =
+  if length arms == 0 then []
+  else
+    let a = head arms
+    let ctor = head a
+    let binds = head (tail a)
+    let body = head (tail (tail a))
+    let nb = nf_rewrite_node body ar
+    cons (cons ctor (cons binds (cons nb []))) (nf_rewrite_arms (tail arms) ar)
+
 wasm_collect_lambdas decls idx =
   if length decls == 0 then []
   else
@@ -4209,7 +4319,7 @@ wasm_lambda_fns lams stab ar =
     let (lnode, lidx) = head lams
     let param = head (tail lnode)
     let body = head (tail (tail lnode))
-    let fvl = fvs body [param]
+    let fvl = wasm_fvs_filter (fvs body [param]) ar
     let locs = wasm_dedup (append fvl (cons "__ptr" (cons "__scrut" (wasm_locs body))))
     let rl = wasm_fltr locs [param, "__env"]
     let ld = if length rl == 0 then "" else join "" (wasm_llist rl)
