@@ -59,8 +59,14 @@ Dylib export count: 15 → 24. Tests: 105/105 → 106/106. Fixed-point preserved
 - [ ] Movement V: `self_train.rail` cutover to Rail-native inference
 - [ ] Movement V: compiler-as-teacher in-process (no `shell` round-trip)
 - [ ] Movement VI: `#metal_kernel` directive / compile-time kernel gen
-- [ ] Movement VII: float_arr support in WASM backend
-- [ ] Movement VII: MHD ported to WASM, replaces parametric model at /plasma/mhd
+- [x] Movement VII: float_arr support in WASM backend — full float
+      stack: literals, arithmetic with var-aware type inference,
+      float_arr_new/get/set, sqrt/fabs/floor/ceil intrinsics,
+      int↔float conversions, show_float. Smoke proof:
+      `tools/train/wasm_diffuse.rail` runs 1-D diffusion + L2 norm
+      under wasmtime to 6-digit accuracy. Shipped 2026-04-14, v2.7.0.
+      *Deferred to v2.8*: sin/cos/exp/log/pow/tanh polyfills.
+- [ ] Movement VII: MHD ported to WASM (gated on sin/cos/exp polyfills)
 - [ ] Movement VII: WebGPU compute shaders
 - [x] Movement VIII: REPL `:load file.rail` — shipped 2026-04-14, v2.6.0.
       Definition persistence across expressions already worked; the

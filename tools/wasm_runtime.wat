@@ -11,6 +11,408 @@
     local.get $ptr
   )
 
+  ;; ─── Float intrinsics and conversions ────────────────────────
+  ;; All floats travel as raw f64 bits stored in i64 (matches the
+  ;; ARM64 ABI; matches what FL literals + float arithmetic emit).
+
+  ;; sqrt(x) via WASM's native f64.sqrt intrinsic.
+  (func $sqrt (param $x i64) (result i64)
+    local.get $x
+    f64.reinterpret_i64
+    f64.sqrt
+    i64.reinterpret_f64
+  )
+
+  ;; fabs(x) via f64.abs.
+  (func $fabs (param $x i64) (result i64)
+    local.get $x
+    f64.reinterpret_i64
+    f64.abs
+    i64.reinterpret_f64
+  )
+
+  ;; floor(x) — float-in, float-out.
+  (func $floor (param $x i64) (result i64)
+    local.get $x
+    f64.reinterpret_i64
+    f64.floor
+    i64.reinterpret_f64
+  )
+
+  ;; ceil(x) — float-in, float-out.
+  (func $ceil (param $x i64) (result i64)
+    local.get $x
+    f64.reinterpret_i64
+    f64.ceil
+    i64.reinterpret_f64
+  )
+
+  ;; int_to_float: tagged-int → raw f64 bits as i64.
+  (func $int_to_float (param $x i64) (result i64)
+    local.get $x
+    i64.const 1
+    i64.shr_s
+    f64.convert_i64_s
+    i64.reinterpret_f64
+  )
+
+  ;; float_to_int: raw f64 bits → tagged int (truncated).
+  (func $float_to_int (param $x i64) (result i64)
+    local.get $x
+    f64.reinterpret_i64
+    i64.trunc_f64_s
+    i64.const 1
+    i64.shl
+    i64.const 1
+    i64.or
+  )
+
+  ;; to_float: alias for int_to_float.
+  (func $to_float (param $x i64) (result i64)
+    local.get $x
+    call $int_to_float
+  )
+
+  ;; ─── float_arr: layout matches ARM64.
+  ;; Bytes [0..7]: length (raw i64, NOT tagged).
+  ;; Bytes [8..]:  f64 doubles, 8 bytes each.
+  ;; The handle returned to Rail code is (ptr_i32 << 1) so the LSB
+  ;; tag bit reads as 0 (pointer), matching cons cells.
+
+  (func $float_arr_new (param $size_t i64) (param $init i64) (result i64)
+    (local $size i64)
+    (local $bytes i32)
+    (local $ptr i32)
+    (local $i i64)
+    (local $addr i32)
+    ;; Untag size.
+    local.get $size_t
+    i64.const 1
+    i64.shr_s
+    local.set $size
+    ;; Allocate 8 (length) + size*8 bytes.
+    local.get $size
+    i64.const 8
+    i64.mul
+    i64.const 8
+    i64.add
+    i32.wrap_i64
+    local.set $bytes
+    local.get $bytes
+    call $alloc
+    local.set $ptr
+    ;; Store length.
+    local.get $ptr
+    local.get $size
+    i64.store
+    ;; Fill with init (already raw f64 bits).
+    i64.const 0
+    local.set $i
+    (block $done
+      (loop $fill
+        local.get $i
+        local.get $size
+        i64.ge_s
+        br_if $done
+        local.get $ptr
+        i32.const 8
+        i32.add
+        local.get $i
+        i32.wrap_i64
+        i32.const 3
+        i32.shl
+        i32.add
+        local.set $addr
+        local.get $addr
+        local.get $init
+        i64.store
+        local.get $i
+        i64.const 1
+        i64.add
+        local.set $i
+        br $fill
+      )
+    )
+    ;; Return tagged pointer.
+    local.get $ptr
+    i64.extend_i32_u
+    i64.const 1
+    i64.shl
+  )
+
+  (func $float_arr_get (param $arr i64) (param $idx_t i64) (result i64)
+    (local $ptr i32)
+    (local $idx i64)
+    local.get $arr
+    i64.const 1
+    i64.shr_u
+    i32.wrap_i64
+    local.set $ptr
+    local.get $idx_t
+    i64.const 1
+    i64.shr_s
+    local.set $idx
+    local.get $ptr
+    i32.const 8
+    i32.add
+    local.get $idx
+    i32.wrap_i64
+    i32.const 3
+    i32.shl
+    i32.add
+    i64.load
+  )
+
+  (func $float_arr_set (param $arr i64) (param $idx_t i64) (param $val i64) (result i64)
+    (local $ptr i32)
+    (local $idx i64)
+    local.get $arr
+    i64.const 1
+    i64.shr_u
+    i32.wrap_i64
+    local.set $ptr
+    local.get $idx_t
+    i64.const 1
+    i64.shr_s
+    local.set $idx
+    local.get $ptr
+    i32.const 8
+    i32.add
+    local.get $idx
+    i32.wrap_i64
+    i32.const 3
+    i32.shl
+    i32.add
+    local.get $val
+    i64.store
+    ;; Return tagged 1 (Rail's "0" success sentinel).
+    i64.const 3
+  )
+
+  (func $float_arr_len (param $arr i64) (result i64)
+    (local $ptr i32)
+    local.get $arr
+    i64.const 1
+    i64.shr_u
+    i32.wrap_i64
+    local.set $ptr
+    local.get $ptr
+    i64.load
+    i64.const 1
+    i64.shl
+    i64.const 1
+    i64.or
+  )
+
+  ;; show_float — minimal f64 → string formatter.
+  ;; Strategy: split into integer and fractional parts.  Print the
+  ;; integer part via the existing $show_int (delegating to a tiny
+  ;; conversion), append a '.', then 6 decimal digits.  Negative
+  ;; values get a leading '-'.  No scientific notation, no rounding
+  ;; — adequate for verifying float math from WASM stdout.
+  (func $show_float (param $x i64) (result i64)
+    (local $f f64)
+    (local $neg i32)
+    (local $int_part i64)
+    (local $frac f64)
+    (local $i i32)
+    (local $digit i32)
+    (local $bufp i32)
+    (local $cur i32)
+    ;; Allocate header (4-byte len prefix) + 32 bytes for digits.
+    i32.const 36
+    call $alloc
+    local.set $bufp
+    local.get $bufp
+    i32.const 4
+    i32.add
+    local.set $cur
+    ;; Load the f64 value.
+    local.get $x
+    f64.reinterpret_i64
+    local.set $f
+    ;; Negative?  Emit '-' and flip sign.
+    i32.const 0
+    local.set $neg
+    local.get $f
+    f64.const 0
+    f64.lt
+    if
+      i32.const 1
+      local.set $neg
+      local.get $f
+      f64.neg
+      local.set $f
+      local.get $cur
+      i32.const 45  ;; '-'
+      i32.store8
+      local.get $cur
+      i32.const 1
+      i32.add
+      local.set $cur
+    end
+    ;; Integer part = floor(f).
+    local.get $f
+    f64.floor
+    i64.trunc_f64_s
+    local.set $int_part
+    ;; Subtract integer part to get the fractional remainder.
+    local.get $f
+    local.get $int_part
+    f64.convert_i64_s
+    f64.sub
+    local.set $frac
+    ;; Emit integer-part digits via $emit_u64 helper.
+    local.get $cur
+    local.get $int_part
+    call $emit_u64
+    local.set $cur
+    ;; Decimal point.
+    local.get $cur
+    i32.const 46  ;; '.'
+    i32.store8
+    local.get $cur
+    i32.const 1
+    i32.add
+    local.set $cur
+    ;; 6 decimal digits.
+    i32.const 0
+    local.set $i
+    (block $dec_done
+      (loop $dec_loop
+        local.get $i
+        i32.const 6
+        i32.ge_s
+        br_if $dec_done
+        local.get $frac
+        f64.const 10
+        f64.mul
+        local.set $frac
+        local.get $frac
+        f64.floor
+        i64.trunc_f64_s
+        i32.wrap_i64
+        local.set $digit
+        local.get $cur
+        local.get $digit
+        i32.const 48
+        i32.add
+        i32.store8
+        local.get $cur
+        i32.const 1
+        i32.add
+        local.set $cur
+        local.get $frac
+        local.get $digit
+        f64.convert_i32_s
+        f64.sub
+        local.set $frac
+        local.get $i
+        i32.const 1
+        i32.add
+        local.set $i
+        br $dec_loop
+      )
+    )
+    ;; Write length prefix.
+    local.get $bufp
+    local.get $cur
+    local.get $bufp
+    i32.sub
+    i32.const 4
+    i32.sub
+    i32.store
+    ;; Return tagged string ptr.
+    local.get $bufp
+    i64.extend_i32_u
+    i64.const 1
+    i64.shl
+  )
+
+  ;; emit_u64: writes the decimal digits of `n` (>=0) at `cur` and
+  ;; returns the new cur.  Helper for $show_float's integer part.
+  (func $emit_u64 (param $cur i32) (param $n i64) (result i32)
+    (local $tmpbuf i32)
+    (local $tmplen i32)
+    (local $q i64)
+    (local $r i64)
+    ;; Special-case zero.
+    local.get $n
+    i64.const 0
+    i64.eq
+    if
+      local.get $cur
+      i32.const 48
+      i32.store8
+      local.get $cur
+      i32.const 1
+      i32.add
+      return
+    end
+    ;; Reserve a 24-byte scratch buffer for reverse digits.
+    i32.const 24
+    call $alloc
+    local.set $tmpbuf
+    i32.const 0
+    local.set $tmplen
+    (block $div_done
+      (loop $div_loop
+        local.get $n
+        i64.const 0
+        i64.eq
+        br_if $div_done
+        local.get $n
+        i64.const 10
+        i64.div_u
+        local.set $q
+        local.get $n
+        i64.const 10
+        i64.rem_u
+        local.set $r
+        local.get $tmpbuf
+        local.get $tmplen
+        i32.add
+        local.get $r
+        i32.wrap_i64
+        i32.const 48
+        i32.add
+        i32.store8
+        local.get $tmplen
+        i32.const 1
+        i32.add
+        local.set $tmplen
+        local.get $q
+        local.set $n
+        br $div_loop
+      )
+    )
+    ;; Reverse-copy into cur.
+    (block $cp_done
+      (loop $cp_loop
+        local.get $tmplen
+        i32.const 0
+        i32.le_s
+        br_if $cp_done
+        local.get $tmplen
+        i32.const 1
+        i32.sub
+        local.set $tmplen
+        local.get $cur
+        local.get $tmpbuf
+        local.get $tmplen
+        i32.add
+        i32.load8_u
+        i32.store8
+        local.get $cur
+        i32.const 1
+        i32.add
+        local.set $cur
+        br $cp_loop
+      )
+    )
+    local.get $cur
+  )
+
   ;; Nil sentinel at offset 144
   (data (i32.const 144) "\02\00\00\00\00\00\00\00")
 
