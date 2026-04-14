@@ -34,10 +34,10 @@ Started 2026-04-13. Every upgrade, ranked and tracked.
 - [x] Validation scatter plot in thruster engine Validate tab —
       measured vs predicted thrust with ±30% error band (2026-04-13)
 - [x] parse_int as compiler builtin — _strtol via _str_unwrap (2026-04-13)
-- [x] Float self-loop TCO — removed body_has_float guard from mark_int_params;
-      int counter params now get register allocation even in float-op bodies.
-      tensor CPU loops (relu_loop, matmul_k, add_loop, etc.) now run at
-      self-loop bottom-test speed while preserving d8 save/restore (2026-04-13)
+- [~] Float self-loop TCO — PARTIAL. Initial fix (remove body_has_float guard
+      in mark_int_params) caused segfaults in self-recursive functions with
+      float params. Reverted. Proper fix requires handling float params in
+      the self-loop TCO register scheduling. See HARD tier for real work.
 
 ## MEDIUM (1-2 days) — THE 13 TENSOR PRIMITIVES
 
