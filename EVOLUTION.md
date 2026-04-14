@@ -59,7 +59,8 @@ These unblock autograd.rail (which is already complete):
 
 ALL 13 DONE + 10 additional autograd utilities added.
 Autograd.rail LINKS. Forward pass verified (C[0,0]=2.2 correct).
-Backward pass segfaults in ag_backward — list depth issue, needs debug.
+Backward pass WORKS after compiler fix (_rail_eq null/type-mismatch guard).
+First training run: XOR MLP loss 0.425→0.043 on Metal GPU.
 
 ## MEDIUM (1-2 days) — OTHER
 
@@ -67,8 +68,9 @@ Backward pass segfaults in ag_backward — list depth issue, needs debug.
 - [ ] Wire self_train.rail to tensor.rail (kill Python/MLX dependency)
 - [ ] WASM: add float_arr support to WASM backend, port mhd.rail
 - [ ] Full 2D MHD replacing parametric model in thruster_engine.html (WebGL compute)
-- [ ] Binary float array file I/O builtins (float_arr_write_bin, float_arr_read_bin)
-- [ ] Autograd on GPU (backward passes dispatch through Metal)
+- [x] Binary float array file I/O builtins — float_arr_to/from_f32_file (2026-04-13)
+- [ ] Autograd on GPU (backward passes dispatch through Metal — partial:
+      tracked_matmul's backward already dispatches through matmul which is GPU)
 - [ ] Proper Laplace current distribution in thruster engine
 - [ ] CF Worker content-type routing for .css/.js/.wasm
 - [ ] GPU matmul double-buffered persistent buffers
