@@ -1,61 +1,100 @@
 -- stdlib/tensord.rail — Rail client for tensor_daemond (Fork B M3).
 -- Import: import "stdlib/tensord.rail"
 --
--- Talks to tools/metal/tensor_daemond on 127.0.0.1:9302 via `nc` subprocess.
--- The daemon keeps Metal device + pipelines warm in a separate process,
--- side-stepping the ObjC-runtime-in-Rail segfault documented in
--- tools/metal/DLOPEN_STATUS.md.
+-- Talks to tools/metal/tensor_daemond on 127.0.0.1:9302 via direct BSD
+-- sockets (stdlib/socket.rail). The daemon keeps Metal device + pipelines
+-- warm in a separate process, side-stepping the ObjC-runtime-in-Rail
+-- segfault documented in tools/metal/DLOPEN_STATUS.md.
 --
--- Why shell+nc instead of direct socket FFI:
---   stdlib/socket.rail's TCP `send` clashes with Rail's channel `send`
---   builtin, causing dispatch confusion. http_server.rail works around this
---   the same way. Cost: ~2-3ms shell overhead per call, dominated by Metal
---   kernel time once batches are non-trivial.
+-- The 2-arg channel `send` / 4-arg socket `send` name collision was resolved
+-- 2026-04-15 in compile.rail (arity-gate on channel intercept; same for recv)
+-- — Rail code can now use BSD socket send/recv directly.
 --
--- Bench:
---   C client (text/file mode): 0.63ms/call, 6.6 GFLOPS.
---   Rail via shell+nc: ~43ms/call (measured 2026-04-15).
---     The shell fork+exec overhead dominates; tensord_matmul is currently
---     SLOWER than CPU matmul in Rail. Do NOT wire this into gpu_matmul_dispatch
---     as a speedup path — use it for correctness testing only, or when a
---     single call dwarfs the shell overhead.
---     Fixing this requires eliminating the socket-`send`/channel-`send`
---     name collision in Rail's FFI dispatch (compiler-level change) so
---     tensord can use stdlib/socket.rail directly.
+-- f32 files bridge heavy payloads via the existing
+-- float_arr_{to,from}_f32_file builtins.
+--
+-- Bench (128x128 matmul, 50 iters):
+--   C client (text/file mode):        0.63ms/call, 6.6 GFLOPS.
+--   Rail via direct socket FFI:       ~34ms/call. (2026-04-15, this module.)
+--   Rail naive CPU matmul (Rail loop): ~5ms/call.
+-- IPC + file I/O still dominate at 128x128. Tensord becomes a speedup only
+-- above ~256x256 where Metal throughput overwhelms the ~30ms overhead.
+-- For lm_transformer at d=16 do NOT wire this in; for M5 scale-up (d=64+)
+-- reassess.
 --
 -- Start daemon:
 --   cd ~/projects/rail/tools/metal
 --   DYLD_LIBRARY_PATH=. ./tensor_daemond &
 
-tensord_port_str = "9302"
+import "stdlib/socket.rail"
+
+tensord_port = 9302
 tensord_host_str = "127.0.0.1"
 
--- Cached availability flag: 0 = unknown, 1 = up, -1 = down
-tensord_avail_flag = float_arr_new 1 0.0
+-- Note: Rail top-level `name = expr` is re-evaluated per reference (not
+-- memoized), so we cannot stash fd in a global float_arr. Reconnect per
+-- call — localhost connect is ~50us, dominated by Metal kernel time anyway.
 
-tensord_available _ =
-  let cached = float_arr_get tensord_avail_flag 0
-  if cached > 0.5 then true
-  else if cached < (0.0 - 0.5) then false
+tensord_open _ =
+  let fd = tcp_socket 0
+  if fd < 0 then 0 - 1
   else
-    let cmd = join "" ["printf 'PING\\n' | nc -w1 ", tensord_host_str, " ", tensord_port_str]
-    let result = shell cmd
-    let avail = str_contains "OK" result
-    let flag = if avail then 1.0 else (0.0 - 1.0)
-    let _ = float_arr_set tensord_avail_flag 0 flag
-    avail
+    let sa = make_sockaddr_in tensord_port tensord_host_str
+    let r = connect fd sa sockaddr_in_size
+    let _ = free sa
+    if r == 0 then fd
+    else
+      let _ = close fd
+      0 - 1
 
--- Run Metal matmul via daemon. Returns a fresh float_arr with the result.
--- Caller should gate with tensord_available first.
+-- Read until newline or buffer fills. Returns bytes read (>= 1) or -1.
+tensord_has_nl buf len i =
+  if i >= len then false
+  else if byte_at buf i == 10 then true
+  else tensord_has_nl buf len (i + 1)
+
+tensord_recv_line_loop fd buf max off =
+  if off >= max then off
+  else
+    let n = recv fd buf (max - off) 0
+    if n <= 0 then 0 - 1
+    else
+      let new_off = off + n
+      if tensord_has_nl buf new_off 0 then new_off
+      else tensord_recv_line_loop fd buf max new_off
+
+tensord_exec cmd =
+  let fd = tensord_open 0
+  if fd < 0 then false
+  else
+    let sent = send fd cmd (length cmd) 0
+    if sent < 0 then
+      let _ = close fd
+      false
+    else
+      let buf = malloc 128
+      let n = tensord_recv_line_loop fd buf 128 0
+      if n <= 0 then
+        let _ = free buf
+        let _ = close fd
+        false
+      else
+        let c0 = byte_at buf 0
+        let c1 = byte_at buf 1
+        let _ = free buf
+        let _ = close fd
+        if c0 == 79 then if c1 == 75 then true else false else false
+
+tensord_available _ = tensord_exec "PING\n"
+
 tensord_build_cmd m k n =
-  join "" ["printf 'MATMUL_F32FILE ", show m, " ", show k, " ", show n, " /tmp/rail_tensord_a.f32 /tmp/rail_tensord_b.f32 /tmp/rail_tensord_c.f32\\n' | nc -w5 ", tensord_host_str, " ", tensord_port_str]
+  join "" ["MATMUL_F32FILE ", show m, " ", show k, " ", show n, " /tmp/rail_tensord_a.f32 /tmp/rail_tensord_b.f32 /tmp/rail_tensord_c.f32\n"]
 
 tensord_matmul a_data b_data m k n =
   let _ = float_arr_to_f32_file "/tmp/rail_tensord_a.f32" a_data (m * k)
   let _ = float_arr_to_f32_file "/tmp/rail_tensord_b.f32" b_data (k * n)
   let cmd = tensord_build_cmd m k n
-  let reply = shell cmd
-  if str_contains "OK" reply then
+  if tensord_exec cmd then
     let result = float_arr_new (m * n) 0.0
     let _ = float_arr_from_f32_file "/tmp/rail_tensord_c.f32" result (m * n)
     result
