@@ -1,0 +1,119 @@
+-- seq_crash_full.rail — repro D: add per-step softmax, Adam, layernorm_save,
+-- and Tensor-ADT wrapping (via gpu_matmul_dispatch) to approximate what a
+-- real forward+backward+optim pass does.
+--
+-- Baselines A, B, C all sustained 2000 steps. If this one crashes at ~600,
+-- the culprit is one of: softmax, Adam Metal kernel, layernorm backward,
+-- or the Tensor/cons ADT churn.
+
+import "stdlib/optim.rail"
+import "stdlib/transformer.rail"
+
+step_loop step seq V d d_ff x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 =
+  if step >= 2000 then 0
+  else
+    let mk = arena_mark 0
+
+    -- Forward path that mirrors lm_transformer forward (minus causal mask):
+    --   e      = matmul x w_e
+    --   ln1    = layernorm_save e g b
+    --   q/k/v  = matmul ln_out w_q/k/v
+    --   scores = matmul q k  (approximation of q@k^T — shape only matters)
+    --   attn   = softmax scores
+    --   attn_out = matmul attn v
+    --   ln2    = layernorm_save attn_out g b
+    --   f1     = matmul ln2 w_f1
+    --   f2     = matmul f1 w_f2
+    --   logits = matmul f2 w_o
+    --   probs  = softmax logits
+    let e_t = matmul x w_e
+    let ln1_pack = layernorm_save e_t ln_g ln_b
+    let ln1_out = head ln1_pack
+    let q_t = matmul ln1_out w_q
+    let k_t = matmul ln1_out w_k
+    let v_t = matmul ln1_out w_v
+    let scores_t = matmul q_t k_t
+    let attn_t = tensor_softmax scores_t
+    let attn_out_t = matmul attn_t v_t
+    let ln2_pack = layernorm_save attn_out_t ln_g ln_b
+    let ln2_out = head ln2_pack
+    let f1_t = matmul ln2_out w_f1
+    let f2_t = matmul f1_t w_f2
+    let logits_t = matmul f2_t w_o
+    let probs_t = tensor_softmax logits_t
+
+    -- Fake gradient = the probs tensor itself (shape matches weights only
+    -- after a reduction we're not doing — so just allocate a grad-sized
+    -- float_arr per weight and call Adam on it to exercise the kernel).
+    let g_we_d = float_arr_new (V * d) 0.0
+    let g_we = Tensor g_we_d (cons V (cons d [])) (compute_strides (cons V (cons d [])))
+    let _ = adam_update w_e g_we st_we 0.02 0.9 0.999 0.00000001
+    let g_wq_d = float_arr_new (d * d) 0.0
+    let g_wq = Tensor g_wq_d (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+    let _ = adam_update w_q g_wq st_wq 0.02 0.9 0.999 0.00000001
+    let g_wk_d = float_arr_new (d * d) 0.0
+    let g_wk = Tensor g_wk_d (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+    let _ = adam_update w_k g_wk st_wk 0.02 0.9 0.999 0.00000001
+    let g_wv_d = float_arr_new (d * d) 0.0
+    let g_wv = Tensor g_wv_d (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+    let _ = adam_update w_v g_wv st_wv 0.02 0.9 0.999 0.00000001
+    let g_wo_d = float_arr_new (d * V) 0.0
+    let g_wo = Tensor g_wo_d (cons d (cons V [])) (compute_strides (cons d (cons V [])))
+    let _ = adam_update w_o g_wo st_wo 0.02 0.9 0.999 0.00000001
+    let g_wf1_d = float_arr_new (d * d_ff) 0.0
+    let g_wf1 = Tensor g_wf1_d (cons d (cons d_ff [])) (compute_strides (cons d (cons d_ff [])))
+    let _ = adam_update w_f1 g_wf1 st_wf1 0.02 0.9 0.999 0.00000001
+    let g_wf2_d = float_arr_new (d_ff * d) 0.0
+    let g_wf2 = Tensor g_wf2_d (cons d_ff (cons d [])) (compute_strides (cons d_ff (cons d [])))
+    let _ = adam_update w_f2 g_wf2 st_wf2 0.02 0.9 0.999 0.00000001
+
+    let _ = arena_reset mk
+
+    let _ = if step % 50 == 0 then
+              print (cat ["step ", show step])
+            else 0
+
+    step_loop (step + 1) seq V d d_ff x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2
+
+main =
+  let seq = 1499
+  let V = 71
+  let d = 64
+  let d_ff = 256
+  let _ = print (cat ["seq_crash_full: seq=", show seq, " V=", show V, " d=", show d])
+
+  let x_data = float_arr_new (seq * V) 0.0
+  let x = Tensor x_data (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+
+  let we_d = float_arr_new (V * d) 0.01
+  let w_e = Tensor we_d (cons V (cons d [])) (compute_strides (cons V (cons d [])))
+  let wq_d = float_arr_new (d * d) 0.01
+  let w_q = Tensor wq_d (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+  let wk_d = float_arr_new (d * d) 0.01
+  let w_k = Tensor wk_d (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+  let wv_d = float_arr_new (d * d) 0.01
+  let w_v = Tensor wv_d (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+  let wo_d = float_arr_new (d * V) 0.01
+  let w_o = Tensor wo_d (cons d (cons V [])) (compute_strides (cons d (cons V [])))
+  let wf1_d = float_arr_new (d * d_ff) 0.01
+  let w_f1 = Tensor wf1_d (cons d (cons d_ff [])) (compute_strides (cons d (cons d_ff [])))
+  let wf2_d = float_arr_new (d_ff * d) 0.01
+  let w_f2 = Tensor wf2_d (cons d_ff (cons d [])) (compute_strides (cons d_ff (cons d [])))
+
+  let lng_d = float_arr_new d 1.0
+  let ln_g = Tensor lng_d (cons d []) (cons 1 [])
+  let lnb_d = float_arr_new d 0.0
+  let ln_b = Tensor lnb_d (cons d []) (cons 1 [])
+
+  let st_we_raw = adam_state (V * d)
+  let st_wq_raw = adam_state (d * d)
+  let st_wk_raw = adam_state (d * d)
+  let st_wv_raw = adam_state (d * d)
+  let st_wo_raw = adam_state (d * V)
+  let st_wf1_raw = adam_state (d * d_ff)
+  let st_wf2_raw = adam_state (d_ff * d)
+
+  let _ = print "starting full-pattern loop (forward + softmax + ln_save + adam)"
+  let _ = step_loop 0 seq V d d_ff x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b st_we_raw st_wq_raw st_wk_raw st_wv_raw st_wo_raw st_wf1_raw st_wf2_raw
+  let _ = print "completed 2000 steps cleanly"
+  0
