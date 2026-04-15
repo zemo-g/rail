@@ -1,0 +1,63 @@
+-- stdlib/tensord.rail — Rail client for tensor_daemond (Fork B M3).
+-- Import: import "stdlib/tensord.rail"
+--
+-- Talks to tools/metal/tensor_daemond on 127.0.0.1:9302 via `nc` subprocess.
+-- The daemon keeps Metal device + pipelines warm in a separate process,
+-- side-stepping the ObjC-runtime-in-Rail segfault documented in
+-- tools/metal/DLOPEN_STATUS.md.
+--
+-- Why shell+nc instead of direct socket FFI:
+--   stdlib/socket.rail's TCP `send` clashes with Rail's channel `send`
+--   builtin, causing dispatch confusion. http_server.rail works around this
+--   the same way. Cost: ~2-3ms shell overhead per call, dominated by Metal
+--   kernel time once batches are non-trivial.
+--
+-- Bench:
+--   C client (text/file mode): 0.63ms/call, 6.6 GFLOPS.
+--   Rail via shell+nc: ~43ms/call (measured 2026-04-15).
+--     The shell fork+exec overhead dominates; tensord_matmul is currently
+--     SLOWER than CPU matmul in Rail. Do NOT wire this into gpu_matmul_dispatch
+--     as a speedup path — use it for correctness testing only, or when a
+--     single call dwarfs the shell overhead.
+--     Fixing this requires eliminating the socket-`send`/channel-`send`
+--     name collision in Rail's FFI dispatch (compiler-level change) so
+--     tensord can use stdlib/socket.rail directly.
+--
+-- Start daemon:
+--   cd ~/projects/rail/tools/metal
+--   DYLD_LIBRARY_PATH=. ./tensor_daemond &
+
+tensord_port_str = "9302"
+tensord_host_str = "127.0.0.1"
+
+-- Cached availability flag: 0 = unknown, 1 = up, -1 = down
+tensord_avail_flag = float_arr_new 1 0.0
+
+tensord_available _ =
+  let cached = float_arr_get tensord_avail_flag 0
+  if cached > 0.5 then true
+  else if cached < (0.0 - 0.5) then false
+  else
+    let cmd = join "" ["printf 'PING\\n' | nc -w1 ", tensord_host_str, " ", tensord_port_str]
+    let result = shell cmd
+    let avail = str_contains "OK" result
+    let flag = if avail then 1.0 else (0.0 - 1.0)
+    let _ = float_arr_set tensord_avail_flag 0 flag
+    avail
+
+-- Run Metal matmul via daemon. Returns a fresh float_arr with the result.
+-- Caller should gate with tensord_available first.
+tensord_build_cmd m k n =
+  join "" ["printf 'MATMUL_F32FILE ", show m, " ", show k, " ", show n, " /tmp/rail_tensord_a.f32 /tmp/rail_tensord_b.f32 /tmp/rail_tensord_c.f32\\n' | nc -w5 ", tensord_host_str, " ", tensord_port_str]
+
+tensord_matmul a_data b_data m k n =
+  let _ = float_arr_to_f32_file "/tmp/rail_tensord_a.f32" a_data (m * k)
+  let _ = float_arr_to_f32_file "/tmp/rail_tensord_b.f32" b_data (k * n)
+  let cmd = tensord_build_cmd m k n
+  let reply = shell cmd
+  if str_contains "OK" reply then
+    let result = float_arr_new (m * n) 0.0
+    let _ = float_arr_from_f32_file "/tmp/rail_tensord_c.f32" result (m * n)
+    result
+  else
+    error "tensord_matmul: daemon call failed"

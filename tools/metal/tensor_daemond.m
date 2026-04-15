@@ -154,10 +154,118 @@ static int write_status(int fd, uint8_t status) {
     return write_exact(fd, &zero, 4);
 }
 
+// Read exactly one line (up to \n, max 1024 bytes). Returns length incl \n,
+// or -1 on EOF / error. Writes null terminator.
+static int read_line_into(int fd, char *buf, size_t max, char first) {
+    buf[0] = first;
+    size_t off = 1;
+    while (off < max - 1) {
+        char c;
+        if (read_exact(fd, &c, 1) < 0) return -1;
+        buf[off++] = c;
+        if (c == '\n') { buf[off] = 0; return (int)off; }
+    }
+    buf[off] = 0;
+    return -1;
+}
+
+// Read whole f32 file into a newly malloced f64 buffer with +1 header pad.
+// Returns NULL on error. *n_out = element count (doubles).
+static double* read_f32_file_padded(const char *path, uint32_t n_elem) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    float *tmp = malloc((size_t)n_elem * 4);
+    if (!tmp) { fclose(f); return NULL; }
+    size_t got = fread(tmp, 4, n_elem, f);
+    fclose(f);
+    if (got != n_elem) { free(tmp); return NULL; }
+    double *buf = calloc((size_t)n_elem + 1, 8);
+    if (!buf) { free(tmp); return NULL; }
+    for (uint32_t i = 0; i < n_elem; i++) buf[1 + i] = (double)tmp[i];
+    free(tmp);
+    return buf;
+}
+
+// Write f64 data buffer (with +1 header pad) to f32 file at path.
+static int write_f32_file_padded(const char *path, const double *buf, uint32_t n_elem) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    float *tmp = malloc((size_t)n_elem * 4);
+    if (!tmp) { fclose(f); return -1; }
+    for (uint32_t i = 0; i < n_elem; i++) tmp[i] = (float)buf[1 + i];
+    size_t wrote = fwrite(tmp, 4, n_elem, f);
+    fclose(f);
+    free(tmp);
+    return (wrote == n_elem) ? 0 : -1;
+}
+
+// Text-mode dispatcher. Called after we've read the first byte and it's ASCII.
+// Protocol: "CMD arg1 arg2 ...\n". Reply: "OK\n" or "ERR <msg>\n".
+// Supported commands:
+//   PING                                             -> OK 1
+//   MATMUL_F32FILE M K N path_a path_b path_c        -> OK
+//   SHUTDOWN                                         -> OK (closes daemon)
+static int handle_text(int fd, char first) {
+    char line[1024];
+    int len = read_line_into(fd, line, sizeof(line), first);
+    if (len < 0) return -1;
+    if (len > 0 && line[len-1] == '\n') line[len-1] = 0;
+    if (len > 1 && line[len-2] == '\r') line[len-2] = 0;
+
+    char *cmd = strtok(line, " ");
+    if (!cmd) { write_exact(fd, "ERR empty\n", 10); return 0; }
+
+    if (strcmp(cmd, "PING") == 0) {
+        write_exact(fd, "OK 1\n", 5);
+        return 0;
+    }
+    if (strcmp(cmd, "SHUTDOWN") == 0) {
+        write_exact(fd, "OK\n", 3);
+        return 1;
+    }
+    if (strcmp(cmd, "MATMUL_F32FILE") == 0) {
+        char *sM = strtok(NULL, " ");
+        char *sK = strtok(NULL, " ");
+        char *sN = strtok(NULL, " ");
+        char *pa = strtok(NULL, " ");
+        char *pb = strtok(NULL, " ");
+        char *pc = strtok(NULL, " ");
+        if (!sM || !sK || !sN || !pa || !pb || !pc) {
+            write_exact(fd, "ERR parse\n", 10); return 0;
+        }
+        int M = atoi(sM), K = atoi(sK), N = atoi(sN);
+        double *A = read_f32_file_padded(pa, (uint32_t)(M*K));
+        double *B = read_f32_file_padded(pb, (uint32_t)(K*N));
+        if (!A || !B) {
+            free(A); free(B);
+            write_exact(fd, "ERR readfile\n", 13); return 0;
+        }
+        double *C = calloc((size_t)(M*N) + 1, 8);
+        int rc = tgl_matmul_f64(A, B, C, M, K, N);
+        if (rc != 1) {
+            free(A); free(B); free(C);
+            write_exact(fd, "ERR kernel\n", 11); return 0;
+        }
+        int wrc = write_f32_file_padded(pc, C, (uint32_t)(M*N));
+        free(A); free(B); free(C);
+        if (wrc != 0) { write_exact(fd, "ERR writefile\n", 14); return 0; }
+        write_exact(fd, "OK\n", 3);
+        return 0;
+    }
+
+    write_exact(fd, "ERR unknown\n", 12);
+    return 0;
+}
+
 // Handle one request. Returns 0 to continue, 1 to shutdown, -1 on error.
 static int handle_request(int fd) {
     uint8_t op;
     if (read_exact(fd, &op, 1) < 0) return -1;
+
+    // Text-mode prefix detection: ASCII uppercase letter → text protocol.
+    if (op >= 'A' && op <= 'Z') {
+        return handle_text(fd, (char)op);
+    }
 
     uint32_t arg_count;
     if (read_exact(fd, &arg_count, 4) < 0) return -1;
