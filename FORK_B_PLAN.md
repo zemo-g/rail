@@ -1,8 +1,45 @@
 # Fork B — Rail Self-Trains on Metal (ULTRAPLAN)
 
-**Status**: execution plan, 2026-04-15. Not yet started.
+**Status**: **M1-M5 shipped 2026-04-15** (same day as plan written). See
+CHANGELOG.md v2.17.0-v2.21.0 for the landed commits. Strategic frame
+held; tactical details deviated — daemon turned orthogonal, compiler
+unblocks were the real wins. Next workflow queued below at
+"Post-M5 next steps."
 **Decision**: Fork B. Rail-native training, Metal dispatch, zero Python in the inner training loop.
 **Machine split**: Mini owns training. Studio owns inference (DDA, Qwen3.5-27B on 10.42.0.2:8080). Razer idle.
+
+## Delivered vs planned
+
+| Milestone | Planned | Delivered | Status |
+|---|---|---|---|
+| M1 | Clear stale banners, rerun gradchecks | `autograd.rail` + `DLOPEN_STATUS.md` banners cleared; attention 18/18, layernorm 9/9 | ✅ |
+| M2 | `lm_transformer` ≤ 2.10 on Shakespeare | 2.098 at d=16, 2000 steps | ✅ |
+| M3 | Rail-native Metal daemon | `tensor_daemond` shipped; but turned out unnecessary — in-process dylib works from Rail once `DLOPEN_STATUS` (stale) was re-tested | ✅ (scope shifted) |
+| M4 | Unattended launchd loop + kill switch | `rail_native_loop.sh` + `com.ledatic.rail_train.plist` ready (not bootstrapped; awaiting checkpoint persistence) | ✅ partial |
+| M5 | First real scaled-up train | d=64, loss 1.796 in 500 steps (6× faster than d=16 baseline). Shakespeare corpus still — Rail stdlib pivot queued. | ✅ partial |
+
+## Load-bearing unlocks this session (compiler)
+
+Three compiler fixes earned all the downstream wins:
+
+1. **v2.18 — arity-gate channel `send`/`recv`**: 2-arg `send`/1-arg `recv` → channel dispatch, else → foreign FFI. Rail sockets work at all.
+2. **v2.19 — batched f32 file I/O**: `_rail_float_arr_to_f32_file` emitted 1 syscall per float (16K syscalls per 64KB); switched to malloc-buffer + single syscall. 11× faster.
+3. **v2.20 — simplify `gpu_matmul_dispatch`**: the `ensure_dylib` cache was hitting the top-level nullary re-eval bug (below), so every matmul paid a shell `test -f` check. Fixed by trusting `tgl_init` idempotency. 60× over CPU at 256×256.
+
+## Known latent compiler bug
+
+Top-level `name = expr` bindings (no args) are re-evaluated per reference instead of memoized. Affects any global cache pattern. Worked around twice this session. Proper fix queued.
+
+## Post-M5 next steps (queued for next session)
+
+1. **Full 2000-step d=64 run** → definitive loss curve + model card.
+2. **Sample generation path** → feed trained weights back to forward, extract completions. Needed for model card.
+3. **Pivot corpus Shakespeare → Rail stdlib** (`training/rail_native/data/corpus.txt`, 553KB prebuilt). Strategic goal per original plan §M7+ (compile-as-oracle setup).
+4. **Checkpoint save/resume** via `stdlib/checkpoint.rail` — blocks the 24h unattended soak.
+5. **Eval split** (last 10% of corpus held out) + val loss at checkpoint boundaries.
+6. **Bootstrap launchd, 24h soak** — once #4 + #5 land.
+7. **Fix top-level nullary memoization** in compile.rail (clean up the workarounds).
+8. **Scale gate M6** — decide multi-head / multi-block / wider d after M5 ships.
 
 ## Ground truth established by running, not reading (2026-04-15)
 
