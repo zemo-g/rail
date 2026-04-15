@@ -1,0 +1,290 @@
+-- stdlib/bpe.rail — Byte-pair encoding tokenizer for Rail LM training.
+-- Import: import "stdlib/bpe.rail"
+--
+-- BPE learns sub-word merge rules from a corpus, compressing long
+-- character sequences into fewer tokens. The v2.3 char-level tokenizer
+-- (stdlib/tokenizer.rail) caps training seq-length at corpus char count;
+-- BPE at target_vocab=4096 compresses ~3x on Rail source, unlocking
+-- chunked training on the 553K stdlib corpus.
+--
+-- Usage:
+--   import "stdlib/bpe.rail"
+--   let bpe = bpe_train corpus 512
+--   let ids = bpe_encode bpe corpus
+--   let back = bpe_decode bpe ids           -- == corpus
+--   let _ = bpe_save "/tmp/tok" bpe          -- → /tmp/tok.vocab + .merges
+--   let bpe2 = bpe_load "/tmp/tok"
+--
+-- Layout:
+--   BPE merges vocab size
+--     merges : [(a, b, new_id)]  — ordered learned merges
+--     vocab  : [string]          — byte-sequence per token id (base chars
+--                                  first, merged tokens appended in order)
+--     size   : int               — len vocab
+--
+-- The base vocab is the set of distinct characters in the training corpus
+-- (first-appearance order, same discipline as stdlib/tokenizer.rail).
+-- Merged tokens start at id = base_size. Encoding applies merges greedy
+-- left-to-right in learn order; decoding concatenates vocab[i] byte-seqs.
+
+import "stdlib/map.rail"
+
+type BPE = | BPE merges vocab size
+
+-- ========== Pair key packing ==========
+-- Pack (a, b) into a single int so map_get / map_put can hash pairs.
+-- Multiplier must exceed any plausible token id. 2^20 = 1_048_576 is
+-- comfortable for vocabularies up to ~1M.
+
+bpe_pair_key a b = a * 1048576 + b
+bpe_key_a k = k / 1048576
+bpe_key_b k = k - (k / 1048576) * 1048576
+
+-- Local nth / drop so bpe.rail doesn't require stdlib/list.rail.
+bpe_nth n xs =
+  if n == 0 then head xs
+  else bpe_nth (n - 1) (tail xs)
+
+bpe_drop n xs =
+  if n <= 0 then xs
+  else if length xs == 0 then []
+  else bpe_drop (n - 1) (tail xs)
+
+-- ========== Base vocab (distinct chars in first-appearance order) ==========
+
+bpe_contains_char cs c =
+  if length cs == 0 then false
+  else if head cs == c then true
+  else bpe_contains_char (tail cs) c
+
+bpe_collect_unique input acc =
+  if length input == 0 then reverse acc
+  else
+    let c = head input
+    if bpe_contains_char acc c then bpe_collect_unique (tail input) acc
+    else bpe_collect_unique (tail input) (cons c acc)
+
+-- Linear-scan char → id in the base-vocab prefix. Merged tokens have
+-- length ≥ 2 so they never false-match a 1-char query.
+bpe_char_id_loop cs c i =
+  if length cs == 0 then (0 - 1)
+  else if head cs == c then i
+  else bpe_char_id_loop (tail cs) c (i + 1)
+
+bpe_init_encode_loop cs vocab_list acc =
+  if length cs == 0 then reverse acc
+  else
+    let id = bpe_char_id_loop vocab_list (head cs) 0
+    bpe_init_encode_loop (tail cs) vocab_list (cons id acc)
+
+-- ========== Pair counting (int→int map) ==========
+
+bpe_count_pairs tokens m =
+  if length tokens < 2 then m
+  else
+    let a = head tokens
+    let b = head (tail tokens)
+    let k = bpe_pair_key a b
+    let c = map_get m k
+    bpe_count_pairs (tail tokens) (map_put m k (c + 1))
+
+-- Walk map keys, track (best_key, best_count). Tie-break: keep smaller
+-- key so the tokenizer is deterministic for a given corpus.
+bpe_find_best_key_loop keys m best_k best_c =
+  if length keys == 0 then (best_k, best_c)
+  else
+    let k = head keys
+    let c = map_get m k
+    if c > best_c then bpe_find_best_key_loop (tail keys) m k c
+    else bpe_find_best_key_loop (tail keys) m best_k best_c
+
+-- ========== Merge application ==========
+-- Replace every adjacent (a, b) pair with new_id, left-to-right.
+-- After a replacement we advance past BOTH consumed tokens, so "aaa"
+-- with merge (a,a)→X tokenizes as [X, a] (not [X, X]).
+
+bpe_apply_merge tokens a b nid acc =
+  if length tokens == 0 then reverse acc
+  else if length tokens == 1 then reverse (cons (head tokens) acc)
+  else
+    let t0 = head tokens
+    let t1 = head (tail tokens)
+    if t0 == a then
+      if t1 == b then
+        bpe_apply_merge (tail (tail tokens)) a b nid (cons nid acc)
+      else bpe_apply_merge (tail tokens) a b nid (cons t0 acc)
+    else bpe_apply_merge (tail tokens) a b nid (cons t0 acc)
+
+-- ========== Training loop ==========
+-- Invariants:
+--   size == length vocab
+--   merges is ordered by learn time (oldest first)
+--
+-- Stops when:
+--   - target hit
+--   - best pair frequency drops below 2 (no compression gain)
+--   - no pairs left (fully consumed)
+
+-- Find best pair. Uses a BST pair-count map as scratch; wraps the whole
+-- scratch in arena_mark/reset so the transient map + keys list don't
+-- accumulate across training iterations (Rail's GC doesn't reliably
+-- reclaim hundreds of BSTs built in tight loops — empirically verified).
+bpe_best_pair tokens =
+  let mk = arena_mark 0
+  let counts = bpe_count_pairs tokens (map_new 0)
+  let keys = map_keys counts
+  if length keys == 0 then
+    let _ = arena_reset mk
+    (0, 0)
+  else
+    let best = bpe_find_best_key_loop keys counts 0 0
+    let (bk, bc) = best
+    let _ = arena_reset mk
+    (bk, bc)
+
+bpe_train_loop tokens merges vocab size target =
+  if size >= target then BPE merges vocab size
+  else
+    let best = bpe_best_pair tokens
+    let (best_k, best_c) = best
+    if best_c < 2 then BPE merges vocab size
+    else
+      let a = bpe_key_a best_k
+      let b = bpe_key_b best_k
+      let nid = size
+      let new_token = append (bpe_nth a vocab) (bpe_nth b vocab)
+      let new_vocab = append vocab [new_token]
+      let new_merges = append merges [(a, b, nid)]
+      let new_tokens = bpe_apply_merge tokens a b nid []
+      bpe_train_loop new_tokens new_merges new_vocab (size + 1) target
+
+bpe_train text target =
+  let all_chars = chars text
+  let uniq = bpe_collect_unique all_chars []
+  let base_size = length uniq
+  if target <= base_size then BPE [] uniq base_size
+  else
+    let init_tokens = bpe_init_encode_loop all_chars uniq []
+    bpe_train_loop init_tokens [] uniq base_size target
+
+-- ========== Encode / decode ==========
+
+bpe_apply_all_merges tokens merges =
+  if length merges == 0 then tokens
+  else
+    let m = head merges
+    let (a, b, nid) = m
+    bpe_apply_all_merges (bpe_apply_merge tokens a b nid []) (tail merges)
+
+bpe_encode bpe text = match bpe
+  | BPE merges vocab size ->
+    let init_tokens = bpe_init_encode_loop (chars text) vocab []
+    bpe_apply_all_merges init_tokens merges
+
+bpe_decode_loop ids vocab acc =
+  if length ids == 0 then reverse acc
+  else bpe_decode_loop (tail ids) vocab (cons (bpe_nth (head ids) vocab) acc)
+
+bpe_decode bpe ids = match bpe
+  | BPE merges vocab size -> join "" (bpe_decode_loop ids vocab [])
+
+bpe_vocab_size bpe = match bpe
+  | BPE _ _ s -> s
+
+-- ========== Persistence ==========
+-- File format:
+--   <path>.vocab   one token per line, escaped: "\\" → "\\\\", "\n" → "\\n",
+--                  "\t" → "\\t". Unescape on load is the literal inverse.
+--   <path>.merges  one "a b c" triple per line (decimal ints).
+--
+-- Vocab is ordered by id: line i (0-indexed) is token i. Merges preserve
+-- learn order. Round-trip preserves the exact BPE struct.
+
+bpe_escape_chars cs acc =
+  if length cs == 0 then reverse acc
+  else
+    let c = head cs
+    if c == "\\" then bpe_escape_chars (tail cs) (cons "\\\\" acc)
+    else if c == "\n" then bpe_escape_chars (tail cs) (cons "\\n" acc)
+    else if c == "\t" then bpe_escape_chars (tail cs) (cons "\\t" acc)
+    else bpe_escape_chars (tail cs) (cons c acc)
+
+bpe_escape s = join "" (bpe_escape_chars (chars s) [])
+
+bpe_unescape_chars cs acc =
+  if length cs == 0 then reverse acc
+  else
+    let c = head cs
+    if c == "\\" then
+      let rest = tail cs
+      if length rest == 0 then reverse (cons c acc)
+      else
+        let n = head rest
+        if n == "n" then bpe_unescape_chars (tail rest) (cons "\n" acc)
+        else if n == "t" then bpe_unescape_chars (tail rest) (cons "\t" acc)
+        else if n == "\\" then bpe_unescape_chars (tail rest) (cons "\\" acc)
+        else bpe_unescape_chars rest (cons c acc)
+    else bpe_unescape_chars (tail cs) (cons c acc)
+
+bpe_unescape s = join "" (bpe_unescape_chars (chars s) [])
+
+bpe_escape_line v = append (bpe_escape v) "\n"
+
+bpe_merge_to_line m =
+  let (a, b, nid) = m
+  join "" [show a, " ", show b, " ", show nid, "\n"]
+
+bpe_save path bpe = match bpe
+  | BPE merges vocab size ->
+    let vocab_body = join "" (map bpe_escape_line vocab)
+    let merges_body = join "" (map bpe_merge_to_line merges)
+    let _ = write_file (append path ".vocab") vocab_body
+    let _ = write_file (append path ".merges") merges_body
+    0
+
+-- Pure-Rail string→int (self-contained so bpe.rail doesn't pull socket.rail).
+-- NOTE: Rail's `char_to_int` doesn't return the ASCII code byte — per
+-- tools/train/hyperagent.rail, the convention in this repo is to
+-- decode digits via direct string comparison.
+bpe_digit_val c =
+  if c == "0" then 0
+  else if c == "1" then 1
+  else if c == "2" then 2
+  else if c == "3" then 3
+  else if c == "4" then 4
+  else if c == "5" then 5
+  else if c == "6" then 6
+  else if c == "7" then 7
+  else if c == "8" then 8
+  else if c == "9" then 9
+  else (0 - 1)
+
+bpe_parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = bpe_digit_val (head cs)
+    if d < 0 then acc
+    else bpe_parse_int_acc (tail cs) (acc * 10 + d)
+
+bpe_parse_int s = bpe_parse_int_acc (chars s) 0
+
+bpe_nonempty s = length s > 0
+
+-- Parse "a b c" → (a, b, c) tuple.
+bpe_parse_merge_line line =
+  let parts = split " " line
+  let a = bpe_parse_int (head parts)
+  let b = bpe_parse_int (head (tail parts))
+  let c = bpe_parse_int (head (tail (tail parts)))
+  (a, b, c)
+
+bpe_load path =
+  let vocab_body = read_file (append path ".vocab")
+  let merges_body = read_file (append path ".merges")
+  let vocab_lines = split "\n" vocab_body
+  let merges_lines = split "\n" merges_body
+  let vocab_ne = filter bpe_nonempty vocab_lines
+  let merges_ne = filter bpe_nonempty merges_lines
+  let vocab = map bpe_unescape vocab_ne
+  let merges = map bpe_parse_merge_line merges_ne
+  BPE merges vocab (length vocab)
