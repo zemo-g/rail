@@ -2,6 +2,52 @@
 
 All notable changes to Rail are documented here.
 
+## Post-v2.21 (unreleased) — `stdlib/bpe.rail`: byte-pair encoding tokenizer
+
+`stdlib/tokenizer.rail` tops out at char-level — training on the 553KB
+stdlib corpus would need `seq ≈ 553000`, versus the current usable cap
+of `seq=382` on Shakespeare. `stdlib/bpe.rail` ships the merge-rule
+tier of the BPE hierarchy that `tokenizer.rail`'s v2.3 header flagged
+as "queued for v2.4". 10,000-char slice of `stdlib/tensor.rail`,
+target vocab 512: 3.46x compression, byte-exact round-trip, byte-exact
+save/load round-trip. Tests 106/106.
+
+### API
+```rail
+import "stdlib/bpe.rail"
+type BPE = | BPE merges vocab size
+  -- merges : [(left_id, right_id, new_id)] in learn order
+  -- vocab  : [string]  byte-sequence per token id
+  -- size   : int       == length vocab
+
+bpe_train      text target_vocab -> BPE
+bpe_encode     bpe  text         -> [int]
+bpe_decode     bpe  ids          -> string
+bpe_save       path bpe          -> int   -- writes <path>.vocab + <path>.merges
+bpe_load       path              -> BPE
+bpe_vocab_size bpe               -> int
+```
+
+### Notes
+- Base vocab is the set of distinct characters in the training corpus
+  in first-appearance order (same discipline as `stdlib/tokenizer.rail`).
+  Merged token IDs start at `base_size`.
+- Training wraps the per-iteration pair-count BST in `arena_mark` /
+  `arena_reset`: Rail's GC doesn't reliably reclaim hundreds of fresh
+  BSTs built in a tight loop, and the smoke test reproducibly segfaulted
+  at ~130 iterations without the mark/reset. Persistent state (tokens,
+  vocab, merges) is allocated outside the mark.
+- Vocab save format escapes `\\` / `\n` / `\t` so tokens containing
+  those bytes survive one-per-line serialization.
+- Decimal digit parsing uses string comparison (matching the
+  `tools/train/hyperagent.rail` convention), not `char_to_int` —
+  the builtin does not return the ASCII byte.
+- The module does NOT integrate with `lm_transformer.rail`; the
+  char-level tokenizer remains the default for existing training. A
+  follow-up session will wire BPE into the training loop.
+
+Smoke test: `tools/train/bpe_smoke.rail`.
+
 ## v2.17.0 – v2.21.0 (2026-04-15) — *Fork B session: Rail self-trains on Metal, end-to-end*
 
 One long session. Eight commits. Takes Rail from "trains a tiny
