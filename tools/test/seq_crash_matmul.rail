@@ -1,0 +1,87 @@
+-- seq_crash_matmul.rail — repro B: include matmul via Metal dylib.
+-- Baseline A (alloc-only) sustained 2000 steps. If this one crashes
+-- at ~600, Metal GPU path is the culprit.
+--
+-- Shapes emulate forward at seq=1499, d=64, V=71, d_ff=256:
+--   M1: e = x · w_e            (seq,V) · (V,d)       → (seq,d)
+--   M2: q = ln · w_q           (seq,d) · (d,d)       → (seq,d)
+--   M3: scores = q · kt        (seq,d) · (d,seq)     → (seq,seq)   ← huge
+--   M4: out   = attn · v       (seq,seq) · (seq,d)   → (seq,d)     ← huge
+--   M5: f1  = ln2 · w_f1       (seq,d) · (d,d_ff)    → (seq,d_ff)
+--   M6: f2  = fh · w_f2        (seq,d_ff) · (d_ff,d) → (seq,d)
+--   M7: logits = blk · w_o     (seq,d) · (d,V)       → (seq,V)
+--
+-- ~5 of those are backward-mirrored so ~15 matmuls per step total; we
+-- approximate with these 7 (should be enough to saturate the Metal buffer
+-- pool at POOL_MAX=32 and stress any leak).
+
+import "stdlib/tensor.rail"
+
+-- Direct call into the Metal dylib. Bypasses the Tensor wrapper so we
+-- don't pay the per-call compute_strides cons chain and we can reuse
+-- raw output float_arrs via arena allocation.
+mm a b out m k n =
+  let _ = tgl_matmul_f64 a b out m k n
+  0
+
+loop step seq V d d_ff x w_e w_q w_k w_v w_o w_f1 w_f2 =
+  if step >= 2000 then 0
+  else
+    let mk = arena_mark 0
+
+    let out_e = float_arr_new (seq * d) 0.0
+    let _ = mm x w_e out_e seq V d
+
+    let out_q = float_arr_new (seq * d) 0.0
+    let _ = mm out_e w_q out_q seq d d
+    let out_k = float_arr_new (seq * d) 0.0
+    let _ = mm out_e w_k out_k seq d d
+    let out_v = float_arr_new (seq * d) 0.0
+    let _ = mm out_e w_v out_v seq d d
+
+    -- scores = q @ k  (seq,d)(d,seq): approximates q @ k^T
+    let out_scores = float_arr_new (seq * seq) 0.0
+    let _ = mm out_q out_k out_scores seq d seq
+
+    -- attn_out = scores @ v  (seq,seq)(seq,d)
+    let out_attn = float_arr_new (seq * d) 0.0
+    let _ = mm out_scores out_v out_attn seq seq d
+
+    let out_f1 = float_arr_new (seq * d_ff) 0.0
+    let _ = mm out_e w_f1 out_f1 seq d d_ff
+    let out_f2 = float_arr_new (seq * d) 0.0
+    let _ = mm out_f1 w_f2 out_f2 seq d_ff d
+
+    let out_logits = float_arr_new (seq * V) 0.0
+    let _ = mm out_f2 w_o out_logits seq d V
+
+    let _ = arena_reset mk
+
+    let _ = if step % 50 == 0 then
+              print (cat ["step ", show step])
+            else 0
+
+    loop (step + 1) seq V d d_ff x w_e w_q w_k w_v w_o w_f1 w_f2
+
+main =
+  let seq = 1499
+  let V = 71
+  let d = 64
+  let d_ff = 256
+  let _ = print (cat ["seq_crash_matmul: seq=", show seq, " V=", show V, " d=", show d, " d_ff=", show d_ff])
+
+  -- Build input + weight float_arrs (allocate ONCE outside the loop so
+  -- they live across arena_reset boundaries).
+  let x   = float_arr_new (seq * V) 0.0
+  let w_e = float_arr_new (V * d) 0.01
+  let w_q = float_arr_new (d * d) 0.01
+  let w_k = float_arr_new (d * d) 0.01
+  let w_v = float_arr_new (d * d) 0.01
+  let w_o = float_arr_new (d * V) 0.01
+  let w_f1 = float_arr_new (d * d_ff) 0.01
+  let w_f2 = float_arr_new (d_ff * d) 0.01
+
+  let _ = print "starting loop — expect crash at step ~600 if Metal leaks"
+  let _ = loop 0 seq V d d_ff x w_e w_q w_k w_v w_o w_f1 w_f2
+  let _ = print "completed 2000 steps cleanly"
+  0
