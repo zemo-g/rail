@@ -184,6 +184,59 @@ next timestep's input. Deferred; requires variable-length forward.
 2. Weights round-trip disk via `stdlib/checkpoint.rail:save_model`.
 3. The model genuinely learned the corpus, not just a constant.
 
+## Autoregressive generation (added 2026-04-15)
+
+`tools/train/lm_infer.rail` loads the v0.2 checkpoint and generates
+characters by feeding each argmax back in as the next timestep's input.
+Weights are loaded correctly — the teacher-force diagnostic on the full
+corpus reproduces the v0.2 sample byte-for-byte. But autoregressive
+generation collapses into repetitive noise on every prompt.
+
+```
+prompt: "To be"      (memorized prefix, in training corpus)
+output: To betoio oktiiiio  oiiiooo o     ooiiiiibot oooTto ooTboooooT: biio o:bib : ffffhooo
+
+prompt: "let us"     (all in-vocab chars, novel ngram)
+output: let uso   oTi,g,n,
+        eTiiittrnobos  ooi oi i  aaaasuTsoboboirbobtrhdn ininin:   ufrrrrrr
+```
+
+### Why the memorization claim was optimistic
+
+`lm_transformer.rail:fill_onehot` walks the input with
+`list_nth i ids` while also tailing `ids` each step, so the one-hot
+tensor at position `i` encodes `corpus[2i]` for `i < seq/2` and the
+out-of-bounds default (char 0, which happens to be `'T'` under
+first-appearance vocab ordering) for `i ≥ seq/2`. The model was
+trained on this corrupted input distribution.
+
+Teacher-forcing with the *same* corrupted pattern reproduces the
+v0.1/v0.2 "memorized" output because both training and sampling share
+the bug. Teacher-forcing with a *correct* `head`-walked input produces
+noise — the model never saw a clean one-hot during training. And
+autoregressive generation at any non-training sequence length cannot
+reproduce the exact out-of-bounds pattern either (a prompt of length
+5 puts `'T'` at positions 3+, whereas training at seq=382 put real
+corpus chars there until position ~191).
+
+Practical consequence: the v0.1/v0.2 loss curve is real, but the
+model it produced is a position→label lookup table conditioned on a
+specific input corruption — not a character LM that can generalise
+across sequence lengths. Fixing `fill_onehot` (use `head ids`) and
+retraining is the right next step; a clean retrain against the
+corrected input should produce weights that both autoregressive and
+teacher-force paths can use.
+
+### Reproducing
+
+```
+cd ~/projects/rail
+./rail_native run tools/train/lm_infer.rail
+```
+
+Prints the teacher-force output under both input paths, then runs
+autoregressive greedy sampling on two prompts.
+
 ## Next milestones
 
 1. Sample generation + greedy completion of 40 tokens
