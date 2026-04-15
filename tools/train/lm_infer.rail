@@ -1,0 +1,283 @@
+-- lm_infer.rail — Autoregressive inference from the v0.2 checkpoint.
+--
+-- Loads weights saved by lm_transformer.rail at
+-- training/rail_native/checkpoints/latest.*, rebuilds the vocab from the
+-- same corpus, tokenizes a prompt, and generates N characters via greedy
+-- next-token sampling (argmax of softmax at the last position).
+--
+-- Does NOT retrain and does NOT modify lm_transformer.rail or stdlib.
+-- Helpers (fill_onehot, build_pe, unwrap, relu_fwd, forward) are copy-
+-- pasted from lm_transformer.rail so this file stands alone.
+--
+-- Usage:
+--   ./rail_native run tools/train/lm_infer.rail
+import "stdlib/transformer.rail"
+import "stdlib/optim.rail"
+import "stdlib/tokenizer.rail"
+import "stdlib/checkpoint.rail"
+
+corpus _ =
+  cat ["To be, or not to be, that is the question.\n",
+       "Whether tis nobler in the mind to suffer\n",
+       "the slings and arrows of outrageous fortune,\n",
+       "or to take arms against a sea of troubles\n",
+       "and by opposing end them. To die, to sleep,\n",
+       "no more; and by a sleep to say we end\n",
+       "the heart-ache and the thousand natural shocks\n",
+       "that flesh is heir to: tis a consummation\n",
+       "devoutly to be wished. To die, to sleep;\n"]
+
+-- ── One-hot fill.
+-- NOTE: lm_transformer.rail's fill_onehot uses `list_nth i ids` with a
+-- tailed `ids` each step, which skips every other element (verified: input
+-- [10,20,30,40,50] writes [10,30,50,0,0]). We expose two variants so the
+-- inference path can match the training distribution AND we can test the
+-- corrected version for comparison.
+fill_onehot_buggy dst ids V seq i =
+  if i >= seq then 0
+  else
+    let c = list_nth i ids
+    let _ = float_arr_set dst (i * V + c) 1.0
+    fill_onehot_buggy dst (tail ids) V seq (i + 1)
+
+-- Correct one-hot fill: head-walk the list.
+fill_onehot dst ids V seq i =
+  if i >= seq then 0
+  else
+    let c = head ids
+    let _ = float_arr_set dst (i * V + c) 1.0
+    fill_onehot dst (tail ids) V seq (i + 1)
+
+-- ── Sinusoidal PE (copy from lm_transformer.rail) ──
+pe_loop arr seq d p k =
+  if p >= seq then 0
+  else if k >= d then pe_loop arr seq d (p + 1) 0
+  else
+    let exp_arg = int_to_float (k - (k % 2)) / int_to_float d
+    let denom = pow 10000.0 exp_arg
+    let angle = int_to_float p / denom
+    let v = if (k % 2) == 0 then sin angle else cos angle
+    let _ = float_arr_set arr (p * d + k) v
+    pe_loop arr seq d p (k + 1)
+
+build_pe seq d =
+  let arr = float_arr_new (seq * d) 0.0
+  let _ = pe_loop arr seq d 0 0
+  arr
+
+-- ── Forward helpers ──
+add_buf_inplace dst src n i =
+  if i >= n then 0
+  else
+    let cur = float_arr_get dst i
+    let s = float_arr_get src i
+    let _ = float_arr_set dst i (cur + s)
+    add_buf_inplace dst src n (i + 1)
+
+unwrap t = match t | Tensor d _ _ -> d
+
+relu_fwd src dst mask n i =
+  if i >= n then 0
+  else
+    let v = float_arr_get src i
+    let pos = if v > 0.0 then 1.0 else 0.0
+    let _ = float_arr_set mask i pos
+    let _ = float_arr_set dst i (v * pos)
+    relu_fwd src dst mask n (i + 1)
+
+-- ── Forward pass (inference-only: returns just probs, no activation cache). ──
+-- Same math as lm_transformer.rail:forward. `pe` is the raw float_arr from
+-- build_pe, not a Tensor. `seq` is the CURRENT sequence length — rebuild pe
+-- for the current seq each call.
+forward x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff =
+  let e = matmul x w_e
+  let ed = unwrap e
+  let _ = add_buf_inplace ed pe (seq * d) 0
+  let x_pe = e
+
+  let ln1_pack = layernorm_save x_pe ln_g ln_b
+  let ln1_out = head ln1_pack
+
+  let q = matmul ln1_out w_q
+  let k = matmul ln1_out w_k
+  let v = matmul ln1_out w_v
+  let kt = tensor_transpose k
+  let scores = matmul q kt
+  let scale = 1.0 / sqrt (int_to_float d)
+  let scaled = tensor_scale scores scale
+  let sd = unwrap scaled
+  let _ = apply_causal_mask_loop sd seq 0 0
+  let attn = tensor_softmax scaled
+  let attn_out = matmul attn v
+
+  let x_attn = tensor_add x_pe attn_out
+
+  let ln2_pack = layernorm_save x_attn ln_g ln_b
+  let ln2_out = head ln2_pack
+
+  let ffn_h_pre = matmul ln2_out w_f1
+  let ffn_h_pre_d = unwrap ffn_h_pre
+  let ffn_h_data = float_arr_new (seq * d_ff) 0.0
+  let ffn_mask = float_arr_new (seq * d_ff) 0.0
+  let _ = relu_fwd ffn_h_pre_d ffn_h_data ffn_mask (seq * d_ff) 0
+  let ffn_h = Tensor ffn_h_data (cons seq (cons d_ff [])) (compute_strides (cons seq (cons d_ff [])))
+  let ffn_out = matmul ffn_h w_f2
+
+  let x_blk = tensor_add x_attn ffn_out
+  let logits = matmul x_blk w_o
+  tensor_softmax logits
+
+-- ── Argmax over row `row` of a flat [seq, V] probs buffer ──
+argmax_row_inner probs row V j best_id best_val =
+  if j >= V then best_id
+  else
+    let p = float_arr_get probs (row * V + j)
+    if p > best_val then argmax_row_inner probs row V (j + 1) j p
+    else argmax_row_inner probs row V (j + 1) best_id best_val
+
+argmax_row probs row V =
+  argmax_row_inner probs row V 1 0 (float_arr_get probs (row * V))
+
+-- Pull the next-token id out of the Tensor probs returned by forward.
+next_from_probs probs_t seq V = match probs_t
+  | Tensor probs_data _ _ -> argmax_row probs_data (seq - 1) V
+
+-- ── O(n) list append (keeps ids in forward order so fill_onehot stays
+--    index-linear). Prompt is short, gen_len ≤ 80, so O(n) is fine. ──
+list_append xs y =
+  if length xs == 0 then cons y []
+  else cons (head xs) (list_append (tail xs) y)
+
+-- Replace any -1 (unknown-char) ids with 0 so fill_onehot can't hit a
+-- negative offset. Warned in main when any char was substituted.
+sanitize_loop ids acc =
+  if length ids == 0 then reverse acc
+  else
+    let id = head ids
+    let fixed = if id < 0 then 0 else id
+    sanitize_loop (tail ids) (cons fixed acc)
+
+sanitize_ids ids = sanitize_loop ids []
+
+any_unk ids =
+  if length ids == 0 then false
+  else if head ids < 0 then true
+  else any_unk (tail ids)
+
+-- ── One greedy generation step: build x/pe from current ids, run
+--    forward, return the argmax id at the last position. ──
+gen_step ids w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff =
+  let seq = length ids
+  let x_data = float_arr_new (seq * V) 0.0
+  let _ = fill_onehot x_data ids V seq 0
+  let x = Tensor x_data (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+  let pe = build_pe seq d
+  let probs_t = forward x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
+  next_from_probs probs_t seq V
+
+-- ── Generation loop. arena_mark/reset bounds peak memory: only next_id
+--    (a small tagged int) and the new cons-cell chain survive each step. ──
+gen_loop ids gen_count max_gen w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff =
+  if gen_count >= max_gen then ids
+  else
+    let mk = arena_mark 0
+    let next_id = gen_step ids w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff
+    let _ = arena_reset mk
+    let new_ids = list_append ids next_id
+    gen_loop new_ids (gen_count + 1) max_gen w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff
+
+-- ── Teacher-force helper: argmax at every position → decoded string. ──
+tf_chain_loop probs_data seq V i acc =
+  if i >= seq then reverse acc
+  else
+    let id = argmax_row probs_data i V
+    tf_chain_loop probs_data seq V (i + 1) (cons id acc)
+
+tf_argmax_chain probs_data seq V vocab =
+  let ids = tf_chain_loop probs_data seq V 0 []
+  decode vocab ids
+
+-- Destructure + decode argmax chain from a Tensor probs.
+tf_extract_chain probs_t seq V vocab = match probs_t
+  | Tensor probs_data _ _ -> tf_argmax_chain probs_data seq V vocab
+
+-- ── Run one prompt end-to-end and print the continuation. ──
+run_prompt label prompt vocab w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff max_gen =
+  let _ = print (cat ["\n--- ", label, " ---"])
+  let _ = print (cat ["prompt: ", prompt])
+  let raw_ids = encode vocab prompt
+  let had_unk = any_unk raw_ids
+  let _ = if had_unk then print "  (note: prompt had chars outside vocab — replaced with id 0)" else 0
+  let ids = sanitize_ids raw_ids
+  let out_ids = gen_loop ids 0 max_gen w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff
+  let text = decode vocab out_ids
+  let _ = print (cat ["output: ", text])
+  0
+
+main =
+  let _ = print "=== Autoregressive inference from v0.2 checkpoint ==="
+
+  -- Rebuild vocab from the same corpus the trainer used. build_vocab is
+  -- deterministic by first-appearance order, so IDs match the checkpoint
+  -- iff the corpus text matches byte-for-byte.
+  let text = corpus 0
+  let vocab = build_vocab text
+  let V = vocab_size vocab
+  let _ = print (cat ["vocab size: ", show V, " (expected 32)"])
+
+  let d = 64
+  let d_ff = 256
+  let max_gen = 80
+
+  let _ = print "loading checkpoint training/rail_native/checkpoints/latest.*"
+  let weights = load_model "/Users/ledaticempire/projects/rail/training/rail_native/checkpoints/latest"
+  let _ = print (cat ["loaded ", show (length weights), " tensors (expected 9)"])
+  let w_e = list_nth 0 weights
+  let w_q = list_nth 1 weights
+  let w_k = list_nth 2 weights
+  let w_v = list_nth 3 weights
+  let w_o = list_nth 4 weights
+  let w_f1 = list_nth 5 weights
+  let w_f2 = list_nth 6 weights
+  let ln_g = list_nth 7 weights
+  let ln_b = list_nth 8 weights
+
+  -- ── Teacher-force diagnostic ─────────────────────────────
+  -- Feed the full training corpus as input, take the argmax at each
+  -- position, and decode. This replicates sample_greedy from
+  -- lm_transformer.rail and tells us whether the weights actually encode
+  -- the memorized mapping. The v0.2 model card showed a coherent shifted-
+  -- by-1 corpus from this procedure — BUT it used the buggy fill_onehot,
+  -- so the coherent output reflects what the model learned given every-
+  -- other-char input, not a true memorization of the full corpus.
+  let _ = print "\n--- Teacher-force on full corpus (buggy input path, matches training) ---"
+  let all_ids = encode vocab text
+  let total = length all_ids
+  let full_seq = total - 1
+  let tf_x_data = float_arr_new (full_seq * V) 0.0
+  let _ = fill_onehot_buggy tf_x_data all_ids V full_seq 0
+  let tf_x = Tensor tf_x_data (cons full_seq (cons V [])) (compute_strides (cons full_seq (cons V [])))
+  let tf_pe = build_pe full_seq d
+  let tf_probs = forward tf_x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b tf_pe full_seq V d d_ff
+  let tf_out = tf_extract_chain tf_probs full_seq V vocab
+  let _ = print tf_out
+
+  let _ = print "\n--- Teacher-force on full corpus (correct input path) ---"
+  let tf_x2_data = float_arr_new (full_seq * V) 0.0
+  let _ = fill_onehot tf_x2_data all_ids V full_seq 0
+  let tf_x2 = Tensor tf_x2_data (cons full_seq (cons V [])) (compute_strides (cons full_seq (cons V [])))
+  let tf_pe2 = build_pe full_seq d
+  let tf_probs2 = forward tf_x2 w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b tf_pe2 full_seq V d d_ff
+  let tf_out2 = tf_extract_chain tf_probs2 full_seq V vocab
+  let _ = print tf_out2
+
+  -- ── Autoregressive inference ──────────────────────────────
+  -- Prompt 1: memorized prefix from the training corpus.
+  let _ = run_prompt "Memorized prefix" "To be" vocab w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff max_gen
+
+  -- Prompt 2: chars are all in-vocab but the exact prefix never appears
+  -- in the training corpus.
+  let _ = run_prompt "Off-corpus prefix" "let us" vocab w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff max_gen
+
+  let _ = print "\n=== done ==="
+  0
