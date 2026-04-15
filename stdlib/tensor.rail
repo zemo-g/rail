@@ -213,40 +213,37 @@ foreign tgl_ce_softmax_backward_f64 probs targets grad batch vocab -> int
 foreign tgl_layernorm_backward_f64 x mean rstd gamma dy dx rows dim -> int
 
 -- Has dylib been initialized this process?
-gpu_dylib_flag = float_arr_new 1 0.0
-
+-- Note: the previous top-level `float_arr` cache was broken by Rail's
+-- re-evaluate-per-reference rule for nullary bindings (float_arr_new
+-- runs fresh on every reference), so ensure_dylib paid a shell + tgl_init
+-- on EVERY matmul call. Fix: tgl_init is idempotent (the dylib has its
+-- own g_initialized flag); call it unconditionally and trust it. Shell
+-- existence check is compile-time anyway — if the dylib weren't linked,
+-- ld would have failed, so this symbol exists by construction.
 ensure_dylib _ =
-  let cached = float_arr_get gpu_dylib_flag 0
-  if cached > 0.5 then true
-  else if cached < (0.0 - 0.5) then false
-  else
-    -- First call: check if dylib exists and try init
-    let has_lib = str_contains "1" (shell "test -f /Users/ledaticempire/projects/rail/tools/metal/libtensor_gpu.dylib && echo 1 || echo 0")
-    if has_lib then
-      let _ = tgl_init 0
-      let _ = float_arr_set gpu_dylib_flag 0 1.0
-      true
-    else
-      let _ = float_arr_set gpu_dylib_flag 0 (0.0 - 1.0)
-      false
+  let _ = tgl_init 0
+  true
 
--- GPU matmul: dylib (fastest), binary file (fallback), text file (last resort)
+-- GPU matmul: in-process dylib. Zero-copy path, ~1ms per 128x128 matmul.
+-- The historical binary-file and text-file fallbacks were dropped from the
+-- hot path — if the dylib isn't linked, link would fail at build time.
+-- Callers needing a non-dylib path should call gpu_matmul_file (below)
+-- explicitly. This keeps the common case branch-free.
 gpu_matmul_dispatch a_data b_data m k n =
-  if ensure_dylib 0 then
-    -- Zero-copy path: pass float_arr pointers directly to dylib
-    let result = float_arr_new (m * n) 0.0
-    let _ = tgl_matmul_f64 a_data b_data result m k n
-    result
-  else
-    -- Binary path fallback
-    let _ = float_arr_to_f32_file "/tmp/rail_tg_a.bin" a_data (m * k)
-    let _ = float_arr_to_f32_file "/tmp/rail_tg_b.bin" b_data (k * n)
-    let cmd = join "" (cons gpu_binary_path (cons " matmul_bin " (cons (show m) (cons " " (cons (show k) (cons " " (cons (show n) (cons " /tmp/rail_tg_a.bin /tmp/rail_tg_b.bin /tmp/rail_tg_c.bin" []))))))))
-    let _ = shell cmd
-    let result = float_arr_new (m * n) 0.0
-    let _ = float_arr_from_f32_file "/tmp/rail_tg_c.bin" result (m * n)
-    let _ = shell "rm -f /tmp/rail_tg_a.bin /tmp/rail_tg_b.bin /tmp/rail_tg_c.bin 2>/dev/null"
-    result
+  let result = float_arr_new (m * n) 0.0
+  let _ = tgl_matmul_f64 a_data b_data result m k n
+  result
+
+-- Legacy binary-file dispatch, kept for debugging. ~50ms/call.
+gpu_matmul_file a_data b_data m k n =
+  let _ = float_arr_to_f32_file "/tmp/rail_tg_a.bin" a_data (m * k)
+  let _ = float_arr_to_f32_file "/tmp/rail_tg_b.bin" b_data (k * n)
+  let cmd = join "" (cons gpu_binary_path (cons " matmul_bin " (cons (show m) (cons " " (cons (show k) (cons " " (cons (show n) (cons " /tmp/rail_tg_a.bin /tmp/rail_tg_b.bin /tmp/rail_tg_c.bin" []))))))))
+  let _ = shell cmd
+  let result = float_arr_new (m * n) 0.0
+  let _ = float_arr_from_f32_file "/tmp/rail_tg_c.bin" result (m * n)
+  let _ = shell "rm -f /tmp/rail_tg_a.bin /tmp/rail_tg_b.bin /tmp/rail_tg_c.bin 2>/dev/null"
+  result
 
 -- GPU relu: daemon (fast) or file-mode (fallback)
 gpu_relu_dispatch src_data n =
