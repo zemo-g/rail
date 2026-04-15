@@ -2,6 +2,110 @@
 
 All notable changes to Rail are documented here.
 
+## v2.17.0 – v2.21.0 (2026-04-15) — *Fork B session: Rail self-trains on Metal, end-to-end*
+
+One long session. Eight commits. Takes Rail from "trains a tiny
+transformer at d=16 via stale code with a broken dispatch" to
+"trains d=64 transformer end-to-end, beats bigram baseline in a
+fraction of the wall time, with Metal matmul dispatch actually
+on the hot path." The strategic plan lives at `FORK_B_PLAN.md`.
+
+### v2.17.0 — Fork B M1-M3 foundation
+- Cleared stale `EXPERIMENTAL — INCOMPLETE` banner in
+  `stdlib/autograd.rail` (the claimed 13-primitive gap was closed
+  long ago; gradchecks 18/18 and 9/9 green).
+- `tools/train/lm_transformer.rail` bumped to 2000 steps / warmup
+  100. Final loss 2.098 on the Shakespeare excerpt — beats the
+  v2.3 bigram baseline (2.10) and v2.4 attn-only (2.62).
+- New `tools/metal/tensor_daemond.m`: long-lived ObjC binary
+  wrapping `libtensor_gpu.dylib` over TCP 127.0.0.1:9302. Exposes
+  23 kernels. C client bench: 0.44ms/call on 128x128 matmul
+  (6.6 GFLOPS), proof that Metal-from-Rail is reachable in a
+  hermetic sibling process.
+
+### v2.18.0 — arity-gate channel `send`/`recv`
+Compiler unblock. `compile.rail` codegen at `fname == "send"`
+and `fname == "recv"` was intercepting ALL calls regardless of
+arity, routing everything to `_rail_chan_send` /
+`_rail_chan_recv`. Socket FFI calls (4-arg `send`/`recv` from
+`stdlib/socket.rail`) silently dispatched to channel code and
+segfaulted. Fixed with arity gates: arity 2 `send` and arity 1
+`recv` → channel (unchanged). Higher arity → falls through to
+normal FFI dispatch. Self-compile still byte-identical; tests
+106/106. Rail code can now use BSD sockets directly.
+
+### v2.19.0 — batched f32 file I/O (11x speedup on disk path)
+Compiler unblock #2. `_rail_float_arr_to_f32_file` and
+`_rail_float_arr_from_f32_file` were emitting **one syscall per
+float**: 16,384 write(fd,ptr,4) calls per 64KB f32 file. Fix:
+malloc N*4, fill/drain in a pure register loop, single
+read/write syscall, free. Zero behavior change, 11x faster.
+
+### v2.20.0 — simplify gpu_matmul_dispatch (60x speedup over CPU)
+`ensure_dylib` was caching its result in a top-level
+`float_arr` — but Rail re-evaluates nullary `name = expr`
+bindings on every reference, so every matmul paid a shell
+`test -f ...` existence check. The if-then-else branch with a
+shell fallback also seemed to inhibit optimization. Fix: trust
+`tgl_init` (idempotent), branch-free dispatch. Legacy
+binary-file path preserved as `gpu_matmul_file` for debugging.
+Result: ~2.8ms/call for 256x256 matmul via dispatch, vs 170ms
+CPU — 60x speedup, visible in actual training.
+
+### v2.21.0 — lm_transformer scale-up to d=64
+Bumped `d` 16→64, `d_ff` 64→256, `init_weight` scale 0.05→0.01
+(without the init fix, d=64 loss explodes from ~17), peak_lr
+0.05→0.02. Added `arena_mark` / `arena_reset` around each
+`train_step` so intermediate tensors don't accumulate.
+
+**Result:** 500 steps at d=64 → loss **1.796** in 2.75 min.
+That's a lower loss in 6× less wall time than the d=16 2000-step
+run (which hit 2.098 in 17 min). Metal matmul dispatch is
+genuinely on the hot path: the larger matmul sizes (seq=382 ×
+d=64 × d=64 for attention, × 256 for FFN) cross the CPU/dylib
+crossover.
+
+### Also this session (intermediate commits, no version bump)
+- `stdlib/tensord.rail` + `tools/metal/tensord_smoke.rail` —
+  Rail client talks directly to `tensor_daemond` via
+  `stdlib/socket.rail`. End-to-end verified. Measured 34ms/call
+  at 128x128 (pre-batched-IO), 5.6ms/call (post-batched-IO).
+- Scale benches: `tools/metal/bench_*.rail` sweep tensord vs
+  CPU across sizes 128/256. Tensord wins 6.8x over CPU at
+  256x256.
+- `tools/train/rail_native_loop.sh` + launchd plist —
+  unattended training harness ready to bootstrap. Kill switch
+  at `~/.ledatic/data/.rail_train_kill`.
+- `training/rail_native/{checkpoints,logs,data}/` directory
+  layout + 553KB Rail stdlib corpus prebuilt at
+  `training/rail_native/data/corpus.txt`.
+
+### Latent compiler bug documented but not fixed
+Top-level `name = expr` bindings (with no arguments) are
+re-evaluated on every reference instead of memoized. Affects any
+global cache pattern. Worked around in two places this session
+(`tensord_fd_cache`, `gpu_dylib_flag`). A proper fix would
+memoize nullary top-level defs with a static value slot + lazy
+init on first call. Queued for next session.
+
+### What didn't pay off
+The `tensor_daemond` daemon path turned out orthogonal to the
+main win. DLOPEN_STATUS.md (2026-04-13) claimed Rail→Metal dylib
+segfaulted — today's test says otherwise: `tgl_matmul_f64` via
+foreign FFI runs clean. The `__attribute__((constructor))` fix
+in `tensor_gpu_lib.m` resolved the ObjC-runtime init issue, the
+DLOPEN_STATUS write-up was just stale. The in-process dylib
+ends up at ~1ms/call raw, while the daemon IPC is 5-25ms/call.
+Daemon is preserved for cross-process ML serving and
+future-proofing but is not on the current training hot path.
+
+### Session retrospective
+The three load-bearing compiler fixes (v2.18, v2.19, v2.20)
+all fit the same pattern: a user-space layer was fighting an
+overhead hidden in codegen or a stale cache. Each fix was
+targeted and small, each enabled the next step downstream.
+v2.21 was just "turn the dial" once the pipeline was clean.
+
 ## v2.16.0 (2026-04-14) — *WASM: fold with bare named functions*
 
 Closes the last v2.15-deferred item.  Passing a bare **arity-2**
