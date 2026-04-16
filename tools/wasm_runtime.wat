@@ -1,25 +1,86 @@
-  ;; Heap bump allocator
-  (global $heap_ptr (mut i32) (i32.const 65536))
-  (func $alloc (param $size i32) (result i32)
-    (local $ptr i32)
-    global.get $heap_ptr
-    local.set $ptr
-    global.get $heap_ptr
+  ;; ─── Memory layout (1 MB total, 16 pages) ────────────────────
+  ;;   0x000000 .. 0x010000  (64K)  — WAT data segments + nil sentinel
+  ;;   0x010000 .. 0x014000  (16K)  — shadow stack (2K i64 root slots)
+  ;;   0x014000 .. 0x020000  (48K)  — string heap (no GC, monotonic)
+  ;;   0x020000 .. 0x090000  (448K) — from-space (active GC heap)
+  ;;   0x090000 .. 0x100000  (448K) — to-space (inactive)
+  ;; Structured objects (cons/closure/ADT/float_arr) live in the GC
+  ;; heap; strings live in the string heap and are never moved or
+  ;; reclaimed.  Cross-region pointers (cons-of-string, closure-with-
+  ;; string-fv) are safe — the collector only forwards pointers that
+  ;; lie within the active semi-space.
+
+  (global $shadow_ptr (mut i32) (i32.const 0x10000))
+  (global $str_ptr    (mut i32) (i32.const 0x14000))
+  (global $obj_ptr    (mut i32) (i32.const 0x20000))
+  (global $from_base  (mut i32) (i32.const 0x20000))
+  (global $from_end   (mut i32) (i32.const 0x90000))
+  (global $to_base    (mut i32) (i32.const 0x90000))
+  (global $to_end     (mut i32) (i32.const 0x100000))
+  (global $gc_count   (mut i32) (i32.const 0))
+
+  ;; alloc_str — bump a string-heap region.  Strings have an i32
+  ;; length prefix only (no GC header) and are referenced by tagged
+  ;; pointers like any other heap value, but the collector ignores
+  ;; them because they lie outside [from_base, from_end).
+  (func $alloc_str (param $size i32) (result i32)
+    (local $p i32)
+    global.get $str_ptr
+    local.tee $p
     local.get $size
     i32.add
-    global.set $heap_ptr
-    local.get $ptr
+    global.set $str_ptr
+    local.get $p
   )
 
-  ;; Arena mark/reset — snapshot and restore the bump pointer.
-  ;; Usage from Rail:
-  ;;   let mk = arena_mark 0
-  ;;   ... allocate scratch ...
-  ;;   let _ = arena_reset mk
-  ;; Everything allocated after arena_mark is freed by arena_reset.
-  ;; Returns the bump pointer as a tagged int.
+  ;; alloc_obj — bump in active semi-space; trigger GC if full.
+  ;; Every structured object's first i64 word is a header of the form
+  ;;   (size_in_bytes << 8) | kind
+  ;; with kind ∈ { 1=cons, 2=nil, 4=closure, 5=ADT, 7=float_arr }.
+  ;; The collector reads bottom byte to dispatch and bits 8..31 for
+  ;; the object size.  Bit 63 is the forwarding-pointer flag.
+  (func $alloc_obj (param $size i32) (result i32)
+    (local $p i32)
+    global.get $obj_ptr
+    local.get $size
+    i32.add
+    global.get $from_end
+    i32.gt_u
+    if
+      call $gc_collect
+      ;; After GC, retry once.  If still over budget, the loop demo
+      ;; outgrew 448K live data — accept OOM (out-of-memory trap).
+      global.get $obj_ptr
+      local.get $size
+      i32.add
+      global.get $from_end
+      i32.gt_u
+      if
+        unreachable
+      end
+    end
+    global.get $obj_ptr
+    local.tee $p
+    local.get $size
+    i32.add
+    global.set $obj_ptr
+    local.get $p
+  )
+
+  ;; Back-compat $alloc — defaults to the string heap so any caller
+  ;; that doesn't need GC tracking (string buffers, scratch, float
+  ;; arrays of raw f64 bits) keeps working unchanged.  Structured
+  ;; objects (cons / closure / ADT) call $alloc_obj explicitly.
+  (func $alloc (param $size i32) (result i32)
+    local.get $size
+    call $alloc_str
+  )
+
+  ;; Arena mark/reset — operate on the string heap only.  Structured
+  ;; objects survive across resets (the GC owns them).  Used by long
+  ;; loops that build up scratch strings.
   (func $arena_mark (param $dummy i64) (result i64)
-    global.get $heap_ptr
+    global.get $str_ptr
     i64.extend_i32_u
     i64.const 1
     i64.shl
@@ -32,9 +93,283 @@
     i64.const 1
     i64.shr_s
     i32.wrap_i64
-    global.set $heap_ptr
-    i64.const 3  ;; tagged 1
+    global.set $str_ptr
+    i64.const 3
   )
+
+  ;; ─── Cheney copying collector ────────────────────────────────
+  ;; Walk shadow-stack [0x10000 .. $shadow_ptr) as i64 root array.
+  ;; For each tagged root (low bit 0) that points into from-space,
+  ;; forward the pointed object to to-space.  Then scan to-space
+  ;; objects breadth-first, forwarding their interior pointers.
+  ;; Finally swap from/to and reset $obj_ptr.
+
+  (func $gc_forward (param $tagged i64) (result i64)
+    (local $addr i32)
+    (local $hdr i64)
+    (local $size i32)
+    (local $new i32)
+    (local $i i32)
+    ;; Skip integers (low bit 1).
+    local.get $tagged
+    i64.const 1
+    i64.and
+    i64.const 1
+    i64.eq
+    if
+      local.get $tagged
+      return
+    end
+    ;; Untagged address.
+    local.get $tagged
+    i64.const 1
+    i64.shr_u
+    i32.wrap_i64
+    local.set $addr
+    ;; Outside from-space: do not forward (string, nil sentinel,
+    ;; static data, or already in to-space).
+    local.get $addr
+    global.get $from_base
+    i32.lt_u
+    if
+      local.get $tagged
+      return
+    end
+    local.get $addr
+    global.get $from_end
+    i32.ge_u
+    if
+      local.get $tagged
+      return
+    end
+    ;; Read header.
+    local.get $addr
+    i64.load
+    local.set $hdr
+    ;; Already forwarded? (bit 63 set) — return forwarded address tagged.
+    local.get $hdr
+    i64.const 0
+    i64.lt_s
+    if
+      local.get $hdr
+      i64.const 0x7fffffffffffffff
+      i64.and
+      i64.const 1
+      i64.shl
+      return
+    end
+    ;; Extract size from header bits 8..31.
+    local.get $hdr
+    i64.const 8
+    i64.shr_u
+    i64.const 0xffffff
+    i64.and
+    i32.wrap_i64
+    local.set $size
+    ;; Bump-allocate in to-space.
+    global.get $obj_ptr
+    local.set $new
+    global.get $obj_ptr
+    local.get $size
+    i32.add
+    global.set $obj_ptr
+    ;; Copy size bytes from $addr to $new (8-byte chunks).
+    i32.const 0
+    local.set $i
+    block $cpd
+      loop $cpl
+        local.get $i
+        local.get $size
+        i32.ge_u
+        br_if $cpd
+        local.get $new
+        local.get $i
+        i32.add
+        local.get $addr
+        local.get $i
+        i32.add
+        i64.load
+        i64.store
+        local.get $i
+        i32.const 8
+        i32.add
+        local.set $i
+        br $cpl
+      end
+    end
+    ;; Install forwarding pointer in old header (bit 63 + new addr).
+    local.get $addr
+    local.get $new
+    i64.extend_i32_u
+    i64.const 0x8000000000000000
+    i64.or
+    i64.store
+    ;; Return tagged new address.
+    local.get $new
+    i64.extend_i32_u
+    i64.const 1
+    i64.shl
+  )
+
+  (func $gc_scan_object (param $addr i32)
+    (local $hdr i64)
+    (local $kind i32)
+    (local $size i32)
+    (local $off i32)      ;; current field offset within object
+    (local $faddr i32)    ;; absolute address of current field
+    (local $val i64)
+    (local $newval i64)
+    local.get $addr
+    i64.load
+    local.set $hdr
+    local.get $hdr
+    i64.const 0xff
+    i64.and
+    i32.wrap_i64
+    local.set $kind
+    local.get $hdr
+    i64.const 8
+    i64.shr_u
+    i64.const 0xffffff
+    i64.and
+    i32.wrap_i64
+    local.set $size
+    ;; Determine first interior-field offset by kind.
+    ;;   1 (cons):    fields at +8, +16
+    ;;   4 (closure): fields at +16 .. +size  (skip lambda_idx at +8)
+    ;;   5 (ADT):     fields at +16 .. +size  (skip ctor_idx at +8)
+    ;;   7 (float):   no scan (raw f64 bits)
+    ;;   else:        no scan
+    local.get $kind
+    i32.const 1
+    i32.eq
+    if
+      i32.const 8
+      local.set $off
+    else
+      local.get $kind
+      i32.const 4
+      i32.eq
+      local.get $kind
+      i32.const 5
+      i32.eq
+      i32.or
+      if
+        i32.const 16
+        local.set $off
+      else
+        return
+      end
+    end
+    block $scd
+      loop $scl
+        local.get $off
+        local.get $size
+        i32.ge_u
+        br_if $scd
+        local.get $addr
+        local.get $off
+        i32.add
+        local.set $faddr
+        local.get $faddr
+        i64.load
+        local.set $val
+        local.get $val
+        call $gc_forward
+        local.set $newval
+        local.get $faddr
+        local.get $newval
+        i64.store
+        local.get $off
+        i32.const 8
+        i32.add
+        local.set $off
+        br $scl
+      end
+    end
+  )
+
+  (func $gc_collect
+    (local $root i32)
+    (local $scan i32)
+    (local $tagged i64)
+    (local $newtag i64)
+    ;; Swap from/to (XOR-style would need locals; simpler: gather then assign).
+    global.get $from_base
+    global.get $to_base
+    global.set $from_base   ;; from_base := old to_base
+    global.set $to_base     ;; to_base   := old from_base
+    global.get $from_end
+    global.get $to_end
+    global.set $from_end    ;; from_end := old to_end
+    global.set $to_end      ;; to_end   := old from_end
+    ;; Reset obj_ptr to (new) from_base — we'll bump as we copy.
+    global.get $from_base
+    global.set $obj_ptr
+    ;; Scan shadow stack.
+    i32.const 0x10000
+    local.set $root
+    block $rd
+      loop $rl
+        local.get $root
+        global.get $shadow_ptr
+        i32.ge_u
+        br_if $rd
+        local.get $root
+        i64.load
+        local.set $tagged
+        local.get $tagged
+        call $gc_forward
+        local.set $newtag
+        local.get $root
+        local.get $newtag
+        i64.store
+        local.get $root
+        i32.const 8
+        i32.add
+        local.set $root
+        br $rl
+      end
+    end
+    ;; Cheney scan: walk newly-copied objects in to-space (now $from).
+    global.get $from_base
+    local.set $scan
+    block $sd
+      loop $sl
+        local.get $scan
+        global.get $obj_ptr
+        i32.ge_u
+        br_if $sd
+        local.get $scan
+        call $gc_scan_object
+        ;; Advance scan by object size.
+        local.get $scan
+        i64.load
+        i64.const 8
+        i64.shr_u
+        i64.const 0xffffff
+        i64.and
+        i32.wrap_i64
+        local.get $scan
+        i32.add
+        local.set $scan
+        br $sl
+      end
+    end
+    global.get $gc_count
+    i32.const 1
+    i32.add
+    global.set $gc_count
+  )
+
+  ;; Note: a shadow-stack frame helper for user functions would live
+  ;; here.  We don't yet emit prologue/epilogue spills in user-function
+  ;; codegen — currently only $cons spills its operand-stack roots,
+  ;; which is sufficient for the loop-allocation stress test (n + nil
+  ;; are not heap pointers).  Programs that hold heap-pointer locals
+  ;; across a GC-triggering call would lose those roots; that is a
+  ;; documented limitation, addressed by adding per-function frames in
+  ;; a follow-up pass.
 
   ;; ─── Float intrinsics and conversions ────────────────────────
   ;; All floats travel as raw f64 bits stored in i64 (matches the
@@ -1073,22 +1408,46 @@
 
   (func $cons (param $hd i64) (param $tl i64) (result i64)
     (local $ptr i32)
+    (local $hd_slot i32)
+    (local $tl_slot i32)
+    ;; Spill operand-stack args to shadow stack so GC (triggered inside
+    ;; $alloc_obj) sees them as roots.  The slots live above the
+    ;; caller's frame; we restore $shadow_ptr before returning so they
+    ;; are reclaimed automatically.
+    global.get $shadow_ptr
+    local.tee $hd_slot
+    local.get $hd
+    i64.store
+    global.get $shadow_ptr
+    i32.const 8
+    i32.add
+    local.tee $tl_slot
+    local.get $tl
+    i64.store
+    global.get $shadow_ptr
+    i32.const 16
+    i32.add
+    global.set $shadow_ptr
     i32.const 24
-    call $alloc
+    call $alloc_obj
     local.set $ptr
     local.get $ptr
-    i64.const 1
+    i64.const 6145  ;; (24 << 8) | 1
     i64.store
     local.get $ptr
     i32.const 8
     i32.add
-    local.get $hd
+    local.get $hd_slot
+    i64.load
     i64.store
     local.get $ptr
     i32.const 16
     i32.add
-    local.get $tl
+    local.get $tl_slot
+    i64.load
     i64.store
+    local.get $hd_slot
+    global.set $shadow_ptr
     local.get $ptr
     i64.extend_i32_u
     i64.const 1
