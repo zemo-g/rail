@@ -824,6 +824,28 @@ is_int node env =
     else efind (cat ["__rt_", fname]) env != (0 - 1)
   else false
 
+-- Track B: precise type of a let-bound RHS, looked up from the per-function
+-- env that holds inject_fret_markers' __ret_<fname> entries.
+-- Returns 0 (UNKNOWN), 1 (INT), 2 (FLOAT), or 3 (HEAP). Only patterns we can
+-- decide from local syntax + global return-type map; conservative otherwise.
+let_binding_ty node env =
+  let tg = head node
+  if tg == "I" then 1
+  else if tg == "FL" then 2
+  else if tg == "B" then 1
+  else if tg == "S" then 3
+  else if tg == "NULL" then 3
+  else if tg == "L" then 3
+  else if tg == "T" then 3
+  else if tg == "F" then 3
+  else if tg == "A" then
+    let (fname, _) = flat node
+    if fname == "_expr" then 0
+    else
+      let r = efind (cat ["__ret_", fname]) env
+      if r == (0 - 1) then 0 else r
+  else 0
+
 is_float node env =
   let tg = head node
   if tg == "FL" then true
@@ -1381,6 +1403,10 @@ cg2 node env ar lc sl tg tp fs =
     let env2 = if is_int vl env then cons (cat ["__int_", nm], 1) env2 else env2
     let vl_is_float = is_float vl env
     let env2 = if vl_is_float then cons (cat ["__float_", nm], 1) env2 else env2
+    -- Track B: tag the binding with its inferred precise type for the
+    -- precise-GC stack-slot map. 0 = UNKNOWN (skip), 1=INT, 2=FLOAT, 3=HEAP.
+    let bind_ty = let_binding_ty vl env
+    let env2 = if bind_ty != 0 then cons (cat ["__ty_", nm], bind_ty) env2 else env2
     let (ba, lc2, sl2) = cg bd env2 ar lc1 (sl + 8) tp fs
     (cat [va, "    str x0, [x29, #", show sl, "]\n", ba], lc2, sl2)
   else if tg == "L" then
@@ -1943,12 +1969,16 @@ mark_int_params params body env =
 
 mark_float_params params body env = env
 
--- Copy __float_ret_ entries from arity map into local env
+-- Copy __float_ret_ AND __ret_ entries from arity map into local env.
+-- __float_ret_ feeds the existing native-float emitter; __ret_ feeds
+-- cg2's let-binding type tagging (track B / precise-GC).
 inject_fret_markers ar env =
   if length ar == 0 then env
   else
     let (k, v) = head ar
     if str_contains "__float_ret_" k then
+      inject_fret_markers (tail ar) (cons (k, v) env)
+    else if str_contains "__ret_" k then
       inject_fret_markers (tail ar) (cons (k, v) env)
     else inject_fret_markers (tail ar) env
 
@@ -2025,7 +2055,11 @@ get_arities decls =
   let fret_pass1 = collect_float_ret_fns decls []
   let fret_pass2 = collect_float_ret_fns decls fret_pass1
   let fret_markers = mk_fret_markers fret_pass2
-  append fret_markers (append builtin_foreign_arities user_ar)
+  let base_ar = append fret_markers (append builtin_foreign_arities user_ar)
+  -- Cross-function return-type inference (track B). Markers consumed by
+  -- inject_ret_markers + cg2's let-binding type tagging.
+  let ret_markers = infer_return_types decls base_ar
+  append ret_markers base_ar
 
 -- Scan function declarations: if returns_float, add name to list
 collect_float_ret_fns decls known =
@@ -2044,6 +2078,165 @@ collect_float_ret_fns decls known =
 mk_fret_markers names =
   if length names == 0 then []
   else cons (cat ["__float_ret_", head names], 1) (mk_fret_markers (tail names))
+
+-- ────────────────────────────────────────────────────────────────────────
+-- Cross-function return-type inference (track B of precise-GC plan).
+-- Tags: 0 = UNKNOWN, 1 = INT, 2 = FLOAT, 3 = HEAP.
+-- Output: (__ret_<fname>, tag) entries appended to the arity map. Phase 2
+-- of the precise-GC plan reads these to refine stack-slot type tags so
+-- function-call results aren't conservatively scanned.
+-- ────────────────────────────────────────────────────────────────────────
+
+ty_lub a b =
+  if a == 0 then b
+  else if b == 0 then a
+  else if a == b then a
+  else 0
+
+infer_is_float_builtin n =
+  n == "to_float" || n == "int_to_float" || n == "float_arr_get" || n == "fneg" || n == "fsqrt" || n == "fabs" || n == "parse_float" || n == "sqrt" || n == "sin" || n == "cos" || n == "tanh" || n == "exp" || n == "log" || n == "pow" || n == "floor" || n == "ceil" || n == "atan2"
+
+infer_is_int_builtin n =
+  n == "length" || n == "str_to_int" || n == "ord" || n == "float_to_int" || n == "byte_get" || n == "arr_len" || n == "str_find" || n == "is_error" || n == "char_to_int" || n == "to_int" || n == "fcmp_lt" || n == "fcmp_eq"
+
+infer_is_heap_builtin n =
+  n == "cat" || n == "join" || n == "show" || n == "show_float" || n == "cons" || n == "append" || n == "reverse" || n == "map" || n == "filter" || n == "range" || n == "chars" || n == "split" || n == "str_split" || n == "str_replace" || n == "str_sub" || n == "trim" || n == "read_file" || n == "read_line" || n == "shell" || n == "arr_new" || n == "float_arr_new" || n == "err_msg" || n == "tokenize" || n == "tokenize_with_pos"
+
+-- Decode the arity field for a fname out of the arity map.
+-- Returns (0 - 1) when not found.
+infer_arity_of fname ar =
+  let v = efind fname ar
+  if v == (0 - 1) then 0 - 1
+  else if v < (0 - 99) then
+    let raw = 0 - v - 100
+    raw % 100
+  else if v >= 1000 then v % 1000
+  else v
+
+-- Map a function call to a return type tag.
+infer_call_ty fname args ar rmap =
+  let n_args = length args
+  let expected = infer_arity_of fname ar
+  if expected != (0 - 1) && n_args < expected then 3
+  else if infer_is_float_builtin fname then 2
+  else if infer_is_int_builtin fname then 1
+  else if infer_is_heap_builtin fname then 3
+  else
+    let av = efind fname ar
+    if av != (0 - 1) && av < (0 - 99) then 3
+    else if av >= 1000 && av < 2000 then 1
+    else if av >= 2000 && av < 3000 then 3
+    else if av >= 3000 && av < 4000 then 2
+    else if av >= 4000 then 0
+    else if av == (0 - 1) then 0
+    else
+      let r = efind (cat ["__ret_", fname]) rmap
+      if r == (0 - 1) then 0 else r
+
+-- Type of an expression node under the in-progress rmap.
+infer_ty node ar rmap =
+  let tg = head node
+  if tg == "I" then 1
+  else if tg == "FL" then 2
+  else if tg == "S" then 3
+  else if tg == "B" then 1
+  else if tg == "NULL" then 3
+  else if tg == "L" then 3
+  else if tg == "T" then 3
+  else if tg == "F" then 3
+  else if tg == "V" then 0
+  else if tg == "O" then
+    let op = head (tail node)
+    if op == "<" || op == ">" || op == "<=" || op == ">=" || op == "==" || op == "!=" || op == "&&" || op == "||" then 1
+    else if op == "%" then 1
+    else if op == "+" || op == "-" || op == "*" || op == "/" then
+      let l = infer_ty (head (tail (tail node))) ar rmap
+      let r = infer_ty (head (tail (tail (tail node)))) ar rmap
+      -- Arithmetic on tagged ints/floats never produces a heap pointer.
+      -- Explicit float anywhere → FLOAT; otherwise default INT (covers
+      -- unknown × unknown, int × unknown). Safe for GC: misclassifying
+      -- a float return as INT only causes the slot to be skipped (correct).
+      if l == 2 || r == 2 then 2
+      else 1
+    else 0
+  else if tg == "?" then
+    let t = infer_ty (head (tail (tail node))) ar rmap
+    let e = infer_ty (head (tail (tail (tail node)))) ar rmap
+    ty_lub t e
+  else if tg == "D" || tg == "TD" then
+    infer_ty (head (tail (tail (tail node)))) ar rmap
+  else if tg == "M" then
+    infer_arms_ty (head (tail (tail node))) ar rmap 0 false
+  else if tg == "A" then
+    let (fname, args) = flat node
+    if fname == "_expr" then 0
+    else if fname == "try" then 0
+    else infer_call_ty fname args ar rmap
+  else 0
+
+-- lub of arm bodies. `seen` = whether we've folded any arm yet.
+infer_arms_ty arms ar rmap acc seen =
+  if length arms == 0 then acc
+  else
+    let arm = head arms
+    let body = head (tail (tail arm))
+    let t = infer_ty body ar rmap
+    let new_acc = if seen then ty_lub acc t else t
+    infer_arms_ty (tail arms) ar rmap new_acc true
+
+-- Initial map: every user fn at UNKNOWN.
+init_rmap decls =
+  if length decls == 0 then []
+  else
+    let d = head decls
+    if head d == "fn" then
+      cons (cat ["__ret_", head (tail d)], 0) (init_rmap (tail decls))
+    else init_rmap (tail decls)
+
+rmap_set key val env =
+  if length env == 0 then [(key, val)]
+  else
+    let (k, v) = head env
+    if k == key then cons (key, val) (tail env)
+    else cons (k, v) (rmap_set key val (tail env))
+
+-- One refinement pass: re-walk every user fn body, update its rmap entry.
+refine_rmap decls ar rmap =
+  if length decls == 0 then rmap
+  else
+    let d = head decls
+    if head d == "fn" then
+      let nm = head (tail d)
+      let bd = head (tail (tail (tail d)))
+      let new_ty = infer_ty bd ar rmap
+      let key = cat ["__ret_", nm]
+      let cur = efind key rmap
+      let merged = if cur == 0 then new_ty
+                   else if new_ty == 0 then cur
+                   else if cur == new_ty then cur
+                   else 0
+      let rmap2 = rmap_set key merged rmap
+      refine_rmap (tail decls) ar rmap2
+    else refine_rmap (tail decls) ar rmap
+
+rmap_eq a b =
+  if length a == 0 then true
+  else
+    let (k, v) = head a
+    if efind k b == v then rmap_eq (tail a) b
+    else false
+
+-- Fixpoint driver. Caps at 8 iterations (mutual recursion settles in 2-3).
+fixpoint_rmap decls ar rmap budget =
+  if budget <= 0 then rmap
+  else
+    let r2 = refine_rmap decls ar rmap
+    if rmap_eq r2 rmap && rmap_eq rmap r2 then rmap
+    else fixpoint_rmap decls ar r2 (budget - 1)
+
+infer_return_types decls ar =
+  let r0 = init_rmap decls
+  fixpoint_rmap decls ar r0 8
 
 builtin_foreign_arities =
   [("sqrt", 3001), ("sin", 3001), ("cos", 3001), ("tanh", 3001),
@@ -3176,6 +3369,40 @@ init_list lst =
   if length lst <= 1 then []
   else cons (head lst) (init_list (tail lst))
 
+-- Track B: inference test helpers. Verify infer_return_types' result by
+-- looking up __ret_<fname> in the arity map produced for `src`.
+infer_ty_str t =
+  if t == 0 then "UNKNOWN"
+  else if t == 1 then "INT"
+  else if t == 2 then "FLOAT"
+  else if t == 3 then "HEAP"
+  else "BAD"
+
+run_infer_test name src fname expected =
+  let _ = print (cat ["  --- infer_", name, " ---"])
+  let toks = tokenize src
+  let decls = pprog toks
+  let decls = opt_decls decls
+  let ar = get_arities decls
+  let actual = efind (cat ["__ret_", fname]) ar
+  let pass = actual == expected
+  let _ = if pass then print (cat ["  PASS: ", fname, "=", infer_ty_str actual])
+                  else print (cat ["  FAIL: ", fname, "=", infer_ty_str actual, " want ", infer_ty_str expected])
+  pass
+
+run_infer_test2 name src f1 e1 f2 e2 =
+  let _ = print (cat ["  --- infer_", name, " ---"])
+  let toks = tokenize src
+  let decls = pprog toks
+  let decls = opt_decls decls
+  let ar = get_arities decls
+  let a1 = efind (cat ["__ret_", f1]) ar
+  let a2 = efind (cat ["__ret_", f2]) ar
+  let pass = a1 == e1 && a2 == e2
+  let _ = if pass then print (cat ["  PASS: ", f1, "=", infer_ty_str a1, " ", f2, "=", infer_ty_str a2])
+                  else print (cat ["  FAIL: ", f1, "=", infer_ty_str a1, " ", f2, "=", infer_ty_str a2, " want ", infer_ty_str e1, " ", infer_ty_str e2])
+  pass
+
 args = []
 
 compile_file path =
@@ -3186,6 +3413,49 @@ compile_file path =
   else
     let _ = build asm
     0
+
+-- Track B: dump cross-function return-type inference for one or more files.
+-- Reports per-fn type and aggregate coverage (% non-UNKNOWN). Used to verify
+-- the precise-GC plan's ≥80% coverage gate against stdlib modules.
+infer_dump_files paths =
+  let totals = infer_dump_walk paths 0 0
+  let (n, k) = totals
+  let pct = if n == 0 then 0 else (k * 100) / n
+  let _ = print (cat ["=== TOTAL: ", show k, "/", show n, " (", show pct, "%) non-UNKNOWN ==="])
+  if pct >= 80 then 0 else 1
+
+infer_dump_walk paths n_acc k_acc =
+  if length paths == 0 then (n_acc, k_acc)
+  else
+    let p = head paths
+    let (n, k) = infer_dump_one p
+    infer_dump_walk (tail paths) (n_acc + n) (k_acc + k)
+
+infer_dump_one path =
+  let src = read_file path
+  let _ = print (cat ["--- ", path, " ---"])
+  let toks = tokenize src
+  let decls = pprog toks
+  let decls = opt_decls decls
+  let ar = get_arities decls
+  let stats = infer_dump_decls decls ar 0 0
+  let (n, k) = stats
+  let pct = if n == 0 then 0 else (k * 100) / n
+  let _ = print (cat ["  ", show k, "/", show n, " (", show pct, "%) non-UNKNOWN"])
+  stats
+
+infer_dump_decls decls ar n_acc k_acc =
+  if length decls == 0 then (n_acc, k_acc)
+  else
+    let d = head decls
+    if head d == "fn" then
+      let nm = head (tail d)
+      let r = efind (cat ["__ret_", nm]) ar
+      let r2 = if r == (0 - 1) then 0 else r
+      let _ = print (cat ["  ", nm, " : ", infer_ty_str r2])
+      let kk = if r2 != 0 then k_acc + 1 else k_acc
+      infer_dump_decls (tail decls) ar (n_acc + 1) kk
+    else infer_dump_decls (tail decls) ar n_acc k_acc
 
 run_tests _ =
   let _ = print "=== Rail ARM64 Compiler ==="
@@ -3334,9 +3604,17 @@ run_tests _ =
   let s9 = (if t81 then 1 else 0) + (if t82 then 1 else 0) + (if t83 then 1 else 0) + (if t84 then 1 else 0) + (if t85 then 1 else 0) + (if t86 then 1 else 0) + (if t87 then 1 else 0) + (if t88 then 1 else 0) + (if t89 then 1 else 0) + (if t90 then 1 else 0)
   let s10 = (if t91 then 1 else 0) + (if t92 then 1 else 0) + (if t93 then 1 else 0) + (if t94 then 1 else 0) + (if t95 then 1 else 0) + (if t96 then 1 else 0) + (if t97 then 1 else 0) + (if t98 then 1 else 0)
   let s11 = (if t99 then 1 else 0) + (if t100 then 1 else 0) + (if t101 then 1 else 0) + (if t102 then 1 else 0) + (if t103 then 1 else 0) + (if t104 then 1 else 0) + (if t105 then 1 else 0) + (if t106 then 1 else 0) + (if t107 then 1 else 0)
-  let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11
-  let _ = print (cat [show total, "/107 tests passed"])
-  if total == 107 then 0 else 1
+  -- Track B: cross-function return-type inference (precise-GC plan).
+  let i1 = run_infer_test "pure_int" "square x = x * x\nmain = square 7" "square" 1
+  let i2 = run_infer_test "pure_float" "halve x = x +. 0.0\nmain = 0" "halve" 2
+  let i3 = run_infer_test "list_return" "mklist x = cons x (cons (x + 1) [])\nmain = 0" "mklist" 3
+  let i4 = run_infer_test2 "mutual_rec" "evnp n = if n == 0 then 1 else oddp (n - 1)\noddp n = if n == 0 then 0 else evnp (n - 1)\nmain = evnp 10" "evnp" 1 "oddp" 1
+  let i5 = run_infer_test "adt_ctor" "type Box = | MkBox v\nwrap x = MkBox x\nmain = 0" "wrap" 3
+  let i6 = run_infer_test "match_int" "type Shape = | Circ r | Sq s\narea sh = match sh\n  | Circ r -> r * r * 3\n  | Sq s -> s * s\nmain = 0" "area" 1
+  let s_inf = (if i1 then 1 else 0) + (if i2 then 1 else 0) + (if i3 then 1 else 0) + (if i4 then 1 else 0) + (if i5 then 1 else 0) + (if i6 then 1 else 0)
+  let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s_inf
+  let _ = print (cat [show total, "/113 tests passed"])
+  if total == 113 then 0 else 1
 
 self_compile _ =
   let _ = print "\n=== Self-compilation ==="
@@ -5319,6 +5597,10 @@ main =
     else if cmd == "packages" then dispatch_packages 0
     else if cmd == "pkg" then dispatch_pkg 0
     else if cmd == "deploy" then dispatch_deploy a
+    else if cmd == "infer" then
+      if length a >= 3 then infer_dump_files (tail (tail a))
+      else let _ = print "Usage: rail infer <file.rail> [<file2.rail> ...]"
+      1
     else compile_file cmd
   else
     let _ = run_tests 0
