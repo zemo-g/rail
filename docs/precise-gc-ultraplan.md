@@ -1,6 +1,26 @@
 # Precise GC + Generational + Compacting — Ultraplan
 
-**Status:** approved 2026-04-16. Execution in progress.
+**Status:** approved 2026-04-16. Execution in progress — Track A landed, Track B C5 scaffolding landed.
+
+## Session 1 ship log (2026-04-16)
+
+| Commit | Track | Status | SHA-at-fixed-point |
+|---|---|---|---|
+| C1 v2.22.0: slot type descriptor scaffolding | A | ✅ 116/116 | 0014ec1c |
+| C2 v2.22.1: `_gc_lookup_fn_desc` binary search | A | ✅ 116/116 | a70a9b1a |
+| C3 v2.22.2: `_rail_gc` consults descriptor (slots 0/1 precise) | A | ✅ 116/116 | 989edec9 |
+| C4 v2.22.3: param/d8 precision from env markers | A | ✅ 116/116 | 7680ca98 |
+| C5 v2.23.0: young gen semi-space layout (64MB × 2) | B | ✅ 116/116 | be7a370b |
+
+Track A (precise roots) **COMPLETE**. `_rail_gc` now skips saved x29/x30,
+int-typed params, float-typed params, and saved d8 slots. Unknown slots
+still fall through to the original tag-filtered scan path — precision
+is additive, never unsafe.
+
+**Remaining work (est. 2-3 sessions):**
+- C6-C8 (Track B generational runtime): young alloc + Cheney scavenge + write barrier
+- C9-C11 (Track C compacting): sliding compaction + forward pointers + auto-trigger
+- C12 (Track D polish): tuning + docs + retire `_rail_stack_top` kludge
 **Motivation:** BPE segfault post-mortem (`docs/gc-phase0-findings.md`) proved conservative scan is fine for correctness but can't support compaction. Precise roots + compaction are needed for long training runs without `arena_mark`/`reset` workarounds. Generational is the perf win on top.
 
 ## Architectural decisions
