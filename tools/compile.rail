@@ -2417,7 +2417,11 @@ compile_func d ar lc =
   let fn_start_lbl = cat [".Lfn_", nm, "_start:\n"]
   let fn_end_lbl = cat [".Lfn_", nm, "_end:\n"]
   let nslots = frame_size / 8
-  let gc_desc = cat ["    .quad .Lfn_", nm, "_start\n    .quad .Lfn_", nm, "_end\n    .long ", show nslots, "\n    .long -1\n    .quad 0\n"]
+  -- Track A C3: slots 0, 1 are always saved x29/x30 — never heap pointers, skip them.
+  -- Encode as 2-bit-per-slot vector: bits 0-3 = 0b0000 (int, int), rest = 0b1 (fallback).
+  -- 0xFFFFFFF0 = -16 as signed 32-bit.
+  let gc_bits = if nslots >= 2 then 0 - 16 else 0 - 1
+  let gc_desc = cat ["    .quad .Lfn_", nm, "_start\n    .quad .Lfn_", nm, "_end\n    .long ", show nslots, "\n    .long ", show gc_bits, "\n    .quad 0\n"]
   (cat [memo_decl, fn_start_lbl, pro, sv, self_loop_lbl, body_asm, epi, fn_end_lbl], gc_desc, lc1)
 
 compile_funcs decls ar lc =
@@ -2595,7 +2599,12 @@ rt_gc_3 =
 
 rt_gc_4 =
   -- _rail_gc: main entry point. Walk stack frames, mark, sweep.
-  cat ["_rail_gc:\n    stp x29, x30, [sp, #-80]!\n    mov x29, sp\n    stp x19, x20, [x29, #48]\n    stp x21, x22, [x29, #64]\n",
+  -- Track A C3: per-frame, look up the return-address in the slot-type
+  -- descriptor table; use its 32-bit bits field to skip slots known to be
+  -- int (00) or float (01). On miss, fall back to the bits = -1 behavior
+  -- (all slots = 11 = scan), which matches the pre-C3 conservative walk.
+  -- x23 holds the current frame's bits register (callee-saved across calls).
+  cat ["_rail_gc:\n    stp x29, x30, [sp, #-96]!\n    mov x29, sp\n    stp x19, x20, [x29, #48]\n    stp x21, x22, [x29, #64]\n    str x23, [x29, #80]\n",
   -- Allocate mark stack: 512K entries * 8 = 4MB
   "    mov x0, #4194304\n    bl _malloc\n    cbz x0, .Lgc_ret\n",
   "    adrp x1, _gc_mark_stack@PAGE\n    str x0, [x1, _gc_mark_stack@PAGEOFF]\n",
@@ -2605,13 +2614,20 @@ rt_gc_4 =
   "    mov x19, x29\n",
   ".Lgc_frame_loop:\n    cbz x19, .Lgc_sweep\n",
   "    ldr x20, [x19]\n",
+  -- C3: resolve return address (caller PC at [fp, #8]) against descriptor table.
+  -- On hit: load 32-bit bits field at offset +16 of the record. On miss: -1.
+  "    ldr x0, [x19, #8]\n    str x19, [x29, #16]\n    str x20, [x29, #24]\n    bl _gc_lookup_fn_desc\n    ldr x19, [x29, #16]\n    ldr x20, [x29, #24]\n    cbz x0, .Lgc_bits_miss\n    ldr w23, [x0, #20]\n    b .Lgc_bits_ready\n.Lgc_bits_miss:\n    mov w23, #-1\n.Lgc_bits_ready:\n",
   -- Scan frame: slots from fp+16 to fp+2048 (or parent frame).
   -- Additional cap at _rail_stack_top prevents walking past the real
   -- stack top for the final frame in the chain.
   "    add x21, x19, #16\n    add x22, x19, #2048\n",
   "    adrp x3, _rail_stack_top@PAGE\n    ldr x3, [x3, _rail_stack_top@PAGEOFF]\n    cbz x3, .Lgc_skip_top_cap\n    cmp x22, x3\n    b.ls .Lgc_skip_top_cap\n    mov x22, x3\n.Lgc_skip_top_cap:\n",
   "    cmp x20, #0\n    b.eq .Lgc_scan\n    cmp x20, x22\n    b.hs .Lgc_scan\n    mov x22, x20\n",
-  ".Lgc_scan:\n    cmp x21, x22\n    b.hs .Lgc_scan_done\n    ldr x0, [x21]\n    str x21, [x29, #16]\n    str x22, [x29, #24]\n    bl _gc_try_mark\n    ldr x21, [x29, #16]\n    ldr x22, [x29, #24]\n    add x21, x21, #8\n    b .Lgc_scan\n",
+  -- C3: per-slot type dispatch. slot_idx = (x21 - x19) / 8. For slot_idx >= 16,
+  -- fall through to scan (bits field only covers slots 0..15). Extract 2 bits
+  -- at (slot_idx * 2). Values 00 (int) and 01 (float) skip. Values 10 (heap)
+  -- and 11 (fallback) call _gc_try_mark (which still tag-filters).
+  ".Lgc_scan:\n    cmp x21, x22\n    b.hs .Lgc_scan_done\n    sub x4, x21, x19\n    lsr x4, x4, #3\n    cmp x4, #16\n    b.hs .Lgc_scan_trymark\n    lsl x4, x4, #1\n    lsr w5, w23, w4\n    and w5, w5, #3\n    cmp w5, #2\n    b.lt .Lgc_scan_skip\n.Lgc_scan_trymark:\n    ldr x0, [x21]\n    str x21, [x29, #16]\n    str x22, [x29, #24]\n    bl _gc_try_mark\n    ldr x21, [x29, #16]\n    ldr x22, [x29, #24]\n.Lgc_scan_skip:\n    add x21, x21, #8\n    b .Lgc_scan\n",
   ".Lgc_scan_done:\n    bl _gc_drain\n    mov x19, x20\n    b .Lgc_frame_loop\n",
   -- Sweep phase
   ".Lgc_sweep:\n",
@@ -2637,7 +2653,7 @@ rt_gc_4 =
   -- Free mark stack
   "    adrp x0, _gc_mark_stack@PAGE\n    add x0, x0, _gc_mark_stack@PAGEOFF\n    ldr x0, [x0]\n    bl _free\n",
   "    adrp x1, _gc_mark_stack@PAGE\n    str xzr, [x1, _gc_mark_stack@PAGEOFF]\n",
-  ".Lgc_ret:\n    ldp x19, x20, [x29, #48]\n    ldp x21, x22, [x29, #64]\n    ldp x29, x30, [sp], #80\n    ret\n\n"]
+  ".Lgc_ret:\n    ldr x23, [x29, #80]\n    ldp x19, x20, [x29, #48]\n    ldp x21, x22, [x29, #64]\n    ldp x29, x30, [sp], #96\n    ret\n\n"]
 
 rt_thread =
   cat ["_rail_spawn_thread:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    mov x0, #40\n    bl _malloc\n    str x0, [x29, #32]\n    ldr x1, [x29, #16]\n    str x1, [x0]\n    ldr x1, [x29, #24]\n    str x1, [x0, #8]\n    str xzr, [x0, #16]\n    ldr x3, [x29, #32]\n    add x0, x3, #24\n    mov x1, #0\n    adr x2, _rail_thread_tramp\n    mov x3, x3\n    bl _pthread_create\n    ldr x0, [x29, #32]\n    ldp x29, x30, [sp], #48\n    ret\n\n",
