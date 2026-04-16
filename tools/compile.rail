@@ -2315,6 +2315,42 @@ is_in name ps =
   else if head ps == name then true
   else is_in name (tail ps)
 
+-- Track A C4: per-function slot type vector for _rail_gc scan filter.
+-- Returns a signed 32-bit int where each 2-bit pair encodes slot N
+-- (slot 0 = LSB). Codes: 00 = int skip, 01 = float skip, 10 = heap scan,
+-- 11 = fallback (call _gc_try_mark, same as conservative behavior).
+-- Layout matches compile_func's save sequence:
+--   slot 0, 1: saved x29, x30 (never heap pointers → 00)
+--   slot 2..2+|ps|-1: parameters, typed via env __int_/__float_ markers
+--   slot 2+|ps| (if has_float): saved d8 (raw float bits → 01)
+--   all other slots: 11 (fallback)
+-- Bits capacity is 16 slots; frames larger than 16 slots leave trailing
+-- slots with the fallback interpretation (the _rail_gc scan loop treats
+-- slot_idx >= 16 as fallback automatically).
+nth_param_by_idx ps n =
+  if n <= 0 then head ps
+  else nth_param_by_idx (tail ps) (n - 1)
+
+pgc_slot_code slot_idx ps env d8_slot =
+  if slot_idx < 2 then 0
+  else if slot_idx - 2 < length ps then
+    let name = nth_param_by_idx ps (slot_idx - 2)
+    if efind (cat ["__int_", name]) env != (0 - 1) then 0
+    else if efind (cat ["__float_", name]) env != (0 - 1) then 1
+    else 3
+  else if slot_idx == d8_slot then 1
+  else 3
+
+pgc_build_bits ps env slot_idx mult acc d8_slot =
+  if slot_idx >= 16 then acc
+  else
+    let code = pgc_slot_code slot_idx ps env d8_slot
+    pgc_build_bits ps env (slot_idx + 1) (mult * 4) (acc + code * mult) d8_slot
+
+compute_fn_slot_bits env ps has_float =
+  let d8_slot = if has_float then 2 + length ps else 0 - 1
+  pgc_build_bits ps env 0 1 0 d8_slot
+
 compile_func d ar lc =
   let nm = head (tail d)
   let ps = head (tail (tail d))
@@ -2417,10 +2453,10 @@ compile_func d ar lc =
   let fn_start_lbl = cat [".Lfn_", nm, "_start:\n"]
   let fn_end_lbl = cat [".Lfn_", nm, "_end:\n"]
   let nslots = frame_size / 8
-  -- Track A C3: slots 0, 1 are always saved x29/x30 — never heap pointers, skip them.
-  -- Encode as 2-bit-per-slot vector: bits 0-3 = 0b0000 (int, int), rest = 0b1 (fallback).
-  -- 0xFFFFFFF0 = -16 as signed 32-bit.
-  let gc_bits = if nslots >= 2 then 0 - 16 else 0 - 1
+  -- Track A C4: compute precise 2-bit-per-slot type vector for _rail_gc.
+  -- Uses env's __int_/__float_ markers (set by mark_int_params/mark_float_params).
+  -- Unknown slots stay at 11 (fallback → _gc_try_mark → tag-filtered like pre-C4).
+  let gc_bits = compute_fn_slot_bits env ps has_float
   let gc_desc = cat ["    .quad .Lfn_", nm, "_start\n    .quad .Lfn_", nm, "_end\n    .long ", show nslots, "\n    .long ", show gc_bits, "\n    .quad 0\n"]
   (cat [memo_decl, fn_start_lbl, pro, sv, self_loop_lbl, body_asm, epi, fn_end_lbl], gc_desc, lc1)
 
