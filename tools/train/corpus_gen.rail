@@ -1,0 +1,746 @@
+-- tools/train/corpus_gen.rail — Phase 5 training corpus builder.
+--
+-- Walks the Rail source tree (stdlib + tools/train + flywheel + tools/deploy,
+-- excluding tools/compile.rail) and emits BPE-tokenized JSONL training data.
+--
+-- Output: training/corpus/v1/{vocab,merges,train.jsonl,val.jsonl,test.jsonl}
+--
+-- Usage:
+--   ./rail_native run tools/train/corpus_gen.rail            -- vocab=4096
+--   ./rail_native run tools/train/corpus_gen.rail 2048       -- vocab=2048
+--
+-- Determinism: sorted file walk + SHA-256 split bucket + deterministic BPE.
+
+import "stdlib/bpe.rail"
+import "stdlib/list.rail"
+import "stdlib/env.rail"
+import "stdlib/hash.rail"
+
+cat parts = join "" parts
+q = "\""
+
+-- ====================================================================
+-- String helpers (kept self-contained; stdlib/string.rail pulls list ops
+-- we don't need and a `contains_char` that uses lambdas).
+-- ====================================================================
+
+str_head_char s =
+  let cs = chars s
+  if length cs == 0 then ""
+  else head cs
+
+starts_with_loop pcs scs =
+  if length pcs == 0 then true
+  else if length scs == 0 then false
+  else if head pcs == head scs then starts_with_loop (tail pcs) (tail scs)
+  else false
+
+str_starts_with prefix s = starts_with_loop (chars prefix) (chars s)
+
+is_blank line = length line == 0
+
+is_indented line =
+  let h = str_head_char line
+  if h == " " then true
+  else if h == "\t" then true
+  else false
+
+is_comment_line line = str_starts_with "--" line
+
+take_word_chars cs acc =
+  if length cs == 0 then reverse acc
+  else
+    let c = head cs
+    if c == " " then reverse acc
+    else if c == "\t" then reverse acc
+    else if c == "=" then reverse acc
+    else if c == "(" then reverse acc
+    else take_word_chars (tail cs) (cons c acc)
+
+first_word s = join "" (take_word_chars (chars s) [])
+
+is_skip_top line =
+  let w = first_word line
+  if w == "type" then true
+  else if w == "import" then true
+  else if w == "foreign" then true
+  else if w == "main" then true
+  else if w == "" then true
+  else false
+
+matches_prefix pcs cs =
+  if length pcs == 0 then true
+  else if length cs == 0 then false
+  else if head pcs == head cs then matches_prefix (tail pcs) (tail cs)
+  else false
+
+drop_n n cs =
+  if n <= 0 then cs
+  else if length cs == 0 then []
+  else drop_n (n - 1) (tail cs)
+
+take_n_chars n cs =
+  if n <= 0 then []
+  else if length cs == 0 then []
+  else cons (head cs) (take_n_chars (n - 1) (tail cs))
+
+find_after_loop nc cs =
+  if length cs == 0 then []
+  else if matches_prefix nc cs then drop_n (length nc) cs
+  else find_after_loop nc (tail cs)
+
+find_after needle cs = find_after_loop (chars needle) cs
+
+has_substr_loop nc cs =
+  if length cs == 0 then false
+  else if matches_prefix nc cs then true
+  else has_substr_loop nc (tail cs)
+
+has_substr needle s = has_substr_loop (chars needle) (chars s)
+
+find_str_idx_loop nc cs i =
+  if length cs == 0 then (0 - 1)
+  else if matches_prefix nc cs then i
+  else find_str_idx_loop nc (tail cs) (i + 1)
+
+find_str_idx needle cs = find_str_idx_loop (chars needle) cs 0
+
+trim_ws_chars_left cs =
+  if length cs == 0 then []
+  else
+    let c = head cs
+    if c == " " then trim_ws_chars_left (tail cs)
+    else if c == "\n" then trim_ws_chars_left (tail cs)
+    else if c == "\t" then trim_ws_chars_left (tail cs)
+    else if c == "\r" then trim_ws_chars_left (tail cs)
+    else cs
+
+trim_ws s =
+  let cs = chars s
+  let l = trim_ws_chars_left cs
+  let r = reverse (trim_ws_chars_left (reverse l))
+  join "" r
+
+take_until_ws cs =
+  if length cs == 0 then []
+  else
+    let c = head cs
+    if c == " " then []
+    else if c == "\t" then []
+    else if c == "\n" then []
+    else if c == "\r" then []
+    else cons c (take_until_ws (tail cs))
+
+-- ====================================================================
+-- JSON string escape
+-- ====================================================================
+
+json_esc_chars cs acc =
+  if length cs == 0 then reverse acc
+  else
+    let c = head cs
+    if c == "\\" then json_esc_chars (tail cs) (cons "\\\\" acc)
+    else if c == q then json_esc_chars (tail cs) (cons "\\\"" acc)
+    else if c == "\n" then json_esc_chars (tail cs) (cons "\\n" acc)
+    else if c == "\r" then json_esc_chars (tail cs) (cons "\\r" acc)
+    else if c == "\t" then json_esc_chars (tail cs) (cons "\\t" acc)
+    else json_esc_chars (tail cs) (cons c acc)
+
+json_esc s = join "" (json_esc_chars (chars s) [])
+
+json_str s = cat [q, json_esc s, q]
+
+ids_to_csv_rest ids =
+  if length ids == 0 then ""
+  else cat [",", show (head ids), ids_to_csv_rest (tail ids)]
+
+ids_to_csv ids =
+  if length ids == 0 then ""
+  else cat [show (head ids), ids_to_csv_rest (tail ids)]
+
+ids_to_json ids = cat ["[", ids_to_csv ids, "]"]
+
+-- ====================================================================
+-- Hex parsing (8 chars → int for split bucket)
+-- ====================================================================
+
+hex_digit_val c =
+  if c == "0" then 0
+  else if c == "1" then 1
+  else if c == "2" then 2
+  else if c == "3" then 3
+  else if c == "4" then 4
+  else if c == "5" then 5
+  else if c == "6" then 6
+  else if c == "7" then 7
+  else if c == "8" then 8
+  else if c == "9" then 9
+  else if c == "a" then 10
+  else if c == "b" then 11
+  else if c == "c" then 12
+  else if c == "d" then 13
+  else if c == "e" then 14
+  else if c == "f" then 15
+  else if c == "A" then 10
+  else if c == "B" then 11
+  else if c == "C" then 12
+  else if c == "D" then 13
+  else if c == "E" then 14
+  else if c == "F" then 15
+  else (0 - 1)
+
+hex_parse_acc cs n acc =
+  if n <= 0 then acc
+  else if length cs == 0 then acc
+  else
+    let d = hex_digit_val (head cs)
+    if d < 0 then acc
+    else hex_parse_acc (tail cs) (n - 1) (acc * 16 + d)
+
+hex_parse_n s n = hex_parse_acc (chars s) n 0
+
+-- ====================================================================
+-- SHA-256 (shell out — there's no native SHA-256 in stdlib)
+-- ====================================================================
+
+sha256_id_seed seed =
+  let _ = write_file "/tmp/rail_corpus_hash_in" seed
+  let raw = shell "shasum -a 256 /tmp/rail_corpus_hash_in"
+  -- raw = "<64-hex>  /tmp/rail_corpus_hash_in\n"
+  -- Take the first 64 hex chars.
+  join "" (take_n_chars 64 (chars raw))
+
+split_bucket id_hex =
+  let n = hex_parse_n id_hex 8
+  n - (n / 20) * 20
+
+split_path bucket =
+  if bucket == 19 then "training/corpus/v1/test.jsonl"
+  else if bucket == 18 then "training/corpus/v1/val.jsonl"
+  else "training/corpus/v1/train.jsonl"
+
+-- ====================================================================
+-- File acceptability (was: ASCII purity).
+--
+-- Rail stdlib comments contain typographic UTF-8 (— → ≥). chars splits
+-- per byte, BPE learns those as base tokens, and JSON allows raw UTF-8
+-- in strings — so UTF-8 passes through cleanly. Reject only files with
+-- bytes that are neither printable ASCII, whitespace, nor valid UTF-8
+-- continuation bytes (NUL, lone CRs, etc.). For now: accept everything
+-- that exists.
+-- ====================================================================
+
+file_is_ascii path = true
+
+-- ====================================================================
+-- File walking (sorted, deterministic)
+-- ====================================================================
+
+filter_nonempty xs =
+  if length xs == 0 then []
+  else
+    let h = head xs
+    if length h == 0 then filter_nonempty (tail xs)
+    else cons h (filter_nonempty (tail xs))
+
+walk_files _ =
+  let cmd = "find stdlib tools/train flywheel tools/deploy -name '*.rail' 2>/dev/null | grep -v 'tools/compile.rail' | sort"
+  let out = shell cmd
+  filter_nonempty (split "\n" out)
+
+-- Several Rail source files have stray \r bytes (CRLF line endings) in
+-- comments. The compiler tolerates them, but JSON requires control
+-- characters in strings be escaped, and `"\r"` is a known unsupported
+-- literal in Rail (see memory: rail-bugs.md), so json_esc can't pattern
+-- match it directly. Strip CR via shell before parsing.
+read_source_no_cr path =
+  shell (cat ["LC_ALL=C tr -d '\\015' < ", path])
+
+-- ====================================================================
+-- Module doc extraction (consecutive `--` lines from the top of file).
+-- ====================================================================
+
+extract_module_doc_loop lines acc =
+  if length lines == 0 then reverse acc
+  else
+    let l = head lines
+    if is_comment_line l then extract_module_doc_loop (tail lines) (cons l acc)
+    else reverse acc
+
+extract_module_doc lines = extract_module_doc_loop lines []
+
+-- ====================================================================
+-- Function extraction
+--
+-- A function is a top-level (column 0, non-comment, non-blank) line whose
+-- first word is not in {type,import,foreign,main}. The body is all
+-- subsequent indented lines until the next top-level line.
+--
+-- Doc comments are the consecutive `--` lines immediately preceding the
+-- function (with no intervening blank line resetting them).
+-- ====================================================================
+
+type Fn = | Fn fname fdoc fsig fbody
+type Cur = | Cur cname cdoc csig cbody
+
+empty_cur = Cur "" [] "" []
+
+is_cur_active cur = match cur
+  | Cur n _ _ _ -> length n > 0
+
+finalize_cur cur acc = match cur
+  | Cur n d s b ->
+    if length n == 0 then acc
+    else cons (Fn n d s (reverse b)) acc
+
+cur_set_body cur body = match cur
+  | Cur n d s _ -> Cur n d s body
+
+cur_body cur = match cur
+  | Cur _ _ _ b -> b
+
+fn_walk lines pending cur acc =
+  if length lines == 0 then
+    let acc2 = finalize_cur cur acc
+    reverse acc2
+  else
+    let l = head lines
+    let rest = tail lines
+    if is_blank l then
+      -- Blank line resets pending_doc; current fn (if any) keeps going.
+      fn_walk rest [] cur acc
+    else if is_comment_line l then
+      -- Top-level comment: terminates current fn (col-0 line breaks it),
+      -- begins new pending_doc.
+      let acc2 = finalize_cur cur acc
+      fn_walk rest (cons l pending) empty_cur acc2
+    else if is_indented l then
+      -- Body line — only meaningful inside a current fn.
+      if is_cur_active cur then fn_walk rest pending (cur_set_body cur (cons l (cur_body cur))) acc
+      else fn_walk rest pending cur acc
+    else
+      -- Top-level non-comment non-blank: finalize current, maybe start new.
+      let acc2 = finalize_cur cur acc
+      if is_skip_top l then fn_walk rest [] empty_cur acc2
+      else
+        let nm = first_word l
+        let new_cur = Cur nm (reverse pending) l []
+        fn_walk rest [] new_cur acc2
+
+extract_functions lines = fn_walk lines [] empty_cur []
+
+-- ====================================================================
+-- Repl-pair extraction from tools/compile.rail run_test calls.
+-- Format: `let tN = run_test "name" "src" "expected"`
+-- (name/src/expected may contain backslash escapes: \n \t \\ \").
+-- ====================================================================
+
+scan_quoted cs acc =
+  if length cs == 0 then (join "" (reverse acc), [])
+  else
+    let c = head cs
+    if c == q then (join "" (reverse acc), tail cs)
+    else if c == "\\" then
+      let r = tail cs
+      if length r == 0 then (join "" (reverse acc), [])
+      else
+        let n = head r
+        if n == "n" then scan_quoted (tail r) (cons "\n" acc)
+        else if n == "t" then scan_quoted (tail r) (cons "\t" acc)
+        else if n == "r" then scan_quoted (tail r) (cons "\r" acc)
+        else if n == "\\" then scan_quoted (tail r) (cons "\\" acc)
+        else if n == "\"" then scan_quoted (tail r) (cons "\"" acc)
+        else scan_quoted (tail r) (cons n acc)
+    else scan_quoted (tail cs) (cons c acc)
+
+read_quoted cs =
+  if length cs == 0 then ("", [])
+  else if head cs == q then scan_quoted (tail cs) []
+  else read_quoted (tail cs)
+
+parse_run_test_line line =
+  let cs = chars line
+  let after = find_after "run_test" cs
+  if length after == 0 then ("", "", "")
+  else
+    let (n, r1) = read_quoted after
+    let (s, r2) = read_quoted r1
+    let (e, r3) = read_quoted r2
+    (n, s, e)
+
+is_run_test_line line = has_substr "run_test " line
+
+collect_run_tests lines acc =
+  if length lines == 0 then reverse acc
+  else
+    let l = head lines
+    if is_run_test_line l then
+      let (n, s, e) = parse_run_test_line l
+      if length n == 0 then collect_run_tests (tail lines) acc
+      else collect_run_tests (tail lines) (cons (n, s, e) acc)
+    else collect_run_tests (tail lines) acc
+
+extract_repl_pairs path =
+  let src = read_source_no_cr path
+  let lines = split "\n" src
+  collect_run_tests lines []
+
+-- ====================================================================
+-- Type inference (per-file `rail infer <file>` call).
+--
+-- Bulk-mode (multi-file argv) appears to bail partway through on
+-- larger directories — empirically it returned partial coverage when
+-- run on the full corpus. Per-file is slower (~50ms-4s per file)
+-- but gives complete deterministic coverage.
+--
+-- Output block per file looks like
+--   --- <path> ---
+--     fname : TYPE
+--     ...
+--     N/M (P%) non-UNKNOWN
+--   === TOTAL: ... ===
+-- We parse the entry lines and build a lookup keyed by "<file>|<fname>"
+-- so cross-file name collisions don't poison the lookup.
+-- ====================================================================
+
+-- Binary path (override with RAIL_BIN env var to pin against rebuilds).
+rail_bin _ =
+  let env = get_env "RAIL_BIN"
+  if length env == 0 then "./rail_native"
+  else env
+
+run_infer_one path =
+  shell (cat [rail_bin 0, " infer ", path, " 2>/dev/null"])
+
+is_file_marker line = str_starts_with "--- " line
+
+is_infer_entry line =
+  if length line < 4 then false
+  else if not (str_starts_with "  " line) then false
+  else if has_substr "non-UNKNOWN" line then false
+  else if has_substr "===" line then false
+  else if not (has_substr " : " line) then false
+  else true
+
+parse_infer_entry line =
+  let cs2 = trim_ws_chars_left (chars line)
+  let sep = find_str_idx " : " cs2
+  if sep < 0 then ("", "")
+  else
+    let name = take_n_chars sep cs2
+    let after = drop_n (sep + 3) cs2
+    let typ_chars = take_until_ws after
+    (join "" name, join "" typ_chars)
+
+infer_key file fname = cat [file, "|", fname]
+
+-- Build hash-map (stdlib/hash.rail) for the infer table — list lookup
+-- is O(N) per call AND `length list` is also O(N), so a 4907-entry
+-- table multiplied by 1800 lookups was ~22B ops (minutes). Hash gives
+-- amortized O(1) per lookup.
+build_infer_for_file_loop file lines ht =
+  if length lines == 0 then ht
+  else
+    let l = head lines
+    if is_infer_entry l then
+      let (n, t) = parse_infer_entry l
+      if length n == 0 then build_infer_for_file_loop file (tail lines) ht
+      else
+        let k = infer_key file n
+        build_infer_for_file_loop file (tail lines) (ht_put ht k t)
+    else build_infer_for_file_loop file (tail lines) ht
+
+build_infer_for_file file out ht =
+  let lines = split "\n" out
+  build_infer_for_file_loop file lines ht
+
+build_infer_all_loop files ht =
+  if length files == 0 then ht
+  else
+    let path = head files
+    let out = run_infer_one path
+    let ht2 = build_infer_for_file path out ht
+    build_infer_all_loop (tail files) ht2
+
+build_infer_all files = build_infer_all_loop files (ht_new 0)
+
+lookup_ret file fname ht =
+  let v = ht_get ht (infer_key file fname)
+  if length v == 0 then "UNKNOWN"
+  else v
+
+-- ====================================================================
+-- Records
+-- ====================================================================
+
+type Rec = | Rec rid_seed src kind prompt comp ret
+
+rec_seed r = match r | Rec s _ _ _ _ _ -> s
+rec_src r = match r | Rec _ s _ _ _ _ -> s
+rec_kind r = match r | Rec _ _ k _ _ _ -> k
+rec_prompt r = match r | Rec _ _ _ p _ _ -> p
+rec_comp r = match r | Rec _ _ _ _ c _ -> c
+rec_ret r = match r | Rec _ _ _ _ _ r2 -> r2
+
+-- Length floor is 8 chars for kinds where both halves are substantive
+-- prose/code. repl_pair completions are test-output strings (often
+-- short integers like "42" or "hello"), so we relax the completion
+-- floor for that kind only — the test-input prompt is still gated.
+valid_rec r =
+  let p = rec_prompt r
+  let c = rec_comp r
+  let pl = length p
+  let cl = length c
+  let kind = rec_kind r
+  let comp_floor = if kind == "repl_pair" then 1 else 8
+  if length kind == 0 then false
+  else if pl < 8 then false
+  else if cl < comp_floor then false
+  else if pl > 4096 then false
+  else if cl > 4096 then false
+  else true
+
+filter_valid recs =
+  if length recs == 0 then []
+  else
+    let r = head recs
+    if valid_rec r then cons r (filter_valid (tail recs))
+    else filter_valid (tail recs)
+
+-- function record: prompt = doc (if any) + LHS-of-signature; completion =
+-- body lines OR (for single-line fns) the RHS of the signature.
+--
+-- A signature line is "name args = expr". For multi-line functions the
+-- body starts on the next line; for single-line definitions the whole
+-- thing fits on one line and we recover the body from after " = ".
+fn_split_sig sig =
+  let cs = chars sig
+  let idx = find_str_idx " = " cs
+  if idx < 0 then (sig, "")
+  else
+    let lhs = join "" (take_n_chars idx cs)
+    let rhs = join "" (drop_n (idx + 3) cs)
+    (lhs, rhs)
+
+fn_prompt doc sig_lhs =
+  if length doc == 0 then sig_lhs
+  else cat [join "\n" doc, "\n", sig_lhs]
+
+fn_completion body = join "\n" body
+
+mk_function_rec sf fn infer_table = match fn
+  | Fn nm doc sig body ->
+    let r = lookup_ret sf nm infer_table
+    let seed = cat ["function|", sf, "|", nm]
+    let (sig_lhs, sig_rhs) = fn_split_sig sig
+    if length body == 0 then
+      let p = fn_prompt doc sig_lhs
+      Rec seed sf "function" p sig_rhs r
+    else
+      let p = fn_prompt doc sig
+      let c = fn_completion body
+      Rec seed sf "function" p c r
+
+-- module_doc record: prompt = header doc; completion = first 10 fn signatures
+take_sigs n fns acc =
+  if n <= 0 then reverse acc
+  else if length fns == 0 then reverse acc
+  else
+    let fn = head fns
+    let s = match fn | Fn _ _ s _ -> s
+    take_sigs (n - 1) (tail fns) (cons s acc)
+
+mk_module_doc_rec sf doc fns =
+  if length doc == 0 then Rec "" "" "" "" "" ""
+  else if length fns == 0 then Rec "" "" "" "" "" ""
+  else
+    let p = join "\n" doc
+    let sigs = take_sigs 10 fns []
+    let c = join "\n" sigs
+    let seed = cat ["module_doc|", sf]
+    Rec seed sf "module_doc" p c "UNKNOWN"
+
+mk_repl_pair_rec name src expected =
+  let seed = cat ["repl_pair|", name]
+  Rec seed "tools/compile.rail" "repl_pair" src expected "UNKNOWN"
+
+build_repl_pair_recs pairs =
+  if length pairs == 0 then []
+  else
+    let (n, s, e) = head pairs
+    cons (mk_repl_pair_rec n s e) (build_repl_pair_recs (tail pairs))
+
+add_fn_records sf fns infer_table acc =
+  if length fns == 0 then acc
+  else
+    let fn = head fns
+    let r = mk_function_rec sf fn infer_table
+    add_fn_records sf (tail fns) infer_table (cons r acc)
+
+-- Process one file: extract module_doc + functions, attach inferred ret types.
+process_file path infer_table acc =
+  if not (file_is_ascii path) then
+    let _ = print (cat ["  SKIP non-ASCII: ", path])
+    acc
+  else
+    let src = read_source_no_cr path
+    let lines = split "\n" src
+    let doc = extract_module_doc lines
+    let fns = extract_functions lines
+    let mod_rec = mk_module_doc_rec path doc fns
+    let acc2 = if length (rec_kind mod_rec) == 0 then acc else cons mod_rec acc
+    add_fn_records path fns infer_table acc2
+
+build_all_records_loop files infer_table acc =
+  if length files == 0 then reverse acc
+  else
+    let path = head files
+    let acc2 = process_file path infer_table acc
+    build_all_records_loop (tail files) infer_table acc2
+
+build_all_records files infer_table =
+  build_all_records_loop files infer_table []
+
+-- ====================================================================
+-- Corpus assembly + BPE training
+-- ====================================================================
+
+collect_corpus_loop recs acc =
+  if length recs == 0 then join "\n" (reverse acc)
+  else collect_corpus_loop (tail recs) (cons (rec_comp (head recs)) acc)
+
+collect_corpus recs = collect_corpus_loop recs []
+
+-- Cap the BPE training corpus. bpe.rail's bpe_init_encode_loop calls
+-- length on the (shrinking) char list every iteration → O(N²) on the
+-- input. ~100K chars is the sweet spot: still represents the Rail
+-- token distribution well, finishes in seconds. Encoding of full
+-- records (which is per-string and short) is unaffected.
+--
+-- The loop only checks `n <= 0` and trusts the source has at least n
+-- chars (the corpus is always >100K from the full source tree). A
+-- defensive `length cs == 0` here would itself be O(N) per iteration.
+truncate_str_loop cs n acc =
+  if n <= 0 then join "" (reverse acc)
+  else truncate_str_loop (tail cs) (n - 1) (cons (head cs) acc)
+
+truncate_str s n =
+  let total = length s
+  let take = if total < n then total else n
+  truncate_str_loop (chars s) take []
+
+parse_vocab_size_arg argv default_size =
+  if length argv < 2 then default_size
+  else
+    let s = head (tail argv)
+    let n = bpe_parse_int s
+    if n <= 0 then default_size
+    else n
+
+save_bpe_renamed bpe =
+  let _ = bpe_save "training/corpus/v1/_bpe" bpe
+  let _ = shell "mv training/corpus/v1/_bpe.vocab training/corpus/v1/vocab"
+  let _ = shell "mv training/corpus/v1/_bpe.merges training/corpus/v1/merges"
+  0
+
+clear_outputs _ =
+  let _ = write_file "training/corpus/v1/train.jsonl" ""
+  let _ = write_file "training/corpus/v1/val.jsonl" ""
+  let _ = write_file "training/corpus/v1/test.jsonl" ""
+  0
+
+-- ====================================================================
+-- JSONL output (shell-append per record to avoid arena pressure)
+-- ====================================================================
+
+build_jsonl_line id_short rec p_ids c_ids = match rec
+  | Rec _ sf kind p c r ->
+    cat [
+      "{",
+      q, "id", q, ":", json_str id_short, ",",
+      q, "source_file", q, ":", json_str sf, ",",
+      q, "kind", q, ":", json_str kind, ",",
+      q, "prompt", q, ":", json_str p, ",",
+      q, "completion", q, ":", json_str c, ",",
+      q, "prompt_ids", q, ":", ids_to_json p_ids, ",",
+      q, "completion_ids", q, ":", ids_to_json c_ids, ",",
+      q, "ret_type", q, ":", json_str r,
+      "}"]
+
+write_jsonl_line path line =
+  let _ = write_file "/tmp/rail_corpus_line.txt" (cat [line, "\n"])
+  shell (cat ["cat /tmp/rail_corpus_line.txt >> ", path])
+
+write_records_loop bpe recs n_train n_val n_test =
+  if length recs == 0 then (n_train, n_val, n_test)
+  else
+    let mk = arena_mark 0
+    let r = head recs
+    let id_full = sha256_id_seed (rec_seed r)
+    let id_short = join "" (take_n_chars 16 (chars id_full))
+    let bucket = split_bucket id_full
+    let path = split_path bucket
+    let p_ids = bpe_encode bpe (rec_prompt r)
+    let c_ids = bpe_encode bpe (rec_comp r)
+    let line = build_jsonl_line id_short r p_ids c_ids
+    let _ = write_jsonl_line path line
+    let nt = if bucket == 19 then n_train else if bucket == 18 then n_train else n_train + 1
+    let nv = if bucket == 18 then n_val + 1 else n_val
+    let ntest = if bucket == 19 then n_test + 1 else n_test
+    let _ = arena_reset mk
+    write_records_loop bpe (tail recs) nt nv ntest
+
+-- ====================================================================
+-- Main
+-- ====================================================================
+
+main =
+  let _ = print "corpus_gen v1: walking source tree..."
+  let files = walk_files 0
+  let _ = print (cat ["  files: ", show (length files)])
+
+  let _ = print "extracting repl_pairs from tools/compile.rail..."
+  let pairs = extract_repl_pairs "tools/compile.rail"
+  let pair_recs = build_repl_pair_recs pairs
+  let _ = print (cat ["  repl_pair candidates: ", show (length pair_recs)])
+
+  let _ = print "running rail infer per-file (this is the slow phase)..."
+  let infer_table = build_infer_all files
+  let _ = print (cat ["  infer entries: ", show (length infer_table)])
+
+  let _ = print "extracting functions and module docs..."
+  let main_recs = build_all_records files infer_table
+  let _ = print (cat ["  function+module_doc candidates: ", show (length main_recs)])
+
+  let all_recs = append main_recs pair_recs
+  let _ = print (cat ["  total candidates: ", show (length all_recs)])
+
+  let valid = filter_valid all_recs
+  let _ = print (cat ["  valid records (after length filter): ", show (length valid)])
+
+  let argv = args
+  let target = parse_vocab_size_arg argv 1024
+  let _ = print (cat ["training BPE (target vocab=", show target, ")..."])
+  let corpus_full = collect_corpus valid
+  let _ = print (cat ["  corpus chars (concat completions): ", show (length corpus_full)])
+  -- bpe.rail's bpe_count_pairs is O(N) per recursive step (`length tokens < 2`
+  -- → O(N) length builtin), so its overall cost on the training corpus is
+  -- O(merges × N²). Sample 8K chars: still represents the Rail token
+  -- distribution (covers all stdlib's chars + most idioms), and total BPE
+  -- training stays under a minute on the 9b691e4 binary. Encoding of full
+  -- records (per-string, short) is unaffected.
+  let corpus = truncate_str corpus_full 8000
+  let _ = print (cat ["  BPE training corpus (sampled): ", show (length corpus), " chars"])
+  let bpe = bpe_train corpus target
+  let vsize = bpe_vocab_size bpe
+  let _ = print (cat ["  BPE vocab size: ", show vsize])
+
+  let _ = save_bpe_renamed bpe
+
+  let _ = clear_outputs 0
+  let _ = print "writing JSONL records..."
+  let (nt, nv, ntest) = write_records_loop bpe valid 0 0 0
+  let _ = print (cat ["  train: ", show nt, "  val: ", show nv, "  test: ", show ntest])
+
+  let _ = print "DONE"
+  0

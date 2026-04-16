@@ -1,0 +1,251 @@
+-- tools/train/corpus_stats.rail — summarize training/corpus/v1/.
+--
+-- Reads the three JSONL splits + the BPE vocab file. Reports:
+--   - record counts per kind
+--   - completion-length distribution in TOKENS (min / median / max / mean)
+--   - vocab size (vocab line count)
+--   - BPE compression ratio (corpus chars / completion tokens, completions only)
+--   - pct UNKNOWN ret_type (over function records)
+--
+-- Pure read, no writes. Safe to run any time.
+
+import "stdlib/list.rail"
+
+cat parts = join "" parts
+q = "\""
+
+-- ====================================================================
+-- Helpers (self-contained — same minimal set as corpus_gen.rail).
+-- ====================================================================
+
+starts_with_loop pcs scs =
+  if length pcs == 0 then true
+  else if length scs == 0 then false
+  else if head pcs == head scs then starts_with_loop (tail pcs) (tail scs)
+  else false
+
+str_starts_with prefix s = starts_with_loop (chars prefix) (chars s)
+
+matches_prefix pcs cs =
+  if length pcs == 0 then true
+  else if length cs == 0 then false
+  else if head pcs == head cs then matches_prefix (tail pcs) (tail cs)
+  else false
+
+drop_n n cs =
+  if n <= 0 then cs
+  else if length cs == 0 then []
+  else drop_n (n - 1) (tail cs)
+
+find_after_loop nc cs =
+  if length cs == 0 then []
+  else if matches_prefix nc cs then drop_n (length nc) cs
+  else find_after_loop nc (tail cs)
+
+find_after needle s = find_after_loop (chars needle) (chars s)
+
+-- ====================================================================
+-- Field extraction by simple string scan (we control the format).
+-- ====================================================================
+
+-- Read chars until the next unescaped `"`, honoring backslash escapes.
+read_until_quote cs acc =
+  if length cs == 0 then (join "" (reverse acc), [])
+  else
+    let c = head cs
+    if c == q then (join "" (reverse acc), tail cs)
+    else if c == "\\" then
+      let r = tail cs
+      if length r == 0 then (join "" (reverse acc), [])
+      else read_until_quote (tail r) (cons (head r) (cons c acc))
+    else read_until_quote (tail cs) (cons c acc)
+
+-- Extract the value of a string field: "<key>":"<value>"
+get_str_field key line =
+  let needle = cat [q, key, q, ":", q]
+  let after = find_after needle line
+  if length after == 0 then ""
+  else
+    let (val, _) = read_until_quote after []
+    val
+
+-- Count comma-separated ints in a JSON int array: "<key>":[1,2,3,...]
+count_ints_acc cs n in_num =
+  if length cs == 0 then n
+  else
+    let c = head cs
+    if c == "]" then if in_num then n + 1 else n
+    else if c == "," then count_ints_acc (tail cs) (n + 1) false
+    else if c == " " then count_ints_acc (tail cs) n in_num
+    else count_ints_acc (tail cs) n true
+
+count_int_list_field key line =
+  let needle = cat [q, key, q, ":["]
+  let after = find_after needle line
+  if length after == 0 then 0
+  else count_ints_acc after 0 false
+
+-- ====================================================================
+-- Stats accumulators
+-- ====================================================================
+
+type Stats = | Stats n_func n_mod n_repl func_unknown comp_lens
+
+stats_zero = Stats 0 0 0 0 []
+
+-- Update stats with one record (line)
+update_stats st line = match st
+  | Stats nf nm nr fu cls ->
+    let kind = get_str_field "kind" line
+    let comp_n = count_int_list_field "completion_ids" line
+    let ret = get_str_field "ret_type" line
+    let cls2 = cons comp_n cls
+    if kind == "function" then
+      let fu2 = if ret == "UNKNOWN" then fu + 1 else fu
+      Stats (nf + 1) nm nr fu2 cls2
+    else if kind == "module_doc" then Stats nf (nm + 1) nr fu cls2
+    else if kind == "repl_pair" then Stats nf nm (nr + 1) fu cls2
+    else st
+
+scan_lines_loop lines st =
+  if length lines == 0 then st
+  else
+    let l = head lines
+    if length l == 0 then scan_lines_loop (tail lines) st
+    else scan_lines_loop (tail lines) (update_stats st l)
+
+scan_file path st =
+  let body = read_file path
+  let lines = split "\n" body
+  scan_lines_loop lines st
+
+-- ====================================================================
+-- Distribution helpers
+-- ====================================================================
+
+-- Insertion sort (small N — ~hundreds of records).
+insert_sorted x ys =
+  if length ys == 0 then [x]
+  else
+    let h = head ys
+    if x <= h then cons x ys
+    else cons h (insert_sorted x (tail ys))
+
+isort_loop xs acc =
+  if length xs == 0 then acc
+  else isort_loop (tail xs) (insert_sorted (head xs) acc)
+
+isort xs = isort_loop xs []
+
+list_min xs =
+  if length xs == 0 then 0
+  else min_loop (tail xs) (head xs)
+
+min_loop xs cur =
+  if length xs == 0 then cur
+  else if head xs < cur then min_loop (tail xs) (head xs)
+  else min_loop (tail xs) cur
+
+list_max xs =
+  if length xs == 0 then 0
+  else max_loop (tail xs) (head xs)
+
+max_loop xs cur =
+  if length xs == 0 then cur
+  else if head xs > cur then max_loop (tail xs) (head xs)
+  else max_loop (tail xs) cur
+
+list_sum xs =
+  if length xs == 0 then 0
+  else (head xs) + list_sum (tail xs)
+
+list_mean xs =
+  if length xs == 0 then 0
+  else list_sum xs / length xs
+
+list_median xs =
+  let sorted = isort xs
+  let n = length sorted
+  if n == 0 then 0
+  else
+    let mid = n / 2
+    nth mid sorted
+
+-- ====================================================================
+-- Vocab + corpus chars (for compression ratio)
+-- ====================================================================
+
+count_lines body =
+  let xs = split "\n" body
+  count_nonempty xs 0
+
+count_nonempty xs n =
+  if length xs == 0 then n
+  else if length (head xs) == 0 then count_nonempty (tail xs) n
+  else count_nonempty (tail xs) (n + 1)
+
+vocab_size _ =
+  let body = read_file "training/corpus/v1/vocab"
+  count_lines body
+
+-- Sum of completion-string lengths across all records, for compression ratio.
+comp_chars_in_line line =
+  let s = get_str_field "completion" line
+  length s
+
+sum_comp_chars_loop lines n =
+  if length lines == 0 then n
+  else
+    let l = head lines
+    if length l == 0 then sum_comp_chars_loop (tail lines) n
+    else sum_comp_chars_loop (tail lines) (n + comp_chars_in_line l)
+
+sum_comp_chars_file path =
+  let body = read_file path
+  let lines = split "\n" body
+  sum_comp_chars_loop lines 0
+
+-- ====================================================================
+-- Main
+-- ====================================================================
+
+main =
+  let _ = print "corpus_stats: scanning training/corpus/v1/..."
+  let st0 = stats_zero
+  let st1 = scan_file "training/corpus/v1/train.jsonl" st0
+  let st2 = scan_file "training/corpus/v1/val.jsonl" st1
+  let st3 = scan_file "training/corpus/v1/test.jsonl" st2
+  let _ = print_stats st3
+  0
+
+print_stats st = match st
+  | Stats nf nm nr fu cls ->
+    let total = nf + nm + nr
+    let lens = cls
+    let mn = list_min lens
+    let med = list_median lens
+    let mx = list_max lens
+    let mean = list_mean lens
+    let total_chars_train = sum_comp_chars_file "training/corpus/v1/train.jsonl"
+    let total_chars_val = sum_comp_chars_file "training/corpus/v1/val.jsonl"
+    let total_chars_test = sum_comp_chars_file "training/corpus/v1/test.jsonl"
+    let total_chars = total_chars_train + total_chars_val + total_chars_test
+    let total_tokens = list_sum lens
+    let ratio_x100 = if total_tokens == 0 then 0 else (total_chars * 100) / total_tokens
+    let vsize = vocab_size 0
+    let unknown_pct = if nf == 0 then 0 else (fu * 100) / nf
+    let _ = print "──────────────────────────────────────────"
+    let _ = print (cat ["records total:    ", show total])
+    let _ = print (cat ["  function:       ", show nf])
+    let _ = print (cat ["  module_doc:     ", show nm])
+    let _ = print (cat ["  repl_pair:      ", show nr])
+    let _ = print (cat ["completion tokens (per record):"])
+    let _ = print (cat ["  min:            ", show mn])
+    let _ = print (cat ["  median:         ", show med])
+    let _ = print (cat ["  mean:           ", show mean])
+    let _ = print (cat ["  max:            ", show mx])
+    let _ = print (cat ["BPE vocab size:   ", show vsize])
+    let _ = print (cat ["compression x100: ", show ratio_x100, "  (chars/token)"])
+    let _ = print (cat ["function ret_type UNKNOWN: ", show fu, " of ", show nf, "  (", show unknown_pct, "%)"])
+    let _ = print "──────────────────────────────────────────"
+    0

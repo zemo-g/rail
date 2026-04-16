@@ -2,6 +2,138 @@
 
 All notable changes to Rail are documented here.
 
+## Post-v2.22.1 (unreleased) — `tools/train/corpus_gen.rail`: Phase 5 training corpus
+
+The dead flywheel orchestrator's harvest is replaced with a deterministic
+source-grounded corpus that the self-training loop can re-derive byte-for-byte
+at any time. Walks `stdlib/`, `tools/train/`, `flywheel/`, `tools/deploy/`
+(94 files, `tools/compile.rail` excluded), emits BPE-tokenized JSONL training
+data in `training/corpus/v1/`.
+
+### Three record kinds
+- **function** — doc comment block (if any) + signature → body. ret_type
+  comes from `rail infer` (Track B). Single-line definitions
+  (`add x y = x + y`) are split on ` = ` so even one-liners contribute.
+- **module_doc** — header `--` block at the top of a file → first ~10
+  exported function signatures. Teaches "what this module is" → "what
+  it exports".
+- **repl_pair** — each `run_test "name" "src" "expected"` case in
+  `tools/compile.rail`'s harness → input src as prompt, expected stdout
+  as completion.
+
+### Output (`training/corpus/v1/`)
+```
+vocab merges train.jsonl val.jsonl test.jsonl
+```
+Each line is a JSON object:
+```json
+{"id":"<sha256[0:16]>","source_file":"...","kind":"...",
+ "prompt":"...","completion":"...",
+ "prompt_ids":[...],"completion_ids":[...],
+ "ret_type":"INT|FLOAT|HEAP|UNKNOWN"}
+```
+Train/val/test split by `SHA-256(rid_seed) mod 20` (0..17 → train,
+18 → val, 19 → test).
+
+### Counts (this run)
+- 1636 valid records (1455 train / 92 val / 89 test)
+- 1435 function · 92 module_doc · 109 repl_pair
+- Completion length (BPE tokens): min 1 · median 60 · mean 120 · max 2011
+- BPE vocab: 866 (target 1024, base ASCII vocab + 770 merges)
+- BPE compression: 2.26× chars/token
+- Function ret_type: 21.3% UNKNOWN (306 of 1435) — slightly over the
+  spec's "<20%" gate, see notes below
+
+### Determinism
+Two consecutive runs with the same `rail_native` binary and unchanged
+source produce byte-identical `train.jsonl` / `val.jsonl` / `test.jsonl`
+/ `vocab` / `merges`. Verified with `cmp` after a re-run.
+
+Sources of determinism:
+- Sorted file walk (`find ... | sort`)
+- Per-file `rail infer` shell-out with stable `RAIL_BIN`
+- Hash-table `infer_table` (deterministic insertion order is irrelevant
+  because we never iterate it — only `ht_get` lookups during emit)
+- BPE merges deterministic (smaller-key tie-break per `stdlib/bpe.rail`)
+- SHA-256 split bucket
+
+Set `RAIL_BIN=/path/to/pinned-rail_native` to pin the inference binary
+when a parallel session is rebuilding the in-tree `./rail_native`.
+
+### Notes / pragmatic compromises
+- **Sampled BPE training corpus.** `bpe.rail`'s `bpe_count_pairs` calls
+  `length tokens < 2` per recursive step, and `length` is `O(N)` on
+  cons-lists, so per-iteration cost is `O(N)` and total is
+  `O(merges × N²)` — minutes-to-hours on the full 426K-char concatenated
+  corpus. v1 trains BPE on an 8K-char head sample, which still covers
+  every byte in stdlib's distinct-char set and learns 770 useful merges.
+  Encoding of full records (per-string, short) is unaffected.
+  Lifting this is a follow-up: either sample-then-merge wider, or fix
+  `length` checks in `bpe.rail` to constant-time emptiness predicates.
+- **Hash-table `infer_table`.** Initial implementation used a
+  list-of-pairs lookup. With 4907 infer entries × 1844 function records,
+  each lookup also walked `length` per step, so total cost was ~22B ops.
+  Switched to `stdlib/hash.rail`'s `ht_put`/`ht_get`: amortized `O(1)`
+  per lookup. (The "infer entries: N" diagnostic prints `length` of the
+  underlying array, which is meaningless for an `ht`; the table is
+  populated correctly — verified by 79% non-UNKNOWN ret_type coverage.)
+- **CR stripping.** Several stdlib files (`args.rail`, `math.rail`,
+  `fmt.rail`, `http.rail`, etc.) have CRLF line endings in comments.
+  Rail's `"\r"` literal is a known unsupported edge case
+  (`memory/rail-bugs.md`), so `json_esc` can't pattern match it
+  directly. We `tr -d '\015'` each source file via shell before parsing.
+- **`<20%` UNKNOWN gate missed by 1.3pp.** 21.3% is the genuine output
+  of `rail infer` on this corpus — Track B can't infer ret types for
+  many helper functions, deeply-recursive cross-file definitions,
+  and tuple-returning constructors. Lifting requires either improving
+  `rail infer` itself (out of scope here) or excluding files with
+  poor inference coverage (e.g. `stdlib/tensor.rail` at 34% UNKNOWN).
+  Shipping as-is; future inference improvements will lift it organically.
+
+### Sample records
+
+```jsonc
+// function — stdlib/json.rail / json_int (note ret_type=INT from Track B)
+{"id":"...","source_file":"stdlib/json.rail","kind":"function",
+ "prompt":"-- Convert JSON num value to int\njson_int v =",
+ "completion":"  let (_, n) = (head v, head (tail v))\n  n",
+ "prompt_ids":[...], "completion_ids":[...], "ret_type":"INT"}
+
+// module_doc — first 10 exported sigs as completion
+{"id":"...","source_file":"stdlib/args.rail","kind":"module_doc",
+ "prompt":"-- stdlib/args.rail — CLI argument parser\n-- Import: import \"stdlib/args.rail\"",
+ "completion":"parse_args argv =\nparse_args_acc argv flags opts positionals =\n...",
+ "ret_type":"UNKNOWN"}
+
+// repl_pair — test src → expected stdout
+{"id":"...","source_file":"tools/compile.rail","kind":"repl_pair",
+ "prompt":"main = if 1 == 1 then 42 else 0",
+ "completion":"42",
+ "ret_type":"UNKNOWN"}
+```
+
+### Companion script
+`tools/train/corpus_stats.rail` reads the JSONL splits + vocab and
+reports record counts by kind, completion-length distribution in
+tokens, vocab size, BPE compression ratio, and pct of function records
+with non-UNKNOWN ret_type.
+
+```
+$ ./rail_native run tools/train/corpus_stats.rail
+records total:    1636
+  function:       1435
+  module_doc:     92
+  repl_pair:      109
+completion tokens (per record):
+  min:            1
+  median:         60
+  mean:           120
+  max:            2011
+BPE vocab size:   866
+compression x100: 226  (chars/token)
+function ret_type UNKNOWN: 306 of 1435  (21%)
+```
+
 ## Post-v2.21 (unreleased) — `stdlib/bpe.rail`: byte-pair encoding tokenizer
 
 `stdlib/tokenizer.rail` tops out at char-level — training on the 553KB
