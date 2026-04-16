@@ -40,16 +40,73 @@ static int g_initialized = 0;
 // All pipeline states, keyed by name; lazy-built.
 static NSMutableDictionary<NSString*, id<MTLComputePipelineState>> *g_pipes = nil;
 
-// Simple buffer pool: up to POOL_MAX reusable MTLBuffers. Keyed by byte size.
-// First-fit: linear scan, take smallest buffer ≥ requested size.
-#define POOL_MAX 32
+// ────────────────────────────────────────────────────────────────────
+// Tiered MTLBuffer pool — track 14
+//
+// Rationale (see docs/metal-pool-design.md): the prior single-pool design
+// (POOL_MAX=32, one bucket) let many distinct small (M,K,N) shapes crowd
+// out the few large shapes a transformer emits at seq=1499 (attention
+// scores ≈ 9 MB).  When the pool was full, large allocations dropped on
+// the floor and re-allocated per call — the documented RSS leak.
+//
+// We bucket by byte-size class, give each tier its own dynamic capacity,
+// and let large tiers grow without evicting small ones.  Storage mode is
+// part of the key so a Shared buffer never pretends to be Private.
+//
+// Tier boundaries are powers of two; T0 ≤ 4 KB, then ×16 / ×16 / ×16 / ∞.
+// All three storage modes get parallel sub-pools (currently only Shared
+// is used by these kernels — the other two stay zero-allocated until a
+// caller asks).
+// ────────────────────────────────────────────────────────────────────
+
+#define NUM_TIERS         5
+#define NUM_STORAGE_MODES 3        // Shared / Managed / Private
+#define TIER_INITIAL_CAP  8
+#define TIER_MAX_CAP      128
+#define TIER_IDLE_SHRINK_SECS 30.0
+#define TIER_MIN_KEEP     4        // never shrink a tier below this many slots
+
+static const NSUInteger TIER_MAX_BYTES[NUM_TIERS] = {
+    (NSUInteger)4096,                  // T0 ≤ 4 KB
+    (NSUInteger)65536,                 // T1 ≤ 64 KB
+    (NSUInteger)1048576,               // T2 ≤ 1 MB
+    (NSUInteger)16777216,              // T3 ≤ 16 MB
+    (NSUInteger)0xFFFFFFFFFFFFFFFFULL, // T4 unbounded
+};
+
 typedef struct {
-    id<MTLBuffer> buf;   // retained
-    NSUInteger    size;  // bytes
+    id<MTLBuffer> buf;        // retained while slot occupied
+    NSUInteger    size;       // bytes (rounded)
     int           in_use;
+    double        last_release_t;
 } pool_slot_t;
-static pool_slot_t g_pool[POOL_MAX];
-static int         g_pool_count = 0;
+
+typedef struct {
+    pool_slot_t  slots[TIER_MAX_CAP];
+    int          count;          // how many slots are populated
+    int          capacity;       // current grown capacity (≤ TIER_MAX_CAP)
+    int          in_use;         // currently checked-out slots
+    int          peak_in_use;    // high-water mark since boot
+    long long    hits;           // satisfied from pool
+    long long    misses;         // newBufferWithLength fired
+    long long    drops;          // misses that couldn't even be tracked
+    long long    shrinks;        // slots freed by idle reaper
+    long long    bytes_in_pool;  // sum of slot.size (in_use + idle)
+} pool_tier_t;
+
+static pool_tier_t g_pools[NUM_STORAGE_MODES][NUM_TIERS];
+static int         g_pools_inited = 0;
+
+static dispatch_once_t g_pool_once;
+
+static void pool_init_once(void) {
+    dispatch_once(&g_pool_once, ^{
+        for (int m = 0; m < NUM_STORAGE_MODES; m++)
+            for (int t = 0; t < NUM_TIERS; t++)
+                g_pools[m][t].capacity = TIER_INITIAL_CAP;
+        g_pools_inited = 1;
+    });
+}
 
 // ObjC runtime warmup — Rail's process isn't a Cocoa app, so class lists need
 // forcing. Touching a constant NSString triggers __objc_classlist processing.
@@ -57,42 +114,187 @@ __attribute__((constructor))
 static void _tgl_ctor(void) {
     volatile NSString *s = @"tgl_init_warmup";
     (void)s;
+    pool_init_once();
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Buffer pool — minimize newBufferWithLength on hot paths.
-// ────────────────────────────────────────────────────────────────────
+static inline int storage_mode_index(MTLResourceOptions opt) {
+    NSUInteger sm = (opt & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift;
+    if (sm == MTLStorageModeShared)  return 0;
+    if (sm == MTLStorageModeManaged) return 1;
+    if (sm == MTLStorageModePrivate) return 2;
+    return 0;
+}
 
-static id<MTLBuffer> pool_acquire(NSUInteger bytes) {
-    // Best-fit to reduce fragmentation. Pick smallest free slot ≥ bytes.
+static const char *storage_mode_name(int idx) {
+    switch (idx) { case 0: return "shared"; case 1: return "managed";
+                   case 2: return "private"; default: return "?"; }
+}
+
+static inline int tier_for_bytes(NSUInteger bytes) {
+    for (int t = 0; t < NUM_TIERS; t++) if (bytes <= TIER_MAX_BYTES[t]) return t;
+    return NUM_TIERS - 1;
+}
+
+static inline NSUInteger round_up_for_tier(NSUInteger bytes, int tier) {
+    // T4 (unbounded) — round to 64 KB to avoid fragmenting megabuffers.
+    if (tier == NUM_TIERS - 1) return (bytes + 65535) & ~((NSUInteger)65535);
+    // Within a bounded tier, round up to next power-of-two so siblings
+    // are interchangeable (best-fit always finds an exact reuse).
+    NSUInteger p = 4096;
+    while (p < bytes) p <<= 1;
+    return p;
+}
+
+static id<MTLBuffer> pool_acquire_mode(NSUInteger bytes, MTLResourceOptions opt) {
+    pool_init_once();
+    int sm  = storage_mode_index(opt);
+    int t   = tier_for_bytes(bytes);
+    pool_tier_t *pt = &g_pools[sm][t];
+
+    // Best-fit within tier — pick smallest idle slot ≥ bytes.
     int best = -1;
-    for (int i = 0; i < g_pool_count; i++) {
-        if (g_pool[i].in_use) continue;
-        if (g_pool[i].size < bytes) continue;
-        if (best < 0 || g_pool[i].size < g_pool[best].size) best = i;
+    for (int i = 0; i < pt->count; i++) {
+        if (pt->slots[i].in_use)         continue;
+        if (pt->slots[i].size < bytes)   continue;
+        if (best < 0 || pt->slots[i].size < pt->slots[best].size) best = i;
     }
     if (best >= 0) {
-        g_pool[best].in_use = 1;
-        return g_pool[best].buf;
+        pt->slots[best].in_use = 1;
+        pt->hits++;
+        pt->in_use++;
+        if (pt->in_use > pt->peak_in_use) pt->peak_in_use = pt->in_use;
+        return pt->slots[best].buf;
     }
-    // Miss — allocate. Round up to 4KB page to improve reuse.
-    NSUInteger rounded = (bytes + 4095) & ~((NSUInteger)4095);
-    id<MTLBuffer> b = [g_device newBufferWithLength:rounded options:MTLResourceStorageModeShared];
+
+    // Miss — allocate.
+    NSUInteger rounded = round_up_for_tier(bytes, t);
+    id<MTLBuffer> b = [g_device newBufferWithLength:rounded options:opt];
     if (!b) return nil;
-    if (g_pool_count < POOL_MAX) {
-        g_pool[g_pool_count].buf = b;
-        g_pool[g_pool_count].size = rounded;
-        g_pool[g_pool_count].in_use = 1;
-        g_pool_count++;
+    pt->misses++;
+
+    if (pt->count < pt->capacity) {
+        // Track in pool.
+        int idx = pt->count++;
+        pt->slots[idx].buf            = b;
+        pt->slots[idx].size           = rounded;
+        pt->slots[idx].in_use         = 1;
+        pt->slots[idx].last_release_t = 0.0;
+        pt->bytes_in_pool            += rounded;
+        pt->in_use++;
+        if (pt->in_use > pt->peak_in_use) pt->peak_in_use = pt->in_use;
+        return b;
     }
+
+    // Capacity full — try to grow (×2 up to TIER_MAX_CAP).
+    if (pt->capacity < TIER_MAX_CAP) {
+        int new_cap = pt->capacity * 2;
+        if (new_cap > TIER_MAX_CAP) new_cap = TIER_MAX_CAP;
+        pt->capacity = new_cap;
+        int idx = pt->count++;
+        pt->slots[idx].buf            = b;
+        pt->slots[idx].size           = rounded;
+        pt->slots[idx].in_use         = 1;
+        pt->slots[idx].last_release_t = 0.0;
+        pt->bytes_in_pool            += rounded;
+        pt->in_use++;
+        if (pt->in_use > pt->peak_in_use) pt->peak_in_use = pt->in_use;
+        return b;
+    }
+
+    // Tier maxed — return the buffer untracked (ARC frees on autoreleasepool exit).
+    pt->drops++;
     return b;
 }
 
-static void pool_release(id<MTLBuffer> b) {
-    for (int i = 0; i < g_pool_count; i++) {
-        if (g_pool[i].buf == b) { g_pool[i].in_use = 0; return; }
+// Convenience wrapper — kernels in this file all use Shared storage.
+static id<MTLBuffer> pool_acquire(NSUInteger bytes) {
+    return pool_acquire_mode(bytes, MTLResourceStorageModeShared);
+}
+
+// Idle shrink: free at most one stale slot per tier per release tick to
+// avoid stutter.  Keep at least TIER_MIN_KEEP slots alive even when idle.
+static void pool_idle_reap(pool_tier_t *pt, double now) {
+    if (pt->count <= TIER_MIN_KEEP) return;
+    int oldest = -1;
+    double oldest_t = now;
+    for (int i = 0; i < pt->count; i++) {
+        if (pt->slots[i].in_use) continue;
+        if (pt->slots[i].last_release_t == 0.0) continue;
+        double age = now - pt->slots[i].last_release_t;
+        if (age < TIER_IDLE_SHRINK_SECS) continue;
+        if (pt->slots[i].last_release_t < oldest_t) {
+            oldest_t = pt->slots[i].last_release_t;
+            oldest = i;
+        }
     }
-    // Not in pool (pool was full) — drop on the floor, ARC frees it.
+    if (oldest < 0) return;
+    pt->bytes_in_pool -= pt->slots[oldest].size;
+    pt->slots[oldest].buf = nil;       // ARC drops the MTLBuffer
+    // Swap-remove with last slot to keep the dense prefix invariant.
+    int last = pt->count - 1;
+    if (oldest != last) pt->slots[oldest] = pt->slots[last];
+    pt->slots[last].buf = nil;
+    pt->count--;
+    pt->shrinks++;
+}
+
+static void pool_release(id<MTLBuffer> b) {
+    if (!b) return;
+    double now = [NSDate timeIntervalSinceReferenceDate];
+    for (int sm = 0; sm < NUM_STORAGE_MODES; sm++) {
+        for (int t = 0; t < NUM_TIERS; t++) {
+            pool_tier_t *pt = &g_pools[sm][t];
+            for (int i = 0; i < pt->count; i++) {
+                if (pt->slots[i].buf == b) {
+                    pt->slots[i].in_use = 0;
+                    pt->slots[i].last_release_t = now;
+                    pt->in_use--;
+                    pool_idle_reap(pt, now);
+                    return;
+                }
+            }
+        }
+    }
+    // Untracked buffer (capacity-overflow miss) — ARC will free it.
+}
+
+// Public C ABI accessor — used by tensor_daemond's stats endpoint.
+typedef struct {
+    int       tier;
+    const char *storage;
+    int       capacity;
+    int       count;
+    int       in_use;
+    int       peak_in_use;
+    long long hits;
+    long long misses;
+    long long drops;
+    long long shrinks;
+    long long bytes_in_pool;
+} tgl_pool_stat_t;
+
+int tgl_pool_stats(tgl_pool_stat_t *out, int max) {
+    pool_init_once();
+    int n = 0;
+    for (int sm = 0; sm < NUM_STORAGE_MODES; sm++) {
+        for (int t = 0; t < NUM_TIERS; t++) {
+            if (n >= max) return n;
+            pool_tier_t *pt = &g_pools[sm][t];
+            out[n].tier          = t;
+            out[n].storage       = storage_mode_name(sm);
+            out[n].capacity      = pt->capacity;
+            out[n].count         = pt->count;
+            out[n].in_use        = pt->in_use;
+            out[n].peak_in_use   = pt->peak_in_use;
+            out[n].hits          = pt->hits;
+            out[n].misses        = pt->misses;
+            out[n].drops         = pt->drops;
+            out[n].shrinks       = pt->shrinks;
+            out[n].bytes_in_pool = pt->bytes_in_pool;
+            n++;
+        }
+    }
+    return n;
 }
 
 // ────────────────────────────────────────────────────────────────────
