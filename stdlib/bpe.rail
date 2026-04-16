@@ -81,20 +81,36 @@ bpe_init_encode_loop_n cs n vocab_list acc =
 bpe_init_encode_loop cs vocab_list acc =
   bpe_init_encode_loop_n cs (length cs) vocab_list acc
 
+-- Array-emitter version — produces a mutable int array of char ids.
+-- Used by the training hot path to avoid O(target × N) cons allocations.
+bpe_init_encode_arr_loop cs n vocab_list arr i =
+  if n == 0 then arr
+  else
+    let id = bpe_char_id_loop vocab_list (head cs) 0
+    let _ = arr_set arr i id
+    bpe_init_encode_arr_loop (tail cs) (n - 1) vocab_list arr (i + 1)
+
+bpe_init_encode_arr cs vocab_list =
+  let n = length cs
+  let arr = arr_new n 0
+  bpe_init_encode_arr_loop cs n vocab_list arr 0
+
 -- ========== Pair counting (int→int map) ==========
 
--- Length-threaded inner loop — avoids O(N) `length tokens` per step (#3).
-bpe_count_pairs_n tokens n m =
-  if n < 2 then m
+-- Array-based pair counting — zero cons allocations per step. For training
+-- on large corpora (#3, memory half): the earlier cons-list scan allocated
+-- a fresh tail cell per step, saturating the arena at ~50K tokens.
+bpe_count_pairs_arr_loop arr n i m =
+  if i >= n - 1 then m
   else
-    let a = head tokens
-    let b = head (tail tokens)
+    let a = arr_get arr i
+    let b = arr_get arr (i + 1)
     let k = bpe_pair_key a b
     let c = map_get m k
-    bpe_count_pairs_n (tail tokens) (n - 1) (map_put m k (c + 1))
+    bpe_count_pairs_arr_loop arr n (i + 1) (map_put m k (c + 1))
 
-bpe_count_pairs tokens m =
-  bpe_count_pairs_n tokens (length tokens) m
+bpe_count_pairs_arr arr n m =
+  bpe_count_pairs_arr_loop arr n 0 m
 
 -- Walk map keys, track (best_key, best_count). Tie-break: keep smaller
 -- key so the tokenizer is deterministic for a given corpus.
@@ -128,6 +144,31 @@ bpe_apply_merge_n tokens n a b nid acc =
 bpe_apply_merge tokens a b nid acc =
   bpe_apply_merge_n tokens (length tokens) a b nid acc
 
+-- In-place array merge. Writes to position w <= read position i, so no
+-- forward corruption. Returns new active length. Zero cons allocations.
+bpe_apply_merge_arr_loop arr n i w a b nid =
+  if i >= n then w
+  else if i == n - 1 then
+    let t = arr_get arr i
+    let _ = arr_set arr w t
+    w + 1
+  else
+    let t0 = arr_get arr i
+    let t1 = arr_get arr (i + 1)
+    if t0 == a then
+      if t1 == b then
+        let _ = arr_set arr w nid
+        bpe_apply_merge_arr_loop arr n (i + 2) (w + 1) a b nid
+      else
+        let _ = arr_set arr w t0
+        bpe_apply_merge_arr_loop arr n (i + 1) (w + 1) a b nid
+    else
+      let _ = arr_set arr w t0
+      bpe_apply_merge_arr_loop arr n (i + 1) (w + 1) a b nid
+
+bpe_apply_merge_arr arr n a b nid =
+  bpe_apply_merge_arr_loop arr n 0 0 a b nid
+
 -- ========== Training loop ==========
 -- Invariants:
 --   size == length vocab
@@ -142,9 +183,9 @@ bpe_apply_merge tokens a b nid acc =
 -- scratch in arena_mark/reset so the transient map + keys list don't
 -- accumulate across training iterations (Rail's GC doesn't reliably
 -- reclaim hundreds of BSTs built in tight loops — empirically verified).
-bpe_best_pair tokens =
+bpe_best_pair_arr arr n =
   let mk = arena_mark 0
-  let counts = bpe_count_pairs tokens (map_new 0)
+  let counts = bpe_count_pairs_arr arr n (map_new 0)
   let keys = map_keys counts
   if length keys == 0 then
     let _ = arena_reset mk
@@ -155,10 +196,11 @@ bpe_best_pair tokens =
     let _ = arena_reset mk
     (bk, bc)
 
-bpe_train_loop tokens merges vocab size target =
+-- Array-based training loop — mutates `arr` in place, threads active length.
+bpe_train_loop_arr arr n merges vocab size target =
   if size >= target then BPE merges vocab size
   else
-    let best = bpe_best_pair tokens
+    let best = bpe_best_pair_arr arr n
     let (best_k, best_c) = best
     if best_c < 2 then BPE merges vocab size
     else
@@ -168,8 +210,8 @@ bpe_train_loop tokens merges vocab size target =
       let new_token = append (bpe_nth a vocab) (bpe_nth b vocab)
       let new_vocab = append vocab [new_token]
       let new_merges = append merges [(a, b, nid)]
-      let new_tokens = bpe_apply_merge tokens a b nid []
-      bpe_train_loop new_tokens new_merges new_vocab (size + 1) target
+      let new_n = bpe_apply_merge_arr arr n a b nid
+      bpe_train_loop_arr arr new_n new_merges new_vocab (size + 1) target
 
 bpe_train text target =
   let all_chars = chars text
@@ -177,8 +219,9 @@ bpe_train text target =
   let base_size = length uniq
   if target <= base_size then BPE [] uniq base_size
   else
-    let init_tokens = bpe_init_encode_loop all_chars uniq []
-    bpe_train_loop init_tokens [] uniq base_size target
+    let arr = bpe_init_encode_arr all_chars uniq
+    let n = arr_len arr
+    bpe_train_loop_arr arr n [] uniq base_size target
 
 -- ========== Encode / decode ==========
 
