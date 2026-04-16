@@ -66,6 +66,64 @@ extern int tgl_matmul_batched_f64(const double*, const double*, double*, int, in
 extern int tgl_ce_softmax_backward_f64(const double*, const double*, double*, int, int);
 extern int tgl_layernorm_backward_f64(const double*, const double*, const double*, const double*, const double*, double*, int, int);
 
+// Pool stats — see tensor_gpu_lib.m for the struct layout.
+typedef struct {
+    int       tier;
+    const char *storage;
+    int       capacity;
+    int       count;
+    int       in_use;
+    int       peak_in_use;
+    long long hits;
+    long long misses;
+    long long drops;
+    long long shrinks;
+    long long bytes_in_pool;
+} tgl_pool_stat_t;
+extern int tgl_pool_stats(tgl_pool_stat_t *out, int max);
+
+// Build a JSON document describing every pool tier.  Returns malloc'd
+// NUL-terminated string; caller frees.  *len_out gets the byte length
+// excluding the terminator.
+static char* build_stats_json(size_t *len_out) {
+    tgl_pool_stat_t stats[64];
+    int n = tgl_pool_stats(stats, 64);
+
+    // ~256 bytes per tier line, plus framing.  Allocate generously.
+    size_t cap = 512 + (size_t)n * 256;
+    char *buf = malloc(cap);
+    if (!buf) { *len_out = 0; return NULL; }
+    size_t off = 0;
+    off += snprintf(buf + off, cap - off, "{\"tiers\":[");
+    long long total_hits = 0, total_misses = 0, total_drops = 0, total_bytes = 0;
+    for (int i = 0; i < n; i++) {
+        total_hits   += stats[i].hits;
+        total_misses += stats[i].misses;
+        total_drops  += stats[i].drops;
+        total_bytes  += stats[i].bytes_in_pool;
+        off += snprintf(buf + off, cap - off,
+            "%s{\"tier\":%d,\"storage\":\"%s\",\"capacity\":%d,\"count\":%d,"
+            "\"in_use\":%d,\"peak_in_use\":%d,\"hits\":%lld,\"misses\":%lld,"
+            "\"drops\":%lld,\"shrinks\":%lld,\"bytes_in_pool\":%lld}",
+            i == 0 ? "" : ",",
+            stats[i].tier, stats[i].storage,
+            stats[i].capacity, stats[i].count,
+            stats[i].in_use, stats[i].peak_in_use,
+            stats[i].hits, stats[i].misses, stats[i].drops,
+            stats[i].shrinks, stats[i].bytes_in_pool);
+    }
+    long long total_acquires = total_hits + total_misses;
+    double miss_rate = total_acquires > 0 ?
+        ((double)total_misses / (double)total_acquires) : 0.0;
+    off += snprintf(buf + off, cap - off,
+        "],\"totals\":{\"hits\":%lld,\"misses\":%lld,\"drops\":%lld,"
+        "\"acquires\":%lld,\"miss_rate\":%.6f,\"bytes_in_pool\":%lld}}\n",
+        total_hits, total_misses, total_drops, total_acquires,
+        miss_rate, total_bytes);
+    *len_out = off;
+    return buf;
+}
+
 // Op codes. Must match Rail-side dispatch in stdlib/tensor.rail.
 typedef enum {
     OP_INIT               = 0,
@@ -222,6 +280,49 @@ static int handle_text(int fd, char first) {
     if (strcmp(cmd, "SHUTDOWN") == 0) {
         write_exact(fd, "OK\n", 3);
         return 1;
+    }
+    // Plain text stats — `STATS\n` or `GPU_STATS\n` returns just the JSON body.
+    if (strcmp(cmd, "STATS") == 0 || strcmp(cmd, "GPU_STATS") == 0) {
+        size_t jlen = 0;
+        char *json = build_stats_json(&jlen);
+        if (!json) { write_exact(fd, "ERR stats\n", 10); return 0; }
+        write_exact(fd, json, jlen);
+        free(json);
+        return 0;
+    }
+    // Minimal HTTP — `GET /gpu/stats ...` (and any other GET path returns
+    // the same payload; we only have one route).  Drains the rest of the
+    // request headers, then writes a single HTTP/1.0 response and closes.
+    if (strcmp(cmd, "GET") == 0) {
+        // strtok consumed the path already if present; we only need to drain.
+        // Read until empty line ("\r\n\r\n" or "\n\n").
+        char drain[256];
+        int blank = 0;
+        while (blank < 2) {
+            char c;
+            if (read_exact(fd, &c, 1) < 0) break;
+            if (c == '\n') { blank++; continue; }
+            if (c != '\r') blank = 0;
+            (void)drain;
+        }
+        size_t jlen = 0;
+        char *json = build_stats_json(&jlen);
+        if (!json) {
+            const char *err = "HTTP/1.0 500 Internal Server Error\r\n"
+                              "Content-Length: 0\r\n\r\n";
+            write_exact(fd, err, strlen(err));
+            return -1;  // close this connection (NOT daemon shutdown)
+        }
+        char hdr[160];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.0 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n\r\n", jlen);
+        write_exact(fd, hdr, (size_t)hlen);
+        write_exact(fd, json, jlen);
+        free(json);
+        return -1;  // HTTP/1.0 — close connection after responding (not daemon)
     }
     if (strcmp(cmd, "MATMUL_F32FILE") == 0) {
         char *sM = strtok(NULL, " ");
