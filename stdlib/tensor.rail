@@ -1080,6 +1080,111 @@ tensor_reshape t new_shape = match t
     Tensor t_data new_shape new_strides
 
 -- ============================================================
+-- Phase-1 gap fills (2026-04-16)
+-- rank, general slice, layer_norm forward
+-- ============================================================
+
+-- tensor_rank: number of dimensions
+tensor_rank t = match t
+  | Tensor _ s _ -> length s
+
+-- Helper: copy [start*block..end*block) from src to dst starting at dst offset 0.
+copy_range src dst src_off n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set dst i (float_arr_get src (src_off + i))
+    copy_range src dst src_off n (i + 1)
+
+-- tensor_slice: extract a contiguous slice along axis 0 (outermost).
+-- For a tensor with shape [D0, D1, D2, ...], returns shape [end-start, D1, D2, ...].
+-- start is inclusive, end is exclusive. Caller must ensure 0 <= start < end <= D0.
+-- This is the common case for attention KV-cache rolling, batch splits, etc.
+-- For slicing along inner axes, compose with transpose first.
+tensor_slice t start end = match t
+  | Tensor t_data t_shape _ ->
+    let d0 = head t_shape
+    let inner = tail t_shape
+    let inner_size = list_product inner
+    let new_d0 = end - start
+    let new_shape = cons new_d0 inner
+    let total = new_d0 * inner_size
+    let out_data = float_arr_new total 0.0
+    let src_off = start * inner_size
+    let _ = copy_range t_data out_data src_off total 0
+    Tensor out_data new_shape (compute_strides new_shape)
+
+-- ============================================================
+-- LayerNorm (forward)
+--   y = gamma * (x - mean) / sqrt(var + eps) + beta
+-- Normalizes along the LAST axis. For input shape [..., D]:
+-- - rows = product of all but the last dim
+-- - dim  = last dim
+-- gamma and beta are 1D tensors of shape [D] (or scalars if null-shaped).
+-- Matches the tgl_layernorm_backward_f64 foreign contract so the backward
+-- pass (reserved for Phase 4 autodiff) lines up: mean and rstd outputs
+-- are returned as a triple alongside y.
+-- ============================================================
+
+-- Inner: per-row normalization. Writes y[row*dim..(row+1)*dim] in place.
+-- Returns 0 (float-result-via-mutation convention — see module header).
+ln_row x y gamma beta row dim eps =
+  let base = row * dim
+  let sum_arr = float_arr_new 1 0.0
+  let _ = ln_row_sum x base dim 0 sum_arr
+  let mean = (float_arr_get sum_arr 0) / (0.0 + dim)
+  let sq_arr = float_arr_new 1 0.0
+  let _ = ln_row_sq x base dim 0 mean sq_arr
+  let var = (float_arr_get sq_arr 0) / (0.0 + dim)
+  let rstd = 1.0 / (sqrt (var + eps))
+  let _ = ln_row_apply x y gamma beta base dim 0 mean rstd
+  0
+
+ln_row_sum x base dim i acc =
+  if i >= dim then 0
+  else
+    let v = float_arr_get x (base + i)
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur + v)
+    ln_row_sum x base dim (i + 1) acc
+
+ln_row_sq x base dim i mean acc =
+  if i >= dim then 0
+  else
+    let v = float_arr_get x (base + i)
+    let d = v - mean
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur + d * d)
+    ln_row_sq x base dim (i + 1) mean acc
+
+ln_row_apply x y gamma beta base dim i mean rstd =
+  if i >= dim then 0
+  else
+    let v = float_arr_get x (base + i)
+    let g = float_arr_get gamma i
+    let b = float_arr_get beta i
+    let norm = (v - mean) * rstd
+    let _ = float_arr_set y (base + i) (g * norm + b)
+    ln_row_apply x y gamma beta base dim (i + 1) mean rstd
+
+ln_rows x y gamma beta rows dim eps r =
+  if r >= rows then 0
+  else
+    let _ = ln_row x y gamma beta r dim eps
+    ln_rows x y gamma beta rows dim eps (r + 1)
+
+tensor_layer_norm t gamma beta eps = match t
+  | Tensor t_data t_shape t_st ->
+    let rank = length t_shape
+    let dim = list_nth (rank - 1) t_shape
+    let total = list_product t_shape
+    let rows = total / dim
+    let y = float_arr_new total 0.0
+    match gamma | Tensor g_data _ _ ->
+      match beta | Tensor b_data _ _ ->
+        let _ = ln_rows t_data y g_data b_data rows dim eps 0
+        Tensor y t_shape t_st
+
+-- ============================================================
 -- Print utility for debugging
 -- ============================================================
 
