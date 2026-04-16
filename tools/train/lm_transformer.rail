@@ -329,8 +329,11 @@ train_step x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog
     let _ = adam_update_raw wf2_d dwf2_d st_wf2 lr adam_default_b1 adam_default_b2 adam_default_eps
     loss
 
-train_loop x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 base_lr warmup max_steps step =
-  if step >= max_steps then 0
+-- `segment_stop` exits the recursion early so the outer driver can
+-- checkpoint between segments. LR schedule still uses the global
+-- `max_steps` so cosine decay doesn't restart each segment.
+train_loop x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 base_lr warmup max_steps segment_stop step =
+  if step >= segment_stop then 0
   else
     let lr = cosine_decay step warmup max_steps base_lr
     -- Drop all arena-allocated intermediates from the prior step before
@@ -343,7 +346,7 @@ train_loop x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog
       let _ = print (cat ["step ", show step, "  lr=", show_float lr, "  loss=", show_float loss])
       0
     else 0
-    train_loop x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 base_lr warmup max_steps (step + 1)
+    train_loop x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 base_lr warmup max_steps segment_stop (step + 1)
 
 eval_loss x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff =
   let result = forward x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
@@ -383,6 +386,41 @@ sample_greedy x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff vocab =
     | Tensor probs_data _ _ ->
       let ids = collect_predictions probs_data seq V
       decode vocab ids
+
+-- Outer checkpoint driver. Weight tensors and Adam states are bundled
+-- into `weights` and `adams` lists (and destructured at the top of the
+-- body) so the param count stays under Rail's ARM64 codegen limit.
+-- `best_val_arr` is a 1-slot float_arr; slot 0 < 0 means "no prior best".
+run_segments x labels weights adams pe seq V d d_ff dlog_buf base_lr warmup max_steps save_every ckpt best_val_arr step =
+  if step >= max_steps then 0
+  else
+    let w_e = list_nth 0 weights
+    let w_q = list_nth 1 weights
+    let w_k = list_nth 2 weights
+    let w_v = list_nth 3 weights
+    let w_o = list_nth 4 weights
+    let w_f1 = list_nth 5 weights
+    let w_f2 = list_nth 6 weights
+    let ln_g = list_nth 7 weights
+    let ln_b = list_nth 8 weights
+    let st_we = list_nth 0 adams
+    let st_wq = list_nth 1 adams
+    let st_wk = list_nth 2 adams
+    let st_wv = list_nth 3 adams
+    let st_wo = list_nth 4 adams
+    let st_wf1 = list_nth 5 adams
+    let st_wf2 = list_nth 6 adams
+    let next0 = step + save_every
+    let next = if next0 > max_steps then max_steps else next0
+    let _ = train_loop x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 base_lr warmup max_steps next step
+    let loss_now = eval_loss x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
+    let prev_best = float_arr_get best_val_arr 0
+    let is_best = if prev_best < 0.0 then true else loss_now < prev_best
+    let _ = if is_best then float_arr_set best_val_arr 0 loss_now else 0
+    let b = float_arr_get best_val_arr 0
+    let _ = save_checkpoint ckpt weights adams next b
+    let _ = print (cat ["  ckpt@", show next, "  eval_loss=", show_float loss_now, "  best=", show_float b])
+    run_segments x labels weights adams pe seq V d d_ff dlog_buf base_lr warmup max_steps save_every ckpt best_val_arr next
 
 main =
   let _ = print "=== Pre-norm transformer LM (LN + residual + FFN) ==="
@@ -448,14 +486,37 @@ main =
 
   let dlog_buf = float_arr_new (seq * V) 0.0
 
+  -- Bundled lists of weights + Adam states — used by the checkpoint
+  -- driver. They alias the individual tensor/adam bindings above, so
+  -- in-place loads update them both.
+  let weights = cons w_e (cons w_q (cons w_k (cons w_v (cons w_o (cons w_f1 (cons w_f2 (cons ln_g (cons ln_b []))))))))
+  let adams = cons st_we (cons st_wq (cons st_wk (cons st_wv (cons st_wo (cons st_wf1 (cons st_wf2 []))))))
+
+  let ckpt = "/Users/ledaticempire/projects/rail/training/rail_native/checkpoints/latest"
+  let save_every = 100
+  let max_steps = 2000
+
+  -- Resume if a committed checkpoint exists.
+  let resumed = ckpt_exists ckpt
+  let start_step = if resumed then
+      let _ = print (cat ["resuming from committed ckpt at ", ckpt])
+      let _ = load_model_into ckpt weights
+      let _ = load_adam_states_into ckpt adams
+      meta_step ckpt
+    else
+      let _ = print "no prior checkpoint — starting fresh"
+      0
+  let start_best = if resumed then meta_best_val ckpt else (0.0 - 1.0)
+  let best_val_arr = float_arr_new 1 start_best
+
   let loss0 = eval_loss x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
-  let _ = print (cat ["initial loss=", show_float loss0])
+  let _ = print (cat ["initial/resume loss=", show_float loss0, "  step=", show start_step, "  best=", show_float start_best])
   let _ = print (cat ["uniform-baseline (log V)=", show_float (log (int_to_float V))])
   let _ = print (cat ["v2.3 bigram baseline=2.10"])
   let _ = print (cat ["v2.4 attention-only baseline=2.62"])
 
-  let _ = print "\nTraining 2000 steps (d=64, arena-mark/reset per step):"
-  let _ = train_loop x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff dlog_buf st_we st_wq st_wk st_wv st_wo st_wf1 st_wf2 0.02 100 2000 0
+  let _ = print (cat ["\nTraining up to ", show max_steps, " steps, checkpoint every ", show save_every, ":"])
+  let _ = run_segments x labels weights adams pe seq V d d_ff dlog_buf 0.02 100 max_steps save_every ckpt best_val_arr start_step
 
   let loss1 = eval_loss x labels w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
   let _ = print (cat ["\nfinal loss=", show_float loss1])
@@ -474,11 +535,14 @@ main =
   let _ = print sample_str
   let _ = print "--- end sample ---"
 
-  -- Save trained weights. Manifest + .f32 payloads at the prefix path.
-  -- Resume machinery not yet wired; rerun still starts from fresh init.
-  let weights = cons w_e (cons w_q (cons w_k (cons w_v (cons w_o (cons w_f1 (cons w_f2 (cons ln_g (cons ln_b []))))))))
-  let _ = save_model "/Users/ledaticempire/projects/rail/training/rail_native/checkpoints/latest" weights
-  let _ = print "checkpoint saved to training/rail_native/checkpoints/latest.*"
+  -- Final checkpoint. Run_segments also saves after every segment, so
+  -- this is mostly a belt-and-suspenders end-of-run snapshot.
+  let final_best0 = float_arr_get best_val_arr 0
+  let final_is_best = if final_best0 < 0.0 then true else loss1 < final_best0
+  let _ = if final_is_best then float_arr_set best_val_arr 0 loss1 else 0
+  let final_best = float_arr_get best_val_arr 0
+  let _ = save_checkpoint ckpt weights adams max_steps final_best
+  let _ = print (cat ["final ckpt saved at step=", show max_steps, " best=", show_float final_best])
   0
 
 ones_loop arr n i =
