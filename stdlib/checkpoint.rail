@@ -1,18 +1,35 @@
--- stdlib/checkpoint.rail — Model parameter save/load for Rail tensors.
+-- stdlib/checkpoint.rail — Save/load model state for Rail training loops.
 -- Import: import "stdlib/checkpoint.rail"
 --
--- Prereq: import "stdlib/tensor.rail" first.
+-- Prereq: import "stdlib/tensor.rail" FIRST.
+-- For Adam save/load, also import "stdlib/optim.rail" (AdamState ADT).
 --
--- Format (per save):
---   <prefix>.manifest    text file, one line per tensor:
---                          "<rank> <dim0> <dim1> ..."
---                        first line is the tensor count.
---   <prefix>.<i>.f32     binary f32 payload for tensor i (size = product of shape).
+-- Entry points:
+--   save_model prefix weights
+--   load_model prefix                → list of Tensor
+--   save_checkpoint prefix weights adam_states step best_val
+--   load_checkpoint prefix           → [weights, adam_states, step, best_val]
+--                                      or [] if no committed ckpt exists
+--   ckpt_exists prefix               → bool
 --
--- Saving interleaves a text manifest with binary data files. The manifest
--- is small and human-readable so ckpt directories can be inspected from a
--- shell without custom tools. Binary payload uses the existing
--- float_arr_{to,from}_f32_file builtins (zero-copy bridge to Metal training).
+-- File layout with prefix P (suitable for direct shell inspection):
+--   P.manifest          "<N>\n" then one "<rank> <d0> <d1> ..." per tensor.
+--   P.<i>.f32           binary f32 payload for tensor i.
+--   P.adam_manifest     "<N>\n" then one "<size> <step>" per Adam state.
+--   P.adam.<i>.m.f32    Adam first-moment payload for state i.
+--   P.adam.<i>.v.f32    Adam second-moment payload for state i.
+--   P.meta              key=value lines. Recognized: step, best_val_loss.
+--   P.committed         sentinel file. Created LAST; absence means the
+--                       prior save was interrupted and the ckpt is invalid.
+--
+-- Atomicity: save_checkpoint removes .committed first, writes every
+-- payload, then creates .committed. load_checkpoint refuses any prefix
+-- without a .committed sentinel, so a partial save is transparent to
+-- callers (they see "no checkpoint" and reinitialize).
+--
+-- Binary payloads are f32 (truncated from Rail's f64) via the existing
+-- float_arr_{to,from}_f32_file builtins. This matches the Metal dylib
+-- ABI and the f64→f32→GPU→f32→f64 roundtrip already paid elsewhere.
 
 -- Format a tensor's shape as "<rank> <dim0> <dim1> ...".
 shape_line_loop shape acc =
@@ -80,3 +97,213 @@ load_model prefix =
   let lines = split "\n" text
   let count = parse_int (head lines)
   load_loop prefix (tail lines) 0 count []
+
+-- ────────────────────────────────────────────────────────────────────
+-- Adam state save/load.
+-- Each AdamState has matching-size m and v float_arrs plus a 1-slot
+-- int arr with the step count. All three must be preserved or resume
+-- restarts momentum from zero and the bias-correction exponent drops
+-- to 1 — neither survives on the first post-resume update.
+-- ────────────────────────────────────────────────────────────────────
+
+-- "<size> <step>" manifest line for one state.
+adam_manifest_line state = match state
+  | AdamState m _ step_arr ->
+    let n = float_arr_len m
+    let t = arr_get step_arr 0
+    cat [show n, " ", show t, "\n"]
+
+-- Write the i'th (and onward) Adam state's m/v payloads.
+save_adam_loop prefix states i =
+  if length states == 0 then 0
+  else match head states
+    | AdamState m v step_arr ->
+      let n = float_arr_len m
+      let mfn = cat [prefix, ".adam.", show i, ".m.f32"]
+      let vfn = cat [prefix, ".adam.", show i, ".v.f32"]
+      let _ = float_arr_to_f32_file mfn m n
+      let _ = float_arr_to_f32_file vfn v n
+      save_adam_loop prefix (tail states) (i + 1)
+
+
+build_adam_manifest states acc =
+  if length states == 0 then acc
+  else
+    let one = adam_manifest_line (head states)
+    build_adam_manifest (tail states) (cat [acc, one])
+
+save_adam_states prefix states =
+  let count = length states
+  let header = cat [show count, "\n"]
+  let body = build_adam_manifest states ""
+  let manifest = cat [header, body]
+  let _ = write_file (cat [prefix, ".adam_manifest"]) manifest
+  save_adam_loop prefix states 0
+
+-- Parse "<size> <step>" → 2-int list.
+parse_adam_line_ints parts acc =
+  if length parts == 0 then reverse acc
+  else
+    let p = head parts
+    if length (chars p) == 0 then parse_adam_line_ints (tail parts) acc
+    else
+      let pi = parse_int p
+      parse_adam_line_ints (tail parts) (cons pi acc)
+
+parse_adam_line line =
+  let parts = split " " line
+  parse_adam_line_ints parts []
+
+load_adam_loop prefix lines i count acc =
+  if i >= count then reverse acc
+  else
+    let pair = parse_adam_line (head lines)
+    let n = head pair
+    let t = head (tail pair)
+    let m = float_arr_new n 0.0
+    let v = float_arr_new n 0.0
+    let step_arr = arr_new 1 t
+    let mfn = cat [prefix, ".adam.", show i, ".m.f32"]
+    let vfn = cat [prefix, ".adam.", show i, ".v.f32"]
+    let _ = float_arr_from_f32_file mfn m n
+    let _ = float_arr_from_f32_file vfn v n
+    let st = AdamState m v step_arr
+    load_adam_loop prefix (tail lines) (i + 1) count (cons st acc)
+
+load_adam_states prefix =
+  let text = read_file (cat [prefix, ".adam_manifest"])
+  let lines = split "\n" text
+  let count = parse_int (head lines)
+  load_adam_loop prefix (tail lines) 0 count []
+
+-- Meta file: "key=value" lines. Keys/values must not contain '='.
+
+save_meta prefix step best_val =
+  let a = cat ["step=", show step, "\n"]
+  let b = cat ["best_val_loss=", show_float best_val, "\n"]
+  let body = cat [a, b]
+  let _ = write_file (cat [prefix, ".meta"]) body
+  0
+
+find_meta_loop lines key =
+  if length lines == 0 then ""
+  else
+    let line = head lines
+    let parts = split "=" line
+    if length parts < 2 then find_meta_loop (tail lines) key
+    else if head parts == key then head (tail parts)
+    else find_meta_loop (tail lines) key
+
+load_meta_text prefix =
+  read_file (cat [prefix, ".meta"])
+
+meta_step prefix =
+  let text = load_meta_text prefix
+  let lines = split "\n" text
+  let v = find_meta_loop lines "step"
+  if length (chars v) == 0 then 0
+  else parse_int v
+
+-- Returns best_val_loss or -1.0 sentinel if key missing.
+meta_best_val prefix =
+  let text = load_meta_text prefix
+  let lines = split "\n" text
+  let v = find_meta_loop lines "best_val_loss"
+  if length (chars v) == 0 then 0.0 - 1.0
+  else parse_float v
+
+-- Commit sentinel.
+
+ckpt_exists prefix =
+  let path = cat [prefix, ".committed"]
+  let result = shell (cat ["test -f ", path, " && echo 1 || echo 0"])
+  str_contains "1" result
+
+clear_committed prefix =
+  let path = cat [prefix, ".committed"]
+  let _ = shell (cat ["rm -f ", path])
+  0
+
+mark_committed prefix =
+  let _ = write_file (cat [prefix, ".committed"]) "1\n"
+  0
+
+-- Full checkpoint save (atomic via commit sentinel).
+save_checkpoint prefix weights adam_states step best_val =
+  let _ = clear_committed prefix
+  let _ = save_model prefix weights
+  let _ = save_adam_states prefix adam_states
+  let _ = save_meta prefix step best_val
+  let _ = mark_committed prefix
+  0
+
+-- Returns [weights, adam_states, step, best_val] or [] if no committed ckpt.
+load_checkpoint prefix =
+  if ckpt_exists prefix then
+    let w = load_model prefix
+    let a = load_adam_states prefix
+    let s = meta_step prefix
+    let b = meta_best_val prefix
+    cons w (cons a (cons s (cons b [])))
+  else []
+
+-- ────────────────────────────────────────────────────────────────────
+-- In-place reload variants.
+-- For training resume, the caller has already allocated weight and
+-- Adam tensors with the right shapes (shape and Adam-state size are
+-- implied by hyperparameters, not by ckpt file contents). These
+-- helpers overwrite the underlying float_arrs in place so resume
+-- doesn't allocate fresh tensors the training loop doesn't know about.
+--
+-- Preconditions: the shapes/sizes in the ckpt file must match the
+-- ones already allocated by the caller. Mismatch silently truncates
+-- or over-reads depending on direction.
+-- ────────────────────────────────────────────────────────────────────
+
+overwrite_model_loop prefix tensors i =
+  if length tensors == 0 then 0
+  else match head tensors
+    | Tensor data shape _ ->
+      let fname = cat [prefix, ".", show i, ".f32"]
+      let size = list_product shape
+      let _ = float_arr_from_f32_file fname data size
+      overwrite_model_loop prefix (tail tensors) (i + 1)
+
+load_model_into prefix tensors =
+  overwrite_model_loop prefix tensors 0
+
+overwrite_adam_loop prefix states lines i =
+  if length states == 0 then 0
+  else match head states
+    | AdamState m v step_arr ->
+      let pair = parse_adam_line (head lines)
+      let n = head pair
+      let t = head (tail pair)
+      let _ = arr_set step_arr 0 t
+      let mfn = cat [prefix, ".adam.", show i, ".m.f32"]
+      let vfn = cat [prefix, ".adam.", show i, ".v.f32"]
+      let _ = float_arr_from_f32_file mfn m n
+      let _ = float_arr_from_f32_file vfn v n
+      overwrite_adam_loop prefix (tail states) (tail lines) (i + 1)
+
+load_adam_states_into prefix states =
+  let text = read_file (cat [prefix, ".adam_manifest"])
+  let all_lines = split "\n" text
+  let body = tail all_lines
+  overwrite_adam_loop prefix states body 0
+
+-- ────────────────────────────────────────────────────────────────────
+-- Eval split: hold out the tail of a text corpus for validation.
+-- val_pct=10 → last 10% of bytes. Returns [train, val] list.
+-- str_sub uses byte offsets; mid-codepoint splits possible if the
+-- corpus is non-ASCII. Tiny corpora where (total*val_pct)/100 == 0
+-- return [text, ""] so the caller still has a train chunk.
+-- ────────────────────────────────────────────────────────────────────
+
+corpus_split text val_pct =
+  let total = length (chars text)
+  let val_len = (total * val_pct) / 100
+  let train_len = total - val_len
+  let train = str_sub text 0 train_len
+  let val = str_sub text train_len val_len
+  cons train (cons val [])

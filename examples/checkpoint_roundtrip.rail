@@ -1,0 +1,161 @@
+-- examples/checkpoint_roundtrip.rail
+--
+-- Smoke test for stdlib/checkpoint.rail: save a small checkpoint
+-- (weights + Adam states + meta), reload it, assert the step count,
+-- weight values, and Adam state values survive the round trip through
+-- f32 disk storage.
+--
+-- Run:  ./rail_native run examples/checkpoint_roundtrip.rail
+-- Pass: prints "PASS 12/12" after all assertions.
+import "stdlib/tensor.rail"
+import "stdlib/optim.rail"
+import "stdlib/checkpoint.rail"
+
+unwrap t = match t
+  | Tensor d _ _ -> d
+
+adam_m_of s = match s
+  | AdamState m _ _ -> m
+
+adam_v_of s = match s
+  | AdamState _ v _ -> v
+
+adam_step_of s = match s
+  | AdamState _ _ stp -> arr_get stp 0
+
+-- Fill a float_arr with 0.5, 1.0, 1.5, ... (i*0.5). Every value is
+-- exactly representable in f32 so round-trip asserts are tight.
+seed_halfs data n i =
+  if i >= n then 0
+  else
+    let step_f = int_to_float i
+    let half = step_f * 0.5
+    let _ = float_arr_set data i half
+    seed_halfs data n (i + 1)
+
+-- Integer-only equality on a float: compares (arr[i] * 10.0) rounded
+-- to an int. Side-steps Rail's cross-fn float-param inference quirks.
+check_x10 arr i expected10 label =
+  let got = float_arr_get arr i
+  let scaled = got * 10.0
+  let got10 = float_to_int scaled
+  if got10 == expected10 then 1
+  else
+    let _ = print (cat ["FAIL ", label, " got10=", show got10,
+                        " expected10=", show expected10])
+    0
+
+check_int got expected label =
+  if got == expected then 1
+  else
+    let _ = print (cat ["FAIL ", label, " got=", show got,
+                        " expected=", show expected])
+    0
+
+main =
+  let prefix = "/tmp/rail_ckpt_smoke"
+
+  -- Fresh slate so ckpt_exists flips false → true across save.
+  let _ = shell (cat ["rm -f ", prefix, ".*"])
+
+  let exists0 = ckpt_exists prefix
+  let before_val = if exists0 then 0 else 1
+  let c_before = check_int before_val 1 "exists_before_save"
+
+  -- Two tensors, shapes [3,4] and [2,5]. Seed, then pin anchor cells.
+  let n1 = 12
+  let n2 = 10
+  let t1 = tensor_new (cons 3 (cons 4 [])) 0.0
+  let d1 = unwrap t1
+  let _ = seed_halfs d1 n1 0
+  let _ = float_arr_set d1 0 1.0
+  let _ = float_arr_set d1 5 3.5
+
+  let t2 = tensor_new (cons 2 (cons 5 [])) 0.0
+  let d2 = unwrap t2
+  let _ = seed_halfs d2 n2 0
+  let _ = float_arr_set d2 0 100.0
+  let _ = float_arr_set d2 9 104.5
+
+  let weights = cons t1 (cons t2 [])
+
+  -- Two Adam states. m[3]=1.5, v[3]=11.5 on state 1; step counts 7 and 11.
+  let st1 = adam_state n1
+  let m1 = adam_m_of st1
+  let v1 = adam_v_of st1
+  let _ = float_arr_set m1 3 1.5
+  let _ = float_arr_set v1 3 11.5
+  let _ = match st1 | AdamState _ _ stp -> arr_set stp 0 7
+
+  let st2 = adam_state n2
+  let _ = match st2 | AdamState _ _ stp -> arr_set stp 0 11
+
+  let adams = cons st1 (cons st2 [])
+
+  let _ = save_checkpoint prefix weights adams 42 1.5
+
+  let exists1 = ckpt_exists prefix
+  let after_val = if exists1 then 1 else 0
+  let c_after = check_int after_val 1 "exists_after_save"
+
+  -- Reload.
+  let bundle = load_checkpoint prefix
+  let wbacks = list_nth 0 bundle
+  let abacks = list_nth 1 bundle
+  let sback = list_nth 2 bundle
+  let bvback = list_nth 3 bundle
+
+  -- Meta asserts.
+  let c_step = check_int sback 42 "step"
+  -- best_val_loss = 1.5 → scaled*10 = 15.
+  let bv_times10 = float_to_int (bvback * 10.0)
+  let c_bv = check_int bv_times10 15 "best_val_loss"
+
+  -- Weight asserts (values × 10 as integers).
+  let w1_data = unwrap (head wbacks)
+  let w2_data = unwrap (head (tail wbacks))
+  let c1 = check_x10 w1_data 0 10 "w1[0]"
+  let c2 = check_x10 w1_data 5 35 "w1[5]"
+  let c3 = check_x10 w2_data 0 1000 "w2[0]"
+  let c4 = check_x10 w2_data 9 1045 "w2[9]"
+
+  -- Adam asserts.
+  let a1_m = adam_m_of (head abacks)
+  let a1_v = adam_v_of (head abacks)
+  let c5 = check_x10 a1_m 3 15 "adam1_m[3]"
+  let c6 = check_x10 a1_v 3 115 "adam1_v[3]"
+  let c_s1 = check_int (adam_step_of (head abacks)) 7 "adam1_step"
+  let c_s2 = check_int (adam_step_of (head (tail abacks))) 11 "adam2_step"
+
+  -- In-place load variants: reuse preallocated tensors/adams.
+  -- Allocate fresh targets, zero-fill, then load_*_into over them.
+  let t1b = tensor_new (cons 3 (cons 4 [])) 0.0
+  let t2b = tensor_new (cons 2 (cons 5 [])) 0.0
+  let wb = cons t1b (cons t2b [])
+  let _ = load_model_into prefix wb
+
+  let st1b = adam_state n1
+  let st2b = adam_state n2
+  let adamsb = cons st1b (cons st2b [])
+  let _ = load_adam_states_into prefix adamsb
+
+  let c_into1 = check_x10 (unwrap t1b) 5 35 "into_w1[5]"
+  let c_into2 = check_x10 (adam_m_of st1b) 3 15 "into_adam1_m[3]"
+  let c_into3 = check_int (adam_step_of st2b) 11 "into_adam2_step"
+
+  -- corpus_split: "abcdefghij" with val_pct=30 → train="abcdefg", val="hij".
+  let text = "abcdefghij"
+  let parts = corpus_split text 30
+  let tr = head parts
+  let va = head (tail parts)
+  let c_cs1 = check_int (length (chars tr)) 7 "cs_train_len"
+  let c_cs2 = check_int (length (chars va)) 3 "cs_val_len"
+
+  let total = c_before + c_after + c_step + c_bv + c1 + c2 + c3 + c4 + c5 + c6 + c_s1 + c_s2 + c_into1 + c_into2 + c_into3 + c_cs1 + c_cs2
+  let _ = print (cat ["passed=", show total, "/17"])
+  if total == 17 then
+    let _ = print "PASS 17/17"
+    0
+  else
+    let _ = print "FAIL"
+    1
