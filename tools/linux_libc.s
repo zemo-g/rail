@@ -742,3 +742,77 @@ _fputs:
     bl _fwrite
     ldp x29, x30, [sp], #32
     ret
+
+// ============ Cross-compile additions (2026-04-17) ============
+
+// accept(fd, addr, addrlen) — wrap accept4 with flags=0
+// Linux ARM64 dropped legacy accept (202); use accept4 (242) with 0 flags.
+_accept:
+    mov x3, #0           // flags = 0
+    mov x8, #242         // accept4
+    svc #0
+    ret
+
+// send(fd, buf, len, flags) — wrap sendto with NULL dest
+_send:
+    mov x4, #0           // dest_addr = NULL
+    mov x5, #0           // addrlen = 0
+    mov x8, #206         // sendto
+    svc #0
+    ret
+
+// recv(fd, buf, len, flags) — wrap recvfrom with NULL src
+_recv:
+    mov x4, #0           // src_addr = NULL
+    mov x5, #0           // addrlen = NULL
+    mov x8, #207         // recvfrom
+    svc #0
+    ret
+
+// strtol(nptr, endptr, base) — Rail's parse_int primitive emits `bl _strtol`.
+// We support base 10 (matching the compiler's `mov x2, #10`). endptr ignored.
+// Skips leading whitespace, optional +/- sign, then digits.
+_strtol:
+    mov x9, x0           // x9 = ptr
+    mov x10, #0          // result
+    mov x11, #1          // sign
+.Lstrtol_skipws:
+    ldrb w12, [x9]
+    cmp w12, #32         // ' '
+    b.eq .Lstrtol_advws
+    cmp w12, #9          // '\t'
+    b.ne .Lstrtol_sign
+.Lstrtol_advws:
+    add x9, x9, #1
+    b .Lstrtol_skipws
+.Lstrtol_sign:
+    cmp w12, #45         // '-'
+    b.ne .Lstrtol_plus
+    mov x11, #-1
+    add x9, x9, #1
+    b .Lstrtol_loop
+.Lstrtol_plus:
+    cmp w12, #43         // '+'
+    b.ne .Lstrtol_loop
+    add x9, x9, #1
+.Lstrtol_loop:
+    ldrb w12, [x9]
+    cmp w12, #48         // '0'
+    b.lt .Lstrtol_done
+    cmp w12, #57         // '9'
+    b.gt .Lstrtol_done
+    sub w12, w12, #48
+    mov x13, #10
+    mul x10, x10, x13
+    add x10, x10, x12
+    add x9, x9, #1
+    b .Lstrtol_loop
+.Lstrtol_done:
+    mul x0, x10, x11
+    ret
+
+// BSS reservations for young-generation semispace GC.
+// Mac codegen declares these via .zerofill which the transform sed strips.
+// .comm provides equivalent BSS allocation in ELF.
+.comm _rail_young_a, 67108864, 8
+.comm _rail_young_b, 67108864, 8
