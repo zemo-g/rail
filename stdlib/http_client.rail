@@ -1,0 +1,162 @@
+-- stdlib/http_client.rail — Pure Rail HTTP client (no HTTPS, no DNS)
+-- Uses stdlib/socket.rail TCP primitives + char_from_int (added to compile.rail 2026-04-16)
+-- to send HTTP requests and parse responses entirely in Rail.
+--
+-- Scope:
+--   * IP-only (no DNS). Caller supplies numeric IP like "192.0.2.1".
+--     Use shell("host example.local | awk '{print $4}'") if you need resolution.
+--   * HTTP only (no HTTPS/TLS). Good for internal services on trusted networks.
+--   * Text responses up to ~64KB. Streaming / chunked transfer not supported yet.
+--   * No cookies, no redirects. Raw single-request/response.
+--
+-- API:
+--   http_get ip port path              -> (status, body)
+--   http_post ip port path ctype body  -> (status, body)
+--   http_post_json ip port path body   -> (status, body)  -- sets Content-Type: application/json
+--   http_get_hdr ip port path hdrs     -> (status, body)  -- hdrs is list of "Name: Value"
+--
+-- Internal: build_request, send_all, recv_all, parse_response
+
+import "stdlib/socket.rail"
+
+-- ---- tcp connect helper ----
+
+connect_tcp ip_str port =
+  let fd = tcp_socket 0
+  if fd < 0 then 0 - 1
+  else
+    let sa = make_sockaddr_in port ip_str
+    let r = connect fd sa sockaddr_in_size
+    let _ = free sa
+    if r == 0 then fd else
+      let _ = close fd
+      0 - 1
+
+-- ---- send-all (loop on partial sends) ----
+
+send_all fd buf =
+  let total = length buf
+  send_all_loop fd buf 0 total
+
+send_all_loop fd buf off total =
+  if off >= total then total
+  else
+    let remaining = total - off
+    let chunk = if off == 0 then buf else str_sub buf off remaining
+    let n = send fd chunk remaining 0
+    if n <= 0 then off
+    else send_all_loop fd buf (off + n) total
+
+-- ---- recv-all into a Rail string via buf → string reconstruction ----
+-- We allocate a fixed buffer, call recv repeatedly until 0 bytes, and
+-- accumulate bytes into a strbuf via char_from_int.
+
+recv_all fd =
+  let buf = malloc 8192
+  let s = recv_all_loop fd buf ""
+  let _ = free buf
+  s
+
+recv_all_loop fd buf acc =
+  let n = recv fd buf 8192 0
+  if n <= 0 then acc
+  else
+    let chunk = bytes_to_str buf 0 n ""
+    recv_all_loop fd buf (join "" [acc, chunk])
+
+-- Copy bytes [start .. start+n) out of `buf` into a Rail string.
+-- Uses char_from_int + join. O(N) work, O(N²) alloc; fine for responses up to ~64KB.
+bytes_to_str buf off n acc =
+  if n <= 0 then acc
+  else
+    let c = byte_at buf off
+    bytes_to_str buf (off + 1) (n - 1) (join "" [acc, char_from_int c])
+
+-- ---- response parsing ----
+-- Find the status from "HTTP/1.1 200 OK", crlf, "..." and the body after ", crlf, "", crlf, ".
+parse_response raw =
+  let first_line = head (split "\n" raw)
+  let parts = split " " first_line
+  let status =
+    if length parts >= 2 then parse_int_s (head (tail parts)) else 0
+  let body = find_body_after_blank raw
+  (status, body)
+
+-- Dedicated int parser (socket.rail has one too, but we stay self-contained).
+parse_int_s s = pi_acc (chars s) 0
+
+pi_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else pi_acc (tail cs) (acc * 10 + d)
+
+-- CRLF must be synthesized at runtime because Rail's string literal parser
+-- doesn't escape \r (known bug). We build CR and LF via char_from_int.
+crlf _ = join "" [char_from_int 13, char_from_int 10]
+crlf_crlf _ = join "" [crlf 0, crlf 0]
+
+-- Split off body after the first empty line (CRLF CRLF separator).
+find_body_after_blank raw =
+  let i = str_find (crlf_crlf 0) raw
+  if i < 0 then
+    let j = str_find "\n\n" raw
+    if j < 0 then "" else str_sub raw (j + 2) (length raw - j - 2)
+  else str_sub raw (i + 4) (length raw - i - 4)
+
+-- ---- request builder ----
+
+-- Return true if any header in the list starts with "Host:".
+has_host_header hdrs =
+  if length hdrs == 0 then false
+  else
+    let h = head hdrs
+    if length h < 5 then has_host_header (tail hdrs)
+    else
+      let prefix = str_sub h 0 5
+      if prefix == "Host:" then true else has_host_header (tail hdrs)
+
+build_request method ip port path ctype body extra_hdrs =
+  let eol = crlf 0
+  let host_hdr =
+    if has_host_header extra_hdrs then ""
+    else join "" ["Host: ", ip, ":", show port, eol]
+  let len_hdr = join "" ["Content-Length: ", show (length body), eol]
+  let ct_hdr = if length ctype == 0 then "" else join "" ["Content-Type: ", ctype, eol]
+  let extras = if length extra_hdrs == 0 then "" else join "" [join eol extra_hdrs, eol]
+  join "" [method, " ", path, " HTTP/1.1", eol,
+       host_hdr, ct_hdr, len_hdr, extras,
+       "Connection: close", eol, eol,
+       body]
+
+-- ---- core request: connect → send → recv → parse → close ----
+
+http_request method ip port path ctype body extra_hdrs =
+  let fd = connect_tcp ip port
+  if fd < 0 then (0, "connect failed")
+  else
+    let req = build_request method ip port path ctype body extra_hdrs
+    let _ = send_all fd req
+    let resp = recv_all fd
+    let _ = close fd
+    parse_response resp
+
+-- ---- public API ----
+
+http_get ip port path =
+  http_request "GET" ip port path "" "" []
+
+http_post ip port path ctype body =
+  http_request "POST" ip port path ctype body []
+
+http_post_json ip port path body =
+  http_request "POST" ip port path "application/json" body []
+
+http_get_hdr ip port path hdrs =
+  http_request "GET" ip port path "" "" hdrs
+
+http_post_hdr ip port path ctype body hdrs =
+  http_request "POST" ip port path ctype body hdrs
