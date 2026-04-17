@@ -1,0 +1,223 @@
+-- stdlib/sha256.rail — Pure-Rail SHA-256 per RFC 6234 (FIPS 180-4).
+--
+-- Depends on stdlib/bytes.rail for bit-op helpers + BE word I/O.
+-- Input: Rail string. Output: 32-byte int-array (hash digest).
+-- Also provides sha256_hex for convenience testing.
+--
+-- Usage:
+--   let digest = sha256 "hello"
+--   let hex = bytes_to_hex digest 32
+--
+-- Not constant-time; not side-channel-hardened. Adequate for TLS
+-- handshake hashing (where timing reveals little) and message
+-- authentication (HMAC-SHA256). Do NOT use for password hashing
+-- unless wrapped in PBKDF2/Argon2.
+
+import "stdlib/bytes.rail"
+
+-- ── Constants ─────────────────────────────────────────────────────────────
+-- K[t] round constants and H[0..7] initial hash values. FIPS 180-4 §4.2.2.
+-- Encoded as hex strings to avoid Rail's missing hex-literal parser;
+-- decoded once at first-use into 32-bit word arrays.
+
+sha256_k_hex = "428a2f9871374491b5c0fbcfe9b5dba53956c25b59f111f1923f82a4ab1c5ed5d807aa9812835b01243185be550c7dc372be5d7480deb1fe9bdc06a7c19bf174e49b69c1efbe47860fc19dc6240ca1cc2de92c6f4a7484aa5cb0a9dc76f988da983e5152a831c66db00327c8bf597fc7c6e00bf3d5a7914706ca63511429296727b70a852e1b21384d2c6dfc53380d13650a7354766a0abb81c2c92e92722c85a2bfe8a1a81a664bc24b8b70c76c51a3d192e819d6990624f40e3585106aa07019a4c1161e376c082748774c34b0bcb5391c0cb34ed8aa4a5b9cca4f682e6ff3748f82ee78a5636f84c878148cc7020890befffaa4506cebbef9a3f7c67178f2"
+
+sha256_h_hex = "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19"
+
+sha256_k_table _ =
+  -- 64 × 32-bit constants = 256 hex chars = 128 bytes.
+  let bytes = hex_to_bytes sha256_k_hex
+  let tbl = arr_new 64 0
+  load_words bytes tbl 0 64
+
+sha256_h_init _ =
+  let bytes = hex_to_bytes sha256_h_hex
+  let h = arr_new 8 0
+  load_words bytes h 0 8
+
+load_words bytes dst i n =
+  if i >= n then dst
+  else
+    let w = be32_read bytes (i * 4)
+    let _ = arr_set dst i w
+    load_words bytes dst (i + 1) n
+
+-- ── Compression function helpers ──────────────────────────────────────────
+-- Ch, Maj, Σ0, Σ1, σ0, σ1 per FIPS 180-4 §4.1.2.
+-- All args are 32-bit unsigned (caller's responsibility — ops mask internally).
+
+sha_ch x y z =
+  let a = bit_and x y
+  let nx = bit_and (bit_xor x mask32) z
+  or32 a nx
+
+sha_maj x y z =
+  let a = bit_and x y
+  let b = bit_and x z
+  let c = bit_and y z
+  or32 (or32 a b) c
+
+sha_big_sigma0 x =
+  let a = rotr32 x 2
+  let b = rotr32 x 13
+  let c = rotr32 x 22
+  xor32 (xor32 a b) c
+
+sha_big_sigma1 x =
+  let a = rotr32 x 6
+  let b = rotr32 x 11
+  let c = rotr32 x 25
+  xor32 (xor32 a b) c
+
+sha_small_sigma0 x =
+  let a = rotr32 x 7
+  let b = rotr32 x 18
+  let c = shr32 x 3
+  xor32 (xor32 a b) c
+
+sha_small_sigma1 x =
+  let a = rotr32 x 17
+  let b = rotr32 x 19
+  let c = shr32 x 10
+  xor32 (xor32 a b) c
+
+-- ── Message schedule: expand W[0..15] → W[16..63] ─────────────────────────
+
+expand_schedule w t =
+  if t >= 64 then 0
+  else
+    let s1 = sha_small_sigma1 (arr_get w (t - 2))
+    let s0 = sha_small_sigma0 (arr_get w (t - 15))
+    let w2 = arr_get w (t - 7)
+    let w16 = arr_get w (t - 16)
+    let v = add32 (add32 s1 w2) (add32 s0 w16)
+    let _ = arr_set w t v
+    expand_schedule w (t + 1)
+
+-- ── Compression: 64 rounds updating (a..h) ────────────────────────────────
+-- Store state as an 8-int array indexed 0..7 = (a,b,c,d,e,f,g,h) to avoid
+-- 8-tuple returns (Rail's tuple support is limited).
+
+sha_round state w k_tbl t =
+  if t >= 64 then 0
+  else
+    let a = arr_get state 0
+    let b = arr_get state 1
+    let c = arr_get state 2
+    let d = arr_get state 3
+    let e = arr_get state 4
+    let f = arr_get state 5
+    let g = arr_get state 6
+    let h = arr_get state 7
+    let k = arr_get k_tbl t
+    let wt = arr_get w t
+    let t1 = add32 (add32 (add32 h (sha_big_sigma1 e)) (sha_ch e f g)) (add32 k wt)
+    let t2 = add32 (sha_big_sigma0 a) (sha_maj a b c)
+    let _ = arr_set state 7 g
+    let _ = arr_set state 6 f
+    let _ = arr_set state 5 e
+    let _ = arr_set state 4 (add32 d t1)
+    let _ = arr_set state 3 c
+    let _ = arr_set state 2 b
+    let _ = arr_set state 1 a
+    let _ = arr_set state 0 (add32 t1 t2)
+    sha_round state w k_tbl (t + 1)
+
+-- ── Block processing ──────────────────────────────────────────────────────
+-- One 64-byte block updates the 8 × 32-bit hash state.
+
+sha_process_block h state block k_tbl =
+  let w = arr_new 64 0
+  let _ = load_words block w 0 16
+  let _ = expand_schedule w 16
+  -- copy h into state
+  let _ = arr_set state 0 (arr_get h 0)
+  let _ = arr_set state 1 (arr_get h 1)
+  let _ = arr_set state 2 (arr_get h 2)
+  let _ = arr_set state 3 (arr_get h 3)
+  let _ = arr_set state 4 (arr_get h 4)
+  let _ = arr_set state 5 (arr_get h 5)
+  let _ = arr_set state 6 (arr_get h 6)
+  let _ = arr_set state 7 (arr_get h 7)
+  let _ = sha_round state w k_tbl 0
+  -- H[i] += state[i]
+  let _ = arr_set h 0 (add32 (arr_get h 0) (arr_get state 0))
+  let _ = arr_set h 1 (add32 (arr_get h 1) (arr_get state 1))
+  let _ = arr_set h 2 (add32 (arr_get h 2) (arr_get state 2))
+  let _ = arr_set h 3 (add32 (arr_get h 3) (arr_get state 3))
+  let _ = arr_set h 4 (add32 (arr_get h 4) (arr_get state 4))
+  let _ = arr_set h 5 (add32 (arr_get h 5) (arr_get state 5))
+  let _ = arr_set h 6 (add32 (arr_get h 6) (arr_get state 6))
+  let _ = arr_set h 7 (add32 (arr_get h 7) (arr_get state 7))
+  0
+
+-- ── Padding + block iteration ─────────────────────────────────────────────
+-- Pad message to 64-byte-multiple with 0x80 + zeros + 8-byte big-endian
+-- bit-length. Output digest: H[0..7] as 32 big-endian bytes.
+
+sha_copy_bytes src dst src_off dst_off n =
+  if n <= 0 then 0
+  else
+    let _ = arr_set dst dst_off (arr_get src src_off)
+    sha_copy_bytes src dst (src_off + 1) (dst_off + 1) (n - 1)
+
+sha_process_from msg_bytes msg_len h state k_tbl off =
+  -- Process full 64-byte blocks until < 64 bytes remain.
+  if msg_len - off >= 64 then
+    let block = arr_new 64 0
+    let _ = sha_copy_bytes msg_bytes block off 0 64
+    let _ = sha_process_block h state block k_tbl
+    sha_process_from msg_bytes msg_len h state k_tbl (off + 64)
+  else off
+
+sha_final_block msg_bytes msg_len h state k_tbl remain_off =
+  -- Build the final 1 or 2 blocks with 0x80 marker + length padding.
+  let rem = msg_len - remain_off
+  let bit_len = msg_len * 8
+  -- If rem + 1 (for 0x80) + 8 (for length) <= 64, one more block suffices.
+  -- Otherwise two blocks.
+  let need_two = rem + 9 > 64
+  let nblocks = if need_two then 2 else 1
+  let buf_size = nblocks * 64
+  let buf = arr_new buf_size 0
+  let _ = sha_copy_bytes msg_bytes buf remain_off 0 rem
+  let _ = arr_set buf rem 128
+  -- Zero-fill is automatic (arr_new default 0). Now write length in last
+  -- 8 bytes as big-endian. Bit-length fits in 32 bits for messages ≤ 2^29
+  -- bytes (536 MB), which covers all realistic TLS transcript hashes.
+  -- Upper 4 bytes of the 8-byte length field stay 0.
+  let _ = be32_write buf (buf_size - 4) bit_len
+  let _ = sha_process_block h state buf k_tbl
+  if need_two then sha_process_block h state (arr_slice buf 64 64) k_tbl
+  else 0
+
+arr_slice src start n =
+  -- Helper: shallow copy of n bytes from src[start..].
+  let dst = arr_new n 0
+  let _ = sha_copy_bytes src dst start 0 n
+  dst
+
+-- ── Public entry points ───────────────────────────────────────────────────
+
+sha256 msg =
+  let msg_bytes = string_to_bytes msg
+  let msg_len = string_length_bytes msg
+  let h = sha256_h_init 0
+  let k_tbl = sha256_k_table 0
+  let state = arr_new 8 0
+  let end = sha_process_from msg_bytes msg_len h state k_tbl 0
+  let _ = sha_final_block msg_bytes msg_len h state k_tbl end
+  -- Serialize H[0..7] to 32 big-endian bytes.
+  let out = arr_new 32 0
+  let _ = be32_write out 0 (arr_get h 0)
+  let _ = be32_write out 4 (arr_get h 1)
+  let _ = be32_write out 8 (arr_get h 2)
+  let _ = be32_write out 12 (arr_get h 3)
+  let _ = be32_write out 16 (arr_get h 4)
+  let _ = be32_write out 20 (arr_get h 5)
+  let _ = be32_write out 24 (arr_get h 6)
+  let _ = be32_write out 28 (arr_get h 7)
+  out
+
+sha256_hex msg =
+  bytes_to_hex (sha256 msg) 32
