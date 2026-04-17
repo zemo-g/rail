@@ -1,0 +1,157 @@
+-- stdlib/chacha20.rail — ChaCha20 stream cipher per RFC 8439.
+--
+-- State is a 4×4 grid of 32-bit little-endian words:
+--   Row 0: constants "expand 32-byte k"
+--   Row 1: key (8 words = 256 bits)
+--   Row 2: key (continued)
+--   Row 3: counter (1 word) || nonce (3 words = 96 bits)
+--
+-- Each block produces 64 bytes of keystream. 20 rounds = 10 "double rounds"
+-- alternating column and diagonal QUARTERROUNDs.
+--
+-- Public API:
+--   chacha20_block key_bytes nonce_bytes counter -> 64-byte int array
+--   chacha20_encrypt key nonce counter plaintext pt_len -> ciphertext (fresh array)
+
+import "stdlib/sha256.rail"  -- transitively imports bytes.rail + Layer 0 ops
+
+-- ── ChaCha20 constants ────────────────────────────────────────────────────
+-- "expand 32-byte k" as 4 little-endian 32-bit words.
+-- 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574
+
+chacha20_c0 = 1634760805
+chacha20_c1 = 857760878
+chacha20_c2 = 2036477234
+chacha20_c3 = 1797285236
+
+-- ── QUARTERROUND: a += b; d ^= a; d <<<= 16; c += d; b ^= c; b <<<= 12;
+--                 a += b; d ^= a; d <<<= 8;  c += d; b ^= c; b <<<= 7
+-- Operates in-place on state[ia], state[ib], state[ic], state[id].
+
+chacha20_qr state ia ib ic id =
+  let a1 = add32 (arr_get state ia) (arr_get state ib)
+  let d1 = rotl32 (bit_xor (arr_get state id) a1) 16
+  let c1 = add32 (arr_get state ic) d1
+  let b1 = rotl32 (bit_xor (arr_get state ib) c1) 12
+  let a2 = add32 a1 b1
+  let d2 = rotl32 (bit_xor d1 a2) 8
+  let c2 = add32 c1 d2
+  let b2 = rotl32 (bit_xor b1 c2) 7
+  let _ = arr_set state ia a2
+  let _ = arr_set state ib b2
+  let _ = arr_set state ic c2
+  let _ = arr_set state id d2
+  0
+
+chacha20_double_round state =
+  -- Column round
+  let _ = chacha20_qr state 0 4 8 12
+  let _ = chacha20_qr state 1 5 9 13
+  let _ = chacha20_qr state 2 6 10 14
+  let _ = chacha20_qr state 3 7 11 15
+  -- Diagonal round
+  let _ = chacha20_qr state 0 5 10 15
+  let _ = chacha20_qr state 1 6 11 12
+  let _ = chacha20_qr state 2 7 8 13
+  let _ = chacha20_qr state 3 4 9 14
+  0
+
+chacha20_rounds state n =
+  if n <= 0 then 0
+  else
+    let _ = chacha20_double_round state
+    chacha20_rounds state (n - 1)
+
+-- ── Block function ────────────────────────────────────────────────────────
+
+chacha20_init_state state key nonce counter =
+  let _ = arr_set state 0 chacha20_c0
+  let _ = arr_set state 1 chacha20_c1
+  let _ = arr_set state 2 chacha20_c2
+  let _ = arr_set state 3 chacha20_c3
+  let _ = arr_set state 4 (le32_read key 0)
+  let _ = arr_set state 5 (le32_read key 4)
+  let _ = arr_set state 6 (le32_read key 8)
+  let _ = arr_set state 7 (le32_read key 12)
+  let _ = arr_set state 8 (le32_read key 16)
+  let _ = arr_set state 9 (le32_read key 20)
+  let _ = arr_set state 10 (le32_read key 24)
+  let _ = arr_set state 11 (le32_read key 28)
+  let _ = arr_set state 12 counter
+  let _ = arr_set state 13 (le32_read nonce 0)
+  let _ = arr_set state 14 (le32_read nonce 4)
+  let _ = arr_set state 15 (le32_read nonce 8)
+  0
+
+chacha20_copy_state src dst =
+  chacha20_copy_at src dst 0
+
+chacha20_copy_at src dst i =
+  if i >= 16 then 0
+  else
+    let _ = arr_set dst i (arr_get src i)
+    chacha20_copy_at src dst (i + 1)
+
+chacha20_add_states acc src =
+  chacha20_add_at acc src 0
+
+chacha20_add_at acc src i =
+  if i >= 16 then 0
+  else
+    let v = add32 (arr_get acc i) (arr_get src i)
+    let _ = arr_set acc i v
+    chacha20_add_at acc src (i + 1)
+
+chacha20_serialize state out =
+  chacha20_serialize_at state out 0
+
+chacha20_serialize_at state out i =
+  if i >= 16 then 0
+  else
+    let _ = le32_write out (i * 4) (arr_get state i)
+    chacha20_serialize_at state out (i + 1)
+
+chacha20_block key nonce counter =
+  let state = arr_new 16 0
+  let initial = arr_new 16 0
+  let _ = chacha20_init_state state key nonce counter
+  let _ = chacha20_copy_state state initial
+  let _ = chacha20_rounds state 10
+  let _ = chacha20_add_states state initial
+  let out = arr_new 64 0
+  let _ = chacha20_serialize state out
+  out
+
+-- ── Encrypt / decrypt (XOR is symmetric) ──────────────────────────────────
+
+chacha20_xor_block pt pt_off ks ct ct_off n =
+  if n <= 0 then 0
+  else
+    let p = arr_get pt pt_off
+    let k = arr_get ks (pt_off - ct_off)
+    let _ = arr_set ct ct_off (bit_xor p k)
+    chacha20_xor_block pt (pt_off + 1) ks ct (ct_off + 1) (n - 1)
+
+chacha20_encrypt_loop key nonce counter pt pt_len ct off =
+  if off >= pt_len then 0
+  else
+    let ks = chacha20_block key nonce counter
+    let take = if pt_len - off < 64 then pt_len - off else 64
+    let _ = chacha20_xor_segment pt off ks ct take
+    chacha20_encrypt_loop key nonce (counter + 1) pt pt_len ct (off + 64)
+
+chacha20_xor_segment pt off ks ct n =
+  chacha20_xor_seg_at pt off ks ct 0 n
+
+chacha20_xor_seg_at pt off ks ct i n =
+  if i >= n then 0
+  else
+    let p = arr_get pt (off + i)
+    let k = arr_get ks i
+    let _ = arr_set ct (off + i) (bit_xor p k)
+    chacha20_xor_seg_at pt off ks ct (i + 1) n
+
+chacha20_encrypt key nonce counter pt pt_len =
+  let ct = arr_new pt_len 0
+  let _ = chacha20_encrypt_loop key nonce counter pt pt_len ct 0
+  ct
