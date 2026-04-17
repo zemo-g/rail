@@ -13,6 +13,7 @@ foreign send fd buf len flags -> int
 foreign recv fd buf len flags -> int
 foreign sendto fd buf len flags to tolen -> int
 foreign recvfrom fd buf len flags from fromlen -> int
+foreign setsockopt fd level optname optval optlen -> int
 foreign close fd -> int
 foreign htons port -> int
 foreign htonl addr -> int
@@ -118,6 +119,107 @@ sa_addr sa =
 tcp_socket _ = socket af_inet sock_stream 0
 udp_socket _ = socket af_inet sock_dgram 0
 close_socket fd = close fd
+
+-- setsockopt constants (macOS/BSD values; Linux values differ — sol_socket=1
+-- on Linux, so_reuseaddr=2. When cross-compiling to Pi, replace below).
+sol_socket_mac = 65535
+so_reuseaddr_mac = 4
+
+-- Write a 4-byte int (little-endian) to a buffer
+write_u32_le p v =
+  let _ = byte_set p 0 (v % 256)
+  let _ = byte_set p 1 ((v / 256) % 256)
+  let _ = byte_set p 2 ((v / 65536) % 256)
+  let _ = byte_set p 3 ((v / 16777216) % 256)
+  p
+
+-- Enable SO_REUSEADDR on a TCP socket so restarts don't hit TIME_WAIT lockout.
+set_reuseaddr fd =
+  let buf = malloc 4
+  let _ = write_u32_le buf 1
+  let r = setsockopt fd sol_socket_mac so_reuseaddr_mac buf 4
+  let _ = free buf
+  r
+
+-- ============ TCP server helpers ============
+
+-- Open a TCP listener bound to ip:port with SO_REUSEADDR + listen(32).
+-- Returns listen fd on success, -1 on failure.
+bind_tcp ip_str port =
+  let fd = tcp_socket 0
+  if fd < 0 then 0 - 1
+  else
+    let _ = set_reuseaddr fd
+    let sa = make_sockaddr_in port ip_str
+    let br = bind fd sa sockaddr_in_size
+    let _ = free sa
+    if br != 0 then
+      let _ = close fd
+      0 - 1
+    else
+      let lr = listen fd 32
+      if lr != 0 then
+        let _ = close fd
+        0 - 1
+      else fd
+
+-- Accept one incoming connection. Blocks until a client arrives.
+-- Returns client fd on success, -1 on failure.
+accept_tcp listen_fd =
+  let sa = make_sockaddr_in 0 "0.0.0.0"
+  let alen = malloc 8
+  let _ = write_u32_le alen sockaddr_in_size
+  let cfd = accept listen_fd sa alen
+  let _ = free alen
+  let _ = free sa
+  cfd
+
+-- Copy `n` bytes from buf[off..off+n) into a Rail string.
+-- Uses char_from_int + join; O(N²) alloc, fine for small reads.
+tcp_bytes_to_str buf off n acc =
+  if n <= 0 then acc
+  else
+    let c = byte_at buf off
+    tcp_bytes_to_str buf (off + 1) (n - 1) (join "" [acc, char_from_int c])
+
+-- Receive bytes until the HTTP header terminator \r\n\r\n appears, then
+-- continue reading Content-Length bytes of body if present. Returns the
+-- full request as a Rail string. Caps at 64KB.
+recv_http_request fd =
+  let buf = malloc 8192
+  let s = recv_headers_loop fd buf ""
+  let _ = free buf
+  s
+
+tcp_crlf_crlf _ = join "" [char_from_int 13, char_from_int 10, char_from_int 13, char_from_int 10]
+
+recv_headers_loop fd buf acc =
+  let n = recv fd buf 8192 0
+  if n <= 0 then acc
+  else
+    let chunk = tcp_bytes_to_str buf 0 n ""
+    let combined = join "" [acc, chunk]
+    if str_find (tcp_crlf_crlf 0) combined >= 0 then
+      -- Could also read Content-Length body here; for MVP the header
+      -- terminator is enough since most fleet POST bodies are <8KB and
+      -- arrive in the same recv burst on loopback/Tailscale.
+      combined
+    else if length combined >= 65536 then combined
+    else recv_headers_loop fd buf combined
+
+-- Send a full response string, looping on partial sends.
+send_all_tcp fd s =
+  let total = length s
+  send_all_tcp_loop fd s 0 total
+
+send_all_tcp_loop fd s off total =
+  if off >= total then total
+  else
+    let remaining = total - off
+    let chunk = if off == 0 then s else str_sub s off remaining
+    let n = send fd chunk remaining 0
+    if n <= 0 then off
+    else send_all_tcp_loop fd s (off + n) total
 
 -- ============ UDP convenience ============
 

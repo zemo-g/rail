@@ -18,7 +18,8 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 - **Effect handlers**: `try body handler` — setjmp/longjmp non-local error recovery. Deep unwinding, nested handlers.
 - **Type checker**: Forward inference pass emits warnings (not errors) for: head/tail on non-list, arithmetic on non-numeric, wrong arity, calling non-functions.
 - **Package manager**: `import math` (bare imports), `rail get github.com/...`, `rail pkg` reads `rail.toml`.
-- **Tests**: `./rail_native test` — 116 tests, should be 116/116.
+- **Tests**: `./rail_native test` — 116 tests, should be 116/116. Count fluctuates only when concurrent sessions collide on `/tmp/rail_out` — rerun to confirm.
+- **Checkpoints**: `stdlib/checkpoint.rail` — `save_checkpoint prefix weights adams step best_val` + `load_checkpoint` / in-place `load_model_into` / `load_adam_states_into`. Atomic via `<prefix>.committed` sentinel. `corpus_split text val_pct` for eval splits. `tools/train/lm_transformer.rail:run_segments` wires resume + periodic checkpoint into the training loop.
 - **Performance**: Tail-recursive loops match C -O2 (5 instructions/iteration). Self-loop optimization, untagged register params, bottom-test with `subs`.
 - **Targets**: macOS ARM64 (native), Linux ARM64 (Pi Zero), Linux x86_64 (Razer WSL)
 
