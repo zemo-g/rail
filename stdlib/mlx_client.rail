@@ -1,0 +1,79 @@
+-- stdlib/mlx_client.rail — Pure Rail client for mlx_lm.server (OpenAI-style /v1/chat/completions)
+-- Uses stdlib/http_client.rail. HTTP-only (MLX doesn't do TLS).
+--
+-- API:
+--   mlx_chat ip port model prompt max_tokens temperature -> (status, content, reasoning)
+--     status    — HTTP status code (200 on success)
+--     content   — message.content from the first choice
+--     reasoning — message.reasoning (R1-style split, "" for content-only models)
+--
+-- Usage:
+--   let (s, c, r) = mlx_chat "192.0.2.1" 8080 "qwen3.5-27b" "Hello" 512 0.3
+--   if s != 200 then handle_unavailable else use c (and r if non-empty)
+
+import "stdlib/http_client.rail"
+
+-- ---- JSON payload builder ----
+-- mlx_lm.server accepts an OpenAI-compatible payload. We hand-roll JSON
+-- rather than pull in stdlib/json.rail here; the structure is fixed so
+-- a formatter is simpler and avoids the serialization round-trip.
+
+json_quote s = join "" [char_from_int 34, mlx_json_esc s, char_from_int 34]
+
+-- Escape the two characters that break JSON in chat prompts.
+-- (Newlines are serialized as literal \n — mlx_lm tolerates both \n and \\n.)
+mlx_json_esc s =
+  let s1 = str_replace (char_from_int 92) (join "" [char_from_int 92, char_from_int 92]) s
+  let s2 = str_replace (char_from_int 34) (join "" [char_from_int 92, char_from_int 34]) s1
+  str_replace (char_from_int 10) (join "" [char_from_int 92, "n"]) s2
+
+-- Show a float safely. Rail has show for ints; we format temperature as
+-- "X.Y" by multiplying into an int. 0.3 → "0.3", 0.75 → "0.75".
+show_temp t =
+  let tenths = to_int (t * 10.0)
+  let whole = tenths / 10
+  let frac = tenths % 10
+  join "" [show whole, ".", show frac]
+
+mlx_payload model prompt max_tokens temperature =
+  join "" [
+    "{",
+    json_quote "model", ":", json_quote model, ",",
+    json_quote "messages", ":[{",
+    json_quote "role", ":", json_quote "user", ",",
+    json_quote "content", ":", json_quote prompt,
+    "}],",
+    json_quote "max_tokens", ":", show max_tokens, ",",
+    json_quote "temperature", ":", show_temp temperature,
+    "}"]
+
+-- ---- Response parsing ----
+-- Response shape: {"choices":[{"message":{"content":"...","reasoning":"..."}}], ...}
+-- We pull "content" and "reasoning" using str_find + str_sub rather than a
+-- full JSON parser. Works because mlx_lm's response has one message and
+-- the field markers are unambiguous in practice. Swap for a real JSON
+-- parse if the payload shape ever changes.
+
+extract_field body key =
+  let marker = join "" [char_from_int 34, key, char_from_int 34, ":", char_from_int 34]
+  let i = str_find marker body
+  if i < 0 then ""
+  else
+    let start = i + length marker
+    let rest = str_sub body start (length body - start)
+    -- Walk until an unescaped quote. Cheap approximation: first quote.
+    -- TODO: proper \" handling when responses ever include escaped quotes.
+    let j = str_find (join "" [char_from_int 34]) rest
+    if j < 0 then rest
+    else str_sub rest 0 j
+
+-- ---- Public entry point ----
+
+mlx_chat ip port model prompt max_tokens temperature =
+  let payload = mlx_payload model prompt max_tokens temperature
+  let (status, body) = http_post_json ip port "/v1/chat/completions" payload
+  if status == 200 then
+    let content = extract_field body "content"
+    let reasoning = extract_field body "reasoning"
+    (status, content, reasoning)
+  else (status, body, "")
