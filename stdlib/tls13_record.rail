@@ -1,0 +1,136 @@
+-- stdlib/tls13_record.rail — TLS 1.3 record layer wrap/unwrap (Layer 5b.3).
+--
+-- Every TLS 1.3 application record (ContentType=0x17 on the wire) is:
+--   TLSCiphertext = header(5) || ciphertext || tag(16)
+-- where the AEAD is called with:
+--   additional_data = header   (opaque_type=0x17, legacy_version=0x0303, length)
+--   plaintext       = TLSInnerPlaintext = content || real_type(1) || zeros
+--   nonce           = tls13_record_nonce(iv, seq)
+-- Per RFC 8446 §5.2, §5.3.
+--
+-- Public API:
+--   tls13_record_encrypt key iv seq real_type fragment frag_len
+--     -> result[0]=wire_buf, result[1]=wire_len
+--   tls13_record_decrypt key iv seq wire_buf wire_len
+--     -> result[0]=fragment, result[1]=real_type, result[2]=frag_len, result[3]=valid
+--
+-- Depends on tls13.rail (for tls13_record_nonce) and aead.rail. tls13_hs
+-- is NOT imported here — record layer is independent of handshake parsing.
+
+import "stdlib/tls13.rail"
+import "stdlib/aead.rail"
+
+-- Buffer helpers (rec_ prefix to avoid colliding with tls13_hs's ch_/sh_).
+
+rec_w_u8 buf off v =
+  let _ = arr_set buf off (bit_and v 255)
+  off + 1
+
+rec_w_u16 buf off v =
+  let _ = arr_set buf off       (bit_and (shr v 8) 255)
+  let _ = arr_set buf (off + 1) (bit_and v 255)
+  off + 2
+
+-- Build the 5-byte TLSCiphertext header = [0x17, 0x03, 0x03, length_hi, length_lo].
+-- length = ciphertext_length = inner_plaintext_length + 16 (for the tag).
+
+rec_build_header hdr inner_len =
+  let _ = arr_set hdr 0 23
+  let _ = arr_set hdr 1 3
+  let _ = arr_set hdr 2 3
+  let total = inner_len + 16
+  let _ = arr_set hdr 3 (bit_and (shr total 8) 255)
+  let _ = arr_set hdr 4 (bit_and total 255)
+  0
+
+-- Build the TLSInnerPlaintext = fragment || real_type || zero_padding.
+-- We use zero padding of 0 (the minimum) so inner_len = frag_len + 1.
+
+rec_build_inner fragment frag_len real_type =
+  let inner = arr_new (frag_len + 1) 0
+  let _ = sha_copy_bytes fragment inner 0 0 frag_len
+  let _ = arr_set inner frag_len real_type
+  inner
+
+-- ── Encrypt ───────────────────────────────────────────────────────────────
+
+tls13_record_encrypt key iv seq real_type fragment frag_len =
+  -- Build inner plaintext (fragment + real_type, no padding).
+  let inner = rec_build_inner fragment frag_len real_type
+  let inner_len = frag_len + 1
+  -- Build AAD = 5-byte header with length = inner_len + 16.
+  let hdr = arr_new 5 0
+  let _ = rec_build_header hdr inner_len
+  -- AEAD encrypt.
+  let nonce = tls13_record_nonce iv seq
+  let aead_result = aead_encrypt key nonce hdr 5 inner inner_len
+  let ct = arr_get aead_result 0
+  let tag = arr_get aead_result 1
+  -- Assemble wire record: header || ct || tag.
+  let wire_len = 5 + inner_len + 16
+  let wire = arr_new wire_len 0
+  let _ = sha_copy_bytes hdr wire 0 0 5
+  let _ = sha_copy_bytes ct  wire 0 5 inner_len
+  let _ = sha_copy_bytes tag wire 0 (5 + inner_len) 16
+  let result = arr_new 2 0
+  let _ = arr_set result 0 wire
+  let _ = arr_set result 1 wire_len
+  result
+
+-- ── Decrypt ───────────────────────────────────────────────────────────────
+
+rec_fail _ =
+  let z = arr_new 0 0
+  let r = arr_new 4 0
+  let _ = arr_set r 0 z
+  let _ = arr_set r 1 0
+  let _ = arr_set r 2 0
+  let _ = arr_set r 3 0
+  r
+
+-- Scan the decrypted inner plaintext backwards from position (n-1) to find
+-- the real_type byte — the last non-zero byte per RFC 8446 §5.2. Returns
+-- the index of the real_type byte, or -1 if all zeros (malformed).
+
+rec_strip_pad inner i =
+  if i < 0 then 0 - 1
+  else if arr_get inner i == 0 then rec_strip_pad inner (i - 1)
+  else i
+
+tls13_record_decrypt key iv seq wire wire_len =
+  if wire_len < 22 then rec_fail 0
+  else
+    let hdr_type = arr_get wire 0
+    if hdr_type == 23 then
+      let hdr_len_hi = arr_get wire 3
+      let hdr_len_lo = arr_get wire 4
+      let ct_plus_tag = bit_or (shl hdr_len_hi 8) hdr_len_lo
+      if ct_plus_tag + 5 > wire_len then rec_fail 0
+      else
+        let inner_len = ct_plus_tag - 16
+        -- Copy header (AAD), ciphertext, tag into separate buffers for AEAD.
+        let aad = arr_new 5 0
+        let _ = sha_copy_bytes wire aad 0 0 5
+        let ct = arr_new inner_len 0
+        let _ = sha_copy_bytes wire ct 5 0 inner_len
+        let tag = arr_new 16 0
+        let _ = sha_copy_bytes wire tag (5 + inner_len) 0 16
+        let nonce = tls13_record_nonce iv seq
+        let dec = aead_decrypt key nonce aad 5 ct inner_len tag
+        let pt = arr_get dec 0
+        let valid = arr_get dec 1
+        if valid == 0 then rec_fail 0
+        else
+          let type_idx = rec_strip_pad pt (inner_len - 1)
+          if type_idx < 0 then rec_fail 0
+          else
+            let real_type = arr_get pt type_idx
+            let frag = arr_new type_idx 0
+            let _ = sha_copy_bytes pt frag 0 0 type_idx
+            let result = arr_new 4 0
+            let _ = arr_set result 0 frag
+            let _ = arr_set result 1 real_type
+            let _ = arr_set result 2 type_idx
+            let _ = arr_set result 3 1
+            result
+    else rec_fail 0
