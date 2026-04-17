@@ -1,0 +1,324 @@
+-- stdlib/x25519.rail — X25519 scalar multiplication per RFC 7748 §5.
+--
+-- Elliptic-curve Diffie-Hellman over Curve25519. Used in TLS 1.3 for
+-- ephemeral key exchange. Given a 32-byte scalar k and a 32-byte u-coord,
+-- returns k*u (another 32-byte u-coord) — the shared secret.
+--
+-- Field: GF(p) where p = 2^255 - 19. Elements are represented as 16
+-- "limbs" of 16 bits each in int arrays. Rail's 63-bit signed ints give
+-- ample headroom: the schoolbook 16×16 product sum peaks around 36 bits.
+--
+-- Algorithm ported from TweetNaCl's crypto_scalarmult_curve25519_tweet
+-- (2-clause BSD). Self-contained (x25519_ prefix) — imports nothing from
+-- stdlib so it can coexist with other crypto modules without the Rail
+-- import-diamond symbol collision problem.
+--
+-- Public API:
+--   x25519 scalar_bytes u_bytes -> 32-byte int array (shared secret)
+--
+-- Not constant-time in the broad sense. sel25519 IS constant-time via
+-- bitmask-XOR trick, but the rest of the field arithmetic has data-
+-- dependent timing. Acceptable for TLS client-side where the long-term
+-- secret is the server's problem; ephemeral keys don't need hardening.
+
+-- ── Constants ─────────────────────────────────────────────────────────────
+
+x25519_limb_count = 16
+x25519_a24 = 121665   -- (A-2)/4 for curve y^2 = x^3 + A*x^2 + x, A=486662
+
+-- ── Byte-level helpers (x25519_ prefix) ───────────────────────────────────
+
+x25519_copy_bytes src dst src_off dst_off n =
+  if n <= 0 then 0
+  else
+    let _ = arr_set dst dst_off (arr_get src src_off)
+    x25519_copy_bytes src dst (src_off + 1) (dst_off + 1) (n - 1)
+
+-- Arithmetic shift right. Rail's shr is LOGICAL (zero-fill), which gives
+-- wrong answers for negative intermediates produced by gf_sub. X25519's
+-- car25519 needs arithmetic semantics (sign-fill). Identity:
+--   asr(v, n) = ~shr(~v, n)   where ~ is bitwise complement (XOR all-ones).
+x25519_asr v n =
+  if v >= 0 then shr v n
+  else
+    let flipped = bit_xor v (0 - 1)
+    let shifted = shr flipped n
+    bit_xor shifted (0 - 1)
+
+-- ── Field element operations ──────────────────────────────────────────────
+-- gf = int array of 16 limbs. Each limb held as full 63-bit int; values
+-- normally in 0..2^16-1 after car25519 normalization but may be larger
+-- during intermediate computation.
+
+x25519_gf_new _ = arr_new 16 0
+
+x25519_gf_copy dst src = x25519_gf_copy_at dst src 0
+x25519_gf_copy_at dst src i =
+  if i >= 16 then 0
+  else
+    let _ = arr_set dst i (arr_get src i)
+    x25519_gf_copy_at dst src (i + 1)
+
+x25519_gf_set1 g = x25519_gf_set1_at g 0
+x25519_gf_set1_at g i =
+  if i >= 16 then 0
+  else
+    let _ = arr_set g i (if i == 0 then 1 else 0)
+    x25519_gf_set1_at g (i + 1)
+
+-- Addition, subtraction — elementwise.
+x25519_gf_add o a b = x25519_gf_add_at o a b 0
+x25519_gf_add_at o a b i =
+  if i >= 16 then 0
+  else
+    let _ = arr_set o i (arr_get a i + arr_get b i)
+    x25519_gf_add_at o a b (i + 1)
+
+x25519_gf_sub o a b = x25519_gf_sub_at o a b 0
+x25519_gf_sub_at o a b i =
+  if i >= 16 then 0
+  else
+    let _ = arr_set o i (arr_get a i - arr_get b i)
+    x25519_gf_sub_at o a b (i + 1)
+
+-- Carry propagation. Reduce each limb to 16 bits; overflow to next,
+-- with limb 15's overflow × 38 folded back into limb 0 (since 2^256 ≡
+-- 38 mod p; we carry 2^256 = 2 × 2^255 and 2^255 ≡ 19 so 2×19 = 38).
+x25519_car o =
+  let _ = x25519_car_pass o 0
+  0
+
+x25519_car_pass o i =
+  if i >= 16 then 0
+  else
+    let v = arr_get o i
+    let carry = x25519_asr v 16   -- arithmetic shift: negative borrows propagate
+    let masked = bit_and v 65535
+    let _ = arr_set o i masked
+    let next_i = if i == 15 then 0 else i + 1
+    let mult = if i == 15 then 38 else 1
+    let _ = arr_set o next_i (arr_get o next_i + mult * carry)
+    x25519_car_pass o (i + 1)
+
+-- Constant-time conditional swap. If b==1, swap p and q; if b==0, leave.
+-- Uses the standard bitmask-XOR trick: c = (b==0 ? 0 : -1); t = c & (p^q);
+-- p ^= t; q ^= t.
+x25519_sel p q b =
+  -- c = -(b & 1) in Rail: if b==0 → c=0; if b==1 → c=-1 (all-ones in 63-bit).
+  let c = 0 - (bit_and b 1)
+  x25519_sel_at p q c 0
+
+x25519_sel_at p q c i =
+  if i >= 16 then 0
+  else
+    let pi = arr_get p i
+    let qi = arr_get q i
+    let t = bit_and c (bit_xor pi qi)
+    let _ = arr_set p i (bit_xor pi t)
+    let _ = arr_set q i (bit_xor qi t)
+    x25519_sel_at p q c (i + 1)
+
+-- Multiplication with schoolbook 16×16 + 2-pass reduce.
+x25519_gf_mul o a b =
+  let t = arr_new 31 0
+  let _ = x25519_mul_outer t a b 0
+  let _ = x25519_mul_fold t 0
+  let _ = x25519_mul_copy o t 0
+  let _ = x25519_car o
+  let _ = x25519_car o
+  0
+
+x25519_mul_outer t a b i =
+  if i >= 16 then 0
+  else
+    let _ = x25519_mul_inner t a b i 0
+    x25519_mul_outer t a b (i + 1)
+
+x25519_mul_inner t a b i j =
+  if j >= 16 then 0
+  else
+    let pos = i + j
+    let prod = arr_get a i * arr_get b j
+    let _ = arr_set t pos (arr_get t pos + prod)
+    x25519_mul_inner t a b i (j + 1)
+
+x25519_mul_fold t i =
+  if i >= 15 then 0
+  else
+    let _ = arr_set t i (arr_get t i + 38 * arr_get t (i + 16))
+    x25519_mul_fold t (i + 1)
+
+x25519_mul_copy o t i =
+  if i >= 16 then 0
+  else
+    let _ = arr_set o i (arr_get t i)
+    x25519_mul_copy o t (i + 1)
+
+x25519_gf_sqr o a = x25519_gf_mul o a a
+
+-- Modular inverse via a^(p-2) where p-2 = 2^255 - 21. Fixed exponent,
+-- standard double-and-multiply based on the binary representation of
+-- 2^255 - 21. Ported from TweetNaCl's inv25519 — all bits of p-2 are 1
+-- except positions 2 and 4.
+x25519_inv o input =
+  let c = x25519_gf_new 0
+  let _ = x25519_gf_copy c input
+  let _ = x25519_inv_loop c input 253
+  let _ = x25519_gf_copy o c
+  0
+
+x25519_inv_loop c input a =
+  if a < 0 then 0
+  else
+    let _ = x25519_gf_sqr c c
+    if a == 2 then x25519_inv_loop c input (a - 1)
+    else if a == 4 then x25519_inv_loop c input (a - 1)
+    else
+      let _ = x25519_gf_mul c c input
+      x25519_inv_loop c input (a - 1)
+
+-- Unpack 32-byte little-endian u-coord into 16 limbs; mask top bit.
+x25519_unpack25519 o n =
+  let _ = x25519_unpack_at o n 0
+  let _ = arr_set o 15 (bit_and (arr_get o 15) 32767)
+  0
+
+x25519_unpack_at o n i =
+  if i >= 16 then 0
+  else
+    let lo = arr_get n (2 * i)
+    let hi = arr_get n (2 * i + 1)
+    let _ = arr_set o i (lo + shl hi 8)
+    x25519_unpack_at o n (i + 1)
+
+-- Pack a gf into 32 little-endian bytes, first reducing to canonical form.
+x25519_pack25519 o n =
+  let t = x25519_gf_new 0
+  let _ = x25519_gf_copy t n
+  let _ = x25519_car t
+  let _ = x25519_car t
+  let _ = x25519_car t
+  let _ = x25519_pack_reduce t 0
+  let _ = x25519_pack_reduce t 1
+  let _ = x25519_pack_out o t 0
+  0
+
+x25519_pack_reduce t _ =
+  -- Conditionally subtract p. m = t - p; if m did not borrow past limb
+  -- 15's 0x7fff, t >= p so replace t with m. Borrow detection uses
+  -- arithmetic-shift-and-mask (same reason as car25519: m[i] can go
+  -- negative and we need sign-fill).
+  let m = x25519_gf_new 0
+  let _ = arr_set m 0 (arr_get t 0 - 65517)
+  let _ = x25519_pack_reduce_mid m t 1
+  let _ = arr_set m 15 (arr_get t 15 - 32767 - bit_and (x25519_asr (arr_get m 14) 16) 1)
+  let b = bit_and (x25519_asr (arr_get m 15) 16) 1
+  let _ = arr_set m 14 (bit_and (arr_get m 14) 65535)
+  let _ = x25519_sel t m (1 - b)
+  0
+
+x25519_pack_reduce_mid m t i =
+  if i >= 15 then 0
+  else
+    let prev = arr_get m (i - 1)
+    let _ = arr_set m i (arr_get t i - 65535 - bit_and (x25519_asr prev 16) 1)
+    let _ = arr_set m (i - 1) (bit_and prev 65535)
+    x25519_pack_reduce_mid m t (i + 1)
+
+x25519_pack_out o t i =
+  if i >= 16 then 0
+  else
+    let v = arr_get t i
+    let _ = arr_set o (2 * i) (bit_and v 255)
+    let _ = arr_set o (2 * i + 1) (bit_and (shr v 8) 255)
+    x25519_pack_out o t (i + 1)
+
+-- ── Montgomery ladder (main scalarmult loop) ─────────────────────────────
+
+x25519_scalarmult q n p =
+  -- Clamp scalar bytes.
+  let z = arr_new 32 0
+  let _ = x25519_copy_bytes n z 0 0 32
+  let _ = arr_set z 0 (bit_and (arr_get z 0) 248)
+  let _ = arr_set z 31 (bit_or (bit_and (arr_get z 31) 127) 64)
+  -- Unpack u-coordinate.
+  let x1 = x25519_gf_new 0
+  let _ = x25519_unpack25519 x1 p
+  -- Initialize: a = 1, b = x1 (copy), c = 0, d = 1.
+  let a = x25519_gf_new 0
+  let b = x25519_gf_new 0
+  let c = x25519_gf_new 0
+  let d = x25519_gf_new 0
+  let _ = x25519_gf_set1 a
+  let _ = x25519_gf_copy b x1
+  let _ = x25519_gf_set1 d
+  -- Scratch:
+  let e = x25519_gf_new 0
+  let f = x25519_gf_new 0
+  let _ = x25519_ladder a b c d e f x1 z 254
+  -- Compute x2 * z2^(p-2) = result u-coord.
+  let _ = x25519_inv c c
+  let _ = x25519_gf_mul a a c
+  let _ = x25519_pack25519 q a
+  0
+
+x25519_ladder a b c d e f x1 z i =
+  if i < 0 then 0
+  else
+    let byte_i = arr_get z (shr i 3)
+    let r = bit_and (shr byte_i (bit_and i 7)) 1
+    let _ = x25519_sel a b r
+    let _ = x25519_sel c d r
+    -- e = a + c
+    let _ = x25519_gf_add e a c
+    -- a = a - c
+    let _ = x25519_gf_sub a a c
+    -- c = b + d
+    let _ = x25519_gf_add c b d
+    -- b = b - d
+    let _ = x25519_gf_sub b b d
+    -- d = e^2
+    let _ = x25519_gf_sqr d e
+    -- f = a^2
+    let _ = x25519_gf_sqr f a
+    -- a = c * a
+    let _ = x25519_gf_mul a c a
+    -- c = b * e
+    let _ = x25519_gf_mul c b e
+    -- e = a + c
+    let _ = x25519_gf_add e a c
+    -- a = a - c
+    let _ = x25519_gf_sub a a c
+    -- b = a^2
+    let _ = x25519_gf_sqr b a
+    -- c = d - f
+    let _ = x25519_gf_sub c d f
+    -- a = c * 121665
+    let _ = x25519_mul_small a c x25519_a24
+    -- a = a + d
+    let _ = x25519_gf_add a a d
+    -- c = c * a
+    let _ = x25519_gf_mul c c a
+    -- a = d * f
+    let _ = x25519_gf_mul a d f
+    -- d = b * x1
+    let _ = x25519_gf_mul d b x1
+    -- b = e^2
+    let _ = x25519_gf_sqr b e
+    let _ = x25519_sel a b r
+    let _ = x25519_sel c d r
+    x25519_ladder a b c d e f x1 z (i - 1)
+
+-- Multiply gf by a small scalar constant (used for *121665 in the ladder).
+x25519_mul_small o a k =
+  let tmp = x25519_gf_new 0
+  let _ = arr_set tmp 0 k
+  let _ = x25519_gf_mul o a tmp
+  0
+
+-- ── Public entry ─────────────────────────────────────────────────────────
+
+x25519 scalar u =
+  let q = arr_new 32 0
+  let _ = x25519_scalarmult q scalar u
+  q
