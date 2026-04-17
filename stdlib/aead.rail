@@ -1,0 +1,126 @@
+-- stdlib/aead.rail — ChaCha20-Poly1305 AEAD per RFC 8439 §2.8.
+--
+-- Authenticated Encryption with Associated Data. Used by TLS 1.3's
+-- TLS_CHACHA20_POLY1305_SHA256 cipher suite. Provides confidentiality
+-- (ChaCha20 stream cipher) AND integrity (Poly1305 MAC over AAD + ciphertext).
+--
+-- Public API:
+--   aead_encrypt key nonce aad aad_len pt pt_len -> (ct, tag)
+--   aead_decrypt key nonce aad aad_len ct ct_len tag -> (pt, valid)
+--
+-- Tuple returns are not native; we use a mutable "result" struct with:
+--   field 0 = ciphertext/plaintext (fresh int array)
+--   field 1 = tag (fresh int array, 16 bytes)
+--   field 2 = valid flag (decrypt only: 1=valid, 0=tampered)
+
+-- chacha20.rail and poly1305.rail are both self-contained (no stdlib
+-- imports) — their helpers are cc_ and po_ prefixed respectively so
+-- they don't collide. This avoids the Rail import-diamond pitfall
+-- where transitively including bytes.rail twice would duplicate every
+-- symbol via textual re-emit.
+import "stdlib/chacha20.rail"
+import "stdlib/poly1305.rail"
+
+-- aead needs its own byte helpers (aead_ prefixed to avoid collision).
+
+aead_mask32 = 4294967295
+
+-- ── Helpers ───────────────────────────────────────────────────────────────
+
+aead_pad16_len n =
+  -- How many zero bytes to append so that n + pad is a multiple of 16.
+  -- Rail integer division is floor for positives, which is what we want.
+  let r = n - (n / 16) * 16
+  if r == 0 then 0 else 16 - r
+
+aead_write_le64_from_arr buf offset n_arr =
+  -- Used for the MAC input length fields that might reach beyond 32 bits
+  -- for huge messages (not relevant to TLS). Omitted for now — callers
+  -- pass int lengths.
+  0
+
+aead_write_le64 buf offset n =
+  -- Write n as 8 little-endian bytes. TLS/AEAD lengths in AAD/MAC input
+  -- are always <= 2^64 per RFC 8439 §2.8. Rail ints are 63-bit signed so
+  -- any real-world TLS length (<< 2^32) fits comfortably.
+  let _ = arr_set buf offset       (bit_and n 255)
+  let _ = arr_set buf (offset + 1) (bit_and (shr n 8) 255)
+  let _ = arr_set buf (offset + 2) (bit_and (shr n 16) 255)
+  let _ = arr_set buf (offset + 3) (bit_and (shr n 24) 255)
+  let _ = arr_set buf (offset + 4) (bit_and (shr n 32) 255)
+  let _ = arr_set buf (offset + 5) (bit_and (shr n 40) 255)
+  let _ = arr_set buf (offset + 6) (bit_and (shr n 48) 255)
+  let _ = arr_set buf (offset + 7) 0
+  0
+
+-- ── Poly1305 key derivation ──────────────────────────────────────────────
+-- The AEAD uses the FIRST 32 bytes of ChaCha20(key, nonce, counter=0) as a
+-- one-time Poly1305 key. The remaining 32 bytes of that block are discarded.
+
+aead_derive_poly_key chacha_key nonce =
+  let block = chacha20_block chacha_key nonce 0
+  let pk = arr_new 32 0
+  let _ = cc_copy_bytes block pk 0 0 32
+  pk
+
+-- ── Build the MAC input (AAD || pad || ct || pad || len_aad || len_ct) ──
+
+aead_build_mac_input aad aad_len ct ct_len =
+  let pad_aad = aead_pad16_len aad_len
+  let pad_ct = aead_pad16_len ct_len
+  let total = aad_len + pad_aad + ct_len + pad_ct + 16
+  let buf = arr_new total 0
+  let _ = cc_copy_bytes aad buf 0 0 aad_len
+  let off1 = aad_len + pad_aad
+  let _ = cc_copy_bytes ct buf 0 off1 ct_len
+  let off2 = off1 + ct_len + pad_ct
+  let _ = aead_write_le64 buf off2 aad_len
+  let _ = aead_write_le64 buf (off2 + 8) ct_len
+  buf
+
+aead_mac_input_len aad_len ct_len =
+  let pa = aead_pad16_len aad_len
+  let pc = aead_pad16_len ct_len
+  aad_len + pa + ct_len + pc + 16
+
+-- ── Encrypt ───────────────────────────────────────────────────────────────
+
+aead_encrypt key nonce aad aad_len pt pt_len =
+  -- Returns a 3-element array: [ct, tag, ct_len] as a packed result.
+  let pk = aead_derive_poly_key key nonce
+  let ct = chacha20_encrypt key nonce 1 pt pt_len
+  let mac_len = aead_mac_input_len aad_len pt_len
+  let mac_in = aead_build_mac_input aad aad_len ct pt_len
+  let tag = poly1305_mac pk mac_in mac_len
+  let result = arr_new 3 0
+  let _ = arr_set result 0 ct
+  let _ = arr_set result 1 tag
+  let _ = arr_set result 2 pt_len
+  result
+
+-- ── Decrypt (with tag verification) ───────────────────────────────────────
+
+aead_tags_match a b =
+  -- Non-constant-time. TLS 1.3 leaks tag-compare timing as a known
+  -- limitation of this implementation — see docs/TLS_DESIGN.md.
+  aead_tag_cmp_at a b 0
+
+aead_tag_cmp_at a b i =
+  if i >= 16 then 1
+  else if arr_get a i == arr_get b i then aead_tag_cmp_at a b (i + 1)
+  else 0
+
+aead_decrypt key nonce aad aad_len ct ct_len tag =
+  -- Returns [pt, valid_flag, pt_len]. If valid_flag == 0, the pt array
+  -- should NOT be trusted — caller must discard it.
+  let pk = aead_derive_poly_key key nonce
+  let mac_len = aead_mac_input_len aad_len ct_len
+  let mac_in = aead_build_mac_input aad aad_len ct ct_len
+  let expected = poly1305_mac pk mac_in mac_len
+  let valid = aead_tags_match tag expected
+  let pt = chacha20_encrypt key nonce 1 ct ct_len
+  let result = arr_new 3 0
+  let _ = arr_set result 0 pt
+  let _ = arr_set result 1 valid
+  let _ = arr_set result 2 ct_len
+  result

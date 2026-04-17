@@ -1,0 +1,260 @@
+-- stdlib/poly1305.rail — Poly1305 MAC per RFC 8439 §2.5.
+--
+-- Self-contained: no stdlib imports, all helpers po_ prefixed, so
+-- aead.rail can combine it with chacha20.rail without import-diamond
+-- symbol collisions.
+--
+-- Representation: 130-bit values as 5 × 26-bit limbs. Products of two
+-- 26-bit limbs fit in 52 bits; sum of 5 such products fits in ~55 bits
+-- (well within Rail's 63-bit signed int range).
+--
+-- Mod-p trick: p = 2^130 - 5, so 2^130 ≡ 5 (mod p). After multiplication,
+-- overflow past limb[4]'s 26-bit slot folds into limb[0] multiplied by 5.
+-- One more carry pass brings all limbs into canonical 0..2^26-1 range.
+--
+-- Public API:
+--   poly1305_mac key msg msg_len -> 16-byte tag (int array)
+--   po_copy_bytes src dst src_off dst_off n  (exported helper)
+--
+-- Not constant-time.
+
+po_mask26 = 67108863      -- 2^26 - 1
+po_mask32 = 4294967295
+
+po_copy_bytes src dst src_off dst_off n =
+  if n <= 0 then 0
+  else
+    let _ = arr_set dst dst_off (arr_get src src_off)
+    po_copy_bytes src dst (src_off + 1) (dst_off + 1) (n - 1)
+
+po_le32_read arr offset =
+  let b0 = arr_get arr offset
+  let b1 = arr_get arr (offset + 1)
+  let b2 = arr_get arr (offset + 2)
+  let b3 = arr_get arr (offset + 3)
+  bit_and (bit_or (bit_or b0 (shl b1 8)) (bit_or (shl b2 16) (shl b3 24))) po_mask32
+
+po_le32_write arr offset value =
+  let _ = arr_set arr offset       (bit_and value 255)
+  let _ = arr_set arr (offset + 1) (bit_and (shr value 8) 255)
+  let _ = arr_set arr (offset + 2) (bit_and (shr value 16) 255)
+  let _ = arr_set arr (offset + 3) (bit_and (shr value 24) 255)
+  0
+
+-- ── Key clamp per RFC 8439 §2.5.1 ─────────────────────────────────────────
+
+poly1305_clamp_r key =
+  let r = arr_new 16 0
+  let _ = po_copy_bytes key r 0 0 16
+  let _ = arr_set r 3 (bit_and (arr_get r 3) 15)
+  let _ = arr_set r 4 (bit_and (arr_get r 4) 252)
+  let _ = arr_set r 7 (bit_and (arr_get r 7) 15)
+  let _ = arr_set r 8 (bit_and (arr_get r 8) 252)
+  let _ = arr_set r 11 (bit_and (arr_get r 11) 15)
+  let _ = arr_set r 12 (bit_and (arr_get r 12) 252)
+  let _ = arr_set r 15 (bit_and (arr_get r 15) 15)
+  r
+
+-- Split 16 bytes (LE) + optional bit-128 marker into 5×26-bit limbs.
+bytes_to_limbs5 bytes with_high_bit =
+  let b0 = arr_get bytes 0
+  let b1 = arr_get bytes 1
+  let b2 = arr_get bytes 2
+  let b3 = arr_get bytes 3
+  let b4 = arr_get bytes 4
+  let b5 = arr_get bytes 5
+  let b6 = arr_get bytes 6
+  let b7 = arr_get bytes 7
+  let b8 = arr_get bytes 8
+  let b9 = arr_get bytes 9
+  let ba = arr_get bytes 10
+  let bb = arr_get bytes 11
+  let bc = arr_get bytes 12
+  let bd = arr_get bytes 13
+  let be = arr_get bytes 14
+  let bf = arr_get bytes 15
+  let l0 = bit_and (bit_or (bit_or b0 (shl b1 8)) (bit_or (shl b2 16) (shl b3 24))) po_mask26
+  let l1 = bit_and (shr (bit_or (bit_or b3 (shl b4 8)) (bit_or (shl b5 16) (shl b6 24))) 2) po_mask26
+  let l2 = bit_and (shr (bit_or (bit_or b6 (shl b7 8)) (bit_or (shl b8 16) (shl b9 24))) 4) po_mask26
+  let l3 = bit_and (shr (bit_or (bit_or b9 (shl ba 8)) (bit_or (shl bb 16) (shl bc 24))) 6) po_mask26
+  let base4 = bit_or (bit_or bd (shl be 8)) (shl bf 16)
+  let l4 = if with_high_bit then bit_or base4 16777216 else base4
+  let out = arr_new 5 0
+  let _ = arr_set out 0 l0
+  let _ = arr_set out 1 l1
+  let _ = arr_set out 2 l2
+  let _ = arr_set out 3 l3
+  let _ = arr_set out 4 l4
+  out
+
+poly1305_prep_block msg offset block_len =
+  let buf = arr_new 16 0
+  let _ = po_copy_bytes msg buf offset 0 block_len
+  if block_len < 16 then
+    let _ = arr_set buf block_len 1
+    buf
+  else buf
+
+poly1305_add acc other =
+  let _ = arr_set acc 0 (arr_get acc 0 + arr_get other 0)
+  let _ = arr_set acc 1 (arr_get acc 1 + arr_get other 1)
+  let _ = arr_set acc 2 (arr_get acc 2 + arr_get other 2)
+  let _ = arr_set acc 3 (arr_get acc 3 + arr_get other 3)
+  let _ = arr_set acc 4 (arr_get acc 4 + arr_get other 4)
+  0
+
+poly1305_mul_r acc r =
+  let h0 = arr_get acc 0
+  let h1 = arr_get acc 1
+  let h2 = arr_get acc 2
+  let h3 = arr_get acc 3
+  let h4 = arr_get acc 4
+  let r0 = arr_get r 0
+  let r1 = arr_get r 1
+  let r2 = arr_get r 2
+  let r3 = arr_get r 3
+  let r4 = arr_get r 4
+  let s1 = r1 * 5
+  let s2 = r2 * 5
+  let s3 = r3 * 5
+  let s4 = r4 * 5
+  let d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+  let d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+  let d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+  let d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+  let d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+  let c0 = shr d0 26
+  let n0 = bit_and d0 po_mask26
+  let d1c = d1 + c0
+  let c1 = shr d1c 26
+  let n1 = bit_and d1c po_mask26
+  let d2c = d2 + c1
+  let c2 = shr d2c 26
+  let n2 = bit_and d2c po_mask26
+  let d3c = d3 + c2
+  let c3 = shr d3c 26
+  let n3 = bit_and d3c po_mask26
+  let d4c = d4 + c3
+  let c4 = shr d4c 26
+  let n4 = bit_and d4c po_mask26
+  let n0b = n0 + c4 * 5
+  let c0b = shr n0b 26
+  let n0c = bit_and n0b po_mask26
+  let n1b = n1 + c0b
+  let _ = arr_set acc 0 n0c
+  let _ = arr_set acc 1 n1b
+  let _ = arr_set acc 2 n2
+  let _ = arr_set acc 3 n3
+  let _ = arr_set acc 4 n4
+  0
+
+poly1305_final_reduce acc =
+  let a0 = arr_get acc 0
+  let a1 = arr_get acc 1
+  let a2 = arr_get acc 2
+  let a3 = arr_get acc 3
+  let a4 = arr_get acc 4
+  let c0 = shr a0 26
+  let b0 = bit_and a0 po_mask26
+  let a1b = a1 + c0
+  let c1 = shr a1b 26
+  let b1 = bit_and a1b po_mask26
+  let a2b = a2 + c1
+  let c2 = shr a2b 26
+  let b2 = bit_and a2b po_mask26
+  let a3b = a3 + c2
+  let c3 = shr a3b 26
+  let b3 = bit_and a3b po_mask26
+  let a4b = a4 + c3
+  let c4 = shr a4b 26
+  let b4 = bit_and a4b po_mask26
+  let b0b = b0 + c4 * 5
+  let c0b = shr b0b 26
+  let b0c = bit_and b0b po_mask26
+  let b1b = b1 + c0b
+  let t0 = b0c + 5
+  let tc0 = shr t0 26
+  let t0m = bit_and t0 po_mask26
+  let t1 = b1b + tc0
+  let tc1 = shr t1 26
+  let t1m = bit_and t1 po_mask26
+  let t2 = b2 + tc1
+  let tc2 = shr t2 26
+  let t2m = bit_and t2 po_mask26
+  let t3 = b3 + tc2
+  let tc3 = shr t3 26
+  let t3m = bit_and t3 po_mask26
+  let t4 = b4 + tc3
+  let use_t = shr t4 26
+  if use_t > 0 then
+    let _ = arr_set acc 0 t0m
+    let _ = arr_set acc 1 t1m
+    let _ = arr_set acc 2 t2m
+    let _ = arr_set acc 3 t3m
+    let _ = arr_set acc 4 (bit_and t4 po_mask26)
+    0
+  else
+    let _ = arr_set acc 0 b0c
+    let _ = arr_set acc 1 b1b
+    let _ = arr_set acc 2 b2
+    let _ = arr_set acc 3 b3
+    let _ = arr_set acc 4 b4
+    0
+
+poly1305_serialize_tag acc s tag =
+  let a0 = arr_get acc 0
+  let a1 = arr_get acc 1
+  let a2 = arr_get acc 2
+  let a3 = arr_get acc 3
+  let a4 = arr_get acc 4
+  let w0 = bit_and (bit_or a0 (shl a1 26)) po_mask32
+  let w1 = bit_and (bit_or (shr a1 6) (shl a2 20)) po_mask32
+  let w2 = bit_and (bit_or (shr a2 12) (shl a3 14)) po_mask32
+  let w3 = bit_and (bit_or (shr a3 18) (shl a4 8)) po_mask32
+  let s0 = po_le32_read s 0
+  let s1 = po_le32_read s 4
+  let s2 = po_le32_read s 8
+  let s3 = po_le32_read s 12
+  let sum0 = w0 + s0
+  let carry0 = shr sum0 32
+  let r0 = bit_and sum0 po_mask32
+  let sum1 = w1 + s1 + carry0
+  let carry1 = shr sum1 32
+  let r1 = bit_and sum1 po_mask32
+  let sum2 = w2 + s2 + carry1
+  let carry2 = shr sum2 32
+  let r2 = bit_and sum2 po_mask32
+  let sum3 = w3 + s3 + carry2
+  let r3 = bit_and sum3 po_mask32
+  let _ = po_le32_write tag 0 r0
+  let _ = po_le32_write tag 4 r1
+  let _ = po_le32_write tag 8 r2
+  let _ = po_le32_write tag 12 r3
+  0
+
+poly1305_process_block msg offset block_len acc r =
+  let buf = poly1305_prep_block msg offset block_len
+  let block_limbs = bytes_to_limbs5 buf (block_len == 16)
+  let _ = poly1305_add acc block_limbs
+  let _ = poly1305_mul_r acc r
+  0
+
+poly1305_loop msg msg_len acc r offset =
+  if offset >= msg_len then 0
+  else
+    let remaining = msg_len - offset
+    let block_len = if remaining < 16 then remaining else 16
+    let _ = poly1305_process_block msg offset block_len acc r
+    poly1305_loop msg msg_len acc r (offset + block_len)
+
+poly1305_mac key msg msg_len =
+  let r_bytes = poly1305_clamp_r key
+  let r_limbs = bytes_to_limbs5 r_bytes false
+  let s_bytes = arr_new 16 0
+  let _ = po_copy_bytes key s_bytes 16 0 16
+  let acc = arr_new 5 0
+  let _ = poly1305_loop msg msg_len acc r_limbs 0
+  let _ = poly1305_final_reduce acc
+  let tag = arr_new 16 0
+  let _ = poly1305_serialize_tag acc s_bytes tag
+  tag
