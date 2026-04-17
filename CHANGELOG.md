@@ -2,7 +2,111 @@
 
 All notable changes to Rail are documented here.
 
-## Post-v2.22.1 (unreleased) — `tools/train/corpus_gen.rail`: Phase 5 training corpus
+## v2.23.0 — 2026-04-17 — Rail talks to the internet
+
+Rail gains a pure-Rail HTTP/1.1 client stack plus a new string primitive
+that unblocks byte-level socket I/O. Combined with the TCP server
+primitives in `stdlib/socket.rail` from v2.22.1, Rail now makes and
+receives HTTP requests end-to-end with zero C-dependencies in the
+request path. TLS (HTTPS) is handled via a local socat proxy — a
+limitation documented in the socket.rail module header; native TLS is
+a future pillar.
+
+### New builtin: `char_from_int`
+
+Inverse of `char_to_int`. Takes an int code point, returns a 1-char
+string. Allocates 2 bytes via `_rail_chained_malloc`, writes the byte
++ null terminator, wraps via `_rail_wrap_str`. ARM64 codegen branch in
+`cg` after the existing `char_to_int` handler. Registered in
+`infer_is_heap_builtin` and the builtin type map as
+`("int", "string", 1)`.
+
+Why: sockets surface raw bytes, and Rail's `"\r"` escape is a known
+compiler bug. `char_from_int 13` + `char_from_int 10` is now the
+canonical way to synthesize CRLF at runtime, used throughout the new
+HTTP stack.
+
+116/116 tests pass. 2-pass self-compile produces byte-identical
+`rail_native` (fixed point preserved).
+
+### `stdlib/http_client.rail` — pure-Rail HTTP/1.1
+
+```rail
+http_get ip port path                           -> (status, body)
+http_post ip port path ctype body               -> (status, body)
+http_post_json ip port path body                -> (status, body)
+http_get_hdr ip port path headers               -> (status, body)
+http_post_hdr ip port path ctype body headers   -> (status, body)
+```
+
+Headers is a list of `"Name: Value"` strings. Custom headers let the
+caller override auto-generated `Host` for SNI through a TLS proxy.
+
+- HTTP/1.1 only, Content-Length or chunked-transfer-encoded response
+  bodies supported (chunked decoder sits above the recv layer)
+- CRLF synthesized via `char_from_int` — no reliance on the broken
+  `"\r"` literal
+- `\r\n\r\n` body boundary found via `str_find`, not `split`
+  (which is single-char)
+
+Known scope:
+- **No HTTPS.** TLS termination is out of scope for v2.23; use a local
+  `socat OPENSSL:host:443,snihost=host` proxy on the caller side.
+- **No DNS.** Caller supplies numeric IP. Use `dscacheutil` or
+  equivalent to resolve names.
+- **Response cap ~64KB** due to O(N²) concat in `bytes_to_str`. Use
+  `stdlib/strbuf.rail` if larger responses are needed; current design
+  is tuned for small JSON bodies.
+
+### `stdlib/mlx_client.rail` — generic OpenAI-style chat completions
+
+Pure-Rail client for any mlx_lm.server or OpenAI-compatible
+`/v1/chat/completions` endpoint:
+
+```rail
+mlx_chat ip port model prompt max_tokens temperature
+  -> (status, content, reasoning)
+```
+
+Handles the R1-style reasoning/content split — `reasoning` is
+non-empty for chain-of-thought models, empty for content-only models
+(Gemma, Qwen without thinking mode). The helper is generic enough to
+work against any OpenAI-shape server; it was developed against
+mlx_lm.server but has no MLX-specific assumptions.
+
+A small fix landed post-initial-ship: `extract_field` now skips
+whitespace after the JSON colon so both `"k":"v"` and `"k": "v"`
+response shapes parse correctly.
+
+### Chunked-transfer decoder
+
+`http_client.rail`'s response path auto-detects `Transfer-Encoding:
+chunked` and unwraps the `<hex>\r\n<chunk>\r\n0\r\n` framing before
+returning the body. Required for the Anthropic `/v1/messages`
+endpoint which always chunks responses.
+
+### Cross-compile progress (partial)
+
+Hardcoded `/opt/homebrew/bin/aarch64-elf-as` path in `compile.rail`
+because Rail's `shell()` does not inherit the parent process PATH.
+Linker runs clean from macOS → Linux ARM64 ELF. A subsequent commit
+adds symbol-strip (to kill duplicate Mac runtime stubs) and extra
+`_accept`/`_send`/`_recv`/`_strtol` + young-gen BSS additions to
+`linux_libc.s`.
+
+**Known gap:** the linked Pi binary segfaults at runtime. Mach-O→ELF
+ABI/alignment edge remains to be bisected. Pi deployment stays on
+v2.22.x (Python transport + Rail CGI handler) until this lands.
+
+### Public-vs-private split
+
+Private infra pieces (fleet control-plane v3, DDA-specific `mlx_query`
+CLI adapter, workspace-specific Slack/Anthropic clients) are kept on
+an internal branch. Public `v2.23.0` ships the generic foundation
+only — anyone can build their own fleet/ops/client layer on top of
+`http_client.rail` + `mlx_client.rail`.
+
+### `tools/train/corpus_gen.rail` — Phase 5 training corpus
 
 The dead flywheel orchestrator's harvest is replaced with a deterministic
 source-grounded corpus that the self-training loop can re-derive byte-for-byte
