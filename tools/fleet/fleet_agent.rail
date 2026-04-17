@@ -1,8 +1,15 @@
--- fleet_agent.rail — Tiny fleet agent HTTP server
--- Reports machine status, executes whitelisted commands.
--- Usage: ./rail_native run tools/fleet/fleet_agent.rail [--port 9101]
--- Auth: reads token from ~/.fleet/token
--- Whitelist: reads ~/.fleet/allowed_commands (one per line)
+-- fleet_agent.rail — Rail fleet control plane (v2 CGI handler)
+-- Mode: reads HTTP request from /tmp/fleet_req.txt, writes response to stdout.
+-- Transport: fleet_server.py (Python stdlib, 20 lines) does the TCP accept loop
+--            and invokes this binary per request. No lag, no nc pre-write hack.
+-- Handler:   Rail. All routing, JSON, whitelist, job dispatch live here.
+--
+-- Why split: `cat | nc -l` can't read-request-THEN-send-response in one nc call,
+-- so v1 returned the PREVIOUS request's response (1-step lag). CGI fork-per-request
+-- is a clean fix — state (jobs/token/whitelist) is file-based and survives forks.
+--
+-- Auth:  ~/.fleet/token              (empty file = open access)
+-- Allow: ~/.fleet/allowed_commands   (whitelist, one command or prefix per line)
 
 foreign time t
 
@@ -11,7 +18,39 @@ trim s = head (split "\n" s)
 q = "\""
 now _ = time 0
 
--- HTTP request parsing
+-- String → int (builtin to_int is float→int only)
+parse_int s = parse_int_acc (chars s) 0
+
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+
+-- Path helpers ---------------------------------------------------------------
+
+path_starts_with path prefix =
+  if length path < length prefix then false
+  else
+    let h = str_sub path 0 (length prefix)
+    h == prefix
+
+path_after path prefix =
+  str_sub path (length prefix) (length path - length prefix)
+
+strip_query s =
+  let parts = split "?" s
+  head parts
+
+query_of s =
+  let parts = split "?" s
+  if length parts >= 2 then head (tail parts) else ""
+
+-- HTTP request parsing -------------------------------------------------------
+
 parse_request_line line =
   let parts = split " " line
   if length parts >= 3 then
@@ -52,25 +91,31 @@ parse_request raw =
     let body = find_body (tail lines)
     (method, path, hdrs, body)
 
--- HTTP response builder (all cat on single lines to avoid parser issue)
+-- Response builders ----------------------------------------------------------
+
 mk_resp code text body =
   cat ["HTTP/1.1 ", show code, " ", text, "\nContent-Type: application/json\nConnection: close\n\n", body]
 
-resp_ok body = mk_resp 200 "OK" body
-resp_403 = mk_resp 403 "Forbidden" (cat ["{", q, "error", q, ": ", q, "forbidden", q, "}"])
-resp_404 = mk_resp 404 "Not Found" (cat ["{", q, "error", q, ": ", q, "not found", q, "}"])
-resp_400 = mk_resp 400 "Bad Request" (cat ["{", q, "error", q, ": ", q, "missing cmd", q, "}"])
-resp_deny = mk_resp 403 "Forbidden" (cat ["{", q, "error", q, ": ", q, "command not whitelisted", q, "}"])
+mk_html code body =
+  cat ["HTTP/1.1 ", show code, " OK\nContent-Type: text/html; charset=utf-8\nConnection: close\n\n", body]
 
--- JSON helpers
-json_esc s = join "\\\"" (split "\"" s)
-json_esc_nl s = join "\\n" (split "\n" s)
-jstr k v = cat [q, k, q, ": ", q, json_esc (json_esc_nl v), q]
-jint k v = cat [q, k, q, ": ", show v]
+resp_ok body   = mk_resp 200 "OK"          body
+resp_403       = mk_resp 403 "Forbidden"   (cat ["{", q, "error", q, ": ", q, "forbidden", q, "}"])
+resp_404       = mk_resp 404 "Not Found"   (cat ["{", q, "error", q, ": ", q, "not found", q, "}"])
+resp_400       = mk_resp 400 "Bad Request" (cat ["{", q, "error", q, ": ", q, "missing cmd", q, "}"])
+resp_deny      = mk_resp 403 "Forbidden"   (cat ["{", q, "error", q, ": ", q, "command not whitelisted", q, "}"])
+
+-- JSON helpers ---------------------------------------------------------------
+
+json_esc s    = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n"  (split "\n" s)
+jstr k v  = cat [q, k, q, ": ", q, json_esc (json_esc_nl v), q]
+jint k v  = cat [q, k, q, ": ", show v]
 jbool k v = cat [q, k, q, ": ", if v then "true" else "false"]
 jobj pairs = cat ["{", join ", " pairs, "}"]
 
--- Auth
+-- Auth -----------------------------------------------------------------------
+
 load_token _ =
   trim (shell "cat ~/.fleet/token 2>/dev/null || echo ''")
 
@@ -85,7 +130,8 @@ check_auth headers token =
     let provided = clean raw
     provided == token
 
--- Whitelist
+-- Whitelist ------------------------------------------------------------------
+
 load_whitelist _ =
   let raw = shell "cat ~/.fleet/allowed_commands 2>/dev/null || echo ''"
   filter (\l -> length l > 0) (split "\n" raw)
@@ -101,9 +147,10 @@ cmd_allowed cmd whitelist =
       if check == entry then true
       else cmd_allowed cmd (tail whitelist)
 
--- Extract "cmd" from JSON body: {"cmd": "..."}
+-- Extract "cmd" from JSON body -----------------------------------------------
+
 extract_cmd body =
-  let parts = split "\"cmd\"" body
+  let parts = str_split "\"cmd\"" body
   if length parts >= 2 then
     find_str_val (split "\"" (head (tail parts)))
   else ""
@@ -115,12 +162,27 @@ find_str_val parts =
     if p == ":" || p == ": " || p == " " || length p == 0 then find_str_val (tail parts)
     else p
 
--- GET /health
+-- Query helpers --------------------------------------------------------------
+
+parse_query_lines q_str =
+  if length q_str == 0 then 50
+  else
+    let idx = str_find "lines=" q_str
+    if idx < 0 then 50
+    else
+      let start = idx + 6
+      let after = str_sub q_str start (length q_str - start)
+      let v = head (split "&" after)
+      if length v == 0 then 50 else parse_int v
+
+-- GET /health ----------------------------------------------------------------
+
 handle_health start_time =
   let up = (now 0) - start_time
   resp_ok (jobj [jbool "alive" true, jint "uptime" up])
 
--- GET /status
+-- GET /status ----------------------------------------------------------------
+
 handle_status _ =
   let hostname = trim (shell "hostname")
   let cpu = trim (shell "sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -p")
@@ -132,7 +194,6 @@ handle_status _ =
   let svc_json = map (\s -> cat [q, s, q]) svc_lines
   let svc_arr = cat ["[", join ", " svc_json, "]"]
   let uptime = trim (shell "uptime | sed 's/.*up //' | sed 's/,.*//'")
-  let train = trim (shell "cat ~/projects/rail/training/self_train/progress.txt 2>/dev/null || echo ''")
   let train_level = trim (shell "grep '^level=' ~/projects/rail/training/self_train/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
   let train_round = trim (shell "grep '^round=' ~/projects/rail/training/self_train/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
   let train_harvested = trim (shell "grep '^harvested=' ~/projects/rail/training/self_train/progress.txt 2>/dev/null | cut -d= -f2 || echo ''")
@@ -140,7 +201,96 @@ handle_status _ =
   let body = cat ["{", jstr "hostname" hostname, ", ", jstr "cpu" cpu, ", ", jstr "mem" mem, ", ", jstr "disk" disk, ", ", jstr "arch" arch, ", ", jstr "uptime" uptime, ", ", jstr "train_level" train_level, ", ", jstr "train_round" train_round, ", ", jstr "train_harvested" train_harvested, ", ", jstr "train_rate" train_last, ", ", q, "services", q, ": ", svc_arr, "}"]
   resp_ok body
 
--- POST /exec
+-- GET /logs/<svc>?lines=N ----------------------------------------------------
+
+handle_logs rest =
+  let svc = strip_query rest
+  let lines_n = parse_query_lines (query_of rest)
+  let cmd = cat ["for p in ~/empire/logs/", svc, ".log /tmp/", svc, ".log ~/Library/Logs/", svc, "/", svc, ".log /var/log/", svc, ".log; do [ -f \"$p\" ] && tail -", show lines_n, " \"$p\" && break; done 2>/dev/null"]
+  let output = shell cmd
+  resp_ok (jobj [jstr "service" svc, jint "lines" lines_n, jstr "output" output])
+
+-- Jobs helpers ---------------------------------------------------------------
+
+jobs_dir _ = trim (shell "echo ~/.fleet/jobs")
+
+ensure_jobs_dir _ =
+  let d = jobs_dir 0
+  let _ = shell (cat ["mkdir -p ", d])
+  d
+
+new_job_id _ =
+  trim (shell "uuidgen | tr -d - | tr '[:upper:]' '[:lower:]' | cut -c1-12")
+
+-- POST /jobs  (create async job) ---------------------------------------------
+
+handle_job_create body whitelist =
+  let cmd = extract_cmd body
+  if length cmd == 0 then resp_400
+  else if cmd_allowed cmd whitelist then
+    let dir = ensure_jobs_dir 0
+    let job_id = new_job_id 0
+    let out_f = cat [dir, "/", job_id, ".out"]
+    let cmd_f = cat [dir, "/", job_id, ".cmd"]
+    let st_f  = cat [dir, "/", job_id, ".status"]
+    let _ = write_file cmd_f cmd
+    let _ = write_file st_f "running\n"
+    let _ = shell (cat ["( ", cmd, " > ", out_f, " 2>&1; echo $? > ", st_f, " ) </dev/null >/dev/null 2>&1 &"])
+    resp_ok (jobj [jstr "job_id" job_id, jstr "cmd" cmd, jstr "status" "running"])
+  else resp_deny
+
+-- GET /jobs/<id> -------------------------------------------------------------
+
+handle_job_get id_raw =
+  let id = strip_query id_raw
+  let dir = jobs_dir 0
+  let status = trim (shell (cat ["cat ", dir, "/", id, ".status 2>/dev/null || echo not_found"]))
+  let output = shell (cat ["head -c 20000 ", dir, "/", id, ".out 2>/dev/null"])
+  let cmd_txt = trim (shell (cat ["cat ", dir, "/", id, ".cmd 2>/dev/null"]))
+  resp_ok (jobj [jstr "id" id, jstr "status" status, jstr "cmd" cmd_txt, jstr "output" output])
+
+-- GET /jobs  (list recent) ---------------------------------------------------
+
+handle_jobs_list _ =
+  let dir = jobs_dir 0
+  let raw = shell (cat ["ls -t ", dir, "/*.status 2>/dev/null | head -20 | xargs -I@ basename @ .status 2>/dev/null"])
+  let ids = filter (\l -> length l > 0) (split "\n" raw)
+  let entries = map (\jid -> cat [q, jid, q]) ids
+  resp_ok (cat ["{", q, "jobs", q, ": [", join ", " entries, "]}"])
+
+-- GET / (HTML dashboard) -----------------------------------------------------
+
+handle_dashboard _ =
+  let hostname = trim (shell "hostname")
+  let uptime = trim (shell "uptime | sed 's/.*up //' | sed 's/,.*//'")
+  let arch = trim (shell "uname -m")
+  let svc_raw = shell "launchctl list 2>/dev/null | grep ledatic | awk '{print $3 \"  (PID \" $1 \")\"}' | head -20"
+  let jd = jobs_dir 0
+  let jobs_raw = shell (cat ["ls -t ", jd, "/*.status 2>/dev/null | head -5 | while read f; do id=$(basename \"$f\" .status); st=$(cat \"$f\"); cmd=$(cat \"${f%.status}.cmd\" 2>/dev/null | head -c 60); echo \"$id  $st  $cmd\"; done"])
+  let body = cat [
+    "<!DOCTYPE html><html><head><title>fleet: ", hostname, "</title>",
+    "<meta http-equiv=", q, "refresh", q, " content=", q, "10", q, ">",
+    "<style>body", "{", "font-family:ui-monospace,monospace;background:#0a0a0a;color:#ddd;padding:24px;margin:0;line-height:1.5", "}",
+    "h1", "{", "color:#0f0;border-bottom:1px solid #0f0;padding-bottom:6px;margin-top:0", "}",
+    "h2", "{", "color:#0af;margin-top:28px", "}",
+    "pre", "{", "background:#111;padding:12px;overflow-x:auto;color:#8af;border-left:2px solid #0af", "}",
+    "a", "{", "color:#0f0;margin-right:14px", "}",
+    "small", "{", "color:#666", "}",
+    "</style></head><body>",
+    "<h1>fleet: ", hostname, " <small>", arch, "</small></h1>",
+    "<p>uptime: ", uptime, "</p>",
+    "<h2>services</h2><pre>", svc_raw, "</pre>",
+    "<h2>recent jobs</h2><pre>", jobs_raw, "</pre>",
+    "<h2>endpoints</h2><p>",
+    "<a href=", q, "/status", q, ">/status</a>",
+    "<a href=", q, "/health", q, ">/health</a>",
+    "<a href=", q, "/jobs", q, ">/jobs</a>",
+    "</p><p><small>rail fleet control plane · auto-refresh 10s</small></p>",
+    "</body></html>"]
+  mk_html 200 body
+
+-- POST /exec  (sync exec, legacy) --------------------------------------------
+
 handle_exec body whitelist =
   let cmd = extract_cmd body
   if length cmd == 0 then resp_400
@@ -149,56 +299,38 @@ handle_exec body whitelist =
     resp_ok (jobj [jstr "output" output, jint "exit_code" 0])
   else resp_deny
 
--- Router
+-- Router ---------------------------------------------------------------------
+
 route method path body start_time whitelist =
   if method == "GET" then
-    if path == "/health" then handle_health start_time
+    if path == "/" then handle_dashboard 0
+    else if path == "/health" then handle_health start_time
     else if path == "/status" then handle_status 0
+    else if path == "/jobs" then handle_jobs_list 0
+    else if path_starts_with path "/logs/" then handle_logs (path_after path "/logs/")
+    else if path_starts_with path "/jobs/" then handle_job_get (path_after path "/jobs/")
     else resp_404
   else if method == "POST" then
     if path == "/exec" then handle_exec body whitelist
+    else if path == "/jobs" then handle_job_create body whitelist
     else resp_404
   else resp_404
 
--- Serve loop (dash_serve pattern: pre-write response, nc serves + captures)
-serve_loop port token start_time whitelist =
-  let default_resp = handle_status 0
-  let _ = write_file "/tmp/fleet_agent_resp.txt" default_resp
-  serve_nc port token start_time whitelist
+-- CGI handler main: read /tmp/fleet_req.txt, write HTTP response to stdout ---
 
-serve_nc port token start_time whitelist =
-  let req = shell (cat ["cat /tmp/fleet_agent_resp.txt | nc -l ", show port, " 2>/dev/null"])
-  let resp = if length req > 5 then process_req req token start_time whitelist else handle_status 0
-  let _ = write_file "/tmp/fleet_agent_resp.txt" resp
-  serve_nc port token start_time whitelist
-
-process_req req token start_time whitelist =
-  let (method, path, hdrs, body) = parse_request req
-  let _ = print (cat ["  ", method, " ", path])
-  if check_auth hdrs token then route method path body start_time whitelist
-  else resp_403
-
--- CLI arg parsing
-get_port argv =
-  if length argv <= 1 then 9101
-  else get_port_acc (tail argv)
-
-get_port_acc argv =
-  if length argv == 0 then 9101
-  else if head argv == "--port" then
-    if length (tail argv) > 0 then to_int (head (tail argv))
-    else 9101
-  else get_port_acc (tail argv)
+load_start_time _ =
+  let s = trim (shell "cat /tmp/fleet_start_time 2>/dev/null || echo 0")
+  if length s == 0 then now 0 else parse_int s
 
 main =
-  let port = get_port args
+  let req = read_file "/tmp/fleet_req.txt"
   let token = load_token 0
   let whitelist = load_whitelist 0
-  let start_time = now 0
-  let _ = print "Fleet Agent"
-  let _ = print (cat ["  port: ", show port])
-  let _ = print (cat ["  token: ", if length token > 0 then "loaded" else "NONE (open access)"])
-  let _ = print (cat ["  whitelist: ", show (length whitelist), " commands"])
-  let _ = print "  Ctrl+C to stop\n"
-  let _ = shell "mkdir -p ~/.fleet && touch ~/.fleet/token ~/.fleet/allowed_commands"
-  serve_loop port token start_time whitelist
+  let start_time = load_start_time 0
+  let _ = ensure_jobs_dir 0
+  let (method, path, hdrs, body) = parse_request req
+  let resp =
+    if check_auth hdrs token then route method path body start_time whitelist
+    else resp_403
+  let _ = write_file "/dev/stdout" resp
+  0
