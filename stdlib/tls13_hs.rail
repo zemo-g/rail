@@ -1,0 +1,183 @@
+-- stdlib/tls13_hs.rail — TLS 1.3 handshake state machine (Layer 5b).
+--
+-- Builds on stdlib/tls13.rail (key schedule + record nonce) to implement
+-- the client-side handshake flow per RFC 8446.
+--
+-- Public API (layer 5b.1 — ClientHello only):
+--   tls13_client_hello random session_id x25519_pub sni -> result
+--     where result is a 2-element array: [buf, total_len]
+--     and buf is a byte array containing the full TLSPlaintext(Handshake(ClientHello))
+--     record ready to send over the wire (5-byte record header + 4-byte handshake
+--     header + ClientHello body).
+--
+-- Wire format references:
+--   RFC 8446 §4.1.2 ClientHello
+--   RFC 8446 §4.2.1 supported_versions
+--   RFC 8446 §4.2.7 supported_groups
+--   RFC 8446 §4.2.3 signature_algorithms
+--   RFC 8446 §4.2.8 key_share
+--   RFC 6066 §3 server_name (SNI)
+--
+-- For layer 5b.1 we only produce ClientHello. Subsequent layers add
+-- ServerHello parsing (5b.2), record layer wrap/unwrap (5b.3), and the
+-- full handshake state machine (5b.4-7).
+
+import "stdlib/tls13.rail"
+
+-- ── Buffer write helpers ─────────────────────────────────────────────────
+-- Each writer takes (buf, offset, value) and returns the new offset.
+-- Callers chain them; errors silently no-op past end-of-buffer (caller
+-- sized the buffer correctly).
+
+ch_w_u8 buf off v =
+  let _ = arr_set buf off (bit_and v 255)
+  off + 1
+
+ch_w_u16 buf off v =
+  let _ = arr_set buf off       (bit_and (shr v 8) 255)
+  let _ = arr_set buf (off + 1) (bit_and v 255)
+  off + 2
+
+ch_w_u24 buf off v =
+  let _ = arr_set buf off       (bit_and (shr v 16) 255)
+  let _ = arr_set buf (off + 1) (bit_and (shr v 8) 255)
+  let _ = arr_set buf (off + 2) (bit_and v 255)
+  off + 3
+
+ch_w_bytes buf off src src_len =
+  let _ = sha_copy_bytes src buf 0 off src_len
+  off + src_len
+
+-- ── Extension: server_name (SNI, type 0x0000) ───────────────────────────
+-- Wire:
+--   ext_type       = 0x0000            (2 bytes)
+--   ext_data_len   = 5 + sni_len       (2 bytes)
+--   ServerNameList:
+--     list_length  = 3 + sni_len       (2 bytes)
+--     name_type    = 0x00 (host_name)  (1 byte)
+--     name_length  = sni_len           (2 bytes)
+--     name_bytes                       (sni_len bytes)
+-- Total extension size on wire: 9 + sni_len
+
+ch_ext_sni_len sni_len = 9 + sni_len
+
+ch_write_ext_sni buf off sni_bytes sni_len =
+  let o = ch_w_u16 buf off 0
+  let o = ch_w_u16 buf o (5 + sni_len)
+  let o = ch_w_u16 buf o (3 + sni_len)
+  let o = ch_w_u8  buf o 0
+  let o = ch_w_u16 buf o sni_len
+  ch_w_bytes buf o sni_bytes sni_len
+
+-- ── Extension: supported_versions (type 0x002b) ─────────────────────────
+-- Wire: [0x002b, ext_data_len=3, versions_len=2, 0x0304]   -> 7 bytes
+
+ch_ext_versions_len = 7
+
+ch_write_ext_versions buf off =
+  let o = ch_w_u16 buf off 43
+  let o = ch_w_u16 buf o 3
+  let o = ch_w_u8  buf o 2
+  ch_w_u16 buf o 772
+
+-- ── Extension: supported_groups (type 0x000a) ───────────────────────────
+-- Only x25519 (0x001d). Wire: [0x000a, ext_data_len=4, groups_len=2, 0x001d]
+-- Total: 8 bytes.
+
+ch_ext_groups_len = 8
+
+ch_write_ext_groups buf off =
+  let o = ch_w_u16 buf off 10
+  let o = ch_w_u16 buf o 4
+  let o = ch_w_u16 buf o 2
+  ch_w_u16 buf o 29
+
+-- ── Extension: signature_algorithms (type 0x000d) ──────────────────────
+-- Offer rsa_pss_rsae_sha256 (0x0804), ecdsa_secp256r1_sha256 (0x0403),
+-- rsa_pkcs1_sha256 (0x0401). 3 algorithms x 2 bytes = 6 bytes of list.
+-- Wire: [0x000d, ext_data_len=8, algos_len=6, 0x0804, 0x0403, 0x0401]
+-- Total: 12 bytes.
+
+ch_ext_sigalgs_len = 12
+
+ch_write_ext_sigalgs buf off =
+  let o = ch_w_u16 buf off 13
+  let o = ch_w_u16 buf o 8
+  let o = ch_w_u16 buf o 6
+  let o = ch_w_u16 buf o 2052
+  let o = ch_w_u16 buf o 1027
+  ch_w_u16 buf o 1025
+
+-- ── Extension: key_share (type 0x0033) ─────────────────────────────────
+-- One share: x25519, 32-byte pubkey.
+-- Wire: [0x0033, ext_data_len=38, shares_len=36, group=0x001d, key_len=32, pubkey..]
+-- Total: 42 bytes.
+
+ch_ext_keyshare_len = 42
+
+ch_write_ext_keyshare buf off pub =
+  let o = ch_w_u16 buf off 51
+  let o = ch_w_u16 buf o 38
+  let o = ch_w_u16 buf o 36
+  let o = ch_w_u16 buf o 29
+  let o = ch_w_u16 buf o 32
+  ch_w_bytes buf o pub 32
+
+-- ── Total extensions length (given sni_len) ─────────────────────────────
+
+ch_extensions_total sni_len =
+  (ch_ext_sni_len sni_len) + ch_ext_versions_len + ch_ext_groups_len + ch_ext_sigalgs_len + ch_ext_keyshare_len
+
+-- ── ClientHello body (before length framing) ───────────────────────────
+-- legacy_version(2) + random(32) + sid_len(1) + sid(32) +
+-- cipher_suites_len(2) + cipher_suites(2) + comp_len(1) + comp(1) +
+-- extensions_len(2) = 75 fixed bytes, plus extensions_total.
+
+ch_body_len sni_len = 75 + ch_extensions_total sni_len
+
+ch_write_body buf off random session_id pub sni_bytes sni_len =
+  -- legacy_version = 0x0303 (TLS 1.2, per RFC 8446 §4.1.2)
+  let o = ch_w_u16 buf off 771
+  -- Client Random (32 bytes)
+  let o = ch_w_bytes buf o random 32
+  -- legacy_session_id: 32-byte pseudo-random (middlebox compat per §4.1.2)
+  let o = ch_w_u8 buf o 32
+  let o = ch_w_bytes buf o session_id 32
+  -- cipher_suites: one entry, TLS_CHACHA20_POLY1305_SHA256 = 0x1303
+  let o = ch_w_u16 buf o 2
+  let o = ch_w_u16 buf o 4867
+  -- legacy_compression_methods: [null]
+  let o = ch_w_u8 buf o 1
+  let o = ch_w_u8 buf o 0
+  -- extensions_length
+  let ext_total = ch_extensions_total sni_len
+  let o = ch_w_u16 buf o ext_total
+  -- Extensions — order chosen to match common client behavior (SNI first).
+  let o = ch_write_ext_sni buf o sni_bytes sni_len
+  let o = ch_write_ext_versions buf o
+  let o = ch_write_ext_groups buf o
+  let o = ch_write_ext_sigalgs buf o
+  ch_write_ext_keyshare buf o pub
+
+-- ── Top-level: build a full TLSPlaintext(Handshake(ClientHello)) ──────
+
+tls13_client_hello random session_id pub sni =
+  let sni_bytes = string_to_bytes sni
+  let sni_len = string_length_bytes sni
+  let body_len = ch_body_len sni_len
+  let hs_total = 4 + body_len
+  let record_total = 5 + hs_total
+  let buf = arr_new record_total 0
+  -- TLSPlaintext header: content_type=22 (handshake), legacy_version=0x0303, length
+  let o = ch_w_u8  buf 0 22
+  let o = ch_w_u16 buf o 771
+  let o = ch_w_u16 buf o hs_total
+  -- Handshake header: msg_type=1 (client_hello), length (uint24)
+  let o = ch_w_u8  buf o 1
+  let o = ch_w_u24 buf o body_len
+  -- ClientHello body
+  let _ = ch_write_body buf o random session_id pub sni_bytes sni_len
+  let result = arr_new 2 0
+  let _ = arr_set result 0 buf
+  let _ = arr_set result 1 record_total
+  result
