@@ -1,0 +1,136 @@
+-- stdlib/tls13_cert_verify.rail — TLS 1.3 CertificateVerify signature check.
+--
+-- Given:
+--   * Server's first Certificate (DER bytes)
+--   * CertificateVerify signature_algorithm (uint16 from RFC 8446 §4.2.3)
+--   * CertificateVerify signature bytes (DER for ECDSA)
+--   * Transcript hash SHA-256(CH || SH || EE || Cert) — 32 bytes
+-- Verify the server's signature over the TLS 1.3 signing context
+-- (RFC 8446 §4.4.3):
+--   signed_data = 64 × 0x20 || "TLS 1.3, server CertificateVerify" || 0x00 || transcript_hash
+--   sig_hash   = SHA-256(signed_data)
+--   verify: ECDSA-P256-verify(pub_from_cert, sig_hash, (r, s))
+--
+-- Only sig_alg 0x0403 (ecdsa_secp256r1_sha256) is currently supported.
+-- Other algorithms (RSA-PSS, RSA-PKCS1, ECDSA-P384/P521) return 0
+-- ("sig_alg not supported") which the caller surfaces as handshake failure.
+--
+-- Public API:
+--   tls13_cert_verify_sig cert cert_len sig_alg sig sig_len transcript_hash -> 1/0
+--
+-- NOTE: intentionally imports NOTHING. asn1, ecdsa_p256, sha256, and bytes
+-- must already be loaded by the caller's import chain (typically via
+-- tls13_hs → tls13 → hkdf → hmac → sha256 → bytes). Importing them here
+-- would cause textual-import duplicate-symbol errors.
+
+-- ── Build the TLS 1.3 "signed data" ────────────────────────────────────
+
+cv_context_str _ = "TLS 1.3, server CertificateVerify"
+cv_context_len _ = 33
+
+-- Returns a 98-byte array: 64 spaces + 33-byte context + 0x00 = 98; then
+-- append the 32-byte transcript_hash externally.
+cv_build_signed transcript_hash =
+  let total = 64 + 33 + 1 + 32
+  let buf = arr_new total 0
+  let _ = cv_fill_spaces buf 0
+  let ctx_bytes = string_to_bytes (cv_context_str 0)
+  let _ = sha_copy_bytes ctx_bytes buf 0 64 33
+  let _ = arr_set buf 97 0
+  let _ = sha_copy_bytes transcript_hash buf 0 98 32
+  buf
+
+cv_fill_spaces buf i =
+  if i >= 64 then 0
+  else
+    let _ = arr_set buf i 32
+    cv_fill_spaces buf (i + 1)
+
+-- ── Public-key extraction for P-256 certs ──────────────────────────────
+-- Returns [pub_x_bytes(32), pub_y_bytes(32), valid].
+
+cv_extract_p256_pubkey cert cert_len =
+  let fields = asn1_cert_fields cert cert_len
+  if arr_get fields 12 == 0 then cv_pk_fail 0
+  else
+    let pa_off = arr_get fields 6
+    let pa_len = arr_get fields 7
+    let pk_off = arr_get fields 10
+    let pk_len = arr_get fields 11
+    let params_off = arr_get fields 8
+    let params_len = arr_get fields 9
+    -- pub alg OID must be ecPublicKey.
+    let is_ec = asn1_oid_eq cert pa_off pa_len (asn1_oid_ec_pubkey 0) 7
+    if is_ec == 0 then cv_pk_fail 0
+    else
+      -- params must be a 10-byte TLV: 06 08 2a8648ce3d030107 (prime256v1 OID).
+      if params_len != 10 then cv_pk_fail 0
+      else
+        let is_p256 = cv_check_p256_params cert params_off
+        if is_p256 == 0 then cv_pk_fail 0
+        else
+          -- Public key BIT STRING contents are already past the unused-bits
+          -- byte. Must be 0x04 || X(32) || Y(32) = 65 bytes uncompressed.
+          if pk_len != 65 then cv_pk_fail 0
+          else if arr_get cert pk_off != 4 then cv_pk_fail 0
+          else
+            let x = arr_new 32 0
+            let y = arr_new 32 0
+            -- Uncompressed EC point: 0x04 || X(32) || Y(32). Skip 0x04.
+            let _ = sha_copy_bytes cert x (pk_off + 1) 0 32
+            let _ = sha_copy_bytes cert y (pk_off + 33) 0 32
+            let r = arr_new 3 0
+            let _ = arr_set r 0 x
+            let _ = arr_set r 1 y
+            let _ = arr_set r 2 1
+            r
+
+-- Check params region: tag 0x06 (OID), length 0x08, content matches prime256v1.
+cv_check_p256_params cert params_off =
+  let t = arr_get cert params_off
+  if t != 6 then 0
+  else
+    let l = arr_get cert (params_off + 1)
+    if l != 8 then 0
+    else asn1_oid_eq cert (params_off + 2) 8 (asn1_oid_p256_curve 0) 8
+
+cv_pk_fail _ =
+  let z = arr_new 32 0
+  let r = arr_new 3 0
+  let _ = arr_set r 0 z
+  let _ = arr_set r 1 z
+  let _ = arr_set r 2 0
+  r
+
+-- ── Main entry ─────────────────────────────────────────────────────────
+-- sig_alg: 0x0403 = ecdsa_secp256r1_sha256 (RFC 8446 §4.2.3).
+
+tls13_cert_verify_sig cert cert_len sig_alg sig sig_len transcript_hash =
+  if sig_alg != 1027 then 0
+  else
+    let pk = cv_extract_p256_pubkey cert cert_len
+    if arr_get pk 2 == 0 then 0
+    else
+      let px = arr_get pk 0
+      let py = arr_get pk 1
+      let parsed = asn1_parse_ecdsa_sig sig sig_len 0 sig_len
+      if arr_get parsed 4 == 0 then 0
+      else
+        let r_off = arr_get parsed 0
+        let r_len = arr_get parsed 1
+        let s_off = arr_get parsed 2
+        let s_len = arr_get parsed 3
+        -- Pad r, s to 32 bytes (left-pad with zeros).
+        let r_bytes = cv_pad32 sig r_off r_len
+        let s_bytes = cv_pad32 sig s_off s_len
+        -- Build signed_data and hash it.
+        let signed_data = cv_build_signed transcript_hash
+        let hash = sha256_bytes signed_data 130
+        ecdsa_p256_verify px py hash r_bytes s_bytes
+
+-- Left-pad a (<=32 byte) slice of `src` starting at `off` into a 32-byte
+-- big-endian array.
+cv_pad32 src off len =
+  let out = arr_new 32 0
+  let _ = sha_copy_bytes src out off (32 - len) len
+  out

@@ -12,12 +12,19 @@
 --     client_hello_msg ch_len  (Handshake-framed CH: type 0x01 + uint24 + body)
 --     server_hello_msg sh_len  (Handshake-framed SH: type 0x02 + uint24 + body)
 --     server_flight  fl_len    (decrypted plaintext: EncExt + Cert + CV + ServerFinished, concatenated as Handshake messages)
+--     verify_cert              (1 = validate server cert's CertificateVerify, 0 = skip)
 --   -> result array with:
 --     [0] = c_ap_traffic (32 bytes)
 --     [1] = s_ap_traffic (32 bytes)
 --     [2] = client_finished_msg (Handshake-framed bytes)
 --     [3] = client_finished_len (int)
 --     [4] = valid (1 = server Finished verified, 0 = rejected)
+--     [5] = cert_verify_result (1 = sig valid, 0 = skipped or failed)
+--
+-- When verify_cert=1, the FSM will only return valid=1 if BOTH the server
+-- Finished MAC AND the CertificateVerify signature checked out. Only
+-- ecdsa_secp256r1_sha256 (sig_alg 0x0403) is supported; other sig_algs
+-- produce cert_verify_result=0 and overall valid=0.
 --
 -- The driver maintains the transcript hash by concatenating messages into
 -- a growing byte buffer and re-hashing at each boundary we need. For a
@@ -25,6 +32,9 @@
 
 import "stdlib/x25519.rail"
 import "stdlib/tls13_hs.rail"
+import "stdlib/asn1.rail"
+import "stdlib/ecdsa_p256.rail"
+import "stdlib/tls13_cert_verify.rail"
 
 -- ── Helper: concatenate two byte arrays ────────────────────────────────
 
@@ -43,17 +53,18 @@ tcl_hash buf n = sha256_bytes buf n
 tcl_fail _ =
   let z = arr_new 32 0
   let zmsg = arr_new 0 0
-  let r = arr_new 5 0
+  let r = arr_new 6 0
   let _ = arr_set r 0 z
   let _ = arr_set r 1 z
   let _ = arr_set r 2 zmsg
   let _ = arr_set r 3 0
   let _ = arr_set r 4 0
+  let _ = arr_set r 5 0
   r
 
 -- ── Main driver ─────────────────────────────────────────────────────────
 
-tls13_client_handshake_offline client_priv client_hello_msg ch_len server_hello_msg sh_len server_flight fl_len =
+tls13_client_handshake_offline client_priv client_hello_msg ch_len server_hello_msg sh_len server_flight fl_len verify_cert =
   -- Parse ServerHello to extract the server's x25519 share.
   let sh_parsed = tls13_parse_server_hello server_hello_msg sh_len
   if arr_get sh_parsed 3 == 0 then tcl_fail 0
@@ -65,10 +76,7 @@ tls13_client_handshake_offline client_priv client_hello_msg ch_len server_hello_
     let t_sh = tcl_concat client_hello_msg ch_len server_hello_msg sh_len
     let t_sh_len = ch_len + sh_len
     let hs_hash = tcl_hash t_sh t_sh_len
-    -- Walk the server flight to find EncExt, Cert, CertVerify, ServerFinished
-    -- boundaries. We need the offset AT THE END of CertVerify (which equals
-    -- the offset AT THE START of ServerFinished) so we can take the
-    -- transcript hash through CertVerify.
+    -- Walk the server flight to find EncExt, Cert, CertVerify, ServerFinished.
     let m_ee = tls13_hs_read_msg server_flight 0
     if arr_get m_ee 0 == 8 then
       let m_cert = tls13_hs_read_msg server_flight (arr_get m_ee 3)
@@ -82,44 +90,65 @@ tls13_client_handshake_offline client_priv client_hello_msg ch_len server_hello_
             let sf_parsed = tls13_parse_finished server_flight (arr_get m_sf 1) (arr_get m_sf 2)
             if arr_get sf_parsed 2 == 0 then tcl_fail 0
             else
-              -- Transcript through CertVerify = t_sh || server_flight[0..cv_end]
+              -- Transcript through Certificate (end of Cert = start of CV).
+              let cert_end_off = arr_get m_cert 3
+              let t_cert = tcl_concat t_sh t_sh_len server_flight cert_end_off
+              let t_cert_len = t_sh_len + cert_end_off
+              let cert_hash = tcl_hash t_cert t_cert_len
+              -- Transcript through CertVerify (end of CV = start of Finished).
               let t_cv = tcl_concat t_sh t_sh_len server_flight cv_end
               let t_cv_len = t_sh_len + cv_end
               let cv_hash = tcl_hash t_cv t_cv_len
-              -- Transcript through ServerFinished = t_sh || server_flight[0..sf_end]
+              -- Transcript through ServerFinished.
               let t_sf = tcl_concat t_sh t_sh_len server_flight sf_end
               let t_sf_len = t_sh_len + sf_end
               let sf_hash = tcl_hash t_sf t_sf_len
-              -- Key schedule: we need handshake_secret (for c_hs/s_hs) and
-              -- also application traffic secrets (derived at sf_hash).
-              let sched = tls13_derive_schedule shared 32 hs_hash sf_hash
-              let c_hs = arr_get sched 1
-              let s_hs = arr_get sched 2
-              let c_ap = arr_get sched 4
-              let s_ap = arr_get sched 5
-              -- Verify server's Finished: expected = HMAC(server_finished_key, cv_hash)
-              let server_vd_expected = tls13_compute_finished s_hs cv_hash
-              let server_vd_actual = arr_get sf_parsed 0
-              let vd_ok = tcl_tag_cmp server_vd_expected server_vd_actual 0
-              if vd_ok == 0 then tcl_fail 0
+              -- ── CertificateVerify signature check (optional) ────────────
+              let cert_ok =
+                if verify_cert == 0 then 1
+                else
+                  let cert_parsed = tls13_parse_certificate server_flight (arr_get m_cert 1) (arr_get m_cert 2)
+                  if arr_get cert_parsed 2 == 0 then 0
+                  else
+                    let cv_parsed = tls13_parse_certificate_verify server_flight (arr_get m_cv 1) (arr_get m_cv 2)
+                    if arr_get cv_parsed 3 == 0 then 0
+                    else
+                      let sig_alg = arr_get cv_parsed 0
+                      let sig_bytes = arr_get cv_parsed 1
+                      let sig_len = arr_get cv_parsed 2
+                      let cert_bytes = arr_get cert_parsed 0
+                      let cert_len = arr_get cert_parsed 1
+                      tls13_cert_verify_sig cert_bytes cert_len sig_alg sig_bytes sig_len cert_hash
+              if cert_ok == 0 then tcl_fail 0
               else
-                -- Build client's Finished over the transcript through ServerFinished.
-                let client_vd = tls13_compute_finished c_hs sf_hash
-                -- Handshake-framed client Finished: type(1)=0x14 + length(3)=0x000020 + verify_data(32).
-                let cf_len = 36
-                let cf_msg = arr_new cf_len 0
-                let _ = arr_set cf_msg 0 20
-                let _ = arr_set cf_msg 1 0
-                let _ = arr_set cf_msg 2 0
-                let _ = arr_set cf_msg 3 32
-                let _ = sha_copy_bytes client_vd cf_msg 0 4 32
-                let result = arr_new 5 0
-                let _ = arr_set result 0 c_ap
-                let _ = arr_set result 1 s_ap
-                let _ = arr_set result 2 cf_msg
-                let _ = arr_set result 3 cf_len
-                let _ = arr_set result 4 1
-                result
+                -- Key schedule.
+                let sched = tls13_derive_schedule shared 32 hs_hash sf_hash
+                let c_hs = arr_get sched 1
+                let s_hs = arr_get sched 2
+                let c_ap = arr_get sched 4
+                let s_ap = arr_get sched 5
+                -- Server Finished MAC.
+                let server_vd_expected = tls13_compute_finished s_hs cv_hash
+                let server_vd_actual = arr_get sf_parsed 0
+                let vd_ok = tcl_tag_cmp server_vd_expected server_vd_actual 0
+                if vd_ok == 0 then tcl_fail 0
+                else
+                  let client_vd = tls13_compute_finished c_hs sf_hash
+                  let cf_len = 36
+                  let cf_msg = arr_new cf_len 0
+                  let _ = arr_set cf_msg 0 20
+                  let _ = arr_set cf_msg 1 0
+                  let _ = arr_set cf_msg 2 0
+                  let _ = arr_set cf_msg 3 32
+                  let _ = sha_copy_bytes client_vd cf_msg 0 4 32
+                  let result = arr_new 6 0
+                  let _ = arr_set result 0 c_ap
+                  let _ = arr_set result 1 s_ap
+                  let _ = arr_set result 2 cf_msg
+                  let _ = arr_set result 3 cf_len
+                  let _ = arr_set result 4 1
+                  let _ = arr_set result 5 cert_ok
+                  result
           else tcl_fail 0
         else tcl_fail 0
       else tcl_fail 0
