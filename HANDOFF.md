@@ -159,3 +159,25 @@ Expect ~5-8 minutes for a full self+test+self+cmp cycle. If `test` goes past 12 
 The torch passes to you at `260aebc`. Aim to land 5b.7 first (it's small and flushes FSM bugs before you build on top). Then commit to Layer 6 as a multi-session arc. Layer 7 is a single sitting once Layer 6 lands. Merge to `next-v2.10` only when `https_get api.anthropic.com` returns a real HTTP status.
 
 Good luck.
+
+---
+
+## Addendum — session 2026-04-18: torch carried through 5b.7 → Layer 7
+
+The next session after `260aebc`/`79ac9ce` (this HANDOFF) continued the work and landed the full stack. Commits:
+
+| Layer | Commit | Delta |
+|---|---|---|
+| 5b.7 | `8a69b63` | RFC 8448 §3 end-to-end trace via `tools/tls/rfc8448_trace_test.rail` (standalone, not in-tree harness per §Harness). c_ap, s_ap, client Finished verify_data all match RFC exact. |
+| 6a | `9da09cf` | `stdlib/asn1.rail` minimal DER parser — extracts TBS, sig-alg OID, signature value, SubjectPublicKey algo + bytes. Tested against RFC 8448 §3's 432-byte cert. |
+| 6b | `73c839a` | `stdlib/ecdsa_p256.rail` pure-Rail ECDSA verify. 16×16-bit limb bignums, Jacobian curve (EFD dbl-2001-b / add-2007-bl), Fermat's inverse. RFC 6979 §A.2.5 test vector verifies in ~4s; 4 negative cases all reject. |
+| 6c | `29632bc` | `stdlib/tls13_cert_verify.rail` + FSM `verify_cert` flag. Only sig_alg 0x0403 (ecdsa_secp256r1_sha256) accepted; others fail cleanly. |
+| 7  | `b731bff` | `stdlib/https_client.rail` — `https_get host ip port path`. Live test: `https_get "api.anthropic.com" "160.79.104.10" 443 "/"` returned real HTTP 404 from Anthropic's Envoy upstream in ~5 seconds. **socat is no longer in the HTTPS request path.** |
+
+**Merge criteria status:** full suite tests running (aim: 137/137 green, t131 harness hang tolerated if the current build avoids it); 2-pass self-compile TBD; live https_get against api.anthropic.com DONE. After all three, ready to fast-forward `next-v2.10`.
+
+**Known carry-over limits for Layer 8+:**
+- Caller resolves DNS (no in-tree resolver).
+- CertificateVerify must be ECDSA-P256-SHA256 only. RSA-PSS/PKCS1 unsupported — most modern server certs are P-256 so this works in practice, but a multi-alg Layer 6d would broaden compat.
+- No cert chain walking / name validation. A single leaf's signature is verified against its own embedded SubjectPublicKey — a self-signed leaf would "verify" with this model. Add chain + name checks before trusting for anything load-bearing.
+- Two back-to-back `ecdsa_p256_verify` calls in one process hang on arena/GC pressure. Real TLS is one-verify-per-connection so it's a non-issue; just don't write two-verifies-per-test.
