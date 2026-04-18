@@ -1,0 +1,324 @@
+-- stdlib/ecdsa_p384.rail — ECDSA verify on NIST P-384 (secp384r1).
+--
+-- Closes the Google Trust Services chain gap: GTS Root R4 (and most
+-- modern Google/Cloudflare ECDSA roots) are on the P-384 curve with
+-- ecdsa-with-SHA384 outer signatures. We already have SHA-384; this
+-- module adds the curve math.
+--
+-- Structure mirrors stdlib/ecdsa_p256.rail (Jacobian coords with a=-3,
+-- EFD dbl-2001-b / add-2007-bl point ops, MSB→LSB double-and-add scalar
+-- mult, Fermat's little theorem for inverse). The difference: 24×16-bit
+-- limbs instead of 16, which means calling bignum_n.rail helpers with
+-- n_limbs=24 rather than hardcoded loops.
+--
+-- Curve parameters (FIPS 186-4 D.1.2.4):
+--   p = 2^384 - 2^128 - 2^96 + 2^32 - 1
+--   a = p - 3
+--   b = B3312FA7E23EE7E4988E056BE3F82D19181D9C6EFE8141120314088F5013875AC656398D8A2ED19D2A85C8EDD3EC2AEF
+--   n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973
+--   Gx = AA87CA22BE8B05378EB1C71EF320AD746E1D3B628BA79B9859F741E082542A385502F25DBF55296C3A545E3872760AB7
+--   Gy = 3617DE4A96262C6F5D9E98BF9292DC29F8F41DBD289A147CE9DA3113B5F0B8C00A60B1CE1D7E819D7A431D7C90EA0E5F
+--
+-- Public API:
+--   ecdsa_p384_verify pub_x_bytes pub_y_bytes msg_hash_bytes r_bytes s_bytes -> 1/0
+--   All byte arguments are 48-byte big-endian arrays.
+--
+-- Depends on bignum_n helpers (bn_new / bn_from_be / bn_cmp / bn_mul_mod /
+-- …). Do NOT import stdlib/bignum_n.rail here: the caller's tls13 chain
+-- already brings it in via rsa_pss.rail, and a second textual import
+-- duplicates every symbol.
+
+p384_nl _ = 24
+
+-- Load curve constants (48 bytes each, 24 limbs).
+p384_load_p _ = bn_from_be (hex_to_bytes "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff") 24
+p384_load_n _ = bn_from_be (hex_to_bytes "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973") 24
+p384_load_gx _ = bn_from_be (hex_to_bytes "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7") 24
+p384_load_gy _ = bn_from_be (hex_to_bytes "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f") 24
+
+-- ── Modular inverse via Fermat's little theorem ──────────────────────
+-- a^-1 mod m = a^(m-2) mod m.
+
+p384_mod_inv c a m =
+  let nl = 24
+  let exp = bn_new nl
+  let _ = bn_copy exp m nl
+  let two = bn_new nl
+  let _ = arr_set two 0 2
+  let tmp = bn_new nl
+  let _ = bn_usub tmp exp two nl
+  let _ = bn_copy exp tmp nl
+  let _ = bn_zero c nl
+  let _ = arr_set c 0 1
+  let _ = p384_pow_loop c a exp m nl 383
+  c
+
+p384_pow_loop c base exp m nl bit_idx =
+  if bit_idx < 0 then 0
+  else
+    let tmp = bn_new nl
+    let _ = bn_sqr_mod tmp c m nl
+    let _ = bn_copy c tmp nl
+    let limb_idx = shr bit_idx 4
+    let bit_in_limb = bit_and bit_idx 15
+    let b = bit_and (shr (arr_get exp limb_idx) bit_in_limb) 1
+    if b == 1 then
+      let tmp2 = bn_new nl
+      let _ = bn_mul_mod tmp2 c base m nl
+      let _ = bn_copy c tmp2 nl
+      p384_pow_loop c base exp m nl (bit_idx - 1)
+    else p384_pow_loop c base exp m nl (bit_idx - 1)
+
+-- ── Point operations (Jacobian, a = -3) ──────────────────────────────
+-- Point = [X, Y, Z] 3-element array of 24-limb bignums. Z=0 ⇒ infinity.
+
+p384_point_new _ =
+  let pt = arr_new 3 0
+  let _ = arr_set pt 0 (bn_new 24)
+  let _ = arr_set pt 1 (bn_new 24)
+  let _ = arr_set pt 2 (bn_new 24)
+  pt
+
+p384_point_copy dst src =
+  let _ = bn_copy (arr_get dst 0) (arr_get src 0) 24
+  let _ = bn_copy (arr_get dst 1) (arr_get src 1) 24
+  let _ = bn_copy (arr_get dst 2) (arr_get src 2) 24
+  dst
+
+p384_point_is_inf pt = bn_is_zero (arr_get pt 2) 24
+
+-- Jacobian doubling with a=-3 (EFD dbl-2001-b), parameterised.
+p384_point_dbl out pin =
+  let p = p384_load_p 0
+  let X = arr_get pin 0
+  let Y = arr_get pin 1
+  let Z = arr_get pin 2
+  if bn_is_zero Z 24 == 1 then
+    let _ = p384_point_copy out pin
+    out
+  else p384_dbl_core out X Y Z p
+
+p384_dbl_core out X Y Z p =
+  let Z2 = bn_new 24
+  let _ = bn_sqr_mod Z2 Z p 24
+  let gamma = bn_new 24
+  let _ = bn_sqr_mod gamma Y p 24
+  let beta = bn_new 24
+  let _ = bn_mul_mod beta X gamma p 24
+  let t1 = bn_new 24
+  let _ = bn_mod_sub t1 X Z2 p 24
+  let t2 = bn_new 24
+  let _ = bn_mod_add t2 X Z2 p 24
+  let t3 = bn_new 24
+  let _ = bn_mul_mod t3 t1 t2 p 24
+  let alpha = bn_new 24
+  let _ = bn_mod_add alpha t3 t3 p 24
+  let tmp_alpha = bn_new 24
+  let _ = bn_mod_add tmp_alpha alpha t3 p 24
+  let _ = bn_copy alpha tmp_alpha 24
+  let alpha2 = bn_new 24
+  let _ = bn_sqr_mod alpha2 alpha p 24
+  let beta4 = bn_new 24
+  let _ = bn_mod_add beta4 beta beta p 24
+  let tmp = bn_new 24
+  let _ = bn_mod_add tmp beta4 beta4 p 24
+  let _ = bn_copy beta4 tmp 24
+  let beta8 = bn_new 24
+  let _ = bn_mod_add beta8 beta4 beta4 p 24
+  let X3 = arr_get out 0
+  let _ = bn_mod_sub X3 alpha2 beta8 p 24
+  let YpZ = bn_new 24
+  let _ = bn_mod_add YpZ Y Z p 24
+  let YpZ2 = bn_new 24
+  let _ = bn_sqr_mod YpZ2 YpZ p 24
+  let t4 = bn_new 24
+  let _ = bn_mod_sub t4 YpZ2 gamma p 24
+  let Z3 = arr_get out 2
+  let _ = bn_mod_sub Z3 t4 Z2 p 24
+  let fourbeta_mX3 = bn_new 24
+  let _ = bn_mod_sub fourbeta_mX3 beta4 X3 p 24
+  let t5 = bn_new 24
+  let _ = bn_mul_mod t5 alpha fourbeta_mX3 p 24
+  let g2 = bn_new 24
+  let _ = bn_sqr_mod g2 gamma p 24
+  let g4 = bn_new 24
+  let _ = bn_mod_add g4 g2 g2 p 24
+  let tmp2 = bn_new 24
+  let _ = bn_mod_add tmp2 g4 g4 p 24
+  let _ = bn_copy g4 tmp2 24
+  let g8 = bn_new 24
+  let _ = bn_mod_add g8 g4 g4 p 24
+  let Y3 = arr_get out 1
+  let _ = bn_mod_sub Y3 t5 g8 p 24
+  out
+
+-- Full Jacobian add (EFD add-2007-bl).
+p384_point_add out pin qin =
+  let p = p384_load_p 0
+  if bn_is_zero (arr_get pin 2) 24 == 1 then
+    let _ = p384_point_copy out qin
+    out
+  else if bn_is_zero (arr_get qin 2) 24 == 1 then
+    let _ = p384_point_copy out pin
+    out
+  else p384_add_core out pin qin p
+
+p384_add_core out pin qin p =
+  let X1 = arr_get pin 0
+  let Y1 = arr_get pin 1
+  let Z1 = arr_get pin 2
+  let X2 = arr_get qin 0
+  let Y2 = arr_get qin 1
+  let Z2 = arr_get qin 2
+  let Z2sq = bn_new 24
+  let _ = bn_sqr_mod Z2sq Z2 p 24
+  let U1 = bn_new 24
+  let _ = bn_mul_mod U1 X1 Z2sq p 24
+  let Z1sq = bn_new 24
+  let _ = bn_sqr_mod Z1sq Z1 p 24
+  let U2 = bn_new 24
+  let _ = bn_mul_mod U2 X2 Z1sq p 24
+  let Z2cb = bn_new 24
+  let _ = bn_mul_mod Z2cb Z2sq Z2 p 24
+  let S1 = bn_new 24
+  let _ = bn_mul_mod S1 Y1 Z2cb p 24
+  let Z1cb = bn_new 24
+  let _ = bn_mul_mod Z1cb Z1sq Z1 p 24
+  let S2 = bn_new 24
+  let _ = bn_mul_mod S2 Y2 Z1cb p 24
+  let H = bn_new 24
+  let _ = bn_mod_sub H U2 U1 p 24
+  let r = bn_new 24
+  let _ = bn_mod_sub r S2 S1 p 24
+  if bn_is_zero H 24 == 1 then
+    if bn_is_zero r 24 == 1 then
+      let _ = p384_point_dbl out pin
+      out
+    else
+      let _ = bn_zero (arr_get out 2) 24
+      out
+  else p384_add_normal out X1 X2 Y1 Y2 Z1 Z2 U1 S1 H r p
+
+p384_add_normal out X1 X2 Y1 Y2 Z1 Z2 U1 S1 H r p =
+  let Hsq = bn_new 24
+  let _ = bn_sqr_mod Hsq H p 24
+  let Hcb = bn_new 24
+  let _ = bn_mul_mod Hcb Hsq H p 24
+  let U1Hsq = bn_new 24
+  let _ = bn_mul_mod U1Hsq U1 Hsq p 24
+  let rsq = bn_new 24
+  let _ = bn_sqr_mod rsq r p 24
+  let t1 = bn_new 24
+  let _ = bn_mod_sub t1 rsq Hcb p 24
+  let U1Hsq2 = bn_new 24
+  let _ = bn_mod_add U1Hsq2 U1Hsq U1Hsq p 24
+  let X3 = arr_get out 0
+  let _ = bn_mod_sub X3 t1 U1Hsq2 p 24
+  let diff = bn_new 24
+  let _ = bn_mod_sub diff U1Hsq X3 p 24
+  let t2 = bn_new 24
+  let _ = bn_mul_mod t2 r diff p 24
+  let t3 = bn_new 24
+  let _ = bn_mul_mod t3 S1 Hcb p 24
+  let Y3 = arr_get out 1
+  let _ = bn_mod_sub Y3 t2 t3 p 24
+  let Z1Z2 = bn_new 24
+  let _ = bn_mul_mod Z1Z2 Z1 Z2 p 24
+  let Z3 = arr_get out 2
+  let _ = bn_mul_mod Z3 Z1Z2 H p 24
+  out
+
+-- Convert Jacobian to affine; returns 1 on success, 0 if at infinity.
+p384_to_affine ax ay pt =
+  let p = p384_load_p 0
+  let Z = arr_get pt 2
+  if bn_is_zero Z 24 == 1 then 0
+  else
+    let Zinv = bn_new 24
+    let _ = p384_mod_inv Zinv Z p
+    let Zinv2 = bn_new 24
+    let _ = bn_sqr_mod Zinv2 Zinv p 24
+    let Zinv3 = bn_new 24
+    let _ = bn_mul_mod Zinv3 Zinv2 Zinv p 24
+    let _ = bn_mul_mod ax (arr_get pt 0) Zinv2 p 24
+    let _ = bn_mul_mod ay (arr_get pt 1) Zinv3 p 24
+    1
+
+-- Scalar multiplication: out = k * P. k is a 24-limb bignum.
+p384_scalar_mul out k pt =
+  let _ = bn_zero (arr_get out 0) 24
+  let _ = bn_zero (arr_get out 1) 24
+  let _ = bn_zero (arr_get out 2) 24
+  let _ = p384_sm_loop out k pt 383
+  out
+
+p384_sm_loop out k pt bit_idx =
+  if bit_idx < 0 then 0
+  else
+    let tmp = p384_point_new 0
+    let _ = p384_point_dbl tmp out
+    let _ = p384_point_copy out tmp
+    let limb_idx = shr bit_idx 4
+    let bit_in_limb = bit_and bit_idx 15
+    let b = bit_and (shr (arr_get k limb_idx) bit_in_limb) 1
+    if b == 1 then
+      let tmp2 = p384_point_new 0
+      let _ = p384_point_add tmp2 out pt
+      let _ = p384_point_copy out tmp2
+      p384_sm_loop out k pt (bit_idx - 1)
+    else p384_sm_loop out k pt (bit_idx - 1)
+
+-- ── ECDSA verify ───────────────────────────────────────────────────
+-- Inputs: 48-byte big-endian pub_x, pub_y, hash, r, s. hash should be the
+-- leftmost 48 bytes of the message digest (SHA-384 output directly).
+
+ecdsa_p384_verify pub_x_bytes pub_y_bytes hash_bytes r_bytes s_bytes =
+  let n = p384_load_n 0
+  let r = bn_from_be r_bytes 24
+  let s = bn_from_be s_bytes 24
+  if bn_is_zero r 24 == 1 then 0
+  else if bn_is_zero s 24 == 1 then 0
+  else if bn_cmp r n 24 >= 0 then 0
+  else if bn_cmp s n 24 >= 0 then 0
+  else
+    let e = bn_from_be hash_bytes 24
+    let tmp = bn_new 24
+    let bor = bn_usub tmp e n 24
+    if bor == 0 then
+      let _ = bn_copy e tmp 24
+      ecdsa_p384_verify_core e r s pub_x_bytes pub_y_bytes
+    else ecdsa_p384_verify_core e r s pub_x_bytes pub_y_bytes
+
+ecdsa_p384_verify_core e r s pub_x_bytes pub_y_bytes =
+  let n = p384_load_n 0
+  let w = bn_new 24
+  let _ = p384_mod_inv w s n
+  let u1 = bn_new 24
+  let _ = bn_mul_mod u1 e w n 24
+  let u2 = bn_new 24
+  let _ = bn_mul_mod u2 r w n 24
+  let Gpt = p384_point_new 0
+  let _ = bn_copy (arr_get Gpt 0) (p384_load_gx 0) 24
+  let _ = bn_copy (arr_get Gpt 1) (p384_load_gy 0) 24
+  let _ = arr_set (arr_get Gpt 2) 0 1
+  let Qpt = p384_point_new 0
+  let _ = bn_copy (arr_get Qpt 0) (bn_from_be pub_x_bytes 24) 24
+  let _ = bn_copy (arr_get Qpt 1) (bn_from_be pub_y_bytes 24) 24
+  let _ = arr_set (arr_get Qpt 2) 0 1
+  let u1G = p384_point_new 0
+  let _ = p384_scalar_mul u1G u1 Gpt
+  let u2Q = p384_point_new 0
+  let _ = p384_scalar_mul u2Q u2 Qpt
+  let R = p384_point_new 0
+  let _ = p384_point_add R u1G u2Q
+  if p384_point_is_inf R == 1 then 0
+  else
+    let ax = bn_new 24
+    let ay = bn_new 24
+    let _ = p384_to_affine ax ay R
+    let tmp = bn_new 24
+    let bor = bn_usub tmp ax n 24
+    if bor == 0 then
+      if bn_cmp tmp r 24 == 0 then 1 else 0
+    else
+      if bn_cmp ax r 24 == 0 then 1 else 0
