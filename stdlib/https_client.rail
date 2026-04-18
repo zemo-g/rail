@@ -1,0 +1,407 @@
+-- stdlib/https_client.rail — pure-Rail HTTPS client (TLS 1.3 over TCP).
+-- Layer 7: composes tls13_client.rail + tls13_record.rail + socket.rail.
+
+import "stdlib/socket.rail"
+import "stdlib/tls13_client.rail"
+import "stdlib/tls13_record.rail"
+
+-- ── Random bytes via /dev/urandom ───────────────────────────────────
+-- Rail has no direct urandom bridge; shell out, read the resulting file.
+
+hc_read_random n =
+  let tmp = "/tmp/rail_https_rand.bin"
+  let cmd = join "" ["dd if=/dev/urandom of=", tmp, " bs=1 count=", show n, " 2>/dev/null"]
+  let _ = shell cmd
+  let s = read_file tmp
+  let arr = arr_new n 0
+  let _ = hc_fill_from_string (chars s) arr 0 n
+  let _ = shell (join "" ["rm -f ", tmp])
+  arr
+
+hc_fill_from_string cs arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (char_to_int (head cs))
+    hc_fill_from_string (tail cs) arr (i + 1) n
+
+-- ── C-buffer ⇄ Rail int-array byte copies ─────────────────────────
+
+hc_arr_to_cbuf arr p n =
+  hc_a2c_at arr p 0 n
+
+hc_a2c_at arr p i n =
+  if i >= n then 0
+  else
+    let _ = byte_set p i (arr_get arr i)
+    hc_a2c_at arr p (i + 1) n
+
+hc_cbuf_to_arr p arr n =
+  hc_c2a_at p arr 0 n
+
+hc_c2a_at p arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at p i)
+    hc_c2a_at p arr (i + 1) n
+
+-- ── TCP byte I/O ────────────────────────────────────────────────────
+
+hc_send_bytes fd arr n =
+  let p = malloc n
+  let _ = hc_arr_to_cbuf arr p n
+  let r = send fd p n 0
+  let _ = free p
+  r
+
+hc_recv_into fd p off want =
+  if off >= want then off
+  else
+    let got = recv fd p want 0
+    if got <= 0 then off
+    else off + got
+
+hc_recv_exact fd n =
+  let p = malloc n
+  let got = hc_recv_exact_loop fd p 0 n
+  let arr = arr_new got 0
+  let _ = hc_cbuf_to_arr p arr got
+  let _ = free p
+  let r = arr_new 2 0
+  let _ = arr_set r 0 arr
+  let _ = arr_set r 1 got
+  r
+
+hc_recv_exact_loop fd p off want =
+  if off >= want then off
+  else
+    let scratch = malloc (want - off)
+    let got = recv fd scratch (want - off) 0
+    if got <= 0 then
+      let _ = free scratch
+      off
+    else
+      let _ = hc_scratch_copy scratch p 0 off got
+      let _ = free scratch
+      hc_recv_exact_loop fd p (off + got) want
+
+hc_scratch_copy src dst src_off dst_off n =
+  if n <= 0 then 0
+  else
+    let _ = byte_set dst dst_off (byte_at src src_off)
+    hc_scratch_copy src dst (src_off + 1) (dst_off + 1) (n - 1)
+
+-- ── TLS record reader ───────────────────────────────────────────────
+-- Returns [record_bytes, record_len, valid].
+
+hc_read_record fd =
+  let hr = hc_recv_exact fd 5
+  let hb = arr_get hr 0
+  let hn = arr_get hr 1
+  if hn != 5 then hc_rec_fail 0
+  else
+    let flen = arr_get hb 3 * 256 + arr_get hb 4
+    if flen <= 0 then hc_rec_fail 0
+    else if flen > 16640 then hc_rec_fail 0
+    else
+      let br = hc_recv_exact fd flen
+      let bb = arr_get br 0
+      let bn = arr_get br 1
+      if bn != flen then hc_rec_fail 0
+      else
+        let total = 5 + flen
+        let rec = arr_new total 0
+        let _ = sha_copy_bytes hb rec 0 0 5
+        let _ = sha_copy_bytes bb rec 0 5 flen
+        let r = arr_new 3 0
+        let _ = arr_set r 0 rec
+        let _ = arr_set r 1 total
+        let _ = arr_set r 2 1
+        r
+
+hc_rec_fail _ =
+  let z = arr_new 0 0
+  let r = arr_new 3 0
+  let _ = arr_set r 0 z
+  let _ = arr_set r 1 0
+  let _ = arr_set r 2 0
+  r
+
+-- ── TCP connect convenience ────────────────────────────────────────
+
+hc_connect_tcp ip port =
+  let fd = tcp_socket 0
+  if fd < 0 then 0 - 1
+  else
+    let sa = make_sockaddr_in port ip
+    let r = connect fd sa sockaddr_in_size
+    let _ = free sa
+    if r == 0 then fd
+    else
+      let _ = close fd
+      0 - 1
+
+-- ── Ephemeral x25519 keypair ────────────────────────────────────────
+
+hc_x25519_base _ =
+  let p = arr_new 32 0
+  let _ = arr_set p 0 9
+  p
+
+hc_gen_keypair _ =
+  let priv = hc_read_random 32
+  let pub = x25519 priv (hc_x25519_base 0)
+  let kp = arr_new 2 0
+  let _ = arr_set kp 0 priv
+  let _ = arr_set kp 1 pub
+  kp
+
+-- ── Server flight reader: decrypt app-data records until Finished ───
+
+hc_scan_finished buf n off =
+  if off + 4 > n then 0
+  else
+    let t = arr_get buf off
+    let body_hi = arr_get buf (off + 1)
+    let body_mid = arr_get buf (off + 2)
+    let body_lo = arr_get buf (off + 3)
+    let body_len = body_hi * 65536 + body_mid * 256 + body_lo
+    let next = off + 4 + body_len
+    if next > n then 0
+    else if t == 20 then
+      if next == n then 1 else 0
+    else hc_scan_finished buf n next
+
+hc_flight_append acc acc_len frag frag_len =
+  let new_len = acc_len + frag_len
+  let new_acc = arr_new new_len 0
+  let _ = sha_copy_bytes acc new_acc 0 0 acc_len
+  let _ = sha_copy_bytes frag new_acc 0 acc_len frag_len
+  let r = arr_new 2 0
+  let _ = arr_set r 0 new_acc
+  let _ = arr_set r 1 new_len
+  r
+
+hc_read_server_flight fd key iv =
+  hc_rsf_loop fd key iv 0 (arr_new 0 0) 0
+
+hc_rsf_loop fd key iv seq acc acc_len =
+  let rec_r = hc_read_record fd
+  if arr_get rec_r 2 == 0 then hc_rsf_err 0
+  else
+    let wire = arr_get rec_r 0
+    let wire_len = arr_get rec_r 1
+    let ctype = arr_get wire 0
+    if ctype != 23 then hc_rsf_loop fd key iv seq acc acc_len
+    else
+      let dec = tls13_record_decrypt key iv seq wire wire_len
+      if arr_get dec 3 == 0 then hc_rsf_err 0
+      else
+        let frag = arr_get dec 0
+        let rtype = arr_get dec 1
+        let flen = arr_get dec 2
+        if rtype != 22 then hc_rsf_err 0
+        else
+          let app = hc_flight_append acc acc_len frag flen
+          let new_acc = arr_get app 0
+          let new_len = arr_get app 1
+          let done = hc_scan_finished new_acc new_len 0
+          if done == 1 then
+            let r = arr_new 2 0
+            let _ = arr_set r 0 new_acc
+            let _ = arr_set r 1 new_len
+            r
+          else hc_rsf_loop fd key iv (seq + 1) new_acc new_len
+
+hc_rsf_err _ =
+  let z = arr_new 0 0
+  let r = arr_new 2 0
+  let _ = arr_set r 0 z
+  let _ = arr_set r 1 (0 - 1)
+  r
+
+-- ── ServerHello parse + handshake traffic derivation ───────────────
+
+-- Read first record (ServerHello), extract server key share, derive
+-- server handshake traffic key/iv. Returns [sh_wire, sh_msg_len, s_hs_key, s_hs_iv, hs_hash, ch_msg_len_for_trans, ch_msg, valid].
+
+hc_exchange_hello fd ch_msg ch_msg_len priv =
+  let sh_rec = hc_read_record fd
+  if arr_get sh_rec 2 == 0 then hc_xh_fail 0
+  else
+    let sh_wire = arr_get sh_rec 0
+    let sh_wire_len = arr_get sh_rec 1
+    if arr_get sh_wire 0 != 22 then hc_xh_fail 0
+    else
+      let sh_msg_len = sh_wire_len - 5
+      let sh_msg = arr_new sh_msg_len 0
+      let _ = sha_copy_bytes sh_wire sh_msg 5 0 sh_msg_len
+      let parsed = tls13_parse_server_hello sh_msg sh_msg_len
+      if arr_get parsed 3 == 0 then hc_xh_fail 0
+      else
+        let server_share = arr_get parsed 2
+        let shared = x25519 priv server_share
+        let t_len = ch_msg_len + sh_msg_len
+        let t_buf = arr_new t_len 0
+        let _ = sha_copy_bytes ch_msg t_buf 0 0 ch_msg_len
+        let _ = sha_copy_bytes sh_msg t_buf 0 ch_msg_len sh_msg_len
+        let hs_hash = sha256_bytes t_buf t_len
+        -- Derive ONLY handshake traffic secrets using a dummy sf_hash; the
+        -- FSM will re-derive app secrets with the real sf_hash later.
+        let sched = tls13_derive_schedule shared 32 hs_hash hs_hash
+        let c_hs = arr_get sched 1
+        let s_hs = arr_get sched 2
+        let s_key = tls13_derive_key s_hs
+        let s_iv = tls13_derive_iv s_hs
+        let r = arr_new 6 0
+        let _ = arr_set r 0 sh_msg
+        let _ = arr_set r 1 sh_msg_len
+        let _ = arr_set r 2 s_key
+        let _ = arr_set r 3 s_iv
+        let _ = arr_set r 4 c_hs
+        let _ = arr_set r 5 1
+        r
+
+hc_xh_fail _ =
+  let z = arr_new 0 0
+  let r = arr_new 6 0
+  let _ = arr_set r 0 z
+  let _ = arr_set r 1 0
+  let _ = arr_set r 2 z
+  let _ = arr_set r 3 z
+  let _ = arr_set r 4 z
+  let _ = arr_set r 5 0
+  r
+
+-- ── Request build + response reader ─────────────────────────────────
+
+hc_crlf _ = join "" [char_from_int 13, char_from_int 10]
+
+hc_build_req host path =
+  let eol = hc_crlf 0
+  let s = join "" ["GET ", path, " HTTP/1.1", eol,
+                   "Host: ", host, eol,
+                   "Connection: close", eol,
+                   "User-Agent: rail-https/0.1", eol,
+                   eol]
+  let n = length s
+  let arr = string_to_bytes s
+  let r = arr_new 2 0
+  let _ = arr_set r 0 arr
+  let _ = arr_set r 1 n
+  r
+
+hc_bytes_to_str_loop arr off n acc =
+  if n <= 0 then acc
+  else hc_bytes_to_str_loop arr (off + 1) (n - 1) (join "" [acc, char_from_int (arr_get arr off)])
+
+hc_recv_response fd key iv seq acc =
+  let rec_r = hc_read_record fd
+  if arr_get rec_r 2 == 0 then acc
+  else
+    let wire = arr_get rec_r 0
+    let wire_len = arr_get rec_r 1
+    if arr_get wire 0 != 23 then hc_recv_response fd key iv seq acc
+    else
+      let dec = tls13_record_decrypt key iv seq wire wire_len
+      if arr_get dec 3 == 0 then acc
+      else
+        let frag = arr_get dec 0
+        let rtype = arr_get dec 1
+        let flen = arr_get dec 2
+        if rtype == 21 then acc
+        else if rtype == 23 then
+          let chunk = hc_bytes_to_str_loop frag 0 flen ""
+          hc_recv_response fd key iv (seq + 1) (join "" [acc, chunk])
+        else hc_recv_response fd key iv (seq + 1) acc
+
+hc_parse_status raw =
+  if length raw < 13 then 0
+  else
+    let sp1 = str_find " " raw
+    if sp1 < 0 then 0
+    else
+      let after1 = str_sub raw (sp1 + 1) (length raw - sp1 - 1)
+      let sp2 = str_find " " after1
+      if sp2 < 0 then 0
+      else hc_parse_int (str_sub after1 0 sp2)
+
+hc_parse_int s = hc_pi (chars s) 0
+
+hc_pi cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else hc_pi (tail cs) (acc * 10 + d)
+
+-- ── Main driver ─────────────────────────────────────────────────────
+
+https_get host ip port path =
+  let fd = hc_connect_tcp ip port
+  if fd < 0 then hc_err "connect failed"
+  else https_get_on_fd fd host path
+
+https_get_on_fd fd host path =
+  let kp = hc_gen_keypair 0
+  let priv = arr_get kp 0
+  let pub = arr_get kp 1
+  let random = hc_read_random 32
+  let sid = hc_read_random 32
+  let ch_rec = tls13_client_hello random sid pub host
+  let ch_wire = arr_get ch_rec 0
+  let ch_wire_len = arr_get ch_rec 1
+  let _ = hc_send_bytes fd ch_wire ch_wire_len
+  let ch_msg_len = ch_wire_len - 5
+  let ch_msg = arr_new ch_msg_len 0
+  let _ = sha_copy_bytes ch_wire ch_msg 5 0 ch_msg_len
+  let xh = hc_exchange_hello fd ch_msg ch_msg_len priv
+  if arr_get xh 5 == 0 then
+    let _ = close fd
+    hc_err "ServerHello parse failed"
+  else https_get_post_hello fd host path priv ch_msg ch_msg_len xh
+
+https_get_post_hello fd host path priv ch_msg ch_msg_len xh =
+  let sh_msg = arr_get xh 0
+  let sh_msg_len = arr_get xh 1
+  let s_hs_key = arr_get xh 2
+  let s_hs_iv = arr_get xh 3
+  let c_hs = arr_get xh 4
+  let flight = hc_read_server_flight fd s_hs_key s_hs_iv
+  let fb = arr_get flight 0
+  let fl = arr_get flight 1
+  if fl < 0 then
+    let _ = close fd
+    hc_err "flight decrypt failed"
+  else https_get_app_phase fd host path priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs
+
+https_get_app_phase fd host path priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs =
+  let fsm = tls13_client_handshake_offline priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl 1
+  if arr_get fsm 4 == 0 then
+    let _ = close fd
+    hc_err "handshake failed"
+  else
+    let c_ap = arr_get fsm 0
+    let s_ap = arr_get fsm 1
+    let cf_msg = arr_get fsm 2
+    let cf_len = arr_get fsm 3
+    let c_hs_key = tls13_derive_key c_hs
+    let c_hs_iv = tls13_derive_iv c_hs
+    let c_ap_key = tls13_derive_key c_ap
+    let c_ap_iv = tls13_derive_iv c_ap
+    let s_ap_key = tls13_derive_key s_ap
+    let s_ap_iv = tls13_derive_iv s_ap
+    let cf_rec = tls13_record_encrypt c_hs_key c_hs_iv 0 22 cf_msg cf_len
+    let _ = hc_send_bytes fd (arr_get cf_rec 0) (arr_get cf_rec 1)
+    let req = hc_build_req host path
+    let req_buf = arr_get req 0
+    let req_len = arr_get req 1
+    let app_rec = tls13_record_encrypt c_ap_key c_ap_iv 0 23 req_buf req_len
+    let _ = hc_send_bytes fd (arr_get app_rec 0) (arr_get app_rec 1)
+    let body = hc_recv_response fd s_ap_key s_ap_iv 0 ""
+    let _ = close fd
+    let status = hc_parse_status body
+    (status, body)
+
+hc_err msg = (0, msg)
