@@ -1,0 +1,258 @@
+-- stdlib/bignum_n.rail — generic n-limb big integer arithmetic.
+--
+-- 16-bit little-endian limbs in an int array. Each function takes an
+-- explicit n_limbs parameter, so the same code serves 8 limbs (128-bit),
+-- 16 limbs (256-bit), 128 limbs (2048-bit), 256 limbs (4096-bit), etc.
+--
+-- Used by RSA-PSS verify (Layer 8b). Parallel to the hardcoded 16-limb
+-- routines in ecdsa_p256.rail; deduplication saved for a future cleanup.
+--
+-- Caller must have bytes.rail loaded (for hex_to_bytes — not used here
+-- directly but expected by RSA-PSS callers).
+
+-- ── Construction / serialization ────────────────────────────────────
+
+bn_new n_limbs = arr_new n_limbs 0
+
+-- Parse n*2 big-endian bytes into an n_limbs little-endian limb array.
+bn_from_be bytes n_limbs =
+  let x = arr_new n_limbs 0
+  let _ = bn_fb_at bytes x 0 n_limbs
+  x
+
+bn_fb_at bytes x i n_limbs =
+  if i >= n_limbs then 0
+  else
+    let hi = arr_get bytes (n_limbs * 2 - 2 - 2 * i)
+    let lo = arr_get bytes (n_limbs * 2 - 1 - 2 * i)
+    let _ = arr_set x i (hi * 256 + lo)
+    bn_fb_at bytes x (i + 1) n_limbs
+
+-- Serialize an n_limbs limb array to n_limbs*2 big-endian bytes.
+bn_to_be x n_limbs =
+  let b = arr_new (n_limbs * 2) 0
+  let _ = bn_tb_at x b 0 n_limbs
+  b
+
+bn_tb_at x b i n_limbs =
+  if i >= n_limbs then 0
+  else
+    let v = arr_get x i
+    let _ = arr_set b (n_limbs * 2 - 2 - 2 * i) (shr v 8)
+    let _ = arr_set b (n_limbs * 2 - 1 - 2 * i) (bit_and v 255)
+    bn_tb_at x b (i + 1) n_limbs
+
+bn_copy dst src n_limbs =
+  let _ = bn_copy_at dst src 0 n_limbs
+  dst
+
+bn_copy_at dst src i n_limbs =
+  if i >= n_limbs then 0
+  else
+    let _ = arr_set dst i (arr_get src i)
+    bn_copy_at dst src (i + 1) n_limbs
+
+bn_zero a n_limbs = bn_zero_at a 0 n_limbs
+
+bn_zero_at a i n_limbs =
+  if i >= n_limbs then 0
+  else
+    let _ = arr_set a i 0
+    bn_zero_at a (i + 1) n_limbs
+
+-- ── Comparison ──────────────────────────────────────────────────────
+
+bn_cmp a b n_limbs = bn_cmp_at a b (n_limbs - 1)
+
+bn_cmp_at a b i =
+  if i < 0 then 0
+  else
+    let av = arr_get a i
+    let bv = arr_get b i
+    if av > bv then 1
+    else if av < bv then 0 - 1
+    else bn_cmp_at a b (i - 1)
+
+bn_is_zero a n_limbs = bn_iz_at a 0 n_limbs
+
+bn_iz_at a i n_limbs =
+  if i >= n_limbs then 1
+  else if arr_get a i != 0 then 0
+  else bn_iz_at a (i + 1) n_limbs
+
+-- ── Unreduced add/sub ──────────────────────────────────────────────
+
+bn_uadd c a b n_limbs = bn_uadd_at c a b 0 0 n_limbs
+
+bn_uadd_at c a b i carry n_limbs =
+  if i >= n_limbs then carry
+  else
+    let s = arr_get a i + arr_get b i + carry
+    let new_c = shr s 16
+    let _ = arr_set c i (bit_and s 65535)
+    bn_uadd_at c a b (i + 1) new_c n_limbs
+
+bn_usub c a b n_limbs = bn_usub_at c a b 0 0 n_limbs
+
+bn_usub_at c a b i borrow n_limbs =
+  if i >= n_limbs then borrow
+  else
+    let d = arr_get a i - arr_get b i - borrow
+    let new_bor = if d < 0 then 1 else 0
+    let v = if d < 0 then d + 65536 else d
+    let _ = arr_set c i v
+    bn_usub_at c a b (i + 1) new_bor n_limbs
+
+-- ── Modular add / sub ──────────────────────────────────────────────
+
+bn_mod_add c a b m n_limbs =
+  let carry = bn_uadd c a b n_limbs
+  let tmp = bn_new n_limbs
+  let bor = bn_usub tmp c m n_limbs
+  if carry == 1 then
+    let _ = bn_copy c tmp n_limbs
+    c
+  else if bor == 0 then
+    let _ = bn_copy c tmp n_limbs
+    c
+  else c
+
+bn_mod_sub c a b m n_limbs =
+  let bor = bn_usub c a b n_limbs
+  if bor == 1 then
+    let tmp = bn_new n_limbs
+    let _ = bn_uadd tmp c m n_limbs
+    let _ = bn_copy c tmp n_limbs
+    c
+  else c
+
+-- ── Schoolbook multiplication (output 2n limbs) ────────────────────
+
+bn_mul_raw c a b n_limbs =
+  let _ = bn_mul_zero c 0 (n_limbs * 2)
+  let _ = bn_mul_outer c a b 0 n_limbs
+  c
+
+bn_mul_zero c i n =
+  if i >= n then 0
+  else
+    let _ = arr_set c i 0
+    bn_mul_zero c (i + 1) n
+
+bn_mul_outer c a b i n_limbs =
+  if i >= n_limbs then 0
+  else
+    let _ = bn_mul_inner c a b i 0 0 n_limbs
+    bn_mul_outer c a b (i + 1) n_limbs
+
+bn_mul_inner c a b i j carry n_limbs =
+  if j >= n_limbs then
+    let _ = arr_set c (i + n_limbs) (arr_get c (i + n_limbs) + carry)
+    let _ = bn_carry_fix c (i + n_limbs) (n_limbs * 2)
+    0
+  else
+    let prod = arr_get a i * arr_get b j
+    let s = arr_get c (i + j) + prod + carry
+    let new_carry = shr s 16
+    let _ = arr_set c (i + j) (bit_and s 65535)
+    bn_mul_inner c a b i (j + 1) new_carry n_limbs
+
+bn_carry_fix c i max_i =
+  if i >= max_i then 0
+  else
+    let v = arr_get c i
+    if v < 65536 then 0
+    else
+      let new_v = bit_and v 65535
+      let carry = shr v 16
+      let _ = arr_set c i new_v
+      let _ = arr_set c (i + 1) (arr_get c (i + 1) + carry)
+      bn_carry_fix c (i + 1) max_i
+
+-- ── Wide reduction (long-division bit-by-bit) ─────────────────────
+-- a is 2n limbs, m is n limbs; output = a mod m (n limbs, in c).
+
+bn_wide_mod c a m n_limbs =
+  let r = bn_new n_limbs
+  let max_bit = n_limbs * 32 - 1
+  let _ = bn_wm_loop r a m n_limbs max_bit
+  let _ = bn_copy c r n_limbs
+  c
+
+bn_wm_loop r a m n_limbs bit_idx =
+  if bit_idx < 0 then 0
+  else
+    let carry = bn_shl1_out r n_limbs
+    let limb_idx = shr bit_idx 4
+    let bit_in_limb = bit_and bit_idx 15
+    let bit_val = bit_and (shr (arr_get a limb_idx) bit_in_limb) 1
+    let _ = arr_set r 0 (arr_get r 0 + bit_val)
+    let _ = bn_carry_fix r 0 n_limbs
+    if carry == 1 then
+      let tmp = bn_new n_limbs
+      let _ = bn_usub tmp r m n_limbs
+      let _ = bn_copy r tmp n_limbs
+      bn_wm_loop r a m n_limbs (bit_idx - 1)
+    else
+      let tmp = bn_new n_limbs
+      let bor = bn_usub tmp r m n_limbs
+      if bor == 0 then
+        let _ = bn_copy r tmp n_limbs
+        bn_wm_loop r a m n_limbs (bit_idx - 1)
+      else bn_wm_loop r a m n_limbs (bit_idx - 1)
+
+bn_shl1_out r n_limbs = bn_shl1_at r 0 0 n_limbs
+
+bn_shl1_at r i carry n_limbs =
+  if i >= n_limbs then carry
+  else
+    let v = arr_get r i
+    let new_v = v * 2 + carry
+    let new_carry = shr new_v 16
+    let _ = arr_set r i (bit_and new_v 65535)
+    bn_shl1_at r (i + 1) new_carry n_limbs
+
+-- ── Modular multiplication ────────────────────────────────────────
+
+bn_mul_mod c a b m n_limbs =
+  let wide = arr_new (n_limbs * 2) 0
+  let _ = bn_mul_raw wide a b n_limbs
+  let _ = bn_wide_mod c wide m n_limbs
+  c
+
+bn_sqr_mod c a m n_limbs = bn_mul_mod c a a m n_limbs
+
+-- ── Modular exponentiation: result = base^e mod m ─────────────────
+-- e is a small int (e.g. RSA public exponent 65537).
+-- Uses square-and-multiply over the bits of e from the MSB.
+
+bn_modexp_small result base e m n_limbs =
+  -- result = 1
+  let _ = bn_zero result n_limbs
+  let _ = arr_set result 0 1
+  if e == 0 then result
+  else bn_modexp_loop result base e m n_limbs (bn_high_bit_int e)
+
+-- Find the highest set bit position of an int (for e). Up to 31 bits is
+-- plenty for RSA exponents (max e = 65537 = 17 bits).
+bn_high_bit_int e =
+  if e == 0 then 0 - 1
+  else bn_high_bit_loop e 0
+
+bn_high_bit_loop e acc =
+  if e == 0 then acc - 1
+  else bn_high_bit_loop (shr e 1) (acc + 1)
+
+bn_modexp_loop result base e m n_limbs bit_idx =
+  if bit_idx < 0 then result
+  else
+    let tmp = bn_new n_limbs
+    let _ = bn_sqr_mod tmp result m n_limbs
+    let _ = bn_copy result tmp n_limbs
+    let b = bit_and (shr e bit_idx) 1
+    if b == 1 then
+      let tmp2 = bn_new n_limbs
+      let _ = bn_mul_mod tmp2 result base m n_limbs
+      let _ = bn_copy result tmp2 n_limbs
+      bn_modexp_loop result base e m n_limbs (bit_idx - 1)
+    else bn_modexp_loop result base e m n_limbs (bit_idx - 1)
