@@ -103,30 +103,43 @@ cv_pk_fail _ =
   r
 
 -- ── Main entry ─────────────────────────────────────────────────────────
--- sig_alg: 0x0403 = ecdsa_secp256r1_sha256 (RFC 8446 §4.2.3).
+-- sig_alg dispatch:
+--   0x0403 = 1027 = ecdsa_secp256r1_sha256
+--   0x0804 = 2052 = rsa_pss_rsae_sha256
 
 tls13_cert_verify_sig cert cert_len sig_alg sig sig_len transcript_hash =
-  if sig_alg != 1027 then 0
+  let signed_data = cv_build_signed transcript_hash
+  if sig_alg == 1027 then cv_verify_ecdsa cert cert_len sig sig_len signed_data
+  else if sig_alg == 2052 then cv_verify_rsa_pss cert cert_len sig sig_len signed_data
+  else 0
+
+cv_verify_ecdsa cert cert_len sig sig_len signed_data =
+  let pk = cv_extract_p256_pubkey cert cert_len
+  if arr_get pk 2 == 0 then 0
   else
-    let pk = cv_extract_p256_pubkey cert cert_len
-    if arr_get pk 2 == 0 then 0
+    let px = arr_get pk 0
+    let py = arr_get pk 1
+    let parsed = asn1_parse_ecdsa_sig sig sig_len 0 sig_len
+    if arr_get parsed 4 == 0 then 0
     else
-      let px = arr_get pk 0
-      let py = arr_get pk 1
-      let parsed = asn1_parse_ecdsa_sig sig sig_len 0 sig_len
-      if arr_get parsed 4 == 0 then 0
-      else
-        let r_off = arr_get parsed 0
-        let r_len = arr_get parsed 1
-        let s_off = arr_get parsed 2
-        let s_len = arr_get parsed 3
-        -- Pad r, s to 32 bytes (left-pad with zeros).
-        let r_bytes = cv_pad32 sig r_off r_len
-        let s_bytes = cv_pad32 sig s_off s_len
-        -- Build signed_data and hash it.
-        let signed_data = cv_build_signed transcript_hash
-        let hash = sha256_bytes signed_data 130
-        ecdsa_p256_verify px py hash r_bytes s_bytes
+      let r_off = arr_get parsed 0
+      let r_len = arr_get parsed 1
+      let s_off = arr_get parsed 2
+      let s_len = arr_get parsed 3
+      let r_bytes = cv_pad32 sig r_off r_len
+      let s_bytes = cv_pad32 sig s_off s_len
+      let hash = sha256_bytes signed_data 130
+      ecdsa_p256_verify px py hash r_bytes s_bytes
+
+cv_verify_rsa_pss cert cert_len sig sig_len signed_data =
+  let pk = cv_extract_rsa_pubkey cert cert_len
+  if arr_get pk 3 == 0 then 0
+  else
+    let n = arr_get pk 0
+    let n_len = arr_get pk 1
+    let e = arr_get pk 2
+    -- TLS 1.3 RSA-PSS-SHA256: signed_data is 130 bytes, hash inside verify.
+    rsa_pss_verify_sha256 n n_len e signed_data 130 sig sig_len
 
 -- Left-pad a (<=32 byte) slice of `src` starting at `off` into a 32-byte
 -- big-endian array.
@@ -214,3 +227,65 @@ cv_find_byte buf n off target =
   if off >= n then 0 - 1
   else if arr_get buf off == target then off
   else cv_find_byte buf n (off + 1) target
+
+-- ── RSA pubkey extraction (Layer 8b) ──────────────────────────────
+-- Cert's SubjectPublicKey BIT STRING (after the unused-bits byte) is
+-- a DER-encoded RSAPublicKey:
+--   SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+-- Returns [n_bytes(byte-array), n_len(int), e_int, valid].
+
+cv_extract_rsa_pubkey cert cert_len =
+  let fields = asn1_cert_fields cert cert_len
+  if arr_get fields 12 == 0 then cv_rk_fail 0
+  else
+    let pa_off = arr_get fields 6
+    let pa_len = arr_get fields 7
+    let pk_off = arr_get fields 10
+    let pk_len = arr_get fields 11
+    if asn1_oid_eq cert pa_off pa_len (asn1_oid_rsa_pubkey 0) 9 == 0 then cv_rk_fail 0
+    else cv_extract_rsa_split cert pk_off pk_len
+
+cv_extract_rsa_split cert pk_off pk_len =
+  let outer = asn1_read_tlv cert (pk_off + pk_len) pk_off
+  if arr_get outer 4 == 0 then cv_rk_fail 0
+  else if arr_get outer 0 != 48 then cv_rk_fail 0
+  else
+    let nt = asn1_read_tlv cert (pk_off + pk_len) (arr_get outer 1)
+    if arr_get nt 4 == 0 then cv_rk_fail 0
+    else if arr_get nt 0 != 2 then cv_rk_fail 0
+    else
+      let et = asn1_read_tlv cert (pk_off + pk_len) (arr_get nt 3)
+      if arr_get et 4 == 0 then cv_rk_fail 0
+      else if arr_get et 0 != 2 then cv_rk_fail 0
+      else cv_rsa_assemble cert nt et
+
+cv_rsa_assemble cert nt et =
+  let n_off = arr_get nt 1
+  let n_raw_len = arr_get nt 2
+  let n_skip = if arr_get cert n_off == 0 then 1 else 0
+  let n_len = n_raw_len - n_skip
+  let n_bytes = arr_new n_len 0
+  let _ = sha_copy_bytes cert n_bytes (n_off + n_skip) 0 n_len
+  let e_off = arr_get et 1
+  let e_len = arr_get et 2
+  let e_int = cv_read_int_be cert e_off e_len
+  let r = arr_new 4 0
+  let _ = arr_set r 0 n_bytes
+  let _ = arr_set r 1 n_len
+  let _ = arr_set r 2 e_int
+  let _ = arr_set r 3 1
+  r
+
+cv_read_int_be buf off len = cv_rib_at buf off len 0
+cv_rib_at buf off len acc =
+  if len <= 0 then acc
+  else cv_rib_at buf (off + 1) (len - 1) (acc * 256 + arr_get buf off)
+
+cv_rk_fail _ =
+  let z = arr_new 0 0
+  let r = arr_new 4 0
+  let _ = arr_set r 0 z
+  let _ = arr_set r 1 0
+  let _ = arr_set r 2 0
+  let _ = arr_set r 3 0
+  r
