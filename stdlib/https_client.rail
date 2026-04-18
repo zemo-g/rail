@@ -456,3 +456,107 @@ https_url_fail _ =
   let _ = arr_set r 3 ""
   let _ = arr_set r 4 0
   r
+
+-- ── POST support ────────────────────────────────────────────────────
+-- Same FSM as https_get, different request builder. Body is a Rail
+-- string; headers are a list of "Name: Value" strings.
+
+hc_build_post host path ctype body hdrs =
+  let eol = hc_crlf 0
+  let cl = join "" ["Content-Length: ", show (length body), eol]
+  let ct = if length ctype == 0 then "" else join "" ["Content-Type: ", ctype, eol]
+  let extra = if length hdrs == 0 then "" else join "" [join eol hdrs, eol]
+  let s = join "" ["POST ", path, " HTTP/1.1", eol,
+                   "Host: ", host, eol,
+                   ct, cl, extra,
+                   "Connection: close", eol,
+                   "User-Agent: rail-https/0.1", eol,
+                   eol,
+                   body]
+  let n = length s
+  let arr = string_to_bytes s
+  let r = arr_new 2 0
+  let _ = arr_set r 0 arr
+  let _ = arr_set r 1 n
+  r
+
+-- Top-level POST. Mirrors https_get but with a POST request builder.
+https_post host ip port path ctype body hdrs =
+  let fd = hc_connect_tcp ip port
+  if fd < 0 then (0, "connect failed")
+  else https_post_on_fd fd host path ctype body hdrs
+
+https_post_on_fd fd host path ctype body hdrs =
+  let kp = hc_gen_keypair 0
+  let priv = arr_get kp 0
+  let pub = arr_get kp 1
+  let random = hc_read_random 32
+  let sid = hc_read_random 32
+  let ch_rec = tls13_client_hello random sid pub host
+  let ch_wire = arr_get ch_rec 0
+  let ch_wire_len = arr_get ch_rec 1
+  let _ = hc_send_bytes fd ch_wire ch_wire_len
+  let ch_msg_len = ch_wire_len - 5
+  let ch_msg = arr_new ch_msg_len 0
+  let _ = sha_copy_bytes ch_wire ch_msg 5 0 ch_msg_len
+  let xh = hc_exchange_hello fd ch_msg ch_msg_len priv
+  if arr_get xh 5 == 0 then
+    let _ = close fd
+    hc_err "ServerHello parse failed"
+  else https_post_post_hello fd host path ctype body hdrs priv ch_msg ch_msg_len xh
+
+https_post_post_hello fd host path ctype body hdrs priv ch_msg ch_msg_len xh =
+  let sh_msg = arr_get xh 0
+  let sh_msg_len = arr_get xh 1
+  let s_hs_key = arr_get xh 2
+  let s_hs_iv = arr_get xh 3
+  let c_hs = arr_get xh 4
+  let flight = hc_read_server_flight fd s_hs_key s_hs_iv
+  let fb = arr_get flight 0
+  let fl = arr_get flight 1
+  if fl < 0 then
+    let _ = close fd
+    hc_err "flight decrypt failed"
+  else https_post_app_phase fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs
+
+https_post_app_phase fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs =
+  let fsm = tls13_client_handshake_offline priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl 1 host
+  if arr_get fsm 4 == 0 then
+    let _ = close fd
+    hc_err "handshake failed"
+  else
+    let c_ap = arr_get fsm 0
+    let s_ap = arr_get fsm 1
+    let cf_msg = arr_get fsm 2
+    let cf_len = arr_get fsm 3
+    let c_hs_key = tls13_derive_key c_hs
+    let c_hs_iv = tls13_derive_iv c_hs
+    let c_ap_key = tls13_derive_key c_ap
+    let c_ap_iv = tls13_derive_iv c_ap
+    let s_ap_key = tls13_derive_key s_ap
+    let s_ap_iv = tls13_derive_iv s_ap
+    let cf_rec = tls13_record_encrypt c_hs_key c_hs_iv 0 22 cf_msg cf_len
+    let _ = hc_send_bytes fd (arr_get cf_rec 0) (arr_get cf_rec 1)
+    let req = hc_build_post host path ctype body hdrs
+    let req_buf = arr_get req 0
+    let req_len = arr_get req 1
+    let app_rec = tls13_record_encrypt c_ap_key c_ap_iv 0 23 req_buf req_len
+    let _ = hc_send_bytes fd (arr_get app_rec 0) (arr_get app_rec 1)
+    let body_resp = hc_recv_response fd s_ap_key s_ap_iv 0 ""
+    let _ = close fd
+    let status = hc_parse_status body_resp
+    (status, body_resp)
+
+-- URL-form POST: https_post_url url content_type body extra_hdrs.
+https_post_url url ctype body hdrs =
+  let parts = https_parse_url url
+  if arr_get parts 4 == 0 then (0, "bad URL")
+  else https_post_url_dispatch parts ctype body hdrs
+
+https_post_url_dispatch parts ctype body hdrs =
+  let host = arr_get parts 0
+  let port = arr_get parts 1
+  let path = arr_get parts 2
+  let ip = dns_resolve_a host
+  if length ip == 0 then (0, join "" ["DNS resolve failed for ", host])
+  else https_post host ip port path ctype body hdrs
