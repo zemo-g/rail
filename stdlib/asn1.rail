@@ -1,0 +1,297 @@
+-- stdlib/asn1.rail — Minimal ASN.1 DER reader for X.509 certificate parsing.
+--
+-- Only the subset needed to support TLS 1.3 server certificate verify:
+--   * SEQUENCE / SET / OID / BIT STRING / context-specific tags
+--   * Extract TBSCertificate bytes (signed data)
+--   * Extract SubjectPublicKeyInfo — algorithm OID + public key bytes
+--   * Extract outer signatureAlgorithm OID + signatureValue
+--
+-- X.509 Certificate (RFC 5280) shape:
+--   Certificate := SEQUENCE {
+--     tbsCertificate          TBSCertificate,
+--     signatureAlgorithm      AlgorithmIdentifier,  -- OID (+ optional params)
+--     signatureValue          BIT STRING
+--   }
+--   TBSCertificate := SEQUENCE {
+--     version              [0] EXPLICIT Version DEFAULT v1,
+--     serialNumber             CertificateSerialNumber,
+--     signature                AlgorithmIdentifier,
+--     issuer                   Name,
+--     validity                 Validity,
+--     subject                  Name,
+--     subjectPublicKeyInfo     SubjectPublicKeyInfo,
+--     ...
+--   }
+--   SubjectPublicKeyInfo := SEQUENCE {
+--     algorithm    AlgorithmIdentifier,
+--     subjectPublicKey  BIT STRING
+--   }
+--
+-- DER TLV: [tag(1)] [length] [value]
+--   length: byte <  0x80 ⇒ length is that byte
+--           byte == 0x80|n ⇒ next n big-endian bytes are the length
+--
+-- This parser does NOT validate: name matching, SAN, validity period, chain
+-- walking. That's Layer 6b. Here we extract bytes only.
+--
+-- Public API:
+--   asn1_read_tlv buf off                 -> [tag, content_off, content_len, next_off] or valid=0
+--   asn1_cert_fields cert_buf cert_len    -> [tbs_off, tbs_len, sig_alg_oid, sig_alg_oid_len, sig_val_off, sig_val_len, pub_alg_oid, pub_alg_oid_len, pub_params_off, pub_params_len, pub_key_off, pub_key_len, valid]
+
+-- ── TLV reader ──────────────────────────────────────────────────────────
+
+-- Read a DER TLV header starting at `off`. Returns a 5-element array:
+--   [0] = tag (int)
+--   [1] = content_off (int) — where the value bytes begin
+--   [2] = content_len (int) — number of value bytes
+--   [3] = next_off (int) — content_off + content_len
+--   [4] = valid (1 on success, 0 on short-buf / malformed length)
+
+asn1_read_tlv buf buf_len off =
+  if off + 2 > buf_len then asn1_tlv_fail 0
+  else
+    let tag = arr_get buf off
+    let len_byte = arr_get buf (off + 1)
+    if len_byte < 128 then
+      let content_off = off + 2
+      let next_off = content_off + len_byte
+      if next_off > buf_len then asn1_tlv_fail 0
+      else asn1_tlv_ok tag content_off len_byte next_off
+    else
+      let nbytes = len_byte - 128
+      if nbytes == 0 then asn1_tlv_fail 0
+      else if nbytes > 4 then asn1_tlv_fail 0
+      else if off + 2 + nbytes > buf_len then asn1_tlv_fail 0
+      else
+        let clen = asn1_read_u buf (off + 2) nbytes 0
+        let content_off = off + 2 + nbytes
+        let next_off = content_off + clen
+        if next_off > buf_len then asn1_tlv_fail 0
+        else asn1_tlv_ok tag content_off clen next_off
+
+asn1_tlv_fail _ =
+  let r = arr_new 5 0
+  let _ = arr_set r 4 0
+  r
+
+asn1_tlv_ok tag content_off clen next_off =
+  let r = arr_new 5 0
+  let _ = arr_set r 0 tag
+  let _ = arr_set r 1 content_off
+  let _ = arr_set r 2 clen
+  let _ = arr_set r 3 next_off
+  let _ = arr_set r 4 1
+  r
+
+-- Read an unsigned big-endian integer of `n` bytes from buf starting at off.
+asn1_read_u buf off n acc =
+  if n == 0 then acc
+  else asn1_read_u buf (off + 1) (n - 1) ((acc * 256) + arr_get buf off)
+
+-- ── TLV skip helpers ────────────────────────────────────────────────────
+
+-- Skip the TLV at `off`; return the offset of the next TLV. Returns -1 on error.
+asn1_skip buf buf_len off =
+  let t = asn1_read_tlv buf buf_len off
+  if arr_get t 4 == 0 then 0 - 1
+  else arr_get t 3
+
+-- ── Certificate field extractor ─────────────────────────────────────────
+-- Returns a 13-element array:
+--   [0]  tbs_off       (offset of TBSCertificate bytes, INCLUDING its SEQUENCE header)
+--   [1]  tbs_len       (byte length of the TBS TLV — header + content)
+--   [2]  sig_alg_oid_off    (offset of sig_alg OID value bytes, NOT including OID TLV header)
+--   [3]  sig_alg_oid_len
+--   [4]  sig_val_off        (offset of signatureValue bytes, past BIT STRING unused-bits byte)
+--   [5]  sig_val_len
+--   [6]  pub_alg_oid_off    (offset of subjectPublicKey algorithm OID value bytes)
+--   [7]  pub_alg_oid_len
+--   [8]  pub_params_off     (offset of algorithm parameters TLV header, or -1 if absent)
+--   [9]  pub_params_len     (total bytes of parameters TLV, header+content; -1 if absent)
+--   [10] pub_key_off        (offset of SubjectPublicKey BIT STRING contents, past unused-bits byte)
+--   [11] pub_key_len        (bytes of public key)
+--   [12] valid (1/0)
+
+asn1_cert_fields buf buf_len =
+  -- Outer SEQUENCE
+  let outer = asn1_read_tlv buf buf_len 0
+  if arr_get outer 4 == 0 then asn1_cf_fail 0
+  else
+    let outer_c = arr_get outer 1
+    let outer_e = arr_get outer 3
+    -- TBSCertificate SEQUENCE
+    let tbs = asn1_read_tlv buf buf_len outer_c
+    if arr_get tbs 4 == 0 then asn1_cf_fail 0
+    else
+      let tbs_off = outer_c
+      let tbs_len = arr_get tbs 3 - outer_c
+      let tbs_c = arr_get tbs 1
+      let tbs_e = arr_get tbs 3
+      -- signatureAlgorithm SEQUENCE (outer)
+      let sig_alg = asn1_read_tlv buf buf_len (arr_get tbs 3)
+      if arr_get sig_alg 4 == 0 then asn1_cf_fail 0
+      else
+        let sa_c = arr_get sig_alg 1
+        -- First child of sig_alg SEQUENCE is OID
+        let sa_oid = asn1_read_tlv buf buf_len sa_c
+        if arr_get sa_oid 4 == 0 then asn1_cf_fail 0
+        else if arr_get sa_oid 0 != 6 then asn1_cf_fail 0
+        else
+          let sa_oid_off = arr_get sa_oid 1
+          let sa_oid_len = arr_get sa_oid 2
+          -- signatureValue BIT STRING
+          let sv = asn1_read_tlv buf buf_len (arr_get sig_alg 3)
+          if arr_get sv 4 == 0 then asn1_cf_fail 0
+          else if arr_get sv 0 != 3 then asn1_cf_fail 0
+          else
+            -- BIT STRING content starts with "unused bits" byte, then raw bytes.
+            let sv_c = arr_get sv 1
+            let sv_len = arr_get sv 2
+            let sv_val_off = sv_c + 1
+            let sv_val_len = sv_len - 1
+            -- Now walk TBSCertificate to find SubjectPublicKeyInfo.
+            -- Structure: [0] version (optional, tag 0xA0), serialNumber,
+            -- signature, issuer, validity, subject, subjectPublicKeyInfo.
+            let first = asn1_read_tlv buf buf_len tbs_c
+            if arr_get first 4 == 0 then asn1_cf_fail 0
+            else
+              let after_version =
+                if arr_get first 0 == 160 then arr_get first 3
+                else tbs_c
+              let after_serial = asn1_skip buf buf_len after_version
+              if after_serial < 0 then asn1_cf_fail 0
+              else
+                let after_sig = asn1_skip buf buf_len after_serial
+                if after_sig < 0 then asn1_cf_fail 0
+                else
+                  let after_issuer = asn1_skip buf buf_len after_sig
+                  if after_issuer < 0 then asn1_cf_fail 0
+                  else
+                    let after_validity = asn1_skip buf buf_len after_issuer
+                    if after_validity < 0 then asn1_cf_fail 0
+                    else
+                      let after_subject = asn1_skip buf buf_len after_validity
+                      if after_subject < 0 then asn1_cf_fail 0
+                      else asn1_cf_parse_spki buf buf_len tbs_off tbs_len sa_oid_off sa_oid_len sv_val_off sv_val_len after_subject
+
+asn1_cf_parse_spki buf buf_len tbs_off tbs_len sa_oid_off sa_oid_len sv_val_off sv_val_len spki_off =
+  let spki = asn1_read_tlv buf buf_len spki_off
+  if arr_get spki 4 == 0 then asn1_cf_fail 0
+  else if arr_get spki 0 != 48 then asn1_cf_fail 0
+  else
+    let spki_c = arr_get spki 1
+    -- SPKI = SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
+    let alg = asn1_read_tlv buf buf_len spki_c
+    if arr_get alg 4 == 0 then asn1_cf_fail 0
+    else if arr_get alg 0 != 48 then asn1_cf_fail 0
+    else
+      let alg_c = arr_get alg 1
+      let alg_e = arr_get alg 3
+      let alg_oid = asn1_read_tlv buf buf_len alg_c
+      if arr_get alg_oid 4 == 0 then asn1_cf_fail 0
+      else if arr_get alg_oid 0 != 6 then asn1_cf_fail 0
+      else
+        let pa_oid_off = arr_get alg_oid 1
+        let pa_oid_len = arr_get alg_oid 2
+        let params_start = arr_get alg_oid 3
+        let has_params = if params_start < alg_e then 1 else 0
+        let params_off = if has_params == 1 then params_start else 0 - 1
+        let params_len = if has_params == 1 then alg_e - params_start else 0 - 1
+        -- subjectPublicKey BIT STRING
+        let pk = asn1_read_tlv buf buf_len (arr_get alg 3)
+        if arr_get pk 4 == 0 then asn1_cf_fail 0
+        else if arr_get pk 0 != 3 then asn1_cf_fail 0
+        else
+          let pk_c = arr_get pk 1
+          let pk_len = arr_get pk 2
+          let pk_val_off = pk_c + 1
+          let pk_val_len = pk_len - 1
+          asn1_cf_ok tbs_off tbs_len sa_oid_off sa_oid_len sv_val_off sv_val_len pa_oid_off pa_oid_len params_off params_len pk_val_off pk_val_len
+
+asn1_cf_fail _ =
+  let r = arr_new 13 0
+  let _ = arr_set r 12 0
+  r
+
+asn1_cf_ok tbs_off tbs_len sa_oid_off sa_oid_len sv_val_off sv_val_len pa_oid_off pa_oid_len params_off params_len pk_val_off pk_val_len =
+  let r = arr_new 13 0
+  let _ = arr_set r 0 tbs_off
+  let _ = arr_set r 1 tbs_len
+  let _ = arr_set r 2 sa_oid_off
+  let _ = arr_set r 3 sa_oid_len
+  let _ = arr_set r 4 sv_val_off
+  let _ = arr_set r 5 sv_val_len
+  let _ = arr_set r 6 pa_oid_off
+  let _ = arr_set r 7 pa_oid_len
+  let _ = arr_set r 8 params_off
+  let _ = arr_set r 9 params_len
+  let _ = arr_set r 10 pk_val_off
+  let _ = arr_set r 11 pk_val_len
+  let _ = arr_set r 12 1
+  r
+
+-- ── OID comparison ──────────────────────────────────────────────────────
+-- Compares an OID contents region against a reference byte array.
+
+asn1_oid_eq buf off len ref ref_len =
+  if len != ref_len then 0
+  else asn1_oid_eq_at buf off ref 0 len
+
+asn1_oid_eq_at buf off ref i n =
+  if i >= n then 1
+  else if arr_get buf (off + i) == arr_get ref i then asn1_oid_eq_at buf off ref (i + 1) n
+  else 0
+
+-- Reference OID byte sequences (OID contents only, no tag/length).
+-- ecPublicKey (1.2.840.10045.2.1) = 2A 86 48 CE 3D 02 01
+asn1_oid_ec_pubkey _ = hex_to_bytes "2a8648ce3d0201"
+-- prime256v1 / secp256r1 (1.2.840.10045.3.1.7) = 2A 86 48 CE 3D 03 01 07
+asn1_oid_p256_curve _ = hex_to_bytes "2a8648ce3d030107"
+-- ecdsa-with-SHA256 (1.2.840.10045.4.3.2) = 2A 86 48 CE 3D 04 03 02
+asn1_oid_ecdsa_sha256 _ = hex_to_bytes "2a8648ce3d040302"
+-- sha256WithRSAEncryption (1.2.840.113549.1.1.11) = 2A 86 48 86 F7 0D 01 01 0B
+asn1_oid_sha256_rsa _ = hex_to_bytes "2a864886f70d01010b"
+-- rsaEncryption (1.2.840.113549.1.1.1) = 2A 86 48 86 F7 0D 01 01 01
+asn1_oid_rsa_pubkey _ = hex_to_bytes "2a864886f70d010101"
+-- rsassa-pss (1.2.840.113549.1.1.10) = 2A 86 48 86 F7 0D 01 01 0A
+asn1_oid_rsa_pss _ = hex_to_bytes "2a864886f70d01010a"
+
+-- ── ECDSA Sig parser (r,s from DER SEQUENCE) ──────────────────────────
+-- ECDSA signatures in X.509 / TLS come as:
+--   SEQUENCE { r INTEGER, s INTEGER }
+-- INTEGER content may have a leading 0x00 to indicate positive when the MSB is 1.
+-- Returns [r_off, r_len, s_off, s_len, valid].
+
+asn1_parse_ecdsa_sig buf buf_len off len =
+  let seq = asn1_read_tlv buf buf_len off
+  if arr_get seq 4 == 0 then asn1_ec_fail 0
+  else if arr_get seq 0 != 48 then asn1_ec_fail 0
+  else
+    let seq_c = arr_get seq 1
+    let r_tlv = asn1_read_tlv buf buf_len seq_c
+    if arr_get r_tlv 4 == 0 then asn1_ec_fail 0
+    else if arr_get r_tlv 0 != 2 then asn1_ec_fail 0
+    else
+      let s_tlv = asn1_read_tlv buf buf_len (arr_get r_tlv 3)
+      if arr_get s_tlv 4 == 0 then asn1_ec_fail 0
+      else if arr_get s_tlv 0 != 2 then asn1_ec_fail 0
+      else
+        let r_off = arr_get r_tlv 1
+        let r_len = arr_get r_tlv 2
+        let s_off = arr_get s_tlv 1
+        let s_len = arr_get s_tlv 2
+        -- Strip leading 0x00 pad byte if present (happens when MSB was 1).
+        let r_skip = if r_len > 0 then if arr_get buf r_off == 0 then 1 else 0 else 0
+        let s_skip = if s_len > 0 then if arr_get buf s_off == 0 then 1 else 0 else 0
+        let out = arr_new 5 0
+        let _ = arr_set out 0 (r_off + r_skip)
+        let _ = arr_set out 1 (r_len - r_skip)
+        let _ = arr_set out 2 (s_off + s_skip)
+        let _ = arr_set out 3 (s_len - s_skip)
+        let _ = arr_set out 4 1
+        out
+
+asn1_ec_fail _ =
+  let r = arr_new 5 0
+  let _ = arr_set r 4 0
+  r
