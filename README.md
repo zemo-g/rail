@@ -1,47 +1,43 @@
-# Rail
+<h1 align="center">Rail</h1>
 
-[![Rail: 95%](https://img.shields.io/badge/Rail-95%25-ff5500?style=for-the-badge&logo=rust&logoColor=white)](#)
+<p align="center">
+  <em>A self-hosting systems language that speaks TLS alone.</em><br>
+  <sub>Zero C dependencies. GC in ARM64 assembly. HTTPS in pure Rail.</sub>
+</p>
 
-> GitHub's language bar shows this repo as Haskell because `github-linguist` doesn't know Rail exists yet. A [PR is in flight](https://github.com/github-linguist/linguist/pulls?q=rail) to fix that. In the meantime: this is a Rail codebase.
+<p align="center">
+  <a href="#releases"><img src="https://img.shields.io/badge/v3.0.0-Rail%20speaks%20TLS-ff5500?style=for-the-badge" alt="v3.0.0"></a>
+</p>
 
-[![v3.0.0: Rail speaks TLS](https://img.shields.io/badge/v3.0.0-Rail%20speaks%20TLS-ff5500?style=for-the-badge)](#releases)
-[![tests: 116/116](https://img.shields.io/badge/tests-116%2F116-brightgreen)](#)
-[![self-hosting](https://img.shields.io/badge/self--hosting-fixed%20point-blue)](#)
-[![HTTPS: pure Rail](https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500)](#releases)
-[![backends: 4](https://img.shields.io/badge/backends-4-orange)](#releases)
-[![GC: ARM64 asm](https://img.shields.io/badge/GC-ARM64%20assembly-purple)](#how-it-works)
-[![dependencies: 0](https://img.shields.io/badge/C%20dependencies-0-brightgreen)](#)
-[![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-green)](LICENSE)
+<p align="center">
+  <a href="#install"><img src="https://img.shields.io/badge/tests-116%2F116-brightgreen" alt="tests 116/116"></a>
+  <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
+  <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
+  <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
+  <a href="#why-rail"><img src="https://img.shields.io/badge/C%20dependencies-0-brightgreen" alt="0 C dependencies"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/backends-4-orange" alt="4 backends"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL%201.1-green" alt="BSL 1.1"></a>
+</p>
 
-Rail compiles itself. It talks TLS 1.3 to `api.anthropic.com` by itself. It runs real-time GPU physics and trains neural networks to be the physics.
+<p align="center">
+  <b><a href="#quick-start">Quick start</a></b> ·
+  <b><a href="#what-rail-does">What Rail does</a></b> ·
+  <b><a href="#why-rail">Why Rail</a></b> ·
+  <b><a href="CHANGELOG.md">Changelog</a></b> ·
+  <b><a href="https://github.com/zemo-g/rail/releases">Releases</a></b>
+</p>
+
+---
+
+Rail compiles itself. The compiler — 4,687 lines of Rail — produces a 729 KB ARM64 binary that compiles the compiler again and reaches byte-identical fixed point. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. As of v3.0.0, the TLS 1.3 client is Rail too: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat.
 
 ```
--- This is the entire bootstrap:
 ./rail_native self && cp /tmp/rail_self ./rail_native
-
--- 4,687 lines of Rail compile to a 729K ARM64 binary.
--- That binary compiles the compiler again.
--- The output is byte-identical. Fixed point.
--- Zero C dependencies. GC in assembly. Everything is Rail.
+./rail_native self && cmp rail_native /tmp/rail_self  # byte-identical
+./rail_native test                                     # 116/116
 ```
 
-```rail
--- v3.0.0: and that same Rail now speaks HTTPS, natively:
-import "stdlib/anthropic_client.rail"
-main = let (status, reply) = anthropic_chat "claude-haiku-4-5-20251001"
-                               "Reply with exactly: hello from pure rail"
-                               40
-                               "/Users/me/.fleet/anthropic_key"
-       let _ = print reply
-       0
-
--- → "hello from pure rail"
--- → 6.9 s wall. Full TLS 1.3 handshake, ECDSA-P256 cert verify, SAN match,
---   validity period, record layer encryption, HTTPS POST to api.anthropic.com.
--- → Zero C transitive dependency. No OpenSSL. No libssl. No curl. No socat.
-```
-
-## Install
+## Quick start
 
 ```bash
 git clone https://github.com/zemo-g/rail
@@ -49,288 +45,187 @@ cd rail
 ./rail_native run examples/hello.rail
 ```
 
-Apple Silicon (ARM64 macOS). Linux ARM64 and x86_64 cross-compilation supported.
-
-### Rebuild from source
+Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, and WASM backends are supported.
 
 ```bash
-./rail_native self                    # self-compile → /tmp/rail_self
-cp /tmp/rail_self ./rail_native       # install
-./rail_native self                    # compile again — must be byte-identical
-./rail_native test                    # 98/98
+./rail_native <file.rail>        # compile to /tmp/rail_out
+./rail_native run <file.rail>    # compile + execute
+./rail_native test               # run the 116-test suite
+./rail_native self               # self-compile, fixed point
+./rail_native x86 <file.rail>    # cross-compile to Linux x86_64
+./rail_native linux <file.rail>  # cross-compile to Linux ARM64
 ```
 
-## Usage
+## What Rail does
 
-```bash
-./rail_native <file.rail>             # compile to /tmp/rail_out
-./rail_native run <file.rail>         # compile + execute
-./rail_native test                    # 98/98 test suite
-./rail_native self                    # self-compile (fixed point)
-./rail_native x86 <file.rail>        # cross-compile to x86_64 Linux
-./rail_native linux <file.rail>       # cross-compile to Linux ARM64
-```
-
-## The Language
+### 1. Compiles itself, byte-identical
 
 ```
--- Functions (defined before main)
-double x = x * 2
-add a b = a + b
+./rail_native self                    -- 4,687 lines of Rail →
+                                      --   a 729 KB ARM64 binary
+cp /tmp/rail_self ./rail_native
+./rail_native self                    -- that binary compiles the
+                                      --   compiler again
+cmp rail_native /tmp/rail_self        -- and the output is identical
+```
 
--- Algebraic data types + pattern matching
-type Option = | Some x | None
+The GC, allocator, and runtime support are ARM64 assembly embedded in the compiler itself. No `gcc`, no `libc`, no linker scripts — just `as` and `ld`.
 
-getOr opt = match opt
-  | Some x -> x
-  | None -> 0
+### 2. Speaks HTTPS, natively ✨ *new in v3.0.0*
 
--- Main returns an integer
+```rail
+import "stdlib/anthropic_client.rail"
+
 main =
-  let _ = print (show (getOr (Some 42)))
+  let (status, reply) = anthropic_chat
+                          "claude-haiku-4-5-20251001"
+                          "Reply with exactly: hello from pure rail"
+                          40
+                          "/Users/me/.fleet/anthropic_key"
+  let _ = print reply
   0
+
+-- → "hello from pure rail"
+-- → 6.9 s wall. Full TLS 1.3: x25519 ECDHE, ECDSA-P256 cert verify,
+--   SAN hostname match, validity period, ChaCha20-Poly1305 record
+--   layer. Zero OpenSSL, zero curl, zero socat.
 ```
 
+The full X.509 chain for `api.anthropic.com` (leaf → WE1 intermediate → GTS Root R4) validates end-to-end to the macOS `/etc/ssl/cert.pem` trust store — ECDSA-P256-SHA256 at the leaf, ECDSA-P384-SHA384 at the root edge, all verified in Rail.
+
+### 3. Trains its own AI, verified by the compiler
+
+```rail
+-- The self-training loop, in one flow:
+--   LLM generates Rail → rail_native compiles (the oracle) →
+--   passes harvested → training data feeds next round
 ```
--- Compiler patterns: expression evaluator
+
+The compiler is the fitness function. Programs that compile become training data; programs that don't are the gradient. Three independent lineages (LoRA on Gemma, Metal-GPU MLP, PCFG-REINFORCE) all use the same compiler as the binary verifier. 92 % strict pass rate on the PCFG lineage in 30 ticks.
+
+## Why Rail
+
+- **Zero C transitive dependency.** The seed binary needs only `as` + `ld` + the kernel. No glibc. No OpenSSL. No runtime C at all — the GC is 300 lines of ARM64 assembly inside the compiler.
+- **Byte-identical self-compile.** `./rail_native self` produces output identical to the binary that produced it. The compiler's own source is the regression suite.
+- **The compiler is the source of truth.** Training loops, tests, site generation, HTTPS clients — they all get compiled by the same binary you cloned. If it compiles, it runs.
+- **Production surface is narrow and honest.** Rail v3.0.0 ships the crypto it uses (ChaCha20-Poly1305, x25519, SHA-256/384/512, ECDSA-P256/P384, RSA-PSS/PKCS1) and nothing more. Every primitive is NIST- or RFC-vector-validated.
+- **Four backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), Linux x86_64, and WASM — the same compiler cross-compiles to all of them.
+
+## The language
+
+```rail
+-- Functions, pattern matching, ADTs
 type Expr = | Num x | Add a b | Mul a b
 
 eval e = match e
-  | Num x -> x
+  | Num x   -> x
   | Add a b -> eval a + eval b
   | Mul a b -> eval a * eval b
 
-main =
-  let _ = print (show (eval (Add (Num 3) (Mul (Num 4) (Num 5)))))
-  0
--- Output: 23
+main = let _ = print (show (eval (Add (Num 3) (Mul (Num 4) (Num 5))))) in 0
+-- → 23
 ```
 
-```
--- Higher-order: fold, map, filter, pipes
-gt3 x = if x > 3 then true else false
-add a b = a + b
+```rail
+-- Higher-order, pipes, real I/O
+gt3 x = x > 3
 inc x = x + 1
 
 main =
-  let _ = print (show (fold add 0 (range 101)))       -- 5050
-  let _ = print (show (length (filter gt3 [1,2,3,4,5,6])))  -- 3
-  let r = 3 |> inc |> double                           -- 8
-  let _ = print (show r)
+  let _ = print (show (fold (\a b -> a + b) 0 (range 101)))  -- 5050
+  let _ = print (show (length (filter gt3 [1,2,3,4,5,6])))   -- 3
+  let _ = write_file "/tmp/out.txt" "hello"
+  let _ = print (read_file "/tmp/out.txt")                   -- hello
   0
 ```
 
-```
--- Real I/O: files, shell, string processing
-find_key lines key = if length lines == 0 then ""
-  else
-    let parts = split "=" (head lines)
-    if head parts == key then head (tail parts)
-    else find_key (tail lines) key
-
-main =
-  let _ = write_file "/tmp/config.txt" "host=localhost\nport=8080"
-  let lines = split "\n" (read_file "/tmp/config.txt")
-  let _ = print (find_key lines "port")
-  0
--- Output: 8080
+```rail
+-- Native floats (unboxed IEEE 754 in ARM64 d-registers)
+-- Effect handlers (setjmp/longjmp non-local error recovery)
+-- WASM output (closures + ADTs + pattern matching in the browser)
+-- Metal GPU IR (JIT-compiled GPU kernels from Rail AST)
 ```
 
-## How It Works
-
-The compiler (`tools/compile.rail`, 4,687 lines) does:
-
-1. **Lexer** — tokenizes Rail source with position tracking
-2. **Parser** — builds AST from tokens (tagged lists)
-3. **Type checker** — forward inference, exhaustiveness warnings
-4. **Codegen** — walks AST, emits ARM64/x86_64 assembly
-5. **Build** — calls `as` + `ld` to produce native binary
-
-### Runtime
+## How it works
 
 | Component | Implementation | Detail |
-|-----------|---------------|--------|
-| **Allocator** | ARM64 assembly | 512MB bump arena + free list + malloc fallback |
+|---|---|---|
+| **Lexer + parser** | Rail | Tokenizer + recursive-descent AST builder, ~900 lines |
+| **Type checker** | Rail | Forward inference, exhaustiveness warnings |
+| **Codegen** | Rail | Walks AST, emits ARM64 / x86_64 / WASM directly |
+| **Allocator** | ARM64 assembly | 512 MB bump arena + free list + malloc fallback |
 | **GC** | ARM64 assembly | Conservative mark-sweep. Scans stack frames, traces tagged objects, sweeps into free list. |
 | **Tagged pointers** | Inline | Integers: `(v << 1) \| 1`. Heap: raw pointer. Tag bit 0 distinguishes. |
-| **Objects** | 8-byte size header | Tags: 1=Cons, 2=Nil, 3=Tuple, 4=Closure, 5=ADT, 6=Float. Mark bit at bit 63. |
+| **Runtime float** | d-registers | Unboxed IEEE 754. `fadd`/`fmul` direct, no heap boxing. ~10× vs boxed. |
 
-Zero C runtime. The GC, allocator, and all runtime support are ARM64 assembly embedded in the compiler.
-
-### Performance
-
-Tail-recursive loops match C `-O2`: 5 instructions per iteration.
-
-```
--- fib(40) = 0.30s (matches gcc -O2)
--- Optimizations: self-loop → bottom-test, untagged register params,
---   direct register arithmetic, auto-memoization, constant folding,
---   type guard elimination, fused compare-and-branch
-```
-
-## Builtins
-
-| Category | Functions |
-|----------|-----------|
-| **I/O** | `print`, `show`, `read_file`, `write_file`, `shell`, `read_line` |
-| **Lists** | `head`, `tail`, `cons`, `append`, `length`, `map`, `filter`, `fold`, `reverse`, `join`, `range` |
-| **Strings** | `chars`, `split`, `str_split`, `str_find`, `str_contains`, `str_replace`, `str_sub` |
-| **Math** | `not`, `to_float`, `to_int`, float arithmetic |
-| **ADTs** | `type`, `match` with exhaustiveness warnings |
-| **Concurrency** | `spawn`, `channel`, `send`, `recv`, `spawn_thread`, `join_thread` |
-| **Memory** | `arena_mark`, `arena_reset`, `arr_new`, `arr_get`, `arr_set`, `arr_len` |
-| **Errors** | `error`, `is_error`, `err_msg` |
-| **FFI** | `foreign` declarations, `llm` builtin |
-| **System** | `args`, `import`, pipe operator `|>` |
+Tail-recursive loops match C `-O2` (5 instructions per iteration). The full architecture is documented in [`CHANGELOG.md`](CHANGELOG.md) — see v2.0.0 for the compiler/runtime; v3.0.0 for the TLS stack.
 
 ## Releases
 
 ### v3.0.0 — 2026-04-18 — *Rail speaks TLS*
 
-**Rail runs on Rail, the rest runs on physics.**
+A complete pure-Rail TLS 1.3 stack + X.509 chain validation + HTTPS client. The `~/.fleet/tls_proxies.sh` socat daemons are no longer on any critical path.
 
-Rail v3.0.0 is a complete pure-Rail TLS 1.3 stack. The `socat` proxy that terminated TLS for v2.23's HTTP client is retired. Rail programs open a TCP socket, run the TLS handshake, verify the server's certificate against a CA root in the macOS system trust store, exchange encrypted records, and hand back the decrypted HTTP response — all in pure Rail with zero C transitive dependency beyond `as`, `ld`, and the kernel's BSD sockets.
-
-**Live at release, in production:**
+**Live on release day, in production:**
 
 ```
 anthropic_chat "claude-haiku-4-5-20251001" "Reply with exactly: hello from pure rail"
-  → status 200, reply "hello from pure rail"   (6.9 s, pure Rail → Anthropic)
+  → HTTP 200, "hello from pure rail"       (6.9 s, pure Rail → Anthropic)
 
-slack_post_text "D0ATHQ1BQD7" "v3.0.0 smoke: pure-Rail TLS direct to slack.com"
-  → ok = true, HTTP 200 with x-slack-req-id    (1.0 s, pure Rail → Slack)
+slack_post_text "D0ATHQ1BQD7" "v3.0.0 smoke: pure-Rail TLS"
+  → ok=true, HTTP 200                      (1.0 s, pure Rail → Slack)
 
 https_get_url "https://www.amazon.com/"
-  → 200 with set-cookie, x-amz-rid             (4.0 s, RSA chain validated
-                                                to DigiCert Global Root G2)
+  → HTTP 200 with set-cookie, x-amz-rid    (4.0 s, RSA chain validated
+                                            to DigiCert Global Root G2)
 ```
 
-The full Google Trust Services chain for `api.anthropic.com` (leaf → WE1 intermediate → GTS Root R4) validates to its CA root in macOS `/etc/ssl/cert.pem`. Every edge cryptographically verified in Rail: ECDSA-P256-SHA256 at the leaf, ECDSA-P384-SHA384 at the WE1 → R4 root edge.
-
-**New in v3.0.0 — ~3,800 lines of pure Rail across ~16 new stdlib modules:**
+~3,800 lines of new pure-Rail crypto + TLS across 16 new stdlib modules. Every primitive NIST- or RFC-vector validated. 22 pure-Rail TLS tests, all green. Self-compile 2-pass byte-identical preserved.
 
 | Layer | Modules |
 |---|---|
-| Crypto primitives | `sha256`, `sha512` (SHA-384), `hmac`, `hkdf`, `chacha20`, `poly1305`, `aead`, `x25519` |
-| Public-key | `ecdsa_p256` (16×16-bit limbs), `ecdsa_p384` (24-limb), `rsa_pss`, `rsa_pkcs1` (128-limb), `bignum_n` |
-| X.509 + PKI | `asn1` (DER walker), `b64`, `pem` (macOS trust store, 128 roots) |
-| TLS 1.3 | `tls13` (key schedule), `tls13_hs`, `tls13_record`, `tls13_cert_verify`, `tls13_client`, `cert_chain`, `cert_p384` |
+| Hash / MAC | `sha256`, `sha512` (SHA-384/512), `hmac`, `hkdf` |
+| Symmetric | `chacha20`, `poly1305`, `aead` (ChaCha20-Poly1305) |
+| Public key | `x25519`, `ecdsa_p256`, `ecdsa_p384`, `rsa_pss` (PSS + PKCS1) |
+| Bignum | `bignum_n` — parameterised n-limb arithmetic |
+| X.509 / PKI | `asn1`, `b64`, `pem` (128 roots from `/etc/ssl/cert.pem`) |
+| TLS 1.3 | `tls13`, `tls13_hs`, `tls13_record`, `tls13_cert_verify`, `tls13_client`, `cert_chain`, `cert_p384` |
 | Application | `https_client`, `dns`, `anthropic_client`, `slack_client` |
 
-**Every primitive NIST- or RFC-vector validated:**
+Full release notes: [**CHANGELOG.md**](CHANGELOG.md).
 
-- SHA-256 / SHA-384 / SHA-512 → NIST "abc" + empty
-- HMAC → RFC 4231 vectors 1/2/4
-- HKDF → RFC 5869 Test Case 1
-- ChaCha20 → RFC 8439 §2.3, §2.4
-- Poly1305 + AEAD → RFC 8439 §2.5, §2.8
-- X25519 → RFC 7748 §5.2
-- ECDSA-P256 → RFC 6979 §A.2.5
-- ECDSA-P384 → RFC 6979 §A.2.6
-- TLS 1.3 key schedule + Finished → RFC 8448 §3 trace exact
+### v2.0.0 — 2026-04-06 — *Rail becomes a self-improving system*
 
-**Trust posture:** a TLS connection refuses to hand plaintext to the caller unless the leaf's CertificateVerify signature checks out AND the SAN dNSName matches the requested hostname (RFC 6125 §6.4.3 wildcard support) AND the cert is currently within its notBefore/notAfter window AND the server Finished MAC validates. The full chain walk to a CA root is available as an opt-in primitive (`cc_walk_chain`).
-
-**Honest limits:** one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one ECDHE group (x25519), no session resumption, no 0-RTT, ~5-8 s per connection (public-key verify dominates). This is a one-shot API-client story, not an OpenSSL replacement. See `CHANGELOG.md` for the full list.
-
-**22 pure-Rail TLS tests**, all green. Self-compile 2-pass byte-identical preserved. Full details: **[CHANGELOG.md](CHANGELOG.md)**.
-
-### v2.0.0 — 2026-04-06
-
-**The version where Rail stops being just a self-hosting compiler and becomes a self-improving system.**
-
-121 commits since v1.4.0. Three independent training lineages now run on the same machine, all driven by the same compiler as the binary fitness function: a 4B-parameter LoRA on Gemma, a Metal-GPU MLP that learns to be a physics engine, and a 23-integer probabilistic context-free grammar trained by REINFORCE. The operational discipline to keep all three honest — intervention ledger, recovery chain, runtime overrides, forward regression bisector, domain plugin spine — is built in pure Rail with zero Python. The compiler that runs all of this is itself self-hosting at a byte-identical fixed point, with native floats, effect handlers, and a working garbage collector in ARM64 assembly.
-
-#### Compiler & runtime
-
-- **Native floats** — unboxed IEEE 754 in ARM64 d-registers. Foreign FFI for `sin`/`cos`/`sqrt`/`tanh`/`exp`/`log`/`pow`. Auto int→float promotion. ~10× speedup vs boxed.
-- **Effect handlers** — `try body handler` via setjmp/longjmp. Deep unwinding, nested handlers, restartable error recovery.
-- **GC bootstrapped** — conservative mark-sweep in ARM64 assembly. 256 MB bump arena + free list + malloc fallback. 10/10 stress self-compiles, byte-identical fixed point.
-- **d8 callee-saved float register** — float operations inside recursive functions now get the fast self-loop optimization. Unblocked the neural plasma MLP training.
-- **FFI strdup wrap** — string-returning foreign calls strdup-wrapped through the runtime. Fixed the memory bug holding tests at 91/92 → **92/92 for the first time.**
-- **Polymorphic show**, **exhaustive match enforcement**, **parser `in` keyword**.
-- Tail-recursive loops match C `-O2` (5 instructions per iteration).
-
-#### Four stable backends
-
-| Backend | Status | Target |
-|---|---|---|
-| **macOS ARM64** | primary, 92 tests, fixed point | M-series Macs |
-| **Linux ARM64** | working | Pi Zero 2 W (fleet display) |
-| **Linux x86_64** | working | Razer (WSL training node) |
-| **WASM** | closures, ADTs, match, lists, strings | browser, edge — 6 demos at compile.ledatic.org |
-
-#### The self-improving flywheel — three lineages
-
-Rail now drives three independent training systems, each using the compiler as the binary fitness function:
-
-1. **LLM-LoRA lineage** — Gemma 4 E4B with a Rail LoRA adapter reaches **14/30 on the README bench**, up from 1/30 baseline. Hyperagent makes bench-gated decisions: keep an adapter only if the bench improves, rollback otherwise. DNA harvester pulls 199 verified examples directly from `compile.rail` itself. The LLM trains on data the compiler has personally verified.
-
-2. **Neural plasma lineage** — A 3D Metal MHD simulator generates training data for a neural surrogate. A pure-Rail linear model converges from loss 4.45 → 0.03 in 500 steps with single-step mass conservation error of 0.027%. A Metal GPU MLP (30→128→6) trains 85× faster than the CPU version using 10 custom Metal kernels. The neural renderer runs the trained MLP forward pass on every cell of a 64×64 grid each frame — **the neural network IS the physics engine**, no PDE solver at runtime. STABLE 200-step simulation via spectral normalization + conservation drift loss.
-
-3. **PCFG-REINFORCE lineage** — `tools/domains/s0_pcfg/` is a 23-rule probabilistic context-free grammar trained by REINFORCE on compile-pass reward. The whole "model" is 23 integer weights, ~120 bytes. Reaches **92% lifetime strict pass rate** in 30 ticks. Generates 5 distinct program shapes (inline, named-binding, statement chain, function definition, ADT + match) — and discovered Rail's runtime tolerances by trial and error before the implementer knew them. **The compiler is the teacher in 720 lines of pure Rail.**
-
-#### Operational discipline (pure Rail, zero Python)
-
-Patterns from the paused Empire trading system, ported as Rail-native infrastructure:
-
-- **Intervention ledger** (`flywheel/interventions.jsonl`) — append-only audit log. Every round_end, level transition, override write, MLX skip, and goal grind is one JSON record. Read with `flywheel/interventions_tail.rail`.
-- **Recovery chain** (`flywheel/flush.rail`) — pure Rail rotator. Per protected file: cp src→tmp, mv backup→prev, mv tmp→backup. Three guards (source-empty, size-shrunk, line-collapse). Protects 5 files per round.
-- **Domain plugin spine** (`tools/domains/`) — filesystem-as-registry. No dispatcher, no manifest, no registry file. Two domains live: `neural_plasma` and `s0_pcfg`. Discovered with `find`.
-- **Runtime overrides** (`flywheel/overrides.txt`) — bounded tunables read fresh every round. Every override write logged to the same ledger. Closes the audit loop.
-
-#### Loop closure
-
-The flywheel runs continuously without human intervention. Each round:
-
-```
-LLM training round  →  rotate backups  →  PCFG REINFORCE round  →
-  cross-feed PCFG-verified programs into LLM harvest  →  repeat
-```
-
-PCFG-verified programs get translated into the chat-completion format the LLM flywheel expects, with SHA-256 dedup against the LLM's existing harvest. **Two oracles, one corpus.**
-
-#### Forward regression bisector
-
-`flywheel/regress.rail` reads the intervention ledger and reports any pass-rate drop bigger than a threshold, plus the suspect events (override_write, level_fallback, server_skip, goal_grind) that occurred in the window before each drop. Threshold configurable. The level 25 → 6 historical regression that motivated the ledger is gone (pre-ledger), so this tool runs **forward**: it watches for the next drop and tells you what changed.
-
-#### Public sandbox
-
-- **[compile.ledatic.org](https://compile.ledatic.org)** — public sandboxed Rail compiler. AST whitelist, WASM import validation, 19-test adversarial suite, Cloudflare Tunnel.
-- **[ledatic.org](https://ledatic.org)** v2.0 — main site redeployed with 6 in-browser WASM demos: hello, fib, math, lists, ADTs, closures, string ops.
-
-#### By the numbers
-
-| | v1.4 (2026-03-22) | **v2.0 (2026-04-06)** |
-|---|---|---|
-| Tests | 70 | **92** |
-| Backends | 1 | **4** |
-| Stdlib modules | ~22 | **38** |
-| Compiler (lines of Rail) | 1,979 | **3,865** |
-| Self-improving lineages | 1 (LLM-LoRA) | **3** (LoRA + Metal-MLP + PCFG-REINFORCE) |
-| Domain plugins | 0 | **2** (neural_plasma, s0_pcfg) |
-| Operational discipline | manual | **full** (ledger + recovery + spine + overrides + bisector) |
-| Compiler-verified training corpus | small | 3.67 MB curated, deduped, quality-weighted |
-
-Full release notes: **[CHANGELOG.md](CHANGELOG.md)**
+Native floats in ARM64 d-registers, effect handlers via setjmp/longjmp, GC in assembly, four backends (macOS ARM64 / Linux ARM64 / Linux x86_64 / WASM), and three independent training lineages — all driven by the same compiler as the binary fitness function. 121 commits. 92/92 tests. [**Full details in CHANGELOG.md →**](CHANGELOG.md).
 
 ### History
 
-| Version | Date | What |
+| Version | Date | Headline |
 |---|---|---|
-| **v3.0** | 2026-04-18 | **Rail speaks TLS.** Pure-Rail TLS 1.3 + cert chain validation + live HTTPS to Anthropic / Slack / Amazon. socat retired. |
-| **v2.23** | 2026-04-17 | Pure-Rail HTTP/1.1 client + `char_from_int`; HTTPS still via socat |
-| **v2.0** | 2026-04-06 | Self-improving flywheel (3 lineages), native floats, effect handlers, GC in assembly, 4 backends, 92 tests |
-| **v1.5** | 2026-03-25 | 92 tests, C-matching performance, hyperagent, DNA training, 3 architectures |
-| **v1.4** | 2026-03-22 | GC in assembly, nested lambdas, exhaustiveness, 70 tests |
+| **v3.0.0** | 2026-04-18 | Rail speaks TLS — pure-Rail HTTPS, chain validation to macOS trust store |
+| **v2.23.0** | 2026-04-17 | Pure-Rail HTTP/1.1 client + `char_from_int` |
+| **v2.0.0** | 2026-04-06 | Self-improving flywheel, native floats, effect handlers, GC in asm |
+| **v1.5** | 2026-03-25 | C-matching performance, hyperagent, DNA training |
+| **v1.4** | 2026-03-22 | GC in assembly, nested lambdas, exhaustiveness |
 | **v1.3** | 2026-03-21 | MCP server, 32-layer LoRA, open source |
 | **v1.1** | 2026-03-20 | Metal GPU, WASM, x86_64, fibers, flywheel |
 | **v1.0** | 2026-03-17 | Self-hosting. Rust deleted. 67 tests. |
 
+## Honest limits
+
+Things Rail v3.0.0 **doesn't** do, so you don't hit them as surprises:
+
+- TLS ships one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one ECDHE group (`x25519`), and three sig-algs (`rsa_pss_rsae_sha256 | ecdsa_secp256r1_sha256 | rsa_pkcs1_sha256`). Modern CDN fronts work; legacy servers may not.
+- No TLS session resumption, no 0-RTT, no client certificates.
+- No constant-time or side-channel resistance guarantees. This is not OpenSSL; don't ship it to a Defense customer.
+- Each HTTPS connection is 5–8 seconds wall time (public-key verify dominates). Great for one-shot API calls, not for an HTTP proxy.
+- Response body is assembled via `join ""` — O(N²), caps cleanly around 64 KB. Streaming is a v3.1 item.
+- Rail is not ANSI-standardised. There is no formal type system or soundness proof. Use it because it's fast, small, and honest — not because it's Haskell.
+
 ## License
 
-BSL 1.1 — free for non-production and non-competitive use. Converts to MIT on 2030-03-14. See [LICENSE](LICENSE).
+[Business Source License 1.1](LICENSE). Free for non-production use; the Additional Use Grant covers research, education, and personal projects. Converts to Apache 2.0 on 2030-04-06.
 
----
+## Notes
 
-[ledatic.org](https://ledatic.org) | [ledatic.org/system](https://ledatic.org/system)
+> GitHub's language bar shows this repo as Haskell because `github-linguist` doesn't know Rail exists yet. A [PR is in flight](https://github.com/github-linguist/linguist/pulls?q=rail) to fix that. This is a Rail codebase.

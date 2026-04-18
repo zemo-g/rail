@@ -1,137 +1,97 @@
 # Contributing to Rail
 
-Rail is a self-hosting programming language. The compiler is written in Rail and compiles itself to ARM64 native code. Contributions are welcome.
+Rail is a real project with a narrow but honest feature set. Contributions are welcome — this file covers build, test, and the practical bar for a patch that lands.
 
-## Prerequisites
-
-- Apple Silicon Mac (ARM64 macOS)
-- Xcode command-line tools (`xcode-select --install`) -- provides `as` and `ld`
-- No other dependencies
-
-## Getting Started
+## Build + test in 30 seconds
 
 ```bash
 git clone https://github.com/zemo-g/rail
 cd rail
 
-# The seed binary is already in the repo. Test it:
-./rail_native test          # should be 70/70
-./rail_native run examples/hello.rail
+./rail_native test       # 116/116 core tests
+./rail_native self       # self-compile → /tmp/rail_self
+cmp rail_native /tmp/rail_self
+# ↑ should be silent; the output is byte-identical to the binary
+#   that produced it. This is the "fixed-point" property.
 ```
 
-## Building from Source
+If any of those three fails on `master`, that's a bug — please open an issue.
 
-Rail is self-hosting. The seed binary (`rail_native`) compiles the compiler source (`tools/compile.rail`) to produce a new binary:
+## Prerequisites
 
-```bash
-./rail_native self                    # compiles itself -> /tmp/rail_self
-cp /tmp/rail_self ./rail_native       # install the new binary
-./rail_native test                    # verify 70/70 tests pass
-```
+- Apple Silicon Mac (ARM64 macOS) is the primary development target.
+- Xcode command-line tools for `as` + `ld` (`xcode-select --install`).
+- No other dependencies. Rail builds with just `as`, `ld`, and the kernel.
 
-The self-compiled binary must be byte-identical to itself when it compiles the compiler again. This is the **fixed-point property** -- the compiler is a fixed point of itself.
+Linux ARM64 and Linux x86_64 work as cross-compile targets; WASM too. See `./rail_native linux`, `./rail_native x86`, `./rail_native wasm`.
 
-## Running Programs
+## The bar for a compiler patch
 
-```bash
-./rail_native run file.rail           # compile + execute
-./rail_native file.rail               # compile only -> /tmp/rail_out
-```
-
-## Running Tests
+The compiler is `tools/compile.rail` (~4,687 lines of Rail). It compiles itself. Every change goes through this loop:
 
 ```bash
-./rail_native test                    # run the full 70-test suite
-```
+# 1. Edit tools/compile.rail.
 
-All 70 tests should pass. If any fail, do not submit a PR until you've fixed the regression.
+# 2. Compile the compiler with the OLD binary.
+./rail_native self                        # → /tmp/rail_self
 
-## Modifying the Compiler
-
-The compiler lives in `tools/compile.rail` (~1,979 lines). After making changes, you **must** verify the fixed-point property:
-
-```bash
-# 1. Compile with the current binary
-./rail_native self                    # produces /tmp/rail_self
-
-# 2. Install the new binary
+# 3. Install the new binary.
 cp /tmp/rail_self ./rail_native
 
-# 3. Compile again with the new binary
-./rail_native self                    # produces /tmp/rail_self
+# 4. Verify the test suite still passes.
+./rail_native test                        # must be 116/116
 
-# 4. Verify fixed point (output must be byte-identical)
-diff /tmp/rail_self /tmp/rail_out
-# Must produce NO output
-
-# 5. If not identical, repeat steps 2-4 until stable
-
-# 6. Run the test suite
-./rail_native test                    # must be 70/70
+# 5. Verify the fixed-point property.
+./rail_native self
+cmp rail_native /tmp/rail_self            # must be silent
 ```
 
-If the diff is not empty, your change is not yet a fixed point. Keep iterating (install new binary, self-compile, diff) until the output stabilizes.
+Step 5 is the hard part. If the new binary doesn't produce byte-identical output on the second pass, iterate (`cp /tmp/rail_self rail_native && ./rail_native self`) until it does. One or two extra passes is normal; three or more means something in the codegen is non-deterministic and wants investigation.
 
-## Adding a Test
+If you change the runtime — `rt_core`, `rt_list`, `rt_string`, the GC embedded in `compile.rail` — the old binary generates the old runtime. You have to bootstrap twice: compile, install, compile again with the new binary.
 
-Tests are embedded in the compiler's test harness. Look at the `test` command handling in `tools/compile.rail` to understand the pattern, then add your test case following the same structure. Every test must pass deterministically.
+## The bar for an stdlib patch
 
-## Adding an Example
+Adding or modifying `stdlib/*.rail`:
 
-Examples live in `examples/`. Each should be:
+- **Test it.** Put a standalone test under `tools/tls/` or a new directory. "Standalone" means `./rail_native run tools/whatever/my_test.rail` prints `PASS` when it works. That's the assertion contract.
+- **Crypto code validates against an RFC or NIST vector.** Hand-derived expected values introduced bugs twice on the TLS branch; canonical data is load-bearing.
+- **Respect the import graph.** Rail imports don't dedupe. Two textual imports of the same module cause duplicate-symbol link errors. When in doubt, imitate existing modules: leaf modules import nothing and rely on the caller's chain to provide `hex_to_bytes`, `sha_copy_bytes`, etc.
 
-1. **Self-contained** -- no imports or external files required
-2. **Compilable and runnable** -- `./rail_native run examples/yourfile.rail` must succeed
-3. **Commented** -- header comment explaining what the example demonstrates
-4. **Small** -- under 50 lines is ideal; showcase one or two features
+## Parser quirks you will hit
 
-Test your example before submitting:
+The full list lives in `CLAUDE.md`. The top five:
 
-```bash
-./rail_native run examples/yourfile.rail
-```
+1. **No hex literals.** `0xFF` silently parses as `0`. Use `hex_to_bytes "ff"` for crypto constants.
+2. **Leading `+` on a continuation line is a parse error.** Keep multi-line arithmetic on one physical line or parenthesise: `(a + b)\n(+ c)` fails, `(a + b) + c` on one line works.
+3. **Deeply-nested `if / else` with side-effecting `let`s** between them can trigger an "expected decl" parse error or a multi-minute compile hang. Factor the deep arms into separate helper functions.
+4. **`split` is single-character.** `split "abc" s` splits on `a`, `b`, `c` individually. Use `str_split` for multi-char delimiters.
+5. **`to_int` is float-only.** For string → int use `parse_int` (walks `chars` via `char_to_int`).
 
-## Code Style
+## Code style (soft)
 
-Rail uses a terse, functional style:
+Rail codebases tend to use a terse functional style:
 
-- **Short function names**: `add`, `fib`, `eval`, not `addTwoNumbers`
-- **Functions before main**: all named functions are defined before `main =`
-- **`let _ =` for side effects**: `let _ = print "hello"` (since Rail is expression-oriented)
-- **Named predicates over lambdas in filter**: `filter isEven xs` not `filter (\x -> ...) xs` (lambdas in filter can segfault at runtime)
-- **`show` for int-to-string**: `show 42` produces `"42"`
-- **Comments**: `-- single line comment`
+- Short, lowercase function names: `add`, `fib`, `eval` — not `addTwoNumbers`.
+- Named functions defined before `main =`.
+- `let _ = print "..."` for side-effect expressions.
+- `show n` for int-to-string; `show_float` for floats.
+- Single-line comments with `-- ` prefix.
+- Named predicates preferred over lambdas in `filter` (lambdas in filter have segfault history).
 
-## Known Limitations
+## Submitting changes
 
-Be aware of these when writing Rail code:
+1. Fork and make a feature branch.
+2. Run `./rail_native test` and, if you touched the compiler, the fixed-point dance.
+3. Open a PR with a clear description of what changed and why.
+4. If you added crypto, point at the RFC section your test vector is from.
 
-- `split` is **single-character only**: `split "abc" s` splits on each of `a`, `b`, `c` individually, not the substring `"abc"`
-- `show` works on integers and floats
-- Lambdas in `filter` can segfault -- use named predicate functions instead
-- Partial application of multi-arg functions may segfault in some contexts
-- WASM backend compiles but has runtime issues
+For bigger changes, opening an issue first to talk about the approach saves time.
 
-## Project Structure
+## Reporting security issues
 
-```
-rail_native              # seed binary (ARM64 Mach-O, ~329K)
-tools/compile.rail       # the compiler (1,979 lines of Rail)
-runtime/gc.c             # garbage collector (conservative mark-sweep)
-runtime/llm.c            # LLM builtin (calls local inference servers)
-stdlib/                  # 22 stdlib modules (json, http, sqlite, etc.)
-examples/                # example programs
-```
-
-## Submitting Changes
-
-1. Fork the repo and create a feature branch
-2. Make your changes
-3. Verify the fixed-point property (if you touched the compiler)
-4. Run `./rail_native test` -- 70/70
-5. Test any new examples with `./rail_native run`
-6. Open a pull request with a clear description of what changed and why
+See [SECURITY.md](SECURITY.md). Rail v3.0.0 is **not** constant-time and has no side-channel-resistance guarantees. Don't deploy the crypto to side-channel-sensitive environments; that's not what it's for.
 
 ## License
 
-Rail is licensed under the Business Source License 1.1 (BSL 1.1). It converts to MIT on 2030-03-14. By contributing, you agree that your contributions will be licensed under the same terms. See [LICENSE](LICENSE) for details.
+By contributing, you agree your contributions are licensed under the same terms as Rail (Business Source License 1.1, converts to Apache 2.0 on 2030-04-06). See [LICENSE](LICENSE).
