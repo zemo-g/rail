@@ -1,0 +1,219 @@
+-- stdlib/dns.rail — Minimal DNS resolver (A records only).
+--
+-- One-shot UDP query to the system resolver. Reads /etc/resolv.conf to
+-- find the first nameserver, sends a recursion-desired A-record query,
+-- parses the first IPv4 answer.
+--
+-- Public API:
+--   dns_resolve_a host -> "a.b.c.d" or "" on failure
+--
+-- Caller must have socket.rail loaded.
+
+-- Read /etc/resolv.conf, find first "nameserver X.Y.Z.W" line.
+dns_default_server _ =
+  let s = read_file "/etc/resolv.conf"
+  dns_scan_lines (split_lines s)
+
+-- Split a string on newlines.
+split_lines s = split "\n" s
+
+dns_scan_lines lines =
+  if length lines == 0 then "1.1.1.1"
+  else
+    let line = head lines
+    if dns_is_nameserver line == 1 then dns_extract_ns line
+    else dns_scan_lines (tail lines)
+
+dns_is_nameserver line =
+  if length line < 11 then 0
+  else if str_sub line 0 10 == "nameserver" then 1 else 0
+
+dns_extract_ns line =
+  let parts = split " " line
+  if length parts < 2 then "1.1.1.1"
+  else
+    let candidate = head (tail parts)
+    -- Skip IPv6 (contains ':').
+    if str_find ":" candidate >= 0 then "1.1.1.1"
+    else candidate
+
+-- ── Query packet construction ─────────────────────────────────────
+
+-- Encode a hostname as DNS labels: "api.anthropic.com" → [3]api[9]anthropic[3]com[0]
+dns_encode_name host =
+  let labels = split "." host
+  let total = dns_labels_total_len labels 0
+  let buf = malloc total
+  let _ = dns_write_labels buf labels 0
+  let r = arr_new 2 0
+  let _ = arr_set r 0 buf
+  let _ = arr_set r 1 total
+  r
+
+dns_labels_total_len labels acc =
+  if length labels == 0 then acc + 1
+  else
+    let lbl = head labels
+    dns_labels_total_len (tail labels) (acc + 1 + length lbl)
+
+dns_write_labels buf labels off =
+  if length labels == 0 then
+    let _ = byte_set buf off 0
+    off + 1
+  else
+    let lbl = head labels
+    let n = length lbl
+    let _ = byte_set buf off n
+    let _ = dns_write_str buf (off + 1) lbl 0 n
+    dns_write_labels buf (tail labels) (off + 1 + n)
+
+dns_write_str buf off s i n =
+  if i >= n then 0
+  else
+    let _ = byte_set buf (off + i) (char_to_int (head (chars_at s i)))
+    dns_write_str buf off s (i + 1) n
+
+-- chars_at s i returns the chars list starting at index i.
+chars_at s i =
+  if i == 0 then chars s
+  else dns_drop (chars s) i
+
+dns_drop xs n =
+  if n <= 0 then xs
+  else if length xs == 0 then xs
+  else dns_drop (tail xs) (n - 1)
+
+-- Build the full DNS query packet: 12-byte header + encoded question.
+-- ID = 0x1234 (deterministic — fine for one-shot UDP). Flags = 0x0100 (RD=1).
+-- QDCOUNT=1, others=0. QTYPE=A=1, QCLASS=IN=1.
+dns_build_query host =
+  let nm = dns_encode_name host
+  let nm_buf = arr_get nm 0
+  let nm_len = arr_get nm 1
+  let total = 12 + nm_len + 4
+  let p = malloc total
+  let _ = byte_set p 0 18
+  let _ = byte_set p 1 52
+  let _ = byte_set p 2 1
+  let _ = byte_set p 3 0
+  let _ = byte_set p 4 0
+  let _ = byte_set p 5 1
+  let _ = byte_set p 6 0
+  let _ = byte_set p 7 0
+  let _ = byte_set p 8 0
+  let _ = byte_set p 9 0
+  let _ = byte_set p 10 0
+  let _ = byte_set p 11 0
+  let _ = dns_copy_cbuf nm_buf p 0 12 nm_len
+  let qoff = 12 + nm_len
+  let _ = byte_set p qoff 0
+  let _ = byte_set p (qoff + 1) 1
+  let _ = byte_set p (qoff + 2) 0
+  let _ = byte_set p (qoff + 3) 1
+  let _ = free nm_buf
+  let r = arr_new 2 0
+  let _ = arr_set r 0 p
+  let _ = arr_set r 1 total
+  r
+
+dns_copy_cbuf src dst src_off dst_off n =
+  if n <= 0 then 0
+  else
+    let _ = byte_set dst dst_off (byte_at src src_off)
+    dns_copy_cbuf src dst (src_off + 1) (dst_off + 1) (n - 1)
+
+-- ── Response parser ───────────────────────────────────────────────
+-- Skip header (12) + question (encoded_name + 4). Walk answers, find
+-- first type=A. Returns "a.b.c.d" or "" on failure.
+--
+-- Answer record: name(2 — pointer 0xC0 0x0C usually) | type(2) | class(2)
+--                ttl(4) | rdlength(2) | rdata.
+
+dns_parse_response p got =
+  if got < 12 then ""
+  else
+    let ancount = byte_at p 6 * 256 + byte_at p 7
+    if ancount == 0 then ""
+    else
+      let qend = dns_skip_qname p 12 got
+      if qend < 0 then ""
+      else dns_walk_answers p (qend + 4) got ancount
+
+dns_skip_qname p off limit =
+  if off >= limit then 0 - 1
+  else
+    let b = byte_at p off
+    if b == 0 then off + 1
+    else if b >= 192 then 0 - 1
+    else dns_skip_qname p (off + 1 + b) limit
+
+dns_walk_answers p off limit count =
+  if count <= 0 then ""
+  else if off + 12 > limit then ""
+  else
+    let aoff = dns_skip_ans_name p off limit
+    if aoff < 0 then ""
+    else
+      let atype = byte_at p aoff * 256 + byte_at p (aoff + 1)
+      let rdlen = byte_at p (aoff + 8) * 256 + byte_at p (aoff + 9)
+      let rdoff = aoff + 10
+      if atype == 1 then
+        if rdlen != 4 then dns_walk_next p (rdoff + rdlen) limit (count - 1)
+        else
+          join "." [show (byte_at p rdoff), show (byte_at p (rdoff + 1)),
+                    show (byte_at p (rdoff + 2)), show (byte_at p (rdoff + 3))]
+      else dns_walk_next p (rdoff + rdlen) limit (count - 1)
+
+dns_walk_next p off limit count = dns_walk_answers p off limit count
+
+-- Skip the name field of an answer record. Could be a label sequence
+-- ending in 0, or a pointer (first byte's top 2 bits set).
+dns_skip_ans_name p off limit =
+  if off >= limit then 0 - 1
+  else
+    let b = byte_at p off
+    if b >= 192 then off + 2
+    else if b == 0 then off + 1
+    else dns_skip_ans_name p (off + 1 + b) limit
+
+-- ── Top level ─────────────────────────────────────────────────────
+
+dns_resolve_a host =
+  let server = dns_default_server 0
+  let fd = udp_socket 0
+  if fd < 0 then ""
+  else
+    let q = dns_build_query host
+    let qbuf = arr_get q 0
+    let qlen = arr_get q 1
+    let _ = dns_send_udp fd qbuf qlen server 53
+    let r = dns_recv_udp fd 512
+    let pp = arr_get r 0
+    let got = arr_get r 1
+    let _ = free qbuf
+    let ip = dns_parse_response pp got
+    let _ = free pp
+    let _ = close fd
+    ip
+
+dns_send_udp fd buf len ip port =
+  let sa = make_sockaddr_in port ip
+  let n = sendto fd buf len 0 sa sockaddr_in_size
+  let _ = free sa
+  n
+
+dns_recv_udp fd bufsize =
+  let buf = malloc bufsize
+  let sa = make_sockaddr_in 0 "0.0.0.0"
+  let alen = malloc 8
+  let _ = byte_set alen 0 sockaddr_in_size
+  let _ = byte_set alen 1 0
+  let _ = byte_set alen 2 0
+  let _ = byte_set alen 3 0
+  let n = recvfrom fd buf bufsize 0 sa alen
+  let _ = free alen
+  let _ = free sa
+  let r = arr_new 2 0
+  let _ = arr_set r 0 buf
+  let _ = arr_set r 1 n
+  r
