@@ -1,0 +1,610 @@
+-- stdlib/ecdsa_p256.rail — ECDSA verify on NIST P-256 (secp256r1).
+--
+-- Verify-only (no sign). Enough to validate a TLS 1.3 server's
+-- CertificateVerify signature against the cert's SubjectPublicKey.
+--
+-- Bignum representation: 16 × 16-bit limbs, little-endian. Each limb is
+-- a Rail int in [0, 65535]. A full 256-bit value = 16 limbs. Intermediate
+-- multiplication products use 32 limbs. Rail ints are 63-bit tagged, so
+-- 16×16 = 32-bit products stay comfortably in range.
+--
+-- Curve parameters (FIPS 186-4 D.1.2.3):
+--   p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+--   a = p - 3
+--   b = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
+--   n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+--   Gx = 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296
+--   Gy = 0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5
+--
+-- Point representation: Jacobian (X, Y, Z) with affine point = (X/Z^2, Y/Z^3).
+-- Identity element = Z=0 by convention.
+--
+-- Public API:
+--   ecdsa_p256_verify pub_x_bytes pub_y_bytes msg_hash_bytes sig_r_bytes sig_s_bytes -> int (1 = valid, 0 = invalid)
+--
+-- All byte arguments are 32-byte big-endian arrays.
+--
+-- Depends on hex_to_bytes from stdlib/bytes.rail — the caller must already
+-- have bytes.rail loaded (in practice always true, since anyone calling
+-- ecdsa came through sha256/tls stack which imports bytes transitively).
+
+-- ── Constants ─────────────────────────────────────────────────────────
+
+p256_limbs _ = 16
+
+-- Build a 16-limb bignum from a 32-byte big-endian byte array.
+p256_from_bytes bytes =
+  let x = arr_new 16 0
+  let _ = p256_fb bytes x 0
+  x
+
+p256_fb bytes x i =
+  if i >= 16 then 0
+  else
+    -- limb index i corresponds to bytes (30 - 2i) and (31 - 2i) in big-endian.
+    let hi = arr_get bytes (30 - 2 * i)
+    let lo = arr_get bytes (31 - 2 * i)
+    let _ = arr_set x i (hi * 256 + lo)
+    p256_fb bytes x (i + 1)
+
+-- Serialize a 16-limb bignum to 32-byte big-endian array.
+p256_to_bytes x =
+  let b = arr_new 32 0
+  let _ = p256_tb x b 0
+  b
+
+p256_tb x b i =
+  if i >= 16 then 0
+  else
+    let v = arr_get x i
+    let hi = shr v 8
+    let lo = bit_and v 255
+    let _ = arr_set b (30 - 2 * i) hi
+    let _ = arr_set b (31 - 2 * i) lo
+    p256_tb x b (i + 1)
+
+-- Allocate a new zero bignum.
+p256_new _ = arr_new 16 0
+
+-- Copy src → dst.
+p256_copy dst src =
+  let _ = p256_copy_at dst src 0
+  dst
+
+p256_copy_at dst src i =
+  if i >= 16 then 0
+  else
+    let _ = arr_set dst i (arr_get src i)
+    p256_copy_at dst src (i + 1)
+
+-- Compare a vs b: returns -1 / 0 / 1.
+p256_cmp a b = p256_cmp_at a b 15
+
+p256_cmp_at a b i =
+  if i < 0 then 0
+  else
+    let av = arr_get a i
+    let bv = arr_get b i
+    if av > bv then 1
+    else if av < bv then 0 - 1
+    else p256_cmp_at a b (i - 1)
+
+-- Is zero?
+p256_is_zero a = p256_iz_at a 0
+
+p256_iz_at a i =
+  if i >= 16 then 1
+  else if arr_get a i != 0 then 0
+  else p256_iz_at a (i + 1)
+
+-- Load curve constants. Built lazily via hex_to_bytes + p256_from_bytes.
+p256_load_p _ = p256_from_bytes (hex_to_bytes "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
+p256_load_n _ = p256_from_bytes (hex_to_bytes "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+p256_load_a _ = p256_from_bytes (hex_to_bytes "ffffffff00000001000000000000000000000000fffffffffffffffffffffffc")
+p256_load_b _ = p256_from_bytes (hex_to_bytes "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b")
+p256_load_gx _ = p256_from_bytes (hex_to_bytes "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+p256_load_gy _ = p256_from_bytes (hex_to_bytes "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+
+-- ── Unreduced bignum arithmetic ──────────────────────────────────────
+-- Add/sub operate on 16-limb numbers; overflow into a 17th "carry" limb.
+
+-- c = a + b. Returns carry-out (0 or 1).
+p256_uadd c a b = p256_uadd_at c a b 0 0
+
+p256_uadd_at c a b i carry =
+  if i >= 16 then carry
+  else
+    let s = arr_get a i + arr_get b i + carry
+    let new_c = shr s 16
+    let _ = arr_set c i (bit_and s 65535)
+    p256_uadd_at c a b (i + 1) new_c
+
+-- c = a - b. Returns borrow-out (0 or 1). If b > a, result wraps.
+p256_usub c a b = p256_usub_at c a b 0 0
+
+p256_usub_at c a b i borrow =
+  if i >= 16 then borrow
+  else
+    let d = arr_get a i - arr_get b i - borrow
+    let new_bor = if d < 0 then 1 else 0
+    let v = if d < 0 then d + 65536 else d
+    let _ = arr_set c i v
+    p256_usub_at c a b (i + 1) new_bor
+
+-- ── Modular arithmetic mod m (given a 16-limb modulus) ──────────────
+-- These assume inputs in [0, m). For mul, see p256_mul_mod.
+
+-- c = (a + b) mod m.
+p256_mod_add c a b m =
+  let carry = p256_uadd c a b
+  let tmp = p256_new 0
+  let borrow = p256_usub tmp c m
+  -- If there was a carry-out OR c >= m, subtract m (i.e., use tmp).
+  if carry == 1 then
+    let _ = p256_copy c tmp
+    c
+  else if borrow == 0 then
+    let _ = p256_copy c tmp
+    c
+  else c
+
+-- c = (a - b) mod m. Assumes a, b in [0, m).
+p256_mod_sub c a b m =
+  let borrow = p256_usub c a b
+  if borrow == 1 then
+    let tmp = p256_new 0
+    let _ = p256_uadd tmp c m
+    let _ = p256_copy c tmp
+    c
+  else c
+
+-- c = a mod m, where a is a "wide" bignum (32 limbs). Bit-by-bit long division.
+-- Mutates c.
+p256_wide_mod c a m =
+  let r = p256_new 0
+  let _ = p256_wm_loop r a m 511
+  let _ = p256_copy c r
+  c
+
+-- Shift r left by 1, add bit; conditionally subtract m.
+p256_wm_loop r a m bit_idx =
+  if bit_idx < 0 then 0
+  else
+    -- Shift r left by 1 (16-limb, with overflow into a 17th temp).
+    let carry = p256_shl1_out r
+    -- Add bit `bit_idx` of a into r[0].
+    let limb_idx = shr bit_idx 4
+    let bit_in_limb = bit_and bit_idx 15
+    let bit_val = bit_and (shr (arr_get a limb_idx) bit_in_limb) 1
+    let _ = arr_set r 0 (arr_get r 0 + bit_val)
+    -- Propagate carry from that addition.
+    let _ = p256_carry_fix r 0
+    -- If carry from shift OR r >= m, subtract m.
+    if carry == 1 then
+      let tmp = p256_new 0
+      let _ = p256_usub tmp r m
+      let _ = p256_copy r tmp
+      p256_wm_loop r a m (bit_idx - 1)
+    else
+      let tmp = p256_new 0
+      let bor = p256_usub tmp r m
+      if bor == 0 then
+        let _ = p256_copy r tmp
+        p256_wm_loop r a m (bit_idx - 1)
+      else p256_wm_loop r a m (bit_idx - 1)
+
+-- Shift r (16 limbs) left by 1 bit. Returns carry-out (bit pushed out of limb 15).
+p256_shl1_out r = p256_shl1_at r 0 0
+
+p256_shl1_at r i carry =
+  if i >= 16 then carry
+  else
+    let v = arr_get r i
+    let new_v = v * 2 + carry
+    let new_carry = shr new_v 16
+    let _ = arr_set r i (bit_and new_v 65535)
+    p256_shl1_at r (i + 1) new_carry
+
+-- Propagate a potentially-overflowing value at limb i up through subsequent limbs.
+p256_carry_fix r i =
+  if i >= 16 then 0
+  else
+    let v = arr_get r i
+    if v < 65536 then 0
+    else
+      let new_v = bit_and v 65535
+      let carry = shr v 16
+      let _ = arr_set r i new_v
+      let _ = arr_set r (i + 1) (arr_get r (i + 1) + carry)
+      p256_carry_fix r (i + 1)
+
+-- ── Schoolbook multiplication ─────────────────────────────────────────
+-- product c (32 limbs) = a (16 limbs) × b (16 limbs).
+
+p256_mul_raw c a b =
+  let _ = p256_mul_zero c 0
+  let _ = p256_mul_outer c a b 0
+  c
+
+p256_mul_zero c i =
+  if i >= 32 then 0
+  else
+    let _ = arr_set c i 0
+    p256_mul_zero c (i + 1)
+
+p256_mul_outer c a b i =
+  if i >= 16 then 0
+  else
+    let _ = p256_mul_inner c a b i 0 0
+    p256_mul_outer c a b (i + 1)
+
+-- For row i of a: accumulate a[i]*b[j] into c[i+j], propagating carry.
+p256_mul_inner c a b i j carry =
+  if j >= 16 then
+    let _ = arr_set c (i + 16) (arr_get c (i + 16) + carry)
+    let _ = p256_carry_fix c (i + 16)
+    0
+  else
+    let prod = arr_get a i * arr_get b j
+    let s = arr_get c (i + j) + prod + carry
+    let new_carry = shr s 16
+    let _ = arr_set c (i + j) (bit_and s 65535)
+    p256_mul_inner c a b i (j + 1) new_carry
+
+-- c = (a * b) mod m (m is 16-limb modulus).
+p256_mul_mod c a b m =
+  let wide = arr_new 32 0
+  let _ = p256_mul_raw wide a b
+  let _ = p256_wide_mod c wide m
+  c
+
+-- c = (a * a) mod m.
+p256_sqr_mod c a m = p256_mul_mod c a a m
+
+-- ── Modular inverse via Fermat's little theorem ──────────────────────
+-- a^(-1) mod p = a^(p - 2) mod p (since p is prime).
+-- Square-and-multiply over the bits of (p-2).
+
+p256_mod_inv c a m =
+  let exp = p256_new 0
+  let _ = p256_copy exp m
+  -- exp = m - 2.
+  let two = p256_new 0
+  let _ = arr_set two 0 2
+  let tmp = p256_new 0
+  let _ = p256_usub tmp exp two
+  let _ = p256_copy exp tmp
+  -- Initialize c = 1.
+  let _ = arr_set c 0 1
+  let _ = p256_zero_from c 1
+  -- Square-multiply from the MSB.
+  let _ = p256_pow_loop c a exp m 255
+  c
+
+p256_zero_from c i =
+  if i >= 16 then 0
+  else
+    let _ = arr_set c i 0
+    p256_zero_from c (i + 1)
+
+p256_pow_loop c base exp m bit_idx =
+  if bit_idx < 0 then 0
+  else
+    -- c = c^2 mod m
+    let tmp = p256_new 0
+    let _ = p256_sqr_mod tmp c m
+    let _ = p256_copy c tmp
+    let limb_idx = shr bit_idx 4
+    let bit_in_limb = bit_and bit_idx 15
+    let b = bit_and (shr (arr_get exp limb_idx) bit_in_limb) 1
+    if b == 1 then
+      let tmp2 = p256_new 0
+      let _ = p256_mul_mod tmp2 c base m
+      let _ = p256_copy c tmp2
+      p256_pow_loop c base exp m (bit_idx - 1)
+    else p256_pow_loop c base exp m (bit_idx - 1)
+
+-- ── Point operations (Jacobian) ───────────────────────────────────────
+-- Point stored as 3-element array [X, Y, Z] of 16-limb bignums.
+-- Identity = Z == 0.
+
+p256_point_new _ =
+  let x = p256_new 0
+  let y = p256_new 0
+  let z = p256_new 0
+  let pt = arr_new 3 0
+  let _ = arr_set pt 0 x
+  let _ = arr_set pt 1 y
+  let _ = arr_set pt 2 z
+  pt
+
+p256_point_copy dst src =
+  let _ = p256_copy (arr_get dst 0) (arr_get src 0)
+  let _ = p256_copy (arr_get dst 1) (arr_get src 1)
+  let _ = p256_copy (arr_get dst 2) (arr_get src 2)
+  dst
+
+p256_point_is_inf pt = p256_is_zero (arr_get pt 2)
+
+-- Point doubling in Jacobian coordinates (for curve y^2 = x^3 - 3x + b).
+-- Using the optimized formula for a = -3:
+--   S = 4 * X * Y^2
+--   M = 3 * (X - Z^2) * (X + Z^2)
+--   X' = M^2 - 2S
+--   Y' = M * (S - X') - 8 * Y^4
+--   Z' = 2 * Y * Z
+-- Reference: http://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-3.html#doubling-dbl-2001-b
+
+p256_point_dbl out pin =
+  let p = p256_load_p 0
+  let X = arr_get pin 0
+  let Y = arr_get pin 1
+  let Z = arr_get pin 2
+  if p256_is_zero Z == 1 then
+    let _ = p256_point_copy out pin
+    out
+  else
+    let Z2 = p256_new 0
+    let _ = p256_sqr_mod Z2 Z p
+    -- delta = Z^2
+    -- gamma = Y^2
+    let gamma = p256_new 0
+    let _ = p256_sqr_mod gamma Y p
+    -- beta = X * gamma
+    let beta = p256_new 0
+    let _ = p256_mul_mod beta X gamma p
+    -- alpha = 3 * (X - Z^2) * (X + Z^2)
+    let t1 = p256_new 0
+    let _ = p256_mod_sub t1 X Z2 p
+    let t2 = p256_new 0
+    let _ = p256_mod_add t2 X Z2 p
+    let t3 = p256_new 0
+    let _ = p256_mul_mod t3 t1 t2 p
+    let alpha = p256_new 0
+    let _ = p256_mod_add alpha t3 t3 p
+    let tmp_alpha = p256_new 0
+    let _ = p256_mod_add tmp_alpha alpha t3 p
+    let _ = p256_copy alpha tmp_alpha
+    -- X3 = alpha^2 - 8*beta
+    let alpha2 = p256_new 0
+    let _ = p256_sqr_mod alpha2 alpha p
+    let beta4 = p256_new 0
+    let _ = p256_mod_add beta4 beta beta p
+    let tmp = p256_new 0
+    let _ = p256_mod_add tmp beta4 beta4 p
+    let _ = p256_copy beta4 tmp
+    let beta8 = p256_new 0
+    let _ = p256_mod_add beta8 beta4 beta4 p
+    let X3 = arr_get out 0
+    let _ = p256_mod_sub X3 alpha2 beta8 p
+    -- Z3 = (Y + Z)^2 - gamma - delta
+    let YpZ = p256_new 0
+    let _ = p256_mod_add YpZ Y Z p
+    let YpZ2 = p256_new 0
+    let _ = p256_sqr_mod YpZ2 YpZ p
+    let t4 = p256_new 0
+    let _ = p256_mod_sub t4 YpZ2 gamma p
+    let Z3 = arr_get out 2
+    let _ = p256_mod_sub Z3 t4 Z2 p
+    -- Y3 = alpha * (4*beta - X3) - 8*gamma^2
+    let fourbeta_mX3 = p256_new 0
+    let _ = p256_mod_sub fourbeta_mX3 beta4 X3 p
+    let t5 = p256_new 0
+    let _ = p256_mul_mod t5 alpha fourbeta_mX3 p
+    let g2 = p256_new 0
+    let _ = p256_sqr_mod g2 gamma p
+    let g4 = p256_new 0
+    let _ = p256_mod_add g4 g2 g2 p
+    let tmp2 = p256_new 0
+    let _ = p256_mod_add tmp2 g4 g4 p
+    let _ = p256_copy g4 tmp2
+    let g8 = p256_new 0
+    let _ = p256_mod_add g8 g4 g4 p
+    let Y3 = arr_get out 1
+    let _ = p256_mod_sub Y3 t5 g8 p
+    out
+
+-- Point addition (mixed: P Jacobian + Q affine) — optimized for scalar
+-- mult where we keep G affine and Q Jacobian.
+-- Reference: EFD add-2007-bl (full Jacobian).
+-- We use full Jacobian add since Q from the signature is affine-loaded
+-- but u2*Q is Jacobian. We convert simpler by just using full Jac add.
+
+p256_point_add out pin qin =
+  let p = p256_load_p 0
+  if p256_is_zero (arr_get pin 2) == 1 then
+    let _ = p256_point_copy out qin
+    out
+  else if p256_is_zero (arr_get qin 2) == 1 then
+    let _ = p256_point_copy out pin
+    out
+  else
+    let X1 = arr_get pin 0
+    let Y1 = arr_get pin 1
+    let Z1 = arr_get pin 2
+    let X2 = arr_get qin 0
+    let Y2 = arr_get qin 1
+    let Z2 = arr_get qin 2
+    -- U1 = X1 * Z2^2
+    let Z2sq = p256_new 0
+    let _ = p256_sqr_mod Z2sq Z2 p
+    let U1 = p256_new 0
+    let _ = p256_mul_mod U1 X1 Z2sq p
+    -- U2 = X2 * Z1^2
+    let Z1sq = p256_new 0
+    let _ = p256_sqr_mod Z1sq Z1 p
+    let U2 = p256_new 0
+    let _ = p256_mul_mod U2 X2 Z1sq p
+    -- S1 = Y1 * Z2^3
+    let Z2cb = p256_new 0
+    let _ = p256_mul_mod Z2cb Z2sq Z2 p
+    let S1 = p256_new 0
+    let _ = p256_mul_mod S1 Y1 Z2cb p
+    -- S2 = Y2 * Z1^3
+    let Z1cb = p256_new 0
+    let _ = p256_mul_mod Z1cb Z1sq Z1 p
+    let S2 = p256_new 0
+    let _ = p256_mul_mod S2 Y2 Z1cb p
+    -- H = U2 - U1
+    let H = p256_new 0
+    let _ = p256_mod_sub H U2 U1 p
+    -- r = S2 - S1
+    let r = p256_new 0
+    let _ = p256_mod_sub r S2 S1 p
+    if p256_is_zero H == 1 then
+      if p256_is_zero r == 1 then
+        -- Same point — double.
+        let _ = p256_point_dbl out pin
+        out
+      else
+        -- Opposite point — return infinity.
+        let _ = arr_set (arr_get out 2) 0 0
+        let _ = p256_zero_from (arr_get out 2) 0
+        out
+    else
+      -- X3 = r^2 - H^3 - 2*U1*H^2
+      let Hsq = p256_new 0
+      let _ = p256_sqr_mod Hsq H p
+      let Hcb = p256_new 0
+      let _ = p256_mul_mod Hcb Hsq H p
+      let U1Hsq = p256_new 0
+      let _ = p256_mul_mod U1Hsq U1 Hsq p
+      let rsq = p256_new 0
+      let _ = p256_sqr_mod rsq r p
+      let t1 = p256_new 0
+      let _ = p256_mod_sub t1 rsq Hcb p
+      let U1Hsq2 = p256_new 0
+      let _ = p256_mod_add U1Hsq2 U1Hsq U1Hsq p
+      let X3 = arr_get out 0
+      let _ = p256_mod_sub X3 t1 U1Hsq2 p
+      -- Y3 = r * (U1*H^2 - X3) - S1 * H^3
+      let diff = p256_new 0
+      let _ = p256_mod_sub diff U1Hsq X3 p
+      let t2 = p256_new 0
+      let _ = p256_mul_mod t2 r diff p
+      let t3 = p256_new 0
+      let _ = p256_mul_mod t3 S1 Hcb p
+      let Y3 = arr_get out 1
+      let _ = p256_mod_sub Y3 t2 t3 p
+      -- Z3 = Z1 * Z2 * H
+      let Z1Z2 = p256_new 0
+      let _ = p256_mul_mod Z1Z2 Z1 Z2 p
+      let Z3 = arr_get out 2
+      let _ = p256_mul_mod Z3 Z1Z2 H p
+      out
+
+-- Convert Jacobian (X, Y, Z) back to affine (x, y). Fails if Z == 0.
+p256_to_affine ax ay pt =
+  let p = p256_load_p 0
+  let Z = arr_get pt 2
+  if p256_is_zero Z == 1 then 0
+  else
+    let Zinv = p256_new 0
+    let _ = p256_mod_inv Zinv Z p
+    let Zinv2 = p256_new 0
+    let _ = p256_sqr_mod Zinv2 Zinv p
+    let Zinv3 = p256_new 0
+    let _ = p256_mul_mod Zinv3 Zinv2 Zinv p
+    let _ = p256_mul_mod ax (arr_get pt 0) Zinv2 p
+    let _ = p256_mul_mod ay (arr_get pt 1) Zinv3 p
+    1
+
+-- Scalar multiplication via double-and-add (walking k MSB→LSB).
+-- out = k * P. k is a 16-limb bignum.
+p256_scalar_mul out k pt =
+  -- Initialize out as identity (Z = 0).
+  let _ = arr_set (arr_get out 2) 0 0
+  let _ = p256_zero_from (arr_get out 2) 0
+  let _ = p256_zero_from (arr_get out 0) 0
+  let _ = p256_zero_from (arr_get out 1) 0
+  let _ = p256_sm_loop out k pt 255
+  out
+
+p256_sm_loop out k pt bit_idx =
+  if bit_idx < 0 then 0
+  else
+    -- out = 2 * out
+    let tmp = p256_point_new 0
+    let _ = p256_point_dbl tmp out
+    let _ = p256_point_copy out tmp
+    -- if bit(k, i) == 1: out = out + pt
+    let limb_idx = shr bit_idx 4
+    let bit_in_limb = bit_and bit_idx 15
+    let b = bit_and (shr (arr_get k limb_idx) bit_in_limb) 1
+    if b == 1 then
+      let tmp2 = p256_point_new 0
+      let _ = p256_point_add tmp2 out pt
+      let _ = p256_point_copy out tmp2
+      p256_sm_loop out k pt (bit_idx - 1)
+    else p256_sm_loop out k pt (bit_idx - 1)
+
+-- ── ECDSA verify ───────────────────────────────────────────────────────
+-- Inputs:
+--   pub_x, pub_y   (32-byte big-endian) — public key affine coords
+--   hash_bytes     (32-byte big-endian) — SHA-256(message)
+--   r_bytes, s_bytes (32-byte big-endian) — signature components
+-- Returns 1 if valid, 0 otherwise.
+
+ecdsa_p256_verify pub_x_bytes pub_y_bytes hash_bytes r_bytes s_bytes =
+  let n = p256_load_n 0
+  let p = p256_load_p 0
+  let r = p256_from_bytes r_bytes
+  let s = p256_from_bytes s_bytes
+  -- Range check: 1 <= r < n and 1 <= s < n.
+  if p256_is_zero r == 1 then 0
+  else if p256_is_zero s == 1 then 0
+  else if p256_cmp r n >= 0 then 0
+  else if p256_cmp s n >= 0 then 0
+  else
+    let e = p256_from_bytes hash_bytes
+    -- Reduce e mod n (in case hash > n, which can happen for SHA-256).
+    let tmp = p256_new 0
+    let bor = p256_usub tmp e n
+    if bor == 0 then
+      let _ = p256_copy e tmp
+      ecdsa_p256_verify_core e r s pub_x_bytes pub_y_bytes
+    else ecdsa_p256_verify_core e r s pub_x_bytes pub_y_bytes
+
+ecdsa_p256_verify_core e r s pub_x_bytes pub_y_bytes =
+  let n = p256_load_n 0
+  let p = p256_load_p 0
+  -- w = s^-1 mod n
+  let w = p256_new 0
+  let _ = p256_mod_inv w s n
+  -- u1 = e * w mod n
+  let u1 = p256_new 0
+  let _ = p256_mul_mod u1 e w n
+  -- u2 = r * w mod n
+  let u2 = p256_new 0
+  let _ = p256_mul_mod u2 r w n
+  -- Load G and Q as Jacobian points with Z = 1.
+  let Gpt = p256_point_new 0
+  let _ = p256_copy (arr_get Gpt 0) (p256_load_gx 0)
+  let _ = p256_copy (arr_get Gpt 1) (p256_load_gy 0)
+  let _ = arr_set (arr_get Gpt 2) 0 1
+  let Qpt = p256_point_new 0
+  let _ = p256_copy (arr_get Qpt 0) (p256_from_bytes pub_x_bytes)
+  let _ = p256_copy (arr_get Qpt 1) (p256_from_bytes pub_y_bytes)
+  let _ = arr_set (arr_get Qpt 2) 0 1
+  -- u1*G
+  let u1G = p256_point_new 0
+  let _ = p256_scalar_mul u1G u1 Gpt
+  -- u2*Q
+  let u2Q = p256_point_new 0
+  let _ = p256_scalar_mul u2Q u2 Qpt
+  -- Sum
+  let R = p256_point_new 0
+  let _ = p256_point_add R u1G u2Q
+  if p256_point_is_inf R == 1 then 0
+  else
+    -- x1 = X3 / Z3^2 mod p, then x1 mod n compared to r.
+    let ax = p256_new 0
+    let ay = p256_new 0
+    let _ = p256_to_affine ax ay R
+    -- Reduce ax mod n.
+    let tmp = p256_new 0
+    let bor = p256_usub tmp ax n
+    if bor == 0 then
+      if p256_cmp tmp r == 0 then 1 else 0
+    else
+      if p256_cmp ax r == 0 then 1 else 0
