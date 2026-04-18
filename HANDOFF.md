@@ -176,8 +176,39 @@ The next session after `260aebc`/`79ac9ce` (this HANDOFF) continued the work and
 
 **Merge criteria status:** full suite tests running (aim: 137/137 green, t131 harness hang tolerated if the current build avoids it); 2-pass self-compile TBD; live https_get against api.anthropic.com DONE. After all three, ready to fast-forward `next-v2.10`.
 
-**Known carry-over limits for Layer 8+:**
-- Caller resolves DNS (no in-tree resolver).
-- CertificateVerify must be ECDSA-P256-SHA256 only. RSA-PSS/PKCS1 unsupported — most modern server certs are P-256 so this works in practice, but a multi-alg Layer 6d would broaden compat.
-- No cert chain walking / name validation. A single leaf's signature is verified against its own embedded SubjectPublicKey — a self-signed leaf would "verify" with this model. Add chain + name checks before trusting for anything load-bearing.
-- Two back-to-back `ecdsa_p256_verify` calls in one process hang on arena/GC pressure. Real TLS is one-verify-per-connection so it's a non-issue; just don't write two-verifies-per-test.
+---
+
+## Addendum 2 — same-day session: Layers 8a-c + 9a + 9b primitives
+
+Continued straight after the merge into `next-v2.10`. Branch is now linear from `master` if you fast-forward.
+
+| Layer | Commit | Delta |
+|---|---|---|
+| 8a | `a1d702e` | SubjectAltName / hostname validation. `asn1_find_extension` + `cv_validate_hostname` (RFC 6125 §6.4.3, leftmost-label wildcard). FSM grows `expected_host` arg. Captured api.anthropic.com cert tests: api → 1, evil.com → 0, API.ANTHROPIC.COM → 1, anthropic.com → 0. Captured cloudflare.com wildcard cert: foo.ns.cloudflare.com → 1, a.b.ns.cloudflare.com → 0. |
+| 8b | `bed1f2c` | RSA-PSS-SHA256 (sig_alg 0x0804). New `stdlib/bignum_n.rail` (parameterised n-limb 16-bit-per-limb arith) + `stdlib/rsa_pss.rail` (MGF1 + EMSA-PSS-VERIFY). `cv_extract_rsa_pubkey` + sig_alg dispatch in `tls13_cert_verify_sig`. **Live `https_get` to www.amazon.com (RSA leaf): real HTTP 200** with x-amz-rid + set-cookie in ~3.3s. RSA verify ~0.3s steady-state — actually faster than ECDSA because e=65537 is only 17 bits. |
+| 8c | `e1fd392` | `stdlib/dns.rail` (UDP A-record query to /etc/resolv.conf's first nameserver) + `https_get_url url` in https_client.rail. `https_get_url "https://api.anthropic.com/"` → HTTP 404 in 5.8s, full DNS+TLS+HTTP. |
+| 9a | `fc05287` | Cert validity period (notBefore / notAfter). `asn1_find_validity` + `cv_decode_time` (UTCTime / GeneralizedTime → 14-digit YYYYMMDDHHMMSS int). Now read via `date -u`. `cv_post_sig_checks` combines period + hostname into a single FSM gate call. |
+| 9b primitives | `114e05a` | Cert-chain edge verifier. `cv_verify_cert_by lower upper` dispatches on sigAlg (sha256WithRSA → PKCS1, ecdsa-with-SHA256 → ECDSA). New `rsa_pkcs1_v15_verify_sha256` for CA chain RSA sigs. Issuer/Subject TLV extraction + name byte-equal compare. `tls13_parse_cert_chain` walks all certs in the cert_list. **Real captured chain test**: api.anthropic.com leaf (931B ECDSA-SHA256) verified against WE1 intermediate (675B). NOT yet wired into the FSM gate — see Layer 9c carry-over below. |
+
+**Self-compile fixed point**: ✓ byte-identical, re-verified post-Layer-9a (compile.rail unchanged this session, all additions are stdlib).
+
+**Test sweep — 12/12 TLS tests green**:
+```
+asn1_cert_test           cert_verify_ecdsa_test    cert_verify_rsa_pss_test
+chain_edge_test          dns_resolve_test          ecdsa_p256_negative_test
+ecdsa_p256_rfc6979_test  https_smoke_test          https_url_test
+p256_bignum_test         rfc8448_trace_test        san_match_test
+```
+
+**Layer 9c carry-over (not in this session — meaningful work):**
+
+1. **SHA-384** as a stdlib module. Needed for ECDSA-with-SHA384 (e.g. Google Trust Services WE1 intermediate signed by GTS Root R4 with SHA-384). SHA-384 = SHA-512 truncated; SHA-512 needs 64-bit word ops, which is fiddly in Rail's 63-bit tagged ints (need to split each word into 32-bit halves and chain carries). Probably ~300 lines.
+2. **CA trust store**. Parse macOS `/etc/ssl/cert.pem` (or Mozilla bundle). Need a minimal PEM block iterator + base64 decoder (~100 lines combined). Index by Subject. ~150 root certs ≈ 300KB DER total.
+3. **Full chain walk wired to FSM**. `cv_walk_full_chain` calls `cv_verify_cert_by` for every adjacent pair in the cert_list, then matches the topmost cert's Issuer against the trust store and verifies that final edge with the matched root's pubkey. Add a `verify_cert=2` mode (vs current `=1` signature-only).
+
+Until 9c, the FSM trust posture is: leaf's CertificateVerify sig verifies + leaf's SAN matches the SNI + cert is currently within its validity window. An attacker who possesses ANY valid leaf cert for the SNI you connected to would still pass — chain walking is the gap.
+
+Other carry-overs (lower priority):
+- HTTP keep-alive / multi-request per connection.
+- Streaming response body (current is O(N²) join "" capped ~64KB).
+- ECDSA-P384 / EdDSA sig algorithms.
