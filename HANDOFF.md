@@ -212,3 +212,37 @@ Other carry-overs (lower priority):
 - HTTP keep-alive / multi-request per connection.
 - Streaming response body (current is O(N²) join "" capped ~64KB).
 - ECDSA-P384 / EdDSA sig algorithms.
+
+---
+
+## Addendum 3 — same-day session: SHA-512/384 + RSA-PKCS1 + Trust store + Chain walker
+
+Continued straight from `078cecd`. Five commits land the rest of the cryptographic + trust-walk plumbing.
+
+| Layer | Commit | Delta |
+|---|---|---|
+| sha512 | `2c1c162` | `stdlib/sha512.rail` — SHA-512 + SHA-384 (FIPS 180-4). 64-bit words emulated as (hi32, lo32) limb pairs in int arrays. NIST vectors for SHA-384("abc"), SHA-512("abc"), SHA-512("") all exact. |
+| 9b ext | `08eaa60` | ecdsa-with-SHA384 dispatch in `cv_verify_cert_by` — feeds SHA-384(TBS) truncated to 32 bytes into ecdsa_p256_verify (FIPS 186-4 §6.4 leftmost-bits truncation). Works for ECDSA-with-SHA384 sigs over P-256 issuer pubkeys. P-384 issuer pubkeys still unsupported (carry-over). |
+| pkcs1 | `09e139e` (also includes b64+pem) | `rsa_pkcs1_v15_verify_sha256` — RFC 8017 §8.2.2. Recovers EM via modexp, validates 0x00 0x01 [PS:0xFF…] 0x00 layout, checks DigestInfo prefix + SHA-256 hash. Used for CA chain RSA sigs (most CDN intermediates). Synthetic 2048-bit test → valid=1 in 0.3s. |
+| b64+pem | `09e139e` | `stdlib/b64.rail` (fast char_to_int-based decoder, ~70 lines, replaces shell-per-char base64.rail) + `stdlib/pem.rail` — `pem_load_trust_store path` reads /etc/ssl/cert.pem, returns 128 cert byte-arrays in ~1.5s. `ts_find_by_subject` looks up by Subject TLV byte-equality. Demonstrated: api.anthropic.com chain[2] (GTS R4 cross-sign) verified against GlobalSign Root CA (idx 58/128 in store) via RSA-PKCS1-SHA256. |
+| chain | `5a1cc6c` | `stdlib/cert_chain.rail` — `cc_walk_chain` with shortest-path policy: at each cert, first try issuer-in-store, fall back to next-cert-in-chain. Pulled into its own module to dodge the cert_verify size-hang. **First end-to-end pure-Rail chain to CA root: www.amazon.com → DigiCert Global Root G2 in 5.9s.** Anthropic chain still gated by P-384 (correctly returns 0). |
+
+**Test sweep — 18/18 TLS tests green** (was 12 in Addendum 2):
+
+```
+asn1_cert_test           cert_verify_ecdsa_test    cert_verify_rsa_pss_test
+chain_edge_test          chain_sha384_test         chain_walk_amazon_test
+chain_walk_test          dns_resolve_test          ecdsa_p256_negative_test
+ecdsa_p256_rfc6979_test  https_smoke_test          https_url_test
+p256_bignum_test         rfc8448_trace_test        san_match_test
+sha512_nist_test         trust_chain_root_test     trust_store_test
+b64_test
+```
+
+**Final Layer 9 carry-over** (didn't finish in this session):
+
+1. **`stdlib/ecdsa_p384.rail`** — closes the GTS Root R4 / Cloudflare ECDSA-P384 chains. P-384 is structurally similar to P-256 (Jacobian curve, same dbl/add formulas) but uses 24×16-bit limb bignums instead of 16. ~600 lines. Once shipped, the Anthropic chain test should flip from "graceful 0" to "valid 1".
+
+2. **FSM `verify_cert=2` mode** — fold `cc_walk_chain` into `tls13_client_handshake_offline`. Needs the FSM to load the trust store once (probably lazily, cached) and to parse the multi-cert `tls13_parse_cert_chain` (already shipped) instead of just the first cert. Strict end-user trust enforcement.
+
+3. **Lower-priority**: HTTP keep-alive, streaming response body, ECDSA-P521, EdDSA.
