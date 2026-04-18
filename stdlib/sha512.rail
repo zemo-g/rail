@@ -1,0 +1,359 @@
+-- stdlib/sha512.rail — SHA-512 / SHA-384 (FIPS 180-4 §6.2 / §6.4).
+--
+-- Used by Layer 9c chain walking to verify ECDSA-with-SHA384 sigs that
+-- show up on modern CA chains (Google Trust Services WE1 → GTS Root R4
+-- and friends).
+--
+-- Rail's tagged ints are 63 bits, so each 64-bit SHA-512 word lives in
+-- two adjacent int-array slots:
+--   word i → arr[2*i]   = high 32 bits
+--           arr[2*i+1] = low  32 bits
+-- All ops mask to 32 bits after each step.
+--
+-- Storage:
+--   state H[8]              → 16 limbs
+--   message schedule W[80]  → 160 limbs
+--   K constants K[80]       → 160 limbs
+--   working a..h            → 16 limbs
+--
+-- Public API:
+--   sha512_bytes buf n -> 64-byte int array
+--   sha384_bytes buf n -> 48-byte int array (truncated SHA-512)
+--
+-- Caller must have stdlib/bytes.rail loaded (for hex_to_bytes +
+-- arr/sha_copy_bytes helpers); typical via tls13/sha256 chain.
+
+-- ── 32-bit op helpers ────────────────────────────────────────────────
+
+s5_and32 a b = bit_and (bit_and a b) 4294967295
+s5_or32  a b = bit_and (bit_or  a b) 4294967295
+s5_xor32 a b = bit_and (bit_xor a b) 4294967295
+s5_add32 a b = bit_and (a + b) 4294967295
+s5_shr32 x n = bit_and (shr x n) 4294967295
+s5_shl32 x n = bit_and (shl x n) 4294967295
+
+-- ── 64-bit (hi32, lo32) word ops in-place on int arrays ──────────────
+
+s5_w_xor dst di a ai b bi =
+  let _ = arr_set dst di       (s5_xor32 (arr_get a ai)       (arr_get b bi))
+  let _ = arr_set dst (di + 1) (s5_xor32 (arr_get a (ai + 1)) (arr_get b (bi + 1)))
+  0
+
+s5_w_and dst di a ai b bi =
+  let _ = arr_set dst di       (s5_and32 (arr_get a ai)       (arr_get b bi))
+  let _ = arr_set dst (di + 1) (s5_and32 (arr_get a (ai + 1)) (arr_get b (bi + 1)))
+  0
+
+-- 64-bit ADD with carry from low to high half.
+s5_w_add dst di a ai b bi =
+  let s_lo = arr_get a (ai + 1) + arr_get b (bi + 1)
+  let new_lo = bit_and s_lo 4294967295
+  let carry = s5_shr32 s_lo 32
+  let s_hi = arr_get a ai + arr_get b bi + carry
+  let _ = arr_set dst di       (bit_and s_hi 4294967295)
+  let _ = arr_set dst (di + 1) new_lo
+  0
+
+-- 64-bit ROTR(n) for 1 <= n <= 63. Splits into <32 / ==32 / >32 cases.
+s5_w_rotr dst di a ai n =
+  if n == 32 then
+    let lo_in = arr_get a (ai + 1)
+    let hi_in = arr_get a ai
+    let _ = arr_set dst di       lo_in
+    let _ = arr_set dst (di + 1) hi_in
+    0
+  else if n < 32 then
+    let lo_in = arr_get a (ai + 1)
+    let hi_in = arr_get a ai
+    let new_hi = s5_or32 (s5_shr32 hi_in n) (s5_shl32 lo_in (32 - n))
+    let new_lo = s5_or32 (s5_shr32 lo_in n) (s5_shl32 hi_in (32 - n))
+    let _ = arr_set dst di       new_hi
+    let _ = arr_set dst (di + 1) new_lo
+    0
+  else
+    -- n > 32: rotate by 32 (swap halves) then by n-32 (small rotate).
+    let m = n - 32
+    let lo_in = arr_get a (ai + 1)
+    let hi_in = arr_get a ai
+    let new_lo = s5_or32 (s5_shr32 hi_in m) (s5_shl32 lo_in (32 - m))
+    let new_hi = s5_or32 (s5_shr32 lo_in m) (s5_shl32 hi_in (32 - m))
+    let _ = arr_set dst di       new_hi
+    let _ = arr_set dst (di + 1) new_lo
+    0
+
+-- 64-bit logical SHR(n) for 1 <= n <= 63.
+s5_w_shr dst di a ai n =
+  if n >= 32 then
+    let _ = arr_set dst di 0
+    let _ = arr_set dst (di + 1) (s5_shr32 (arr_get a ai) (n - 32))
+    0
+  else
+    let new_hi = s5_shr32 (arr_get a ai) n
+    let cross = s5_shl32 (arr_get a ai) (32 - n)
+    let new_lo = s5_or32 (s5_shr32 (arr_get a (ai + 1)) n) cross
+    let _ = arr_set dst di       new_hi
+    let _ = arr_set dst (di + 1) new_lo
+    0
+
+-- ── Constant tables ─────────────────────────────────────────────────
+
+s5_k_hex _ = "428a2f98d728ae227137449123ef65cdb5c0fbcfec4d3b2fe9b5dba58189dbbc3956c25bf348b53859f111f1b605d019923f82a4af194f9bab1c5ed5da6d8118d807aa98a303024212835b0145706fbe243185be4ee4b28c550c7dc3d5ffb4e272be5d74f27b896f80deb1fe3b1696b19bdc06a725c71235c19bf174cf692694e49b69c19ef14ad2efbe4786384f25e30fc19dc68b8cd5b5240ca1cc77ac9c652de92c6f592b02754a7484aa6ea6e4835cb0a9dcbd41fbd476f988da831153b5983e5152ee66dfaba831c66d2db43210b00327c898fb213fbf597fc7beef0ee4c6e00bf33da88fc2d5a79147930aa72506ca6351e003826f142929670a0e6e7027b70a8546d22ffc2e1b21385c26c9264d2c6dfc5ac42aed53380d139d95b3df650a73548baf63de766a0abb3c77b2a881c2c92e47edaee692722c851482353ba2bfe8a14cf10364a81a664bbc423001c24b8b70d0f89791c76c51a30654be30d192e819d6ef5218d69906245565a910f40e35855771202a106aa07032bbd1b819a4c116b8d2d0c81e376c085141ab532748774cdf8eeb9934b0bcb5e19b48a8391c0cb3c5c95a634ed8aa4ae3418acb5b9cca4f7763e373682e6ff3d6b2b8a3748f82ee5defb2fc78a5636f43172f6084c87814a1f0ab728cc702081a6439ec90befffa23631e28a4506cebde82bde9bef9a3f7b2c67915c67178f2e372532bca273eceea26619cd186b8c721c0c207eada7dd6cde0eb1ef57d4f7fee6ed17806f067aa72176fba0a637dc5a2c898a6113f9804bef90dae1b710b35131c471b28db77f523047d8432caab7b40c724933c9ebe0a15c9bebc431d67c49c100d4c4cc5d4becb3e42b6597f299cfc657e2a5fcb6fab3ad6faec6c44198c4a475817"
+
+s5_h512_hex _ = "6a09e667f3bcc908bb67ae8584caa73b3c6ef372fe94f82ba54ff53a5f1d36f1510e527fade682d19b05688c2b3e6c1f1f83d9abfb41bd6b5be0cd19137e2179"
+s5_h384_hex _ = "cbbb9d5dc1059ed8629a292a367cd5079159015a3070dd17152fecd8f70e593967332667ffc00b318eb44a8768581511db0c2e0d64f98fa747b5481dbefa4fa4"
+
+-- Convert n_words 64-bit big-endian byte words at bytes[off..] into limb-pair
+-- slots in dst[base..base+2*n_words).
+s5_bytes_to_words bytes off dst base n_words =
+  if n_words == 0 then 0
+  else
+    let hi = ((arr_get bytes off) * 16777216) + ((arr_get bytes (off + 1)) * 65536) + ((arr_get bytes (off + 2)) * 256) + (arr_get bytes (off + 3))
+    let lo = ((arr_get bytes (off + 4)) * 16777216) + ((arr_get bytes (off + 5)) * 65536) + ((arr_get bytes (off + 6)) * 256) + (arr_get bytes (off + 7))
+    let _ = arr_set dst base       hi
+    let _ = arr_set dst (base + 1) lo
+    s5_bytes_to_words bytes (off + 8) dst (base + 2) (n_words - 1)
+
+s5_load_k _ =
+  let bytes = hex_to_bytes (s5_k_hex 0)
+  let k = arr_new 160 0
+  let _ = s5_bytes_to_words bytes 0 k 0 80
+  k
+
+s5_load_h hex_fn =
+  let bytes = hex_to_bytes (hex_fn 0)
+  let h = arr_new 16 0
+  let _ = s5_bytes_to_words bytes 0 h 0 8
+  h
+
+-- ── Compression function ─────────────────────────────────────────
+-- σ0(x) = ROTR1 ^ ROTR8 ^ SHR7
+-- σ1(x) = ROTR19 ^ ROTR61 ^ SHR6
+-- Σ0(x) = ROTR28 ^ ROTR34 ^ ROTR39
+-- Σ1(x) = ROTR14 ^ ROTR18 ^ ROTR41
+-- Ch(x,y,z) = (x AND y) XOR ((NOT x) AND z)
+-- Maj(x,y,z) = (x AND y) XOR (x AND z) XOR (y AND z)
+
+-- Compute σ0 of W[i_in_words], store in tmp[ti].
+s5_sigma0 tmp ti w wi =
+  let r1 = arr_new 2 0
+  let r2 = arr_new 2 0
+  let r3 = arr_new 2 0
+  let _ = s5_w_rotr r1 0 w wi 1
+  let _ = s5_w_rotr r2 0 w wi 8
+  let _ = s5_w_shr  r3 0 w wi 7
+  let _ = s5_w_xor tmp ti r1 0 r2 0
+  let _ = s5_w_xor tmp ti tmp ti r3 0
+  0
+
+s5_sigma1 tmp ti w wi =
+  let r1 = arr_new 2 0
+  let r2 = arr_new 2 0
+  let r3 = arr_new 2 0
+  let _ = s5_w_rotr r1 0 w wi 19
+  let _ = s5_w_rotr r2 0 w wi 61
+  let _ = s5_w_shr  r3 0 w wi 6
+  let _ = s5_w_xor tmp ti r1 0 r2 0
+  let _ = s5_w_xor tmp ti tmp ti r3 0
+  0
+
+s5_bigsig0 tmp ti w wi =
+  let r1 = arr_new 2 0
+  let r2 = arr_new 2 0
+  let r3 = arr_new 2 0
+  let _ = s5_w_rotr r1 0 w wi 28
+  let _ = s5_w_rotr r2 0 w wi 34
+  let _ = s5_w_rotr r3 0 w wi 39
+  let _ = s5_w_xor tmp ti r1 0 r2 0
+  let _ = s5_w_xor tmp ti tmp ti r3 0
+  0
+
+s5_bigsig1 tmp ti w wi =
+  let r1 = arr_new 2 0
+  let r2 = arr_new 2 0
+  let r3 = arr_new 2 0
+  let _ = s5_w_rotr r1 0 w wi 14
+  let _ = s5_w_rotr r2 0 w wi 18
+  let _ = s5_w_rotr r3 0 w wi 41
+  let _ = s5_w_xor tmp ti r1 0 r2 0
+  let _ = s5_w_xor tmp ti tmp ti r3 0
+  0
+
+-- Ch(x,y,z) = (x AND y) XOR ((NOT x) AND z) — uses (x AND y) XOR (z AND NOT x).
+s5_ch tmp ti x xi y yi z zi =
+  let a = arr_new 2 0
+  let b = arr_new 2 0
+  let nx = arr_new 2 0
+  let _ = s5_w_and a 0 x xi y yi
+  let _ = arr_set nx 0 (s5_xor32 (arr_get x xi) 4294967295)
+  let _ = arr_set nx 1 (s5_xor32 (arr_get x (xi + 1)) 4294967295)
+  let _ = s5_w_and b 0 nx 0 z zi
+  let _ = s5_w_xor tmp ti a 0 b 0
+  0
+
+-- Maj(x,y,z) = (x AND y) XOR (x AND z) XOR (y AND z)
+s5_maj tmp ti x xi y yi z zi =
+  let a = arr_new 2 0
+  let b = arr_new 2 0
+  let c = arr_new 2 0
+  let _ = s5_w_and a 0 x xi y yi
+  let _ = s5_w_and b 0 x xi z zi
+  let _ = s5_w_and c 0 y yi z zi
+  let _ = s5_w_xor tmp ti a 0 b 0
+  let _ = s5_w_xor tmp ti tmp ti c 0
+  0
+
+-- Process one 128-byte block. Updates state h (16 limbs) in place.
+s5_process_block h block k =
+  let w = arr_new 160 0
+  -- W[0..15] from the block bytes.
+  let _ = s5_bytes_to_words block 0 w 0 16
+  -- W[16..79] = σ1(W[i-2]) + W[i-7] + σ0(W[i-15]) + W[i-16].
+  let _ = s5_extend_w w 16
+  -- Working vars a..h = state h.
+  let v = arr_new 16 0
+  let _ = sha_copy_bytes h v 0 0 16
+  let _ = s5_round_loop v w k 0
+  -- Add v back to state h.
+  let _ = s5_add_state h v
+  0
+
+s5_extend_w w i =
+  if i >= 80 then 0
+  else
+    let s0 = arr_new 2 0
+    let s1 = arr_new 2 0
+    let _ = s5_sigma0 s0 0 w ((i - 15) * 2)
+    let _ = s5_sigma1 s1 0 w ((i - 2) * 2)
+    let t = arr_new 2 0
+    let _ = s5_w_add t 0 s1 0 w ((i - 7) * 2)
+    let _ = s5_w_add t 0 t 0 s0 0
+    let _ = s5_w_add t 0 t 0 w ((i - 16) * 2)
+    let _ = arr_set w (i * 2)       (arr_get t 0)
+    let _ = arr_set w (i * 2 + 1)   (arr_get t 1)
+    s5_extend_w w (i + 1)
+
+s5_round_loop v w k i =
+  if i >= 80 then 0
+  else
+    let t1 = arr_new 2 0
+    let t2 = arr_new 2 0
+    -- T1 = h + Σ1(e) + Ch(e,f,g) + K[i] + W[i]
+    let bs1 = arr_new 2 0
+    let _ = s5_bigsig1 bs1 0 v 8       -- Σ1(e); v[8..9]=e
+    let ch = arr_new 2 0
+    let _ = s5_ch ch 0 v 8 v 10 v 12   -- Ch(e,f,g); v[10..11]=f, v[12..13]=g
+    let _ = s5_w_add t1 0 v 14 bs1 0   -- t1 = h + Σ1(e); v[14..15]=h
+    let _ = s5_w_add t1 0 t1 0 ch 0
+    let _ = s5_w_add t1 0 t1 0 k (i * 2)
+    let _ = s5_w_add t1 0 t1 0 w (i * 2)
+    -- T2 = Σ0(a) + Maj(a,b,c)
+    let bs0 = arr_new 2 0
+    let _ = s5_bigsig0 bs0 0 v 0       -- Σ0(a); v[0..1]=a
+    let mj = arr_new 2 0
+    let _ = s5_maj mj 0 v 0 v 2 v 4    -- Maj(a,b,c)
+    let _ = s5_w_add t2 0 bs0 0 mj 0
+    -- Shift: h=g, g=f, f=e, e=d+T1, d=c, c=b, b=a, a=T1+T2.
+    let _ = sha_copy_bytes v v 12 14 2  -- h ← g
+    let _ = sha_copy_bytes v v 10 12 2  -- g ← f
+    let _ = sha_copy_bytes v v 8  10 2  -- f ← e
+    let new_e = arr_new 2 0
+    let _ = s5_w_add new_e 0 v 6 t1 0   -- e ← d + T1
+    let _ = sha_copy_bytes v v 4 6 2    -- d ← c
+    let _ = sha_copy_bytes v v 2 4 2    -- c ← b
+    let _ = sha_copy_bytes v v 0 2 2    -- b ← a
+    let new_a = arr_new 2 0
+    let _ = s5_w_add new_a 0 t1 0 t2 0  -- a ← T1 + T2
+    let _ = arr_set v 0 (arr_get new_a 0)
+    let _ = arr_set v 1 (arr_get new_a 1)
+    let _ = arr_set v 8 (arr_get new_e 0)
+    let _ = arr_set v 9 (arr_get new_e 1)
+    s5_round_loop v w k (i + 1)
+
+s5_add_state h v = s5_add_state_at h v 0
+
+s5_add_state_at h v i =
+  if i >= 8 then 0
+  else
+    let _ = s5_w_add h (i * 2) h (i * 2) v (i * 2)
+    s5_add_state_at h v (i + 1)
+
+-- ── Padding + multi-block driver ────────────────────────────────────
+-- SHA-512 padding: append 0x80, then zeros, then 128-bit length in bits
+-- (big-endian) so total length ≡ 0 mod 128 bytes.
+-- For inputs < 2^61 bytes, the upper 64 bits of the length field are 0.
+
+s5_padded_len n =
+  let r = (n + 17) % 128
+  if r == 0 then n + 17
+  else n + 17 + (128 - r)
+
+s5_pad_bytes buf n =
+  let total = s5_padded_len n
+  let out = arr_new total 0
+  let _ = sha_copy_bytes buf out 0 0 n
+  let _ = arr_set out n 128
+  -- Upper 64 bits of length stay 0.
+  let bits = n * 8
+  let _ = arr_set out (total - 8) (bit_and (shr bits 56) 255)
+  let _ = arr_set out (total - 7) (bit_and (shr bits 48) 255)
+  let _ = arr_set out (total - 6) (bit_and (shr bits 40) 255)
+  let _ = arr_set out (total - 5) (bit_and (shr bits 32) 255)
+  let _ = arr_set out (total - 4) (bit_and (shr bits 24) 255)
+  let _ = arr_set out (total - 3) (bit_and (shr bits 16) 255)
+  let _ = arr_set out (total - 2) (bit_and (shr bits 8)  255)
+  let _ = arr_set out (total - 1) (bit_and bits 255)
+  let r = arr_new 2 0
+  let _ = arr_set r 0 out
+  let _ = arr_set r 1 total
+  r
+
+s5_run_blocks h padded total k off =
+  if off >= total then 0
+  else
+    let _ = s5_process_block_at h padded off k
+    s5_run_blocks h padded total k (off + 128)
+
+s5_process_block_at h padded off k =
+  let block = arr_new 128 0
+  let _ = sha_copy_bytes padded block off 0 128
+  s5_process_block h block k
+
+-- Serialize state h (16 limbs of 32-bit) into a 64-byte big-endian array.
+s5_state_to_bytes h =
+  let out = arr_new 64 0
+  let _ = s5_state_serialize h out 0
+  out
+
+s5_state_serialize h out i =
+  if i >= 16 then 0
+  else
+    let v = arr_get h i
+    let _ = arr_set out (i * 4)     (bit_and (shr v 24) 255)
+    let _ = arr_set out (i * 4 + 1) (bit_and (shr v 16) 255)
+    let _ = arr_set out (i * 4 + 2) (bit_and (shr v 8)  255)
+    let _ = arr_set out (i * 4 + 3) (bit_and v 255)
+    s5_state_serialize h out (i + 1)
+
+-- ── Public entries ──────────────────────────────────────────────────
+
+sha512_bytes buf n =
+  let h = s5_load_h s5_h512_hex
+  let k = s5_load_k 0
+  let p = s5_pad_bytes buf n
+  let padded = arr_get p 0
+  let total = arr_get p 1
+  let _ = s5_run_blocks h padded total k 0
+  s5_state_to_bytes h
+
+sha384_bytes buf n =
+  let h = s5_load_h s5_h384_hex
+  let k = s5_load_k 0
+  let p = s5_pad_bytes buf n
+  let padded = arr_get p 0
+  let total = arr_get p 1
+  let _ = s5_run_blocks h padded total k 0
+  let full = s5_state_to_bytes h
+  -- SHA-384 truncates to first 48 bytes.
+  let out = arr_new 48 0
+  let _ = sha_copy_bytes full out 0 0 48
+  out
