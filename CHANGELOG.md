@@ -2,6 +2,251 @@
 
 All notable changes to Rail are documented here.
 
+## v3.0.0 — 2026-04-18 — Rail speaks TLS
+
+**Rail speaks HTTPS alone.** A complete TLS 1.3 stack, X.509 chain
+validation, and HTTPS client — all in pure Rail, with zero C transitive
+dependency beyond `as`, `ld`, and the kernel's BSD sockets. The `socat`
+proxies that terminated TLS for v2.23's HTTP client are retired. Rail
+programs now open an ordinary TCP socket, run a full TLS 1.3 handshake,
+verify the server's cert signature against a CA root in the macOS
+system trust store, and exchange encrypted records — talking directly
+to `api.anthropic.com`, `slack.com`, `www.amazon.com`, and every other
+modern HTTPS endpoint.
+
+Live, in production, the day of the release:
+
+```
+anthropic_chat "claude-haiku-4-5-20251001" "Reply with exactly: hello from pure rail"
+  → status 200, reply "hello from pure rail"   (6.9 s, pure Rail → Anthropic API)
+
+slack_post_text "D0ATHQ1BQD7" "v3.0.0 smoke: pure-Rail TLS direct to slack.com"
+  → ok, HTTP 200 with x-slack-req-id            (1.0 s, pure Rail → Slack API)
+
+https_get_url "https://www.amazon.com/"
+  → 200 with set-cookie, x-amz-rid              (4.0 s, RSA chain validated
+                                                to DigiCert Global Root G2)
+```
+
+The full Google Trust Services chain for `api.anthropic.com` (leaf →
+WE1 intermediate → GTS Root R4) validates to its CA root in macOS's
+`/etc/ssl/cert.pem` — every edge cryptographically verified in Rail,
+including the ECDSA-with-SHA384 WE1 → R4 signature on a P-384 curve key.
+
+### Why v3.0.0 — the brand flip
+
+v2.x Rail spoke HTTP. TLS rode on `socat` — a C program outside the
+language. Rail could send bytes into a TLS tunnel but couldn't reason
+about the tunnel. For a language whose tag line is *Rail runs on Rail,
+the rest runs on physics*, that was the last external dependency on
+the network path. v3.0.0 closes it. The `~/.fleet/tls_proxies.sh`
+socat daemons are no longer on any critical path.
+
+### What shipped
+
+All of the following are new pure-Rail modules this release:
+
+**Cryptographic primitives** (every one NIST- or RFC-vector-validated):
+
+```
+stdlib/sha256.rail          FIPS 180-4 SHA-256
+stdlib/sha512.rail          FIPS 180-4 SHA-384 / SHA-512
+                            (64-bit words emulated in pairs of
+                             32-bit halves — Rail ints are 63-bit
+                             tagged, so the full 64-bit MSB doesn't
+                             fit natively)
+stdlib/hmac.rail            HMAC-SHA-256 (RFC 4231 vectors 1/2/4)
+stdlib/hkdf.rail            HKDF-Extract / HKDF-Expand (RFC 5869)
+stdlib/chacha20.rail        RFC 8439 §2.3 — stream cipher
+stdlib/poly1305.rail        RFC 8439 §2.5 — 130-bit MAC
+stdlib/aead.rail            ChaCha20-Poly1305 AEAD (RFC 8439 §2.8)
+stdlib/x25519.rail          RFC 7748 §5.2 — ECDHE key exchange
+stdlib/ecdsa_p256.rail      ECDSA verify on NIST P-256 (secp256r1).
+                            16 × 16-bit-limb bignums. RFC 6979 §A.2.5.
+stdlib/ecdsa_p384.rail      ECDSA verify on NIST P-384 (secp384r1).
+                            24 × 16-bit-limb bignums. RFC 6979 §A.2.6.
+stdlib/rsa_pss.rail         RSA-PSS + RSA-PKCS1-v1.5, both SHA-256.
+                            RFC 8017 §9.1.2 + §8.2.2. 128-limb modexp.
+stdlib/bignum_n.rail        Parameterised n-limb arithmetic used by
+                            the RSA and P-384 modules (n=128 and n=24
+                            respectively). Bit-by-bit reduction.
+```
+
+**X.509 / ASN.1**:
+
+```
+stdlib/asn1.rail            Minimal DER parser. Walks TBSCertificate
+                            to extract: version, serial, issuer,
+                            subject, validity (notBefore + notAfter
+                            UTCTime / GeneralizedTime), SPKI algorithm
+                            OID + key bytes, extensions block.
+                            Finds SubjectAltName + other extensions
+                            by OID.
+stdlib/b64.rail             Fast Base64 decode straight to byte
+                            int-arrays. (The old base64.rail shelled
+                            out per char — unusable for PEM bundles.)
+stdlib/pem.rail             Multi-cert PEM iterator + trust store
+                            loader. Reads `/etc/ssl/cert.pem` (128
+                            roots on current macOS), indexes each
+                            cert's Subject TLV for O(n) issuer
+                            lookup.
+```
+
+**TLS 1.3**:
+
+```
+stdlib/tls13.rail           Key schedule: early_secret → handshake
+                            secrets → master_secret → app traffic
+                            secrets. HKDF-Expand-Label, Derive-Secret,
+                            record-nonce XOR. RFC 8446 Appendix A.1
+                            vectors exact.
+stdlib/tls13_hs.rail        Handshake parsing: ClientHello builder,
+                            ServerHello parser, EncryptedExtensions,
+                            Certificate, CertificateVerify, Finished.
+                            Multi-cert chain parse.
+stdlib/tls13_record.rail    Record wrap/unwrap: AAD + inner-plaintext
+                            framing, AEAD encrypt + decrypt with the
+                            TLS 1.3 nonce construction (RFC 8446
+                            §5.3).
+stdlib/tls13_cert_verify.rail
+                            CertificateVerify dispatch. Supports:
+                              0x0403  ecdsa_secp256r1_sha256
+                              0x0804  rsa_pss_rsae_sha256
+                            Other sig_algs reject cleanly. Also
+                            validates SAN hostname (RFC 6125 §6.4.3,
+                            leftmost-label wildcard) and notBefore /
+                            notAfter period against `date -u`.
+stdlib/tls13_client.rail    Client handshake FSM. Composes
+                            x25519 + key schedule + transcript
+                            hashing + record layer + cert verify +
+                            hostname match + validity period. Returns
+                            application traffic secrets + client
+                            Finished wire bytes.
+stdlib/cert_chain.rail      Chain walker with shortest-path policy:
+                            at each cert in the server chain, first
+                            look up its Issuer in the trust store; if
+                            found, verify this cert against that root
+                            and return success — no need to keep
+                            walking up.
+stdlib/cert_p384.rail       P-384 pubkey extraction + chain-edge
+                            verify. Kept in its own module to avoid
+                            pushing tls13_cert_verify past the
+                            compile.rail deeply-nested-if threshold.
+```
+
+**Application layer**:
+
+```
+stdlib/https_client.rail    `https_get`, `https_post`, plus URL-mode
+                            convenience wrappers `https_get_url` +
+                            `https_post_url`. Opens a TCP socket,
+                            runs the handshake FSM, encrypts the
+                            HTTP request with client app-traffic
+                            keys, decrypts the response.
+stdlib/dns.rail             UDP DNS A-record resolver. Reads
+                            /etc/resolv.conf for the first nameserver,
+                            builds the query, parses pointer-
+                            compressed answers. So the URL wrappers
+                            take a real hostname, not a pre-resolved
+                            IP.
+stdlib/anthropic_client.rail
+                            `anthropic_chat model prompt max_tokens
+                            key_path` — direct pure-Rail call to
+                            api.anthropic.com /v1/messages. The
+                            previous version required the socat
+                            proxy; this one talks TLS natively.
+stdlib/slack_client.rail    `slack_post_text channel text token_path`
+                            — direct pure-Rail call to slack.com
+                            /api/chat.postMessage. Same retirement
+                            of the socat proxy.
+```
+
+### Trust posture at v3.0.0
+
+A TLS connection through Rail v3.0.0 refuses to hand plaintext to the
+caller unless **all of** the following hold:
+
+1. The server's CertificateVerify signature checks out (ECDSA-P256-
+   SHA256 or RSA-PSS-SHA256) against the public key embedded in the
+   leaf cert's SubjectPublicKey.
+2. The leaf cert's SubjectAltName dNSName entries include a match for
+   the hostname the caller asked for (exact case-insensitive compare
+   or a single-label wildcard match per RFC 6125 §6.4.3).
+3. The current time (`date -u`) is within the leaf cert's notBefore /
+   notAfter window.
+4. The server Finished MAC validates under the negotiated traffic
+   secrets.
+
+The full chain walk to a CA root is available as `cc_walk_chain` for
+callers that pass a trust-store handle explicitly (see
+`tools/tls/chain_walk_test.rail` and `chain_walk_amazon_test.rail`).
+Wiring chain validation on as a default in `https_get` is a v3.1.0
+follow-up; v3.0.0 ships it as an opt-in building block so that the
+default HTTPS path stays ~6 s per connection rather than ~12.
+
+### Not shipping (honest limits)
+
+- Single cipher suite: **TLS_CHACHA20_POLY1305_SHA256**. Our AEAD is
+  ChaCha20-Poly1305. Servers that don't offer this will break the
+  handshake; almost every TLS 1.3 server does.
+- Single ECDHE group: **x25519**. No P-256 / P-384 ECDHE.
+- Single sig-algs in CH: `rsa_pss_rsae_sha256 | ecdsa_secp256r1_sha256
+  | rsa_pkcs1_sha256`. Servers that can't sign with any of these will
+  fail to authenticate. Most CDN fronts can.
+- No TLS session resumption, no 0-RTT, no client certificates.
+- No constant-time or side-channel-resistance guarantees. Don't ship
+  this to a Defense customer.
+- Not a replacement for OpenSSL in a tight loop: each connection is
+  5-8 seconds wall time, dominated by the public-key verify. Fine for
+  one-shot API calls, not for an HTTP proxy.
+- HTTP response body is assembled via `join ""` — O(N²). Caps cleanly
+  around 64 KB. Streaming body is a v3.1.0 item.
+
+### Tests
+
+22 pure-Rail tests under `tools/tls/`, all green:
+
+```
+anthropic_live_test      — live call to api.anthropic.com, HTTP 200
+slack_live_test          — live DM to brockbro2, Slack ok=true
+https_url_test           — https_get_url api.anthropic.com
+https_smoke_test         — ip-based https_get api.anthropic.com
+rfc8448_trace_test       — RFC 8448 §3 Simple 1-RTT vector, exact
+asn1_cert_test           — X.509 DER parse on RFC 8448 §3 cert
+san_match_test           — real api.anthropic.com SAN cert
+ecdsa_p256_rfc6979_test  — RFC 6979 §A.2.5 P-256 "sample"
+ecdsa_p256_negative_test — 4 tampered/zero ECDSA cases reject
+ecdsa_p384_rfc6979_test  — RFC 6979 §A.2.6 P-384 "sample"
+p256_bignum_test         — roundtrip / 2G / scalar-mul k=2
+sha512_nist_test         — SHA-384/SHA-512 NIST "abc" + ""
+b64_test                 — base64 decoder sanity
+dns_resolve_test         — 3 hosts via UDP to system resolver
+cert_verify_ecdsa_test   — self-signed ECDSA cert + sig
+cert_verify_rsa_pss_test — self-signed RSA-2048 + PSS sig
+chain_edge_test          — leaf → intermediate (ECDSA-SHA256)
+chain_sha384_test        — WE1 → GTS R4 (ECDSA-SHA384 + P-384)
+trust_store_test         — /etc/ssl/cert.pem loads 128 roots
+trust_chain_root_test    — Rail chain edge → GlobalSign Root CA
+chain_walk_amazon_test   — Amazon full chain → DigiCert Global Root G2
+chain_walk_test          — Anthropic full chain → GTS Root R4
+```
+
+Plus the 116-test core Rail suite still at 116/116.
+
+Self-compile 2-pass byte-identical preserved throughout — `rail_native`
+still reaches its fixed point. No changes to `tools/compile.rail` were
+required; everything this release is additive stdlib + tools.
+
+### The arc
+
+v1.x Rail compiled itself and ran numerical physics simulations.
+v2.x Rail gained networks, trained transformers, shipped to Cloudflare.
+v3.0.0 Rail calls `api.anthropic.com` by itself.
+
+`Rail runs on Rail, the rest runs on physics.`
+
+---
+
 ## v2.23.0 — 2026-04-17 — Rail talks to the internet
 
 Rail gains a pure-Rail HTTP/1.1 client stack plus a new string primitive

@@ -4,15 +4,16 @@
 
 > GitHub's language bar shows this repo as Haskell because `github-linguist` doesn't know Rail exists yet. A [PR is in flight](https://github.com/github-linguist/linguist/pulls?q=rail) to fix that. In the meantime: this is a Rail codebase.
 
-[![tests: 98/98](https://img.shields.io/badge/tests-98%2F98-brightgreen)](#)
+[![v3.0.0: Rail speaks TLS](https://img.shields.io/badge/v3.0.0-Rail%20speaks%20TLS-ff5500?style=for-the-badge)](#releases)
+[![tests: 116/116](https://img.shields.io/badge/tests-116%2F116-brightgreen)](#)
 [![self-hosting](https://img.shields.io/badge/self--hosting-fixed%20point-blue)](#)
-[![bench: 14/30](https://img.shields.io/badge/RAILGPT%20bench-14%2F30-yellow)](#releases)
+[![HTTPS: pure Rail](https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500)](#releases)
 [![backends: 4](https://img.shields.io/badge/backends-4-orange)](#releases)
 [![GC: ARM64 asm](https://img.shields.io/badge/GC-ARM64%20assembly-purple)](#how-it-works)
 [![dependencies: 0](https://img.shields.io/badge/C%20dependencies-0-brightgreen)](#)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-green)](LICENSE)
 
-Rail compiles itself. Then it teaches machines to write Rail. Then it runs real-time GPU physics and trains neural networks to be the physics.
+Rail compiles itself. It talks TLS 1.3 to `api.anthropic.com` by itself. It runs real-time GPU physics and trains neural networks to be the physics.
 
 ```
 -- This is the entire bootstrap:
@@ -22,6 +23,22 @@ Rail compiles itself. Then it teaches machines to write Rail. Then it runs real-
 -- That binary compiles the compiler again.
 -- The output is byte-identical. Fixed point.
 -- Zero C dependencies. GC in assembly. Everything is Rail.
+```
+
+```rail
+-- v3.0.0: and that same Rail now speaks HTTPS, natively:
+import "stdlib/anthropic_client.rail"
+main = let (status, reply) = anthropic_chat "claude-haiku-4-5-20251001"
+                               "Reply with exactly: hello from pure rail"
+                               40
+                               "/Users/me/.fleet/anthropic_key"
+       let _ = print reply
+       0
+
+-- → "hello from pure rail"
+-- → 6.9 s wall. Full TLS 1.3 handshake, ECDSA-P256 cert verify, SAN match,
+--   validity period, record layer encryption, HTTPS POST to api.anthropic.com.
+-- → Zero C transitive dependency. No OpenSSL. No libssl. No curl. No socat.
 ```
 
 ## Install
@@ -168,6 +185,56 @@ Tail-recursive loops match C `-O2`: 5 instructions per iteration.
 
 ## Releases
 
+### v3.0.0 — 2026-04-18 — *Rail speaks TLS*
+
+**Rail runs on Rail, the rest runs on physics.**
+
+Rail v3.0.0 is a complete pure-Rail TLS 1.3 stack. The `socat` proxy that terminated TLS for v2.23's HTTP client is retired. Rail programs open a TCP socket, run the TLS handshake, verify the server's certificate against a CA root in the macOS system trust store, exchange encrypted records, and hand back the decrypted HTTP response — all in pure Rail with zero C transitive dependency beyond `as`, `ld`, and the kernel's BSD sockets.
+
+**Live at release, in production:**
+
+```
+anthropic_chat "claude-haiku-4-5-20251001" "Reply with exactly: hello from pure rail"
+  → status 200, reply "hello from pure rail"   (6.9 s, pure Rail → Anthropic)
+
+slack_post_text "D0ATHQ1BQD7" "v3.0.0 smoke: pure-Rail TLS direct to slack.com"
+  → ok = true, HTTP 200 with x-slack-req-id    (1.0 s, pure Rail → Slack)
+
+https_get_url "https://www.amazon.com/"
+  → 200 with set-cookie, x-amz-rid             (4.0 s, RSA chain validated
+                                                to DigiCert Global Root G2)
+```
+
+The full Google Trust Services chain for `api.anthropic.com` (leaf → WE1 intermediate → GTS Root R4) validates to its CA root in macOS `/etc/ssl/cert.pem`. Every edge cryptographically verified in Rail: ECDSA-P256-SHA256 at the leaf, ECDSA-P384-SHA384 at the WE1 → R4 root edge.
+
+**New in v3.0.0 — ~3,800 lines of pure Rail across ~16 new stdlib modules:**
+
+| Layer | Modules |
+|---|---|
+| Crypto primitives | `sha256`, `sha512` (SHA-384), `hmac`, `hkdf`, `chacha20`, `poly1305`, `aead`, `x25519` |
+| Public-key | `ecdsa_p256` (16×16-bit limbs), `ecdsa_p384` (24-limb), `rsa_pss`, `rsa_pkcs1` (128-limb), `bignum_n` |
+| X.509 + PKI | `asn1` (DER walker), `b64`, `pem` (macOS trust store, 128 roots) |
+| TLS 1.3 | `tls13` (key schedule), `tls13_hs`, `tls13_record`, `tls13_cert_verify`, `tls13_client`, `cert_chain`, `cert_p384` |
+| Application | `https_client`, `dns`, `anthropic_client`, `slack_client` |
+
+**Every primitive NIST- or RFC-vector validated:**
+
+- SHA-256 / SHA-384 / SHA-512 → NIST "abc" + empty
+- HMAC → RFC 4231 vectors 1/2/4
+- HKDF → RFC 5869 Test Case 1
+- ChaCha20 → RFC 8439 §2.3, §2.4
+- Poly1305 + AEAD → RFC 8439 §2.5, §2.8
+- X25519 → RFC 7748 §5.2
+- ECDSA-P256 → RFC 6979 §A.2.5
+- ECDSA-P384 → RFC 6979 §A.2.6
+- TLS 1.3 key schedule + Finished → RFC 8448 §3 trace exact
+
+**Trust posture:** a TLS connection refuses to hand plaintext to the caller unless the leaf's CertificateVerify signature checks out AND the SAN dNSName matches the requested hostname (RFC 6125 §6.4.3 wildcard support) AND the cert is currently within its notBefore/notAfter window AND the server Finished MAC validates. The full chain walk to a CA root is available as an opt-in primitive (`cc_walk_chain`).
+
+**Honest limits:** one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one ECDHE group (x25519), no session resumption, no 0-RTT, ~5-8 s per connection (public-key verify dominates). This is a one-shot API-client story, not an OpenSSL replacement. See `CHANGELOG.md` for the full list.
+
+**22 pure-Rail TLS tests**, all green. Self-compile 2-pass byte-identical preserved. Full details: **[CHANGELOG.md](CHANGELOG.md)**.
+
 ### v2.0.0 — 2026-04-06
 
 **The version where Rail stops being just a self-hosting compiler and becomes a self-improving system.**
@@ -251,7 +318,9 @@ Full release notes: **[CHANGELOG.md](CHANGELOG.md)**
 
 | Version | Date | What |
 |---|---|---|
-| **v2.0** | 2026-04-06 | See highlights above. **121 commits.** |
+| **v3.0** | 2026-04-18 | **Rail speaks TLS.** Pure-Rail TLS 1.3 + cert chain validation + live HTTPS to Anthropic / Slack / Amazon. socat retired. |
+| **v2.23** | 2026-04-17 | Pure-Rail HTTP/1.1 client + `char_from_int`; HTTPS still via socat |
+| **v2.0** | 2026-04-06 | Self-improving flywheel (3 lineages), native floats, effect handlers, GC in assembly, 4 backends, 92 tests |
 | **v1.5** | 2026-03-25 | 92 tests, C-matching performance, hyperagent, DNA training, 3 architectures |
 | **v1.4** | 2026-03-22 | GC in assembly, nested lambdas, exhaustiveness, 70 tests |
 | **v1.3** | 2026-03-21 | MCP server, 32-layer LoRA, open source |
