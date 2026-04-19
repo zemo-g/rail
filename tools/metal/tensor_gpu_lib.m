@@ -31,6 +31,7 @@
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
+#include <dlfcn.h>
 
 static id<MTLDevice>               g_device = nil;
 static id<MTLCommandQueue>         g_queue = nil;
@@ -324,13 +325,21 @@ int tgl_init(int dummy) {
     g_device = MTLCreateSystemDefaultDevice();
     if (!g_device) return -1;
 
-    int rc = system("test -f /tmp/tensor_gpu.metallib || "
-                    "(xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && "
-                    " xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
-    (void)rc;
-
+    // Runtime-compile the shaders from tensor_gpu.metal source.  Locate
+    // it relative to this dylib's own path on disk (via dladdr on tgl_init
+    // itself) — no Xcode toolchain dependency, no env-var dependency, and
+    // works regardless of what HOME the caller has (rail_native's child
+    // process runs with an empty env).
+    Dl_info dl;
+    if (dladdr((const void *)&tgl_init, &dl) == 0 || !dl.dli_fname) return -1;
+    NSString *dylib_path = [NSString stringWithUTF8String:dl.dli_fname];
+    NSString *src_path = [[dylib_path stringByDeletingLastPathComponent]
+                          stringByAppendingPathComponent:@"tensor_gpu.metal"];
     NSError *err = nil;
-    g_lib = [g_device newLibraryWithURL:[NSURL fileURLWithPath:@"/tmp/tensor_gpu.metallib"] error:&err];
+    NSString *src = [NSString stringWithContentsOfFile:src_path encoding:NSUTF8StringEncoding error:&err];
+    if (!src) return -1;
+    MTLCompileOptions *opts = [MTLCompileOptions new];
+    g_lib = [g_device newLibraryWithSource:src options:opts error:&err];
     if (!g_lib) return -1;
 
     g_queue = [g_device newCommandQueue];
