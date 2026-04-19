@@ -163,6 +163,48 @@ layernorm_save x gamma beta = match x
 -- mean and rstd are float_arrs as produced by layernorm_save.
 -- ────────────────────────────────────────────────────────
 
+-- CPU LayerNorm backward.  Per-row reductions are collected into a small
+-- scratch float_arr (row_stats: [sum_dxhat, sum_dxhat_xhat]) so we never
+-- need to carry more than ~8 params in any helper — Rail's ARM64 codegen
+-- gets unhappy with wide mixed int/float parameter lists.
+cpu_ln_accum xd gd dyd base dim j mean rstd acc =
+  if j >= dim then 0
+  else
+    let xv = float_arr_get xd (base + j)
+    let dv = float_arr_get dyd (base + j)
+    let gi = float_arr_get gd j
+    let xhat = (xv - mean) * rstd
+    let dxhat = dv * gi
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + dxhat)
+    let _ = float_arr_set acc 1 ((float_arr_get acc 1) + dxhat * xhat)
+    cpu_ln_accum xd gd dyd base dim (j + 1) mean rstd acc
+
+cpu_ln_write xd gd dyd dxd base dim j mean rstd acc =
+  if j >= dim then 0
+  else
+    let df = int_to_float dim
+    let xv = float_arr_get xd (base + j)
+    let dv = float_arr_get dyd (base + j)
+    let gi = float_arr_get gd j
+    let xhat = (xv - mean) * rstd
+    let dxhat = dv * gi
+    let sd = float_arr_get acc 0
+    let sx = float_arr_get acc 1
+    let dx = rstd * (dxhat - sd / df - xhat * sx / df)
+    let _ = float_arr_set dxd (base + j) dx
+    cpu_ln_write xd gd dyd dxd base dim (j + 1) mean rstd acc
+
+cpu_ln_back xd md rd gd dyd dxd n_rows dim r =
+  if r >= n_rows then 0
+  else
+    let base = r * dim
+    let mean = float_arr_get md r
+    let rstd = float_arr_get rd r
+    let acc = float_arr_new 2 0.0
+    let _ = cpu_ln_accum xd gd dyd base dim 0 mean rstd acc
+    let _ = cpu_ln_write xd gd dyd dxd base dim 0 mean rstd acc
+    cpu_ln_back xd md rd gd dyd dxd n_rows dim (r + 1)
+
 layernorm_backward_dx x mean_arr rstd_arr gamma dy = match x
   | Tensor x_data x_shape _ -> match gamma
     | Tensor g_data _ _ -> match dy
@@ -171,7 +213,10 @@ layernorm_backward_dx x mean_arr rstd_arr gamma dy = match x
         let dim = head (reverse x_shape)
         let n_rows = total / dim
         let dx_data = float_arr_new total 0.0
-        let _ = tgl_layernorm_backward_f64 x_data mean_arr rstd_arr g_data dy_data dx_data n_rows dim
+        let _ = if gpu_available 0 then
+                  tgl_layernorm_backward_f64 x_data mean_arr rstd_arr g_data dy_data dx_data n_rows dim
+                else
+                  cpu_ln_back x_data mean_arr rstd_arr g_data dy_data dx_data n_rows dim 0
         Tensor dx_data x_shape (compute_strides x_shape)
 
 -- dgamma[j] = Σ_r dy[r,j] * x_hat[r,j]   where x_hat = (x - mean) * rstd
@@ -322,6 +367,32 @@ scaled_dot_attention_causal q k v = match q
 -- needed.
 -- ────────────────────────────────────────────────────────
 
+-- CPU softmax backward per-row: dx[j] = y[j] * (dy[j] - Σ_k y[k]*dy[k]).
+cpu_sm_sum yd dyd cols base j s =
+  if j >= cols then 0
+  else
+    let v = (float_arr_get yd (base + j)) * (float_arr_get dyd (base + j))
+    let _ = float_arr_set s 0 ((float_arr_get s 0) + v)
+    cpu_sm_sum yd dyd cols base (j + 1) s
+
+cpu_sm_write yd dyd dxd cols base j sum =
+  if j >= cols then 0
+  else
+    let y = float_arr_get yd (base + j)
+    let d = float_arr_get dyd (base + j)
+    let _ = float_arr_set dxd (base + j) (y * (d - sum))
+    cpu_sm_write yd dyd dxd cols base (j + 1) sum
+
+cpu_sm_back yd dyd dxd rows cols r =
+  if r >= rows then 0
+  else
+    let base = r * cols
+    let s = float_arr_new 1 0.0
+    let _ = cpu_sm_sum yd dyd cols base 0 s
+    let sum = float_arr_get s 0
+    let _ = cpu_sm_write yd dyd dxd cols base 0 sum
+    cpu_sm_back yd dyd dxd rows cols (r + 1)
+
 attention_backward q k v attn d_out = match q
   | Tensor q_data q_shape q_st -> match k
     | Tensor k_data k_shape k_st -> match v
@@ -343,7 +414,10 @@ attention_backward q k v attn d_out = match q
             -- dScaled = softmax_backward(attn, dAttn) row-wise.
             let dscaled_data = float_arr_new (seq * seq) 0.0
             match d_attn | Tensor dattn_data _ _ ->
-              let _ = tgl_softmax_backward_f64 attn_data dattn_data dscaled_data seq seq
+              let _ = if gpu_available 0 then
+                        tgl_softmax_backward_f64 attn_data dattn_data dscaled_data seq seq
+                      else
+                        cpu_sm_back attn_data dattn_data dscaled_data seq seq 0
               let d_scaled = Tensor dscaled_data (cons seq (cons seq [])) (compute_strides (cons seq (cons seq [])))
 
               -- dScores = dScaled * scale (Jacobian of the scalar scaling)
