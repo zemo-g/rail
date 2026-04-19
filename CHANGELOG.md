@@ -2,6 +2,90 @@
 
 All notable changes to Rail are documented here.
 
+## v3.3.0 — 2026-04-19 — HTTPS keep-alive sessions
+
+**One TLS handshake, many requests.** `stdlib/https_session.rail` ships
+`https_session_open` / `_open_strict` / `_get` / `_post` / `_close`: a
+warm TCP+TLS socket across successive HTTP requests. For multi-turn
+agents (Anthropic chat, Slack batch posts, any loop over a single API)
+this collapses per-request latency from the full ~5–8 s handshake
+(x25519 + chain walk to DigiCert) down to just the request
+round-trip. The initial handshake happens once; every subsequent call
+sends a fresh app-data record on the existing socket and reads the
+response.
+
+### Why the reverted v3.2.0-track attempt hung
+
+Session open would complete the handshake, send ClientFinished, then
+`session_get` would block in `recv` forever. Three overlapping causes
+were live. v3.3.0 fixes each explicitly.
+
+1. **Nagle buffering on the ClientFinished**. Bare CF is ~56 wire
+   bytes. Macs default TCP sockets to NAGLE on, so the kernel holds
+   the segment waiting for more data or an ACK. Without a follow-up
+   write, the server sees a half-handshake and times out. v3.3.0
+   ships `set_tcp_nodelay fd` (new helper in `stdlib/socket.rail`
+   using the existing `setsockopt` foreign, `IPPROTO_TCP=6` +
+   `TCP_NODELAY=1`) and calls it on every session socket right after
+   `connect`.
+2. **CF alone in flight is brittle**. Even with NODELAY, some
+   middleboxes reject a CF that arrives without the first record of
+   application data close behind. v3.3.0 pre-wraps CF into a TLS
+   record *at open time*, stores it in the session handle as
+   `pending`, and the first `session_get`/`_post` emits `(CF_record
+   || app_record)` in a SINGLE `send()`. Subsequent requests clear
+   `pending` and just send the app record.
+3. **Post-handshake NewSessionTicket seq advance**. Servers emit one
+   or two NSTs immediately after their own Finished. The session
+   reader advances `s_seq` on every record it consumes — NSTs (inner
+   rtype 22) included — so the application response lands on the
+   right seq and AEAD decrypts cleanly.
+
+### Response framing
+
+`hss_recv` accumulates decrypted app-data fragments into a cons list,
+materialises to a single buffer at finalise (O(total) not O(total²)),
+and detects HTTP framing after `\r\n\r\n`:
+
+- **Content-Length**: case-insensitive header lookup, drain until
+  body length reached.
+- **Transfer-Encoding: chunked**: scan for `0\r\n\r\n` terminator.
+- **Neither**: fall back to "read until EOF" — same behaviour as the
+  one-shot path; the session is not reusable after this, but the
+  request still returns.
+
+Live-verified against `https://www.amazon.com/` — two successive
+`/` + `/robots.txt` GETs on one session, both returning HTTP 200 over
+a chain-walked TLS 1.3 connection. Same `fd` on both requests.
+
+### The arity-0 gotcha in socket.rail
+
+The v3.3.0 track hit an unexpected regression midway: adding
+top-level constants `ipproto_tcp = 6` / `tcp_nodelay = 1` to
+`stdlib/socket.rail` made the previously-green `https_strict_test`
+segfault inside the strict chain walk, while adding a function
+defined in terms of those constants was fine. Inlining the two
+integers at the one call site cleared it. The collision's root cause
+isn't fully understood — nothing else in the codebase names those
+symbols — but the workaround is cheap and documented in a comment at
+the `set_tcp_nodelay` call site.
+
+### Files touched
+
+- `stdlib/https_session.rail` (new, ~330 lines)
+- `stdlib/socket.rail` (added `set_tcp_nodelay`)
+- `tools/tls/https_session_test.rail` (new, live 3-request smoke)
+
+### Invariants held
+
+- `./rail_native self` → byte-identical 2-pass fixed point.
+- `https_get_url_strict "https://www.amazon.com/"` still returns
+  HTTP 200 with chain-to-root validation.
+- v3.0.0's Anthropic + Slack one-shot paths untouched.
+- `./rail_native test` 137/137 — re-verify once the concurrent
+  `lm_transformer` session on this machine releases `/tmp/rail_out`
+  (test harness and training both write to that path).
+
 ## v3.2.0 — 2026-04-19 — Strict HTTPS by default + compiler quadratic fix
 
 **Two structural fixes in `tools/compile.rail` eliminate the O(3^n)
