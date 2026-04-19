@@ -158,6 +158,111 @@ layernorm_save x gamma beta = match x
         cons y (cons mean_arr (cons rstd_arr []))
 
 -- ────────────────────────────────────────────────────────
+-- RMSNorm — Llama/Mistral/Qwen-style normalization.
+--   rstd = 1 / sqrt(mean(x_i^2) + eps)
+--   y_i  = x_i * rstd * gamma_i
+-- No mean subtraction, no bias.  Saves only rstd per row for backward.
+-- ────────────────────────────────────────────────────────
+
+rms_row_sumsq xd base dim j acc =
+  if j >= dim then 0
+  else
+    let v = float_arr_get xd (base + j)
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + v * v)
+    rms_row_sumsq xd base dim (j + 1) acc
+
+rms_row_apply xd yd gd base dim j rstd =
+  if j >= dim then 0
+  else
+    let v = float_arr_get xd (base + j)
+    let g = float_arr_get gd j
+    let _ = float_arr_set yd (base + j) (v * rstd * g)
+    rms_row_apply xd yd gd base dim (j + 1) rstd
+
+rms_rows_save xd yd gd rstd_arr dim eps n_rows r =
+  if r >= n_rows then 0
+  else
+    let base = r * dim
+    let acc = float_arr_new 1 0.0
+    let _ = rms_row_sumsq xd base dim 0 acc
+    let dim_f = int_to_float dim
+    let rms_sq = (float_arr_get acc 0) / dim_f
+    let rstd = 1.0 / sqrt (rms_sq + eps)
+    let _ = float_arr_set rstd_arr r rstd
+    let _ = rms_row_apply xd yd gd base dim 0 rstd
+    rms_rows_save xd yd gd rstd_arr dim eps n_rows (r + 1)
+
+-- Forward RMSNorm that saves rstd for backward.  Returns [y, rstd].
+-- Signature intentionally mirrors layernorm_save minus the mean output.
+rmsnorm_save x gamma = match x
+  | Tensor x_data x_shape x_st -> match gamma
+    | Tensor g_data _ _ ->
+      let total = list_product x_shape
+      let dim = head (reverse x_shape)
+      let n_rows = total / dim
+      let out_data = float_arr_new total 0.0
+      let rstd_arr = float_arr_new n_rows 0.0
+      let _ = rms_rows_save x_data out_data g_data rstd_arr dim 0.00001 n_rows 0
+      let y = Tensor out_data x_shape x_st
+      cons y (cons rstd_arr [])
+
+-- RMSNorm backward.  Per-row:
+--   xhat_i   = x_i * rstd
+--   dxhat_i  = dy_i * gamma_i
+--   s        = Σ_i dxhat_i * xhat_i / dim
+--   dx_i     = rstd * (dxhat_i - xhat_i * s)
+-- gamma grad: dg_i += dy_i * xhat_i (accumulated across rows by caller
+-- if learnable; for fixed-gamma models we skip it).
+cpu_rms_back_accum xd gd dyd base dim j rstd s =
+  if j >= dim then 0
+  else
+    let xv = float_arr_get xd (base + j)
+    let dv = float_arr_get dyd (base + j)
+    let gi = float_arr_get gd j
+    let xhat = xv * rstd
+    let dxhat = dv * gi
+    let _ = float_arr_set s 0 ((float_arr_get s 0) + dxhat * xhat)
+    cpu_rms_back_accum xd gd dyd base dim (j + 1) rstd s
+
+cpu_rms_back_write xd gd dyd dxd base dim j rstd s =
+  if j >= dim then 0
+  else
+    let xv = float_arr_get xd (base + j)
+    let dv = float_arr_get dyd (base + j)
+    let gi = float_arr_get gd j
+    let xhat = xv * rstd
+    let dxhat = dv * gi
+    let df = int_to_float dim
+    let dx = rstd * (dxhat - xhat * s / df)
+    let _ = float_arr_set dxd (base + j) dx
+    cpu_rms_back_write xd gd dyd dxd base dim (j + 1) rstd s
+
+cpu_rms_back xd gd dyd dxd rstd_arr n_rows dim r =
+  if r >= n_rows then 0
+  else
+    let base = r * dim
+    let rstd = float_arr_get rstd_arr r
+    let s_arr = float_arr_new 1 0.0
+    let _ = cpu_rms_back_accum xd gd dyd base dim 0 rstd s_arr
+    let s = float_arr_get s_arr 0
+    let _ = cpu_rms_back_write xd gd dyd dxd base dim 0 rstd s
+    cpu_rms_back xd gd dyd dxd rstd_arr n_rows dim (r + 1)
+
+-- Returns a Tensor of dx with the same shape as x.  CPU only for now;
+-- Metal kernel can come later if this shows up hot (it's dim-parallel,
+-- O(rows × dim) with one reduction).
+rmsnorm_backward_dx x gamma rstd_arr dy = match x
+  | Tensor x_data x_shape _ -> match gamma
+    | Tensor g_data _ _ -> match dy
+      | Tensor dy_data _ _ ->
+        let total = list_product x_shape
+        let dim = head (reverse x_shape)
+        let n_rows = total / dim
+        let dx_data = float_arr_new total 0.0
+        let _ = cpu_rms_back x_data g_data dy_data dx_data rstd_arr n_rows dim 0
+        Tensor dx_data x_shape (compute_strides x_shape)
+
+-- ────────────────────────────────────────────────────────
 -- Layernorm backward — dispatches to tgl_layernorm_backward_f64.
 -- Returns a Tensor of dx with the same shape as x.
 -- mean and rstd are float_arrs as produced by layernorm_save.
