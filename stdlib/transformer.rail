@@ -263,6 +263,106 @@ rmsnorm_backward_dx x gamma rstd_arr dy = match x
         Tensor dx_data x_shape (compute_strides x_shape)
 
 -- ────────────────────────────────────────────────────────
+-- RoPE — rotary position encoding (Llama/GPT-NeoX interleaved pair form).
+-- Applied in-place on Q or K after projection, before attention scores.
+--
+-- For each position p in 0..seq-1 and each pair index j in 0..d/2-1:
+--   θ_j   = 10000^(-2j/d)
+--   angle = p * θ_j
+--   (x[2j], x[2j+1])  ←  (x[2j]*cos - x[2j+1]*sin,
+--                         x[2j]*sin + x[2j+1]*cos)
+--
+-- Backward (rope_inverse) applies the transpose rotation: cos stays,
+-- sin negates.  Identical cost to forward.
+-- ────────────────────────────────────────────────────────
+
+rope_row_pairs xd base d p j sign =
+  if j >= d / 2 then 0
+  else
+    let theta_exp = 0.0 - 2.0 * int_to_float j / int_to_float d
+    let theta = pow 10000.0 theta_exp
+    let angle = int_to_float p * theta
+    let c = cos angle
+    let s = sin angle * sign
+    let i0 = base + 2 * j
+    let i1 = i0 + 1
+    let x0 = float_arr_get xd i0
+    let x1 = float_arr_get xd i1
+    let _ = float_arr_set xd i0 (x0 * c - x1 * s)
+    let _ = float_arr_set xd i1 (x0 * s + x1 * c)
+    rope_row_pairs xd base d p (j + 1) sign
+
+rope_positions xd seq d p sign =
+  if p >= seq then 0
+  else
+    let _ = rope_row_pairs xd (p * d) d p 0 sign
+    rope_positions xd seq d (p + 1) sign
+
+-- ────────────────────────────────────────────────────────
+-- SiLU (Swish): y = x * σ(x). Forward + backward.  Used in SwiGLU:
+--   SwiGLU(x) = SiLU(x @ W_gate) ⊙ (x @ W_up), then @ W_down.
+--
+-- silu_forward writes y = silu(x) and stores σ(x) in sig_out for
+-- reuse in backward (saves one exp per element).
+--
+-- silu'(x) = σ(x) + x * σ(x) * (1 - σ(x)) = σ(x) * (1 + x * (1 - σ(x)))
+-- ────────────────────────────────────────────────────────
+
+silu_fwd_loop xd yd sig_out n i =
+  if i >= n then 0
+  else
+    let xv = float_arr_get xd i
+    let s = 1.0 / (1.0 + exp (0.0 - xv))
+    let _ = float_arr_set sig_out i s
+    let _ = float_arr_set yd i (xv * s)
+    silu_fwd_loop xd yd sig_out n (i + 1)
+
+silu_forward x = match x
+  | Tensor xd x_shape x_st ->
+    let n = list_product x_shape
+    let yd = float_arr_new n 0.0
+    let sig_out = float_arr_new n 0.0
+    let _ = silu_fwd_loop xd yd sig_out n 0
+    let y = Tensor yd x_shape x_st
+    cons y (cons sig_out [])
+
+silu_bwd_loop xd dyd sig dxd n i =
+  if i >= n then 0
+  else
+    let xv = float_arr_get xd i
+    let dv = float_arr_get dyd i
+    let s = float_arr_get sig i
+    let grad = s * (1.0 + xv * (1.0 - s))
+    let _ = float_arr_set dxd i (dv * grad)
+    silu_bwd_loop xd dyd sig dxd n (i + 1)
+
+-- Given saved sig (σ(x)) from forward, compute dx = dy * silu'(x).
+silu_backward x dy sig_arr = match x
+  | Tensor xd x_shape x_st -> match dy
+    | Tensor dyd _ _ ->
+      let n = list_product x_shape
+      let dxd = float_arr_new n 0.0
+      let _ = silu_bwd_loop xd dyd sig_arr dxd n 0
+      Tensor dxd x_shape x_st
+
+-- Forward rotation. Mutates x_data in place.
+rope_apply x = match x
+  | Tensor xd x_shape _ ->
+    let seq = head x_shape
+    let d = head (tail x_shape)
+    let _ = rope_positions xd seq d 0 1.0
+    x
+
+-- Inverse rotation (transpose). Used in backward pass: dq_unrotated =
+-- rope_apply_inverse(dq_rotated).
+rope_apply_inverse x = match x
+  | Tensor xd x_shape _ ->
+    let seq = head x_shape
+    let d = head (tail x_shape)
+    let _ = rope_positions xd seq d 0 (0.0 - 1.0)
+    x
+
+-- ────────────────────────────────────────────────────────
 -- Layernorm backward — dispatches to tgl_layernorm_backward_f64.
 -- Returns a Tensor of dx with the same shape as x.
 -- mean and rstd are float_arrs as produced by layernorm_save.
