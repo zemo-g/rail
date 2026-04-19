@@ -1,0 +1,108 @@
+-- matmul_bench.rail — Metal dylib throughput at Phase-3 target shapes.
+-- Runs each case for enough iterations to get >= 3 seconds wall time
+-- under `time` (second-resolution). Reports GFLOPS + speedup vs CPU
+-- triple-loop baseline.
+import "stdlib/tensor.rail"
+import "stdlib/time.rail"
+
+fill arr n seed i =
+  if i >= n then 0
+  else
+    let raw = ((i * 97 + seed * 13) % 100) - 50
+    let _ = float_arr_set arr i (0.01 * int_to_float raw)
+    fill arr n (seed + 1) (i + 1)
+
+bench_dylib_once a b m k n =
+  let c_data = float_arr_new (m * n) 0.0
+  let _ = tgl_matmul_f64 a b c_data m k n
+  0
+
+bench_dylib_loop a b m k n iters i =
+  if i >= iters then 0
+  else
+    let _ = bench_dylib_once a b m k n
+    bench_dylib_loop a b m k n iters (i + 1)
+
+cpu_matmul_k ad bd acc k_dim n_dim i j kk =
+  if kk >= k_dim then 0
+  else
+    let av = float_arr_get ad (i * k_dim + kk)
+    let bv = float_arr_get bd (kk * n_dim + j)
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + av * bv)
+    cpu_matmul_k ad bd acc k_dim n_dim i j (kk + 1)
+
+cpu_matmul_j ad bd cd acc m_dim n_dim k_dim i j =
+  if j >= n_dim then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = cpu_matmul_k ad bd acc k_dim n_dim i j 0
+    let _ = float_arr_set cd (i * n_dim + j) (float_arr_get acc 0)
+    cpu_matmul_j ad bd cd acc m_dim n_dim k_dim i (j + 1)
+
+cpu_matmul_i ad bd cd acc m_dim n_dim k_dim i =
+  if i >= m_dim then 0
+  else
+    let _ = cpu_matmul_j ad bd cd acc m_dim n_dim k_dim i 0
+    cpu_matmul_i ad bd cd acc m_dim n_dim k_dim (i + 1)
+
+bench_cpu_once a b m k n =
+  let c_data = float_arr_new (m * n) 0.0
+  let acc = float_arr_new 1 0.0
+  let _ = cpu_matmul_i a b c_data acc m n k 0
+  0
+
+bench_cpu_loop a b m k n iters i =
+  if i >= iters then 0
+  else
+    let _ = bench_cpu_once a b m k n
+    bench_cpu_loop a b m k n iters (i + 1)
+
+-- label, m, k, n, dylib_iters, cpu_iters
+run_case label m k n dylib_iters cpu_iters =
+  let _ = print (cat ["\n=== ", label, "  [", show m, ",", show k, "] @ [", show k, ",", show n, "]"])
+  let a = float_arr_new (m * k) 0.0
+  let _ = fill a (m * k) 1 0
+  let b = float_arr_new (k * n) 0.0
+  let _ = fill b (k * n) 2 0
+
+  -- Warmup the dylib pipeline (first call includes pipeline state init).
+  let _ = bench_dylib_once a b m k n
+
+  let t0 = time 0
+  let _ = bench_dylib_loop a b m k n dylib_iters 0
+  let t1 = time 0
+  let dylib_secs = t1 - t0
+  let flops_per = 2.0 * int_to_float m * int_to_float k * int_to_float n
+  let total_flops_dylib = flops_per * int_to_float dylib_iters
+  let dylib_gflops = if dylib_secs > 0 then total_flops_dylib / (int_to_float dylib_secs * 1000000000.0)
+                     else 0.0 - 1.0
+  let _ = print (cat ["  dylib: ", show dylib_iters, " iters in ", show dylib_secs, "s  =  ", show_float dylib_gflops, " GFLOPS"])
+
+  let t2 = time 0
+  let _ = bench_cpu_loop a b m k n cpu_iters 0
+  let t3 = time 0
+  let cpu_secs = t3 - t2
+  let total_flops_cpu = flops_per * int_to_float cpu_iters
+  let cpu_gflops = if cpu_secs > 0 then total_flops_cpu / (int_to_float cpu_secs * 1000000000.0)
+                   else 0.0 - 1.0
+  let _ = print (cat ["  cpu  : ", show cpu_iters, " iters in ", show cpu_secs, "s  =  ", show_float cpu_gflops, " GFLOPS"])
+
+  let speedup = if cpu_gflops > 0.0 then dylib_gflops / cpu_gflops else 0.0 - 1.0
+  let _ = print (cat ["  speedup: ", show_float speedup, "x"])
+  0
+
+main =
+  let _ = print "=== Phase 3 throughput baseline (Studio M1 Ultra) ==="
+  let _ = print "Theoretical M1 Ultra GPU f32 peak: ~16 TFLOPS (dual-chip unified)."
+
+  -- Phase-1 scale for reference. Tiny matmuls, dylib dispatch overhead
+  -- likely dominates.
+  let _ = run_case "phase1-ref d=64"     382 64 64    2000 100
+
+  -- Phase-3 target sizes at d_model=384, d_ff=1024, seq=512, V=8192.
+  let _ = run_case "qkv proj"            512 384 384  200 5
+  let _ = run_case "ffn gate (SwiGLU)"   512 384 1024 200 3
+  let _ = run_case "ffn down"            512 1024 384 200 3
+  let _ = run_case "logits head"         512 384 8192 50 1
+  let _ = run_case "attention scores"    512 48 512   500 10
+  0
