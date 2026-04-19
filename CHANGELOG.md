@@ -2,6 +2,50 @@
 
 All notable changes to Rail are documented here.
 
+## v3.1.0 — 2026-04-19 — Streaming HTTPS bodies
+
+**Response bodies scale linearly.** The v3.0.0 `hc_recv_response`
+accumulated the HTTP response by re-joining a growing string on every
+record and re-joining a growing string on every byte within each
+record — two layers of `join "" [acc, chunk]` making total work
+O(body_len²). Practical bodies capped at ~64 KB before walltime
+exploded.
+
+v3.1.0 replaces the accumulator with a cons list of byte-array chunks.
+On terminate the driver allocates one buffer of the exact total size,
+copies each fragment in O(total), then converts bytes → string in a
+single `join` pass. Total work is O(body_len). Full-length Anthropic
+completions, multi-hundred-KB HTML, chunked streams — all decode
+without the old quadratic tax.
+
+No API change: `https_get` / `https_post` signatures are unchanged.
+`hc_recv_response` keeps the same arity (the old `acc` string arg is
+now ignored, retained for source compatibility). The legacy
+`hc_bytes_to_str_loop` is kept as an O(n²) shim for any external code
+that depends on the exact old name; new code should call the new
+`hc_bytes_to_str buf n`.
+
+Verified live: `https_get api.anthropic.com` returns a real 404 with
+the full Envoy response body parsed cleanly. No regressions in the
+116-core / 18-TLS test suite.
+
+### Known gaps carried from v3.0.0
+
+- **Chain walk is not wired as the default trust posture.** The
+  `stdlib/cert_chain.rail` walker + `stdlib/pem.rail` trust-store
+  loader are shipped as standalone modules and validated
+  end-to-end (see `tools/tls/chain_walk_amazon_test.rail`) but
+  composing them with `stdlib/https_client.rail` in one compilation
+  unit trips a quadratic pass in `tools/compile.rail` that makes the
+  combined module unusable (3+ minute compile). Fixing the compiler
+  is the unblock; queued as a v3.2.0 task. Until then, the default
+  trust posture is v3.0.0's: leaf CertificateVerify sig + SAN +
+  validity window. Chain-to-root users can assemble their own
+  strict client using `cert_chain.rail` + `pem.rail` primitives
+  (see the test module for the pattern).
+- **HTTP keep-alive / session reuse** — deferred to v3.2.0.
+- **ECDSA-P521, Ed25519 signature algorithms** — deferred to v3.2.0.
+
 ## v3.0.0 — 2026-04-18 — Rail speaks TLS
 
 **Rail speaks HTTPS alone.** A complete TLS 1.3 stack, X.509 chain
