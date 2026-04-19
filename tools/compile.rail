@@ -624,25 +624,38 @@ afind n ar =
     else afind n (tail ar)
 
 -- ── did-you-mean machinery ────────────────────────────────────
--- Levenshtein edit distance with an early bail at threshold + 1.
--- The compiler runs this only at the unbound-name warning site, so
--- worst-case work is O(env_size · |fname|²) on the COLD path.
-edit_dist a b =
-  let cs1 = chars a
-  let cs2 = chars b
-  edist_loop cs1 cs2
+-- Bounded Levenshtein edit distance. The suggestion site caps
+-- best_d at 3, so any distance ≥ bound can be reported as bound
+-- without exploring further. That turns the naive 3-way recursion
+-- (which was O(3^n) and routinely took longer than the rest of
+-- the compile combined on stdlib-heavy inputs — ~195 s wedge on
+-- https_client + cert_chain) into O(bound · |a+b|) worst case.
+edit_dist a b = edist_bounded (chars a) (chars b) 3
 
-edist_loop a b =
-  if length a == 0 then length b
-  else if length b == 0 then length a
-  else if head a == head b then edist_loop (tail a) (tail b)
+edist_bounded a b bound =
+  if bound <= 0 then 0
+  else if length a == 0 then
+    if length b < bound then length b else bound
+  else if length b == 0 then
+    if length a < bound then length a else bound
   else
-    let d_del = edist_loop (tail a) b
-    let d_ins = edist_loop a (tail b)
-    let d_sub = edist_loop (tail a) (tail b)
-    let m1 = if d_del < d_ins then d_del else d_ins
-    let m2 = if m1 < d_sub then m1 else d_sub
-    1 + m2
+    -- Quick length-diff bail: distances below the length gap
+    -- are impossible.
+    let la = length a
+    let lb = length b
+    let gap = if la > lb then la - lb else lb - la
+    if gap >= bound then bound
+    else if head a == head b then edist_bounded (tail a) (tail b) bound
+    else
+      let d_del = edist_bounded (tail a) b (bound - 1)
+      let d_ins = edist_bounded a (tail b) (bound - 1)
+      let d_sub = edist_bounded (tail a) (tail b) (bound - 1)
+      let m1 = if d_del < d_ins then d_del else d_ins
+      let m2 = if m1 < d_sub then m1 else d_sub
+      1 + m2
+
+-- Legacy name kept so the old label survives any lingering reference.
+edist_loop a b = edist_bounded a b 3
 
 -- Walk the arity map and return the key with the smallest edit
 -- distance to `name`, provided that distance is ≤ 2.  Empty string
@@ -2501,15 +2514,21 @@ compile_func d ar lc =
   let gc_desc = cat ["    .quad .Lfn_", nm, "_start\n    .quad .Lfn_", nm, "_end\n    .long ", show nslots, "\n    .long ", show gc_bits, "\n    .quad 0\n"]
   (cat [memo_decl, fn_start_lbl, pro, sv, self_loop_lbl, body_asm, epi, fn_end_lbl], gc_desc, lc1)
 
-compile_funcs decls ar lc =
-  if length decls == 0 then ("", "", lc)
-  else if head (head decls) == "TY" then compile_funcs (tail decls) ar lc
-  else if head (head decls) == "FN_EXT" then compile_funcs (tail decls) ar lc
-  else if head (head decls) == "LINK" then compile_funcs (tail decls) ar lc
+-- compile_funcs walks the decl list and compiles each FN. Was
+-- non-tail-recursive with `cat [fasm, rest]` on the unwind, which is
+-- O(N²) in total asm length (each cat copies the growing prefix) and
+-- costs one stack frame per decl. Rewritten tail-recursive: cons each
+-- produced chunk onto accumulators, single `join ""` at the end.
+compile_funcs decls ar lc = compile_funcs_loop decls ar lc [] []
+
+compile_funcs_loop decls ar lc asm_acc desc_acc =
+  if length decls == 0 then (join "" (reverse asm_acc), join "" (reverse desc_acc), lc)
+  else if head (head decls) == "TY" then compile_funcs_loop (tail decls) ar lc asm_acc desc_acc
+  else if head (head decls) == "FN_EXT" then compile_funcs_loop (tail decls) ar lc asm_acc desc_acc
+  else if head (head decls) == "LINK" then compile_funcs_loop (tail decls) ar lc asm_acc desc_acc
   else
     let (fasm, fdesc, lc1) = compile_func (head decls) ar lc
-    let (rest, rest_desc, lc2) = compile_funcs (tail decls) ar lc1
-    (cat [fasm, rest], cat [fdesc, rest_desc], lc2)
+    compile_funcs_loop (tail decls) ar lc1 (cons fasm asm_acc) (cons fdesc desc_acc)
 
 rt_core =
   let req = "_rail_eq:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    tst x1, #1\n    b.eq .Lreq_heap\n    cmp x1, x0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_heap:\n    cbz x1, .Lreq_raw_cmp\n    cbz x0, .Lreq_raw_cmp\n    tst x0, #1\n    b.ne .Lreq_mismatch\n    ldr x2, [x1]\n    and x2, x2, #0x7fffffffffffffff\n    cmp x2, #6\n    b.eq .Lreq_float\n    str x0, [x29, #16]\n    mov x0, x1\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _str_unwrap\n    mov x1, x0\n    ldr x0, [x29, #24]\n    bl _strcmp\n    cmp x0, #0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_raw_cmp:\n    cmp x1, x0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_mismatch:\n    mov x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n\n"

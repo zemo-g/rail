@@ -1,0 +1,122 @@
+-- stdlib/https_strict.rail — HTTPS with full X.509 chain-to-root
+-- validation.
+--
+-- Layer above stdlib/https_client.rail that inserts a chain-walk gate
+-- between flight decrypt and the handshake FSM. Trust roots come from
+-- /etc/ssl/cert.pem; on load failure the call returns
+-- (0, "trust store load failed"). Each call re-loads the store; to
+-- amortise across many requests use `https_get_with_store` /
+-- `https_post_with_store` and supply a pre-loaded store.
+--
+-- Public API:
+--   https_get_strict        host ip port path           -> (status, body)
+--   https_get_url_strict    url                          -> (status, body)
+--   https_post_strict       host ip port path ct body hs -> (status, body)
+--   https_post_url_strict   url ct body hs               -> (status, body)
+--   https_get_with_store    store host ip port path      -> (status, body)
+--   https_post_with_store   store host ip port path ct body hs -> (status, body)
+--   hs_chain_ok             store fb                     -> 1/0 (helper)
+
+import "stdlib/https_client.rail"
+import "stdlib/b64.rail"
+import "stdlib/pem.rail"
+import "stdlib/cert_chain.rail"
+
+hs_trust_store_path _ = "/etc/ssl/cert.pem"
+
+hs_chain_ok store fb =
+  let m_ee = tls13_hs_read_msg fb 0
+  if arr_get m_ee 0 != 8 then 0
+  else
+    let m_cert = tls13_hs_read_msg fb (arr_get m_ee 3)
+    if arr_get m_cert 0 != 11 then 0
+    else
+      let parsed = tls13_parse_cert_chain fb (arr_get m_cert 1) (arr_get m_cert 2)
+      if arr_get parsed 3 == 0 then 0
+      else cc_walk_chain store (arr_get parsed 0) (arr_get parsed 1) (arr_get parsed 2)
+
+-- Strict driver: mirrors https_get_on_fd but gates on chain walk
+-- before the FSM. Single flat function body to keep compile cost down.
+hs_drive_get fd host path store =
+  let kp = hc_gen_keypair 0
+  let priv = arr_get kp 0
+  let ch_rec = tls13_client_hello (hc_read_random 32) (hc_read_random 32) (arr_get kp 1) host
+  let ch_wire = arr_get ch_rec 0
+  let ch_wire_len = arr_get ch_rec 1
+  let _ = hc_send_bytes fd ch_wire ch_wire_len
+  let ch_msg_len = ch_wire_len - 5
+  let ch_msg = arr_new ch_msg_len 0
+  let _ = sha_copy_bytes ch_wire ch_msg 5 0 ch_msg_len
+  let xh = hc_exchange_hello fd ch_msg ch_msg_len priv
+  if arr_get xh 5 == 0 then let _ = close fd in (0, "ServerHello parse failed")
+  else
+    let flight = hc_read_server_flight fd (arr_get xh 2) (arr_get xh 3)
+    let fb = arr_get flight 0
+    let fl = arr_get flight 1
+    if fl < 0 then let _ = close fd in (0, "flight decrypt failed")
+    else if hs_chain_ok store fb == 0 then let _ = close fd in (0, "chain does not validate to trust store")
+    else https_get_app_phase fd host path priv ch_msg ch_msg_len (arr_get xh 0) (arr_get xh 1) fb fl (arr_get xh 4)
+
+hs_drive_post fd host path ctype body hdrs store =
+  let kp = hc_gen_keypair 0
+  let priv = arr_get kp 0
+  let ch_rec = tls13_client_hello (hc_read_random 32) (hc_read_random 32) (arr_get kp 1) host
+  let ch_wire = arr_get ch_rec 0
+  let ch_wire_len = arr_get ch_rec 1
+  let _ = hc_send_bytes fd ch_wire ch_wire_len
+  let ch_msg_len = ch_wire_len - 5
+  let ch_msg = arr_new ch_msg_len 0
+  let _ = sha_copy_bytes ch_wire ch_msg 5 0 ch_msg_len
+  let xh = hc_exchange_hello fd ch_msg ch_msg_len priv
+  if arr_get xh 5 == 0 then let _ = close fd in (0, "ServerHello parse failed")
+  else
+    let flight = hc_read_server_flight fd (arr_get xh 2) (arr_get xh 3)
+    let fb = arr_get flight 0
+    let fl = arr_get flight 1
+    if fl < 0 then let _ = close fd in (0, "flight decrypt failed")
+    else if hs_chain_ok store fb == 0 then let _ = close fd in (0, "chain does not validate to trust store")
+    else https_post_app_phase fd host path ctype body hdrs priv ch_msg ch_msg_len (arr_get xh 0) (arr_get xh 1) fb fl (arr_get xh 4)
+
+https_get_with_store store host ip port path =
+  let fd = hc_connect_tcp ip port
+  if fd < 0 then (0, "connect failed")
+  else hs_drive_get fd host path store
+
+https_get_strict host ip port path =
+  let store = pem_load_trust_store (hs_trust_store_path 0)
+  if arr_get store 3 == 0 then (0, "trust store load failed")
+  else https_get_with_store store host ip port path
+
+https_get_url_strict url =
+  let store = pem_load_trust_store (hs_trust_store_path 0)
+  if arr_get store 3 == 0 then (0, "trust store load failed")
+  else
+    let parts = https_parse_url url
+    if arr_get parts 4 == 0 then (0, "bad URL")
+    else
+      let host = arr_get parts 0
+      let ip = dns_resolve_a host
+      if length ip == 0 then (0, join "" ["DNS resolve failed for ", host])
+      else https_get_with_store store host ip (arr_get parts 1) (arr_get parts 2)
+
+https_post_with_store store host ip port path ctype body hdrs =
+  let fd = hc_connect_tcp ip port
+  if fd < 0 then (0, "connect failed")
+  else hs_drive_post fd host path ctype body hdrs store
+
+https_post_strict host ip port path ctype body hdrs =
+  let store = pem_load_trust_store (hs_trust_store_path 0)
+  if arr_get store 3 == 0 then (0, "trust store load failed")
+  else https_post_with_store store host ip port path ctype body hdrs
+
+https_post_url_strict url ctype body hdrs =
+  let store = pem_load_trust_store (hs_trust_store_path 0)
+  if arr_get store 3 == 0 then (0, "trust store load failed")
+  else
+    let parts = https_parse_url url
+    if arr_get parts 4 == 0 then (0, "bad URL")
+    else
+      let host = arr_get parts 0
+      let ip = dns_resolve_a host
+      if length ip == 0 then (0, join "" ["DNS resolve failed for ", host])
+      else https_post_with_store store host ip (arr_get parts 1) (arr_get parts 2) ctype body hdrs
