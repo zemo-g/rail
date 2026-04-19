@@ -32,7 +32,7 @@
               </a>
             </h2>
             <time><xsl:value-of select="substring(atom:updated, 1, 10)"/></time>
-            <div class="content"><xsl:value-of select="atom:content"/></div>
+            <div class="content"><xsl:value-of select="atom:content" disable-output-escaping="yes"/></div>
           </article>
         </xsl:for-each>
 
