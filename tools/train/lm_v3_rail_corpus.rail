@@ -1,0 +1,442 @@
+-- lm_v3_rail_corpus.rail — Phase 3 model trained on Rail source code.
+--
+-- First "Rail-on-Rail" training run: same architecture as lm_v3.rail
+-- (single-block, d=64, RMSNorm + RoPE + SwiGLU + tied embeddings + Adam),
+-- but the corpus is a Rail source excerpt instead of Shakespeare.
+-- Goal: demonstrate the model memorizes Rail syntax + structure.
+import "stdlib/transformer.rail"
+import "stdlib/optim.rail"
+import "stdlib/tokenizer.rail"
+
+-- First ~400 chars of stdlib/optim.rail as the corpus. Rail syntax
+-- density is higher than prose (operators, punctuation, identifiers
+-- repeated), so the char vocab is ~60-70 vs Shakespeare's 32.
+corpus _ =
+  cat ["-- stdlib/optim.rail — Adam optimizer.\n",
+       "import \"stdlib/tensor.rail\"\n",
+       "type AdamState = | AdamState m v step_arr\n\n",
+       "adam_state n =\n",
+       "  let m = float_arr_new n 0.0\n",
+       "  let v = float_arr_new n 0.0\n",
+       "  AdamState m v (arr_new 1 0)\n\n",
+       "adam_hyp lr b1 b2 eps t =\n",
+       "  let t_f = int_to_float t\n",
+       "  let bc1 = 1.0 - (pow b1 t_f)\n",
+       "  let h = float_arr_new 6 0.0\n",
+       "  let _ = float_arr_set h 0 lr\n",
+       "  h\n"]
+
+init_weight arr n seed = init_w_loop arr n seed 0
+
+init_w_loop arr n seed i =
+  if i >= n then 0
+  else
+    let raw = ((i * 97 + seed * 13) % 100) - 50
+    let _ = float_arr_set arr i (0.01 * int_to_float raw)
+    init_w_loop arr n (seed + 1) (i + 1)
+
+fill_onehot dst ids V seq i =
+  if i >= seq then 0
+  else
+    let c = head ids
+    let _ = float_arr_set dst (i * V + c) 1.0
+    fill_onehot dst (tail ids) V seq (i + 1)
+
+fill_labels arr ids seq i =
+  if i >= seq then 0
+  else
+    let _ = float_arr_set arr i (int_to_float (head ids))
+    fill_labels arr (tail ids) seq (i + 1)
+
+unwrap t = match t | Tensor d _ _ -> d
+
+ones_loop_rc arr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set arr i 1.0
+    ones_loop_rc arr n (i + 1)
+
+-- Cross-entropy + grad.
+rc_ce_loss_loop pd ld seq V acc i =
+  if i >= seq then 0
+  else
+    let target = float_to_int (float_arr_get ld i)
+    let p = float_arr_get pd (i * V + target)
+    let p2 = if p < 0.00000001 then 0.00000001 else p
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur - log p2)
+    rc_ce_loss_loop pd ld seq V acc (i + 1)
+
+rc_ce_loss probs labels seq V = match probs
+  | Tensor pd _ _ -> match labels
+    | Tensor ld _ _ ->
+      let acc = float_arr_new 1 0.0
+      let _ = rc_ce_loss_loop pd ld seq V acc 0
+      (float_arr_get acc 0) / int_to_float seq
+
+rc_ce_grad_loop dst probs labels seq V invN i =
+  if i >= seq * V then 0
+  else
+    let row = i / V
+    let col = i % V
+    let target = float_to_int (float_arr_get labels row)
+    let p = float_arr_get probs i
+    let g = if col == target then (p - 1.0) * invN else p * invN
+    let _ = float_arr_set dst i g
+    rc_ce_grad_loop dst probs labels seq V invN (i + 1)
+
+rc_hadamard_loop ad bd cd n i =
+  if i >= n then 0
+  else
+    let a = float_arr_get ad i
+    let b = float_arr_get bd i
+    let _ = float_arr_set cd i (a * b)
+    rc_hadamard_loop ad bd cd n (i + 1)
+
+rc_hadamard a b = match a
+  | Tensor ad a_shape _ -> match b
+    | Tensor bd _ _ ->
+      let n = list_product a_shape
+      let cd = float_arr_new n 0.0
+      let _ = rc_hadamard_loop ad bd cd n 0
+      Tensor cd a_shape (compute_strides a_shape)
+
+-- Forward (same as lm_v3).
+rc_forward x w_e w_q w_k w_v w_o w_gate w_up w_down g1 g2 gf seq V d =
+  let x_embed = matmul x w_e
+  let pack1 = rmsnorm_save x_embed g1
+  let ln1_out = head pack1
+  let rstd1 = head (tail pack1)
+  let q = matmul ln1_out w_q
+  let k = matmul ln1_out w_k
+  let v = matmul ln1_out w_v
+  let _ = rope_apply q
+  let _ = rope_apply k
+  let kt = tensor_transpose k
+  let scores = matmul q kt
+  let scale = 1.0 / sqrt (int_to_float d)
+  let scaled = tensor_scale scores scale
+  let sd = unwrap scaled
+  let _ = apply_causal_mask_loop sd seq 0 0
+  let attn = tensor_softmax scaled
+  let attn_val = matmul attn v
+  let attn_out = matmul attn_val w_o
+  let x_attn = tensor_add x_embed attn_out
+  let pack2 = rmsnorm_save x_attn g2
+  let ln2_out = head pack2
+  let rstd2 = head (tail pack2)
+  let h_gate = matmul ln2_out w_gate
+  let h_up = matmul ln2_out w_up
+  let silu_pack = silu_forward h_gate
+  let h_gate_silu = head silu_pack
+  let h_gate_sig = head (tail silu_pack)
+  let h_act = rc_hadamard h_gate_silu h_up
+  let h_out = matmul h_act w_down
+  let x_block = tensor_add x_attn h_out
+  let packf = rmsnorm_save x_block gf
+  let x_final = head packf
+  let rstd_final = head (tail packf)
+  let we_t = tensor_transpose w_e
+  let logits = matmul x_final we_t
+  let probs = tensor_softmax logits
+
+  let r0 = cons attn_val []
+  let r1 = cons x_final r0
+  let r2 = cons rstd_final r1
+  let r3 = cons rstd2 r2
+  let r4 = cons rstd1 r3
+  let r5 = cons h_gate r4
+  let r6 = cons h_up r5
+  let r7 = cons h_gate_sig r6
+  let r8 = cons h_act r7
+  let r9 = cons v r8
+  let r10 = cons k r9
+  let r11 = cons q r10
+  let r12 = cons x_embed r11
+  let r13 = cons ln1_out r12
+  let r14 = cons x_attn r13
+  let r15 = cons ln2_out r14
+  let r16 = cons x_block r15
+  let r17 = cons attn r16
+  cons probs r17
+
+rc_train_step x labels weights adams seq V d dlog_buf lr =
+  let w_e = list_nth 0 weights
+  let w_q = list_nth 1 weights
+  let w_k = list_nth 2 weights
+  let w_v = list_nth 3 weights
+  let w_o = list_nth 4 weights
+  let w_gate = list_nth 5 weights
+  let w_up = list_nth 6 weights
+  let w_down = list_nth 7 weights
+  let g1 = list_nth 8 weights
+  let g2 = list_nth 9 weights
+  let gf = list_nth 10 weights
+  let st_we = list_nth 0 adams
+  let st_wq = list_nth 1 adams
+  let st_wk = list_nth 2 adams
+  let st_wv = list_nth 3 adams
+  let st_wo = list_nth 4 adams
+  let st_wgate = list_nth 5 adams
+  let st_wup = list_nth 6 adams
+  let st_wdown = list_nth 7 adams
+
+  let result = rc_forward x w_e w_q w_k w_v w_o w_gate w_up w_down g1 g2 gf seq V d
+  let probs = list_nth 0 result
+  let attn = list_nth 1 result
+  let x_block = list_nth 2 result
+  let ln2_out = list_nth 3 result
+  let x_attn = list_nth 4 result
+  let ln1_out = list_nth 5 result
+  let x_embed = list_nth 6 result
+  let q = list_nth 7 result
+  let k = list_nth 8 result
+  let v = list_nth 9 result
+  let h_act = list_nth 10 result
+  let h_gate_sig = list_nth 11 result
+  let h_up = list_nth 12 result
+  let h_gate = list_nth 13 result
+  let rstd1 = list_nth 14 result
+  let rstd2 = list_nth 15 result
+  let rstd_final = list_nth 16 result
+  let x_final = list_nth 17 result
+  let attn_val = list_nth 18 result
+
+  let loss = rc_ce_loss probs labels seq V
+
+  match probs | Tensor pd _ _ -> match labels | Tensor ld _ _ ->
+    let invN = 1.0 / int_to_float seq
+    let _ = rc_ce_grad_loop dlog_buf pd ld seq V invN 0
+    let dlog_t = Tensor dlog_buf (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+
+    let dx_final_head = matmul dlog_t w_e
+    let dlog_T = tensor_transpose dlog_t
+    let d_we_head = matmul dlog_T x_final
+
+    let dx_block = rmsnorm_backward_dx x_block gf rstd_final dx_final_head
+    let dffn_out = dx_block
+    let hact_T = tensor_transpose h_act
+    let d_wdown = matmul hact_T dffn_out
+    let wdown_T = tensor_transpose w_down
+    let dh_act = matmul dffn_out wdown_T
+    let hg_d = unwrap h_gate
+    let hg_n = seq * 3 * d
+    let h_gate_silu_d = float_arr_new hg_n 0.0
+    let _ = rc_hadamard_loop hg_d h_gate_sig h_gate_silu_d hg_n 0
+    let h_gate_silu = Tensor h_gate_silu_d (cons seq (cons (3 * d) [])) (compute_strides (cons seq (cons (3 * d) [])))
+    let dh_up = rc_hadamard dh_act h_gate_silu
+    let dh_silu = rc_hadamard dh_act h_up
+    let dh_gate = silu_backward h_gate dh_silu h_gate_sig
+    let ln2_T = tensor_transpose ln2_out
+    let d_wgate = matmul ln2_T dh_gate
+    let d_wup = matmul ln2_T dh_up
+    let wgate_T = tensor_transpose w_gate
+    let wup_T = tensor_transpose w_up
+    let d_ln2_gate = matmul dh_gate wgate_T
+    let d_ln2_up = matmul dh_up wup_T
+    let d_ln2_out = tensor_add d_ln2_gate d_ln2_up
+
+    let d_x_attn_ln = rmsnorm_backward_dx x_attn g2 rstd2 d_ln2_out
+    let dx_attn = tensor_add dx_block d_x_attn_ln
+    let dattn_out = dx_attn
+    let attn_val_T = tensor_transpose attn_val
+    let d_wo = matmul attn_val_T dattn_out
+    let wo_T = tensor_transpose w_o
+    let d_attn_val = matmul dattn_out wo_T
+    let (d_q_rot, d_k_rot, d_v_proj) = attention_backward q k v attn d_attn_val
+    let _ = rope_apply_inverse d_q_rot
+    let _ = rope_apply_inverse d_k_rot
+    let ln1_T = tensor_transpose ln1_out
+    let d_wq = matmul ln1_T d_q_rot
+    let d_wk = matmul ln1_T d_k_rot
+    let d_wv = matmul ln1_T d_v_proj
+    let wq_T = tensor_transpose w_q
+    let wk_T = tensor_transpose w_k
+    let wv_T = tensor_transpose w_v
+    let dx_q = matmul d_q_rot wq_T
+    let dx_k = matmul d_k_rot wk_T
+    let dx_v = matmul d_v_proj wv_T
+    let dx_qk = tensor_add dx_q dx_k
+    let d_ln1_out = tensor_add dx_qk dx_v
+    let d_x_embed_ln = rmsnorm_backward_dx x_embed g1 rstd1 d_ln1_out
+    let dx_embed = tensor_add dx_attn d_x_embed_ln
+    let xT = tensor_transpose x
+    let d_we_embed = matmul xT dx_embed
+    let d_we = tensor_add d_we_head d_we_embed
+
+    let we_d = unwrap w_e
+    let wq_d = unwrap w_q
+    let wk_d = unwrap w_k
+    let wv_d = unwrap w_v
+    let wo_d = unwrap w_o
+    let wgate_d = unwrap w_gate
+    let wup_d = unwrap w_up
+    let wdown_d = unwrap w_down
+    let dwe_d = unwrap d_we
+    let dwq_d = unwrap d_wq
+    let dwk_d = unwrap d_wk
+    let dwv_d = unwrap d_wv
+    let dwo_d = unwrap d_wo
+    let dwgate_d = unwrap d_wgate
+    let dwup_d = unwrap d_wup
+    let dwdown_d = unwrap d_wdown
+    let _ = adam_update_raw we_d dwe_d st_we lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wq_d dwq_d st_wq lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wk_d dwk_d st_wk lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wv_d dwv_d st_wv lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wo_d dwo_d st_wo lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wgate_d dwgate_d st_wgate lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wup_d dwup_d st_wup lr adam_default_b1 adam_default_b2 adam_default_eps
+    let _ = adam_update_raw wdown_d dwdown_d st_wdown lr adam_default_b1 adam_default_b2 adam_default_eps
+    loss
+
+rc_train_loop x labels weights adams seq V d dlog_buf base_lr warmup max_steps step =
+  if step >= max_steps then 0
+  else
+    let lr = cosine_decay step warmup max_steps base_lr
+    let mk = arena_mark 0
+    let loss = rc_train_step x labels weights adams seq V d dlog_buf lr
+    let _ = arena_reset mk
+    let _ = if step % 25 == 0 then
+      let _ = print (cat ["step ", show step, "  lr=", show_float lr, "  loss=", show_float loss])
+      0
+    else 0
+    rc_train_loop x labels weights adams seq V d dlog_buf base_lr warmup max_steps (step + 1)
+
+rc_eval_loss x labels weights seq V d =
+  let w_e = list_nth 0 weights
+  let w_q = list_nth 1 weights
+  let w_k = list_nth 2 weights
+  let w_v = list_nth 3 weights
+  let w_o = list_nth 4 weights
+  let w_gate = list_nth 5 weights
+  let w_up = list_nth 6 weights
+  let w_down = list_nth 7 weights
+  let g1 = list_nth 8 weights
+  let g2 = list_nth 9 weights
+  let gf = list_nth 10 weights
+  let result = rc_forward x w_e w_q w_k w_v w_o w_gate w_up w_down g1 g2 gf seq V d
+  let probs = list_nth 0 result
+  rc_ce_loss probs labels seq V
+
+-- Greedy sample: pick the argmax at each position.
+argmax_row probs row V j best_id best_val =
+  if j >= V then best_id
+  else
+    let p = float_arr_get probs (row * V + j)
+    if p > best_val then argmax_row probs row V (j + 1) j p
+    else argmax_row probs row V (j + 1) best_id best_val
+
+collect_preds probs seq V i acc =
+  if i >= seq then reverse acc
+  else
+    let id = argmax_row probs i V 1 0 (float_arr_get probs (i * V))
+    collect_preds probs seq V (i + 1) (cons id acc)
+
+rc_sample x weights seq V d vocab =
+  let w_e = list_nth 0 weights
+  let w_q = list_nth 1 weights
+  let w_k = list_nth 2 weights
+  let w_v = list_nth 3 weights
+  let w_o = list_nth 4 weights
+  let w_gate = list_nth 5 weights
+  let w_up = list_nth 6 weights
+  let w_down = list_nth 7 weights
+  let g1 = list_nth 8 weights
+  let g2 = list_nth 9 weights
+  let gf = list_nth 10 weights
+  let result = rc_forward x w_e w_q w_k w_v w_o w_gate w_up w_down g1 g2 gf seq V d
+  let probs_t = list_nth 0 result
+  match probs_t | Tensor pd _ _ ->
+    let ids = collect_preds pd seq V 0 []
+    decode vocab ids
+
+main =
+  let _ = print "=== Rail-on-Rail: lm_v3 on Rail source corpus ==="
+
+  let text = corpus 0
+  let vocab = build_vocab text
+  let V = vocab_size vocab
+  let ids = encode vocab text
+  let total = length ids
+  let seq = total - 1
+  let _ = print (cat ["corpus chars=", show total, "  vocab size=", show V, "  seq=", show seq])
+
+  let x_data = float_arr_new (seq * V) 0.0
+  let _ = fill_onehot x_data ids V seq 0
+  let x = Tensor x_data (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+
+  let labels_data = float_arr_new seq 0.0
+  let _ = fill_labels labels_data (tail ids) seq 0
+  let labels = Tensor labels_data (cons seq []) (cons 1 [])
+
+  let d = 64
+  let d_ff = 3 * d
+
+  let we_data = float_arr_new (V * d) 0.0
+  let _ = init_weight we_data (V * d) 1
+  let w_e = Tensor we_data (cons V (cons d [])) (compute_strides (cons V (cons d [])))
+
+  let wq_data = float_arr_new (d * d) 0.0
+  let _ = init_weight wq_data (d * d) 2
+  let w_q = Tensor wq_data (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+  let wk_data = float_arr_new (d * d) 0.0
+  let _ = init_weight wk_data (d * d) 3
+  let w_k = Tensor wk_data (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+  let wv_data = float_arr_new (d * d) 0.0
+  let _ = init_weight wv_data (d * d) 4
+  let w_v = Tensor wv_data (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+  let wo_data = float_arr_new (d * d) 0.0
+  let _ = init_weight wo_data (d * d) 5
+  let w_o = Tensor wo_data (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+
+  let wgate_data = float_arr_new (d * d_ff) 0.0
+  let _ = init_weight wgate_data (d * d_ff) 6
+  let w_gate = Tensor wgate_data (cons d (cons d_ff [])) (compute_strides (cons d (cons d_ff [])))
+  let wup_data = float_arr_new (d * d_ff) 0.0
+  let _ = init_weight wup_data (d * d_ff) 7
+  let w_up = Tensor wup_data (cons d (cons d_ff [])) (compute_strides (cons d (cons d_ff [])))
+  let wdown_data = float_arr_new (d_ff * d) 0.0
+  let _ = init_weight wdown_data (d_ff * d) 8
+  let w_down = Tensor wdown_data (cons d_ff (cons d [])) (compute_strides (cons d_ff (cons d [])))
+
+  let g1_data = float_arr_new d 1.0
+  let _ = ones_loop_rc g1_data d 0
+  let g1 = Tensor g1_data (cons d []) (cons 1 [])
+  let g2_data = float_arr_new d 1.0
+  let _ = ones_loop_rc g2_data d 0
+  let g2 = Tensor g2_data (cons d []) (cons 1 [])
+  let gf_data = float_arr_new d 1.0
+  let _ = ones_loop_rc gf_data d 0
+  let gf = Tensor gf_data (cons d []) (cons 1 [])
+
+  let st_we = adam_state (V * d)
+  let st_wq = adam_state (d * d)
+  let st_wk = adam_state (d * d)
+  let st_wv = adam_state (d * d)
+  let st_wo = adam_state (d * d)
+  let st_wgate = adam_state (d * d_ff)
+  let st_wup = adam_state (d * d_ff)
+  let st_wdown = adam_state (d_ff * d)
+
+  let dlog_buf = float_arr_new (seq * V) 0.0
+
+  let base_lr = 0.02
+  let warmup = 100
+  let max_steps = 500
+
+  let weights = cons w_e (cons w_q (cons w_k (cons w_v (cons w_o (cons w_gate (cons w_up (cons w_down (cons g1 (cons g2 (cons gf []))))))))))
+  let adams = cons st_we (cons st_wq (cons st_wk (cons st_wv (cons st_wo (cons st_wgate (cons st_wup (cons st_wdown [])))))))
+
+  let loss0 = rc_eval_loss x labels weights seq V d
+  let _ = print (cat ["initial loss=", show_float loss0, "  uniform=", show_float (log (int_to_float V))])
+  let _ = print (cat ["\ntraining ", show max_steps, " steps..."])
+  let _ = rc_train_loop x labels weights adams seq V d dlog_buf base_lr warmup max_steps 0
+
+  let loss1 = rc_eval_loss x labels weights seq V d
+  let _ = print (cat ["\nfinal loss=", show_float loss1])
+
+  let _ = print "\n--- greedy predictions (memorization check) ---"
+  let sample_str = rc_sample x weights seq V d vocab
+  let _ = print sample_str
+  0
