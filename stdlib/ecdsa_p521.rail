@@ -1,0 +1,330 @@
+-- stdlib/ecdsa_p521.rail — ECDSA verify on NIST P-521 (secp521r1).
+--
+-- Structural clone of stdlib/ecdsa_p384.rail: same Jacobian-coords
+-- point math (dbl-2001-b / add-2007-bl, a = -3), same Fermat inverse,
+-- same MSB→LSB double-and-add scalar mult. The only differences from
+-- P-384 are:
+--   * 33 × 16-bit limbs (528-bit storage, top 7 bits of limb 32 unused)
+--   * Scalar-mult + pow loops start at bit_idx 520 (not 383)
+--   * Curve constants are 66 bytes big-endian
+--
+-- Curve parameters (FIPS 186-4 D.1.2.5, cross-checked via OpenSSL
+-- `ecparam -name secp521r1 -param_enc explicit -text`):
+--   p = 2^521 - 1
+--   a = p - 3
+--   b = 0051...3F00  (the full B from FIPS — unused in verify; a = -3
+--                    shortcut means b is only needed for sign/keygen)
+--   n = 01FF..FA 51868783BF2F966B7FCC0148F709A5D03BB5C9B8899C47AE
+--                 BB6FB71E91386409
+--   Gx = 00C6858E06B70404E9CD9E3ECB662395B4429C648139053FB521F828
+--        AF606B4D3DBAA14B5E77EFE75928FE1DC127A2FFA8DE3348B3C1856A
+--        429BF97E7E31C2E5BD66
+--   Gy = 011839296A789A3BC0045C8A5FB42C7D1BD998F54449579B446817AF
+--        BD17273E662C97EE72995EF42640C550B9013FAD0761353C7086A272
+--        C24088BE94769FD16650
+--
+-- Public API:
+--   ecdsa_p521_verify pub_x_bytes pub_y_bytes msg_hash_bytes r_bytes s_bytes -> 1/0
+--   All byte arguments are 66-byte big-endian arrays. For SHA-512
+--   message digests (64 bytes), left-pad two zero bytes before handing
+--   to the verifier — the hash integer is then < n.
+--
+-- Depends on bignum_n helpers (bn_new / bn_from_be / bn_cmp / bn_mul_mod /
+-- …). Do NOT import stdlib/bignum_n.rail here: the caller's tls13 chain
+-- already brings it in via rsa_pss.rail, and a second textual import
+-- duplicates every symbol.
+
+p521_nl _ = 33
+
+-- Load curve constants (66 bytes each, 33 limbs with the top limb
+-- holding only the 9 most-significant bits of the 521-bit value).
+p521_load_p _ = bn_from_be (hex_to_bytes "01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff") 33
+p521_load_n _ = bn_from_be (hex_to_bytes "01fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e91386409") 33
+p521_load_gx _ = bn_from_be (hex_to_bytes "00c6858e06b70404e9cd9e3ecb662395b4429c648139053fb521f828af606b4d3dbaa14b5e77efe75928fe1dc127a2ffa8de3348b3c1856a429bf97e7e31c2e5bd66") 33
+p521_load_gy _ = bn_from_be (hex_to_bytes "011839296a789a3bc0045c8a5fb42c7d1bd998f54449579b446817afbd17273e662c97ee72995ef42640c550b9013fad0761353c7086a272c24088be94769fd16650") 33
+
+-- ── Modular inverse via Fermat's little theorem ──────────────────────
+-- a^-1 mod m = a^(m-2) mod m. Loop runs 521 squarings (bit 520 → 0).
+
+p521_mod_inv c a m =
+  let nl = 33
+  let exp = bn_new nl
+  let _ = bn_copy exp m nl
+  let two = bn_new nl
+  let _ = arr_set two 0 2
+  let tmp = bn_new nl
+  let _ = bn_usub tmp exp two nl
+  let _ = bn_copy exp tmp nl
+  let _ = bn_zero c nl
+  let _ = arr_set c 0 1
+  let _ = p521_pow_loop c a exp m nl 520
+  c
+
+p521_pow_loop c base exp m nl bit_idx =
+  if bit_idx < 0 then 0
+  else
+    let tmp = bn_new nl
+    let _ = bn_sqr_mod tmp c m nl
+    let _ = bn_copy c tmp nl
+    let limb_idx = shr bit_idx 4
+    let bit_in_limb = bit_and bit_idx 15
+    let b = bit_and (shr (arr_get exp limb_idx) bit_in_limb) 1
+    if b == 1 then
+      let tmp2 = bn_new nl
+      let _ = bn_mul_mod tmp2 c base m nl
+      let _ = bn_copy c tmp2 nl
+      p521_pow_loop c base exp m nl (bit_idx - 1)
+    else p521_pow_loop c base exp m nl (bit_idx - 1)
+
+-- ── Point operations (Jacobian, a = -3) ──────────────────────────────
+
+p521_point_new _ =
+  let pt = arr_new 3 0
+  let _ = arr_set pt 0 (bn_new 33)
+  let _ = arr_set pt 1 (bn_new 33)
+  let _ = arr_set pt 2 (bn_new 33)
+  pt
+
+p521_point_copy dst src =
+  let _ = bn_copy (arr_get dst 0) (arr_get src 0) 33
+  let _ = bn_copy (arr_get dst 1) (arr_get src 1) 33
+  let _ = bn_copy (arr_get dst 2) (arr_get src 2) 33
+  dst
+
+p521_point_is_inf pt = bn_is_zero (arr_get pt 2) 33
+
+-- Jacobian doubling with a=-3 (EFD dbl-2001-b).
+p521_point_dbl out pin =
+  let p = p521_load_p 0
+  let X = arr_get pin 0
+  let Y = arr_get pin 1
+  let Z = arr_get pin 2
+  if bn_is_zero Z 33 == 1 then
+    let _ = p521_point_copy out pin
+    out
+  else p521_dbl_core out X Y Z p
+
+p521_dbl_core out X Y Z p =
+  let Z2 = bn_new 33
+  let _ = bn_sqr_mod Z2 Z p 33
+  let gamma = bn_new 33
+  let _ = bn_sqr_mod gamma Y p 33
+  let beta = bn_new 33
+  let _ = bn_mul_mod beta X gamma p 33
+  let t1 = bn_new 33
+  let _ = bn_mod_sub t1 X Z2 p 33
+  let t2 = bn_new 33
+  let _ = bn_mod_add t2 X Z2 p 33
+  let t3 = bn_new 33
+  let _ = bn_mul_mod t3 t1 t2 p 33
+  let alpha = bn_new 33
+  let _ = bn_mod_add alpha t3 t3 p 33
+  let tmp_alpha = bn_new 33
+  let _ = bn_mod_add tmp_alpha alpha t3 p 33
+  let _ = bn_copy alpha tmp_alpha 33
+  let alpha2 = bn_new 33
+  let _ = bn_sqr_mod alpha2 alpha p 33
+  let beta4 = bn_new 33
+  let _ = bn_mod_add beta4 beta beta p 33
+  let tmp = bn_new 33
+  let _ = bn_mod_add tmp beta4 beta4 p 33
+  let _ = bn_copy beta4 tmp 33
+  let beta8 = bn_new 33
+  let _ = bn_mod_add beta8 beta4 beta4 p 33
+  let X3 = arr_get out 0
+  let _ = bn_mod_sub X3 alpha2 beta8 p 33
+  let YpZ = bn_new 33
+  let _ = bn_mod_add YpZ Y Z p 33
+  let YpZ2 = bn_new 33
+  let _ = bn_sqr_mod YpZ2 YpZ p 33
+  let t4 = bn_new 33
+  let _ = bn_mod_sub t4 YpZ2 gamma p 33
+  let Z3 = arr_get out 2
+  let _ = bn_mod_sub Z3 t4 Z2 p 33
+  let fourbeta_mX3 = bn_new 33
+  let _ = bn_mod_sub fourbeta_mX3 beta4 X3 p 33
+  let t5 = bn_new 33
+  let _ = bn_mul_mod t5 alpha fourbeta_mX3 p 33
+  let g2 = bn_new 33
+  let _ = bn_sqr_mod g2 gamma p 33
+  let g4 = bn_new 33
+  let _ = bn_mod_add g4 g2 g2 p 33
+  let tmp2 = bn_new 33
+  let _ = bn_mod_add tmp2 g4 g4 p 33
+  let _ = bn_copy g4 tmp2 33
+  let g8 = bn_new 33
+  let _ = bn_mod_add g8 g4 g4 p 33
+  let Y3 = arr_get out 1
+  let _ = bn_mod_sub Y3 t5 g8 p 33
+  out
+
+-- Full Jacobian add (EFD add-2007-bl).
+p521_point_add out pin qin =
+  let p = p521_load_p 0
+  if bn_is_zero (arr_get pin 2) 33 == 1 then
+    let _ = p521_point_copy out qin
+    out
+  else if bn_is_zero (arr_get qin 2) 33 == 1 then
+    let _ = p521_point_copy out pin
+    out
+  else p521_add_core out pin qin p
+
+p521_add_core out pin qin p =
+  let X1 = arr_get pin 0
+  let Y1 = arr_get pin 1
+  let Z1 = arr_get pin 2
+  let X2 = arr_get qin 0
+  let Y2 = arr_get qin 1
+  let Z2 = arr_get qin 2
+  let Z2sq = bn_new 33
+  let _ = bn_sqr_mod Z2sq Z2 p 33
+  let U1 = bn_new 33
+  let _ = bn_mul_mod U1 X1 Z2sq p 33
+  let Z1sq = bn_new 33
+  let _ = bn_sqr_mod Z1sq Z1 p 33
+  let U2 = bn_new 33
+  let _ = bn_mul_mod U2 X2 Z1sq p 33
+  let Z2cb = bn_new 33
+  let _ = bn_mul_mod Z2cb Z2sq Z2 p 33
+  let S1 = bn_new 33
+  let _ = bn_mul_mod S1 Y1 Z2cb p 33
+  let Z1cb = bn_new 33
+  let _ = bn_mul_mod Z1cb Z1sq Z1 p 33
+  let S2 = bn_new 33
+  let _ = bn_mul_mod S2 Y2 Z1cb p 33
+  let H = bn_new 33
+  let _ = bn_mod_sub H U2 U1 p 33
+  let r = bn_new 33
+  let _ = bn_mod_sub r S2 S1 p 33
+  if bn_is_zero H 33 == 1 then
+    if bn_is_zero r 33 == 1 then
+      let _ = p521_point_dbl out pin
+      out
+    else
+      let _ = bn_zero (arr_get out 2) 33
+      out
+  else p521_add_normal out X1 X2 Y1 Y2 Z1 Z2 U1 S1 H r p
+
+p521_add_normal out X1 X2 Y1 Y2 Z1 Z2 U1 S1 H r p =
+  let Hsq = bn_new 33
+  let _ = bn_sqr_mod Hsq H p 33
+  let Hcb = bn_new 33
+  let _ = bn_mul_mod Hcb Hsq H p 33
+  let U1Hsq = bn_new 33
+  let _ = bn_mul_mod U1Hsq U1 Hsq p 33
+  let rsq = bn_new 33
+  let _ = bn_sqr_mod rsq r p 33
+  let t1 = bn_new 33
+  let _ = bn_mod_sub t1 rsq Hcb p 33
+  let U1Hsq2 = bn_new 33
+  let _ = bn_mod_add U1Hsq2 U1Hsq U1Hsq p 33
+  let X3 = arr_get out 0
+  let _ = bn_mod_sub X3 t1 U1Hsq2 p 33
+  let diff = bn_new 33
+  let _ = bn_mod_sub diff U1Hsq X3 p 33
+  let t2 = bn_new 33
+  let _ = bn_mul_mod t2 r diff p 33
+  let t3 = bn_new 33
+  let _ = bn_mul_mod t3 S1 Hcb p 33
+  let Y3 = arr_get out 1
+  let _ = bn_mod_sub Y3 t2 t3 p 33
+  let Z1Z2 = bn_new 33
+  let _ = bn_mul_mod Z1Z2 Z1 Z2 p 33
+  let Z3 = arr_get out 2
+  let _ = bn_mul_mod Z3 Z1Z2 H p 33
+  out
+
+-- Convert Jacobian to affine; returns 1 on success, 0 if at infinity.
+p521_to_affine ax ay pt =
+  let p = p521_load_p 0
+  let Z = arr_get pt 2
+  if bn_is_zero Z 33 == 1 then 0
+  else
+    let Zinv = bn_new 33
+    let _ = p521_mod_inv Zinv Z p
+    let Zinv2 = bn_new 33
+    let _ = bn_sqr_mod Zinv2 Zinv p 33
+    let Zinv3 = bn_new 33
+    let _ = bn_mul_mod Zinv3 Zinv2 Zinv p 33
+    let _ = bn_mul_mod ax (arr_get pt 0) Zinv2 p 33
+    let _ = bn_mul_mod ay (arr_get pt 1) Zinv3 p 33
+    1
+
+-- Scalar multiplication: out = k * P. k is a 33-limb bignum. Bit 520 → 0.
+p521_scalar_mul out k pt =
+  let _ = bn_zero (arr_get out 0) 33
+  let _ = bn_zero (arr_get out 1) 33
+  let _ = bn_zero (arr_get out 2) 33
+  let _ = p521_sm_loop out k pt 520
+  out
+
+p521_sm_loop out k pt bit_idx =
+  if bit_idx < 0 then 0
+  else
+    let tmp = p521_point_new 0
+    let _ = p521_point_dbl tmp out
+    let _ = p521_point_copy out tmp
+    let limb_idx = shr bit_idx 4
+    let bit_in_limb = bit_and bit_idx 15
+    let b = bit_and (shr (arr_get k limb_idx) bit_in_limb) 1
+    if b == 1 then
+      let tmp2 = p521_point_new 0
+      let _ = p521_point_add tmp2 out pt
+      let _ = p521_point_copy out tmp2
+      p521_sm_loop out k pt (bit_idx - 1)
+    else p521_sm_loop out k pt (bit_idx - 1)
+
+-- ── ECDSA verify ───────────────────────────────────────────────────
+-- Inputs: 66-byte big-endian pub_x, pub_y, hash, r, s. For SHA-512
+-- digests (64 bytes), left-pad two zero bytes to get 66-byte hash.
+
+ecdsa_p521_verify pub_x_bytes pub_y_bytes hash_bytes r_bytes s_bytes =
+  let n = p521_load_n 0
+  let r = bn_from_be r_bytes 33
+  let s = bn_from_be s_bytes 33
+  if bn_is_zero r 33 == 1 then 0
+  else if bn_is_zero s 33 == 1 then 0
+  else if bn_cmp r n 33 >= 0 then 0
+  else if bn_cmp s n 33 >= 0 then 0
+  else
+    let e = bn_from_be hash_bytes 33
+    let tmp = bn_new 33
+    let bor = bn_usub tmp e n 33
+    if bor == 0 then
+      let _ = bn_copy e tmp 33
+      ecdsa_p521_verify_core e r s pub_x_bytes pub_y_bytes
+    else ecdsa_p521_verify_core e r s pub_x_bytes pub_y_bytes
+
+ecdsa_p521_verify_core e r s pub_x_bytes pub_y_bytes =
+  let n = p521_load_n 0
+  let w = bn_new 33
+  let _ = p521_mod_inv w s n
+  let u1 = bn_new 33
+  let _ = bn_mul_mod u1 e w n 33
+  let u2 = bn_new 33
+  let _ = bn_mul_mod u2 r w n 33
+  let Gpt = p521_point_new 0
+  let _ = bn_copy (arr_get Gpt 0) (p521_load_gx 0) 33
+  let _ = bn_copy (arr_get Gpt 1) (p521_load_gy 0) 33
+  let _ = arr_set (arr_get Gpt 2) 0 1
+  let Qpt = p521_point_new 0
+  let _ = bn_copy (arr_get Qpt 0) (bn_from_be pub_x_bytes 33) 33
+  let _ = bn_copy (arr_get Qpt 1) (bn_from_be pub_y_bytes 33) 33
+  let _ = arr_set (arr_get Qpt 2) 0 1
+  let u1G = p521_point_new 0
+  let _ = p521_scalar_mul u1G u1 Gpt
+  let u2Q = p521_point_new 0
+  let _ = p521_scalar_mul u2Q u2 Qpt
+  let R = p521_point_new 0
+  let _ = p521_point_add R u1G u2Q
+  if p521_point_is_inf R == 1 then 0
+  else
+    let ax = bn_new 33
+    let ay = bn_new 33
+    let _ = p521_to_affine ax ay R
+    let tmp = bn_new 33
+    let bor = bn_usub tmp ax n 33
+    if bor == 0 then
+      if bn_cmp tmp r 33 == 0 then 1 else 0
+    else
+      if bn_cmp ax r 33 == 0 then 1 else 0

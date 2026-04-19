@@ -1,0 +1,498 @@
+-- stdlib/ed25519.rail — Ed25519 signature verify (RFC 8032 §5.1).
+--
+-- ⚠ WIP — NOT YET FUNCTIONAL. Known issues at v3.3.0 handoff:
+--   * `ed_d_bytes` constant has a stale pre-verification hex string
+--     (the verified LE hex is "a3785913ca4deb75abd841414d0a700098e8
+--     79777940c78c73fe6f2bee6c0352" — the `|> ed_strip_ws` pipe was a
+--     band-aid over a transcription error).
+--   * `ed_pow_bytes_loop`/`_next` and `ed_sm_loop`/`_next` are mutual-
+--     recursive; Rail does NOT TCO mutual recursion (v3.3.0 handoff
+--     rule #3), so 256- and 512-iteration loops will grow the stack
+--     unboundedly. Must be flattened to a single self-recursive driver
+--     using `bit_total = byte_idx * 8 + bit_idx` as the decremented
+--     counter before first real use.
+--   * No tests, no import yet. Keeping in-tree as a starter for the
+--     v3.4.0 track — do NOT import it from tls13_client until both
+--     issues above are fixed and RFC 8032 TEST 1 verifies clean.
+--
+-- Verify-only; no signing. Built on top of x25519.rail's field
+-- arithmetic (same p = 2^255 - 19). Uses extended twisted Edwards
+-- coordinates (X, Y, Z, T = XY/Z) with a = -1 and d as below.
+--
+-- Verification equation (non-cofactored form):
+--   [S]B == R + [k]A
+-- where:
+--   pub bytes: A_enc (32 bytes, compressed point)
+--   sig bytes: R_enc (32 bytes) || S (32 bytes LE integer)
+--   k = SHA-512(R_enc || A_enc || message) interpreted as 512-bit LE
+--     (we feed k directly as a 512-bit scalar — scalar mult gives the
+--      same result as reducing mod L first, just slower)
+--   B = standard base point
+--
+-- Public API:
+--   ed25519_verify pub msg msg_len sig -> 1 / 0
+--
+-- Caller must have stdlib/x25519.rail and stdlib/sha512.rail already
+-- loaded (typical via tls13_client.rail).
+
+-- Ed25519 "d" curve param = -121665 / 121666 (mod p)
+-- Value: 37095705934669439343138083508754565189542113879843219016388785533085940283555
+-- As 32-byte little-endian: A3 78 59 13 CA 4D EB 75 AB D8 41 41 4D 0A 70 00
+--                           98 E8 79 77 94 0C 78 C7 3F E6 F2 BB E3 2B 85 52
+ed_d_bytes _ = hex_to_bytes "a3785913ca4deb75abd841414d0a700098e8797794 0c78c73fe6f2bbe32b8552" |> ed_strip_ws
+
+-- Strip spaces from a byte string (defensive — keeps hex literals above
+-- readable with optional internal whitespace).
+ed_strip_ws bs =
+  let n = arr_len bs
+  let tmp = arr_new n 0
+  let k = ed_sws_copy bs tmp 0 0 n
+  let out = arr_new k 0
+  let _ = sha_copy_bytes tmp out 0 0 k
+  out
+
+ed_sws_copy src dst si di n =
+  if si >= n then di
+  else
+    let v = arr_get src si
+    if v == 32 then ed_sws_copy src dst (si + 1) di n
+    else
+      let _ = arr_set dst di v
+      ed_sws_copy src dst (si + 1) (di + 1) n
+
+-- sqrt(-1) mod p; needed when recovering x whose square root candidate
+-- differs by sqrt(-1). Value = 2^((p-1)/4) mod p
+-- = 19681161376707505956807428261136721352453178828470896037035617363440128182579
+-- LE: B0 A0 0E 4A 27 1B EE C4 78 E4 2F AD 06 18 43 2F
+--     A7 D7 FB 3D 99 00 4D 2B 0B DF C1 4F 80 24 83 2B
+ed_sqrt_m1_bytes _ = hex_to_bytes "b0a00e4a271beec478e42fad0618432fa7d7fb3d99004d2b0bdfc14f8024832b"
+
+-- L (group order) = 2^252 + 27742317777372353535851937790883648493
+-- LE 32 bytes: ED D3 F5 5C 1A 63 12 58 D6 9C F7 A2 DE F9 DE 14 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10
+ed_l_bytes _ = hex_to_bytes "edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010"
+
+-- Base point B:  compressed encoding 0x5866666666...66 (33 bytes — wait, 32).
+-- Standard encoding: 58 66 66 66 66 66 66 66 66 66 66 66 66 66 66 66
+--                    66 66 66 66 66 66 66 66 66 66 66 66 66 66 66 66
+ed_b_bytes _ = hex_to_bytes "5866666666666666666666666666666666666666666666666666666666666666"
+
+-- ── Field helpers built on x25519_gf_* ────────────────────────────────
+
+-- Load a 32-byte LE bytestring as a field element, masking high bit
+-- (RFC 8032 §5.1.2 step 1 / §5.1.3 step 1 for decoded y).
+ed_gf_from_le32 bytes =
+  let o = x25519_gf_new 0
+  let _ = x25519_unpack25519 o bytes
+  o
+
+-- Load a 32-byte LE bytestring as a field element WITHOUT masking the
+-- high bit (used for x25519-like elements and when we need the raw 256
+-- bits — the caller decides semantic masking).
+ed_gf_from_le32_raw bytes =
+  let o = x25519_gf_new 0
+  let _ = x25519_unpack_at o bytes 0
+  o
+
+-- Convenience constants as packed gf (malloc'd once per call — callers
+-- that care about allocator pressure can hoist these above the verify
+-- loop, but for a one-shot verify the 4 extra arrays per call are fine).
+ed_gf_d _ = ed_gf_from_le32 (ed_d_bytes 0)
+
+ed_gf_sqrt_m1 _ = ed_gf_from_le32 (ed_sqrt_m1_bytes 0)
+
+-- Neg: out = -a mod p. Implemented as p - a then reduce.
+ed_gf_neg out a =
+  let z = x25519_gf_new 0
+  let _ = x25519_gf_set1 z
+  let _ = arr_set z 0 0   -- z = 0
+  let _ = x25519_gf_sub out z a
+  let _ = x25519_car out
+  let _ = x25519_car out
+  0
+
+-- Equality on canonical packed encodings (32-byte LE).
+ed_gf_eq a b =
+  let pa = arr_new 32 0
+  let _ = x25519_pack25519 pa a
+  let pb = arr_new 32 0
+  let _ = x25519_pack25519 pb b
+  ed_bytes_eq pa pb 0 32
+
+ed_bytes_eq a b i n =
+  if i >= n then 1
+  else if arr_get a i != arr_get b i then 0
+  else ed_bytes_eq a b (i + 1) n
+
+-- LSB of a (after packing to canonical 32-byte LE).
+ed_gf_parity a =
+  let p = arr_new 32 0
+  let _ = x25519_pack25519 p a
+  bit_and (arr_get p 0) 1
+
+-- ── Point decoding (RFC 8032 §5.1.3) ──────────────────────────────────
+-- Input: 32-byte compressed encoding. Output: [X, Y, Z, T, valid].
+-- On success Z = 1 and T = X*Y. On failure valid = 0 and other fields
+-- are zero-initialised fillers.
+
+ed_decode bytes =
+  -- Copy so we can clear the sign bit before parsing y.
+  let b = arr_new 32 0
+  let _ = sha_copy_bytes bytes b 0 0 32
+  let sign_bit = bit_and (shr (arr_get b 31) 7) 1
+  let _ = arr_set b 31 (bit_and (arr_get b 31) 127)
+  let y = x25519_gf_new 0
+  let _ = x25519_unpack_at y b 0
+  -- Compute u = y^2 - 1, v = d*y^2 + 1.
+  let y2 = x25519_gf_new 0
+  let _ = x25519_gf_sqr y2 y
+  let one = x25519_gf_new 0
+  let _ = x25519_gf_set1 one
+  let u = x25519_gf_new 0
+  let _ = x25519_gf_sub u y2 one
+  let dy2 = x25519_gf_new 0
+  let d_elem = ed_gf_d 0
+  let _ = x25519_gf_mul dy2 d_elem y2
+  let v = x25519_gf_new 0
+  let _ = x25519_gf_add v dy2 one
+  let _ = x25519_car v
+  let _ = x25519_car v
+  ed_decode_finish u v y sign_bit
+
+-- x candidate = u * v^3 * (u * v^7)^((p-5)/8).  The exponent (p-5)/8 has
+-- a known closed-form that TweetNaCl / ref10 implement via a fixed
+-- addition chain. We use x25519_inv for v^(-1) and derive v^3, v^7
+-- explicitly.  Then run the (p-5)/8 exponentiation inline as an
+-- addition chain.  To keep this module short we reuse the inverse
+-- helper: v^((p-5)/8) = v^(p-2)^((-1)*((p-5)/8 * (p-2)^-1)) — no, that
+-- hurts. Simpler: exponentiate via repeated squaring over a known bit
+-- pattern.
+--
+-- (p-5)/8 in binary: 250 ones followed by 2 zeros.  Implemented below
+-- as ed_pow_p58.
+ed_decode_finish u v y sign_bit =
+  -- vu = u*v
+  let vu = x25519_gf_new 0
+  let _ = x25519_gf_mul vu u v
+  let v2 = x25519_gf_new 0
+  let _ = x25519_gf_sqr v2 v
+  let v3 = x25519_gf_new 0
+  let _ = x25519_gf_mul v3 v2 v
+  let uv3 = x25519_gf_new 0
+  let _ = x25519_gf_mul uv3 u v3
+  let v7 = x25519_gf_new 0
+  let _ = x25519_gf_mul v7 v3 v3
+  let _ = x25519_gf_mul v7 v7 v
+  let uv7 = x25519_gf_new 0
+  let _ = x25519_gf_mul uv7 u v7
+  let p58 = x25519_gf_new 0
+  let _ = ed_pow_p58 p58 uv7
+  let x = x25519_gf_new 0
+  let _ = x25519_gf_mul x uv3 p58
+  -- Check v*x^2 == u
+  let x2 = x25519_gf_new 0
+  let _ = x25519_gf_sqr x2 x
+  let vx2 = x25519_gf_new 0
+  let _ = x25519_gf_mul vx2 v x2
+  if ed_gf_eq vx2 u == 1 then ed_decode_sign_and_build x y sign_bit
+  else
+    -- Try v*x^2 == -u, then x *= sqrt(-1).
+    let neg_u = x25519_gf_new 0
+    let _ = ed_gf_neg neg_u u
+    if ed_gf_eq vx2 neg_u == 1 then
+      let sm1 = ed_gf_sqrt_m1 0
+      let x_new = x25519_gf_new 0
+      let _ = x25519_gf_mul x_new x sm1
+      ed_decode_sign_and_build x_new y sign_bit
+    else ed_decode_fail 0
+
+ed_decode_sign_and_build x y sign_bit =
+  let is_zero = ed_gf_is_zero x
+  if is_zero == 1 then
+    if sign_bit == 1 then ed_decode_fail 0
+    else ed_build_point x y
+  else
+    let par = ed_gf_parity x
+    if par == sign_bit then ed_build_point x y
+    else
+      let x2 = x25519_gf_new 0
+      let _ = ed_gf_neg x2 x
+      ed_build_point x2 y
+
+ed_build_point x y =
+  let Z = x25519_gf_new 0
+  let _ = x25519_gf_set1 Z
+  let T = x25519_gf_new 0
+  let _ = x25519_gf_mul T x y
+  let r = arr_new 5 0
+  let _ = arr_set r 0 x
+  let _ = arr_set r 1 y
+  let _ = arr_set r 2 Z
+  let _ = arr_set r 3 T
+  let _ = arr_set r 4 1
+  r
+
+ed_decode_fail _ =
+  let z = x25519_gf_new 0
+  let r = arr_new 5 0
+  let _ = arr_set r 0 z
+  let _ = arr_set r 1 z
+  let _ = arr_set r 2 z
+  let _ = arr_set r 3 z
+  let _ = arr_set r 4 0
+  r
+
+ed_gf_is_zero a =
+  let p = arr_new 32 0
+  let _ = x25519_pack25519 p a
+  ed_bytes_all_zero p 0
+
+ed_bytes_all_zero p i =
+  if i >= 32 then 1
+  else if arr_get p i != 0 then 0
+  else ed_bytes_all_zero p (i + 1)
+
+-- Exponent (p-5)/8 — 250 bits all set, then 2 bits of zero (bit positions
+-- 250, 251 are zero in standard big-endian view since p is 2^255 - 19).
+-- p-5 = 2^255 - 24 = 2^252 * (2^3 - 3 * 2^-252). Simpler: just walk bits
+-- of (p-5)/8 directly. (p-5)/8 = 2^252 - 3. Its 252-bit binary form
+-- is: 250 ones, 0, 1 (LSB first: 1 1 0 1 1 1 ... 1). Let me just do
+-- exponent 2^252 - 3.
+ed_pow_p58 out base =
+  -- Start with base, then square 251 times adding back at each step
+  -- (repeated base * square). Simplest: double-and-multiply using the
+  -- exponent value provided as 32 bytes LE. This avoids a bitmask
+  -- computed from integers.
+  let e = ed_gf_p58_bytes 0
+  ed_pow_bytes out base e 31 7
+
+-- (p-5)/8 = 2^252 - 3 has the LE byte pattern:
+--   byte 0 = 0xFD (bits 0-7:  11111101 → LSB-first, so value 0xFD)
+--   bytes 1-31 = 0xFF except byte 31 = 0x0F (bits 252-255 = 0001 LE-wise)
+-- Let me verify: 2^252 - 3 = 0x0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd
+-- LE bytes (byte 0 is LSB): FD FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+--                           FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF 0F
+ed_gf_p58_bytes _ = hex_to_bytes "fdffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0f"
+
+-- Compute out = base^e where e is a 32-byte LE integer. Scan bits from
+-- MSB (byte 31, bit 7) down to (byte 0, bit 0).
+ed_pow_bytes out base e byte_idx bit_idx =
+  let _ = x25519_gf_set1 out
+  ed_pow_bytes_loop out base e byte_idx bit_idx
+
+ed_pow_bytes_loop out base e byte_idx bit_idx =
+  if byte_idx < 0 then 0
+  else
+    let _ = x25519_gf_sqr out out
+    let b = bit_and (shr (arr_get e byte_idx) bit_idx) 1
+    if b == 1 then
+      let tmp = x25519_gf_new 0
+      let _ = x25519_gf_mul tmp out base
+      let _ = x25519_gf_copy out tmp
+      ed_pow_bytes_next out base e byte_idx bit_idx
+    else ed_pow_bytes_next out base e byte_idx bit_idx
+
+ed_pow_bytes_next out base e byte_idx bit_idx =
+  if bit_idx == 0 then ed_pow_bytes_loop out base e (byte_idx - 1) 7
+  else ed_pow_bytes_loop out base e byte_idx (bit_idx - 1)
+
+-- ── Extended-coords Edwards add (unified, works for doubling too) ─────
+-- P = (X1, Y1, Z1, T1), Q = (X2, Y2, Z2, T2); output into R (same shape).
+-- Uses a = -1.
+
+ed_point_new _ =
+  let r = arr_new 5 0
+  let _ = arr_set r 0 (x25519_gf_new 0)
+  let _ = arr_set r 1 (x25519_gf_new 0)
+  let _ = arr_set r 2 (x25519_gf_new 0)
+  let _ = arr_set r 3 (x25519_gf_new 0)
+  let _ = arr_set r 4 1
+  r
+
+ed_point_copy dst src =
+  let _ = x25519_gf_copy (arr_get dst 0) (arr_get src 0)
+  let _ = x25519_gf_copy (arr_get dst 1) (arr_get src 1)
+  let _ = x25519_gf_copy (arr_get dst 2) (arr_get src 2)
+  let _ = x25519_gf_copy (arr_get dst 3) (arr_get src 3)
+  let _ = arr_set dst 4 (arr_get src 4)
+  dst
+
+ed_point_identity out =
+  let _ = arr_set (arr_get out 0) 0 0   -- X = 0 (leave rest zero)
+  let _ = bn_zero_at_gf (arr_get out 0)
+  let Y = arr_get out 1
+  let _ = x25519_gf_set1 Y
+  let Z = arr_get out 2
+  let _ = x25519_gf_set1 Z
+  let _ = bn_zero_at_gf (arr_get out 3)
+  out
+
+bn_zero_at_gf a = bn_zero_gf_loop a 0
+
+bn_zero_gf_loop a i =
+  if i >= 16 then 0
+  else
+    let _ = arr_set a i 0
+    bn_zero_gf_loop a (i + 1)
+
+ed_point_add out P Q =
+  let X1 = arr_get P 0
+  let Y1 = arr_get P 1
+  let Z1 = arr_get P 2
+  let T1 = arr_get P 3
+  let X2 = arr_get Q 0
+  let Y2 = arr_get Q 1
+  let Z2 = arr_get Q 2
+  let T2 = arr_get Q 3
+  let A = x25519_gf_new 0
+  let t = x25519_gf_new 0
+  let _ = x25519_gf_sub t Y1 X1
+  let u = x25519_gf_new 0
+  let _ = x25519_gf_sub u Y2 X2
+  let _ = x25519_gf_mul A t u
+  let B = x25519_gf_new 0
+  let _ = x25519_gf_add t Y1 X1
+  let _ = x25519_gf_add u Y2 X2
+  let _ = x25519_gf_mul B t u
+  let C = x25519_gf_new 0
+  let d = ed_gf_d 0
+  let _ = x25519_gf_mul C T1 T2
+  let two = x25519_gf_new 0
+  let _ = x25519_gf_set1 two
+  let _ = arr_set two 0 2
+  let two_d = x25519_gf_new 0
+  let _ = x25519_gf_mul two_d d two
+  let Ctmp = x25519_gf_new 0
+  let _ = x25519_gf_mul Ctmp C two_d
+  let _ = x25519_gf_copy C Ctmp
+  let D = x25519_gf_new 0
+  let _ = x25519_gf_mul t Z1 Z2
+  let _ = x25519_gf_add D t t
+  let E = x25519_gf_new 0
+  let _ = x25519_gf_sub E B A
+  let F = x25519_gf_new 0
+  let _ = x25519_gf_sub F D C
+  let G = x25519_gf_new 0
+  let _ = x25519_gf_add G D C
+  let H = x25519_gf_new 0
+  let _ = x25519_gf_add H B A
+  let _ = x25519_gf_mul (arr_get out 0) E F
+  let _ = x25519_gf_mul (arr_get out 1) G H
+  let _ = x25519_gf_mul (arr_get out 3) E H
+  let _ = x25519_gf_mul (arr_get out 2) F G
+  let _ = arr_set out 4 1
+  out
+
+-- Scalar-mult: out = k*P where k is a LE byte array of len n_bytes.
+-- Double-and-add from MSB to LSB. For h (SHA-512 = 64 bytes) we iterate
+-- n_bytes * 8 = 512 bits.
+ed_scalar_mul out k n_bytes P =
+  let _ = ed_point_identity out
+  ed_sm_loop out k n_bytes P (n_bytes - 1) 7
+
+ed_sm_loop out k n_bytes P byte_idx bit_idx =
+  if byte_idx < 0 then out
+  else
+    let tmp = ed_point_new 0
+    let _ = ed_point_add tmp out out
+    let _ = ed_point_copy out tmp
+    let b = bit_and (shr (arr_get k byte_idx) bit_idx) 1
+    if b == 1 then
+      let tmp2 = ed_point_new 0
+      let _ = ed_point_add tmp2 out P
+      let _ = ed_point_copy out tmp2
+      ed_sm_next out k n_bytes P byte_idx bit_idx
+    else ed_sm_next out k n_bytes P byte_idx bit_idx
+
+ed_sm_next out k n_bytes P byte_idx bit_idx =
+  if bit_idx == 0 then ed_sm_loop out k n_bytes P (byte_idx - 1) 7
+  else ed_sm_loop out k n_bytes P byte_idx (bit_idx - 1)
+
+-- ── Point encoding (for comparing the verify LHS with RHS) ────────────
+
+ed_encode out pt =
+  let X = arr_get pt 0
+  let Y = arr_get pt 1
+  let Z = arr_get pt 2
+  let Zinv = x25519_gf_new 0
+  let _ = x25519_inv Zinv Z
+  let x = x25519_gf_new 0
+  let _ = x25519_gf_mul x X Zinv
+  let y = x25519_gf_new 0
+  let _ = x25519_gf_mul y Y Zinv
+  let _ = x25519_pack25519 out y
+  let par = ed_gf_parity x
+  let _ = arr_set out 31 (bit_or (arr_get out 31) (shl par 7))
+  0
+
+-- ── S < L check ───────────────────────────────────────────────────────
+-- Compare two 32-byte LE integers; returns 1 if a < b, 0 otherwise.
+ed_le_lt a b =
+  ed_le_lt_loop a b 31
+
+ed_le_lt_loop a b i =
+  if i < 0 then 0   -- equal
+  else
+    let ai = arr_get a i
+    let bi = arr_get b i
+    if ai < bi then 1
+    else if ai > bi then 0
+    else ed_le_lt_loop a b (i - 1)
+
+-- ── Main verify ───────────────────────────────────────────────────────
+-- pub_bytes: 32-byte compressed A
+-- msg_bytes: byte array, msg_len bytes
+-- sig_bytes: 64 bytes (R_enc || S)
+
+ed25519_verify pub_bytes msg_bytes msg_len sig_bytes =
+  -- Parse R.
+  let R_enc = arr_new 32 0
+  let _ = sha_copy_bytes sig_bytes R_enc 0 0 32
+  let R = ed_decode R_enc
+  if arr_get R 4 == 0 then 0
+  else ed25519_verify_step2 pub_bytes msg_bytes msg_len sig_bytes R_enc R
+
+ed25519_verify_step2 pub_bytes msg_bytes msg_len sig_bytes R_enc R =
+  -- Parse A.
+  let A = ed_decode pub_bytes
+  if arr_get A 4 == 0 then 0
+  else ed25519_verify_step3 pub_bytes msg_bytes msg_len sig_bytes R_enc R A
+
+ed25519_verify_step3 pub_bytes msg_bytes msg_len sig_bytes R_enc R A =
+  -- Parse S.
+  let S = arr_new 32 0
+  let _ = sha_copy_bytes sig_bytes S 0 32 32
+  -- Reject S >= L.
+  let L = ed_l_bytes 0
+  if ed_le_lt S L == 0 then 0
+  else ed25519_verify_step4 pub_bytes msg_bytes msg_len R_enc R A S
+
+ed25519_verify_step4 pub_bytes msg_bytes msg_len R_enc R A S =
+  -- k = SHA-512(R_enc || pub_bytes || msg)
+  let total = 32 + 32 + msg_len
+  let buf = arr_new total 0
+  let _ = sha_copy_bytes R_enc buf 0 0 32
+  let _ = sha_copy_bytes pub_bytes buf 0 32 32
+  let _ = sha_copy_bytes msg_bytes buf 0 64 msg_len
+  let k = sha512_bytes buf total
+  -- Decode base point B.
+  let B_enc = ed_b_bytes 0
+  let B = ed_decode B_enc
+  if arr_get B 4 == 0 then 0
+  else ed25519_verify_final R A S k B
+
+ed25519_verify_final R A S k B =
+  -- LHS = [S]B  (S is 32 LE bytes)
+  let lhs = ed_point_new 0
+  let _ = ed_scalar_mul lhs S 32 B
+  -- rhs_A = [k]A  (k is 64 LE bytes from SHA-512 output)
+  let rhs_A = ed_point_new 0
+  let _ = ed_scalar_mul rhs_A k 64 A
+  -- rhs = R + rhs_A
+  let rhs = ed_point_new 0
+  let _ = ed_point_add rhs R rhs_A
+  -- Compare encoded forms.
+  let e_lhs = arr_new 32 0
+  let _ = ed_encode e_lhs lhs
+  let e_rhs = arr_new 32 0
+  let _ = ed_encode e_rhs rhs
+  ed_bytes_eq e_lhs e_rhs 0 32

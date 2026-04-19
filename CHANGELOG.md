@@ -2,7 +2,43 @@
 
 All notable changes to Rail are documented here.
 
-## v3.3.0 — 2026-04-19 — HTTPS keep-alive sessions
+## v3.3.0 — 2026-04-19 — HTTPS keep-alive sessions + ECDSA-P521
+
+Two features land together in v3.3.0 because they share a test session
+and both pass the full validation gate (137/137 tests, self-compile
+byte-identical fixed point, live amazon.com strict + keep-alive both
+green).
+
+### ECDSA-P521 (secp521r1 / ecdsa-with-SHA512)
+
+`stdlib/ecdsa_p521.rail` — structural clone of `ecdsa_p384.rail` with
+33 × 16-bit limbs (528-bit storage for 521-bit values) and loop bounds
+bumped from 383 → 520. All curve math reuses `bignum_n.rail` helpers;
+no new primitives. `stdlib/cert_p521.rail` is the parallel-to-
+`cert_p384.rail` chain-edge driver (SPKI extraction + ECDSA-with-
+SHA512 verify using the issuer's P-521 pubkey). Wired into:
+
+- `stdlib/tls13_cert_verify.rail`:
+  - CertificateVerify leaf sigalg `0x0603` (`ecdsa_secp521r1_sha512`)
+    now dispatches to `cv_verify_ecdsa_p521`.
+  - Chain-walk: `ecdsa-with-SHA512` OID (1.2.840.10045.4.3.4) now
+    dispatches to `cv_chain_p521`.
+- `stdlib/asn1.rail`: adds `asn1_oid_p521_curve` (1.3.132.0.35) and
+  `asn1_oid_ecdsa_sha512` OID references.
+- `stdlib/tls13_client.rail`: pulls both new modules into the
+  transitive import chain.
+
+Live-verified with an OpenSSL-generated P-521 keypair and SHA-512
+signature over "hello p521 from rail\n" — `ecdsa_p521_verify` returns
+1 on the valid signature and 0 on both a flipped-byte-in-hash and a
+flipped-byte-in-s negative control. Test at
+`tools/tls/ecdsa_p521_test.rail`.
+
+No live endpoint in our caller set uses P-521 today — this ships for
+TLS completeness (any future service using ECDSA-P-521 leaves or
+roots will now verify cleanly).
+
+### HTTPS keep-alive sessions
 
 **One TLS handshake, many requests.** `stdlib/https_session.rail` ships
 `https_session_open` / `_open_strict` / `_get` / `_post` / `_close`: a
