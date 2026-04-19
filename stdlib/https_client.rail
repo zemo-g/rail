@@ -291,29 +291,69 @@ hc_build_req host path =
   let _ = arr_set r 1 n
   r
 
+-- Convert `n` bytes of `arr` to a string in O(n) using a list-build +
+-- single join. The old `hc_bytes_to_str_loop` was O(n²) because it
+-- re-joined the growing accumulator on every char; each recv_response
+-- iteration paid that cost over the running body, which capped
+-- practical response bodies at ~64 KB before walltime exploded.
+
+hc_buf_to_chars buf i acc =
+  if i < 0 then acc
+  else hc_buf_to_chars buf (i - 1) (cons (char_from_int (arr_get buf i)) acc)
+
+hc_bytes_to_str buf n = join "" (hc_buf_to_chars buf (n - 1) [])
+
+-- hc_bytes_to_str_loop retained as an O(n²) shim for any external
+-- caller that depends on the old signature.
 hc_bytes_to_str_loop arr off n acc =
   if n <= 0 then acc
   else hc_bytes_to_str_loop arr (off + 1) (n - 1) (join "" [acc, char_from_int (arr_get arr off)])
 
+-- Stream-accumulating response reader. Fragments are kept as raw
+-- byte-array chunks (each paired with its length) in a cons list; on
+-- terminate we allocate one buffer of the exact total size and copy
+-- each chunk in place, then convert bytes→string once. Overall work
+-- is O(body_len) instead of the old O(body_len²).
 hc_recv_response fd key iv seq acc =
+  hc_recv_loop fd key iv seq [] 0
+
+hc_recv_loop fd key iv seq chunks total =
   let rec_r = hc_read_record fd
-  if arr_get rec_r 2 == 0 then acc
+  if arr_get rec_r 2 == 0 then hc_recv_finalize chunks total
   else
     let wire = arr_get rec_r 0
     let wire_len = arr_get rec_r 1
-    if arr_get wire 0 != 23 then hc_recv_response fd key iv seq acc
+    if arr_get wire 0 != 23 then hc_recv_loop fd key iv seq chunks total
     else
       let dec = tls13_record_decrypt key iv seq wire wire_len
-      if arr_get dec 3 == 0 then acc
+      if arr_get dec 3 == 0 then hc_recv_finalize chunks total
       else
         let frag = arr_get dec 0
         let rtype = arr_get dec 1
         let flen = arr_get dec 2
-        if rtype == 21 then acc
+        if rtype == 21 then hc_recv_finalize chunks total
         else if rtype == 23 then
-          let chunk = hc_bytes_to_str_loop frag 0 flen ""
-          hc_recv_response fd key iv (seq + 1) (join "" [acc, chunk])
-        else hc_recv_response fd key iv (seq + 1) acc
+          let pair = arr_new 2 0
+          let _ = arr_set pair 0 frag
+          let _ = arr_set pair 1 flen
+          hc_recv_loop fd key iv (seq + 1) (cons pair chunks) (total + flen)
+        else hc_recv_loop fd key iv (seq + 1) chunks total
+
+hc_recv_finalize chunks total =
+  if total <= 0 then ""
+  else
+    let buf = arr_new total 0
+    let _ = hc_copy_chunks buf (reverse chunks) 0
+    hc_bytes_to_str buf total
+
+hc_copy_chunks buf chunks write_pos =
+  if length chunks == 0 then 0
+  else
+    let pair = head chunks
+    let frag = arr_get pair 0
+    let flen = arr_get pair 1
+    let _ = sha_copy_bytes frag buf 0 write_pos flen
+    hc_copy_chunks buf (tail chunks) (write_pos + flen)
 
 hc_parse_status raw =
   if length raw < 13 then 0
@@ -338,6 +378,12 @@ hc_pi cs acc =
     else hc_pi (tail cs) (acc * 10 + d)
 
 -- ── Main driver ─────────────────────────────────────────────────────
+-- `https_get` performs leaf-signature + SAN + validity verification via
+-- the FSM (verify_cert=1). It does NOT walk the certificate chain to a
+-- CA root — an attacker with any valid leaf for the SNI passes. For
+-- production use, prefer stdlib/https_strict.rail's `https_get_strict`
+-- / `https_post_strict` which additionally walk the chain to a trust
+-- store root.
 
 https_get host ip port path =
   let fd = hc_connect_tcp ip port
@@ -480,7 +526,9 @@ hc_build_post host path ctype body hdrs =
   let _ = arr_set r 1 n
   r
 
--- Top-level POST. Mirrors https_get but with a POST request builder.
+-- Top-level POST. Leaf-signature-only — same trust posture as
+-- `https_get`. For strict chain-to-root trust walking see
+-- `https_post_strict` in stdlib/https_strict.rail.
 https_post host ip port path ctype body hdrs =
   let fd = hc_connect_tcp ip port
   if fd < 0 then (0, "connect failed")
