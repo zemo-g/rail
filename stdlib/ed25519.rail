@@ -1,19 +1,9 @@
 -- stdlib/ed25519.rail — Ed25519 signature verify (RFC 8032 §5.1).
 --
--- ⚠ WIP — NOT YET FUNCTIONAL. Known issues at v3.3.0 handoff:
---   * `ed_d_bytes` constant has a stale pre-verification hex string
---     (the verified LE hex is "a3785913ca4deb75abd841414d0a700098e8
---     79777940c78c73fe6f2bee6c0352" — the `|> ed_strip_ws` pipe was a
---     band-aid over a transcription error).
---   * `ed_pow_bytes_loop`/`_next` and `ed_sm_loop`/`_next` are mutual-
---     recursive; Rail does NOT TCO mutual recursion (v3.3.0 handoff
---     rule #3), so 256- and 512-iteration loops will grow the stack
---     unboundedly. Must be flattened to a single self-recursive driver
---     using `bit_total = byte_idx * 8 + bit_idx` as the decremented
---     counter before first real use.
---   * No tests, no import yet. Keeping in-tree as a starter for the
---     v3.4.0 track — do NOT import it from tls13_client until both
---     issues above are fixed and RFC 8032 TEST 1 verifies clean.
+-- v3.4.0: d constant fixed, mutual recursion flattened, RFC 8032 TEST
+-- 1 vector at tools/tls/ed25519_test.rail. Not imported by
+-- tls13_client yet — no live endpoint in our caller set uses Ed25519
+-- certs today; wire in once a caller needs it.
 --
 -- Verify-only; no signing. Built on top of x25519.rail's field
 -- arithmetic (same p = 2^255 - 19). Uses extended twisted Edwards
@@ -35,30 +25,10 @@
 -- Caller must have stdlib/x25519.rail and stdlib/sha512.rail already
 -- loaded (typical via tls13_client.rail).
 
--- Ed25519 "d" curve param = -121665 / 121666 (mod p)
--- Value: 37095705934669439343138083508754565189542113879843219016388785533085940283555
--- As 32-byte little-endian: A3 78 59 13 CA 4D EB 75 AB D8 41 41 4D 0A 70 00
---                           98 E8 79 77 94 0C 78 C7 3F E6 F2 BB E3 2B 85 52
-ed_d_bytes _ = hex_to_bytes "a3785913ca4deb75abd841414d0a700098e8797794 0c78c73fe6f2bbe32b8552" |> ed_strip_ws
-
--- Strip spaces from a byte string (defensive — keeps hex literals above
--- readable with optional internal whitespace).
-ed_strip_ws bs =
-  let n = arr_len bs
-  let tmp = arr_new n 0
-  let k = ed_sws_copy bs tmp 0 0 n
-  let out = arr_new k 0
-  let _ = sha_copy_bytes tmp out 0 0 k
-  out
-
-ed_sws_copy src dst si di n =
-  if si >= n then di
-  else
-    let v = arr_get src si
-    if v == 32 then ed_sws_copy src dst (si + 1) di n
-    else
-      let _ = arr_set dst di v
-      ed_sws_copy src dst (si + 1) (di + 1) n
+-- Ed25519 "d" curve param = -121665 / 121666 (mod p), verified via
+-- Python: (-121665 * pow(121666, -1, 2**255-19)) % (2**255-19). Canonical
+-- 32-byte little-endian:
+ed_d_bytes _ = hex_to_bytes "a3785913ca4deb75abd841414d0a700098e879777940c78c73fe6f2bee6c0352"
 
 -- sqrt(-1) mod p; needed when recovering x whose square root candidate
 -- differs by sqrt(-1). Value = 2^((p-1)/4) mod p
@@ -258,12 +228,11 @@ ed_bytes_all_zero p i =
 -- is: 250 ones, 0, 1 (LSB first: 1 1 0 1 1 1 ... 1). Let me just do
 -- exponent 2^252 - 3.
 ed_pow_p58 out base =
-  -- Start with base, then square 251 times adding back at each step
-  -- (repeated base * square). Simplest: double-and-multiply using the
-  -- exponent value provided as 32 bytes LE. This avoids a bitmask
-  -- computed from integers.
+  -- Start at 1, then double-and-multiply using the exponent bits scanned
+  -- MSB→LSB. 32 bytes × 8 = 256 bit positions (bit_total 255..0).
   let e = ed_gf_p58_bytes 0
-  ed_pow_bytes out base e 31 7
+  let _ = x25519_gf_set1 out
+  ed_pow_bytes_iter out base e 255
 
 -- (p-5)/8 = 2^252 - 3 has the LE byte pattern:
 --   byte 0 = 0xFD (bits 0-7:  11111101 → LSB-first, so value 0xFD)
@@ -273,27 +242,23 @@ ed_pow_p58 out base =
 --                           FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF 0F
 ed_gf_p58_bytes _ = hex_to_bytes "fdffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0f"
 
--- Compute out = base^e where e is a 32-byte LE integer. Scan bits from
--- MSB (byte 31, bit 7) down to (byte 0, bit 0).
-ed_pow_bytes out base e byte_idx bit_idx =
-  let _ = x25519_gf_set1 out
-  ed_pow_bytes_loop out base e byte_idx bit_idx
-
-ed_pow_bytes_loop out base e byte_idx bit_idx =
-  if byte_idx < 0 then 0
+-- Self-tail-recursive driver: bit_total = byte_idx * 8 + bit_idx. Rail
+-- does NOT TCO mutual recursion — must stay single-function (handoff
+-- rule #3). Scan MSB → LSB: start at bit_total = n_bytes*8 - 1, decrement
+-- to 0.
+ed_pow_bytes_iter out base e bit_total =
+  if bit_total < 0 then 0
   else
+    let byte_idx = shr bit_total 3
+    let bit_idx = bit_and bit_total 7
     let _ = x25519_gf_sqr out out
     let b = bit_and (shr (arr_get e byte_idx) bit_idx) 1
     if b == 1 then
       let tmp = x25519_gf_new 0
       let _ = x25519_gf_mul tmp out base
       let _ = x25519_gf_copy out tmp
-      ed_pow_bytes_next out base e byte_idx bit_idx
-    else ed_pow_bytes_next out base e byte_idx bit_idx
-
-ed_pow_bytes_next out base e byte_idx bit_idx =
-  if bit_idx == 0 then ed_pow_bytes_loop out base e (byte_idx - 1) 7
-  else ed_pow_bytes_loop out base e byte_idx (bit_idx - 1)
+      ed_pow_bytes_iter out base e (bit_total - 1)
+    else ed_pow_bytes_iter out base e (bit_total - 1)
 
 -- ── Extended-coords Edwards add (unified, works for doubling too) ─────
 -- P = (X1, Y1, Z1, T1), Q = (X2, Y2, Z2, T2); output into R (same shape).
@@ -383,15 +348,20 @@ ed_point_add out P Q =
   out
 
 -- Scalar-mult: out = k*P where k is a LE byte array of len n_bytes.
--- Double-and-add from MSB to LSB. For h (SHA-512 = 64 bytes) we iterate
--- n_bytes * 8 = 512 bits.
+-- Double-and-add MSB→LSB. For h (SHA-512 = 64 bytes) we iterate 512
+-- bits; 32-byte S is 256. Self-tail-recursive driver only — Rail does
+-- NOT TCO mutual recursion (handoff rule #3), and a 512-deep call
+-- stack WILL blow up.
 ed_scalar_mul out k n_bytes P =
   let _ = ed_point_identity out
-  ed_sm_loop out k n_bytes P (n_bytes - 1) 7
+  let bit_total = n_bytes * 8 - 1
+  ed_sm_iter out k P bit_total
 
-ed_sm_loop out k n_bytes P byte_idx bit_idx =
-  if byte_idx < 0 then out
+ed_sm_iter out k P bit_total =
+  if bit_total < 0 then out
   else
+    let byte_idx = shr bit_total 3
+    let bit_idx = bit_and bit_total 7
     let tmp = ed_point_new 0
     let _ = ed_point_add tmp out out
     let _ = ed_point_copy out tmp
@@ -400,12 +370,8 @@ ed_sm_loop out k n_bytes P byte_idx bit_idx =
       let tmp2 = ed_point_new 0
       let _ = ed_point_add tmp2 out P
       let _ = ed_point_copy out tmp2
-      ed_sm_next out k n_bytes P byte_idx bit_idx
-    else ed_sm_next out k n_bytes P byte_idx bit_idx
-
-ed_sm_next out k n_bytes P byte_idx bit_idx =
-  if bit_idx == 0 then ed_sm_loop out k n_bytes P (byte_idx - 1) 7
-  else ed_sm_loop out k n_bytes P byte_idx (bit_idx - 1)
+      ed_sm_iter out k P (bit_total - 1)
+    else ed_sm_iter out k P (bit_total - 1)
 
 -- ── Point encoding (for comparing the verify LHS with RHS) ────────────
 
@@ -458,9 +424,9 @@ ed25519_verify_step2 pub_bytes msg_bytes msg_len sig_bytes R_enc R =
   else ed25519_verify_step3 pub_bytes msg_bytes msg_len sig_bytes R_enc R A
 
 ed25519_verify_step3 pub_bytes msg_bytes msg_len sig_bytes R_enc R A =
-  -- Parse S.
+  -- Parse S = sig[32..64] → S[0..32]. Arg order: src dst src_off dst_off n.
   let S = arr_new 32 0
-  let _ = sha_copy_bytes sig_bytes S 0 32 32
+  let _ = sha_copy_bytes sig_bytes S 32 0 32
   -- Reject S >= L.
   let L = ed_l_bytes 0
   if ed_le_lt S L == 0 then 0
