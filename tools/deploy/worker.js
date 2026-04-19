@@ -87,6 +87,7 @@ const MIME = {
   mjs:  "application/javascript; charset=utf-8",
   json: "application/json; charset=utf-8",
   xml:  "application/xml; charset=utf-8",
+  xsl:  "text/xsl; charset=utf-8",
   txt:  "text/plain; charset=utf-8",
   svg:  "image/svg+xml",
   png:  "image/png",
@@ -108,7 +109,7 @@ const BINARY_EXT = new Set([
 ]);
 
 const LONG_CACHE_EXT = new Set([
-  "css", "js", "mjs", "json", "xml", "txt", "svg",
+  "css", "js", "mjs", "json", "xml", "xsl", "txt", "svg",
   "woff", "woff2", "ttf",
   "png", "jpg", "jpeg", "gif", "webp", "ico",
   "wasm",
