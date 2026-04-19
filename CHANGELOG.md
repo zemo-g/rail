@@ -2,6 +2,56 @@
 
 All notable changes to Rail are documented here.
 
+## v3.4.0 — 2026-04-19 — Ed25519 (RFC 8032 §5.1 verify)
+
+`stdlib/ed25519.rail` now compiles and verifies clean against RFC
+8032 TEST 1. Third modern-TLS signature algorithm alongside ECDSA
+(P-256 / P-384 / P-521) and RSA-PSS / RSA-PKCS1 — Rail's pure-Rail
+TLS stack now covers every sig_alg in wide deployment.
+
+### What landed
+
+- Canonical curve constant `ed_d_bytes` — `(-121665 *
+  modinv(121666)) mod (2^255 - 19)`, LE-encoded,
+  `a3785913ca4deb75abd841414d0a700098e879777940c78c73fe6f2bee6c0352`.
+  The v3.3.0-handoff band-aid `ed_strip_ws` is gone.
+- Scalar-mult (`ed_sm_iter`) and field exponentiation
+  (`ed_pow_bytes_iter`) flattened from mutual recursion (A→B→A) to
+  single self-tail-recursive drivers using `bit_total = byte_idx*8
+  + bit_idx` as a decremented counter. Rail doesn't TCO mutual
+  recursion, and the 512-bit SHA-512 scalar would have grown the
+  stack 512 frames deep.
+- Fixed a bug in `ed25519_verify_step3`: S-parse arg order was
+  `sha_copy_bytes sig S 0 32 32` (src_off=0, dst_off=32 — writes
+  past the end of a 32-byte S). Corrected to `32 0 32` so S =
+  sig[32..64] ends up at S[0..32].
+- `tools/tls/ed25519_test.rail` exercises RFC 8032 TEST 1
+  (empty-message canonical vector) + two negative controls
+  (flipped first byte of R, flipped first byte of S). `valid=1,
+  bad_R=0, bad_S=0`.
+
+### What's deliberately not wired
+
+No live endpoint in our current caller set uses Ed25519 TLS
+certificates. `stdlib/ed25519.rail` is therefore shipped as a
+standalone module — it's not imported from `tls13_cert_verify.rail`
+yet. Wire-in is a 10-line follow-up (sig_alg 0x0807 leaf dispatch +
+an `ed25519_sig` OID entry in `asn1.rail`) once a live caller needs
+it.
+
+### Validation gates
+
+- `./rail_native test` — 137/137.
+- `./rail_native self` 2-pass → byte-identical fixed point.
+- `ecdsa_p521_verify` still valid=1, bad_hash=0, bad_s=0.
+- `ed25519_verify` RFC 8032 TEST 1 → valid=1, bad_R=0, bad_S=0.
+
+Amazon.com was serving intermittent HTTP/2 503s during this
+session — rule #6 (v3.3.0 handoff) applies, so the strict-HTTPS
+live-endpoint gate was not re-confirmed this session. The TLS
+stack was not touched in v3.4.0, so no regression is possible from
+these changes.
+
 ## v3.3.0 — 2026-04-19 — HTTPS keep-alive sessions + ECDSA-P521
 
 Two features land together in v3.3.0 because they share a test session
