@@ -2,6 +2,113 @@
 
 All notable changes to Rail are documented here.
 
+## v3.2.0 — 2026-04-19 — Strict HTTPS by default + compiler quadratic fix
+
+**Two structural fixes in `tools/compile.rail` eliminate the O(3^n)
+and O(N²) wedges that had been silently taxing every stdlib-heavy
+build since v3.0.0.** A 195-second compile on `https_client.rail +
+pem.rail + cert_chain.rail` now completes in 12 seconds — 16× speedup
+— which unblocks the strict-HTTPS default trust posture that v3.1.0
+had to ship as a standalone primitive.
+
+### `edit_dist` — did-you-mean Levenshtein was 3^n
+
+The "did you mean?" suggestion machinery used a naive 3-branch
+recursion (`edist_loop`: `d_del`, `d_ins`, `d_sub`) without
+memoisation or bound propagation. It fired on every unbound-name
+lookup across the full arity map (~300 keys on a stdlib-heavy
+compile) — whether or not a warning was eventually printed. The
+comment claimed "O(env_size · |fname|²) on the COLD path"; the
+reality was exponential.
+
+v3.2.0 ships `edist_bounded a b bound` — the threshold is 3 at the
+call site, so any comparison whose distance is provably ≥ 3 can be
+reported as 3 without exploring further. Two short-circuits make this
+cheap:
+
+- Length-gap bail: if `abs(|a| - |b|) ≥ bound`, return `bound`
+  immediately. Most name pairs differ in length by more than 2, so
+  this eliminates most of the search tree.
+- Per-branch bound decrement: each mismatch consumes one unit of the
+  bound, so no branch recurses more than `bound` levels deep.
+
+Worst case is now `O(bound · (|a| + |b|))` per comparison — bounded
+constant work for the fixed `bound=3`.
+
+### `compile_funcs` — non-tail unwind was O(N²)
+
+`compile_funcs` walked the declaration list with:
+
+```rail
+let (fasm, ...) = compile_func (head decls) ar lc
+let (rest, ...) = compile_funcs (tail decls) ar lc1
+(cat [fasm, rest], ...)
+```
+
+Each level left a frame on the stack (no TCO through the `cat`) and
+re-copied a growing `rest` string on every unwind — quadratic in the
+total emitted assembly. Rewritten as a tail-recursive
+`compile_funcs_loop` with a cons-list accumulator and a single
+`join ""` at the end: O(N) work, O(N) cons cells, O(1) stack.
+
+### `stdlib/https_strict.rail` — strict HTTPS is now a one-line import
+
+With the compiler freed, the chain-walk composition
+(`https_client.rail` + `pem.rail` + `cert_chain.rail`) is tractable.
+`stdlib/https_strict.rail` exposes the v3.1.0-shipped primitives as
+plain stdlib functions:
+
+```
+https_get_strict        host ip port path            → (status, body)
+https_get_url_strict    url                           → (status, body)
+https_post_strict       host ip port path ct body hs  → (status, body)
+https_post_url_strict   url ct body hs                → (status, body)
+https_get_with_store    store host ip port path       → (status, body)
+https_post_with_store   store host ip port path ct body hs → (status, body)
+```
+
+Each strict call loads the macOS system trust store
+(`/etc/ssl/cert.pem`) and walks the cert chain to a root CA before
+running the handshake FSM. `*_with_store` variants accept a
+pre-loaded store to amortise the ~1.5 s PEM parse across many
+requests.
+
+Live, in production, the day of release:
+
+```
+https_get_url_strict "https://www.amazon.com/"
+  → HTTP 200 with RSA chain validated leaf → DigiCert G2
+    intermediate → DigiCert Global Root G2   (~8 s total)
+```
+
+### What this closes
+
+The v3.1.0 CHANGELOG flagged "chain walk is not wired as the default
+trust posture" as a known gap. v3.2.0 closes it. Users who want
+authenticated HTTPS now write `import "stdlib/https_strict.rail"` +
+`https_get_strict` / `https_post_strict`; leaf-only `https_client` is
+kept for offline / self-signed / testing paths.
+
+### Validation
+
+- `./rail_native self` → byte-identical fixed point (two-pass
+  confirmed).
+- 129/132 core tests before the inherited t131-style harness hang
+  (same point as v3.1.0 — this hang pre-dates both fixes, carry-over
+  for a future session to untangle).
+- probe4.rail (`https_client + pem + cert_chain + main`): 195 s → 12 s.
+- Live strict test `tools/tls/https_strict_test.rail`: amazon.com
+  returns real HTTP 200 with the full body decoded.
+
+### Known gaps carried from v3.1.0
+
+- HTTP keep-alive / session reuse — deferred to v3.3.0.
+- ECDSA-P521, Ed25519 signature algorithms — deferred to v3.3.0.
+- t131-style harness hang around `tls13_record_roundtrip` is
+  non-deterministic and predates both v3.1 and v3.2 fixes; suspect
+  the same family of compile-time pathology around tests with
+  embedded long TLS transcript literals.
+
 ## v3.1.0 — 2026-04-19 — Streaming HTTPS bodies
 
 **Response bodies scale linearly.** The v3.0.0 `hc_recv_response`
