@@ -51,3 +51,96 @@ oracle_ok code =
 oracle_compile_and_run code =
   let _ = write_file "/tmp/rail_oracle_in.rail" code
   shell "cd ~/projects/rail && ./rail_native run /tmp/rail_oracle_in.rail 2>&1"
+
+-- ────────────────────────────────────────────────────────────────
+-- Richer oracle metric: compile-OK × non-triviality
+--
+-- `oracle_errors` alone is not a good training signal because a
+-- whitespace-only output parses as a valid empty program (0 errors).
+-- An untrained model whose argmax collapses to a single token per
+-- position scores perfectly. Training initially moves the metric
+-- the "wrong" way as the model diversifies.
+--
+-- oracle_quality folds three signals into one int:
+--   1. compile_ok   — binary, 0 if compile fails
+--   2. non-whitespace — count of chars that aren't space/tab/newline
+--   3. diversity    — count of distinct characters
+-- score = compile_ok * non_whitespace * diversity
+--
+-- A model emitting one token gets 0 (diversity=1 → 0 after multiplication
+-- yields length, but the min-threshold gate rejects it). A valid program
+-- with real tokens and structure gets a large positive value. Rising
+-- score during training means the model is producing more substantive
+-- Rail that the compiler still accepts.
+-- ────────────────────────────────────────────────────────────────
+
+is_ws c = if c == " " then true
+          else if c == "\n" then true
+          else if c == "\t" then true
+          else false
+
+count_nw_loop cs acc =
+  if length cs == 0 then acc
+  else
+    let h = head cs
+    let inc = if is_ws h then 0 else 1
+    count_nw_loop (tail cs) (acc + inc)
+
+count_non_whitespace code = count_nw_loop (chars code) 0
+
+-- Build a set (as list) of distinct chars, return length.
+dedupe_contains xs target =
+  if length xs == 0 then false
+  else if head xs == target then true
+  else dedupe_contains (tail xs) target
+
+dedupe_loop cs acc =
+  if length cs == 0 then length acc
+  else
+    let h = head cs
+    if dedupe_contains acc h then dedupe_loop (tail cs) acc
+    else dedupe_loop (tail cs) (cons h acc)
+
+count_unique_chars code = dedupe_loop (chars code) []
+
+-- Composite score. Rewards structured substantive output AND compile
+-- success. Degenerate inputs (short or low-diversity) score 0.
+-- Compiling output scores 10× the baseline-substance score.
+-- Non-compiling substantive output scores proportional to substance,
+-- penalized by error count — so a tiny Rail-shaped output with 1 error
+-- scores better than the same length with 5 errors, giving training
+-- a gradient even before the model reaches clean compile.
+--
+-- Single oracle_compile call shared between error-count parse and
+-- compile-OK check — keeps the shell-out cost to one per scoring.
+oracle_stats_impl code =
+  let out = oracle_compile code
+  let lines = str_split "\n" out
+  let errs = count_error_lines lines 0
+  let ok_flag = if str_contains "ld: OK" out then 1 else 0
+  cons errs (cons ok_flag [])
+
+-- Min non-whitespace for the compile-pass bonus to apply. Below this
+-- threshold the output is considered trivial even if the compiler
+-- accepts it — prevents an all-whitespace-with-30-stray-chars baseline
+-- from outscoring substantive-but-imperfect trained output.
+oracle_min_nw_for_bonus = 64
+
+oracle_quality code =
+  let nw = count_non_whitespace code
+  let uq = count_unique_chars code
+  if nw < 16 then 0
+  else if uq < 4 then 0
+  else
+    let stats = oracle_stats_impl code
+    let errs = head stats
+    let ok_flag = head (tail stats)
+    let base = nw * uq
+    if ok_flag == 1 then
+      (if nw >= 64 then base * 10 else base)
+    else
+      -- Parse succeeded (errs=0) but link failed (ok_flag=0) means the
+      -- output is effectively empty - all comments / dashes, nothing
+      -- callable. Don't reward it. Only give partial credit when there
+      -- are genuine parse errors (model produced real token structure).
+      (if errs == 0 then 0 else base / (1 + errs))
