@@ -58,3 +58,42 @@ sudo rm /Library/LaunchDaemons/com.ledatic.tb_autojoin.plist
 - `/var/log/tb_autojoin.launchd.out|.err` — launchd-captured stdio
   (should stay empty)
 - `sudo launchctl print system/com.ledatic.tb_autojoin` — launchd state
+
+## security_bootstrap — one-shot hardening
+
+`security_bootstrap.sh` + `pf_ledatic_fleet.conf`.
+
+Run once per node. Locks down the fleet control plane (`:9101`) and
+local TLS proxies (`:8443/:8444/:8445`) to loopback + Tailscale + the
+TB mesh only, and forces SSH into key-only mode.
+
+### Install (per node)
+
+```bash
+sudo bash tools/fleet/security_bootstrap.sh
+```
+
+Idempotent — re-run anytime to re-apply. The sshd step validates the
+config with `sshd -t` before restart so a typo can't lock you out.
+
+### Verify
+
+```bash
+sudo pfctl -s rules | grep 9101
+sudo pfctl -s info   | head -2                    # Status: Enabled
+# From a LAN IP that isn't on Tailscale:
+curl -m 3 http://<node-lan-ip>:9101/health        # should time out / be dropped
+# From the same node:
+curl -s http://127.0.0.1:9101/health              # should respond
+```
+
+### Rollback
+
+```bash
+sudo sed -i '' '/^# Fleet control-plane firewall/,/load anchor "ledatic_fleet"/d' /etc/pf.conf
+sudo rm /etc/pf.anchors/ledatic_fleet
+sudo pfctl -f /etc/pf.conf
+# sshd: revert via System Settings → General → Sharing → Remote Login options,
+# or edit /etc/ssh/sshd_config back and kickstart sshd.
+```
+
