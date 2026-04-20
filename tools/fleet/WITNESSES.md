@@ -68,7 +68,9 @@ stamping*.
 - **Fingerprint:** `cac5f21a70564aeb`
 - **Algorithm:** Ed25519
 - **Since:** 2026-04-20
-- **Runtime:** `witness.sh` under systemd `witness.service`
+- **Runtime:** `witness.sh` + `witness_push.sh` under systemd (`witness.service`, `witness-push.service`)
+- **Public endpoint:** `https://ledatic.org/witness/fleet0/latest` (signed record of the
+  most recently observed pulse; refreshed every 5s)
 
 ```
 -----BEGIN PUBLIC KEY-----
