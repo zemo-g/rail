@@ -15,6 +15,7 @@
 -- them and checking the exit code via oracle_compile_and_run.
 
 import "stdlib/file.rail"
+import "stdlib/parallel.rail"
 
 -- Runs the rail_native compiler on `code`, returns the combined
 -- stdout+stderr. The compiler prints one "file:line:col: error: msg"
@@ -202,3 +203,83 @@ oracle_quality code =
       -- callable. Don't reward it. Only give partial credit when there
       -- are genuine parse errors (model produced real token structure).
       (if errs == 0 then 0 else base / (1 + errs))
+
+-- ────────────────────────────────────────────────────────────────
+-- oracle_compile_batch  (Stream 3 addition, 2026-04-20)
+--
+-- Fans compile-oracle calls across OS processes via parallel_shell.
+-- Input:  codes (list of Rail source strings), max_conc (int)
+-- Output: list of [errs, ok_flag, quality] triples, same order as codes.
+--
+-- Scoring MIRRORS oracle_quality above (decls gate + thresholds).
+-- If oracle_quality tightens further, update ob_score_one in
+-- lockstep (search "MIRRORS oracle_quality").
+--
+-- Known limitation — /tmp/rail_out.s race:
+-- rail_native hardcodes /tmp/rail_out.{s,o} as compile intermediates.
+-- Concurrent workers clobber each other's .s mid-assemble, producing
+-- bogus assembler errors ("unrecognized instruction mnemonic").
+-- Until compile.rail accepts a --out-path flag, each rail_native
+-- invocation is serialised by a POSIX file lock (flock on
+-- /tmp/rail_compile.lock).  parallel_shell still parallelises process
+-- spawn + stdout capture, but compile itself runs serial.  Measured
+-- 1.03× Mini at max_conc=10 (training/rail_native/ORACLE_PARALLEL_BENCH.md).
+-- ────────────────────────────────────────────────────────────────
+
+ob_write_codes tmpdir codes idx =
+  if length codes == 0 then idx
+  else
+    let path = cat [tmpdir, "/ob_in_", show idx, ".rail"]
+    let _ = write_file path (head codes)
+    ob_write_codes tmpdir (tail codes) (idx + 1)
+
+-- flock serialises rail_native on /tmp/rail_compile.lock. See header.
+ob_make_cmd tmpdir idx =
+  cat ["/opt/homebrew/bin/flock /tmp/rail_compile.lock bash -c 'cd ~/projects/rail && ./rail_native ", tmpdir, "/ob_in_", show idx, ".rail 2>&1'"]
+
+ob_build_cmds tmpdir n idx acc =
+  if idx >= n then reverse acc
+  else ob_build_cmds tmpdir n (idx + 1) (cons (ob_make_cmd tmpdir idx) acc)
+
+-- MIRRORS oracle_quality.  Given captured compile output, replay the
+-- scoring formula so we don't re-shell once per candidate. Keep in
+-- sync with oracle_quality's body (thresholds + decls gate).
+ob_score_one code out =
+  let nw = count_non_whitespace code
+  let uq = count_unique_chars code
+  let lines = str_split "\n" out
+  let errs = count_error_lines lines 0
+  let ok_flag = if str_contains "ld: OK" out then 1 else 0
+  if nw < 16 then cons errs (cons ok_flag (cons 0 []))
+  else if uq < oracle_min_unique_chars then cons errs (cons ok_flag (cons 0 []))
+  else
+    let decls = count_top_level_decls code
+    let base = nw * uq
+    let q = if ok_flag == 1 then
+              (if decls < oracle_min_decls_for_bonus then 0
+               else if nw >= oracle_min_nw_for_bonus then base * 10
+               else base)
+            else (if errs == 0 then 0 else base / (1 + errs))
+    cons errs (cons ok_flag (cons q []))
+
+ob_score_loop codes pairs acc =
+  if length codes == 0 then reverse acc
+  else if length pairs == 0 then reverse acc
+  else
+    let code = head codes
+    let pair = head pairs
+    let out = head (tail pair)
+    ob_score_loop (tail codes) (tail pairs) (cons (ob_score_one code out) acc)
+
+oracle_compile_batch codes max_conc =
+  let n = length codes
+  if n == 0 then []
+  else
+    let tmpdir_raw = shell "mktemp -d /tmp/rail_oracle_batch.XXXXXX"
+    let tmpdir = par_rstrip_nl tmpdir_raw
+    let _ = ob_write_codes tmpdir codes 0
+    let cmds = ob_build_cmds tmpdir n 0 []
+    let pairs = parallel_shell cmds max_conc
+    let triples = ob_score_loop codes pairs []
+    let _ = shell (cat ["rm -rf ", tmpdir])
+    triples
