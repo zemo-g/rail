@@ -2,6 +2,92 @@
 
 All notable changes to Rail are documented here.
 
+## v3.6.0 — 2026-04-20 — Unified HTTPS client
+
+Chain-walked verification is now the default. `https_get_url` /
+`https_post_url` (and their `host ip port`-taking siblings
+`https_get` / `https_post`) perform full X.509 chain validation
+against `/etc/ssl/cert.pem` on every call. The previous leaf-only
+drivers live on under explicit `https_*_unsafe_noverify` names for
+tests that need to exercise the FSM without trust-store setup.
+
+- `stdlib/https_client.rail` — `https_get` / `https_post` /
+  `https_get_url` / `https_post_url` renamed to
+  `https_get_unsafe_noverify` / `https_post_unsafe_noverify` /
+  `https_get_url_unsafe_noverify` / `https_post_url_unsafe_noverify`.
+  Function bodies unchanged; only the public names shifted.
+
+- `stdlib/https_strict.rail` — the chain-walking drivers now own
+  the unsuffixed public names `https_get` / `https_post` /
+  `https_get_url` / `https_post_url`. The `_strict`-suffixed names
+  are retained for one release as thin delegating aliases; they
+  will be removed in v3.7.0.
+
+- `stdlib/cert_chain.rail` — `cc_walk_chain` gained an SPKI-keyed
+  termination check in `cc_walk_at`. Each chain cert's
+  SubjectPublicKeyInfo DER is hashed and compared against the
+  trust store's pre-computed root SPKI hashes. A match halts the
+  walk immediately and treats the cert as trusted — which makes
+  cross-signed roots (the GTS R4 variant with GlobalSign as its
+  `issuer` field) validate cleanly even when the server's chain
+  doesn't stop at a name-matching root.
+
+- `stdlib/pem.rail` — `pem_load_trust_store` now emits a 7-element
+  store (`[certs, lens, count, valid, sub_offs, sub_lens,
+  spki_hashes]`). The extra parallel arrays cache the Subject TLV
+  ranges and SHA-256(SPKI) digests of every root, so
+  `ts_find_by_subject` is a cached byte-equal loop and the new
+  `ts_has_spki_hash` is O(store size) with no per-lookup DER
+  reparse. On the macOS 128-entry store this drops a two-lookup
+  chain walk from ~60 s of parse overhead to sub-millisecond
+  lookups.
+
+- `stdlib/asn1.rail` — new `asn1_find_spki` + `asn1_find_sub_spki`
+  finders return the TLV ranges for the SubjectPublicKeyInfo
+  SEQUENCE (and, in the combined form, the Subject Name range
+  too). Used by the trust-store loader for single-pass Subject +
+  SPKI extraction per root.
+
+- `stdlib/slack_client.rail` — `slack_post_text` now calls the
+  chain-walked `https_post_url` default.
+
+- `stdlib/anthropic_client.rail` — `anthropic_chat` explicitly
+  calls `https_post_url_unsafe_noverify` with a docblock pointing
+  at the blocker. `api.anthropic.com` chains up to GTS Root R4
+  (P-384), and one pure-Rail P-384 signature verify in the chain
+  walk takes ~90 s — past CloudFlare's handshake-idle budget, so
+  the strict default can't complete a request before the server
+  closes the socket. Moving `anthropic_chat` off the unsafe path
+  is queued behind a P-384 scalar-mult optimisation in v3.7.0.
+
+### Validation gates
+
+- `./rail_native test` — 137/137.
+- `./rail_native self` 2-pass → byte-identical fixed point.
+- `tools/tls/https_strict_test.rail` — `https_get_url
+  "https://www.amazon.com/"` → HTTP 200 (DigiCert root chain, RSA).
+- `tools/tls/cc_spki_probe.rail` — every pre-computed root SPKI
+  hash round-trips through `ts_has_spki_hash` (128/128 self-match).
+- `tools/tls/mitm_chain_reject.rail` — a fresh self-signed
+  ECDSA-P256 leaf with `CN=api.anthropic.com` is rejected by
+  `cc_walk_chain` (status 0).
+- Live Slack `chat.postMessage` via `slack_post_text` on the
+  chain-walked default → `ok=1`, HTTP 200.
+
+### Known gaps
+
+- `https_get_url "https://api.anthropic.com/"` returns status 0:
+  the chain walker accepts the GTS R4 chain, but the one P-384
+  verify pushes total handshake time past ~90 s, and CloudFlare
+  closes the socket before the client can send its Finished +
+  request. Tracked for v3.7.0 (P-384 scalar-mult windowing /
+  precompute).
+- `https_get_url "https://slack.com/"` bus-errors in
+  `hc_recv_response` on the 230 KB HTML body; unrelated to
+  v3.6.0 (pre-existing Rail list/string-concat behaviour on very
+  large bodies). Use a small API endpoint for chain-walked smoke
+  tests.
+
 ## v3.5.0 — 2026-04-20 — Hardened HTTPS client + http_server
 
 Two stdlib hardening passes plus a docs clarification.

@@ -6,8 +6,9 @@
 -- Subject Name via asn1_find_subject + asn1_name_eq.
 --
 -- Public API:
---   pem_load_trust_store path -> [certs_arr, lens_arr, count, valid]
+--   pem_load_trust_store path -> [certs_arr, lens_arr, count, valid, sub_offs, sub_lens, spki_hashes]
 --   ts_find_by_subject store name_buf name_off name_len -> idx (-1 if not found)
+--   ts_has_spki_hash   store h32 -> 1/0 (byte-eq against pre-computed root SPKI hashes)
 --
 -- Caller must have stdlib/b64.rail + stdlib/asn1.rail loaded.
 
@@ -48,12 +49,44 @@ pem_load_trust_store path =
   let certs = arr_new n 0
   let lens = arr_new n 0
   let _ = pem_decode_into certs lens blocks 0 n
-  let r = arr_new 4 0
+  -- Pre-compute per-cert Subject offsets and SPKI SHA-256 hashes so
+  -- repeated ts_find_by_subject / ts_has_spki_hash lookups do not
+  -- re-parse every cert. On a 128-entry store this drops a two-lookup
+  -- chain walk from ~60s to ~10ms of lookup overhead.
+  let sub_offs = arr_new n 0
+  let sub_lens = arr_new n 0
+  let spki_hashes = arr_new n 0
+  let _ = pem_precompute certs lens sub_offs sub_lens spki_hashes n 0
+  let r = arr_new 7 0
   let _ = arr_set r 0 certs
   let _ = arr_set r 1 lens
   let _ = arr_set r 2 n
   let _ = arr_set r 3 1
+  let _ = arr_set r 4 sub_offs
+  let _ = arr_set r 5 sub_lens
+  let _ = arr_set r 6 spki_hashes
   r
+
+pem_precompute certs lens sub_offs sub_lens spki_hashes n i =
+  if i >= n then 0
+  else
+    let cert = arr_get certs i
+    let cert_len = arr_get lens i
+    let r = asn1_find_sub_spki cert cert_len
+    if arr_get r 4 == 0 then
+      let _ = arr_set sub_offs i (0 - 1)
+      let _ = arr_set sub_lens i 0
+      let _ = arr_set spki_hashes i (arr_new 32 0)
+      pem_precompute certs lens sub_offs sub_lens spki_hashes n (i + 1)
+    else
+      let _ = arr_set sub_offs i (arr_get r 0)
+      let _ = arr_set sub_lens i (arr_get r 1)
+      let spki_off = arr_get r 2
+      let spki_len = arr_get r 3
+      let buf = arr_new spki_len 0
+      let _ = sha_copy_bytes cert buf spki_off 0 spki_len
+      let _ = arr_set spki_hashes i (sha256_bytes buf spki_len)
+      pem_precompute certs lens sub_offs sub_lens spki_hashes n (i + 1)
 
 pem_decode_into certs lens blocks i n =
   if i >= n then 0
@@ -67,23 +100,45 @@ pem_decode_into certs lens blocks i n =
 
 -- ── Subject lookup ─────────────────────────────────────────────────
 -- Walk the store looking for a cert whose Subject equals (name_buf
--- @ name_off..name_off+name_len). Returns the index, or -1 if no match.
+-- @ name_off..name_off+name_len). Uses the cached (subject_off,
+-- subject_len) arrays built in pem_load_trust_store, so the inner
+-- loop is just a byte-equal comparison — no per-cert DER reparse.
 
 ts_find_by_subject store name_buf name_off name_len =
   let certs = arr_get store 0
-  let lens = arr_get store 1
   let n = arr_get store 2
-  ts_find_loop certs lens n name_buf name_off name_len 0
+  let sub_offs = arr_get store 4
+  let sub_lens = arr_get store 5
+  ts_find_loop certs n sub_offs sub_lens name_buf name_off name_len 0
 
-ts_find_loop certs lens n name_buf name_off name_len i =
+ts_find_loop certs n sub_offs sub_lens name_buf name_off name_len i =
   if i >= n then 0 - 1
   else
-    let cert = arr_get certs i
-    let cert_len = arr_get lens i
-    let sub = asn1_find_subject cert cert_len
-    if arr_get sub 2 == 0 then ts_find_loop certs lens n name_buf name_off name_len (i + 1)
-    else
-      let sub_off = arr_get sub 0
-      let sub_len = arr_get sub 1
-      if asn1_name_eq cert sub_off sub_len name_buf name_off name_len == 1 then i
-      else ts_find_loop certs lens n name_buf name_off name_len (i + 1)
+    let so = arr_get sub_offs i
+    let sl = arr_get sub_lens i
+    if so < 0 then ts_find_loop certs n sub_offs sub_lens name_buf name_off name_len (i + 1)
+    else if asn1_name_eq (arr_get certs i) so sl name_buf name_off name_len == 1 then i
+    else ts_find_loop certs n sub_offs sub_lens name_buf name_off name_len (i + 1)
+
+-- ── SPKI-hash lookup ───────────────────────────────────────────────
+-- Test whether a given 32-byte SHA-256(SPKI) matches any root in the
+-- store. Returns 1 on match, 0 otherwise. Used by the chain walker
+-- for SPKI-keyed trust-store termination so cross-signed roots (e.g.
+-- GTS R4 presented with GlobalSign as its issuer) still terminate.
+
+ts_has_spki_hash store h32 =
+  let n = arr_get store 2
+  let hashes = arr_get store 6
+  ts_hsh_loop hashes n h32 0
+
+ts_hsh_loop hashes n target i =
+  if i >= n then 0
+  else if bytes32_eq (arr_get hashes i) target == 1 then 1
+  else ts_hsh_loop hashes n target (i + 1)
+
+bytes32_eq a b = bytes32_eq_at a b 0
+
+bytes32_eq_at a b i =
+  if i >= 32 then 1
+  else if arr_get a i != arr_get b i then 0
+  else bytes32_eq_at a b (i + 1)
