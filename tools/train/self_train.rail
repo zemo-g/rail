@@ -1166,18 +1166,31 @@ pb_classify_all codes expecteds compile_pairs run_pairs idx acc =
     let result = pb_classify_one code expected compile_out rp
     pb_classify_all (tail codes) (tail expecteds) (tail compile_pairs) (tail run_pairs) (idx + 1) (cons result acc)
 
+-- Extract just the compile stdout from each pair (we need to hand it back
+-- to the retry prompt builder so the LLM sees the compiler's feedback).
+pb_extract_compile_outs pairs acc =
+  if length pairs == 0 then reverse acc
+  else
+    let p = head pairs
+    let out = if length p >= 2 then head (tail p) else ""
+    pb_extract_compile_outs (tail pairs) (cons out acc)
+
 -- Batch compile + run + classify. Input: codes list + expecteds list + max_conc.
--- Output: list of result strings matching verify()'s contract.
+-- Output: (results, compile_outs) — results match verify()'s contract;
+-- compile_outs are the raw stdout from each `rail_native` invocation, for
+-- use in retry prompts.
 pb_verify_batch tmpdir codes expecteds max_conc =
   let n = length codes
-  if n == 0 then []
+  if n == 0 then ([], [])
   else
     let _ = pb_write_codes tmpdir codes 0
     let compile_cmds = pb_build_compile_cmds tmpdir n 0 []
     let compile_pairs = parallel_shell compile_cmds max_conc
     let run_cmds = pb_build_run_cmds tmpdir n 0 []
     let run_pairs = parallel_shell run_cmds max_conc
-    pb_classify_all codes expecteds compile_pairs run_pairs 0 []
+    let results = pb_classify_all codes expecteds compile_pairs run_pairs 0 []
+    let compile_outs = pb_extract_compile_outs compile_pairs []
+    (results, compile_outs)
 
 -- Pull descs and expecteds out of a list of task lines, as two parallel lists.
 pb_task_descs tasks acc =
@@ -1205,8 +1218,78 @@ pb_tally descs codes results pass fail harvested idx =
       let _ = print (cat ["    ✗ FAIL (", result, ")"])
       pb_tally (tail descs) (tail codes) (tail results) pass (fail + 1) harvested (idx + 1)
 
+-- Build a retry prompt given previous attempt's code + failure result +
+-- compiler output. Mirrors gen_with_retry's retry-branch shape.
+pb_retry_prompt desc expected prev_code prev_result prev_compile_out =
+  let hint = if expected == "" then "" else cat ["\n\nThe program must print exactly: ", expected]
+  let class = error_class prev_result
+  let detail = error_detail prev_result
+  let class_hint = if class == "syntax_error" then
+      cat ["\n\nSYNTAX ERROR: ", detail, "\nRemember: Rail uses 'match expr | Pat -> body' (NO with keyword). NO let rec. NO x::xs. NO where clauses."]
+    else if class == "type_error" then
+      cat ["\n\nTYPE ERROR: ", detail, "\nCheck: function names are correct, right number of arguments, show converts int to string."]
+    else if class == "linker_error" then
+      cat ["\n\nLINKER ERROR: ", detail, "\nYou used a function that doesn't exist."]
+    else cat ["\n\nFailure: ", prev_result]
+  cat [desc, hint, class_hint, "\n\nYour previous code was:\n", prev_code, "\n\nCompiler output:\n", prev_compile_out, "\n\nFix the errors. Output ONLY Rail code."]
+
+-- Collect 0-based indices of failed tasks (result != "success").
+pb_fail_idxs results idx acc =
+  if length results == 0 then reverse acc
+  else
+    let r = head results
+    let acc2 = if r == "success" then acc else cons idx acc
+    pb_fail_idxs (tail results) (idx + 1) acc2
+
+-- Gather list elements at the given indices, in index order.
+pb_gather xs idxs acc =
+  if length idxs == 0 then reverse acc
+  else pb_gather xs (tail idxs) (cons (pb_nth xs (head idxs)) acc)
+
+pb_nth xs n =
+  if n <= 0 then head xs
+  else pb_nth (tail xs) (n - 1)
+
+-- Merge new values at `idxs` into old list, preserving non-idx positions.
+-- idxs must be sorted ascending (which pb_fail_idxs guarantees).
+pb_merge xs idxs news pos acc =
+  if length xs == 0 then reverse acc
+  else if length idxs > 0 && head idxs == pos then
+    pb_merge (tail xs) (tail idxs) (tail news) (pos + 1) (cons (head news) acc)
+  else
+    pb_merge (tail xs) idxs news (pos + 1) (cons (head xs) acc)
+
+-- Build retry prompts for the failed subset (already gathered into parallel lists).
+pb_retry_prompts_loop descs expecteds codes results compile_outs acc =
+  if length descs == 0 then reverse acc
+  else
+    let p = pb_retry_prompt (head descs) (head expecteds) (head codes) (head results) (head compile_outs)
+    pb_retry_prompts_loop (tail descs) (tail expecteds) (tail codes) (tail results) (tail compile_outs) (cons p acc)
+
+-- One retry round. Returns updated (codes, results, compile_outs) after one
+-- more attempt on the failed subset.
+pb_retry_round sys tmpdir port descs expecteds codes results compile_outs batch_size attempt =
+  let fail_idxs = pb_fail_idxs results 0 []
+  let nfails = length fail_idxs
+  let _ = print (cat ["  [parallel] attempt ", show attempt, ": retrying ", show nfails, " failed task(s)"])
+  if nfails == 0 then (codes, results, compile_outs)
+  else
+    let fail_descs = pb_gather descs fail_idxs []
+    let fail_expecteds = pb_gather expecteds fail_idxs []
+    let fail_codes = pb_gather codes fail_idxs []
+    let fail_results = pb_gather results fail_idxs []
+    let fail_compile_outs = pb_gather compile_outs fail_idxs []
+    let retry_prompts = pb_retry_prompts_loop fail_descs fail_expecteds fail_codes fail_results fail_compile_outs []
+    let retry_codes = pb_par_llm tmpdir port sys retry_prompts batch_size
+    let (retry_results, retry_compile_outs) = pb_verify_batch tmpdir retry_codes fail_expecteds batch_size
+    let new_codes = pb_merge codes fail_idxs retry_codes 0 []
+    let new_results = pb_merge results fail_idxs retry_results 0 []
+    let new_compile_outs = pb_merge compile_outs fail_idxs retry_compile_outs 0 []
+    (new_codes, new_results, new_compile_outs)
+
 -- Parallel round entry point. Same return contract as run_batch:
--- (pass, fail, new_harvested).
+-- (pass, fail, new_harvested). Up to 3 attempts per task (initial + 2 retries)
+-- to match serial gen_with_retry's behavior.
 run_batch_parallel sys tasks batch_size pass fail new_harvested =
   if length tasks == 0 then (pass, fail, new_harvested)
   else
@@ -1218,12 +1301,18 @@ run_batch_parallel sys tasks batch_size pass fail new_harvested =
     let n = length tasks
     let _ = print (cat ["\n  [parallel] fan-out N=", show n, " max_conc=", show batch_size])
     let t0 = trim (shell "date +%s")
-    let codes = pb_par_llm tmpdir port sys prompts batch_size
+    let codes1 = pb_par_llm tmpdir port sys prompts batch_size
     let t1 = trim (shell "date +%s")
-    let _ = print (cat ["  [parallel] LLM batch done in ", t1, "-", t0, "s"])
-    let results = pb_verify_batch tmpdir codes expecteds batch_size
+    let _ = print (cat ["  [parallel] LLM attempt 1 done in ", t1, "-", t0, "s"])
+    let (results1, compile_outs1) = pb_verify_batch tmpdir codes1 expecteds batch_size
     let t2 = trim (shell "date +%s")
-    let _ = print (cat ["  [parallel] verify batch done in ", t2, "-", t1, "s"])
-    let (p, f, h) = pb_tally descs codes results pass fail new_harvested 0
+    let _ = print (cat ["  [parallel] verify 1 done in ", t2, "-", t1, "s"])
+    let (codes2, results2, compile_outs2) = pb_retry_round sys tmpdir port descs expecteds codes1 results1 compile_outs1 batch_size 2
+    let t3 = trim (shell "date +%s")
+    let _ = print (cat ["  [parallel] attempt 2 done in ", t3, "-", t2, "s"])
+    let (codes3, results3, compile_outs3) = pb_retry_round sys tmpdir port descs expecteds codes2 results2 compile_outs2 batch_size 3
+    let t4 = trim (shell "date +%s")
+    let _ = print (cat ["  [parallel] attempt 3 done in ", t4, "-", t3, "s"])
+    let (p, f, h) = pb_tally descs codes3 results3 pass fail new_harvested 0
     let _ = shell (cat ["rm -rf ", tmpdir])
     (p, f, h)
