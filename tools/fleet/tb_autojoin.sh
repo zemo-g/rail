@@ -35,7 +35,8 @@ fi
 
 # ── Classify candidate interfaces ───────────────────────────────────────────
 # Real TB peer:
-#   flags include UP, RUNNING, PROMISC
+#   flags include UP and RUNNING (PROMISC is set *by* bridge addition —
+#   requiring it up front creates a chicken-and-egg that blocks first join)
 #   AND media is `autoselect` OR (media is `none` AND options contain CHANNEL_IO)
 # Skip en0/en1 (Wi-Fi / built-in).
 real_peers=""
@@ -46,14 +47,22 @@ for iface in $(ifconfig -l | tr ' ' '\n' | grep -E '^en[0-9]+$'); do
   info=$(ifconfig "$iface" 2>/dev/null)
   [ -z "$info" ] && continue
 
-  flags_line=$(printf '%s' "$info" | grep -E '^[[:space:]]*flags=' | head -1)
+  flags_line=$(printf '%s' "$info" | grep 'flags=' | head -1)
   case "$flags_line" in
-    *UP*RUNNING*PROMISC*|*PROMISC*UP*RUNNING*|*UP*PROMISC*RUNNING*|*RUNNING*UP*PROMISC*|*RUNNING*PROMISC*UP*|*PROMISC*RUNNING*UP*) ;;
+    *UP*RUNNING*|*RUNNING*UP*) ;;
     *) log "$iface stub reason=flags"; continue ;;
   esac
 
   media=$(printf '%s' "$info" | awk '/^[[:space:]]*media:/ {print $2; exit}')
   options=$(printf '%s' "$info" | awk '/^[[:space:]]*options=/ {print $0; exit}')
+  status=$(printf '%s' "$info" | awk '/^[[:space:]]*status:/ {print $2; exit}')
+
+  # Reject if explicit status: inactive — TB stubs from prior peers can
+  # linger as UP+RUNNING+CHANNEL_IO with media=none but no live link.
+  if [ "$status" = "inactive" ]; then
+    log "$iface stub reason=status-inactive"
+    continue
+  fi
 
   case "$media" in
     autoselect)
@@ -130,12 +139,23 @@ for m in $members; do
 done
 removed=$(printf '%s' "$removed" | awk '{$1=$1};1')
 
-# ── Unstick TB Bridge service if bridge0 is inactive AND we have peers ──────
+# ── Unstick TB Bridge service if bridge0 is inactive ────────────────────────
+# Rate-limited via a touchfile to avoid thrashing on genuinely unplugged
+# nodes.  Only toggle once every 5 minutes.
 status=$(ifconfig bridge0 2>/dev/null | awk '/^[[:space:]]*status:/ {print $2; exit}')
-if [ -n "$real_peers" ] && [ "$status" != "active" ]; then
-  log "bridge0 inactive with peers — toggling Thunderbolt Bridge service"
-  networksetup -setnetworkserviceenabled "Thunderbolt Bridge" off >/dev/null 2>&1
-  networksetup -setnetworkserviceenabled "Thunderbolt Bridge" on  >/dev/null 2>&1
+TOGGLE_STAMP="/var/run/tb_autojoin.last_toggle"
+if [ "$status" != "active" ]; then
+  now=$(date +%s)
+  last=$(stat -f%m "$TOGGLE_STAMP" 2>/dev/null || echo 0)
+  if [ $((now - last)) -ge 300 ]; then
+    log "bridge0 inactive — toggling Thunderbolt Bridge service (last=${last})"
+    networksetup -setnetworkserviceenabled "Thunderbolt Bridge" off >/dev/null 2>&1
+    sleep 1
+    networksetup -setnetworkserviceenabled "Thunderbolt Bridge" on  >/dev/null 2>&1
+    touch "$TOGGLE_STAMP" 2>/dev/null
+  else
+    log "bridge0 inactive — toggle rate-limited ($((now - last))s since last)"
+  fi
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
