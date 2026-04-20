@@ -24,7 +24,12 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ANCHOR_SRC="$REPO_ROOT/tools/fleet/pf_ledatic_fleet.conf"
+# v2 anchor adds IPv6 rules; fall back to v1 if v2 isn't in the tree yet.
+if [ -f "$REPO_ROOT/tools/fleet/pf_ledatic_fleet.v2.conf" ]; then
+  ANCHOR_SRC="$REPO_ROOT/tools/fleet/pf_ledatic_fleet.v2.conf"
+else
+  ANCHOR_SRC="$REPO_ROOT/tools/fleet/pf_ledatic_fleet.conf"
+fi
 ANCHOR_DST="/etc/pf.anchors/ledatic_fleet"
 
 if [ ! -f "$ANCHOR_SRC" ]; then
@@ -58,6 +63,28 @@ else
 fi
 
 # ── 4. SSH key-only ──────────────────────────────────────────────────────
+# Preflight: refuse to disable password auth unless at least one user on
+# this box has an authorized_keys file with a non-empty public key.
+# Without this, turning off PasswordAuthentication locks everyone out.
+HAS_KEYS=0
+for home in /Users/*; do
+  user=$(basename "$home")
+  case "$user" in Shared|Guest) continue ;; esac
+  ak="$home/.ssh/authorized_keys"
+  if [ -s "$ak" ]; then
+    # Actually contains something that looks like a key (ssh-*/ecdsa-*/sk-*)
+    if grep -qE '^(ssh-|ecdsa-|sk-)' "$ak" 2>/dev/null; then
+      HAS_KEYS=1
+      echo "sshd: authorized_keys found for $user"
+    fi
+  fi
+done
+if [ "$HAS_KEYS" -eq 0 ]; then
+  echo "ERR: no user has a valid authorized_keys — refusing to disable password auth" >&2
+  echo "     install a public key in ~/.ssh/authorized_keys (chmod 600) and re-run." >&2
+  exit 2
+fi
+
 SSHD_CONFIG=/etc/ssh/sshd_config
 CHANGED_SSHD=0
 
