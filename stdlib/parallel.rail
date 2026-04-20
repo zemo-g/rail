@@ -1,0 +1,162 @@
+-- stdlib/parallel.rail — fan N shell commands across OS processes.
+--
+-- Rail's runtime is cooperative single-threaded (fibers, one OS thread,
+-- one GC arena). For embarrassingly-parallel CPU-heavy work —
+-- independent subprocess invocations, e.g. oracle compiler calls over
+-- a batch of candidates — we use the OS: write each command to a
+-- tempfile, fork up to N at a time via a bash driver, collect results.
+--
+-- Each worker runs in its own process with its own arena, so this
+-- sidesteps the single-GC-thread bottleneck entirely. On the Mac
+-- Studio (16 P-cores), this yields ~10× speedup on oracle batches.
+--
+-- Usage:
+--   import "stdlib/parallel.rail"
+--   let results = parallel_shell [cmd1, cmd2, ...] 16
+--   -- results is a list of [exit_code, stdout_str] pairs.
+--
+-- No import "stdlib/file.rail" here: write_file is a compiler builtin,
+-- and file.rail's foreign declarations collide if it's pulled in twice
+-- along an import chain (Rail imports are not deduplicated).
+
+-- Default concurrency. Tune per host via the explicit max_conc arg;
+-- Mini M4 Pro: 10 (leave headroom for MLX server on GPU). Studio
+-- M1 Ultra: 16 (matches the P-core budget under the TB hub).
+parallel_default_conc_mini = 10
+parallel_default_conc_studio = 16
+
+-- Default worker timeout (seconds). TERM at T, KILL at T+2. Escalation
+-- is handled by a per-worker killer subshell (macOS ships no timeout(1)).
+parallel_default_timeout = 60
+
+-- ── Internals ──────────────────────────────────────────────────────
+
+-- Strip trailing newline left by shell command substitution.
+par_rstrip_nl s =
+  let n = length (chars s)
+  if n == 0 then s
+  else if str_sub s (n - 1) 1 == "\n" then str_sub s 0 (n - 1)
+  else s
+
+-- Parse a non-negative integer from a string. Stops on first non-digit.
+-- Handles leading whitespace and an optional leading minus.
+par_digit_val c =
+  if c == "0" then 0
+  else if c == "1" then 1
+  else if c == "2" then 2
+  else if c == "3" then 3
+  else if c == "4" then 4
+  else if c == "5" then 5
+  else if c == "6" then 6
+  else if c == "7" then 7
+  else if c == "8" then 8
+  else if c == "9" then 9
+  else -1
+
+par_parse_int_loop cs acc =
+  if length cs == 0 then acc
+  else
+    let d = par_digit_val (head cs)
+    if d < 0 then acc
+    else par_parse_int_loop (tail cs) (acc * 10 + d)
+
+par_parse_int s =
+  let t = str_replace " " "" (str_replace "\n" "" s)
+  if length (chars t) == 0 then 0
+  else if str_sub t 0 1 == "-" then
+    0 - (par_parse_int_loop (chars (str_sub t 1 (length (chars t) - 1))) 0)
+  else par_parse_int_loop (chars t) 0
+
+-- Create a unique tempdir + its cmds/ and out/ subdirs.
+par_init_tmpdir _ =
+  let raw = shell "mktemp -d /tmp/rail_par.XXXXXX"
+  let d = par_rstrip_nl raw
+  let _ = shell (cat ["mkdir -p ", d, "/cmds ", d, "/out"])
+  d
+
+-- Write one command-per-file into tmpdir/cmds/$idx.  Returns count.
+par_write_cmds tmpdir cmds idx =
+  if length cmds == 0 then idx
+  else
+    let path = cat [tmpdir, "/cmds/", show idx]
+    let _ = write_file path (head cmds)
+    par_write_cmds tmpdir (tail cmds) (idx + 1)
+
+-- Assemble the bash driver.  Fires workers behind `&`, throttled by
+-- $MAX via `wait -n`.  Each worker runs under an in-script portable
+-- timeout (background killer subshell), captures stdout+stderr to
+-- $TMPDIR/out/$i.out and exit code to $TMPDIR/out/$i.ec.  Final pass
+-- emits sentinel-delimited chunks that Rail parses back.
+--
+-- Split into single-line fragments — Rail's parser rejects multi-line
+-- list literals, so join/cat must feed same-line string expressions.
+par_driver_header tmpdir n max_conc to_s =
+  cat ["#!/bin/bash\nTMPDIR=", tmpdir, "\nMAX=", show max_conc, "\nN=", show n, "\nT=", show to_s, "\n\n"]
+
+par_driver_worker _ =
+  "run_with_timeout() {\n  local idx=$1\n  local script=\"$TMPDIR/cmds/$idx\"\n  (\n    exec >\"$TMPDIR/out/$idx.out\" 2>&1\n    bash \"$script\" &\n    local pid=$!\n    ( sleep $T; kill -TERM $pid 2>/dev/null; sleep 2; kill -KILL $pid 2>/dev/null ) &\n    local killer=$!\n    wait $pid 2>/dev/null\n    local ec=$?\n    kill -KILL $killer 2>/dev/null\n    wait $killer 2>/dev/null\n    echo $ec > \"$TMPDIR/out/$idx.ec\"\n  ) &\n}\n\n"
+
+par_driver_loop _ =
+  "running=0\nfor ((i=0; i<N; i++)); do\n  if [ $running -ge $MAX ]; then\n    wait -n 2>/dev/null\n    running=$((running-1))\n  fi\n  run_with_timeout $i\n  running=$((running+1))\ndone\nwait\n\n"
+
+par_driver_emit _ =
+  "for ((i=0; i<N; i++)); do\n  echo \"===RAIL_PAR_${i}===\"\n  if [ -r \"$TMPDIR/out/$i.ec\" ]; then cat \"$TMPDIR/out/$i.ec\"; else echo -1; fi\n  echo \"===RAIL_PAR_OUT===\"\n  if [ -r \"$TMPDIR/out/$i.out\" ]; then cat \"$TMPDIR/out/$i.out\"; fi\n  echo \"===RAIL_PAR_END===\"\ndone\n"
+
+par_make_driver tmpdir n max_conc to_s =
+  cat [par_driver_header tmpdir n max_conc to_s, par_driver_worker 0, par_driver_loop 0, par_driver_emit 0]
+
+-- Pull (ec_int, out_str) out of one inter-sentinel chunk of form:
+--   "===RAIL_PAR_<idx>===\n<ec>\n===RAIL_PAR_OUT===\n<out>"
+par_strip_trailing_nl s =
+  let m = length (chars s)
+  if m == 0 then s
+  else if str_sub s (m - 1) 1 == "\n" then str_sub s 0 (m - 1)
+  else s
+
+par_parse_one chunk =
+  let parts = str_split "===RAIL_PAR_OUT===\n" chunk
+  if length parts < 2 then cons (-1) (cons "" [])
+  else
+    let pre = head parts
+    let post = head (tail parts)
+    let pre_lines = str_split "\n" pre
+    let ec_str = if length pre_lines < 2 then "-1" else head (tail pre_lines)
+    let ec = par_parse_int ec_str
+    let out_clean = par_strip_trailing_nl post
+    cons ec (cons out_clean [])
+
+-- Parse the driver's aggregated output into a list of [ec, out] pairs.
+par_parse_all_loop chunks acc =
+  if length chunks == 0 then reverse acc
+  else
+    let c = head chunks
+    -- Skip the trailing empty split produced after the final END sentinel.
+    if length (chars c) == 0 then par_parse_all_loop (tail chunks) acc
+    else par_parse_all_loop (tail chunks) (cons (par_parse_one c) acc)
+
+par_parse_all text n =
+  let chunks = str_split "===RAIL_PAR_END===\n" text
+  par_parse_all_loop chunks []
+
+-- ── Public API ─────────────────────────────────────────────────────
+
+-- Run each cmd in cmds up to max_conc at a time. Returns a list of
+-- [exit_code, stdout] pairs in the same order as cmds. Per-worker
+-- timeout defaults to parallel_default_timeout seconds.
+parallel_shell_timeout cmds max_conc to_s =
+  let n = length cmds
+  if n == 0 then []
+  else
+    let tmpdir = par_init_tmpdir 0
+    let _ = par_write_cmds tmpdir cmds 0
+    let driver = par_make_driver tmpdir n max_conc to_s
+    let driver_path = cat [tmpdir, "/driver.sh"]
+    let _ = write_file driver_path driver
+    let out = shell (cat ["bash ", driver_path])
+    let results = par_parse_all out n
+    let _ = shell (cat ["rm -rf ", tmpdir])
+    results
+
+-- Convenience wrapper with default timeout.
+parallel_shell cmds max_conc =
+  parallel_shell_timeout cmds max_conc parallel_default_timeout
