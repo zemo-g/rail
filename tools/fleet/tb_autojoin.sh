@@ -24,7 +24,11 @@ if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX"
 fi
 
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG"; }
+log() {
+  printf '%s %s\n' "$(ts)" "$*" >> "$LOG"
+  # Tighten perms on first write — world-readable logs leak fleet topology.
+  chmod 600 "$LOG" 2>/dev/null || true
+}
 
 # ── Read desired IP ─────────────────────────────────────────────────────────
 TB_IP=$(cat "$TB_IP_FILE" 2>/dev/null | tr -d '[:space:]')
