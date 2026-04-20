@@ -1,0 +1,258 @@
+-- tools/train/generate.rail — Autoregressive sampler from a Rail LM checkpoint.
+--
+-- Loads weights saved by lm_transformer.rail (or any topology-compatible
+-- training loop), rebuilds the Shakespeare vocab, tokenizes a prompt, and
+-- generates N new tokens using greedy (k=1), top-k (k>1, default), or
+-- top-k-with-temperature sampling.
+--
+-- Silent by design: the only stdout is the decoded text (prompt+continuation).
+-- That makes it easy to pipe into a grader like flywheel/bench_railnative.rail.
+--
+-- Flags (all optional, order-independent):
+--   --prefix PATH     checkpoint prefix (default: training/rail_native/checkpoints_apr15_backup/latest)
+--   --prompt STR      seed prompt (default: "main = ")
+--   --max N           tokens to generate (default: 256)
+--   --k N             top-k (default: 1 = greedy)
+--   --temp FLOAT      sampling temperature (default: 1.0)
+--   --seed N          RNG seed for top-k sampling (default: 42)
+--
+-- Usage:
+--   ./rail_native run tools/train/generate.rail
+--   ./rail_native run tools/train/generate.rail --prompt "main = " --max 256 --k 1
+--   ./rail_native run tools/train/generate.rail --prompt "let x =" --k 5 --temp 0.8 --seed 7
+
+import "stdlib/transformer.rail"
+import "stdlib/optim.rail"
+import "stdlib/tokenizer.rail"
+import "stdlib/checkpoint.rail"
+import "stdlib/sampling.rail"
+
+-- Must match the corpus in tools/train/lm_transformer.rail byte-for-byte
+-- so build_vocab produces the same id assignment the checkpoint was
+-- trained with.
+corpus _ =
+  cat ["To be, or not to be, that is the question.\n",
+       "Whether tis nobler in the mind to suffer\n",
+       "the slings and arrows of outrageous fortune,\n",
+       "or to take arms against a sea of troubles\n",
+       "and by opposing end them. To die, to sleep,\n",
+       "no more; and by a sleep to say we end\n",
+       "the heart-ache and the thousand natural shocks\n",
+       "that flesh is heir to: tis a consummation\n",
+       "devoutly to be wished. To die, to sleep;\n"]
+
+-- ── CLI parsing ─────────────────────────────────────────────────────
+
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if head xs == key then
+    if length (tail xs) > 0 then head (tail xs) else ""
+  else argv_get_loop (tail xs) key
+
+argv_get argv key default_val =
+  let v = argv_get_loop argv key
+  if length (chars v) == 0 then default_val else v
+
+-- ── One-hot / PE / forward helpers (match lm_infer.rail exactly) ────
+
+fill_onehot dst ids V seq i =
+  if i >= seq then 0
+  else
+    let c = head ids
+    let _ = float_arr_set dst (i * V + c) 1.0
+    fill_onehot dst (tail ids) V seq (i + 1)
+
+pe_loop arr seq d p k =
+  if p >= seq then 0
+  else if k >= d then pe_loop arr seq d (p + 1) 0
+  else
+    let exp_arg = int_to_float (k - (k % 2)) / int_to_float d
+    let denom = pow 10000.0 exp_arg
+    let angle = int_to_float p / denom
+    let v = if (k % 2) == 0 then sin angle else cos angle
+    let _ = float_arr_set arr (p * d + k) v
+    pe_loop arr seq d p (k + 1)
+
+build_pe seq d =
+  let arr = float_arr_new (seq * d) 0.0
+  let _ = pe_loop arr seq d 0 0
+  arr
+
+add_buf_inplace dst src n i =
+  if i >= n then 0
+  else
+    let cur = float_arr_get dst i
+    let s = float_arr_get src i
+    let _ = float_arr_set dst i (cur + s)
+    add_buf_inplace dst src n (i + 1)
+
+unwrap t = match t | Tensor d _ _ -> d
+
+relu_fwd src dst mask n i =
+  if i >= n then 0
+  else
+    let v = float_arr_get src i
+    let pos = if v > 0.0 then 1.0 else 0.0
+    let _ = float_arr_set mask i pos
+    let _ = float_arr_set dst i (v * pos)
+    relu_fwd src dst mask n (i + 1)
+
+-- 1-block pre-norm forward. Returns the [seq, V] softmax Tensor.
+-- Same math as lm_transformer.rail:forward.
+forward x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff =
+  let e = matmul x w_e
+  let ed = unwrap e
+  let _ = add_buf_inplace ed pe (seq * d) 0
+  let x_pe = e
+
+  let ln1_pack = layernorm_save x_pe ln_g ln_b
+  let ln1_out = head ln1_pack
+
+  let q = matmul ln1_out w_q
+  let k = matmul ln1_out w_k
+  let v = matmul ln1_out w_v
+  let kt = tensor_transpose k
+  let scores = matmul q kt
+  let scale = 1.0 / sqrt (int_to_float d)
+  let scaled = tensor_scale scores scale
+  let sd = unwrap scaled
+  let _ = apply_causal_mask_loop sd seq 0 0
+  let attn = tensor_softmax scaled
+  let attn_out = matmul attn v
+
+  let x_attn = tensor_add x_pe attn_out
+
+  let ln2_pack = layernorm_save x_attn ln_g ln_b
+  let ln2_out = head ln2_pack
+
+  let ffn_h_pre = matmul ln2_out w_f1
+  let ffn_h_pre_d = unwrap ffn_h_pre
+  let ffn_h_data = float_arr_new (seq * d_ff) 0.0
+  let ffn_mask = float_arr_new (seq * d_ff) 0.0
+  let _ = relu_fwd ffn_h_pre_d ffn_h_data ffn_mask (seq * d_ff) 0
+  let ffn_h = Tensor ffn_h_data (cons seq (cons d_ff [])) (compute_strides (cons seq (cons d_ff [])))
+  let ffn_out = matmul ffn_h w_f2
+
+  let x_blk = tensor_add x_attn ffn_out
+  let logits = matmul x_blk w_o
+  tensor_softmax logits
+
+-- ── Sampling ────────────────────────────────────────────────────────
+
+-- Copy row `row` of a flat [seq, V] buffer into a fresh float_arr dst.
+copy_row src row V dst i =
+  if i >= V then 0
+  else
+    let v = float_arr_get src (row * V + i)
+    let _ = float_arr_set dst i v
+    copy_row src row V dst (i + 1)
+
+-- Temperature rescale: treat probs as quasi-logits, divide by tau, re-softmax.
+-- This is the same approximation as lm_generate.rail — cheap and works well
+-- for tau in [0.5, 2].
+rescale_by_temp row V tau =
+  let _ = temp_div row row V tau 0
+  let m = max_val row V
+  let sum_arr = float_arr_new 1 0.0
+  let _ = exp_shift row V m sum_arr 0
+  let s = float_arr_get sum_arr 0
+  let safe = if s < 1e-12 then 1.0 else s
+  let _ = renorm_loop row V safe 0
+  0
+
+-- One sampled token given the forward Tensor probs and the sampling cfg.
+-- tau_is_one / greedy_k are precomputed bools so we keep the shape of the
+-- decision tree simple (Rail doesn't short-circuit && / ||).
+next_sample probs_t seq V k tau rands step = match probs_t
+  | Tensor probs_data _ _ ->
+    let row = float_arr_new V 0.0
+    let _ = copy_row probs_data (seq - 1) V row 0
+    if tau < 0.999 then
+      let _ = rescale_by_temp row V tau
+      if k <= 1 then sample_argmax row V
+      else sample_topk row V k (float_arr_get rands step)
+    else if tau > 1.001 then
+      let _ = rescale_by_temp row V tau
+      if k <= 1 then sample_argmax row V
+      else sample_topk row V k (float_arr_get rands step)
+    else
+      if k <= 1 then sample_argmax row V
+      else sample_topk row V k (float_arr_get rands step)
+
+-- ── Id-list housekeeping ────────────────────────────────────────────
+
+list_append xs y =
+  if length xs == 0 then cons y []
+  else cons (head xs) (list_append (tail xs) y)
+
+sanitize_loop ids acc =
+  if length ids == 0 then reverse acc
+  else
+    let id = head ids
+    let fixed = if id < 0 then 0 else id
+    sanitize_loop (tail ids) (cons fixed acc)
+
+sanitize_ids ids = sanitize_loop ids []
+
+-- ── Generation loop ─────────────────────────────────────────────────
+
+gen_step ids w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff k tau rands step =
+  let seq = length ids
+  let x_data = float_arr_new (seq * V) 0.0
+  let _ = fill_onehot x_data ids V seq 0
+  let x = Tensor x_data (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+  let pe = build_pe seq d
+  let probs_t = forward x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
+  next_sample probs_t seq V k tau rands step
+
+gen_loop ids gen_count max_gen w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff k tau rands =
+  if gen_count >= max_gen then ids
+  else
+    let mk = arena_mark 0
+    let next_id = gen_step ids w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff k tau rands gen_count
+    let _ = arena_reset mk
+    let new_ids = list_append ids next_id
+    gen_loop new_ids (gen_count + 1) max_gen w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff k tau rands
+
+-- ── main ────────────────────────────────────────────────────────────
+
+main =
+  let prefix = argv_get args "--prefix" "training/rail_native/checkpoints_apr15_backup/latest"
+  let prompt = argv_get args "--prompt" "main = "
+  let max_str = argv_get args "--max" "256"
+  let k_str = argv_get args "--k" "1"
+  let tau_str = argv_get args "--temp" "1.0"
+  let seed_str = argv_get args "--seed" "42"
+
+  let max_gen = parse_int max_str
+  let k = parse_int k_str
+  let tau = parse_float tau_str
+  let seed = parse_int seed_str
+
+  let text = corpus 0
+  let vocab = build_vocab text
+  let V = vocab_size vocab
+  let d = 64
+  let d_ff = 256
+
+  let weights = load_model prefix
+  let w_e = list_nth 0 weights
+  let w_q = list_nth 1 weights
+  let w_k = list_nth 2 weights
+  let w_v = list_nth 3 weights
+  let w_o = list_nth 4 weights
+  let w_f1 = list_nth 5 weights
+  let w_f2 = list_nth 6 weights
+  let ln_g = list_nth 7 weights
+  let ln_b = list_nth 8 weights
+
+  -- Uniforms are only used when k > 1. Allocate a stub otherwise to keep
+  -- types aligned.
+  let rands = if k > 1 then fill_uniforms max_gen seed else float_arr_new 1 0.0
+
+  let raw_ids = encode vocab prompt
+  let ids = sanitize_ids raw_ids
+  let out_ids = gen_loop ids 0 max_gen w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b V d d_ff k tau rands
+  let out = decode vocab out_ids
+  let _ = print out
+  0
