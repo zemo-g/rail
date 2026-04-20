@@ -1,12 +1,16 @@
 -- self_train.rail — Rail trains itself to write better Rail
 -- The compiler is the oracle. Generate → Compile → Harvest → Retrain → Repeat.
--- Usage: cd ~/projects/rail && ./rail_native run tools/train/self_train.rail
+-- Usage:
+--   cd ~/projects/rail && ./rail_native run tools/train/self_train.rail
+--   cd ~/projects/rail && ./rail_native run tools/train/self_train.rail --parallel 10
 --
 -- Requires: MLX server on :8080 with LoRA adapter loaded
 --   /Users/ledaticempire/homebrew/bin/python3.11 -m mlx_lm.server \
 --     --model /Users/ledaticempire/models/Qwen3.5-9B-6bit \
 --     --adapter-path training/adapters_st \
 --     --host 0.0.0.0 --port 8080 --trust-remote-code --max-tokens 4096
+
+import "stdlib/parallel.rail"
 
 cat parts = join "" parts
 trim s = head (split "\n" s)
@@ -852,11 +856,13 @@ get_flag argv flag def =
   else get_flag (tail argv) flag def
 
 main =
-  -- Parse CLI: --port PORT (default 8080), --no-retrain
+  -- Parse CLI: --port PORT (default 8080), --no-retrain, --parallel N
   let port = get_flag args "--port" "8080"
   let no_retrain = get_flag args "--no-retrain" "no"
+  let parallel_str = get_flag args "--parallel" "0"
   let _ = write_file "/tmp/rail_st_port.txt" port
   let _ = write_file "/tmp/rail_st_no_retrain.txt" (if no_retrain != "no" then "yes" else "no")
+  let _ = write_file "/tmp/rail_st_parallel.txt" parallel_str
   let _ = print "=== RAIL SELF-TRAINING LOOP ==="
   let _ = print (cat ["  Port: ", port, if no_retrain != "no" then " (no-retrain)" else ""])
 
@@ -924,7 +930,10 @@ run_loop sys all_tasks goals round level harvested since_retrain consecutive_pas
 
   -- Run up to 10 tasks this round
   let batch = take_n level_tasks 10
-  let (pass, fail, new_harvested) = run_batch sys batch 0 0 0
+  let parallel_str = trim (shell "cat /tmp/rail_st_parallel.txt 2>/dev/null || echo 0")
+  let (pass, fail, new_harvested) = if parallel_str != "0" && parallel_str != "" then
+      run_batch_parallel sys batch (par_parse_int parallel_str) 0 0 0
+    else run_batch sys batch 0 0 0
 
   let pass_rate = if (pass + fail) > 0 then pass * 100 / (pass + fail) else 0
 
@@ -1015,3 +1024,206 @@ run_batch sys tasks pass fail new_harvested =
       run_batch sys (tail tasks) pass (fail + 1) new_harvested
 
 take_n lst n = if n <= 0 then [] else if length lst == 0 then [] else cons (head lst) (take_n (tail lst) (n - 1))
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- PARALLEL ROUND — N-way fan-out of LLM + compile + run
+--
+-- Compared to run_batch (serial, up-to-3 retries per task), run_batch_parallel
+-- runs a round as one shot: N prompts fan out to the MLX server concurrently,
+-- N codes batch-compile via --out-prefix (compile.rail 4399445), N binaries
+-- run in parallel. No retry for now — MVP. Each parallel stage is ≈ max-wall
+-- of one task's equivalent step.
+--
+-- Expected speedup vs run_batch on a 10-task round:
+--   serial wall   ≈ 10 × (LLM + compile + run) + retry overhead
+--   parallel wall ≈ max(LLM) + max(compile) + max(run)   — roughly 10× on 10
+--   tasks if MLX server handles concurrent requests.
+--
+-- Opt-in: `./rail_native run tools/train/self_train.rail --parallel 10`.
+-- Falls through to run_batch when --parallel is unset.
+--
+-- Per-worker paths live under a single mktemp-d tmpdir for the round, cleaned
+-- up at the end. No /tmp/rail_st_* race with the serial path.
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Strip one trailing newline from a shell-captured string.
+pb_rstrip_nl s =
+  let cs = chars s
+  let n = length cs
+  if n == 0 then s
+  else if str_sub s (n - 1) 1 == "\n" then str_sub s 0 (n - 1)
+  else s
+
+-- Build the JSON body for one chat completion (same shape as stdlib/llm.rail's
+-- llm_mk_body, inlined here to avoid namespace clash with the file's local
+-- llm_call wrapper over the `llm` builtin).
+pb_llm_body sys user =
+  join "" ["{", q, "messages", q, ":[",
+    "{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, json_esc sys, q, "},",
+    "{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, json_esc user, q, "}],",
+    q, "max_tokens", q, ":4096,", q, "temperature", q, ":0.3,",
+    q, "chat_template_kwargs", q, ":{", q, "enable_thinking", q, ":true}}"]
+
+-- Build initial (first-attempt) user prompt for a task + expected output.
+-- Mirrors gen_with_retry's initial-attempt branch.
+pb_build_prompt desc expected =
+  let hint = if expected == "" then "" else cat ["\n\nThe program must print exactly: ", expected]
+  cat [desc, hint, "\n\nOutput ONLY Rail code. No markdown, no explanation. Functions before main."]
+
+pb_build_prompts descs expecteds acc =
+  if length descs == 0 then reverse acc
+  else pb_build_prompts (tail descs) (tail expecteds) (cons (pb_build_prompt (head descs) (head expecteds)) acc)
+
+-- Write each prompt's JSON request body to <tmpdir>/req_<i>.json
+pb_write_reqs tmpdir sys prompts idx =
+  if length prompts == 0 then idx
+  else
+    let body = pb_llm_body sys (head prompts)
+    let path = cat [tmpdir, "/req_", show idx, ".json"]
+    let _ = write_file path body
+    pb_write_reqs tmpdir sys (tail prompts) (idx + 1)
+
+-- One worker's LLM call: curl | jq | perl. Writes raw response to
+-- <tmpdir>/resp_<i>.txt, emits cleaned content to stdout (captured by
+-- parallel_shell). Mirrors stdlib/llm.rail's cleanup pipeline.
+pb_llm_cmd port tmpdir idx =
+  cat ["curl -s http://localhost:", port, "/v1/chat/completions -H 'Content-Type: application/json' -d @", tmpdir, "/req_", show idx, ".json 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null > ", tmpdir, "/resp_", show idx, ".txt && perl -0777 -pe 's/^\\s+//; s/\\s+$//; s/<think>.*?<\\/think>\\s*//gs; s/^```[^\\n]*\\n(.*?)\\n```.*$/$1/s; s/\\n\\n\\*\\*.*//s; s/\\n\\nExplanation.*//s; s/\\n\\nNote:.*//s; s/\\n\\nThis .*//s' ", tmpdir, "/resp_", show idx, ".txt"]
+
+pb_build_llm_cmds tmpdir port n idx acc =
+  if idx >= n then reverse acc
+  else pb_build_llm_cmds tmpdir port n (idx + 1) (cons (pb_llm_cmd port tmpdir idx) acc)
+
+-- Extract stdout text from parallel_shell's [exit_code, stdout] pairs.
+pb_extract_outs pairs acc =
+  if length pairs == 0 then reverse acc
+  else
+    let pair = head pairs
+    let out = if length pair >= 2 then head (tail pair) else ""
+    pb_extract_outs (tail pairs) (cons out acc)
+
+-- Full parallel LLM: port, sys, list-of-user-prompts, max_conc → list of responses.
+pb_par_llm tmpdir port sys prompts max_conc =
+  let n = length prompts
+  if n == 0 then []
+  else
+    let _ = pb_write_reqs tmpdir sys prompts 0
+    let cmds = pb_build_llm_cmds tmpdir port n 0 []
+    let pairs = parallel_shell cmds max_conc
+    pb_extract_outs pairs []
+
+-- Write each generated code to <tmpdir>/code_<i>.rail for batch compile.
+pb_write_codes tmpdir codes idx =
+  if length codes == 0 then idx
+  else
+    let path = cat [tmpdir, "/code_", show idx, ".rail"]
+    let _ = write_file path (head codes)
+    pb_write_codes tmpdir (tail codes) (idx + 1)
+
+-- Compile cmd: use --out-prefix so each worker writes to its own binary path.
+pb_compile_cmd tmpdir idx =
+  cat ["cd ~/projects/rail && ./rail_native --out-prefix ", tmpdir, "/bin_", show idx, " ", tmpdir, "/code_", show idx, ".rail 2>&1"]
+
+pb_build_compile_cmds tmpdir n idx acc =
+  if idx >= n then reverse acc
+  else pb_build_compile_cmds tmpdir n (idx + 1) (cons (pb_compile_cmd tmpdir idx) acc)
+
+-- Run cmd: timeout 5s, capture stdout+stderr. parallel_shell's [ec, stdout]
+-- pair gives us exit code + output. We append exit code to stdout as a
+-- trailing line to make classify easier (mirrors verify()'s pattern).
+pb_run_cmd tmpdir idx =
+  cat ["test -f ", tmpdir, "/bin_", show idx, " && perl -e 'alarm 5; exec @ARGV' ", tmpdir, "/bin_", show idx, " 2>&1 || echo __NO_BINARY__"]
+
+pb_build_run_cmds tmpdir n idx acc =
+  if idx >= n then reverse acc
+  else pb_build_run_cmds tmpdir n (idx + 1) (cons (pb_run_cmd tmpdir idx) acc)
+
+-- Classify one (code, expected, compile_out, run_pair) into a verify()-shaped
+-- result string. Reuses classify_compile_error for consistency with the
+-- serial path's retry-prompt hints.
+pb_classify_one code expected compile_out run_pair =
+  if str_contains "ld: OK" compile_out == false then
+    classify_compile_error compile_out code
+  else
+    let ec = head run_pair
+    let out = if length run_pair >= 2 then head (tail run_pair) else ""
+    let out_trim = pb_rstrip_nl out
+    if str_contains "__NO_BINARY__" out_trim then "compile_fail:binary missing after ld: OK"
+    else if ec == 142 then "timeout"
+    else if ec != 0 then "runtime_fail"
+    else if expected == "" then
+      if length out_trim > 0 then "success" else "runtime_fail"
+    else if out_trim == expected then "success"
+    else "wrong_output"
+
+pb_classify_all codes expecteds compile_pairs run_pairs idx acc =
+  if length codes == 0 then reverse acc
+  else
+    let code = head codes
+    let expected = head expecteds
+    let cp = head compile_pairs
+    let compile_out = if length cp >= 2 then head (tail cp) else ""
+    let rp = head run_pairs
+    let result = pb_classify_one code expected compile_out rp
+    pb_classify_all (tail codes) (tail expecteds) (tail compile_pairs) (tail run_pairs) (idx + 1) (cons result acc)
+
+-- Batch compile + run + classify. Input: codes list + expecteds list + max_conc.
+-- Output: list of result strings matching verify()'s contract.
+pb_verify_batch tmpdir codes expecteds max_conc =
+  let n = length codes
+  if n == 0 then []
+  else
+    let _ = pb_write_codes tmpdir codes 0
+    let compile_cmds = pb_build_compile_cmds tmpdir n 0 []
+    let compile_pairs = parallel_shell compile_cmds max_conc
+    let run_cmds = pb_build_run_cmds tmpdir n 0 []
+    let run_pairs = parallel_shell run_cmds max_conc
+    pb_classify_all codes expecteds compile_pairs run_pairs 0 []
+
+-- Pull descs and expecteds out of a list of task lines, as two parallel lists.
+pb_task_descs tasks acc =
+  if length tasks == 0 then reverse acc
+  else pb_task_descs (tail tasks) (cons (task_desc (head tasks)) acc)
+
+pb_task_expecteds tasks acc =
+  if length tasks == 0 then reverse acc
+  else pb_task_expecteds (tail tasks) (cons (task_expected (head tasks)) acc)
+
+-- Tally passes, print per-task status, harvest successes.
+-- Mirrors run_batch's print + harvest behavior.
+pb_tally descs codes results pass fail harvested idx =
+  if length descs == 0 then (pass, fail, harvested)
+  else
+    let desc = head descs
+    let code = head codes
+    let result = head results
+    let _ = print (cat ["\n  → ", desc])
+    if result == "success" then
+      let _ = print "    ✓ PASS"
+      let n = harvest desc code
+      pb_tally (tail descs) (tail codes) (tail results) (pass + 1) fail (harvested + n) (idx + 1)
+    else
+      let _ = print (cat ["    ✗ FAIL (", result, ")"])
+      pb_tally (tail descs) (tail codes) (tail results) pass (fail + 1) harvested (idx + 1)
+
+-- Parallel round entry point. Same return contract as run_batch:
+-- (pass, fail, new_harvested).
+run_batch_parallel sys tasks batch_size pass fail new_harvested =
+  if length tasks == 0 then (pass, fail, new_harvested)
+  else
+    let port = trim (shell "cat /tmp/rail_st_port.txt 2>/dev/null || echo 8080")
+    let tmpdir = pb_rstrip_nl (shell "mktemp -d /tmp/rail_st_par.XXXXXX")
+    let descs = pb_task_descs tasks []
+    let expecteds = pb_task_expecteds tasks []
+    let prompts = pb_build_prompts descs expecteds []
+    let n = length tasks
+    let _ = print (cat ["\n  [parallel] fan-out N=", show n, " max_conc=", show batch_size])
+    let t0 = trim (shell "date +%s")
+    let codes = pb_par_llm tmpdir port sys prompts batch_size
+    let t1 = trim (shell "date +%s")
+    let _ = print (cat ["  [parallel] LLM batch done in ", t1, "-", t0, "s"])
+    let results = pb_verify_batch tmpdir codes expecteds batch_size
+    let t2 = trim (shell "date +%s")
+    let _ = print (cat ["  [parallel] verify batch done in ", t2, "-", t1, "s"])
+    let (p, f, h) = pb_tally descs codes results pass fail new_harvested 0
+    let _ = shell (cat ["rm -rf ", tmpdir])
+    (p, f, h)
