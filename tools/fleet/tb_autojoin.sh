@@ -64,24 +64,18 @@ for iface in $(ifconfig -l | tr ' ' '\n' | grep -E '^en[0-9]+$'); do
     continue
   fi
 
-  case "$media" in
-    autoselect)
+  # CHANNEL_IO is the authoritative signal for a TB-fabric interface.
+  # macOS reports the media either as `autoselect`, `100baseTX`, or `none`
+  # across different driver versions / Apple Silicon combos, so gating on
+  # media alone mis-classifies real peers as stubs.  USB-C Ethernet dongles
+  # never set CHANNEL_IO — that's our safe discriminator.
+  case "$options" in
+    *CHANNEL_IO*)
       real_peers="$real_peers $iface"
-      log "$iface real reason=media-autoselect"
-      ;;
-    none)
-      case "$options" in
-        *CHANNEL_IO*)
-          real_peers="$real_peers $iface"
-          log "$iface real reason=media-none+channel_io"
-          ;;
-        *)
-          log "$iface stub reason=media-none-no-channel_io"
-          ;;
-      esac
+      log "$iface real reason=channel_io media=$media"
       ;;
     *)
-      log "$iface stub reason=media-$media"
+      log "$iface stub reason=no-channel_io media=$media"
       ;;
   esac
 done
