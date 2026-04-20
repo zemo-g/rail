@@ -516,8 +516,24 @@ async function handleSite(request, env, url) {
       headers: sec({ "content-type": MIME.html, "cache-control": "public, max-age=60" }),
     });
   }
+  if (pathname === "/entropy/pulse" && method === "PUT") {
+    // Beacon-daemon write path. R2 has no 60s runtime cache, so reads
+    // from /entropy/pulse go live within ~1s of each write. Auth via
+    // shared BEACON_TOKEN env secret.
+    if (request.headers.get("x-beacon-token") !== env.BEACON_TOKEN) {
+      return new Response("forbidden", { status: 403, headers: sec({ "content-type": "text/plain" }) });
+    }
+    const body = await request.text();
+    await env.REPORTS_R2.put("entropy/pulse.json", body, {
+      httpMetadata: { contentType: "application/json" },
+    });
+    return new Response("ok", { headers: sec({ "content-type": "text/plain" }) });
+  }
   if (pathname === "/entropy/pulse") {
-    const pulse = await env.LEDATIC_KV.get("entropy:pulse:current");
+    // Read from R2 (strongly consistent, no KV 60s edge cache) with
+    // KV fallback during transition.
+    const obj = await env.REPORTS_R2.get("entropy/pulse.json");
+    const pulse = obj ? await obj.text() : await env.LEDATIC_KV.get("entropy:pulse:current");
     if (!pulse) return new Response('{"error":"no pulse yet"}', {
       status: 503,
       headers: sec({ "content-type": "application/json", "access-control-allow-origin": "*" }),
