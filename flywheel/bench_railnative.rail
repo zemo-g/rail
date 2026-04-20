@@ -130,32 +130,87 @@ run_generate gen_bin prefix prompt max_gen k tau seed =
                  " --prompt \"", esc, "\" 2>/dev/null"]
   shell cmd
 
--- Compile+run the completed text, return stdout. Hits the same
--- /tmp/rail_oracle_in path as oracle_compile; caller is expected to
--- have already scored via oracle_quality first.
+-- Compile+run the completed text, return stdout. Uses the bench-local
+-- input path (not stdlib/oracle's shared /tmp/rail_oracle_in.rail),
+-- and serialises the compile behind flock so a concurrent harvest
+-- or self-train can't steal our /tmp/rail_out between compile and
+-- binary-grab.
 run_output code =
   let _ = write_file "/tmp/rail_bench_rn_in.rail" code
   let _ = shell "rm -f /tmp/rail_bench_rn_bin /tmp/rail_bench_rn_out.txt"
-  let _ = shell "cd ~/projects/rail && ./rail_native /tmp/rail_bench_rn_in.rail 2>/dev/null && cp /tmp/rail_out /tmp/rail_bench_rn_bin 2>/dev/null"
+  let _ = shell "cd ~/projects/rail && /opt/homebrew/bin/flock /tmp/rail_compile.lock bash -c './rail_native /tmp/rail_bench_rn_in.rail 2>/dev/null && cp /tmp/rail_out /tmp/rail_bench_rn_bin 2>/dev/null'"
   let check = trim (shell "test -f /tmp/rail_bench_rn_bin && echo ok || echo fail")
   if check == "fail" then ""
   else trim (shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_bench_rn_bin 2>/dev/null")
 
--- Score one task: returns [quality, compiled, exec_match] as a 3-int list.
--- compiled = 1 if oracle_quality > 0, 0 otherwise.
--- exec_match = 1 if expected non-empty AND compiled AND run_output == expected.
--- `pass` is compiled || exec_match (exec_match implies compiled anyway).
+-- Bench-local oracle. stdlib/oracle.rail hard-codes
+-- /tmp/rail_oracle_in.rail for its input file; other concurrent
+-- flywheel processes (harvest_filter, self_train) race us on that
+-- path, which makes every task score the same "someone else's code"
+-- quality. We write to a dedicated path instead, but reuse the rest
+-- of the oracle machinery (thresholds, diversity counts) verbatim
+-- by composing oracle_quality's pieces that DON'T shell out.
+-- flock-serialized compile; other concurrent rail_native processes
+-- (harvest_filter, self_train, stream-1 bpe bench) race us on both
+-- the shared /tmp/rail_out and the default oracle input path.
+-- /tmp/rail_compile.lock is the fleet-wide convention
+-- (flywheel/harvest_filter.rail uses the same file).
+rn_oracle_compile code =
+  let _ = write_file "/tmp/rail_bench_rn_oracle_in.rail" code
+  shell "cd ~/projects/rail && /opt/homebrew/bin/flock /tmp/rail_compile.lock bash -c './rail_native /tmp/rail_bench_rn_oracle_in.rail 2>&1'"
+
+rn_oracle_stats code =
+  let out = rn_oracle_compile code
+  let lines = str_split "\n" out
+  let errs = count_error_lines lines 0
+  let ok_flag = if str_contains "ld: OK" out then 1 else 0
+  cons errs (cons ok_flag [])
+
+-- Mirror of oracle_quality but driven by rn_oracle_stats so we avoid
+-- the shared /tmp/rail_oracle_in.rail path. Threshold values pulled
+-- from stdlib/oracle.rail so any future bump lands here transparently.
+rn_quality code =
+  let nw = count_non_whitespace code
+  let uq = count_unique_chars code
+  if nw < 16 then 0
+  else if uq < oracle_min_unique_chars then 0
+  else
+    let stats = rn_oracle_stats code
+    let errs = head stats
+    let ok_flag = head (tail stats)
+    let decls = count_top_level_decls code
+    let base = nw * uq
+    if ok_flag == 1 then
+      if decls < oracle_min_decls_for_bonus then 0
+      else if nw >= oracle_min_nw_for_bonus then base * 10
+      else base
+    else
+      (if errs == 0 then 0 else base / (1 + errs))
+
+-- Score one task: returns [quality, ok, exec_match] as a 3-int list.
+-- ok = 1 iff the generated text compiles+links cleanly.
+-- quality = the oracle_quality composite (rewards partial-progress
+--   non-compiles too — see stdlib/oracle.rail).
+-- exec_match = 1 if expected non-empty AND ok AND run_output == expected.
+-- Pass criterion is `ok` (strict compile-pass). Non-zero quality on a
+-- failing task means the model produced Rail-shaped garbage — useful
+-- for tracking gradient, not a success.
+--
+-- Single rn_oracle_compile shellout per task (rn_quality + a cached
+-- ok_flag pulled out of rn_oracle_stats). Kept as two calls here for
+-- readability; the second call re-uses the same /tmp input path.
 score_task gen_bin prefix prompt expected max_gen k tau seed =
   let out = run_generate gen_bin prefix prompt max_gen k tau seed
-  let quality = oracle_quality out
-  let compiled = if quality > 0 then 1 else 0
+  let quality = rn_quality out
+  let stats = rn_oracle_stats out
+  let ok = head (tail stats)
   let exec_match =
     if length (chars expected) == 0 then 0
-    else if compiled == 0 then 0
+    else if ok == 0 then 0
     else
       let actual = run_output out
       if actual == expected then 1 else 0
-  cons quality (cons compiled (cons exec_match []))
+  cons quality (cons ok (cons exec_match []))
 
 -- ── Band runner ─────────────────────────────────────────────────────
 
@@ -170,11 +225,14 @@ run_band_loop gen_bin prefix tasks max_gen k tau seed_base idx pass_acc qsum =
     let m = arena_mark 0
     let trio = score_task gen_bin prefix prompt expected max_gen k tau (seed_base + idx)
     let q = head trio
-    let compiled = head (tail trio)
+    let ok = head (tail trio)
     let exec_match = head (tail (tail trio))
     let _ = arena_reset m
-    let passed = if compiled == 1 then 1 else 0
-    let mark = if exec_match == 1 then "EXEC-MATCH" else (if compiled == 1 then "COMPILED" else "fail")
+    let passed = if ok == 1 then 1 else 0
+    let mark = if exec_match == 1 then "EXEC-MATCH"
+               else if ok == 1 then "OK"
+               else if q > 0 then "partial"
+               else "fail"
     let _ = print (cat ["    ", mark, "  quality=", show q])
     run_band_loop gen_bin prefix (tail tasks) max_gen k tau seed_base (idx + 1) (pass_acc + passed) (qsum + q)
 
@@ -219,13 +277,23 @@ main =
   -- `./rail_native run tools/train/generate.rail --prompt "…"` mangles
   -- shell metacharacters (parens, newlines) inside the forwarded argv,
   -- so we bypass that path and invoke the binary directly.
+  --
+  -- Concurrency note: /tmp/rail_out is shared with every other
+  -- rail_native process on the box, so the compile-then-copy step has
+  -- to happen under flock AND with a size gate — a concurrent oracle
+  -- shellout from harvest_filter or self_train can silently win the
+  -- race and hand us a 60-KB "someone else's binary" that prints
+  -- whatever they asked for. The gate retries up to 5× and a 100-KB
+  -- threshold is the minimum plausible size for a generate.rail
+  -- output (empirically ≈ 320 KB).
   let _ = print "\nCompiling tools/train/generate.rail…"
-  let compile_out = shell "cd ~/projects/rail && ./rail_native tools/train/generate.rail 2>&1 && cp /tmp/rail_out /tmp/rail_bench_rn_gen"
-  let check = trim (shell "test -x /tmp/rail_bench_rn_gen && echo ok || echo fail")
-  let _ = if check == "fail" then
-            let _ = print "  ERROR: generate.rail failed to compile — aborting"
+  let gen_script = "cd ~/projects/rail && for i in 1 2 3 4 5; do /opt/homebrew/bin/flock /tmp/rail_compile.lock bash -c \"./rail_native tools/train/generate.rail >/dev/null 2>&1 && cp /tmp/rail_out /tmp/rail_bench_rn_gen\"; sz=$(stat -f %z /tmp/rail_bench_rn_gen 2>/dev/null || echo 0); if [ \"$sz\" -gt 100000 ]; then echo \"ok: $sz bytes (attempt $i)\"; break; fi; echo \"attempt $i too small ($sz bytes), retrying\"; sleep 1; done"
+  let gen_out = trim (shell gen_script)
+  let check = trim (shell "test -x /tmp/rail_bench_rn_gen && stat -f %z /tmp/rail_bench_rn_gen")
+  let _ = if parse_int check < 100000 then
+            let _ = print (cat ["  ERROR: generate.rail compile lost race 5× — aborting. Last size: ", check])
             shell "exit 1"
-          else print "  ok: /tmp/rail_bench_rn_gen"
+          else print (cat ["  ", gen_out])
   let gen_bin = "/tmp/rail_bench_rn_gen"
 
   -- Per-band seed bases keep tasks independent but reproducible.
