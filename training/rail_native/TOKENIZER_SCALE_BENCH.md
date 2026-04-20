@@ -71,3 +71,60 @@ The determinism test (`tools/train/tokenizer_determinism_test.rail`)
 asserts the new counted-loop ordering matches the preserved
 `build_vocab_old` form on a fixed 256-char corpus; run it after any
 tokenizer edit.
+
+## BPE bake-off (stdlib/bpe.rail)
+
+The BPE trainer got three companion changes. `bpe_train` is now backed
+by `bpe_train_loop_deferred`:
+
+1. **Tree-walk max** (`bpe_map_best_pair`) — finds the max-count pair
+   by direct in-order traversal of the persistent BST, instead of
+   materializing `map_keys` (itself O(K²) via `append (map_keys l) …`)
+   and then calling `map_get` per key.
+2. **Deferred vocab** — during training we keep only the token-id
+   array + `(a,b,nid)` merge triples. The actual vocab strings are
+   built once at the end from base_vocab + merges. Removes the
+   per-iter `append vocab [new_token]` (O(V)) and the `bpe_nth a
+   vocab` / `bpe_nth b vocab` O(V) lookups that computed `new_token`.
+3. **Cons merges, reverse at end** — O(1) per iter instead of O(M)
+   per `append merges [...]`.
+
+Determinism regression: `tools/train/bpe_determinism_test.rail`
+asserts the new path produces byte-identical `(merges, vocab, size)`
+to the preserved `bpe_train_legacy` (same seed, same corpus) — PASS
+at V=256 on a 3.9 KB synthetic corpus.
+
+Timings on Mac Mini M4 Pro (`/tmp/bpe_prof` of
+`tools/bench/bpe_profile.rail`):
+
+| Corpus   | target V | legacy (ms) | deferred (ms) | peak RSS | speedup |
+|----------|---------:|------------:|--------------:|---------:|--------:|
+|   50 KB  |      512 |      11 671 |         6 775 |   —      |   1.72× |
+|  540 KB  |     1024 |         —   |       393 600 |   —      |     —   |
+|  540 KB  |     2048 |         —   |       466 520 | 1.56 GB  |     —   |
+
+The `—` cell for legacy × 540 KB × any target wasn't run — the legacy
+profile on 50 KB × 512 was already slow enough (the `.Lapp_list` list-
+append was 95% of the `sample` stack traces) that extrapolated
+legacy-at-scale is many hours.
+
+Target axis scales sub-linearly (1.19× wall for 2× target) — post-merge
+corpus compaction means later iters touch fewer positions per
+`bpe_apply_merge_arr`.
+
+**Where we stand relative to the <5 min / target=4096 / 540 KB bar:**
+short on the wall-clock bar, clear on correctness and capability.
+The deferred path handles the full stdlib corpus to target=2048 in
+7.8 minutes at 1.56 GB peak, which is already enough to unblock
+Phase 3 LM training on real Rail source (the original goal of
+this stream). Extrapolating to target=4096 on the same corpus:
+~9–11 minutes. Above the bar, but a tractable starting point. An incremental-counts prototype
+(`bpe_train_inc_wip`, disabled) proved semantically identical on
+smoke + determinism runs but the persistent BST's per-bump `map_put`
+allocation overwhelmed the arena above ~50 KB — the 540 KB × 1024
+run hadn't completed after 30 min and was killed. The correct fix
+is an open-addressed mutable hash table of ints (two parallel
+`float_arr`s for keys + counts), which makes each bump O(1) with
+zero allocation. That's the next session's first item, together with
+an explicit max-heap for `best_pair`.
+

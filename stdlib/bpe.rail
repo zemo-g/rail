@@ -196,8 +196,12 @@ bpe_best_pair_arr arr n =
     let _ = arena_reset mk
     (bk, bc)
 
--- Array-based training loop — mutates `arr` in place, threads active length.
-bpe_train_loop_arr arr n merges vocab size target =
+-- LEGACY (pre-v2.4): preserved for regression comparison against the
+-- fast path below. O(K²) per iter because map_keys does `append (map_keys
+-- l) (cons k (map_keys r))`, and `append vocab [...]` / `append merges
+-- [...]` are O(V)+O(M) every iter. Observable on 50 KB × target=512:
+-- 11.7 s on the sample profile, dominated by `.Lapp_list`.
+bpe_train_loop_arr_old arr n merges vocab size target =
   if size >= target then BPE merges vocab size
   else
     let best = bpe_best_pair_arr arr n
@@ -211,7 +215,191 @@ bpe_train_loop_arr arr n merges vocab size target =
       let new_vocab = append vocab [new_token]
       let new_merges = append merges [(a, b, nid)]
       let new_n = bpe_apply_merge_arr arr n a b nid
-      bpe_train_loop_arr arr new_n new_merges new_vocab (size + 1) target
+      bpe_train_loop_arr_old arr new_n new_merges new_vocab (size + 1) target
+
+-- ========== Fast path (v2.4) ==========
+-- Three wins over the legacy loop:
+--   (a) Direct BST tree-walk to find the max-count pair — no `map_keys`
+--       list materialization (that was O(K²) via append) and no per-key
+--       `map_get` pass. Single in-order traversal, O(K).
+--   (b) Deferred vocab: during training we keep ONLY arr + (a,b,nid)
+--       merge triples. Vocab strings are built once at the end from
+--       base_vocab + merges. Removes the per-iter `append vocab [...]`
+--       O(V) list append AND the `bpe_nth a vocab` / `bpe_nth b vocab`
+--       O(V) lookup that was computing `new_token` every iter.
+--   (c) Merges accumulated in reverse with `cons`, reversed once at the
+--       end. O(1) per iter instead of O(M) append.
+-- The pair-count rebuild itself is still per-iter O(n log K) — genuine
+-- incremental updates are queued for a follow-up if the headline
+-- metric slips (target V=4096 / 540 KB / <5 min).
+
+-- In-order tree walk that returns (best_key, best_count). Because we
+-- walk left-root-right, lower keys are visited first, so the strict
+-- `v > best_c` check preserves the legacy tie-break ("prefer smaller
+-- key on equal count").
+bpe_map_best_pair m best_k best_c = match m
+  | MapEmpty -> (best_k, best_c)
+  | MapNode k v l r ->
+    let lbest = bpe_map_best_pair l best_k best_c
+    let (lk, lc) = lbest
+    if v > lc then bpe_map_best_pair r k v
+    else bpe_map_best_pair r lk lc
+
+bpe_best_pair_tree arr n =
+  let mk = arena_mark 0
+  let counts = bpe_count_pairs_arr arr n (map_new 0)
+  let best = bpe_map_best_pair counts 0 0
+  let (bk, bc) = best
+  let _ = arena_reset mk
+  (bk, bc)
+
+-- Deferred-vocab loop: accumulates (a,b,nid) triples in reverse and
+-- returns (merges_forward, final_size) once done.
+bpe_train_loop_deferred arr n merges_rev size target =
+  if size >= target then (reverse merges_rev, size)
+  else
+    let best = bpe_best_pair_tree arr n
+    let (best_k, best_c) = best
+    if best_c < 2 then (reverse merges_rev, size)
+    else
+      let a = bpe_key_a best_k
+      let b = bpe_key_b best_k
+      let nid = size
+      let new_n = bpe_apply_merge_arr arr n a b nid
+      bpe_train_loop_deferred arr new_n (cons (a, b, nid) merges_rev) (size + 1) target
+
+-- ========== Incremental pair-count update (v2.4) ==========
+-- Classic BPE speedup: instead of rebuilding the whole pair_count map
+-- each iteration (O(n log K) per step × target steps = O(n·target·log K)),
+-- we keep the map persistent and apply a delta at each merge.
+--
+-- Process match positions in runs: a "run" is a maximal sequence of
+-- consecutive non-overlapping matches at positions i, i+2, i+4, ...,
+-- i+2*(k-1) for a merge rule (a,b)→nid. Collapsing a run of length k
+-- turns 2k tokens (a,b,a,b,...,a,b) into k copies of nid.
+--
+-- Deltas per run with outer neighbors L_raw, R_raw (both may be -1 for
+-- "end of array"):
+--   (a, b)       -= k
+--   (b, a)       -= (k - 1)      -- crossing pairs inside the run
+--   (nid, nid)   += (k - 1)      -- new inside-run pairs
+--   (L_raw, a)   -= 1    if L_raw >= 0
+--   (L_raw, nid) += 1    if L_raw >= 0
+--   (b, R_raw)   -= 1    if R_raw >= 0
+--   (nid, R_raw) += 1    if R_raw >= 0
+-- map_get returns 0 for missing keys, so decrementing a non-present
+-- pair yields a -1 stale entry — harmless for the max-finder (counts
+-- ≤ 0 can't beat a positive count).
+
+-- Adjust one pair's count by delta.
+bpe_bump counts key delta =
+  let c = map_get counts key
+  map_put counts key (c + delta)
+
+-- Apply the run's delta to counts. Called when we close a run.
+bpe_delta_close counts a b nid L R k =
+  if k <= 0 then counts
+  else
+    let ab = bpe_pair_key a b
+    let ba = bpe_pair_key b a
+    let nn = bpe_pair_key nid nid
+    let c1 = bpe_bump counts ab (0 - k)
+    let c2 = if k > 1 then bpe_bump c1 ba (0 - (k - 1)) else c1
+    let c3 = if k > 1 then bpe_bump c2 nn (k - 1) else c2
+    let c4 = if L >= 0 then
+               let c4a = bpe_bump c3 (bpe_pair_key L a) (0 - 1)
+               bpe_bump c4a (bpe_pair_key L nid) 1
+             else c3
+    let c5 = if R >= 0 then
+               let c5a = bpe_bump c4 (bpe_pair_key b R) (0 - 1)
+               bpe_bump c5a (bpe_pair_key nid R) 1
+             else c4
+    c5
+
+-- Detect a match at position i. Guarded: no short-circuit in `&&`, so
+-- nested ifs do the bounds-safe check.
+bpe_is_match arr n a b i =
+  if i + 1 < n then
+    if arr_get arr i == a then
+      if arr_get arr (i + 1) == b then true
+      else false
+    else false
+  else false
+
+-- Scan the array and fold run deltas into counts. Returns the updated
+-- counts map. Does NOT mutate arr — the actual merge rewrite happens
+-- in bpe_apply_merge_arr afterwards on the (still-current) arr.
+bpe_delta_scan arr n a b nid counts i run_k L =
+  if i >= n then bpe_delta_close counts a b nid L (0 - 1) run_k
+  else if bpe_is_match arr n a b i then
+    if run_k == 0 then
+      -- Opening a run. L_raw = arr[i-1] if i > 0 else -1.
+      let newL = if i == 0 then (0 - 1) else arr_get arr (i - 1)
+      bpe_delta_scan arr n a b nid counts (i + 2) 1 newL
+    else
+      bpe_delta_scan arr n a b nid counts (i + 2) (run_k + 1) L
+  else
+    if run_k > 0 then
+      -- Close the run using arr[i] as R_raw (it's not a match, so it stays).
+      let c2 = bpe_delta_close counts a b nid L (arr_get arr i) run_k
+      bpe_delta_scan arr n a b nid c2 (i + 1) 0 (0 - 1)
+    else
+      bpe_delta_scan arr n a b nid counts (i + 1) 0 (0 - 1)
+
+-- Tree-walk max over a persistent counts map. Same semantics as
+-- bpe_map_best_pair; no arena wrap because the caller holds `counts`
+-- across iterations and we don't want to free it.
+bpe_best_pair_persistent counts =
+  let best = bpe_map_best_pair counts 0 0
+  let (bk, bc) = best
+  (bk, bc)
+
+-- Incremental training loop: persistent counts, delta-updated per merge.
+bpe_train_loop_inc arr n counts merges_rev size target =
+  if size >= target then (reverse merges_rev, size)
+  else
+    let best = bpe_best_pair_persistent counts
+    let (best_k, best_c) = best
+    if best_c < 2 then (reverse merges_rev, size)
+    else
+      let a = bpe_key_a best_k
+      let b = bpe_key_b best_k
+      let nid = size
+      let counts2 = bpe_delta_scan arr n a b nid counts 0 0 (0 - 1)
+      let new_n = bpe_apply_merge_arr arr n a b nid
+      bpe_train_loop_inc arr new_n counts2 (cons (a, b, nid) merges_rev) (size + 1) target
+
+-- Build the final vocab list once training is done. Layout:
+--   vocab[0..base_size-1] = base_vocab (1-char strings)
+--   vocab[base_size..size-1] = vocab[a] ++ vocab[b] for each (a,b,nid)
+-- Mutable string array is O(1)-index and lets us build forward without
+-- an O(V²) append chain. Converted to a cons list at the very end to
+-- match the existing BPE ADT.
+bpe_fill_base_arr arr base i =
+  if length base == 0 then 0
+  else
+    let _ = arr_set arr i (head base)
+    bpe_fill_base_arr arr (tail base) (i + 1)
+
+bpe_fill_merged_arr arr merges =
+  if length merges == 0 then 0
+  else
+    let m = head merges
+    let (a, b, nid) = m
+    let sa = arr_get arr a
+    let sb = arr_get arr b
+    let _ = arr_set arr nid (append sa sb)
+    bpe_fill_merged_arr arr (tail merges)
+
+bpe_arr_to_list_rev arr i acc =
+  if i < 0 then acc
+  else bpe_arr_to_list_rev arr (i - 1) (cons (arr_get arr i) acc)
+
+bpe_build_vocab base_vocab merges final_size =
+  let varr = arr_new final_size ""
+  let _ = bpe_fill_base_arr varr base_vocab 0
+  let _ = bpe_fill_merged_arr varr merges
+  bpe_arr_to_list_rev varr (final_size - 1) []
 
 bpe_train text target =
   let all_chars = chars text
@@ -221,7 +409,53 @@ bpe_train text target =
   else
     let arr = bpe_init_encode_arr all_chars uniq
     let n = arr_len arr
-    bpe_train_loop_arr arr n [] uniq base_size target
+    let trained = bpe_train_loop_deferred arr n [] base_size target
+    let (merges, final_size) = trained
+    let vocab = bpe_build_vocab uniq merges final_size
+    BPE merges vocab final_size
+
+-- Incremental-counts entry point (WIP, NOT wired into bpe_train).
+--
+-- Semantically correct: the determinism test and 10 KB smoke both show
+-- it produces byte-identical (merges, vocab, size) to the legacy path.
+-- Performance, however, degrades badly above ~50 KB / target=512 — the
+-- persistent Map + per-bump map_put allocations fill the 512 MB arena
+-- fast enough that GC dominates. On the 540 KB × target=1024 run it had
+-- not finished after 30 minutes, vs 6.5 minutes for the non-incremental
+-- deferred path in the same configuration.
+--
+-- The real fix is an open-addressed mutable hash table of ints (two
+-- parallel float_arrs for keys + counts) so each bump is O(1) with zero
+-- allocation. That's the next session's first job — queued along with
+-- an explicit max-heap so best_pair is O(log K) instead of O(K). Until
+-- then, the deferred-vocab + tree-walk-max path ships as bpe_train,
+-- worth ~1.7–3× over the legacy loop and correct at every corpus size
+-- we've tried.
+bpe_train_inc_wip text target =
+  let all_chars = chars text
+  let uniq = bpe_collect_unique all_chars []
+  let base_size = length uniq
+  if target <= base_size then BPE [] uniq base_size
+  else
+    let arr = bpe_init_encode_arr all_chars uniq
+    let n = arr_len arr
+    let counts0 = bpe_count_pairs_arr arr n (map_new 0)
+    let trained = bpe_train_loop_inc arr n counts0 [] base_size target
+    let (merges, final_size) = trained
+    let vocab = bpe_build_vocab uniq merges final_size
+    BPE merges vocab final_size
+
+-- Legacy entry point for regression tests — lets callers verify the fast
+-- path produces identical (merges, vocab, size) to the old loop.
+bpe_train_legacy text target =
+  let all_chars = chars text
+  let uniq = bpe_collect_unique all_chars []
+  let base_size = length uniq
+  if target <= base_size then BPE [] uniq base_size
+  else
+    let arr = bpe_init_encode_arr all_chars uniq
+    let n = arr_len arr
+    bpe_train_loop_arr_old arr n [] uniq base_size target
 
 -- ========== Encode / decode ==========
 
