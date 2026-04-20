@@ -1,0 +1,270 @@
+-- flywheel/bench_railnative.rail — 30-task benchmark for Rail-native LMs.
+--
+-- Companion to flywheel/bench.rail (the Gemma/MLX-era bench): same six
+-- band names (FUND / IO / TOOLS / COMP / ADV / COMPREHEND), same five
+-- tasks each, same append-to-flywheel/bench_log.txt format — but the
+-- student is invoked through tools/train/generate.rail, not an MLX
+-- server. The log rows are tagged `model=railnative-…` so downstream
+-- analyses can segment the two populations.
+--
+-- Task shape for a char-level Rail LM is different from an instruct
+-- LLM: we give the model a Rail *starter* (a prefix of a real program)
+-- and let it autoregress the rest. Score = oracle_quality of the full
+-- concatenation (prompt + continuation). If a task has an expected
+-- stdout, we *also* compile+run and check equality; any match there
+-- gives a bonus flag beyond the compile-pass.
+--
+-- Usage:
+--   cd ~/projects/rail && ./rail_native run flywheel/bench_railnative.rail
+--
+-- Optional flags:
+--   --prefix PATH   checkpoint prefix (default: training/rail_native/checkpoints_apr15_backup/latest)
+--   --max N         tokens to generate per task (default: 128)
+--   --k N           top-k for generate.rail (default: 1 = greedy)
+--   --temp F        sampling temperature (default: 1.0)
+--   --tag STR       override the bench_log.txt model tag (default: read from .meta.step)
+
+import tensor
+import "stdlib/optim.rail"
+import "stdlib/oracle.rail"
+import "stdlib/checkpoint.rail"
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+
+-- ── CLI ─────────────────────────────────────────────────────────────
+
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if head xs == key then
+    if length (tail xs) > 0 then head (tail xs) else ""
+  else argv_get_loop (tail xs) key
+
+argv_get argv key default_val =
+  let v = argv_get_loop argv key
+  if length (chars v) == 0 then default_val else v
+
+-- ── Tasks (30 = 6 bands × 5) ────────────────────────────────────────
+--
+-- Each task is "prompt\texpected" where expected is optional.
+-- The prompt is a Rail source prefix; the model completes it. The full
+-- concatenation is then scored by oracle_quality. If `expected` is
+-- non-empty AND oracle_ok, we also run the program and check
+-- stdout == expected.
+
+bench_fund _ = [
+  "fact n = if n <= 1 then 1 else n * fact (n - 1)\nmain = let _ = print (show (fact 5))\n  0\n\t120",
+  "add a b = a + b\nmain = ",
+  "square x = x * x\nsum_sq a b = square a + square b\nmain = ",
+  "fib n = if n <= 1 then n else fib (n - 1) + fib (n - 2)\nmain = ",
+  "triangular n = if n <= 0 then 0 else n + triangular (n - 1)\nmain = "]
+
+bench_io _ = [
+  "split_get s = split \" \" s\nmain = ",
+  "join_csv xs = join \",\" xs\nmain = ",
+  "second xs = head (tail xs)\nmain = ",
+  "read_cfg _ = read_file \"/tmp/bench_railnative_cfg.txt\"\nmain = ",
+  "first_line s = head (split \"\\n\" s)\nmain = "]
+
+bench_tools _ = [
+  "type Opt = | Some x | None\nget_or o = match o | Some x -> x | None -> 0\nmain = ",
+  "type Res = | Ok x | Err x\nrun r = match r | Ok v -> v | Err _ -> 0\nmain = ",
+  "type State = | Init | Run | Done\nnext s = match s | Init -> Run | Run -> Done | Done -> Done\nmain = ",
+  "type Pair = | Pair a b\nfst p = match p | Pair a _ -> a\nmain = ",
+  "type Maybe = | Just x | Nothing\nvalue m = match m | Just x -> x | Nothing -> 0\nmain = "]
+
+bench_comp _ = [
+  "type Expr = | Num x | Add a b\neval e = match e | Num x -> x | Add a b -> eval a + eval b\nmain = ",
+  "type Op = | Push x | Mul | Halt\nstep ops = ops\nmain = ",
+  "type Tok = | TNum x | TPlus | TEof\nmain = ",
+  "type Instr = | MOV | ADD | RET\nasm i = match i | MOV -> \"mov x0, 0\" | ADD -> \"add x0, x0, 1\" | RET -> \"ret\"\nmain = ",
+  "type Inst = | ILoad x | IStore x\nemit i = match i | ILoad n -> cat [\"ldr x0, [sp,#\", show n, \"]\"] | IStore n -> cat [\"str x0, [sp,#\", show n, \"]\"]\nmain = "]
+
+bench_adv _ = [
+  "count_lines text = length (split \"\\n\" text)\nmain = ",
+  "sum_list xs = fold add 0 xs\nmain = ",
+  "reverse_str s = join \"\" (reverse (chars s))\nmain = ",
+  "doubled xs = map (\\x -> x * 2) xs\nmain = ",
+  "filter_even xs = filter is_even xs\nis_even n = n % 2 == 0\nmain = "]
+
+bench_comprehend _ = [
+  "-- complete this factorial so it prints 120\nfact n = ",
+  "-- complete this flatten so [[1,2],[3,4]] prints 4\nflatten xss = ",
+  "-- complete this fold so it prints 15\nsum_list xs = ",
+  "-- complete this map so it prints [2,4,6]\ndoubled xs = ",
+  "-- complete this find_key so it prints rail\nfind_key ls k = "]
+
+-- ── Task parsing ────────────────────────────────────────────────────
+
+task_prompt t = head (split "\t" t)
+task_expected t =
+  let parts = split "\t" t
+  if length parts >= 2 then head (tail parts) else ""
+
+-- ── Driver: one task ────────────────────────────────────────────────
+
+-- Shell-escape a string for passing into a double-quoted argv slot.
+-- generate.rail's --prompt is read verbatim from argv, so we only need
+-- to escape the four metacharacters that bash expands inside "…":
+-- \, `, $, and ". Newlines pass through bash fine inside double quotes.
+shell_dq_escape s =
+  let a = str_replace "\\" "\\\\" s
+  let b = str_replace "\"" "\\\"" a
+  let c = str_replace "`" "\\`" b
+  str_replace "$" "\\$" c
+
+-- Run the pre-compiled generate.rail binary directly. We can't go
+-- through `./rail_native run` because its internal argv forwarding
+-- mangles shell metacharacters like parens and newlines. Silent-by-
+-- design on generate.rail's side means the only stdout is the decoded
+-- text; we capture it verbatim. `gen_bin` is the path to the already-
+-- compiled binary (set once at startup).
+run_generate gen_bin prefix prompt max_gen k tau seed =
+  let esc = shell_dq_escape prompt
+  let cmd = cat [gen_bin,
+                 " --prefix ", prefix,
+                 " --max ", show max_gen,
+                 " --k ", show k,
+                 " --temp ", tau,
+                 " --seed ", show seed,
+                 " --prompt \"", esc, "\" 2>/dev/null"]
+  shell cmd
+
+-- Compile+run the completed text, return stdout. Hits the same
+-- /tmp/rail_oracle_in path as oracle_compile; caller is expected to
+-- have already scored via oracle_quality first.
+run_output code =
+  let _ = write_file "/tmp/rail_bench_rn_in.rail" code
+  let _ = shell "rm -f /tmp/rail_bench_rn_bin /tmp/rail_bench_rn_out.txt"
+  let _ = shell "cd ~/projects/rail && ./rail_native /tmp/rail_bench_rn_in.rail 2>/dev/null && cp /tmp/rail_out /tmp/rail_bench_rn_bin 2>/dev/null"
+  let check = trim (shell "test -f /tmp/rail_bench_rn_bin && echo ok || echo fail")
+  if check == "fail" then ""
+  else trim (shell "perl -e 'alarm 5; exec @ARGV' /tmp/rail_bench_rn_bin 2>/dev/null")
+
+-- Score one task: returns [quality, compiled, exec_match] as a 3-int list.
+-- compiled = 1 if oracle_quality > 0, 0 otherwise.
+-- exec_match = 1 if expected non-empty AND compiled AND run_output == expected.
+-- `pass` is compiled || exec_match (exec_match implies compiled anyway).
+score_task gen_bin prefix prompt expected max_gen k tau seed =
+  let out = run_generate gen_bin prefix prompt max_gen k tau seed
+  let quality = oracle_quality out
+  let compiled = if quality > 0 then 1 else 0
+  let exec_match =
+    if length (chars expected) == 0 then 0
+    else if compiled == 0 then 0
+    else
+      let actual = run_output out
+      if actual == expected then 1 else 0
+  cons quality (cons compiled (cons exec_match []))
+
+-- ── Band runner ─────────────────────────────────────────────────────
+
+run_band_loop gen_bin prefix tasks max_gen k tau seed_base idx pass_acc qsum =
+  if length tasks == 0 then cons pass_acc (cons qsum [])
+  else
+    let task = head tasks
+    let prompt = task_prompt task
+    let expected = task_expected task
+    let _ = print (cat ["  → [seed=", show (seed_base + idx), "] ",
+                        if length (chars prompt) > 60 then cat [str_sub prompt 0 60, "…"] else prompt])
+    let m = arena_mark 0
+    let trio = score_task gen_bin prefix prompt expected max_gen k tau (seed_base + idx)
+    let q = head trio
+    let compiled = head (tail trio)
+    let exec_match = head (tail (tail trio))
+    let _ = arena_reset m
+    let passed = if compiled == 1 then 1 else 0
+    let mark = if exec_match == 1 then "EXEC-MATCH" else (if compiled == 1 then "COMPILED" else "fail")
+    let _ = print (cat ["    ", mark, "  quality=", show q])
+    run_band_loop gen_bin prefix (tail tasks) max_gen k tau seed_base (idx + 1) (pass_acc + passed) (qsum + q)
+
+run_band gen_bin prefix band_name tasks max_gen k tau seed_base =
+  let _ = print (cat ["\n── ", band_name, " ──"])
+  run_band_loop gen_bin prefix tasks max_gen k tau seed_base 0 0 0
+
+-- ── Output row ──────────────────────────────────────────────────────
+
+write_line file text =
+  let _ = write_file "/tmp/rail_bench_rn_line.txt" (cat [text, "\n"])
+  shell (cat ["cat /tmp/rail_bench_rn_line.txt >> ", file])
+
+-- Default tag from the checkpoint step. If the meta file is missing
+-- or unreadable, fall back to "stepNA".
+default_tag prefix =
+  let step = meta_step prefix
+  cat ["railnative-d64-1blk-step", show step]
+
+-- ── main ────────────────────────────────────────────────────────────
+
+main =
+  let prefix = argv_get args "--prefix" "training/rail_native/checkpoints_apr15_backup/latest"
+  let max_str = argv_get args "--max" "128"
+  let k_str = argv_get args "--k" "1"
+  let tau = argv_get args "--temp" "1.0"
+  let tag_arg = argv_get args "--tag" ""
+
+  let max_gen = parse_int max_str
+  let k = parse_int k_str
+
+  let tag = if length (chars tag_arg) > 0 then tag_arg else default_tag prefix
+
+  let _ = print "╔═══════════════════════════════════════╗"
+  let _ = print "║  RAIL-NATIVE FLYWHEEL BENCHMARK       ║"
+  let _ = print "╚═══════════════════════════════════════╝"
+  let _ = print (cat ["checkpoint prefix: ", prefix])
+  let _ = print (cat ["model tag:         ", tag])
+  let _ = print (cat ["tokens per task:   ", show max_gen, "  (k=", show k, " temp=", tau, ")"])
+
+  -- Compile generate.rail once to a dedicated binary. Calling via
+  -- `./rail_native run tools/train/generate.rail --prompt "…"` mangles
+  -- shell metacharacters (parens, newlines) inside the forwarded argv,
+  -- so we bypass that path and invoke the binary directly.
+  let _ = print "\nCompiling tools/train/generate.rail…"
+  let compile_out = shell "cd ~/projects/rail && ./rail_native tools/train/generate.rail 2>&1 && cp /tmp/rail_out /tmp/rail_bench_rn_gen"
+  let check = trim (shell "test -x /tmp/rail_bench_rn_gen && echo ok || echo fail")
+  let _ = if check == "fail" then
+            let _ = print "  ERROR: generate.rail failed to compile — aborting"
+            shell "exit 1"
+          else print "  ok: /tmp/rail_bench_rn_gen"
+  let gen_bin = "/tmp/rail_bench_rn_gen"
+
+  -- Per-band seed bases keep tasks independent but reproducible.
+  let r1 = run_band gen_bin prefix "FUNDAMENTALS (1-4)"  (bench_fund 0)       max_gen k tau 100
+  let r2 = run_band gen_bin prefix "PRACTICAL I/O (5-6)" (bench_io 0)          max_gen k tau 200
+  let r3 = run_band gen_bin prefix "REAL TOOLS (7-8)"    (bench_tools 0)       max_gen k tau 300
+  let r4 = run_band gen_bin prefix "COMPILER (9-10)"     (bench_comp 0)        max_gen k tau 400
+  let r5 = run_band gen_bin prefix "ADVANCED (11+)"      (bench_adv 0)         max_gen k tau 500
+  let r6 = run_band gen_bin prefix "COMPREHENSION"       (bench_comprehend 0)  max_gen k tau 600
+
+  let p1 = head r1    let q1 = head (tail r1)
+  let p2 = head r2    let q2 = head (tail r2)
+  let p3 = head r3    let q3 = head (tail r3)
+  let p4 = head r4    let q4 = head (tail r4)
+  let p5 = head r5    let q5 = head (tail r5)
+  let p6 = head r6    let q6 = head (tail r6)
+
+  let total_pass = p1 + p2 + p3 + p4 + p5 + p6
+  let total_tasks = 30
+  let total_q = q1 + q2 + q3 + q4 + q5 + q6
+  let pct = (total_pass * 100) / total_tasks
+
+  let _ = print "\n═══ RESULTS ═══"
+  let _ = print (cat ["  Fundamentals: ", show p1, "/5   q=", show q1])
+  let _ = print (cat ["  Practical IO: ", show p2, "/5   q=", show q2])
+  let _ = print (cat ["  Real Tools:   ", show p3, "/5   q=", show q3])
+  let _ = print (cat ["  Compiler:     ", show p4, "/5   q=", show q4])
+  let _ = print (cat ["  Advanced:     ", show p5, "/5   q=", show q5])
+  let _ = print (cat ["  Comprehend:   ", show p6, "/5   q=", show q6])
+  let _ = print (cat ["  pass rate:    ", show total_pass, "/", show total_tasks, " (", show pct, "%)"])
+  let _ = print (cat ["  total q:      ", show total_q])
+
+  let timestamp = trim (shell "date +%Y-%m-%dT%H:%M:%S")
+  let row = cat [timestamp, " model=", tag,
+                 " fund=", show p1, "/5 io=", show p2, "/5 tools=", show p3, "/5",
+                 " comp=", show p4, "/5 adv=", show p5, "/5 comprehend=", show p6, "/5",
+                 " total=", show total_pass, "/", show total_tasks,
+                 " (", show pct, "%)",
+                 " q=", show total_q]
+  let _ = write_line "flywheel/bench_log.txt" row
+  let _ = print (cat ["\nLogged to flywheel/bench_log.txt"])
+  0
