@@ -2,6 +2,29 @@
 
 All notable changes to Rail are documented here.
 
+## v3.5.0 — 2026-04-20 — Hardened HTTPS client + http_server
+
+Two stdlib hardening passes plus a docs clarification.
+
+- `stdlib/https_client.rail` — `hc_read_random` reads urandom into
+  process memory via a shell pipeline (`dd | od -tx1 | tr`) instead
+  of an intermediate tmp file. No functional change to callers;
+  live chain-validated GET to `www.amazon.com` still returns 200.
+
+- `stdlib/http_server.rail` — `serve_static` returns `400 Bad
+  Request` on any request path containing `..` or `\` before
+  resolving against the server root.
+
+Also adds a note above the non-strict HTTPS drivers pointing
+production callers at `https_get_url_strict` / `https_post_url_strict`
+in `stdlib/https_strict.rail` for chain-walked verification.
+
+### Validation gates
+
+- `./rail_native test` — 137/137.
+- `./rail_native self` 2-pass → byte-identical fixed point.
+- `https_get_url_strict "https://www.amazon.com/"` → HTTP 200.
+
 ## v3.4.0 — 2026-04-19 — Ed25519 (RFC 8032 §5.1 verify)
 
 `stdlib/ed25519.rail` now compiles and verifies clean against RFC
