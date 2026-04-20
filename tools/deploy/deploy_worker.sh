@@ -24,13 +24,15 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   > "$BACKUP_DIR/ledatic_worker_$TS.txt"
 
 echo "> Writing metadata"
-cat > "$META" <<'JSON'
+BEACON_TOKEN_VAL=$(cat ~/.ledatic/entropy/beacon_token)
+cat > "$META" <<JSON
 {
   "main_module": "worker.js",
   "compatibility_date": "2024-01-01",
   "bindings": [
     {"type":"kv_namespace","name":"LEDATIC_KV","namespace_id":"be34022eeedc4d6fb802087156eb1aae"},
-    {"type":"r2_bucket","name":"REPORTS_R2","bucket_name":"ledatic-reports"}
+    {"type":"r2_bucket","name":"REPORTS_R2","bucket_name":"ledatic-reports"},
+    {"type":"secret_text","name":"BEACON_TOKEN","text":"$BEACON_TOKEN_VAL"}
   ]
 }
 JSON
