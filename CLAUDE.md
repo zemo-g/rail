@@ -18,7 +18,7 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 - **Effect handlers**: `try body handler` — setjmp/longjmp non-local error recovery. Deep unwinding, nested handlers.
 - **Type checker**: Forward inference pass emits warnings (not errors) for: head/tail on non-list, arithmetic on non-numeric, wrong arity, calling non-functions.
 - **Package manager**: `import math` (bare imports), `rail get github.com/...`, `rail pkg` reads `rail.toml`.
-- **Tests**: `./rail_native test` — 116 tests, should be 116/116. Count fluctuates only when concurrent sessions collide on `/tmp/rail_out` — rerun to confirm.
+- **Tests**: `./rail_native test` — 137 tests, should be 137/137. Count fluctuates only when concurrent sessions collide on `/tmp/rail_out` — rerun to confirm.
 - **Checkpoints**: `stdlib/checkpoint.rail` — `save_checkpoint prefix weights adams step best_val` + `load_checkpoint` / in-place `load_model_into` / `load_adam_states_into`. Atomic via `<prefix>.committed` sentinel. `corpus_split text val_pct` for eval splits. `tools/train/lm_transformer.rail:run_segments` wires resume + periodic checkpoint into the training loop.
 - **Performance**: Tail-recursive loops match C -O2 (5 instructions/iteration). Self-loop optimization, untagged register params, bottom-test with `subs`.
 - **Targets**: macOS ARM64 (native), Linux ARM64 (Pi Zero), Linux x86_64 (Razer WSL)
@@ -26,7 +26,7 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 ### Key Commands
 
 ```bash
-./rail_native test                    # run 116-test suite
+./rail_native test                    # run 137-test suite
 ./rail_native self                    # self-compile → /tmp/rail_self (must be byte-identical)
 ./rail_native run file.rail           # compile + execute
 ./rail_native file.rail               # compile only → /tmp/rail_out
@@ -112,7 +112,7 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 After editing `tools/compile.rail`:
 1. `./rail_native self` — self-compile
 2. `cp /tmp/rail_self rail_native` — install new binary
-3. `./rail_native test` — verify 116/116
+3. `./rail_native test` — verify 137/137
 4. `./rail_native self && cmp rail_native /tmp/rail_self` — verify fixed point (may need 2-3 rounds)
 
 **NOTE**: Self-compile works cleanly since the 256MB stack fix. No gen2_head bootstrap needed.
@@ -121,80 +121,36 @@ After editing `tools/compile.rail`:
 
 **DATA SECTION BUG**: Changes to the `data` string literal in `compile_program` may not propagate. If you need new data section labels, construct strings at runtime via `malloc` + byte stores in the ARM64 assembly instead. See polymorphic show implementation in `rshow` for the pattern.
 
-## Flywheel (Self-Training System)
+## Related repos
 
-Compiler-verified self-training loop. The compiler is the oracle — generate code, compile to verify, harvest successes as training data.
+Rail is the compiler + stdlib. A few things that used to live here moved out on 2026-04-20:
 
-### Architecture
+- **Training infrastructure** → [`Ledatic-Empire/rail-training`](https://github.com/Ledatic-Empire/rail-training) (private). Flywheel orchestrator, dataset pipeline, model cards, small corpora. Weights kept on disk, not in git. Depends on `rail_native` + stdlib from this repo.
+- **Website source** → [`Ledatic-Empire/ledatic-site`](https://github.com/Ledatic-Empire/ledatic-site) (public). Hand-rolled HTML/CSS/JS/GLSL for ledatic.org, plus the Cloudflare Worker. Dynamic pages (mission control, changelog, plasma landing) still generated from `tools/deploy/gen_*.rail` here.
+- **UAV / AIGP** → [`Ledatic-Empire/zemog`](https://github.com/Ledatic-Empire/zemog) (private). Nested at `tools/uav/` in the working tree (gitignored).
 
-```
-self_train.rail (orchestrator)
-  → LLM generates Rail code (via llm builtin → MLX server on :8080)
-  → rail_native compiles it (oracle verification)
-  → Passes get harvested to training/self_train/harvest.jsonl
-  → 25 levels, auto-advance at 80%+ for 3 consecutive rounds
-  → Falls back on 2 consecutive 0% rounds
+## Self-training (in tree)
 
-dataset.rail (data pipeline)
-  → Merges 10 JSONL sources → SHA-256 dedup → 90/5/5 split
-  → Output: /tmp/rail_flywheel_data/{train,valid,test}.jsonl
+`tools/train/self_train.rail` is a compiler-verified self-training loop: an LLM generates Rail, `rail_native` compiles it, passes get harvested. 25 levels, auto-advances at 80%+ for 3 rounds, falls back on 2 zero rounds. `stdlib/llm.rail` + `stdlib/anthropic_client.rail` + `stdlib/mlx_client.rail` provide the LLM clients over pure-Rail TLS.
 
-train_cuda.py (CUDA trainer on Razer)
-  → QLoRA on Qwen3.5-4B, BitsAndBytes 4-bit
-  → Targets self_attn + DeltaNet layers (Qwen3.5 hybrid architecture)
-  → device_map="auto" (NOT {"": 0} — that OOMs)
+Runners and data live in `Ledatic-Empire/rail-training`; the library code that makes them possible lives here (`stdlib/autograd.rail`, `stdlib/transformer.rail`, `stdlib/optim.rail`, `stdlib/checkpoint.rail`, `stdlib/bpe.rail`, `stdlib/tokenizer.rail`).
 
-bench.rail (benchmark)
-  → 30 tasks, 6 bands, output-verified where possible
-  → Logged to flywheel/bench_log.txt
-
-waterfall.rail (cross-node orchestrator)
-  → Coordinates Mini (inference) + Razer (training)
-```
-
-### Flywheel Commands
+## Site generation (dynamic pages)
 
 ```bash
-./rail_native run tools/train/self_train.rail        # compile self-train binary
-./tools/train/run_training.sh                         # immortal training loop (one round per process)
-./rail_native run flywheel/dataset.rail prepare       # full data pipeline: dedup → merge → split
-./rail_native run flywheel/bench.rail                 # 30-task benchmark
-cat training/self_train/progress.txt                  # check training state
-tail -20 /tmp/rail_training.log                       # recent round results
+./rail_native run tools/deploy/gen_mission_control.rail    # /system mission control
+./rail_native run tools/deploy/gen_changelog.rail          # /changelog
+./rail_native run tools/deploy/gen_feed.rail               # Atom feed
+./rail_native run tools/deploy/gen_plasma_landing.rail     # /plasma
+./rail_native run tools/deploy/daily_deploy.rail           # cron orchestrator
 ```
 
-### MLX Server (Inference)
+Pure-static pages live in `Ledatic-Empire/ledatic-site` and deploy with a shell script there.
+
+## Cross-compile (Linux ARM64 for Pi Zero / similar)
 
 ```bash
-# Current: 4B + v5 adapter
-/Users/ledaticempire/homebrew/bin/python3.11 -m mlx_lm.server \
-  --model /Users/ledaticempire/models/Qwen3.5-4B-4bit \
-  --adapter-path training/adapters_4b_v5_mlx \
-  --host 0.0.0.0 --port 8080 --trust-remote-code --max-tokens 2048
-
-# Watchdog (auto-restart + proactive restart every 30min):
-./tools/train/mlx_watchdog.sh
+./rail_native linux tools/compile.rail && scp /tmp/rail_linux <host>:~/rail_native
 ```
 
-## Compute Fleet
-
-| Node | Role | Access |
-|------|------|--------|
-| Mac Mini M4 Pro (24GB) | Inference, compilation, orchestration | local |
-| Razer3070 (RTX 3070 8GB) | CUDA QLoRA training | `ssh Detro@100.109.63.37` (Tailscale) |
-| Pi Zero 2 W (416MB) | Fleet display, Rail execution | `ssh zemog@100.87.231.45` (Tailscale) |
-
-### Pi Zero Notes
-
-- Rail compiler deployed at `~/rail_native` (532K static ELF)
-- Runtime libs at `~/tools/linux_libc.s`, `~/tools/linux_data.s`
-- Fleet display: `fleet-rail.service` (Rail binary, SPI LCD)
-- Cross-compile from Mini: `./rail_native linux tools/compile.rail && scp /tmp/rail_linux zemog@100.87.231.45:~/rail_native`
-
-## Site Generation
-
-```bash
-./rail_native run tools/deploy/gen_site.rail              # regenerate ledatic.org (auto-deploys)
-./rail_native run tools/deploy/gen_mission_control.rail    # mission control page
-./rail_native run tools/deploy/cf_deploy.rail FILE KEY     # deploy specific file to Cloudflare KV
-```
+Runtime libs live at `tools/linux_libc.s` and `tools/linux_data.s`.
