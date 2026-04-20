@@ -1,0 +1,330 @@
+-- fleet_agent_v3.rail — Pure Rail fleet control plane (v3, direct TCP)
+-- Retires the Python fleet_server.py transport. Single binary, persistent
+-- process, accept loop → route → send → close. All handlers from v2.
+--
+-- Run:    ./rail_native run tools/fleet/fleet_agent_v3.rail
+-- Compile: ./rail_native tools/fleet/fleet_agent_v3.rail && cp /tmp/rail_out ~/.fleet/fleet_agent_v3
+-- Port:   $FLEET_PORT (default 9101)
+
+import "stdlib/socket.rail"
+
+foreign time t
+
+cat parts = join "" parts
+trim s = head (split "\n" s)
+q = "\""
+now _ = time 0
+
+-- parse_int comes from socket.rail
+
+-- Path helpers
+path_starts_with path prefix =
+  if length path < length prefix then false
+  else
+    let h = str_sub path 0 (length prefix)
+    h == prefix
+
+path_after path prefix =
+  str_sub path (length prefix) (length path - length prefix)
+
+strip_query s =
+  let parts = split "?" s
+  head parts
+
+query_of s =
+  let parts = split "?" s
+  if length parts >= 2 then head (tail parts) else ""
+
+-- HTTP parsing
+parse_request_line line =
+  let parts = split " " line
+  if length parts >= 3 then
+    (head parts, head (tail parts), head (tail (tail parts)))
+  else ("", "", "")
+
+parse_headers lines =
+  if length lines == 0 then []
+  else
+    let line = head lines
+    if length line <= 1 then []
+    else
+      let parts = split ": " line
+      if length parts >= 2 then
+        let name = head parts
+        let value = join ": " (tail parts)
+        cons (name, value) (parse_headers (tail lines))
+      else parse_headers (tail lines)
+
+get_header headers name =
+  if length headers == 0 then ""
+  else
+    let (k, v) = head headers
+    if k == name then v
+    else get_header (tail headers) name
+
+find_body lines =
+  if length lines == 0 then ""
+  else if length (head lines) <= 1 then join "\n" (tail lines)
+  else find_body (tail lines)
+
+parse_request raw =
+  let lines = split "\n" raw
+  if length lines == 0 then ("", "", [], "")
+  else
+    let (method, path, _version) = parse_request_line (head lines)
+    let hdrs = parse_headers (tail lines)
+    let body = find_body (tail lines)
+    (method, path, hdrs, body)
+
+-- Response builders (bare-LF; curl + Rail http_client both accept)
+mk_resp code text body =
+  cat ["HTTP/1.1 ", show code, " ", text, "\nContent-Type: application/json\nConnection: close\n\n", body]
+
+mk_html code body =
+  cat ["HTTP/1.1 ", show code, " OK\nContent-Type: text/html; charset=utf-8\nConnection: close\n\n", body]
+
+resp_ok body   = mk_resp 200 "OK"          body
+resp_403       = mk_resp 403 "Forbidden"   (cat ["{", q, "error", q, ": ", q, "forbidden", q, "}"])
+resp_404       = mk_resp 404 "Not Found"   (cat ["{", q, "error", q, ": ", q, "not found", q, "}"])
+resp_400       = mk_resp 400 "Bad Request" (cat ["{", q, "error", q, ": ", q, "missing cmd", q, "}"])
+resp_deny      = mk_resp 403 "Forbidden"   (cat ["{", q, "error", q, ": ", q, "command not whitelisted", q, "}"])
+
+-- JSON helpers
+json_esc s    = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n"  (split "\n" s)
+jstr k v  = cat [q, k, q, ": ", q, json_esc (json_esc_nl v), q]
+jint k v  = cat [q, k, q, ": ", show v]
+jbool k v = cat [q, k, q, ": ", if v then "true" else "false"]
+jobj pairs = cat ["{", join ", " pairs, "}"]
+
+-- Auth + whitelist
+load_token _ = trim (shell "cat ~/.fleet/token 2>/dev/null || echo ''")
+
+clean s =
+  let _ = write_file "/tmp/_fleet_v3_clean.txt" s
+  trim (shell "sed 's/^[[:space:]]*//' /tmp/_fleet_v3_clean.txt | tr -d '\\015'")
+
+check_auth headers token =
+  if length token == 0 then true
+  else
+    let raw = get_header headers "X-Fleet-Token"
+    let provided = clean raw
+    provided == token
+
+load_whitelist _ =
+  let raw = shell "cat ~/.fleet/allowed_commands 2>/dev/null || echo ''"
+  filter_nonempty (split "\n" raw)
+
+filter_nonempty lines =
+  if length lines == 0 then []
+  else
+    let l = head lines
+    if length l > 0 then cons l (filter_nonempty (tail lines))
+    else filter_nonempty (tail lines)
+
+cmd_allowed cmd whitelist =
+  if length whitelist == 0 then false
+  else
+    let entry = head whitelist
+    if cmd == entry then true
+    else
+      let prefix = cat [entry, " "]
+      let check = trim (shell (cat ["echo ", q, cmd, q, " | cut -c1-", show (length prefix)]))
+      if check == entry then true
+      else cmd_allowed cmd (tail whitelist)
+
+-- Extract "cmd" from JSON body
+extract_cmd body =
+  let parts = str_split "\"cmd\"" body
+  if length parts >= 2 then
+    find_str_val (split "\"" (head (tail parts)))
+  else ""
+
+find_str_val parts =
+  if length parts == 0 then ""
+  else
+    let p = head parts
+    if p == ":" || p == ": " || p == " " || length p == 0 then find_str_val (tail parts)
+    else p
+
+parse_query_lines q_str =
+  if length q_str == 0 then 50
+  else
+    let idx = str_find "lines=" q_str
+    if idx < 0 then 50
+    else
+      let start = idx + 6
+      let after = str_sub q_str start (length q_str - start)
+      let v = head (split "&" after)
+      if length v == 0 then 50 else parse_int v
+
+-- Handlers
+handle_health start_time =
+  let up = (now 0) - start_time
+  resp_ok (jobj [jbool "alive" true, jint "uptime" up])
+
+map_quote items =
+  if length items == 0 then []
+  else cons (cat [q, head items, q]) (map_quote (tail items))
+
+-- Platform-aware: Linux first, falls back to Mac.
+handle_status _ =
+  let hostname = trim (shell "hostname")
+  let cpu = trim (shell "lscpu 2>/dev/null | awk -F: '/^Model name/ {sub(/^[ \\t]+/,\"\",$2); print $2; exit}' || sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -p")
+  let mem = trim (shell "awk '/MemAvailable/ {printf \"%d MB avail\", $2/1024; exit}' /proc/meminfo 2>/dev/null || vm_stat 2>/dev/null | awk '/Pages free/{gsub(/\\./,\"\",$3);f=$3}/Pages inactive/{gsub(/\\./,\"\",$3);i=$3}/Pages purgeable/{gsub(/\\./,\"\",$3);p=$3}END{printf \"%d MB avail\", (f+i+p)*16384/1048576}' || echo unknown")
+  let disk = trim (shell "df -h / | tail -1 | awk '{print $4 \" free of \" $2}'")
+  let arch = trim (shell "uname -m")
+  let temp = trim (shell "awk '{printf \"%.1fC\", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo -")
+  let load = trim (shell "cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime | sed 's/.*load averages*: //'")
+  let svc_raw = shell "if [ -d /proc ]; then systemctl list-units --state=running --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^(dns-|fleet-|witness)' | head -20; else launchctl list 2>/dev/null | grep ledatic | awk '{print $3}' | head -20; fi"
+  let svc_lines = filter_nonempty (split "\n" svc_raw)
+  let svc_json = map_quote svc_lines
+  let svc_arr = cat ["[", join ", " svc_json, "]"]
+  let uptime = trim (shell "uptime | sed 's/.*up //' | sed 's/,.*//'")
+  let body = cat ["{", jstr "hostname" hostname, ", ", jstr "cpu" cpu, ", ", jstr "mem" mem, ", ", jstr "disk" disk, ", ", jstr "arch" arch, ", ", jstr "temp" temp, ", ", jstr "load" load, ", ", jstr "uptime" uptime, ", ", jstr "transport" "rail-v3", ", ", q, "services", q, ": ", svc_arr, "}"]
+  resp_ok body
+
+handle_logs rest =
+  let svc = strip_query rest
+  let lines_n = parse_query_lines (query_of rest)
+  let cmd = cat ["for p in ~/empire/logs/", svc, ".log /tmp/", svc, ".log ~/Library/Logs/", svc, "/", svc, ".log /var/log/", svc, ".log; do [ -f \"$p\" ] && tail -", show lines_n, " \"$p\" && break; done 2>/dev/null"]
+  let output = shell cmd
+  resp_ok (jobj [jstr "service" svc, jint "lines" lines_n, jstr "output" output])
+
+-- Jobs
+jobs_dir _ = trim (shell "echo ~/.fleet/jobs")
+
+ensure_jobs_dir _ =
+  let d = jobs_dir 0
+  let _ = shell (cat ["mkdir -p ", d])
+  d
+
+new_job_id _ =
+  trim (shell "uuidgen | tr -d - | tr '[:upper:]' '[:lower:]' | cut -c1-12")
+
+handle_job_create body whitelist =
+  let cmd = extract_cmd body
+  if length cmd == 0 then resp_400
+  else if cmd_allowed cmd whitelist then
+    let dir = ensure_jobs_dir 0
+    let job_id = new_job_id 0
+    let out_f = cat [dir, "/", job_id, ".out"]
+    let cmd_f = cat [dir, "/", job_id, ".cmd"]
+    let st_f  = cat [dir, "/", job_id, ".status"]
+    let _ = write_file cmd_f cmd
+    let _ = write_file st_f "running\n"
+    let _ = shell (cat ["( ", cmd, " > ", out_f, " 2>&1; echo $? > ", st_f, " ) </dev/null >/dev/null 2>&1 &"])
+    resp_ok (jobj [jstr "job_id" job_id, jstr "cmd" cmd, jstr "status" "running"])
+  else resp_deny
+
+handle_job_get id_raw =
+  let id = strip_query id_raw
+  let dir = jobs_dir 0
+  let status = trim (shell (cat ["cat ", dir, "/", id, ".status 2>/dev/null || echo not_found"]))
+  let output = shell (cat ["head -c 20000 ", dir, "/", id, ".out 2>/dev/null"])
+  let cmd_txt = trim (shell (cat ["cat ", dir, "/", id, ".cmd 2>/dev/null"]))
+  resp_ok (jobj [jstr "id" id, jstr "status" status, jstr "cmd" cmd_txt, jstr "output" output])
+
+handle_jobs_list _ =
+  let dir = jobs_dir 0
+  let raw = shell (cat ["ls -t ", dir, "/*.status 2>/dev/null | head -20 | xargs -I@ basename @ .status 2>/dev/null"])
+  let ids = filter_nonempty (split "\n" raw)
+  let entries = map_quote ids
+  resp_ok (cat ["{", q, "jobs", q, ": [", join ", " entries, "]}"])
+
+handle_dashboard _ =
+  let hostname = trim (shell "hostname")
+  let arch = trim (shell "uname -m")
+  let uptime = trim (shell "uptime | sed 's/.*up //' | sed 's/,.*//'")
+  let svc_raw = shell "if [ -d /proc ]; then systemctl list-units --state=running --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^(dns-|fleet-|witness)' | head -20; else launchctl list 2>/dev/null | grep ledatic | awk '{print $3 \"  (PID \" $1 \")\"}' | head -20; fi"
+  let jd = jobs_dir 0
+  let jobs_raw = shell (cat ["ls -t ", jd, "/*.status 2>/dev/null | head -5 | while read f; do id=$(basename \"$f\" .status); st=$(cat \"$f\"); cmd=$(cat \"${f%.status}.cmd\" 2>/dev/null | head -c 60); echo \"$id  $st  $cmd\"; done"])
+  let body = cat [
+    "<!DOCTYPE html><html><head><title>fleet-v3: ", hostname, "</title>",
+    "<meta http-equiv=", q, "refresh", q, " content=", q, "10", q, ">",
+    "<style>body", "{", "font-family:ui-monospace,monospace;background:#0a0a0a;color:#ddd;padding:24px;margin:0;line-height:1.5", "}",
+    "h1", "{", "color:#0f0;border-bottom:1px solid #0f0;padding-bottom:6px;margin-top:0", "}",
+    "h2", "{", "color:#0af;margin-top:28px", "}",
+    "pre", "{", "background:#111;padding:12px;overflow-x:auto;color:#8af;border-left:2px solid #0af", "}",
+    "a", "{", "color:#0f0;margin-right:14px", "}",
+    "small", "{", "color:#666", "}",
+    "</style></head><body>",
+    "<h1>fleet: ", hostname, " <small>", arch, " · rail-v3</small></h1>",
+    "<p>uptime: ", uptime, "</p>",
+    "<h2>services</h2><pre>", svc_raw, "</pre>",
+    "<h2>recent jobs</h2><pre>", jobs_raw, "</pre>",
+    "<h2>endpoints</h2><p>",
+    "<a href=", q, "/status", q, ">/status</a>",
+    "<a href=", q, "/health", q, ">/health</a>",
+    "<a href=", q, "/jobs", q, ">/jobs</a>",
+    "</p><p><small>rail fleet v3 · pure Rail TCP · no Python transport</small></p>",
+    "</body></html>"]
+  mk_html 200 body
+
+handle_exec body whitelist =
+  let cmd = extract_cmd body
+  if length cmd == 0 then resp_400
+  else if cmd_allowed cmd whitelist then
+    let output = shell (cat [cmd, " 2>&1"])
+    resp_ok (jobj [jstr "output" output, jint "exit_code" 0])
+  else resp_deny
+
+-- Router
+route method path body start_time whitelist =
+  if method == "GET" then
+    if path == "/" then handle_dashboard 0
+    else if path == "/health" then handle_health start_time
+    else if path == "/status" then handle_status 0
+    else if path == "/jobs" then handle_jobs_list 0
+    else if path_starts_with path "/logs/" then handle_logs (path_after path "/logs/")
+    else if path_starts_with path "/jobs/" then handle_job_get (path_after path "/jobs/")
+    else resp_404
+  else if method == "POST" then
+    if path == "/exec" then handle_exec body whitelist
+    else if path == "/jobs" then handle_job_create body whitelist
+    else resp_404
+  else resp_404
+
+-- Accept loop
+serve_loop listen_fd token start_time whitelist =
+  let cfd = accept_tcp listen_fd
+  if cfd < 0 then serve_loop listen_fd token start_time whitelist
+  else
+    let req = recv_http_request cfd
+    let _ = handle_one cfd req token start_time whitelist
+    let _ = close cfd
+    serve_loop listen_fd token start_time whitelist
+
+handle_one cfd req token start_time whitelist =
+  let (method, path, hdrs, body) = parse_request req
+  let _ = print (cat ["  ", method, " ", path])
+  let resp =
+    if check_auth hdrs token then route method path body start_time whitelist
+    else resp_403
+  send_all_tcp cfd resp
+
+-- Port priority: ~/.fleet/port file (single line), else default 9101.
+-- (Rail's shell() doesn't inherit parent env vars, so we don't use $FLEET_PORT.)
+get_port _ =
+  let s = trim (shell "cat ~/.fleet/port 2>/dev/null")
+  if length s == 0 then 9101 else parse_int s
+
+main =
+  let port = get_port 0
+  let token = load_token 0
+  let whitelist = load_whitelist 0
+  let start_time = now 0
+  let _ = ensure_jobs_dir 0
+  let _ = print "Rail Fleet v3 — pure-Rail TCP (no Python transport)"
+  let _ = print (cat ["  port:      ", show port])
+  let _ = print (cat ["  token:     ", if length token > 0 then "loaded" else "NONE (open access)"])
+  let _ = print (cat ["  whitelist: ", show (length whitelist), " commands"])
+  let _ = print "  routes:    GET / /status /health /jobs /jobs/<id> /logs/<svc>"
+  let _ = print "             POST /exec /jobs"
+  let lfd = bind_tcp "0.0.0.0" port
+  if lfd < 0 then
+    let _ = print "  FATAL: bind_tcp failed"
+    1
+  else
+    let _ = print (cat ["  listening on 0.0.0.0:", show port])
+    serve_loop lfd token start_time whitelist
