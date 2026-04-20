@@ -108,8 +108,9 @@ class PlasmaHandler(http.server.SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("0.0.0.0", PORT), PlasmaHandler)
-    print(f"RAIL PLASMA server on http://0.0.0.0:{PORT}")
+    BIND = os.environ.get("MHD_BIND", "127.0.0.1")
+    server = http.server.HTTPServer((BIND, PORT), PlasmaHandler)
+    print(f"RAIL PLASMA server on http://{BIND}:{PORT}")
     print(f"  Static files: {STATIC_DIR}")
     print(f"  GPU frames:   {FRAME_PATH}")
     print(f"  Control:      POST {CTRL_PATH}")

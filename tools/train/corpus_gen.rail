@@ -142,7 +142,7 @@ json_esc_chars cs acc =
     if c == "\\" then json_esc_chars (tail cs) (cons "\\\\" acc)
     else if c == q then json_esc_chars (tail cs) (cons "\\\"" acc)
     else if c == "\n" then json_esc_chars (tail cs) (cons "\\n" acc)
-    else if c == "\r" then json_esc_chars (tail cs) (cons "\\r" acc)
+    else if char_to_int c == 13 then json_esc_chars (tail cs) (cons "\\r" acc)
     else if c == "\t" then json_esc_chars (tail cs) (cons "\\t" acc)
     else json_esc_chars (tail cs) (cons c acc)
 
@@ -243,23 +243,28 @@ filter_nonempty xs =
     if length h == 0 then filter_nonempty (tail xs)
     else cons h (filter_nonempty (tail xs))
 
--- v2: full repo scope. Skip the obvious build-output / vendored / VCS
--- directories but include compile.rail and examples/ and every other
--- .rail in the tree. We trust the corpus generator's filters
--- (length floors + ASCII pass-through + per-record dedup via SHA-256
--- bucket) to handle redundant snippets.
+-- v2: full repo scope EXCEPT tools/compile.rail (the 5700-line compiler
+-- file segfaults process_file's extract_functions — recursion depth /
+-- parser state blows up on it). All other .rail files are in scope; we
+-- trust corpus_gen's filters (length floors + ASCII + SHA-256 dedup)
+-- to handle redundant snippets.
 walk_files _ =
   let cmd = "find . -name '*.rail' 2>/dev/null | grep -v '^./training/' | grep -v '^./archive/' | grep -v '^./.git/' | grep -v '^./.wrangler/' | sed 's|^./||' | sort"
   let out = shell cmd
   filter_nonempty (split "\n" out)
 
--- Several Rail source files have stray \r bytes (CRLF line endings) in
--- comments. The compiler tolerates them, but JSON requires control
--- characters in strings be escaped, and `"\r"` is a known unsupported
--- literal in Rail (see memory: rail-bugs.md), so json_esc can't pattern
--- match it directly. Strip CR via shell before parsing.
+-- Read a Rail source file and strip stray \r bytes (CRLF endings in
+-- some comments). Uses native read_file + str_replace — the earlier
+-- `shell (tr -d ...)` version fed the full file contents back through
+-- Rail's shell-output buffer, which overflows the bump allocator on
+-- large files (compile.rail @ 335KB was segfaulting).
+--
+-- Uses char_from_int 13 for the CR byte — the `"\r"` literal in Rail
+-- is a known-broken escape (see memory: rail-bugs.md) and str_replace
+-- with `"\r"` silently no-ops, letting CR bytes leak into the JSON.
 read_source_no_cr path =
-  shell (cat ["LC_ALL=C tr -d '\\015' < ", path])
+  let cr = char_from_int 13
+  str_replace cr "" (read_file path)
 
 -- ====================================================================
 -- Module doc extraction (consecutive `--` lines from the top of file).
@@ -498,11 +503,15 @@ valid_rec r =
   let cl = length c
   let kind = rec_kind r
   let comp_floor = if kind == "repl_pair" then 1 else 8
+  -- Upper bound 2048 chars ≈ 512 BPE tokens (at vocab 1024, compression
+  -- ~4x). Matches max_seq_len in train_v1.py — anything longer gets
+  -- truncated by the training loader anyway, and the untruncated tail
+  -- dominates gradient on giant multi-hundred-line stdlib functions.
   if length kind == 0 then false
   else if pl < 8 then false
   else if cl < comp_floor then false
-  else if pl > 4096 then false
-  else if cl > 4096 then false
+  else if pl > 2048 then false
+  else if cl > 2048 then false
   else true
 
 filter_valid recs =
@@ -511,6 +520,35 @@ filter_valid recs =
     let r = head recs
     if valid_rec r then cons r (filter_valid (tail recs))
     else filter_valid (tail recs)
+
+-- Content-prefix dedup: drop records whose completion starts with the
+-- same first 100 chars as an earlier record. Collapses near-identical
+-- boilerplate twins (e.g. multiple files with the same import / setup
+-- block followed by divergent code) — the PROMPT differs but the
+-- training signal at the head of the completion is redundant.
+--
+-- Uses str_sub directly (zero cons allocations) vs the chars+join
+-- approach which allocated 2048 cons cells per record call.
+prefix_key r =
+  let c = rec_comp r
+  let n = length c
+  if n < 100 then c
+  else str_sub c 0 100
+
+seen_prefix key seen =
+  if length seen == 0 then false
+  else if head seen == key then true
+  else seen_prefix key (tail seen)
+
+dedup_prefix_loop recs seen acc =
+  if length recs == 0 then reverse acc
+  else
+    let r = head recs
+    let k = prefix_key r
+    if seen_prefix k seen then dedup_prefix_loop (tail recs) seen acc
+    else dedup_prefix_loop (tail recs) (cons k seen) (cons r acc)
+
+dedup_prefix recs = dedup_prefix_loop recs [] []
 
 -- function record: prompt = doc (if any) + LHS-of-signature; completion =
 -- body lines OR (for single-line fns) the RHS of the signature.
@@ -616,6 +654,32 @@ collect_corpus_loop recs acc =
 
 collect_corpus recs = collect_corpus_loop recs []
 
+-- Uniform BPE sample — take N evenly-spaced records across the full
+-- (alphabetical) record list so the tokenizer sees proportional coverage
+-- of every file in the tree. truncate_str (first-N chars of the full
+-- concat) over-weights early-alphabetical files; this doesn't.
+nth_record recs n =
+  if n <= 0 then head recs
+  else nth_record (tail recs) (n - 1)
+
+uniform_sample_loop recs total bins i acc =
+  if i >= bins then reverse acc
+  else
+    let idx = i * total / bins
+    let r = nth_record recs idx
+    uniform_sample_loop recs total bins (i + 1) (cons (rec_comp r) acc)
+
+uniform_sample_corpus recs bins =
+  let total = length recs
+  if total == 0 then ""
+  else if total <= bins then join "\n" (map_comp_list recs [])
+  else join "\n" (uniform_sample_loop recs total bins 0 [])
+
+-- helper when we need all completions (small corpus path).
+map_comp_list recs acc =
+  if length recs == 0 then reverse acc
+  else map_comp_list (tail recs) (cons (rec_comp (head recs)) acc)
+
 -- Cap the BPE training corpus. bpe.rail's bpe_init_encode_loop calls
 -- length on the (shrinking) char list every iteration → O(N²) on the
 -- input. ~100K chars is the sweet spot: still represents the Rail
@@ -676,14 +740,34 @@ write_jsonl_line path line =
   let _ = write_file "/tmp/rail_corpus_line.txt" (cat [line, "\n"])
   shell (cat ["cat /tmp/rail_corpus_line.txt >> ", path])
 
-write_records_loop bpe recs n_train n_val n_test =
+-- File-level split: hash the source file path once per file, route ALL
+-- records from that file to the same train/val/test bucket. Prevents
+-- records from the same file leaking across splits (e.g. train has
+-- fn_A from foo.rail and val has fn_B from foo.rail, so model can
+-- memorize foo.rail-specific patterns that appear in both).
+build_file_buckets files =
+  if length files == 0 then []
+  else
+    let f = head files
+    let bucket = split_bucket (sha256_id_seed f)
+    cons (f, bucket) (build_file_buckets (tail files))
+
+lookup_file_bucket path fbs =
+  if length fbs == 0 then 0
+  else
+    let pair = head fbs
+    let (p, b) = pair
+    if p == path then b
+    else lookup_file_bucket path (tail fbs)
+
+write_records_loop bpe fbs recs n_train n_val n_test =
   if length recs == 0 then (n_train, n_val, n_test)
   else
     let mk = arena_mark 0
     let r = head recs
     let id_full = sha256_id_seed (rec_seed r)
     let id_short = join "" (take_n_chars 16 (chars id_full))
-    let bucket = split_bucket id_full
+    let bucket = lookup_file_bucket (rec_src r) fbs
     let path = split_path bucket
     let p_ids = bpe_encode bpe (rec_prompt r)
     let c_ids = bpe_encode bpe (rec_comp r)
@@ -693,7 +777,7 @@ write_records_loop bpe recs n_train n_val n_test =
     let nv = if bucket == 18 then n_val + 1 else n_val
     let ntest = if bucket == 19 then n_test + 1 else n_test
     let _ = arena_reset mk
-    write_records_loop bpe (tail recs) nt nv ntest
+    write_records_loop bpe fbs (tail recs) nt nv ntest
 
 -- ====================================================================
 -- Main
@@ -720,26 +804,25 @@ main =
   let all_recs = append main_recs pair_recs
   let _ = print (cat ["  total candidates: ", show (length all_recs)])
 
-  let valid = filter_valid all_recs
-  let _ = print (cat ["  valid records (after length filter): ", show (length valid)])
+  let pre_dedup = filter_valid all_recs
+  let _ = print (cat ["  valid records (after length filter): ", show (length pre_dedup)])
+  let valid = dedup_prefix pre_dedup
+  let _ = print (cat ["  valid records (after content dedup): ", show (length valid)])
 
   let argv = args
   let target = parse_vocab_size_arg argv 1024
   let _ = print (cat ["training BPE (target vocab=", show target, ")..."])
   let corpus_full = collect_corpus valid
   let _ = print (cat ["  corpus chars (concat completions): ", show (length corpus_full)])
-  -- bpe.rail's bpe_count_pairs is O(N) per recursive step (`length tokens < 2`
-  -- → O(N) length builtin), so its overall cost on the training corpus is
-  -- O(merges × N²). Sample 8K chars: still represents the Rail token
-  -- distribution (covers all stdlib's chars + most idioms), and total BPE
-  -- training stays under a minute on the 9b691e4 binary. Encoding of full
-  -- records (per-string, short) is unaffected.
-  -- v2 corpus pulls in compile.rail's full Rail-syntax vocabulary, so the
-  -- 8K head sample produces a wider unique-pair set and BPE training stalls
-  -- in bpe_best_pair (BST walk per pass). 4K is the sweet spot: wider
-  -- merges than 2K (which capped vocab at ~348), still tractable.
-  let corpus = truncate_str corpus_full 4000
-  let _ = print (cat ["  BPE training corpus (sampled): ", show (length corpus), " chars"])
+  -- v2: sample 200 evenly-spaced records (uniform across the
+  -- alphabetical-by-file record list) for the BPE tokenizer. Ensures
+  -- proportional file coverage — the earlier truncate_str approach
+  -- over-weighted early-alphabetical files (examples/, archive/).
+  -- Still cap total chars at 20K so BPE completes in reasonable time
+  -- (see Rail rules: the concat-completions corpus is super-linear).
+  let raw_sample = uniform_sample_corpus valid 200
+  let corpus = truncate_str raw_sample 20000
+  let _ = print (cat ["  BPE training corpus (uniform sample): ", show (length corpus), " chars"])
   let bpe = bpe_train corpus target
   let vsize = bpe_vocab_size bpe
   let _ = print (cat ["  BPE vocab size: ", show vsize])
@@ -748,7 +831,9 @@ main =
 
   let _ = clear_outputs 0
   let _ = print "writing JSONL records..."
-  let (nt, nv, ntest) = write_records_loop bpe valid 0 0 0
+  let fbs = build_file_buckets files
+  let _ = print (cat ["  file buckets: ", show (length fbs)])
+  let (nt, nv, ntest) = write_records_loop bpe fbs valid 0 0 0
   let _ = print (cat ["  train: ", show nt, "  val: ", show nv, "  test: ", show ntest])
 
   let _ = print "DONE"

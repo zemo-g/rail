@@ -18,7 +18,7 @@
 set -u
 
 ALLOWED_FILE="$HOME/.fleet/allowed_tailnet_peers"
-LOG="/var/log/ledatic-tailscale-peer-check.log"
+LOG="$HOME/.fleet/tailscale_peer_check.log"
 SLACK_TOKEN_FILE="$HOME/.fleet/slack_token"
 
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
@@ -29,9 +29,16 @@ if [ ! -f "$ALLOWED_FILE" ]; then
   exit 0
 fi
 
-which tailscale >/dev/null 2>&1 || { log "tailscale CLI missing"; exit 0; }
+# Tailscale CLI — prefer standalone install, fall back to App Store bundle.
+if command -v tailscale >/dev/null 2>&1; then
+  TS=tailscale
+elif [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
+  TS="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+else
+  log "tailscale CLI missing"; exit 0
+fi
 
-current=$(tailscale status 2>/dev/null | awk 'NR>1 && $2 != "" {print $2}' | sort -u)
+current=$("$TS" status 2>/dev/null | awk '$2 != "" {print $2}' | sort -u)
 allowed=$(sort -u "$ALLOWED_FILE")
 
 added=$(comm -13 <(printf '%s\n' "$allowed") <(printf '%s\n' "$current"))
