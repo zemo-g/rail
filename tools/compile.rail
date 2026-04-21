@@ -2625,7 +2625,14 @@ rt_gc_1 =
   -- read past the real stack top (symptom: EXC_BAD_ACCESS in .Lgc_scan
   -- when env var count made main_fp near the stack top page — see
   -- docs/gc-phase0-findings.md).
-  "_rail_stack_top:\n    .quad 0\n.text\n\n",
+  "_rail_stack_top:\n    .quad 0\n",
+  -- Small-block free list: 12 power-of-two size classes (32B, 64B, 128B, ...
+  -- up to 65536B). Heads pushed by _rail_malloc_chain_drain when sub-64KB
+  -- chunks are evicted from the chain; popped by _rail_chained_malloc on
+  -- matching requests. This turns _free-no-op (for small blocks) into a
+  -- recycling pool, fixing the 3 MB/step leak documented in
+  -- docs/plans/1D4_MEMORY_LEAK.md.
+  "_rail_small_fl:\n    .quad 0\n    .quad 0\n    .quad 0\n    .quad 0\n    .quad 0\n    .quad 0\n    .quad 0\n    .quad 0\n    .quad 0\n    .quad 0\n    .quad 0\n    .quad 0\n.text\n\n",
   -- rail_free_list_alloc: first-fit search. x0=size, returns ptr or 0
   "_rail_free_list_alloc:\n    adrp x1, _rail_free_list@PAGE\n    add x1, x1, _rail_free_list@PAGEOFF\n",
   ".Lfla_loop:\n    ldr x2, [x1]\n    cbz x2, .Lfla_fail\n    ldr x3, [x2]\n    cmp x3, x0\n    b.ge .Lfla_found\n    add x1, x2, #8\n    b .Lfla_loop\n",
@@ -2645,7 +2652,13 @@ rt_gc_1 =
   -- munmap the exact region. Without this header Rail's `_free` stub is
   -- a no-op and large mmap'd pages never return to OS — the cause of
   -- the 38GB peak footprint at 500 steps on seq=512 chunked training.
-  "_rail_chained_malloc:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x0, [x29, #16]\n    add x0, x0, #31\n    and x0, x0, #-16\n    str x0, [x29, #24]\n    bl _malloc\n    ldr x2, [x29, #24]\n    str x2, [x0, #8]\n    adrp x1, _rail_malloc_chain@PAGE\n    add x1, x1, _rail_malloc_chain@PAGEOFF\n    ldr x2, [x1]\n    str x2, [x0]\n    str x0, [x1]\n    add x0, x0, #16\n    ldp x29, x30, [sp], #32\n    ret\n\n",
+  -- Small requests (≤64KB) round up to a power-of-two size class and try
+  -- the per-class free list first; misses fall through to _malloc with the
+  -- class size. Large requests (>64KB) go straight to _malloc with the
+  -- aligned total, same as pre-fix behavior. Stored alloc_size at [chunk,#8]
+  -- is always the actual block size (class_bytes for small, aligned total
+  -- for large) so drain's munmap path is unchanged.
+  "_rail_chained_malloc:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    add x0, x0, #31\n    and x0, x0, #-16\n    cmp x0, #32\n    b.hs .Lcm_k32\n    mov x0, #32\n.Lcm_k32:\n    cmp x0, #65536\n    b.hi .Lcm_alloc_direct\n    sub x3, x0, #1\n    clz x3, x3\n    mov x4, #64\n    sub x3, x4, x3\n    sub x2, x3, #5\n    mov x0, #1\n    lsl x0, x0, x3\n    adrp x4, _rail_small_fl@PAGE\n    add x4, x4, _rail_small_fl@PAGEOFF\n    add x5, x4, x2, lsl #3\n    ldr x6, [x5]\n    cbz x6, .Lcm_alloc_direct\n    ldr x7, [x6]\n    str x7, [x5]\n    str x0, [x29, #24]\n    mov x0, x6\n    b .Lcm_link\n.Lcm_alloc_direct:\n    str x0, [x29, #24]\n    bl _malloc\n.Lcm_link:\n    ldr x2, [x29, #24]\n    str x2, [x0, #8]\n    adrp x1, _rail_malloc_chain@PAGE\n    add x1, x1, _rail_malloc_chain@PAGEOFF\n    ldr x2, [x1]\n    str x2, [x0]\n    str x0, [x1]\n    add x0, x0, #16\n    ldp x29, x30, [sp], #32\n    ret\n\n",
   -- rail_malloc_chain_drain: walk the chain down to _rail_chain_mark,
   -- release each chunk. Preserves anything allocated before the
   -- outstanding arena_mark (e.g. weights created in main). Rail's `_free`
@@ -2654,7 +2667,7 @@ rt_gc_1 =
   -- chunks live inside the _rail_malloc_ptr bump region and can't be
   -- individually returned; we fall through to `_free` (no-op) for those.
   -- The 64KB cutoff matches `_malloc`'s internal b.hi .Lmal_large test.
-  "_rail_malloc_chain_drain:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x19, [x29, #16]\n    str x20, [x29, #24]\n    adrp x19, _rail_malloc_chain@PAGE\n    add x19, x19, _rail_malloc_chain@PAGEOFF\n    adrp x20, _rail_chain_mark@PAGE\n    add x20, x20, _rail_chain_mark@PAGEOFF\n.Lmdrn_loop:\n    ldr x0, [x19]\n    ldr x1, [x20]\n    cmp x0, x1\n    b.eq .Lmdrn_done\n    cbz x0, .Lmdrn_done\n    ldr x2, [x0]\n    str x2, [x19]\n    ldr x3, [x0, #8]\n    cmp x3, #65536\n    b.ls .Lmdrn_small\n    str x0, [x29, #32]\n    str x3, [x29, #40]\n    mov x1, x3\n    mov x16, #73\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lmdrn_loop\n.Lmdrn_small:\n    bl _free\n    b .Lmdrn_loop\n.Lmdrn_done:\n    ldr x20, [x29, #24]\n    ldr x19, [x29, #16]\n    ldp x29, x30, [sp], #64\n    ret\n\n"]
+  "_rail_malloc_chain_drain:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x19, [x29, #16]\n    str x20, [x29, #24]\n    adrp x19, _rail_malloc_chain@PAGE\n    add x19, x19, _rail_malloc_chain@PAGEOFF\n    adrp x20, _rail_chain_mark@PAGE\n    add x20, x20, _rail_chain_mark@PAGEOFF\n.Lmdrn_loop:\n    ldr x0, [x19]\n    ldr x1, [x20]\n    cmp x0, x1\n    b.eq .Lmdrn_done\n    cbz x0, .Lmdrn_done\n    ldr x2, [x0]\n    str x2, [x19]\n    ldr x3, [x0, #8]\n    cmp x3, #65536\n    b.ls .Lmdrn_small\n    str x0, [x29, #32]\n    str x3, [x29, #40]\n    mov x1, x3\n    mov x16, #73\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lmdrn_loop\n.Lmdrn_small:\n    sub x4, x3, #1\n    clz x4, x4\n    mov x5, #64\n    sub x4, x5, x4\n    sub x4, x4, #5\n    adrp x5, _rail_small_fl@PAGE\n    add x5, x5, _rail_small_fl@PAGEOFF\n    add x5, x5, x4, lsl #3\n    ldr x6, [x5]\n    str x6, [x0]\n    str x0, [x5]\n    b .Lmdrn_loop\n.Lmdrn_done:\n    ldr x20, [x29, #24]\n    ldr x19, [x29, #16]\n    ldp x29, x30, [sp], #64\n    ret\n\n"]
 
 rt_gc_2 =
   -- _gc_try_mark: x0=value. Check if heap ptr, mark if valid object, push children.
