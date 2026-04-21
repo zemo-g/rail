@@ -1440,3 +1440,153 @@ int tgl_matmul_half_host(const double *A, const double *B, double *C,
     }
     return 1;
 }
+
+// Zero-cast fp16 element-wise add. Inputs + output are packed-half
+// float_arrs; GPU keeps accumulator in fp32 and casts back to half at
+// store. Uses the tensor_add_f16 kernel (gid-per-element, 1-D).
+int tgl_add_half_host(const double *A, const double *B, double *C, int n) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    const uint16_t *Bptr = (const uint16_t *)(B + 1);
+    uint16_t       *Cptr = (uint16_t       *)(C + 1);
+
+    @autoreleasepool {
+        NSUInteger bytes = (NSUInteger)n * 2;
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufB = pool_acquire(bytes);
+        id<MTLBuffer> bufC = pool_acquire(bytes);
+
+        memcpy(bufA.contents, Aptr, bytes);
+        memcpy(bufB.contents, Bptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_add_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufC offset:0 atIndex:2];
+        uint32_t nu = n;
+        [enc setBytes:&nu length:4 atIndex:3];
+
+        NSUInteger tg = 256;
+        [enc dispatchThreadgroups:MTLSizeMake((n + tg - 1) / tg, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, bytes);
+        pool_release(bufA); pool_release(bufB); pool_release(bufC);
+    }
+    return 1;
+}
+
+// Zero-cast fp16 element-wise scale. Scalar is passed via a 1-element
+// Rail float_arr (same ABI as tgl_scale_f64): scalar_arr[1] holds the
+// f64 value, narrowed to fp32 on the GPU side.
+int tgl_scale_half_host(const double *A, double *C,
+                        const double *scalar_arr, int n) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    uint16_t       *Cptr = (uint16_t       *)(C + 1);
+    float sf = (float)scalar_arr[1];
+
+    @autoreleasepool {
+        NSUInteger bytes = (NSUInteger)n * 2;
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufC = pool_acquire(bytes);
+
+        memcpy(bufA.contents, Aptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_scale_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufC offset:0 atIndex:1];
+        [enc setBytes:&sf length:4 atIndex:2];
+        uint32_t nu = n;
+        [enc setBytes:&nu length:4 atIndex:3];
+        dispatch_1d(enc, n);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, bytes);
+        pool_release(bufA); pool_release(bufC);
+    }
+    return 1;
+}
+
+// Zero-cast fp16 matrix transpose: B[N×M] = A[M×N]^T. Packed-half
+// storage in + out, no f64 boundary cross.
+int tgl_transpose_half_host(const double *A, double *B, int M, int N) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    uint16_t       *Bptr = (uint16_t       *)(B + 1);
+    NSUInteger bytes = (NSUInteger)M * (NSUInteger)N * 2;
+
+    @autoreleasepool {
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufB = pool_acquire(bytes);
+        memcpy(bufA.contents, Aptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_transpose_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        uint32_t mu = M, nu = N;
+        [enc setBytes:&mu length:4 atIndex:2];
+        [enc setBytes:&nu length:4 atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(N, M, 1)
+          threadsPerThreadgroup:MTLSizeMake(N < 16 ? N : 16, M < 16 ? M : 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Bptr, bufB.contents, bytes);
+        pool_release(bufA); pool_release(bufB);
+    }
+    return 1;
+}
+
+// Zero-cast fp16 row-wise softmax. Log-sum-exp reformulation keeps
+// exp() inputs ≤ 0 on the GPU so no fp16 overflow even when raw
+// logits would have saturated. Accumulators stay fp32.
+int tgl_softmax_half_host(const double *A, double *C, int rows, int cols) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    uint16_t       *Cptr = (uint16_t       *)(C + 1);
+    NSUInteger bytes = (NSUInteger)rows * (NSUInteger)cols * 2;
+
+    @autoreleasepool {
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufC = pool_acquire(bytes);
+        memcpy(bufA.contents, Aptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_softmax_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufC offset:0 atIndex:1];
+        uint32_t ru = rows, cu = cols;
+        [enc setBytes:&ru length:4 atIndex:2];
+        [enc setBytes:&cu length:4 atIndex:3];
+        dispatch_1d(enc, rows);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, bytes);
+        pool_release(bufA); pool_release(bufC);
+    }
+    return 1;
+}

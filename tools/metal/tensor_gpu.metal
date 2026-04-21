@@ -800,3 +800,69 @@ kernel void matmul_bias_gelu_f16(
     C[row * N + col] = half(0.5f * x * (1.0f + tanh(inner)));
 }
 
+// ═══════════════════════════════════════════════════════════
+// fp16 ELEMENT-WISE (HalfTensor zero-cast — S2 Mini)
+// Accumulators stay fp32 on the GPU; storage stays fp16.
+// ═══════════════════════════════════════════════════════════
+
+kernel void tensor_add_f16(
+    device const half *A  [[buffer(0)]],
+    device const half *B  [[buffer(1)]],
+    device half       *C  [[buffer(2)]],
+    constant uint     &n  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    C[gid] = half(float(A[gid]) + float(B[gid]));
+}
+
+kernel void tensor_scale_f16(
+    device const half *A       [[buffer(0)]],
+    device half       *C       [[buffer(1)]],
+    constant float    &scalar  [[buffer(2)]],
+    constant uint     &n       [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    C[gid] = half(float(A[gid]) * scalar);
+}
+
+kernel void tensor_transpose_f16(
+    device const half *A  [[buffer(0)]],
+    device half       *B  [[buffer(1)]],
+    constant uint     &M  [[buffer(2)]],
+    constant uint     &N  [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.y >= M || gid.x >= N) return;
+    B[gid.x * M + gid.y] = A[gid.y * N + gid.x];
+}
+
+// Row-wise softmax in log-sum-exp form. One thread per row; all
+// reductions in fp32 so exp(x - rowmax) never overflows fp16's
+// ~65504 ceiling even when raw logits would. Output clamps to
+// [0, 1] by construction. Cast back to half at store.
+kernel void tensor_softmax_f16(
+    device const half *A     [[buffer(0)]],
+    device half       *C     [[buffer(1)]],
+    constant uint     &rows  [[buffer(2)]],
+    constant uint     &cols  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= rows) return;
+    uint row_off = gid * cols;
+    float mx = float(A[row_off]);
+    for (uint j = 1; j < cols; j++) {
+        float v = float(A[row_off + j]);
+        if (v > mx) mx = v;
+    }
+    float s = 0.0f;
+    for (uint j = 0; j < cols; j++) {
+        s += exp(float(A[row_off + j]) - mx);
+    }
+    float inv = 1.0f / max(s, 1e-20f);
+    for (uint j = 0; j < cols; j++) {
+        C[row_off + j] = half(exp(float(A[row_off + j]) - mx) * inv);
+    }
+}
+
