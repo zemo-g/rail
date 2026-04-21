@@ -827,3 +827,14 @@ kernel void tensor_scale_f16(
     C[gid] = half(float(A[gid]) * scalar);
 }
 
+kernel void tensor_transpose_f16(
+    device const half *A  [[buffer(0)]],
+    device half       *B  [[buffer(1)]],
+    constant uint     &M  [[buffer(2)]],
+    constant uint     &N  [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.y >= M || gid.x >= N) return;
+    B[gid.x * M + gid.y] = A[gid.y * N + gid.x];
+}
+
