@@ -1482,3 +1482,41 @@ int tgl_add_half_host(const double *A, const double *B, double *C, int n) {
     }
     return 1;
 }
+
+// Zero-cast fp16 element-wise scale. Scalar is passed via a 1-element
+// Rail float_arr (same ABI as tgl_scale_f64): scalar_arr[1] holds the
+// f64 value, narrowed to fp32 on the GPU side.
+int tgl_scale_half_host(const double *A, double *C,
+                        const double *scalar_arr, int n) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    uint16_t       *Cptr = (uint16_t       *)(C + 1);
+    float sf = (float)scalar_arr[1];
+
+    @autoreleasepool {
+        NSUInteger bytes = (NSUInteger)n * 2;
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufC = pool_acquire(bytes);
+
+        memcpy(bufA.contents, Aptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_scale_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufC offset:0 atIndex:1];
+        [enc setBytes:&sf length:4 atIndex:2];
+        uint32_t nu = n;
+        [enc setBytes:&nu length:4 atIndex:3];
+        dispatch_1d(enc, n);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, bytes);
+        pool_release(bufA); pool_release(bufC);
+    }
+    return 1;
+}
