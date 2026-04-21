@@ -1520,3 +1520,38 @@ int tgl_scale_half_host(const double *A, double *C,
     }
     return 1;
 }
+
+// Zero-cast fp16 matrix transpose: B[N×M] = A[M×N]^T. Packed-half
+// storage in + out, no f64 boundary cross.
+int tgl_transpose_half_host(const double *A, double *B, int M, int N) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    uint16_t       *Bptr = (uint16_t       *)(B + 1);
+    NSUInteger bytes = (NSUInteger)M * (NSUInteger)N * 2;
+
+    @autoreleasepool {
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufB = pool_acquire(bytes);
+        memcpy(bufA.contents, Aptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_transpose_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        uint32_t mu = M, nu = N;
+        [enc setBytes:&mu length:4 atIndex:2];
+        [enc setBytes:&nu length:4 atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(N, M, 1)
+          threadsPerThreadgroup:MTLSizeMake(N < 16 ? N : 16, M < 16 ? M : 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Bptr, bufB.contents, bytes);
+        pool_release(bufA); pool_release(bufB);
+    }
+    return 1;
+}
