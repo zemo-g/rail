@@ -178,18 +178,47 @@ ports back-to-back:
 So tonight delivers **2 production-ready fp16 kernel drafts** (matmul,
 matmul_blocked) — the first concrete artifacts of Phase 4a Option A
 via the labrat agent. The transplant checklist is in
-`tools/metal/fp16_drafts/RESULTS.md`. Tomorrow's Phase 4a work:
+`tools/metal/fp16_drafts/RESULTS.md`.
 
-1. Review and merge those two kernels into `tools/metal/tensor_gpu.metal`
-   (rename existing `matmul` → `matmul_f32` first, since labrat assumed
-   that name).
-2. Iterate prompt v5+ on bias_relu with the fp32-bias hint.
-3. Once bias_relu KEEPs cleanly, run `tools/labrat/port_kernels.sh` over
-   the full kernel list to chain-port the rest overnight.
+**Overnight continuation (00:00–08:30 EDT):** session continued
+autonomously. Two prompt iterations (v5, v6) and two new guards
+(ambiguity detection, fence-strip in parser) landed. All three
+remaining matmul-family kernels delivered:
+
+| Kernel | Task-spec lesson | Speedup | Commit |
+|---|---|---|---|
+| matmul_blocked   | same as matmul | 1.6× | `b79452b` |
+| matmul_bias_relu | **fp32-bias hint** — keeps bias as fp32 to avoid per-cell conversion | 1.8× | `ab1f106` |
+| matmul_bias_gelu | fp32-bias + uniqueness hint | 1.7× | `d324f95` |
+
+tensor_relu attempted but plateaued at 1.1–1.2× — unary ops need
+vectorized (half4/half8) task specs before labrat hits the gate.
+Documented as a limit of the current scaffold. Commit `85ef7d2`.
+
+**End-of-session state: 4 production-ready fp16 kernel drafts** at
+`tools/metal/fp16_drafts/`. Phase 4a Option A's matmul sub-family is
+done pending transplant + dylib wiring.
+
+Tomorrow's Phase 4a work:
+
+1. Review + merge the 4 drafts into `tools/metal/tensor_gpu.metal`
+   (rename existing `matmul`, `matmul_blocked`, `matmul_bias_relu`,
+   `matmul_bias_gelu` → `_f32` first).
+2. Add `tgl_*_f16` foreign decls in `stdlib/tensor.rail` and host
+   dispatch in `tools/metal/tensor_gpu_lib.m` for each.
+3. Rebuild `libtensor_gpu.dylib`; `./rail_native test` must still pass.
+4. Once those are live, extend `port_kernels.sh` to cover softmax
+   family + layernorm + reductions (compute-bound, good labrat fit).
+   For unary ops, first revise the task-spec template to require
+   half4/half8 vectorization.
 
 ## Final commit log this session
 
 ```
+85ef7d2 labrat: fence-strip in patch parser + tensor_relu findings
+d324f95 labrat: prompt v6 (uniqueness hint) + ambiguity guard + bias_gelu port
+ab1f106 fp16_drafts: matmul_bias_relu ported — 1.8x with fp32-bias hint
+a7b8bcd docs: session handoff — late-night addendum + full commit log
 88b2953 labrat: prompt v5 — drop file delimiters entirely
 b79452b fp16_drafts: 2 labrat-produced kernels (matmul, matmul_blocked)
 4209d8a labrat: chain runner for sequential kernel ports
