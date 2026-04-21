@@ -1,0 +1,127 @@
+-- matmul_half_smoke.rail — Phase 4b follow-on numerical + wall-time check.
+--
+-- Two pieces:
+--   (1) Correctness: 128×128 matmul via matmul_half (zero-cast path) vs
+--       matmul via the f64 reference, max-abs diff must be < 1e-2 (same
+--       half-precision tolerance the existing fp16_matmul_smoke uses).
+--   (2) Microbench: 1024×1024 matmul, per-call ns for tgl_matmul_f16
+--       (with f64↔f16 cast) vs tgl_matmul_half_host (no cast). The
+--       delta is the cast overhead Phase 4b left on the table.
+--
+-- Run: DYLD_LIBRARY_PATH=tools/metal ./rail_native run tools/test/matmul_half_smoke.rail
+-- Exits 1 on numerical failure; 0 on pass.
+
+import "stdlib/tensor.rail"
+
+foreign tgl_init dummy -> int
+
+-- Nanosecond wall clock via shell (Rail's stdlib/time is second-
+-- granularity; foreign float returns are finicky for int-arg timers).
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = char_to_int (head cs) - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+
+now_ns _ =
+  let s = shell "date +%s%N | tr -d '\\n'"
+  parse_int_acc (chars s) 0
+
+-- Deterministic fill: tent-shaped values in [-0.5, 0.5] so matmul
+-- outputs stay in half's normal range (~6.1e-5 … 6.5e4).
+fill_seeded arr n seed i =
+  if i >= n then 0
+  else
+    let x = (i + seed) % 100
+    let v = int_to_float x / 100.0 - 0.5
+    let _ = float_arr_set arr i v
+    fill_seeded arr n seed (i + 1)
+
+max_diff_loop a b n i best =
+  if i >= n then best
+  else
+    let raw = float_arr_get a i - float_arr_get b i
+    let d = if raw > 0.0 then raw else 0.0 - raw
+    let b2 = if d > best then d else best
+    max_diff_loop a b n (i + 1) b2
+
+unwrap_t t = match t | Tensor d _ _ -> d
+unwrap_h h = match h | HalfTensor d _ _ -> d
+
+-- Counted loops for timing (avoids foreign-call match nesting depth).
+bench_f16_loop a b c m k n iters i =
+  if i >= iters then 0
+  else
+    let _ = tgl_matmul_f16 a b c m k n
+    bench_f16_loop a b c m k n iters (i + 1)
+
+bench_half_loop a b c m k n iters i =
+  if i >= iters then 0
+  else
+    let _ = tgl_matmul_half_host a b c m k n
+    bench_half_loop a b c m k n iters (i + 1)
+
+make_tensor m n seed =
+  let arr = float_arr_new (m * n) 0.0
+  let _ = fill_seeded arr (m * n) seed 0
+  Tensor arr (cons m (cons n [])) (compute_strides (cons m (cons n [])))
+
+main =
+  let _ = tgl_init 0
+
+  -- ========== (1) correctness ==========
+  let m = 128
+  let A = make_tensor m m 0
+  let B = make_tensor m m 37
+  let C_f64 = matmul A B
+  let Ch = matmul_half (half_of_tensor A) (half_of_tensor B)
+  let C_rt = tensor_of_half Ch
+  let md = max_diff_loop (unwrap_t C_f64) (unwrap_t C_rt) (m * m) 0 0.0
+  let md_scaled = float_to_int (md * 10000.0)
+  let _ = print (cat ["matmul_half 128x128 max_abs_diff=", show_float md, "  scaled=", show md_scaled])
+  let tolerance_fail = md_scaled >= 100
+
+  -- ========== (2) microbench ==========
+  let mb = 1024
+  let iters = 50
+  let Ab = make_tensor mb mb 7
+  let Bb = make_tensor mb mb 43
+  let Cf16 = float_arr_new (mb * mb) 0.0
+  let Ahb = half_of_tensor Ab
+  let Bhb = half_of_tensor Bb
+  let Chb = half_tensor_new (cons mb (cons mb []))
+
+  let ad = unwrap_t Ab
+  let bd = unwrap_t Bb
+  let ahd = unwrap_h Ahb
+  let bhd = unwrap_h Bhb
+  let chd = unwrap_h Chb
+
+  -- Warmup (pipeline compile on first dispatch).
+  let _ = tgl_matmul_f16 ad bd Cf16 mb mb mb
+  let _ = tgl_matmul_half_host ahd bhd chd mb mb mb
+
+  let t0 = now_ns 0
+  let _ = bench_f16_loop ad bd Cf16 mb mb mb iters 0
+  let t1 = now_ns 0
+  let ns_f16 = t1 - t0
+
+  let u0 = now_ns 0
+  let _ = bench_half_loop ahd bhd chd mb mb mb iters 0
+  let u1 = now_ns 0
+  let ns_half = u1 - u0
+
+  let _ = print (cat ["iters=", show iters, "  1024x1024 matmul"])
+  let _ = print (cat ["  tgl_matmul_f16       total_ns=", show ns_f16, "  per_call_ns=", show (ns_f16 / iters)])
+  let _ = print (cat ["  tgl_matmul_half_host total_ns=", show ns_half, "  per_call_ns=", show (ns_half / iters)])
+  let speedup_x100 = ns_f16 * 100 / ns_half
+  let _ = print (cat ["  cast-elimination speedup_x100=", show speedup_x100])
+
+  if tolerance_fail then
+    let _ = print "FAIL matmul_half: max_abs_diff too large"
+    1
+  else
+    let _ = print "ok matmul_half"
+    0
