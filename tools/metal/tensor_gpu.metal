@@ -800,3 +800,19 @@ kernel void matmul_bias_gelu_f16(
     C[row * N + col] = half(0.5f * x * (1.0f + tanh(inner)));
 }
 
+// ═══════════════════════════════════════════════════════════
+// fp16 ELEMENT-WISE (HalfTensor zero-cast — S2 Mini)
+// Accumulators stay fp32 on the GPU; storage stays fp16.
+// ═══════════════════════════════════════════════════════════
+
+kernel void tensor_add_f16(
+    device const half *A  [[buffer(0)]],
+    device const half *B  [[buffer(1)]],
+    device half       *C  [[buffer(2)]],
+    constant uint     &n  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    C[gid] = half(float(A[gid]) + float(B[gid]));
+}
+
