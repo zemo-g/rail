@@ -16,7 +16,7 @@ without me. Authored at the end of a 6-hour session that landed Phase
 - ✅ Phase 5.0 labrat scaffold + first end-to-end win (1.8× fp16 matmul, iter 1) + prompt v4 + no-op detection + float-compare workaround
 - ✅ Phase 5.0b Code-JEPA design doc
 - ✅ Phase 2d.E snapshot/rollback primitives scaffolded in `self_train.rail`
-- ✅ Stability sweep launched (results at `/tmp/labrat_stability_summary` when done — check first thing in the morning)
+- ✅ Stability sweep COMPLETE (2026-04-21 00:03): **4/5 KEPT (80% success)**, real KEEP speedups 1.7/1.8/1.9/1.8 → mean **1.80×**, 22-min wall. Labrat is operationally cheap for kernel ports.
 
 **Top-priority next moves (ordered):**
 1. Read the stability sweep result. Decide whether labrat is robust enough to delegate kernel ports.
