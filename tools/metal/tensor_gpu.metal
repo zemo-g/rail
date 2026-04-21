@@ -816,3 +816,14 @@ kernel void tensor_add_f16(
     C[gid] = half(float(A[gid]) + float(B[gid]));
 }
 
+kernel void tensor_scale_f16(
+    device const half *A       [[buffer(0)]],
+    device half       *C       [[buffer(1)]],
+    constant float    &scalar  [[buffer(2)]],
+    constant uint     &n       [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    C[gid] = half(float(A[gid]) * scalar);
+}
+
