@@ -160,9 +160,41 @@ diff /tmp/labrat_test/seed.metal.orig /tmp/labrat_test/fp16_kernel_v1.metal
 - Re-attempt `xcrun metal` install — not necessary (validator path works) and is hours of bandwidth.
 - Trust single-chunk loss as a ranking signal. Multi-chunk eval (every 100 steps) is the only reliable ranking signal — it's already wired in `lm_v3_chunked.rail`.
 
+## Late-night addendum (00:00–00:40 EDT)
+
+After the formal handoff was written, ran labrat on two more kernel
+ports back-to-back:
+
+- **matmul_blocked**: KEPT @ iter 5, speedup 1.6× (right at gate). Saved
+  to `tools/metal/fp16_drafts/matmul_blocked_f16.metal`.
+- **matmul_bias_relu**: 0/5 KEPT in v4 (closing-fence echo dominated).
+  After **prompt v5** fix (drop all file delimiters, natural text flow),
+  v5 retry got real iters (no more no-ops) but plateaued at 1.2–1.3×
+  speedup. Conclusion: bias_relu is a harder fp16 target — model
+  produces literal half-bias which costs conversion in the inner loop.
+  A v5+ task spec should hint "keep bias as fp32 buffer to avoid
+  per-cell conversion overhead." Documented in `tools/metal/fp16_drafts/RESULTS.md`.
+
+So tonight delivers **2 production-ready fp16 kernel drafts** (matmul,
+matmul_blocked) — the first concrete artifacts of Phase 4a Option A
+via the labrat agent. The transplant checklist is in
+`tools/metal/fp16_drafts/RESULTS.md`. Tomorrow's Phase 4a work:
+
+1. Review and merge those two kernels into `tools/metal/tensor_gpu.metal`
+   (rename existing `matmul` → `matmul_f32` first, since labrat assumed
+   that name).
+2. Iterate prompt v5+ on bias_relu with the fp32-bias hint.
+3. Once bias_relu KEEPs cleanly, run `tools/labrat/port_kernels.sh` over
+   the full kernel list to chain-port the rest overnight.
+
 ## Final commit log this session
 
 ```
+88b2953 labrat: prompt v5 — drop file delimiters entirely
+b79452b fp16_drafts: 2 labrat-produced kernels (matmul, matmul_blocked)
+4209d8a labrat: chain runner for sequential kernel ports
+6b5afae labrat: stability sweep result — 4/5 KEPT (80%), mean speedup 1.80x
+ac40c10 docs: session handoff for 2026-04-21 AM — full cold-start context
 e1bd472 docs: 1d.4 leak root cause LOCALIZED — _free is no-op stub at compile.rail:2855
 4e8b8e2 labrat: prompt v4 (markdown fences) + no-op patch detection
 f74ec2a labrat: first end-to-end win (1.8x fp16) + stability sweep runner
