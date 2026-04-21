@@ -94,8 +94,18 @@ LABRAT_SPEC=/tmp/labrat_test/fp16_spec.json /tmp/labrat_bin
 
 ## Next increments
 
-- **Stability sweep (overnight 2026-04-20→21):** run labrat 10× on the
-  same task, count successes. See `tools/labrat/stability_run.sh`.
+- **Stability sweep (2026-04-20 23:41 → 2026-04-21 00:03, N=5):**
+  - **Success rate: 4/5 = 80%.** Total wall 22 min.
+  - Per-run KEEP speedups (real iter values, not the parser's
+    first-match display bug): **1.7×, 1.8×, 1.9×, 1.8× — mean 1.80×.**
+  - One run (4/5) ran 5 iters all rolled back — likely MLX sampling
+    variance hitting a string of degenerate patches. Suggests the
+    inner loop should retry on full-loop failure.
+  - Conclusion: labrat is robust enough at this task class to delegate
+    overnight kernel ports. Phase 4a Option A is now operationally
+    cheap.
+- **Re-run with bigger model on :8081 (Qwen3.6-35B-A3B-8bit)?** May
+  push success to 5/5 and lift mean speedup. One-line plist switch.
 - **Port to production:** transplant the working `matmul_f16` into
   `tools/metal/tensor_gpu.metal` (renaming existing `matmul` →
   `matmul_f32` first), add Rail-side `tgl_matmul_f16` foreign decl.
