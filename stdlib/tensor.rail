@@ -18,6 +18,14 @@ foreign exp x -> float
 -- ADT: flat float array + shape + strides (row-major)
 type Tensor = | Tensor data shape strides
 
+-- HalfTensor: the same shape/strides machinery, but `half_data` is a
+-- float_arr whose 8-byte slots are reinterpreted as packed uint16_t[4].
+-- Storage size = ceil(n_elements / 4) slots, where n_elements is
+-- product(shape). See tools/metal/tensor_gpu_lib.m: tgl_f64_to_half /
+-- tgl_half_to_f64 / tgl_matmul_half_host cross the boundary once at
+-- cast time so hot-path matmuls don't pay the f64↔f16 cast.
+type HalfTensor = | HalfTensor half_data shape strides
+
 -- ============================================================
 -- Shape utilities
 -- ============================================================
@@ -228,6 +236,13 @@ foreign tgl_matmul_f16           a b c m k n -> int
 foreign tgl_matmul_blocked_f16   a b c m k n -> int
 foreign tgl_matmul_bias_relu_f16 a b bias c m k n -> int
 foreign tgl_matmul_bias_gelu_f16 a b bias c m k n -> int
+
+-- HalfTensor primitives (Phase 4b follow-on). Pack/unpack cross the
+-- host-side f64↔f16 boundary once; matmul_half_host accepts already-
+-- packed half buffers so hot-path calls skip the cast.
+foreign tgl_f64_to_half      src dst n -> int
+foreign tgl_half_to_f64      src dst n -> int
+foreign tgl_matmul_half_host a b c m k n -> int
 
 -- Has dylib been initialized this process?
 -- Note: the previous top-level `float_arr` cache was broken by Rail's
@@ -457,6 +472,56 @@ matmul_bias_gelu_f16 a b bias = match a
       let c_data = float_arr_new (m_dim * n_dim) 0.0
       let _ = tgl_matmul_bias_gelu_f16 a_data b_data bias c_data m_dim k_dim n_dim
       Tensor c_data (cons m_dim (cons n_dim [])) (compute_strides (cons m_dim (cons n_dim [])))
+
+-- ============================================================
+-- HalfTensor — f16-native representation
+-- ============================================================
+
+-- Packed-half storage size: one 8-byte float_arr slot holds 4 halfs.
+-- For n half elements we need ceil(n/4) slots. Slot 0 of the underlying
+-- float_arr still holds the slot-count header (set by float_arr_new).
+half_storage_slots n = (n + 3) / 4
+
+-- Allocate an uninitialized HalfTensor with the given shape. Content
+-- is zero-bit-pattern, which in fp16 is 0.0 — so this is effectively
+-- half_zeros, same as tensor_zeros for Tensor.
+half_tensor_new shape =
+  let n = list_product shape
+  let data = float_arr_new (half_storage_slots n) 0.0
+  HalfTensor data shape (compute_strides shape)
+
+-- f64 Tensor → packed HalfTensor (host-side, one cast). Used at init,
+-- checkpoint load, and eval boundaries — NOT inside the training loop.
+half_of_tensor t = match t
+  | Tensor t_data shape strides ->
+    let n = list_product shape
+    let h_data = float_arr_new (half_storage_slots n) 0.0
+    let _ = tgl_f64_to_half t_data h_data n
+    HalfTensor h_data shape strides
+
+-- Packed HalfTensor → f64 Tensor. Inverse of half_of_tensor; used at
+-- measurement / checkpoint save time.
+tensor_of_half h = match h
+  | HalfTensor h_data shape strides ->
+    let n = list_product shape
+    let t_data = float_arr_new n 0.0
+    let _ = tgl_half_to_f64 h_data t_data n
+    Tensor t_data shape strides
+
+-- fp16 matmul on already-packed HalfTensors. Zero cast at the host
+-- boundary — memcpy in, GPU kernel runs on fp16, memcpy out. This is
+-- the Phase 4b follow-on: the language stops paying the cast on every
+-- call; it pays once at init/checkpoint.
+matmul_half a b = match a
+  | HalfTensor a_data a_shape a_strides -> match b
+    | HalfTensor b_data b_shape b_strides ->
+      let m_dim = head a_shape
+      let k_dim = head (tail a_shape)
+      let n_dim = head (tail b_shape)
+      let out_shape = cons m_dim (cons n_dim [])
+      let c_data = float_arr_new (half_storage_slots (m_dim * n_dim)) 0.0
+      let _ = tgl_matmul_half_host a_data b_data c_data m_dim k_dim n_dim
+      HalfTensor c_data out_shape (compute_strides out_shape)
 
 -- ============================================================
 -- Element-wise ops (explicit loops, no function passing)
