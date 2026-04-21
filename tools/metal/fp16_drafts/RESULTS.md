@@ -6,6 +6,7 @@
 | matmul_blocked     | KEPT | 1.6× | 5/5 | ~9  | `matmul_blocked_f16.metal` |
 | matmul_bias_relu (v1) | rolled back | — | 0/5 | ~9 | (see v2) |
 | matmul_bias_relu (v2, fp32-bias hint) | **KEPT** | **1.8×** | 1/5 | ~5 | `matmul_bias_relu_f16.metal` |
+| matmul_bias_gelu (v6, uniqueness + fp32-bias) | **KEPT** | **1.7×** | 1/5 | ~5 | `matmul_bias_gelu_f16.metal` |
 
 ## matmul_bias_relu failure mode
 
