@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <sys/time.h>
 
 static id<MTLDevice>               g_device = nil;
 static id<MTLCommandQueue>         g_queue = nil;
@@ -1347,6 +1348,95 @@ int tgl_unary_from_source(const char *src, const char *kname,
 
         f32_to_f64((float *)bY.contents, Yp, N);
         pool_release(bX); pool_release(bY);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Sub-ms wall clock for microbenches. Rail's stdlib/time.rail `time`
+// is Unix-second granularity; this returns float ms since epoch.
+// ────────────────────────────────────────────────────────────────────
+
+double tgl_now_ms(int _ignored) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// HalfTensor path (Phase 4b follow-on, 2026-04-21).
+//
+// These entry points skip the f64↔f16 cast that tgl_matmul_f16 pays on
+// every call. A HalfTensor's Rail-side storage is a float_arr whose
+// data area is reinterpreted as packed uint16_t[n]. Pack/unpack crosses
+// the Rail↔C boundary once at cast time (init, checkpoint) rather than
+// per-matmul. Kernels still use the existing matmul_f16 shader — only
+// the host-side entry changes.
+//
+// ABI: Rail's float_arr layout is [length(8), data...]. We pass the
+// float_arr pointer as `double*` for ABI consistency and cast to
+// `uint16_t*` internally. That cast plus the `+1` offset gives a
+// pointer to the first packed half.
+// ────────────────────────────────────────────────────────────────────
+
+// f64 array → packed-half float_arr (host-side). Callers pass two Rail
+// float_arrs; after the call, dst's data area holds n packed halfs.
+int tgl_f64_to_half(const double *src, double *dst, int n) {
+    const double *Sp = src + 1;
+    uint16_t *Dp = (uint16_t *)(dst + 1);
+    f64_to_f16(Sp, Dp, n);
+    return 1;
+}
+
+// Inverse: packed-half float_arr → f64 array.
+int tgl_half_to_f64(const double *src, double *dst, int n) {
+    const uint16_t *Sp = (const uint16_t *)(src + 1);
+    double *Dp = dst + 1;
+    f16_to_f64(Sp, Dp, n);
+    return 1;
+}
+
+// Zero-cast fp16 matmul. Inputs and output are packed-half float_arrs.
+// Kernel is the existing matmul_f16 shader; only the host side changes:
+// memcpy in, dispatch, memcpy out. No f64 staging buffer, no per-element
+// cast. This is the Phase 4b "eliminate the language's need for the
+// cast" line item.
+int tgl_matmul_half_host(const double *A, const double *B, double *C,
+                         int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    const uint16_t *Bptr = (const uint16_t *)(B + 1);
+    uint16_t *Cptr       = (uint16_t       *)(C + 1);
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        memcpy(bufA.contents, Aptr, sA*2);
+        memcpy(bufB.contents, Bptr, sB*2);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufC offset:0 atIndex:2];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:3];
+        [enc setBytes:&ku length:4 atIndex:4];
+        [enc setBytes:&nu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, sC*2);
+        pool_release(bufA); pool_release(bufB); pool_release(bufC);
     }
     return 1;
 }
