@@ -1440,3 +1440,45 @@ int tgl_matmul_half_host(const double *A, const double *B, double *C,
     }
     return 1;
 }
+
+// Zero-cast fp16 element-wise add. Inputs + output are packed-half
+// float_arrs; GPU keeps accumulator in fp32 and casts back to half at
+// store. Uses the tensor_add_f16 kernel (gid-per-element, 1-D).
+int tgl_add_half_host(const double *A, const double *B, double *C, int n) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    const uint16_t *Bptr = (const uint16_t *)(B + 1);
+    uint16_t       *Cptr = (uint16_t       *)(C + 1);
+
+    @autoreleasepool {
+        NSUInteger bytes = (NSUInteger)n * 2;
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufB = pool_acquire(bytes);
+        id<MTLBuffer> bufC = pool_acquire(bytes);
+
+        memcpy(bufA.contents, Aptr, bytes);
+        memcpy(bufB.contents, Bptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_add_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufC offset:0 atIndex:2];
+        uint32_t nu = n;
+        [enc setBytes:&nu length:4 atIndex:3];
+
+        NSUInteger tg = 256;
+        [enc dispatchThreadgroups:MTLSizeMake((n + tg - 1) / tg, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, bytes);
+        pool_release(bufA); pool_release(bufB); pool_release(bufC);
+    }
+    return 1;
+}
