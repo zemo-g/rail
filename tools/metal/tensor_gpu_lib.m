@@ -1555,3 +1555,38 @@ int tgl_transpose_half_host(const double *A, double *B, int M, int N) {
     }
     return 1;
 }
+
+// Zero-cast fp16 row-wise softmax. Log-sum-exp reformulation keeps
+// exp() inputs ≤ 0 on the GPU so no fp16 overflow even when raw
+// logits would have saturated. Accumulators stay fp32.
+int tgl_softmax_half_host(const double *A, double *C, int rows, int cols) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    uint16_t       *Cptr = (uint16_t       *)(C + 1);
+    NSUInteger bytes = (NSUInteger)rows * (NSUInteger)cols * 2;
+
+    @autoreleasepool {
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufC = pool_acquire(bytes);
+        memcpy(bufA.contents, Aptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_softmax_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufC offset:0 atIndex:1];
+        uint32_t ru = rows, cu = cols;
+        [enc setBytes:&ru length:4 atIndex:2];
+        [enc setBytes:&cu length:4 atIndex:3];
+        dispatch_1d(enc, rows);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, bytes);
+        pool_release(bufA); pool_release(bufC);
+    }
+    return 1;
+}
