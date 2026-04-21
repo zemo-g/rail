@@ -16,12 +16,15 @@ pick up first.
 - **Test floor: 136/137 on Studio** (only pre-existing `gpu_map` Metal env
   FAIL). Mini 137/137.
 - **Self-compile fixed point held** at every commit.
-- **Parallel Mini session running Phase 1c T5 overnight** — d=64 × 2-block
-  × seq=1024 × 540 KB corpus, ~12,000 steps / ~3.5 h wall. 500-step
-  staging showed clean warmup (8.40 → 3.15 in 100 steps) then plateau
-  at 3.1–3.3. Overnight establishes baseline loss + resolves plateau-
-  vs-floor. Not in my lane; check `/tmp/t5_overnight.log` + the parallel
-  session's own handoff if present.
+- **Phase 1c T5 run COMPLETE** (killed at step 11183/12000, 5h38m wall).
+  Full handoff: `training/rail_native/T5_OVERNIGHT.md`. Headline:
+  **min loss 1.37 @ step 1157** — the 2.7–3.3 band was per-chunk eval
+  variance, not a loss floor. **d=64 is not capacity-bound.** Separate
+  finding: peak RSS 35.84 GB (vs 437 MB at 500 steps) — small-block
+  leak active in back half.
+- **fp16 probe (Option A decision gate) PASSES:** 1.70× at N=1024,
+  1.92× at N=2048 on M1 Ultra. Exceeds the 1.6× threshold from
+  `MIXED_PRECISION_SCOPE.md`. Binary at `tools/metal/probes/fp16_probe`.
 
 ## Today's commits (bottom-up)
 
@@ -49,15 +52,17 @@ Plus infra: mlx_studio plist bound 10.42.0.2 → 0.0.0.0 and reloaded
 | 0     | ✅ DONE | Three commits shipped |
 | 1a    | ✅ DONE | `--out-prefix` flag |
 | 1b    | ⏸ Stream 1 | BPE hash table — coordination required; not mine to touch |
-| 1c    | 🏃 Running | Parallel session overnight on lm_v3_chunked.rail |
-| 2a    | ⏳ Blocked | Waits on 1c baseline loss curve |
+| 1c    | ✅ DONE | Min loss 1.37; d=64 not capacity-bound. See `training/rail_native/T5_OVERNIGHT.md` |
+| 1d    | 🟢 Next | Multi-chunk eval + memory bisect. Precondition for Phase 2. |
+| 2a    | ⏳ Blocked on 1d | Revised: ≤3000 steps with multi-chunk eval |
 | 2b    | ⏳ Blocked | Waits on 2a |
 | 2c    | ⏳ Blocked | Waits on 2a/b |
 | 2d    | ✅ DONE | Structurally + 5.31× batch + 10.6× N=16 round — validated live |
+| 2d.E  | 🟢 Can start | Snapshot/rollback (nnzap-inspired). Small, post-1c OK |
 | 3a    | ⏳ Blocked | `harvest_clean_v2.jsonl` lives in private `rail-training` repo |
 | 3b    | ⏳ Blocked | Needs 3a + `flywheel/` code (private repo) |
 | 3c    | ✅ DONE | Cleanup done; match parse bug non-reproducible in current HEAD |
-| 4a    | ✅ DONE | Scoping doc shipped — decision pending from user |
+| 4a    | 🟢 Gate open | Scoping doc shipped; probe measured 1.70× at N=1024 — Option A worth pursuing |
 | 4b    | ⏳ Blocked | Needs 2a/b trained checkpoint + harvest_clean_v2 |
 | 4c    | ⏳ Blocked | Needs 4b soak output |
 | 5.1   | ⏸ Private repo territory | flywheel process-level parallelism |
@@ -67,24 +72,26 @@ Plus infra: mlx_studio plist bound 10.42.0.2 → 0.0.0.0 and reloaded
 
 ## First-to-act list for next session (priority order)
 
-1. **Read parallel session's 1c result.** `/tmp/t5_overnight.log` +
-   `training/rail_native/T5_OVERNIGHT.md` if committed. Loss curve
-   resolution — plateau at 3.1–3.3 or descent below? This is the single
-   biggest decision input for Phase 2a.
-2. **Confirm MLX :8080 is still up** on Studio. `launchctl list | grep
-   mlx_studio` and `curl -sf localhost:8080/v1/models`. MLX crashes have
-   been observed under concurrent load; if down, `launchctl load ~/Library/LaunchAgents/com.ledatic.mlx_studio.plist`.
-3. **Decide Phase 2a launch** (width d=64 → d=128, 2-block). Single-line
-   edit to `tools/train/lm_v3_chunked.rail`. Only proceed if the 1c loss
-   curve shows capacity bottleneck (plateau ~3.0+). If 1c dropped well
-   below 3.0, consider depth up first (2b).
-4. **If Phase 3a/b wanted:** confirm with user where
-   `Ledatic-Empire/rail-training` is cloned locally (or clone it) and
-   wire up paths. `harvest_clean_v2.jsonl` + `flywheel/harvest_filter.rail`
-   are both in that repo.
-5. **If waiting on training runs + no 2a/3 decision yet:** pick a
-   Phase 5 stretch item that's self-contained. 5.2 (typed effects) is
-   best-scoped; 5.3 (Stage0) and 5.4 (all-reduce) are weekend-scale.
+1. **Phase 1d.1 — multi-chunk eval in `lm_v3_chunked.rail`.** Held-out
+   fixed-seed 10-chunk average every N=100 steps. This is the ranking
+   signal. Without it, Phase 2a tells you nothing (single-chunk loss
+   spans 1.4–4+). See master plan Phase 1d.
+2. **Phase 1d.2 + 1d.3 — RSS snapshots every 500 steps, 2000-step
+   memory-bisect run.** 437 MB → 35 GB growth needs localization.
+   Likely small-block arena or an allocation in `m_train_step`
+   accumulating across `arena_reset`.
+3. **Phase 1d.4 — fix the leak** once bisect identifies the growth
+   regime. Likely mirrors `d24340c` (munmap path for bump region) or
+   pulls an `arr_new` out of the hot path.
+4. **Phase 2a launch** (d=64 → d=128, 2-block, **≤3000 steps**, multi-chunk
+   eval). Only meaningful after 1d. Compare 10-chunk mean @ step ≤1500
+   vs d=64 baseline captured in 1d validation.
+5. **Phase 4a fp16 Option A** — the decision gate passed (1.70× @ N=1024).
+   Decide: hand-port kernels (~2-3d) vs drive via Phase 5.0 labrat-style
+   agent (~1d + durable infra). User call.
+6. **Phase 2d.E snapshot/rollback** — small, independent, can interleave.
+7. **Phase 3a/b** if `Ledatic-Empire/rail-training` is clonable on Studio
+   — `harvest_clean_v2.jsonl` + `flywheel/harvest_filter.rail` live there.
 
 ## What the parallel self_train path can do now
 
@@ -173,7 +180,9 @@ curl -sf http://localhost:8080/v1/models | head -3
    Phase 3c work item.
 2. **fp16 Option A** — scoping doc `MIXED_PRECISION_SCOPE.md` recommends
    fp16 Metal kernels (2–3 days, contained risk) this week. User flagged
-   "everything this week" for fp16 — awaiting go on Option A.
+   "everything this week" for fp16. **2026-04-20 PM: probe measured
+   1.70× at N=1024, 1.92× at N=2048 — passes the 1.6× decision gate.**
+   Open sub-decision: hand-port vs agent-driven (Phase 5.0 labrat).
 3. **Phase 5 stretch priority** — not chosen. Master plan ranks 5.1 →
    5.2 → 5.3 → 5.4 by leverage; 5.1 lives in private repo.
 4. **Model swap on mlx_studio** — "better models on disc" noted today.
