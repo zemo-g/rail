@@ -99,7 +99,96 @@ a code path that doesn't write the chunk header (e.g. an older
 linearly. **Compile.rail bisect of `_rail_chained_malloc` call sites
 is the next investigation step.**
 
+## Root cause LOCALIZED (2026-04-20 23:45)
+
+`tools/compile.rail:2855`:
+```rail
+let nfree = "_free:\n    ret\n\n"
+```
+
+Rail emits its own `_malloc` (line 2854, direct-mmap allocator using a
+4MB shared page for sub-64KB requests + per-allocation mmap for larger)
+AND its own `_free` — which is a literal no-op (`ret`).
+
+Drain at `_rail_malloc_chain_drain` (line 2657):
+```asm
+ldr x3, [x0, #8]            ; chunk size
+cmp x3, #65536              ; > 64KB?
+b.ls .Lmdrn_small           ; ≤ 64KB → small path
+... munmap(chunk, size) ... ; > 64KB → returned to OS ✓
+.Lmdrn_small:
+    bl _free                ; ← no-op, sub-64KB stays malloc'd
+```
+
+So:
+- Blocks > 64KB → munmap → reclaimed ✓
+- Blocks ≤ 64KB → `_free` → no-op → leak ✗
+
+For training at d=64 seq=1024, the 4-8 MB tensors (matmul outputs,
+attention scores) hit the munmap path. But the dozens of sub-64KB
+allocations per step (Tensor wrappers, gradient buffers for biases,
+RMSNorm γ tensors of size d=64*8=512 bytes, and many cons/list cells)
+all go through `_free`-no-op → 3 MB/step accumulation observed.
+
+## Why the no-op exists
+
+Rail's small-block `_malloc` doesn't track per-allocation metadata.
+Sub-64KB requests bump within a shared 4MB mmap'd page. There's no
+free list for individual chunks within these pages. A real `_free`
+would need either (a) a small-block free-list allocator, or (b)
+reference counting of which 4MB pages are entirely freed (so they
+can be munmap'd as a unit).
+
 ## Fix paths
+
+### Option A — true small-block free list (clean, ~1 day)
+
+Add a `_rail_small_free_list` keyed by power-of-two size class. `_free`
+pushes onto the appropriate class. `_malloc` (small path) checks the
+class first before bumping. Standard small-allocator design.
+
+Risk: must not corrupt the bump-pointer invariants used elsewhere.
+Test path: same memory bisect, target flat RSS at 2000 steps.
+
+### Option B — fix the threshold and force more allocations to be munmap-eligible (quick, ~1 hr)
+
+Change `cmp x3, #65536` to a smaller threshold (e.g. `#4096`). Then
+sub-64KB but >4KB blocks would also try munmap. Risk: those blocks
+were allocated from the shared 4MB page, NOT individually mmap'd, so
+munmap would either fail (different region) or corrupt the page.
+**Doesn't work as-is** — would need `_rail_chained_malloc` to also
+allocate via direct mmap for medium blocks (>4KB). That's a small
+refactor in `_malloc` itself.
+
+### Option C — bigger bump arena + smarter GC compaction (medium, ~half day)
+
+Increase the 512MB arena to 2GB+. Most training steps would fit
+without ever hitting the chained_malloc fallback. Combine with
+arena_reset that resets the bump pointer (already cheap O(1)).
+Doesn't fix the underlying leak, just defers it. Won't survive
+12k-step runs but probably fine for ≤3k-step Phase 2a/2b.
+
+### Option D — application-level: pre-allocate gradient + intermediate buffers (medium, scoped)
+
+In `m_train_step`, replace per-step `float_arr_new` calls for known-
+shape intermediates (gradient accumulators, attention scratch) with
+pre-allocated arrays initialized in `main`. Each step OVERWRITES in
+place rather than allocating. Eliminates the per-step alloc churn
+that drives the leak.
+
+Closest to "no allocator changes needed" but requires careful audit
+of m_train_step for which allocations are actually hot.
+
+## Recommendation
+
+**Tonight: defer.** Each option is multi-hour and touches load-bearing
+code. Phase 2a/2b/2c run fine within the 6-10 GB RSS budget at ≤3000
+steps; the leak isn't blocking anything in the week's plan.
+
+**Next dedicated session (1d.4 actual fix):** Option A is the cleanest
+permanent fix. Option D is a fast workaround if needed first.
+
+
 
 **A. Deep fix (2–4 h).** Inspect `tools/metal/tensor_gpu_lib.m`. For
 each foreign entry that returns a float_arr: confirm the caller-side
