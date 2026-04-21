@@ -7,6 +7,25 @@
 | matmul_bias_relu (v1) | rolled back | — | 0/5 | ~9 | (see v2) |
 | matmul_bias_relu (v2, fp32-bias hint) | **KEPT** | **1.8×** | 1/5 | ~5 | `matmul_bias_relu_f16.metal` |
 | matmul_bias_gelu (v6, uniqueness + fp32-bias) | **KEPT** | **1.7×** | 1/5 | ~5 | `matmul_bias_gelu_f16.metal` |
+| tensor_relu (attempted) | rolled back | 1.1–1.2× | — | ~3 (stopped iter 3) | — |
+
+## Unary op finding (2026-04-21 08:25)
+
+**Pure 1:1 fp16 ports of simple unary kernels (tensor_relu) don't clear
+the 1.6× gate.** Bench measured 1.1–1.2× across iters — the kernel is
+launch-latency bound at its current shape (one thread per element, one
+`max(x, 0)` op). Memory bandwidth savings from half-precision are
+eaten by dispatch overhead.
+
+Real wins for unary ops need **vectorization** (half4 / half8 loads with
+1 thread per group of 4–8 elements). That's a different task class —
+the goal prompt needs to specify the vectorized algorithm, not a
+1:1 type swap. Save for a later spec revision.
+
+**Good news:** fence-strip in parser + ambiguity guard both fired
+correctly across the run. Labrat's infra is now robust enough to
+handle these "legitimate-but-below-gate" cases without corrupting
+state.
 
 ## matmul_bias_relu failure mode
 
