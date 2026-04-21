@@ -1,0 +1,315 @@
+-- labrat.rail — autonomous kernel-optimizer agent entry point.
+-- Phase 5.0 (2026-04-20 PM). Implemented per README protocol:
+--   snapshot → edit → compile → test → bench → keep/rollback
+--
+-- Usage:
+--   LABRAT_SPEC=tools/labrat/tasks/fp16_matmul.spec \
+--     ./rail_native run tools/labrat/labrat.rail
+--   (default spec used if the env var is empty)
+--
+-- Rail has no runtime argv exposed from `./rail_native run`, so we
+-- take the spec path from the LABRAT_SPEC env var and fall back to the
+-- fp16 task spec. Same pattern as fleet_agent_v3's get_port.
+--
+-- NOTE: this file imports researcher.rail implicitly via the outer
+-- runner (the first-run gate in README lands researcher primitives
+-- separately). To avoid a hard coupling during scaffolding we shell
+-- out for compile + bench only inside labrat.rail (no researcher
+-- functions are called from here); the README protocol is preserved.
+-- When researcher.rail is live, swap the shell blocks for its
+-- snapshot_file / restore_file / apply_patch / compile_metal /
+-- run_bench calls.
+
+import "stdlib/llm.rail"
+import "stdlib/mlx_client.rail"
+import "stdlib/env.rail"
+import "stdlib/time.rail"
+import "stdlib/list.rail"
+
+-- Knob constants — tune via labrat.rail edits, not inline.
+labrat_max_iters = 5
+labrat_bench_gate_ratio = 1.6
+labrat_correctness_tol = 0.001
+labrat_mlx_port = "8080"
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- LOCAL HELPERS (parsers + string utils). Prefix `lb_` to avoid name collisions.
+-- ──────────────────────────────────────────────────────────────────────────────
+
+-- Parse a decimal integer from a leading digit run; stop on first non-digit.
+-- Returns 0 if the string starts non-numeric (good enough for spec fields).
+lb_pi_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else lb_pi_acc (tail cs) (acc * 10 + d)
+
+lb_parse_int s = lb_pi_acc (chars s) 0
+
+-- Extract a JSON-ish string value for "key": "val".
+-- Uses the same trick as stdlib/mlx_client.rail:extract_field — find
+-- `"key":`, skip to next quote, read up to next quote. No escape
+-- handling. Adequate for spec files we author ourselves.
+lb_get_str body key =
+  let q = char_from_int 34
+  let marker = join "" [q, key, q, ":"]
+  let i = str_find marker body
+  if i < 0 then ""
+  else
+    let after_m = str_sub body (i + length marker) (length body - i - length marker)
+    let qi = str_find q after_m
+    if qi < 0 then ""
+    else
+      let val_start = qi + 1
+      let rest = str_sub after_m val_start (length after_m - val_start)
+      let end_qi = str_find q rest
+      if end_qi < 0 then rest
+      else str_sub rest 0 end_qi
+
+-- Extract a JSON-ish numeric field for "key": 123 or "key": 1.6.
+-- Finds the marker, then reads the numeric run (digits, '.', '-').
+-- Returns the raw numeric string ("" if not found) — callers decide
+-- parse_int vs parse_float.
+lb_scan_num cs acc =
+  if length cs == 0 then reverse acc
+  else
+    let c = head cs
+    let ci = char_to_int c
+    -- digits '0'..'9' = 48..57, '.' = 46, '-' = 45, '+' = 43
+    let is_d = ci >= 48 && ci <= 57
+    let is_p = ci == 46 || ci == 45 || ci == 43
+    if is_d || is_p then lb_scan_num (tail cs) (cons c acc)
+    else reverse acc
+
+lb_get_num_str body key =
+  let q = char_from_int 34
+  let marker = join "" [q, key, q, ":"]
+  let i = str_find marker body
+  if i < 0 then ""
+  else
+    let after_m = str_sub body (i + length marker) (length body - i - length marker)
+    -- skip leading whitespace + optional space
+    let sp = char_from_int 32
+    let trimmed = if length after_m > 0 && head (chars after_m) == sp
+                  then str_sub after_m 1 (length after_m - 1)
+                  else after_m
+    join "" (lb_scan_num (chars trimmed) [])
+
+lb_get_int body key =
+  let s = lb_get_num_str body key
+  if length s == 0 then 0 else lb_parse_int s
+
+lb_get_float body key =
+  let s = lb_get_num_str body key
+  if length s == 0 then 0.0 else parse_float s
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- PARSE_SPEC — returns a 6-element list:
+--   [name, target, goal, bench_bin, N (as show-int-string), min_speedup_str]
+-- plus max_iters reported separately via nth. We bundle as a list so
+-- labrat_run can `nth i spec` cleanly. Strings only (parse numerics at
+-- the call site) — keeps the returned list homogeneous.
+--
+-- Return shape (indices):
+--   0: name          — task id, used in transcript filename
+--   1: target        — file to edit (e.g. tools/metal/tensor_gpu.metal)
+--   2: goal          — natural-language instruction for the LLM
+--   3: bench_bin     — compiled bench binary path
+--   4: N_str         — matrix size (still a string)
+--   5: min_speedup_s — threshold vs fp32 (still a string)
+--   6: max_iters_s   — loop cap (still a string)
+-- ──────────────────────────────────────────────────────────────────────────────
+
+parse_spec path =
+  let content = read_file path
+  let name = lb_get_str content "name"
+  let target = lb_get_str content "target"
+  let goal = lb_get_str content "goal"
+  -- bench_bin appears under both "correctness" and "throughput"; the
+  -- first match is fine since they're the same binary in the spec.
+  let bench_bin = lb_get_str content "bench_bin"
+  let n_str = lb_get_num_str content "N"
+  let speed_str = lb_get_num_str content "min_speedup_vs_fp32"
+  let iters_str = lb_get_num_str content "max_iters"
+  [name, target, goal, bench_bin, n_str, speed_str, iters_str]
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- AGENT LOOP HELPERS
+-- ──────────────────────────────────────────────────────────────────────────────
+
+-- Shell out to cp for snapshot/restore. Thin wrapper — the researcher
+-- module will eventually own this; for now keeping labrat.rail
+-- self-contained so the scaffold runs standalone.
+lb_snapshot path snap =
+  let _ = shell (join "" ["cp ", path, " ", snap])
+  1
+
+lb_restore snap path =
+  let _ = shell (join "" ["cp ", snap, " ", path])
+  1
+
+-- Apply a find/replace patch. Mirrors researcher.apply_patch so the
+-- eventual swap is a one-line change.
+lb_apply_patch path find_text replace_text =
+  let content = read_file path
+  let new_content = str_replace find_text replace_text content
+  let _ = write_file path new_content
+  1
+
+-- Compile the Metal target. Exit code 0 = success, anything else fail.
+-- Captures stderr to a log so a failed iteration leaves a breadcrumb.
+lb_compile target out_lib =
+  let log = "/tmp/labrat_compile.log"
+  let cmd = join "" [
+    "xcrun -sdk macosx metal -c ", target, " -o /tmp/labrat_intermediate.air 2> ", log,
+    " && xcrun -sdk macosx metallib /tmp/labrat_intermediate.air -o ", out_lib,
+    " 2>> ", log,
+    " && echo OK || echo FAIL"]
+  let out = shell cmd
+  str_contains "OK" out
+
+-- Run the bench binary. Parse the last float on stdout as the speedup.
+-- Robust to the bench emitting extra status lines.
+lb_bench bench_bin =
+  let out = shell (join "" [bench_bin, " 2>/dev/null | tail -n 1"])
+  parse_float out
+
+-- Unified-find-replace response parser. LLM is instructed to emit:
+--   FIND: <exact text>
+--   REPLACE: <exact text>
+--   END
+-- We locate the FIND/REPLACE/END markers on their own lines and slice
+-- between them. Returns ("", "") on parse failure.
+lb_parse_patch resp =
+  let find_tag = "FIND:\n"
+  let repl_tag = "\nREPLACE:\n"
+  let end_tag = "\nEND"
+  let fi = str_find find_tag resp
+  if fi < 0 then ("", "")
+  else
+    let after_find = str_sub resp (fi + length find_tag) (length resp - fi - length find_tag)
+    let ri = str_find repl_tag after_find
+    if ri < 0 then ("", "")
+    else
+      let find_text = str_sub after_find 0 ri
+      let after_repl_start = ri + length repl_tag
+      let after_repl = str_sub after_find after_repl_start (length after_find - after_repl_start)
+      let ei = str_find end_tag after_repl
+      let replace_text = if ei < 0 then after_repl else str_sub after_repl 0 ei
+      (find_text, replace_text)
+
+-- Build the LLM prompt. Kept outside the loop body so the promptology
+-- is easy to tweak without touching control flow.
+lb_prompt goal target_contents last_result =
+  join "" [
+    "You are optimizing a Metal kernel in a Rail project.\n\n",
+    "TASK: ", goal, "\n\n",
+    "CURRENT FILE CONTENTS:\n",
+    "=== BEGIN FILE ===\n",
+    target_contents,
+    "\n=== END FILE ===\n\n",
+    "LAST ITERATION RESULT: ", last_result, "\n\n",
+    "Propose ONE minimal edit as a unified find/replace block. ",
+    "Output EXACTLY this shape, nothing else:\n",
+    "FIND:\n",
+    "<verbatim text that appears in the file, long enough to be unique>\n",
+    "REPLACE:\n",
+    "<the new text to substitute>\n",
+    "END\n"]
+
+-- Transcript line for one iteration. Not a full JSON event — one line,
+-- tab-separated, greppable.
+lb_transcript_line iter decision speedup detail =
+  join "" [
+    show iter, "\t",
+    decision, "\t",
+    "speedup=", show_temp speedup, "\t",
+    detail, "\n"]
+
+-- Reuse show_temp from mlx_client (imported transitively). Gives us
+-- "1.7" instead of needing a full float formatter.
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- AGENT LOOP proper. Recursive worker over iteration index; terminates
+-- on success (speedup ≥ gate) or when iter > max_iters.
+-- ──────────────────────────────────────────────────────────────────────────────
+
+-- One iteration: prompt → patch → compile → bench → keep/rollback.
+-- Returns (kept_bool_as_int, speedup, detail_str) so the driver can log
+-- + decide whether to continue. Keeps params ≤ 10 per rail_quirks.
+labrat_step target goal snap bench_bin min_speed last_result out_lib iter =
+  let file_text = read_file target
+  let prompt = lb_prompt goal file_text last_result
+  let resp = llm_call labrat_mlx_port "You are a Metal kernel optimizer." prompt
+  let (find_t, repl_t) = lb_parse_patch resp
+  if length find_t == 0 then
+    let _ = print (join "" ["iter ", show iter, ": parse-fail, skipping"])
+    (0, 0.0, "parse-fail")
+  else
+    let _ = lb_apply_patch target find_t repl_t
+    let ok = lb_compile target out_lib
+    if not ok then
+      let _ = print (join "" ["iter ", show iter, ": compile-fail, rollback"])
+      let _ = lb_restore snap target
+      (0, 0.0, "compile-fail")
+    else
+      let speedup = lb_bench bench_bin
+      if speedup >= min_speed then
+        let _ = print (join "" ["iter ", show iter, ": KEEP speedup=", show_temp speedup])
+        let _ = lb_snapshot target snap  -- roll snapshot forward
+        (1, speedup, "kept")
+      else
+        let _ = print (join "" ["iter ", show iter, ": rollback speedup=", show_temp speedup])
+        let _ = lb_restore snap target
+        (0, speedup, "below-gate")
+
+-- Drive labrat_step across iterations. Appends to the transcript log
+-- after each iteration.
+labrat_loop target goal snap bench_bin min_speed out_lib tlog iter max_iter last_result =
+  if iter > max_iter then 0
+  else
+    let (kept, speedup, detail) = labrat_step target goal snap bench_bin min_speed last_result out_lib iter
+    let line = lb_transcript_line iter (if kept == 1 then "KEEP" else "ROLLBACK") speedup detail
+    let _ = write_file tlog (join "" [read_file tlog, line])
+    if kept == 1 then 1
+    else
+      let next_result = join "" ["iter ", show iter, " ", detail, " speedup=", show_temp speedup]
+      labrat_loop target goal snap bench_bin min_speed out_lib tlog (iter + 1) max_iter next_result
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- labrat_run — the outer entry point called by main.
+-- ──────────────────────────────────────────────────────────────────────────────
+
+labrat_run spec_path =
+  let spec = parse_spec spec_path
+  let name = nth 0 spec
+  let target = nth 1 spec
+  let goal = nth 2 spec
+  let bench_bin = nth 3 spec
+  let min_speed_s = nth 5 spec
+  let max_iter_s = nth 6 spec
+  let min_speed = if length min_speed_s == 0 then labrat_bench_gate_ratio else parse_float min_speed_s
+  let max_iter = if length max_iter_s == 0 then labrat_max_iters else lb_parse_int max_iter_s
+  let ts = show (now 0)
+  let tlog = join "" ["tools/labrat/transcripts/", name, "-", ts, ".log"]
+  let _ = shell "mkdir -p tools/labrat/transcripts"
+  let _ = write_file tlog (join "" ["# labrat run ", name, " @ ", ts, "\n"])
+  let snap = join "" ["/tmp/labrat_snap_", name, "_", ts]
+  let out_lib = join "" ["/tmp/labrat_", name, ".metallib"]
+  let _ = lb_snapshot target snap
+  let _ = print (join "" ["labrat: ", name, " target=", target, " gate=", show_temp min_speed, " max_iter=", show max_iter])
+  let _ = print (join "" ["labrat: transcript -> ", tlog])
+  labrat_loop target goal snap bench_bin min_speed out_lib tlog 1 max_iter "none (first iteration)"
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- main — Rail doesn't expose argv at runtime. LABRAT_SPEC env var
+-- selects the spec; default to the fp16 task.
+-- ──────────────────────────────────────────────────────────────────────────────
+
+main =
+  let from_env = get_env "LABRAT_SPEC"
+  let spec_path = if length from_env > 0 then from_env else "tools/labrat/tasks/fp16_matmul.spec"
+  labrat_run spec_path
