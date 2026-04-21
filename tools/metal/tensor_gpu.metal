@@ -642,3 +642,161 @@ kernel void tensor_transpose(
     if (gid.y >= M || gid.x >= N) return;
     B[gid.x * M + gid.y] = A[gid.y * N + gid.x];
 }
+
+// ═══════════════════════════════════════════════════════════
+// fp16 VARIANTS — labrat-produced (Phase 4a Option A, 2026-04-21)
+// See docs/plans/LABRAT_FIRST_WIN.md for the methodology.
+// Benchmarked at N=1024: 1.6-1.8x vs fp32 on M1 Ultra.
+// Accumulator stays float (fp32) to avoid reduction-rounding drift.
+// Bias variants keep bias as fp32 buffer (per-cell conversion cost).
+// ═══════════════════════════════════════════════════════════
+
+kernel void matmul_f16(
+    device const half *A [[buffer(0)]],
+    device const half *B [[buffer(1)]],
+    device half *C [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    constant uint &K [[buffer(4)]],
+    constant uint &N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint row = gid.y; uint col = gid.x;
+    threadgroup half As[TILE][TILE];
+    threadgroup half Bs[TILE][TILE];
+    float sum = 0.0f;
+    uint numTiles = (K + TILE - 1) / TILE;
+    for (uint t = 0; t < numTiles; t++) {
+        uint aCol = t * TILE + lid.x;
+        uint bRow = t * TILE + lid.y;
+        As[lid.y][lid.x] = (row < M && aCol < K) ? A[row * K + aCol] : half(0.0f);
+        Bs[lid.y][lid.x] = (bRow < K && col < N) ? B[bRow * N + col] : half(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < TILE; i++) sum += float(As[lid.y][i]) * float(Bs[i][lid.x]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < M && col < N) C[row * N + col] = half(sum);
+}
+
+kernel void matmul_blocked_f16(
+    device const half *A     [[buffer(0)]],
+    device const half *B     [[buffer(1)]],
+    device half       *C     [[buffer(2)]],
+    constant uint      &M     [[buffer(3)]],
+    constant uint      &K     [[buffer(4)]],
+    constant uint      &N     [[buffer(5)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint block_row = gid.y * BTILE;
+    uint block_col = gid.x * BTILE;
+    uint row_base = block_row + lid.y * BP;
+    uint col_base = block_col + lid.x * BP;
+
+    float acc[BP][BP];
+    for (uint i = 0; i < BP; i++)
+        for (uint j = 0; j < BP; j++)
+            acc[i][j] = 0.0f;
+
+    threadgroup half As[BTILE][BTILE];
+    threadgroup half Bs[BTILE][BTILE];
+
+    uint numTiles = (K + BTILE - 1) / BTILE;
+    for (uint t = 0; t < numTiles; t++) {
+        uint tile_k = t * BTILE;
+        for (uint i = 0; i < BP; i++) {
+            for (uint j = 0; j < BP; j++) {
+                uint ar = block_row + lid.y * BP + i;
+                uint ac = tile_k + lid.x * BP + j;
+                As[lid.y * BP + i][lid.x * BP + j] = (ar < M && ac < K) ? A[ar * K + ac] : half(0.0f);
+
+                uint br = tile_k + lid.y * BP + i;
+                uint bc = block_col + lid.x * BP + j;
+                Bs[lid.y * BP + i][lid.x * BP + j] = (br < K && bc < N) ? B[br * N + bc] : half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < BTILE; k++) {
+            half a_col[BP];
+            half b_row[BP];
+            for (uint i = 0; i < BP; i++) a_col[i] = As[lid.y * BP + i][k];
+            for (uint j = 0; j < BP; j++) b_row[j] = Bs[k][lid.x * BP + j];
+            for (uint i = 0; i < BP; i++)
+                for (uint j = 0; j < BP; j++)
+                    acc[i][j] += float(a_col[i]) * float(b_row[j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < BP; i++) {
+        for (uint j = 0; j < BP; j++) {
+            uint r = row_base + i;
+            uint c = col_base + j;
+            if (r < M && c < N) C[r * N + c] = half(acc[i][j]);
+        }
+    }
+}
+
+kernel void matmul_bias_relu_f16(
+    device const half *A    [[buffer(0)]],
+    device const half *B    [[buffer(1)]],
+    device const float *bias [[buffer(2)]],
+    device half       *C    [[buffer(3)]],
+    constant uint      &M    [[buffer(4)]],
+    constant uint      &K    [[buffer(5)]],
+    constant uint      &N    [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint row = gid.y;
+    uint col = gid.x;
+    threadgroup half As[TILE][TILE];
+    threadgroup half Bs[TILE][TILE];
+    float sum = 0.0f;
+    uint numTiles = (K + TILE - 1) / TILE;
+    for (uint t = 0; t < numTiles; t++) {
+        uint aCol = t * TILE + lid.x;
+        uint bRow = t * TILE + lid.y;
+        As[lid.y][lid.x] = (row < M && aCol < K) ? A[row * K + aCol] : half(0.0f);
+        Bs[lid.y][lid.x] = (bRow < K && col < N) ? B[bRow * N + col] : half(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < TILE; i++) sum += float(As[lid.y][i]) * float(Bs[i][lid.x]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row >= M || col >= N) return;
+    float biased = sum + bias[col];
+    C[row * N + col] = half(biased > 0.0f ? biased : 0.0f);
+}
+
+kernel void matmul_bias_gelu_f16(
+    device const half *A    [[buffer(0)]],
+    device const half *B    [[buffer(1)]],
+    device const float *bias [[buffer(2)]],
+    device half       *C    [[buffer(3)]],
+    constant uint      &M    [[buffer(4)]],
+    constant uint      &K    [[buffer(5)]],
+    constant uint      &N    [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint row = gid.y;
+    uint col = gid.x;
+    threadgroup half As[TILE][TILE];
+    threadgroup half Bs[TILE][TILE];
+    float sum = 0.0f;
+    uint numTiles = (K + TILE - 1) / TILE;
+    for (uint t = 0; t < numTiles; t++) {
+        uint aCol = t * TILE + lid.x;
+        uint bRow = t * TILE + lid.y;
+        As[lid.y][lid.x] = (row < M && aCol < K) ? A[row * K + aCol] : half(0.0f);
+        Bs[lid.y][lid.x] = (bRow < K && col < N) ? B[bRow * N + col] : half(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < TILE; i++) sum += float(As[lid.y][i]) * float(Bs[i][lid.x]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row >= M || col >= N) return;
+    float x = sum + bias[col];
+    const float c = 0.7978845608f;
+    float inner = c * (x + 0.044715f * x * x * x);
+    C[row * N + col] = half(0.5f * x * (1.0f + tanh(inner)));
+}
+
