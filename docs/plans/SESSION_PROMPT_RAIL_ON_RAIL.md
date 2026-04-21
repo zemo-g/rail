@@ -375,3 +375,47 @@ soak and 4c model card. `lm_v3_chunked_4block.rail` should be cloned
 from the current `lm_v3_chunked.rail` (not the /tmp bench variant).
 Staged 10 → 50 → 500 → 3000. Target eval mean below d=128×2-block's 2.87.
 
+
+---
+
+## Session B Phase 4b result (2026-04-21 PM, Mini)
+
+Rail-side wiring of the four fp16 foreigns landed as commits:
+
+- `35e96d4` stdlib: `matmul_f16` / `matmul_bias_relu_f16` / `matmul_bias_gelu_f16`
+- `6779569` train: `lm_v3_chunked_fp16` — forward-only fp16 variant
+- `5b4a726` bench: phase 4b fp16 vs f64 — 10-step seq=1024 d=128
+
+**Wall-time:** 1.067× speedup (f64 7.52 s → fp16 7.05 s median, 4 runs
+at seq=1024 d=128 10-step). Below the 1.3× target.
+
+**Convergence:** forward-only fp16 tracks f64 within ~0.2 nats over
+500 steps (final loss f64=2.04, fp16=2.27). Two intermediate samples
+exceed the 0.1 window but trajectory is real and stable.
+
+**Backward stays f64.** Tried two aggressive configs (all 23 bwd
+matmuls in fp16, then just grad-input bwd in fp16); both diverged by
+~1 full nat at step 500. Backward gradients have wider dynamic range
+than forward activations and fp16's 5-bit exponent rounds too
+aggressively for Adam to recover.
+
+**Why speedup under target:** half the matmuls are still f64, and the
+dylib's per-call f64↔f16 host cast eats most of the isolated-kernel
+win. A persistent-fp16-activation representation (cast once at block
+entry, not per-matmul) would push past 1.3×. See
+`docs/plans/PHASE_4B_BENCH.md` for the full write-up.
+
+**Gotcha log:**
+
+1. `/usr/bin/time` strips `DYLD_LIBRARY_PATH` on macOS 26 due to SIP —
+   use shell `time` for benches that need the dylib.
+2. `tools/metal/libtensor_gpu.dylib` is gitignored. Any change to
+   `tensor_gpu_lib.m` needs a per-machine rebuild (`clang -shared
+   -framework Metal -framework Foundation -fobjc-arc …` from
+   `tools/metal/`). Session A's fp16 dispatcher commit (`2680e20`) did
+   not come with an updated dylib, so Mini's was stale until rebuilt.
+
+**Files:** `stdlib/tensor.rail`, `tools/train/lm_v3_chunked_fp16.rail`,
+`docs/plans/PHASE_4B_BENCH.md`. No changes to
+`tools/train/lm_v3_chunked.rail` or
+`tools/train/lm_v3_chunked_4block.rail`.
