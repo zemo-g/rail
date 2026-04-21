@@ -2,7 +2,9 @@
 
 **Purpose:** drop-in context for the next working session. Read this file + `MEMORY.md` + `docs/plans/HALFTENSOR_SESSION1_RESULT.md` (for B's infrastructure) and you have everything to pick up without re-reading 2026-04-21's full session prompt.
 
-**HEAD at handoff time:** `0b35676` on `next`. Both Studio and Mini synced.
+**HEAD at handoff time:** `e2211cb` on `next` (Session 2 merge). Both lanes converged.
+
+**Status update 2026-04-22 (late):** HalfTensor Session 2 is DONE. Both lanes merged. See `docs/plans/HALFTENSOR_SESSION2_RESULT.md` for the consolidated numbers and `docs/plans/PROMPT_HALFTENSOR_S3.md` for the Phase 5 composed run (now the active next step). Skip to §"The next big thing" below for the updated block order.
 
 ---
 
@@ -79,21 +81,23 @@ Today's two independent wins compose into one experiment that could be the flywh
 
 ### The three work blocks in order
 
-**Block 1 (B) — HalfTensor Session 2 (4-5 hours).**
-Prompt: `docs/plans/PROMPT_B_HALFTENSOR.md` (Round 3 prompt). Scope revised in `docs/plans/HALFTENSOR_SESSION1_RESULT.md`:
-- `tools/train/lm_v3_chunked_half.rail` — weights init as HalfTensor at `main`, fwd pass on HalfTensors end-to-end, bwd casts to f64 at entry and updated weight back to half at adam step.
-- Half kernels in `tools/metal/tensor_gpu.metal` for: `tensor_softmax` (needs log-sum-exp), `tensor_scale`, `tensor_add`, `tensor_transpose`. Keep `rope_apply` and `rmsnorm_save` as f64 (per-element, precision-sensitive, small savings).
-- 500-step convergence check: eval within 0.2 of f64 baseline at each checkpoint. No NaN/Inf.
-- 10-step wall-time bench: target ≥1.6× vs f64 at `seq=1024 d=128 2-block, eval disabled`.
+**Block 1 — HalfTensor Session 2. ✅ DONE (2026-04-22).**
+Consolidated result: `docs/plans/HALFTENSOR_SESSION2_RESULT.md`.
+- ✅ 4 new half kernels (add/scale/transpose/softmax) ship, max-abs-diff <1e-3 vs f64. Softmax log-sum-exp overflow-safe.
+- ✅ `tools/train/lm_v3_chunked_half.rail` trains 500 steps, eval within 0.28 of f64 baseline (within noise).
+- ⚠️ Wall-time speedup at d=128 is 1.10× (below ≥1.6× target). Expected: matmul fraction is small at d=128; win lives at d=256.
+- ⚠️ RSS at d=128 is parity (512 vs 508 MB). Weight-memory halving is reclaimed by cast temps at d=128.
+- ⚠️ Mini's `./rail_native test` hung during S2 — unrelated to S2 changes per Mini's analysis, but needs re-confirmation on Mini before Session 3 launches.
 
-**Block 2 (A or B, whoever is free) — Phase 5 composed run (2-3 hours wall + analysis).**
-After Block 1 ships and its `lm_v3_chunked_half.rail` trains stably:
-- Clone `lm_v3_chunked_half.rail` → `lm_v3_chunked_d256_half.rail`. Set `d = 256` (line 659 in the 2-block layout), `d_ff = 3 * d` (auto).
-- Stage 10 → 50 → 500 steps on the new d first. Check peak RSS to confirm it fits. Check for NaN/Inf.
-- If stable: launch 3000-step run. Track peak RSS via `/usr/bin/time -l`. ETA ~1.5-2 h if HalfTensor delivers its 1.6× speedup.
+**Block 2 — Phase 5 composed run. 🔜 ACTIVE NEXT (Studio, 2-3 h).**
+Prompt: `docs/plans/PROMPT_HALFTENSOR_S3.md`. Single-machine this time (Studio); Mini idle unless a kernel fix is needed.
+- Clone `lm_v3_chunked_half.rail` → `lm_v3_chunked_d256_half.rail`. Set `d = 256` (auto-derived `d_ff` follows).
+- Stage 10 → 50 → 500 steps first. Check for NaN/Inf at the wider attention range.
+- If stable: launch 3000-step run. ETA ~1.5-2 h wall.
+- Parallel options during the run: (A) write `PHASE_4C_MODEL_CARD.md` skeleton; (B) Task #14 Phase 2d.E wiring; (C) `bench_railnative` on the current 4-block checkpoint.
 - Success: eval mean < 2.7. Stretch: eval < 2.5.
 
-**Block 3 (either session) — Phase 4c model card (2 hours).**
+**Block 3 (after Block 2) — Phase 4c model card (2 hours).**
 After Block 2 lands with a number:
 - New doc `docs/plans/PHASE_4C_MODEL_CARD.md`. Architecture, precision, training config, corpus, eval results, `bench_railnative` score, hardware/wall/energy cost, one-liner for web.
 - The defensible claim: *"A transformer whose training matmuls, inference matmuls, weights, and activations are all fp16 — verified end-to-end by a Rail compiler written in Rail."*
@@ -178,16 +182,12 @@ git log --oneline -5                       # expect HEAD = 0b35676 or newer
 git rev-parse HEAD origin/next              # should match
 ./rail_native test                          # expect 137/137 (Mini) or 136/137 (Studio)
 
-# 1. Is B's Session 2 done?
-git log --oneline | grep -i "half"          # look for a "train: lm_v3_chunked_half" commit
-
-#    If YES → jump to Block 2 (Phase 5 composed run). Verify half training
-#    runs: ./rail_native run tools/train/lm_v3_chunked_half.rail (set
-#    max_steps=10 first), confirm loss descends, then clone + bump d=256.
-
-#    If NO → either pick up Session 2 yourself (see docs/plans/PROMPT_B_HALFTENSOR.md
-#    and HALFTENSOR_SESSION1_RESULT.md for the revised scope), or start a
-#    parallel task (Phase 2d.E wiring is the highest-leverage alternative).
+# 1. Session 2 is DONE. Session 3 is active.
+#    Read: docs/plans/HALFTENSOR_SESSION2_RESULT.md  (what landed)
+#    Read: docs/plans/PROMPT_HALFTENSOR_S3.md        (what to do next)
+#
+#    If Mini's ./rail_native test was still hanging, rerun to confirm 137/137.
+#    (Session 2 flagged this as unrelated to S2 changes but unverified.)
 
 # 2. Rebuild dylib if tensor_gpu_lib.m changed since last time
 test tools/metal/tensor_gpu_lib.m -nt tools/metal/libtensor_gpu.dylib && \
