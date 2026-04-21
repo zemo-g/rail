@@ -364,6 +364,39 @@ static inline void f32_to_f64(const float *src, double *dst, int n) {
     for (int i = 0; i < n; i++) dst[i] = (double)src[i];
 }
 
+// IEEE 754 double → half (flush subnormals to zero; saturate on overflow).
+// Used by the fp16 matmul entry points. Bias buffers stay fp32 on the GPU
+// side — only activations/weights go through half conversion.
+static inline void f64_to_f16(const double *src, uint16_t *dst, int n) {
+    for (int i = 0; i < n; i++) {
+        float f = (float)src[i];
+        union { float f; uint32_t u; } v; v.f = f;
+        uint32_t sign = (v.u >> 31) & 0x1;
+        int32_t  exp  = (int32_t)((v.u >> 23) & 0xFF) - 127 + 15;
+        uint32_t mant = v.u & 0x7FFFFF;
+        if (exp <= 0)       dst[i] = (uint16_t)(sign << 15);
+        else if (exp >= 31) dst[i] = (uint16_t)((sign << 15) | (0x1F << 10));
+        else                dst[i] = (uint16_t)((sign << 15) | ((uint32_t)exp << 10) | (mant >> 13));
+    }
+}
+
+// IEEE 754 half → double. Subnormals flush to zero (kernels produce
+// normalized outputs for trained workloads).
+static inline void f16_to_f64(const uint16_t *src, double *dst, int n) {
+    for (int i = 0; i < n; i++) {
+        uint16_t h = src[i];
+        uint32_t sign = (h >> 15) & 0x1;
+        uint32_t exp  = (h >> 10) & 0x1F;
+        uint32_t mant = h & 0x3FF;
+        uint32_t f32;
+        if (exp == 0)       f32 = sign << 31;
+        else if (exp == 31) f32 = (sign << 31) | 0x7F800000 | (mant << 13);
+        else                f32 = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+        union { uint32_t u; float f; } v; v.u = f32;
+        dst[i] = (double)v.f;
+    }
+}
+
 // Dispatch a 1D "gid < n" kernel with N threads. Threadgroup 256 covers typical sizes.
 static void dispatch_1d(id<MTLComputeCommandEncoder> enc, uint32_t n) {
     NSUInteger tg = 256;
@@ -534,6 +567,175 @@ int tgl_matmul_batched_f64(const double *A, const double *B, double *C,
 
         f32_to_f64((float*)bC.contents, Cptr, sC);
         pool_release(bA); pool_release(bB); pool_release(bC);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// fp16 MATMUL variants (Phase 4a Option A, 2026-04-21).
+// A/B/C stage through f64 → half on input, half → f64 on output.
+// Bias (when present) stays fp32 on GPU — see docs/plans/LABRAT_FIRST_WIN.md
+// for the "fp32-bias" hint that made the fused kernels land 1.7–1.8×.
+// ────────────────────────────────────────────────────────────────────
+
+int tgl_matmul_f16(const double *A, const double *B, double *C, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A + 1, *Bptr = B + 1;
+    double *Cptr = C + 1;
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        f64_to_f16(Aptr, (uint16_t*)bufA.contents, sA);
+        f64_to_f16(Bptr, (uint16_t*)bufB.contents, sB);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufC offset:0 atIndex:2];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:3];
+        [enc setBytes:&ku length:4 atIndex:4];
+        [enc setBytes:&nu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f16_to_f64((uint16_t*)bufC.contents, Cptr, sC);
+        pool_release(bufA); pool_release(bufB); pool_release(bufC);
+    }
+    return 1;
+}
+
+int tgl_matmul_blocked_f16(const double *A, const double *B, double *C, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A + 1, *Bptr = B + 1;
+    double *Cptr = C + 1;
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        f64_to_f16(Aptr, (uint16_t*)bufA.contents, sA);
+        f64_to_f16(Bptr, (uint16_t*)bufB.contents, sB);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_blocked_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufC offset:0 atIndex:2];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:3];
+        [enc setBytes:&ku length:4 atIndex:4];
+        [enc setBytes:&nu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((N+63)/64, (M+63)/64, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f16_to_f64((uint16_t*)bufC.contents, Cptr, sC);
+        pool_release(bufA); pool_release(bufB); pool_release(bufC);
+    }
+    return 1;
+}
+
+int tgl_matmul_bias_relu_f16(const double *A, const double *B, const double *bias,
+                             double *C, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A + 1, *Bptr = B + 1, *Bsptr = bias + 1;
+    double *Cptr = C + 1;
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufBias = pool_acquire(N*4);   // fp32 bias per task-spec hint
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        f64_to_f16(Aptr, (uint16_t*)bufA.contents, sA);
+        f64_to_f16(Bptr, (uint16_t*)bufB.contents, sB);
+        f64_to_f32(Bsptr, (float*)bufBias.contents, N);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_bias_relu_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufBias offset:0 atIndex:2];
+        [enc setBuffer:bufC offset:0 atIndex:3];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:4];
+        [enc setBytes:&ku length:4 atIndex:5];
+        [enc setBytes:&nu length:4 atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f16_to_f64((uint16_t*)bufC.contents, Cptr, sC);
+        pool_release(bufA); pool_release(bufB);
+        pool_release(bufBias); pool_release(bufC);
+    }
+    return 1;
+}
+
+int tgl_matmul_bias_gelu_f16(const double *A, const double *B, const double *bias,
+                             double *C, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A + 1, *Bptr = B + 1, *Bsptr = bias + 1;
+    double *Cptr = C + 1;
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufBias = pool_acquire(N*4);
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        f64_to_f16(Aptr, (uint16_t*)bufA.contents, sA);
+        f64_to_f16(Bptr, (uint16_t*)bufB.contents, sB);
+        f64_to_f32(Bsptr, (float*)bufBias.contents, N);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_bias_gelu_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufBias offset:0 atIndex:2];
+        [enc setBuffer:bufC offset:0 atIndex:3];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:4];
+        [enc setBytes:&ku length:4 atIndex:5];
+        [enc setBytes:&nu length:4 atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f16_to_f64((uint16_t*)bufC.contents, Cptr, sC);
+        pool_release(bufA); pool_release(bufB);
+        pool_release(bufBias); pool_release(bufC);
     }
     return 1;
 }
