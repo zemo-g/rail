@@ -4,7 +4,8 @@
 |---|---|---|---|---|---|
 | matmul             | KEPT | 1.8× | 1/5 | ~5  | `matmul_f16.metal` |
 | matmul_blocked     | KEPT | 1.6× | 5/5 | ~9  | `matmul_blocked_f16.metal` |
-| matmul_bias_relu   | rolled back | — | 0/5 | ~9 | (failed) |
+| matmul_bias_relu (v1) | rolled back | — | 0/5 | ~9 | (see v2) |
+| matmul_bias_relu (v2, fp32-bias hint) | **KEPT** | **1.8×** | 1/5 | ~5 | `matmul_bias_relu_f16.metal` |
 
 ## matmul_bias_relu failure mode
 
@@ -51,12 +52,34 @@ Now produce a FIND/REPLACE/END patch.
 Model sees raw text; no fence to echo. The "Now produce..." line is the
 natural boundary. Worked example after that.
 
+## Post-addendum (2026-04-21 08:05)
+
+Prompt v5 landed (commit 88b2953), and `matmul_bias_relu` was retried
+with an updated task spec v2 adding a **fp32-bias hint**: keep the bias
+buffer as `float` (fp32) even in the fp16 kernel, avoiding per-cell
+`half(float_bias)` conversion in the hot path. Bench was patched to
+pass the same fp32 bias buffer to both f32 and f16 kernels.
+
+Result: **iter 1 KEEP at 1.8× speedup**. The fp32-bias hypothesis was
+correct — v1's half-bias approach stalled at 1.2–1.3× because of the
+conversion overhead.
+
+**All 3 matmul-family kernels now have labrat-produced fp16 variants
+ready for production transplant.** Phase 4a Option A is materially
+unblocked.
+
 ## Next session
 
-1. Implement prompt v5 in `tools/labrat/labrat.rail:lb_prompt`.
-2. Re-run matmul_bias_relu task — confirm KEEP.
-3. Run port_kernels.sh on full Option A kernel list. Estimated 26 kernels × ~10 min average = ~4-5 hours overnight.
-4. Transplant the 2 working drafts (`matmul_f16.metal`, `matmul_blocked_f16.metal`) into production `tools/metal/tensor_gpu.metal` while you're awake — review the kernels first.
+1. Transplant all 3 drafts into production `tools/metal/tensor_gpu.metal`
+   (rename existing `matmul` → `matmul_f32` etc. first).
+2. Add corresponding `tgl_*_f16` foreign decls in `stdlib/tensor.rail`
+   and host dispatch in `tools/metal/tensor_gpu_lib.m`.
+3. Rebuild `libtensor_gpu.dylib`; `./rail_native test` must still pass.
+4. Extend `port_kernels.sh` spec list with the remaining matmul
+   variants (`matmul_bias_gelu`, `matmul_batched`, softmax, layernorm
+   variants). Each probably needs its own task-spec hint (same pattern
+   as v2 — identify fp32-stays buffers).
+5. Run `port_kernels.sh` overnight to chain-port the rest.
 
 ## Production transplant checklist
 
