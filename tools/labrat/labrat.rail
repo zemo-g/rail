@@ -161,12 +161,17 @@ lb_apply_patch path find_text replace_text =
 
 -- Compile the Metal target. Exit code 0 = success, anything else fail.
 -- Captures stderr to a log so a failed iteration leaves a breadcrumb.
+--
+-- Studio doesn't have full Xcode (only CLI tools — no `xcrun metal`).
+-- We use a tiny Obj-C validator (`/tmp/labrat_test/validate_metal`) that
+-- runs `newLibraryWithSource` — same path tensor_gpu_lib.m uses at
+-- runtime. Equivalent fidelity to the production load. Sentinel-file
+-- selectable so a future xcrun build path can coexist.
 lb_compile target out_lib =
   let log = "/tmp/labrat_compile.log"
+  let validator = "/tmp/labrat_test/validate_metal"
   let cmd = join "" [
-    "xcrun -sdk macosx metal -c ", target, " -o /tmp/labrat_intermediate.air 2> ", log,
-    " && xcrun -sdk macosx metallib /tmp/labrat_intermediate.air -o ", out_lib,
-    " 2>> ", log,
+    validator, " ", target, " 2> ", log,
     " && echo OK || echo FAIL"]
   let out = shell cmd
   str_contains "OK" out
@@ -203,22 +208,34 @@ lb_parse_patch resp =
 
 -- Build the LLM prompt. Kept outside the loop body so the promptology
 -- is easy to tweak without touching control flow.
+--
+-- Prompt v3 (2026-04-20 PM): positive-only instructions. Negative
+-- ("don't / do not") often anti-prompts: the model attends to the
+-- forbidden behavior and emits it. Each line below is what the model
+-- SHOULD do.
 lb_prompt goal target_contents last_result =
   join "" [
-    "You are optimizing a Metal kernel in a Rail project.\n\n",
+    "You are a code-edit agent. You produce ONE find/replace patch per turn.\n\n",
     "TASK: ", goal, "\n\n",
-    "CURRENT FILE CONTENTS:\n",
-    "=== BEGIN FILE ===\n",
+    "FILE TO EDIT (between markers):\n",
+    "<<<FILE_BEGIN>>>\n",
     target_contents,
-    "\n=== END FILE ===\n\n",
-    "LAST ITERATION RESULT: ", last_result, "\n\n",
-    "Propose ONE minimal edit as a unified find/replace block. ",
-    "Output EXACTLY this shape, nothing else:\n",
+    "<<<FILE_END>>>\n\n",
+    "PRIOR ITERATION RESULT: ", last_result, "\n\n",
+    "Reply using exactly this format. Begin your reply with FIND:\n\n",
     "FIND:\n",
-    "<verbatim text that appears in the file, long enough to be unique>\n",
+    "(the exact substring from the file, copied verbatim, long enough to be unique)\n",
     "REPLACE:\n",
-    "<the new text to substitute>\n",
-    "END\n"]
+    "(the new substring to substitute)\n",
+    "END\n\n",
+    "Worked example for a different task (adapt to the real task above):\n\n",
+    "FIND:\n",
+    "kernel void matmul(\n",
+    "REPLACE:\n",
+    "// new comment\n",
+    "kernel void matmul(\n",
+    "END\n\n",
+    "Now emit your patch for the real task. Start your reply with FIND: on its own line.\n"]
 
 -- Transcript line for one iteration. Not a full JSON event — one line,
 -- tab-separated, greppable.
@@ -244,6 +261,8 @@ labrat_step target goal snap bench_bin min_speed last_result out_lib iter =
   let file_text = read_file target
   let prompt = lb_prompt goal file_text last_result
   let resp = llm_call labrat_mlx_port "You are a Metal kernel optimizer." prompt
+  -- Stash raw response per iter so transcripts include the prompt-side trail.
+  let _ = write_file (join "" ["/tmp/labrat_resp_iter", show iter, ".txt"]) resp
   let (find_t, repl_t) = lb_parse_patch resp
   if length find_t == 0 then
     let _ = print (join "" ["iter ", show iter, ": parse-fail, skipping"])
@@ -257,7 +276,11 @@ labrat_step target goal snap bench_bin min_speed last_result out_lib iter =
       (0, 0.0, "compile-fail")
     else
       let speedup = lb_bench bench_bin
-      if speedup >= min_speed then
+      -- Rail's fp `>=` codegen is fragile; route through int by ×1000.
+      let speedup_x1000 = float_to_int (speedup * 1000.0)
+      let gate_x1000 = float_to_int (min_speed * 1000.0)
+      let pass = speedup_x1000 >= gate_x1000
+      if pass then
         let _ = print (join "" ["iter ", show iter, ": KEEP speedup=", show_temp speedup])
         let _ = lb_snapshot target snap  -- roll snapshot forward
         (1, speedup, "kept")
