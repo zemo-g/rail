@@ -198,6 +198,81 @@ argmax_row probs row V = match probs
     let v0 = float_arr_get pd base
     argmax_row_loop pd V base 0 v0 1
 
+-- ── Top-k weighted-multinomial sampling. Used when --k > 1. Argmax
+-- collapses to the whitespace fixed point at our current eval ~3.4;
+-- sampling from top-k breaks it and lets non-whitespace chars contribute.
+--
+-- Strategy: copy the predicted row into a scratch buffer, k times find
+-- argmax + record + mark visited (-1.0), then weighted-multinomial over
+-- the k recorded (id, prob) pairs using an LCG rng.
+--
+-- Scratch layout: buf[V] for visited-mask, ids[k] for chosen indices,
+-- ws[k] for their softmax probs.
+
+-- Copy probs[row, :] into a fresh float_arr[V].
+copy_row_loop src dst V base i =
+  if i >= V then 0
+  else
+    let _ = float_arr_set dst i (float_arr_get src (base + i))
+    copy_row_loop src dst V base (i + 1)
+
+-- Find argmax over buf (ignoring entries < 0.0, which mark visited).
+amax_avail_loop buf V best_id best_val i =
+  if i >= V then best_id
+  else
+    let cur = float_arr_get buf i
+    if cur > best_val then amax_avail_loop buf V i cur (i + 1)
+    else amax_avail_loop buf V best_id best_val (i + 1)
+
+-- Pick top-k: repeatedly find argmax of buf, record, mark visited.
+topk_fill_loop buf V k i ids ws =
+  if i >= k then 0
+  else
+    let v0 = float_arr_get buf 0
+    let top_id = amax_avail_loop buf V 0 v0 1
+    let top_val = float_arr_get buf top_id
+    let _ = float_arr_set ids i (int_to_float top_id)
+    let _ = float_arr_set ws i top_val
+    let _ = float_arr_set buf top_id (0.0 - 1.0)
+    topk_fill_loop buf V k (i + 1) ids ws
+
+-- Sum of weights across top-k (for normalization of sampling threshold).
+sum_ws_loop ws k i acc =
+  if i >= k then acc
+  else sum_ws_loop ws k (i + 1) (acc + float_arr_get ws i)
+
+-- LCG rng over a float_arr[1] slot at index `slot`.
+rng_next buf slot =
+  let s = float_to_int (float_arr_get buf slot)
+  let new_s = (s * 1664525 + 1013904223) % 2147483648
+  let _ = float_arr_set buf slot (int_to_float new_s)
+  new_s
+
+-- Walk top-k cumulative sum; return id at first bucket whose cum ≥ u.
+sample_walk_loop ids ws k i u acc =
+  if i >= k - 1 then float_to_int (float_arr_get ids (k - 1))
+  else
+    let w = float_arr_get ws i
+    let new_acc = acc + w
+    if u < new_acc then float_to_int (float_arr_get ids i)
+    else sample_walk_loop ids ws k (i + 1) u new_acc
+
+-- Weighted-multinomial sample from top-k entries. samp = float_arr 2
+-- with slot 0 = k (as float), slot 1 = rng state (as float-of-int).
+topk_sample probs row V samp = match probs
+  | Tensor pd _ _ ->
+    let base = row * V
+    let k = float_to_int (float_arr_get samp 0)
+    let buf = float_arr_new V 0.0
+    let _ = copy_row_loop pd buf V base 0
+    let ids = float_arr_new k 0.0
+    let ws = float_arr_new k 0.0
+    let _ = topk_fill_loop buf V k 0 ids ws
+    let sum = sum_ws_loop ws k 0 0.0
+    let r = rng_next samp 1
+    let u = (int_to_float (r % 1000000)) / 1000000.0 * sum
+    sample_walk_loop ids ws k 0 u 0.0
+
 -- ── Zero a range of a float_arr before we refill it. (Copied from
 -- lm_v3_chunked_d256_half.rail:146 — cleaner to copy than to import a
 -- training-only file.)
@@ -218,20 +293,22 @@ fill_prompt_loop xd ids_list V pos =
 
 -- ── Generation driver. Runs n_gen greedy steps starting from position
 -- prompt_len. Returns a list of generated ids (reversed; caller reverses).
-gen_loop x blocks_h w_e_h gf_h seq V d acc cur_pos end_pos =
+-- samp = float_arr 2 with [k_as_float, rng_state_int_as_float]. When
+-- slot 0 == 1 we take the argmax fast path (deterministic, seed-
+-- independent); otherwise topk_sample with the bundled k + rng.
+gen_loop x blocks_h w_e_h gf_h seq V d acc cur_pos end_pos samp =
   if cur_pos >= end_pos then reverse acc
   else
     let mk = arena_mark 0
     let probs = infer_forward x w_e_h blocks_h gf_h seq V d
-    -- probs[cur_pos - 1] is the distribution predicting what comes at
-    -- cur_pos. Caller ensures prompt_len >= 1 so cur_pos - 1 >= 0.
     let pred_row = cur_pos - 1
-    let next_id = argmax_row probs pred_row V
+    let k = float_to_int (float_arr_get samp 0)
+    let next_id = if k <= 1 then argmax_row probs pred_row V
+                  else topk_sample probs pred_row V samp
     let _ = arena_reset mk
-    -- Write the chosen token at cur_pos. Accumulate for decoding.
     match x | Tensor xd _ _ ->
       let _ = float_arr_set xd (cur_pos * V + next_id) 1.0
-      gen_loop x blocks_h w_e_h gf_h seq V d (cons next_id acc) (cur_pos + 1) end_pos
+      gen_loop x blocks_h w_e_h gf_h seq V d (cons next_id acc) (cur_pos + 1) end_pos samp
 
 -- ── Decode ids into a string using vocab's id_char lookup.
 ids_to_string_loop ids vocab acc =
@@ -265,13 +342,14 @@ main =
   let prefix = argv_get args "--prefix" default_prefix
   let prompt = argv_get args "--prompt" default_prompt
   let max_str = argv_get args "--max" default_max_gen_str
-  -- --k / --temp / --seed are accepted for CLI-compatibility with
-  -- generate.rail; greedy-only is implemented. Top-k/temperature is a
-  -- follow-on. Ignoring them means the bench can still invoke us with
-  -- its default --k 1 and get sensible output.
-  let _k_str = argv_get args "--k" "1"
+  -- --k selects greedy (k=1, argmax) vs top-k weighted multinomial
+  -- sampling. --seed seeds the LCG rng for reproducibility. --temp is
+  -- accepted but ignored (no pow() in Rail stdlib; top-k weighted by
+  -- softmax already breaks the whitespace fixed point at low model
+  -- quality, which is the point of this session's sampling add).
+  let k_str = argv_get args "--k" "1"
   let _tau_str = argv_get args "--temp" "1.0"
-  let _seed_str = argv_get args "--seed" "42"
+  let seed_str = argv_get args "--seed" "42"
 
   let max_gen = parse_int max_str
 
@@ -321,7 +399,12 @@ main =
         -- prompt_len + max_gen. gen_loop writes each chosen id into x
         -- at its own position and returns the id list for decoding.
         let end_pos = prompt_len + max_gen
-        let gen_ids = gen_loop x blocks_h w_e_h gf_h seq_len V 256 [] prompt_len end_pos
+        let k_val = parse_int k_str
+        let seed_val = parse_int seed_str
+        let samp = float_arr_new 2 0.0
+        let _ = float_arr_set samp 0 (int_to_float k_val)
+        let _ = float_arr_set samp 1 (int_to_float seed_val)
+        let gen_ids = gen_loop x blocks_h w_e_h gf_h seq_len V 256 [] prompt_len end_pos samp
         let gen_text = ids_to_string gen_ids vocab
         -- Print prompt+continuation verbatim (matches generate.rail's
         -- `print out` contract with decode vocab out_ids).
