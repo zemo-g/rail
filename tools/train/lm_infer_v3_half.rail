@@ -257,20 +257,44 @@ sample_walk_loop ids ws k i u acc =
     if u < new_acc then float_to_int (float_arr_get ids i)
     else sample_walk_loop ids ws k (i + 1) u new_acc
 
--- Weighted-multinomial sample from top-k entries. samp = float_arr 2
--- with slot 0 = k (as float), slot 1 = rng state (as float-of-int).
+-- Weighted-multinomial sample from top-k entries. samp = float_arr 5:
+--   [0] k (int as float)
+--   [1] rng state (LCG int as float)
+--   [2] no_ws_remaining — how many more tokens must suppress whitespace;
+--       decremented each call. 0 disables the filter.
+--   [3] space_id (−1 if vocab has no space)
+--   [4] newline_id (−1 if vocab has no newline)
+-- The whitespace filter is the second half of the Rail-specific decoding
+-- story (the first being top-k sampling itself). At char-perplexity ~30,
+-- whitespace is the argmax at nearly every position after content; a
+-- greedy or top-k sampler without this filter produces "one char then
+-- newlines forever." Masking space/newline out of the first ~20 generated
+-- positions forces the model to stay inside code characters where its
+-- learned shape has real signal.
 topk_sample probs row V samp = match probs
   | Tensor pd _ _ ->
     let base = row * V
     let k = float_to_int (float_arr_get samp 0)
     let buf = float_arr_new V 0.0
     let _ = copy_row_loop pd buf V base 0
+    let no_ws_rem = float_to_int (float_arr_get samp 2)
+    let sp_id = float_to_int (float_arr_get samp 3)
+    let nl_id = float_to_int (float_arr_get samp 4)
+    -- Mask whitespace ids in-buffer if filter active. Setting to -1.0
+    -- makes them invisible to amax_avail_loop (seeded with v0 ≥ 0).
+    let _ = if no_ws_rem > 0 then
+              let _ = if sp_id >= 0 then float_arr_set buf sp_id (0.0 - 1.0) else 0
+              let _ = if nl_id >= 0 then float_arr_set buf nl_id (0.0 - 1.0) else 0
+              0
+            else 0
     let ids = float_arr_new k 0.0
     let ws = float_arr_new k 0.0
     let _ = topk_fill_loop buf V k 0 ids ws
     let sum = sum_ws_loop ws k 0 0.0
     let r = rng_next samp 1
     let u = (int_to_float (r % 1000000)) / 1000000.0 * sum
+    -- Decrement no_ws counter for the next call. Hits 0, stays 0.
+    let _ = if no_ws_rem > 0 then float_arr_set samp 2 (int_to_float (no_ws_rem - 1)) else 0
     sample_walk_loop ids ws k 0 u 0.0
 
 -- ── Zero a range of a float_arr before we refill it. (Copied from
@@ -344,12 +368,14 @@ main =
   let max_str = argv_get args "--max" default_max_gen_str
   -- --k selects greedy (k=1, argmax) vs top-k weighted multinomial
   -- sampling. --seed seeds the LCG rng for reproducibility. --temp is
-  -- accepted but ignored (no pow() in Rail stdlib; top-k weighted by
-  -- softmax already breaks the whitespace fixed point at low model
-  -- quality, which is the point of this session's sampling add).
+  -- accepted but ignored (no pow() in Rail stdlib). --no-ws-first <n>
+  -- masks space/newline from the top-k sample for the first n generated
+  -- tokens (only active when --k > 1, since the filter piggybacks on
+  -- topk_sample). Default 0 = disabled.
   let k_str = argv_get args "--k" "1"
   let _tau_str = argv_get args "--temp" "1.0"
   let seed_str = argv_get args "--seed" "42"
+  let no_ws_str = argv_get args "--no-ws-first" "0"
 
   let max_gen = parse_int max_str
 
@@ -401,9 +427,15 @@ main =
         let end_pos = prompt_len + max_gen
         let k_val = parse_int k_str
         let seed_val = parse_int seed_str
-        let samp = float_arr_new 2 0.0
+        let no_ws_val = parse_int no_ws_str
+        let sp_id = char_id vocab " "
+        let nl_id = char_id vocab "\n"
+        let samp = float_arr_new 5 0.0
         let _ = float_arr_set samp 0 (int_to_float k_val)
         let _ = float_arr_set samp 1 (int_to_float seed_val)
+        let _ = float_arr_set samp 2 (int_to_float no_ws_val)
+        let _ = float_arr_set samp 3 (int_to_float sp_id)
+        let _ = float_arr_set samp 4 (int_to_float nl_id)
         let gen_ids = gen_loop x blocks_h w_e_h gf_h seq_len V 256 [] prompt_len end_pos samp
         let gen_text = ids_to_string gen_ids vocab
         -- Print prompt+continuation verbatim (matches generate.rail's
