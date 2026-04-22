@@ -32,6 +32,7 @@ import "stdlib/transformer.rail"
 import "stdlib/optim.rail"
 import "stdlib/tokenizer.rail"
 import "stdlib/oracle.rail"
+import "stdlib/checkpoint.rail"
 
 -- Chunk size = the seq dimension the model sees each step.
 -- Must be < corpus_len so we have valid offsets to sample.
@@ -495,6 +496,11 @@ m_train_step x labels blocks_h w_e_h gf_h adams_e adams_gf adams_blocks seq V d 
 
   let loss = m_ce_loss probs labels seq V
 
+  -- γ LR multiplier: RMSNorm γs learn too fast at global lr; ported from
+  -- lm_v3_chunked_4block.rail:425 (tuning from commit 924e0c5). Applied to
+  -- gf + g1/g2 across both blocks — 5 γ tensors total at depth=2.
+  let lr_g = lr * adam_lr_mult_gamma
+
   match probs | Tensor pd _ _ -> match labels | Tensor ld _ _ ->
     let invN = 1.0 / int_to_float seq
     let _ = m_ce_grad_loop dlog_buf pd ld seq V invN 0
@@ -547,7 +553,7 @@ m_train_step x labels blocks_h w_e_h gf_h adams_e adams_gf adams_blocks seq V d 
     let _ = half_adam_update w_e_h d_we st_we lr
 
     let st_gf = list_nth 0 adams_gf
-    let _ = half_adam_update gf_h d_gf st_gf lr
+    let _ = half_adam_update gf_h d_gf st_gf lr_g
 
     let b0_adams = list_nth 0 adams_blocks
     let _ = half_adam_update (list_nth 0 b0_weights) d_wq0 (list_nth 0 b0_adams) lr
@@ -557,8 +563,8 @@ m_train_step x labels blocks_h w_e_h gf_h adams_e adams_gf adams_blocks seq V d 
     let _ = half_adam_update (list_nth 4 b0_weights) d_wgate0 (list_nth 4 b0_adams) lr
     let _ = half_adam_update (list_nth 5 b0_weights) d_wup0 (list_nth 5 b0_adams) lr
     let _ = half_adam_update (list_nth 6 b0_weights) d_wdown0 (list_nth 6 b0_adams) lr
-    let _ = half_adam_update (list_nth 7 b0_weights) d_g1_b0 (list_nth 7 b0_adams) lr
-    let _ = half_adam_update (list_nth 8 b0_weights) d_g2_b0 (list_nth 8 b0_adams) lr
+    let _ = half_adam_update (list_nth 7 b0_weights) d_g1_b0 (list_nth 7 b0_adams) lr_g
+    let _ = half_adam_update (list_nth 8 b0_weights) d_g2_b0 (list_nth 8 b0_adams) lr_g
 
     let b1_adams = list_nth 1 adams_blocks
     let _ = half_adam_update (list_nth 0 b1_weights) d_wq1 (list_nth 0 b1_adams) lr
@@ -568,8 +574,8 @@ m_train_step x labels blocks_h w_e_h gf_h adams_e adams_gf adams_blocks seq V d 
     let _ = half_adam_update (list_nth 4 b1_weights) d_wgate1 (list_nth 4 b1_adams) lr
     let _ = half_adam_update (list_nth 5 b1_weights) d_wup1 (list_nth 5 b1_adams) lr
     let _ = half_adam_update (list_nth 6 b1_weights) d_wdown1 (list_nth 6 b1_adams) lr
-    let _ = half_adam_update (list_nth 7 b1_weights) d_g1_b1 (list_nth 7 b1_adams) lr
-    let _ = half_adam_update (list_nth 8 b1_weights) d_g2_b1 (list_nth 8 b1_adams) lr
+    let _ = half_adam_update (list_nth 7 b1_weights) d_g1_b1 (list_nth 7 b1_adams) lr_g
+    let _ = half_adam_update (list_nth 8 b1_weights) d_g2_b1 (list_nth 8 b1_adams) lr_g
     loss
 
 -- batch_ctx = [x, labels, corpus_ids_arr, rng, corpus_len]
@@ -790,6 +796,19 @@ main =
 
   let loss1 = m_eval_loss batch_ctx blocks w_e gf seq V d
   let min_loss = float_arr_get min_buf 0
+
+  -- Final save. HalfTensor weights round-trip through f64 to .f32 payloads
+  -- (stdlib/checkpoint.rail: save_half_checkpoint). Canonical tensor order:
+  -- [w_e, gf, b0[q,k,v,o,gate,up,down,g1,g2], b1[q,k,v,o,gate,up,down,g1,g2]]
+  -- = 20 weights. Adam states follow the same order. Loader side is
+  -- lm_infer_v3_half.rail (same flatten order).
+  let ckpt = "training/rail_native/checkpoints/d256_half_step3000"
+  let _ = shell "mkdir -p training/rail_native/checkpoints"
+  let weights_flat = append (cons w_e (cons gf [])) (append block0 block1)
+  let adams_flat = append (cons st_we (cons st_gf [])) (append block0_adams block1_adams)
+  let _ = save_half_checkpoint ckpt weights_flat adams_flat max_steps loss1
+  let _ = print (cat ["saved checkpoint to ", ckpt, " (", show (length weights_flat), " weights, loss1=", show_float loss1, ")"])
+
   let _ = print (cat ["\nfinal loss (fresh chunk)=", show_float loss1])
   let _ = print (cat ["min loss during run=", show_float min_loss])
   let _ = print "(compare to lm_v3_multi fixed-corpus baseline: 1.546 at step 429)"
