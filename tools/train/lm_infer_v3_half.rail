@@ -1,10 +1,13 @@
 -- lm_infer_v3_half.rail — Autoregressive inference for the v3 HalfTensor
--- architecture (RMSNorm + RoPE + SwiGLU, d=256, 2-block, tied embeddings).
+-- architecture (RMSNorm + RoPE + SwiGLU, d=256, N-block, tied embeddings).
 --
--- Loads a checkpoint saved by lm_v3_chunked_d256_half.rail's final
--- save_half_checkpoint call (expected at
--- training/rail_native/checkpoints/d256_half_step3000, 20 HalfTensor
--- weights in order [w_e, gf, b0(9), b1(9)]).
+-- Block count is derived from checkpoint weight count: N = (n_weights - 2) / 9.
+-- Supports any valid N (2, 4, 6, …) with no CLI flag required. The
+-- save_half_checkpoint emits weights in order [w_e, gf, b0(9), b1(9), …].
+--
+-- Loads a checkpoint saved by the v3 half training variants' final
+-- save_half_checkpoint call (e.g. d=256 × 2-block: 20 weights;
+-- d=256 × 4-block: 38 weights).
 --
 -- Greedy decoding: argmax of softmax(logits) at the last prompt position,
 -- append, repeat. No temperature, no top-k, no beam. Deterministic by
@@ -123,21 +126,53 @@ infer_block_fwd x_h w_block seq d =
   let x_out = add_half x_attn h_out
   x_out
 
+-- Unpack a single 9-weight block from halfs starting at `base`.
+-- Rail parser requires the cons chain on one line (cf cast_block_to_half).
+unpack_one_block halfs base =
+  let w0 = list_nth base halfs
+  let w1 = list_nth (base + 1) halfs
+  let w2 = list_nth (base + 2) halfs
+  let w3 = list_nth (base + 3) halfs
+  let w4 = list_nth (base + 4) halfs
+  let w5 = list_nth (base + 5) halfs
+  let w6 = list_nth (base + 6) halfs
+  let w7 = list_nth (base + 7) halfs
+  let w8 = list_nth (base + 8) halfs
+  cons w0 (cons w1 (cons w2 (cons w3 (cons w4 (cons w5 (cons w6 (cons w7 (cons w8 []))))))))
+
+-- Unpack `count` consecutive 9-weight blocks starting at `halfs[start]`.
+-- Returns a list of block-weight-lists (what infer_forward expects).
+unpack_blocks_loop halfs idx count acc =
+  if count <= 0 then reverse acc
+  else
+    let b = unpack_one_block halfs idx
+    unpack_blocks_loop halfs (idx + 9) (count - 1) (cons b acc)
+
+unpack_blocks halfs start n_blocks =
+  unpack_blocks_loop halfs start n_blocks []
+
+-- Recursive fold: apply infer_block_fwd over blocks_h in order. Input is
+-- already a HalfTensor (x_embed); output is a HalfTensor after the last
+-- block. Supports any block count including the d=256 × 4-block variant.
+infer_blocks_loop x_h blocks_h seq d i n =
+  if i >= n then x_h
+  else
+    let b_weights_h = list_nth i blocks_h
+    let next_x_h = infer_block_fwd x_h b_weights_h seq d
+    infer_blocks_loop next_x_h blocks_h seq d (i + 1) n
+
 -- Full forward. Returns probs tensor [seq, V]. Same shape contract as
 -- the training variant's m_forward (first element of its return list).
 infer_forward x w_e_h blocks_h gf_h seq V d =
   let x_h = half_of_tensor x
   let x_embed = matmul_half x_h w_e_h
 
-  let b0_weights_h = list_nth 0 blocks_h
-  let x_after_b0 = infer_block_fwd x_embed b0_weights_h seq d
+  let n_blocks = length blocks_h
+  let x_last_h = infer_blocks_loop x_embed blocks_h seq d 0 n_blocks
 
-  let b1_weights_h = list_nth 1 blocks_h
-  let x_after_b1_h = infer_block_fwd x_after_b0 b1_weights_h seq d
-
-  let x_after_b1 = tensor_of_half x_after_b1_h
+  let x_last_f = tensor_of_half x_last_h
   let gf_f = tensor_of_half gf_h
-  let packf = rmsnorm_save x_after_b1 gf_f
+  let packf = rmsnorm_save x_last_f gf_f
   let x_final = head packf
 
   let x_final_h = half_of_tensor x_final
@@ -253,16 +288,18 @@ main =
   else
     let halfs = load_half_model prefix
     let n_weights = length halfs
-    if n_weights != 20 then
-      let _ = print (cat ["ERROR: expected 20 weights (w_e + gf + 2×9 per block), got ", show n_weights])
+    let n_blocks = (n_weights - 2) / 9
+    if n_weights < 11 then
+      let _ = print (cat ["ERROR: need at least 11 weights (w_e + gf + 9 per block); got ", show n_weights])
+      0
+    else if n_weights != 2 + 9 * n_blocks then
+      let _ = print (cat ["ERROR: n_weights ", show n_weights, " is not 2 + 9*N for any integer N; checkpoint corrupt?"])
       0
     else
-      -- Unpack weights in save order: [w_e, gf, b0[9], b1[9]].
+      -- Unpack weights in save order: [w_e, gf, b0[9], b1[9], ...].
       let w_e_h = list_nth 0 halfs
       let gf_h = list_nth 1 halfs
-      let b0 = cons (list_nth 2 halfs) (cons (list_nth 3 halfs) (cons (list_nth 4 halfs) (cons (list_nth 5 halfs) (cons (list_nth 6 halfs) (cons (list_nth 7 halfs) (cons (list_nth 8 halfs) (cons (list_nth 9 halfs) (cons (list_nth 10 halfs) []))))))))
-      let b1 = cons (list_nth 11 halfs) (cons (list_nth 12 halfs) (cons (list_nth 13 halfs) (cons (list_nth 14 halfs) (cons (list_nth 15 halfs) (cons (list_nth 16 halfs) (cons (list_nth 17 halfs) (cons (list_nth 18 halfs) (cons (list_nth 19 halfs) []))))))))
-      let blocks_h = cons b0 (cons b1 [])
+      let blocks_h = unpack_blocks halfs 2 n_blocks
 
       let raw_ids = encode vocab prompt
       let prompt_ids = sanitize_ids raw_ids
