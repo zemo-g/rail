@@ -6,7 +6,7 @@
 
 ## One-liner
 
-> A Rail-native transformer whose forward matmuls, weights, softmax, transposes, adds, and scales are all fp16 — cast once at init, never per call — trained end-to-end with an f64 backward, verified by a Rail compiler written in Rail.
+> A 3.4M-parameter self-hosted transformer, trained end-to-end in Rail on the Rail stdlib corpus, scores **12/30 (40%)** on the 30-task `bench_railnative` benchmark. Forward matmuls, weights, softmax, transposes, adds, and scales are all fp16 — cast once at init, never per call — with an f64 backward. Every layer of the stack (compiler, training loop, inference harness, benchmark grader) is Rail compiled by itself, with a 729K ARM64 seed binary and zero C runtime dependencies.
 
 ## Architecture
 
@@ -136,16 +136,16 @@ The d=128 half result (3.50) was a 500-step intermediate, not a training endpoin
 
 ## `bench_railnative`
 
-| checkpoint | bench score | total quality | notes |
-|---|---:|---:|---|
-| d=256 × 2-block × half (S3) | **1/30** | 17,706 | Fund 1/5, others 0/5. Single pass from Fund-1 (fact+main prompt was already a complete program; empty completion compiled) |
-| d=256 × 4-block × half (S4) | **1/30** | 17,706 | Byte-identical to 2-block result — model's whitespace-dominated output means both checkpoints produce same completions |
-| d=256 × 4-block × half × 6000 (S6) | pending | pending | Session 6 run in flight |
-| d=256 × 4-block × half (S4) with top-k 5 sampling (S5) | not completed | — | Killed at task 4/30 after 7 min wall; per-step cost 15× higher; sampling-smoke diagnostics showed one non-whitespace char then collapse to newlines, predicted bench delta of zero |
+| checkpoint | decoder | bench score | total quality | notes |
+|---|---|---:|---:|---|
+| d=256 × 2-block × half (S3) | `--k 1` argmax | 1/30 | 17,706 | Fund-1 prompt was already a complete program; argmax collapsed to whitespace elsewhere |
+| d=256 × 4-block × half (S4) | `--k 1` argmax | 1/30 | 17,706 | Byte-identical output to 2-block — argmax is whitespace at both |
+| d=256 × 4-block × half × 6000 (S7, resume) | `--k 10 --temp 0.8` sampling | **12/30 (40%)** | 22,270 | **Deadline ≥5/30 cleared by 7 passes.** Single-sample top-k multinomial sampling, no re-rank. Sampling breaks argmax's whitespace fixed point and exposes the model's real Rail-shape distribution. |
+| d=256 × 4-block × half × 6000 | `--k 10 --temp 0.8` × N=20 rerank | pending | — | Deferred overnight run; expected to add 2-5 passes on top of the 12/30 baseline |
 
-**Target:** ≥5/30 (2026-04-27 milestone).
-**Current ceiling at this model scale:** 1/30 via argmax, same via sampling, because the model's softmax at char-level perplexity ~30 has mass ≈1.0 on `\n` after any content char.
-**Gap:** 4 more passes. Requires either (a) longer training to push eval below ~2.5 where non-whitespace chars get top-1, (b) bigger corpus to teach the model program-level structure, (c) better inference harness (beam search, constrained decoding against Rail grammar).
+**Target:** ≥5/30 (2026-04-27 milestone) — **CLEARED at 12/30 on the step6000 checkpoint with `--k 10 --temp 0.8` sampling.**
+**What made the difference:** switching from argmax to top-k sampling. The model's softmax concentrates most mass on `\n` at every content-boundary position, but the 1% tail contains valid Rail continuations. Sampling (even one sample per task) exposes that tail; argmax collapses it. A single-sample sampling run on the step6000 checkpoint already passes 40% of the bench.
+**Why the training delta wasn't the story:** Session 7's 3000 additional training steps moved eval from 3.39 → 3.37 (noise-level). The 12-point bench jump came entirely from the decoder change, not from model capacity. The step3000 checkpoint under the same sampling decoder would likely score similarly (control bench pending).
 
 Bench format (as of 2026-04-04): 30 questions across 6 bands of 5 each (FUND / IO / TOOLS / COMP / ADV / COMPREHEND); score is total compile-passes out of 30. Historical range on prior model states: 0/30 — 14/30 (see `DEADLINE_2026-04-27_PUNCHLIST.md` §"Historical bench data").
 
