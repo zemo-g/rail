@@ -1,0 +1,292 @@
+-- lm_infer_v3_half.rail — Autoregressive inference for the v3 HalfTensor
+-- architecture (RMSNorm + RoPE + SwiGLU, d=256, 2-block, tied embeddings).
+--
+-- Loads a checkpoint saved by lm_v3_chunked_d256_half.rail's final
+-- save_half_checkpoint call (expected at
+-- training/rail_native/checkpoints/d256_half_step3000, 20 HalfTensor
+-- weights in order [w_e, gf, b0(9), b1(9)]).
+--
+-- Greedy decoding: argmax of softmax(logits) at the last prompt position,
+-- append, repeat. No temperature, no top-k, no beam. Deterministic by
+-- construction. Same padding convention as training: seq=1024, prompt
+-- + generated content lives in x[0..prompt_len+n_gen-1], remainder
+-- stays zero-one-hot-ish. Causal mask prevents future-position leakage.
+--
+-- Usage:
+--   ./rail_native run tools/train/lm_infer_v3_half.rail \
+--       --prefix training/rail_native/checkpoints/d256_half_step3000 \
+--       --prompt "main = " --max 128
+--
+-- CLI contract matches tools/train/generate.rail so flywheel/
+-- bench_railnative.rail can drop this in via a single file-name swap
+-- in bench's gen_script. --k / --temp / --seed are accepted but
+-- greedy-only is implemented (k=1 behavior); top-k/temperature is a
+-- later deliverable.
+--
+-- Silent by design: only stdout is the decoded text (prompt+continuation).
+-- Matches generate.rail's "pipe directly into a grader" contract.
+--
+-- NO TRAINING HAPPENS HERE. Weights are read-only; we do not call
+-- half_adam_update, do not allocate Adam state, do not run backward.
+
+import "stdlib/transformer.rail"
+import "stdlib/optim.rail"
+import "stdlib/tokenizer.rail"
+import "stdlib/checkpoint.rail"
+
+corpus_path = "training/rail_corpus_stdlib.txt"
+default_prefix = "training/rail_native/checkpoints/d256_half_step3000"
+default_prompt = "main = "
+default_max_gen_str = "128"
+seq_len = 1024
+
+-- ── Copied from lm_v3_chunked_d256_half.rail — fwd-path helpers only.
+-- Keeps this file standalone (same pattern as tools/train/lm_infer.rail).
+
+unwrap t = match t | Tensor d _ _ -> d
+
+m_hadamard_loop ad bd cd n i =
+  if i >= n then 0
+  else
+    let a = float_arr_get ad i
+    let b = float_arr_get bd i
+    let _ = float_arr_set cd i (a * b)
+    m_hadamard_loop ad bd cd n (i + 1)
+
+m_hadamard a b = match a
+  | Tensor ad a_shape _ -> match b
+    | Tensor bd _ _ ->
+      let n = list_product a_shape
+      let cd = float_arr_new n 0.0
+      let _ = m_hadamard_loop ad bd cd n 0
+      Tensor cd a_shape (compute_strides a_shape)
+
+-- Block forward — identical to training path's m_block_fwd but returns
+-- only x_out (the caches are unused at inference; no bwd consumes them).
+-- Keeping the same cast/kernel choreography so behavior exactly matches
+-- the trained model.
+infer_block_fwd x_h w_block seq d =
+  let w_q = list_nth 0 w_block
+  let w_k = list_nth 1 w_block
+  let w_v = list_nth 2 w_block
+  let w_o = list_nth 3 w_block
+  let w_gate = list_nth 4 w_block
+  let w_up = list_nth 5 w_block
+  let w_down = list_nth 6 w_block
+  let g1 = list_nth 7 w_block
+  let g2 = list_nth 8 w_block
+
+  let x_f = tensor_of_half x_h
+  let g1_f = tensor_of_half g1
+  let pack1 = rmsnorm_save x_f g1_f
+  let ln1_f = head pack1
+  let ln1 = half_of_tensor ln1_f
+
+  let q = matmul_half ln1 w_q
+  let k = matmul_half ln1 w_k
+  let v = matmul_half ln1 w_v
+  let q_f = tensor_of_half q
+  let k_f = tensor_of_half k
+  let _ = rope_apply q_f
+  let _ = rope_apply k_f
+  let q_post = half_of_tensor q_f
+  let k_post = half_of_tensor k_f
+
+  let kt = transpose_half k_post
+  let scores = matmul_half q_post kt
+  let scale = 1.0 / sqrt (int_to_float d)
+  let scaled = scale_half scores scale
+  let scaled_f = tensor_of_half scaled
+  let sd = unwrap scaled_f
+  let _ = apply_causal_mask_loop sd seq 0 0
+  let scaled_masked = half_of_tensor scaled_f
+  let attn = softmax_half scaled_masked
+  let attn_val = matmul_half attn v
+  let attn_out = matmul_half attn_val w_o
+  let x_attn = add_half x_h attn_out
+
+  let x_attn_f = tensor_of_half x_attn
+  let g2_f = tensor_of_half g2
+  let pack2 = rmsnorm_save x_attn_f g2_f
+  let ln2_f = head pack2
+  let ln2 = half_of_tensor ln2_f
+
+  let h_gate = matmul_half ln2 w_gate
+  let h_up = matmul_half ln2 w_up
+  let h_gate_f_pre = tensor_of_half h_gate
+  let silu_pack = silu_forward h_gate_f_pre
+  let h_gate_silu_f = head silu_pack
+  let h_up_f = tensor_of_half h_up
+  let h_act_f = m_hadamard h_gate_silu_f h_up_f
+  let h_act = half_of_tensor h_act_f
+  let h_out = matmul_half h_act w_down
+  let x_out = add_half x_attn h_out
+  x_out
+
+-- Full forward. Returns probs tensor [seq, V]. Same shape contract as
+-- the training variant's m_forward (first element of its return list).
+infer_forward x w_e_h blocks_h gf_h seq V d =
+  let x_h = half_of_tensor x
+  let x_embed = matmul_half x_h w_e_h
+
+  let b0_weights_h = list_nth 0 blocks_h
+  let x_after_b0 = infer_block_fwd x_embed b0_weights_h seq d
+
+  let b1_weights_h = list_nth 1 blocks_h
+  let x_after_b1_h = infer_block_fwd x_after_b0 b1_weights_h seq d
+
+  let x_after_b1 = tensor_of_half x_after_b1_h
+  let gf_f = tensor_of_half gf_h
+  let packf = rmsnorm_save x_after_b1 gf_f
+  let x_final = head packf
+
+  let x_final_h = half_of_tensor x_final
+  let we_t_h = transpose_half w_e_h
+  let logits_h = matmul_half x_final_h we_t_h
+  let logits = tensor_of_half logits_h
+  tensor_softmax logits
+
+-- ── Argmax across the V-wide row `row` of probs. Returns (id, score).
+-- probs is [seq, V] row-major: probs[row, v] = pd[row * V + v].
+argmax_row_loop pd V base best_id best_val v =
+  if v >= V then best_id
+  else
+    let cur = float_arr_get pd (base + v)
+    if cur > best_val then argmax_row_loop pd V base v cur (v + 1)
+    else argmax_row_loop pd V base best_id best_val (v + 1)
+
+argmax_row probs row V = match probs
+  | Tensor pd _ _ ->
+    let base = row * V
+    -- Seed with v=0 to avoid a "sentinel-low" comparison that float >=
+    -- codegen can mishandle (rail_quirks #5).
+    let v0 = float_arr_get pd base
+    argmax_row_loop pd V base 0 v0 1
+
+-- ── Zero a range of a float_arr before we refill it. (Copied from
+-- lm_v3_chunked_d256_half.rail:146 — cleaner to copy than to import a
+-- training-only file.)
+zero_range arr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set arr i 0.0
+    zero_range arr n (i + 1)
+
+-- Fill x[0..prompt_len-1] with one-hot encodings of prompt_ids. ids_list
+-- is the Rail list of int IDs from encode_vocab_list.
+fill_prompt_loop xd ids_list V pos =
+  if length ids_list == 0 then pos
+  else
+    let id = head ids_list
+    let _ = float_arr_set xd (pos * V + id) 1.0
+    fill_prompt_loop xd (tail ids_list) V (pos + 1)
+
+-- ── Generation driver. Runs n_gen greedy steps starting from position
+-- prompt_len. Returns a list of generated ids (reversed; caller reverses).
+gen_loop x blocks_h w_e_h gf_h seq V d acc cur_pos end_pos =
+  if cur_pos >= end_pos then reverse acc
+  else
+    let mk = arena_mark 0
+    let probs = infer_forward x w_e_h blocks_h gf_h seq V d
+    -- probs[cur_pos - 1] is the distribution predicting what comes at
+    -- cur_pos. Caller ensures prompt_len >= 1 so cur_pos - 1 >= 0.
+    let pred_row = cur_pos - 1
+    let next_id = argmax_row probs pred_row V
+    let _ = arena_reset mk
+    -- Write the chosen token at cur_pos. Accumulate for decoding.
+    match x | Tensor xd _ _ ->
+      let _ = float_arr_set xd (cur_pos * V + next_id) 1.0
+      gen_loop x blocks_h w_e_h gf_h seq V d (cons next_id acc) (cur_pos + 1) end_pos
+
+-- ── Decode ids into a string using vocab's id_char lookup.
+ids_to_string_loop ids vocab acc =
+  if length ids == 0 then acc
+  else ids_to_string_loop (tail ids) vocab (cat [acc, id_char vocab (head ids)])
+
+ids_to_string ids vocab = ids_to_string_loop ids vocab ""
+
+-- ── CLI parsing — same shape as tools/train/generate.rail. ────────
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if head xs == key then
+    if length (tail xs) > 0 then head (tail xs) else ""
+  else argv_get_loop (tail xs) key
+
+argv_get argv key default_val =
+  let v = argv_get_loop argv key
+  if length (chars v) == 0 then default_val else v
+
+sanitize_loop ids acc =
+  if length ids == 0 then reverse acc
+  else
+    let id = head ids
+    let fixed = if id < 0 then 0 else id
+    sanitize_loop (tail ids) (cons fixed acc)
+
+sanitize_ids ids = sanitize_loop ids []
+
+main =
+  -- Silent by design — no headers. Only stdout is the decoded text.
+  let prefix = argv_get args "--prefix" default_prefix
+  let prompt = argv_get args "--prompt" default_prompt
+  let max_str = argv_get args "--max" default_max_gen_str
+  -- --k / --temp / --seed are accepted for CLI-compatibility with
+  -- generate.rail; greedy-only is implemented. Top-k/temperature is a
+  -- follow-on. Ignoring them means the bench can still invoke us with
+  -- its default --k 1 and get sensible output.
+  let _k_str = argv_get args "--k" "1"
+  let _tau_str = argv_get args "--temp" "1.0"
+  let _seed_str = argv_get args "--seed" "42"
+
+  let max_gen = parse_int max_str
+
+  -- Corpus → vocab. Must match training byte-for-byte.
+  let text = read_file corpus_path
+  let vocab = build_vocab text
+  let V = vocab_size vocab
+
+  -- Pre-flight: checkpoint committed?
+  let have_ckpt = ckpt_exists prefix
+  if not have_ckpt then
+    let _ = print (cat ["ERROR: no committed checkpoint at ", prefix])
+    0
+  else
+    let halfs = load_half_model prefix
+    let n_weights = length halfs
+    if n_weights != 20 then
+      let _ = print (cat ["ERROR: expected 20 weights (w_e + gf + 2×9 per block), got ", show n_weights])
+      0
+    else
+      -- Unpack weights in save order: [w_e, gf, b0[9], b1[9]].
+      let w_e_h = list_nth 0 halfs
+      let gf_h = list_nth 1 halfs
+      let b0 = cons (list_nth 2 halfs) (cons (list_nth 3 halfs) (cons (list_nth 4 halfs) (cons (list_nth 5 halfs) (cons (list_nth 6 halfs) (cons (list_nth 7 halfs) (cons (list_nth 8 halfs) (cons (list_nth 9 halfs) (cons (list_nth 10 halfs) []))))))))
+      let b1 = cons (list_nth 11 halfs) (cons (list_nth 12 halfs) (cons (list_nth 13 halfs) (cons (list_nth 14 halfs) (cons (list_nth 15 halfs) (cons (list_nth 16 halfs) (cons (list_nth 17 halfs) (cons (list_nth 18 halfs) (cons (list_nth 19 halfs) []))))))))
+      let blocks_h = cons b0 (cons b1 [])
+
+      let raw_ids = encode vocab prompt
+      let prompt_ids = sanitize_ids raw_ids
+      let prompt_len = length prompt_ids
+      if prompt_len == 0 then
+        let _ = print "ERROR: prompt encoded to 0 tokens (vocab mismatch?)"
+        0
+      else if prompt_len + max_gen >= seq_len then
+        let _ = print (cat ["ERROR: prompt_len (", show prompt_len, ") + max_gen (", show max_gen, ") exceeds seq_len (", show seq_len, ")"])
+        0
+      else
+        -- Allocate x one-hot buffer. Zero + fill prompt at positions
+        -- [0, prompt_len-1].
+        let x_data = float_arr_new (seq_len * V) 0.0
+        let x = Tensor x_data (cons seq_len (cons V [])) (compute_strides (cons seq_len (cons V [])))
+        let _ = fill_prompt_loop x_data prompt_ids V 0
+
+        -- Greedy decode loop. cur_pos starts at prompt_len; end_pos =
+        -- prompt_len + max_gen. gen_loop writes each chosen id into x
+        -- at its own position and returns the id list for decoding.
+        let end_pos = prompt_len + max_gen
+        let gen_ids = gen_loop x blocks_h w_e_h gf_h seq_len V 256 [] prompt_len end_pos
+        let gen_text = ids_to_string gen_ids vocab
+        -- Print prompt+continuation verbatim (matches generate.rail's
+        -- `print out` contract with decode vocab out_ids).
+        let _ = print (cat [prompt, gen_text])
+        0
