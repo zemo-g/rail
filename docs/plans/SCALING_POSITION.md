@@ -59,7 +59,9 @@ Using weights + Adam + n_blocks × cache + 300 MB baseline, with 13·d² ≈ par
 | d=3584 × 20-block | ~3.3B | 6.6 GB | 53 GB | 6.1 GB | ~66 GB |
 | d=4096 × 24-block | ~5.0B | 10 GB | 80 GB | 8.8 GB | ~99 GB |
 
-**The Studio's comfortable ceiling: ~2B parameters at ~40-45 GB RSS.** This is GPT-2 XL scale (1.5B params, the largest open model of 2019). The 128 GB unified memory accommodates this with headroom for the OS, intermediate tools, and IDE work. Going past ~2B hits 50%+ memory pressure which degrades Metal command-buffer scheduling.
+**Revised ceiling given actual Studio RAM (64 GB, verified 2026-04-22 — my earlier "128 GB" was wrong):** the practical near-term ceiling on Studio is more like **~500M parameters** (d=1024 × 16-block, ~18 GB RSS), with comfortable headroom for OS + Claude Code + a concurrent MLX server. The ~2B config (d=3072 × 16-block) *could* fit at ~40 GB RSS in principle, but only after (a) the arena bump lands, (b) bf16/fp16 Adam state replaces f64, and (c) gradient checkpointing cuts the 16-block cache line in half. Until all three ship, treat 500M-830M as the Studio ceiling.
+
+Also: Spur-0.1's ablation (2026-04-22) showed that at 544K chars of training corpus, ~1.74M parameters was already capacity-sufficient — the 4-block × 6000-step variant did not bench-improve over the 2-block × 3000-step flagship. Corpus is the binding constraint at this data size, not parameter count.
 
 ## What needs to ship before those configs become practical
 

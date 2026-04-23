@@ -74,8 +74,9 @@ Neither is critical path. If we choose to ship the model card with 12/30 as the 
 - [x] ≥5/30 deadline target cleared: **12/30**
 - [x] Training pipeline verified stable over 6000 steps with save+resume
 - [x] Peak RSS confirmed flat at 606-612 MB (leak hypothesis disproved after killing 27B MLX swap-thrash)
-- [ ] Model card updated with 12/30 headline
-- [ ] Final self-compile fixed-point verification (`./rail_native self && cmp rail_native /tmp/rail_self`)
+- [x] Model card updated with 13/30 headline (post-ablation)
+- [x] Final self-compile fixed-point verification: two consecutive unsigned self-compiles byte-identical (2026-04-22).
+- [x] Ablation shipped: 2-block × 3000 is Spur-0.1; 4-block variants are side-experiments.
 
 Only the last two items remain before the 2026-04-27 milestone is formally shipped.
 
@@ -84,4 +85,43 @@ Only the last two items remain before the 2026-04-27 milestone is formally shipp
 - `/tmp/rerank_sweep_2026-04-22/N1_nows0_step6000.log` — the 12/30 bench output (lives on Studio only)
 - `/tmp/rerank_sweep_2026-04-22/summary.txt` — one-line summary (Studio only)
 - `training/rail_native/checkpoints/d256_4block_half_step6000.*` — the 12/30 checkpoint
+- `training/rail_native/checkpoints/d256_half_step3000.*` — the **13/30** Spur-0.1 flagship checkpoint
 - This doc — the reasoning
+
+---
+
+## Ablation landed (appended 2026-04-22 late)
+
+Ran two follow-up benches to isolate variables:
+
+**Phase B — capacity ablation.** d=256 × **2-block** × half × **3000 steps** (S3 Run 2 checkpoint, 1.74M params, 84 min training), same `--k 10 --temp 0.8` decoder, default seeds.
+→ **13/30 (43%), q=22,709.** Per-band: Fund 2, IO 4, Tools 3, Comp 2, Adv 2, Comprh 0.
+
+**Phase A — variance check.** d=256 × 4-block × half × 6000 steps (same as 12/30 reference), same decoder, seed bases shifted +1000 (per-band: 1100-1600 instead of 100-600).
+→ **12/30 (40%), q=21,909.** Per-band: Fund 1, IO 3, Tools 3, Comp 2, Adv 3, Comprh 0.
+
+### What this tells us
+
+1. **Variance is tight (±0 headline, ±1 per band).** Reference 12/30 at base seeds, A 12/30 at +1000 seeds. The per-band distribution reshuffled (IO 4→3, Adv 2→3) but totals tied. The 13 on 2-block is 1 pass above the variance floor — directional but not confidently "different."
+
+2. **Capacity was not the lever.** The 2-block × 3000-step model (1.74M params, 84 min) BEAT the 4-block × 6000-step model (3.44M params, 255 min) by 1 pass. Doubling parameters and doubling training compute produced a net −1-point regression. At this corpus size, adding capacity past ~1.74M params does not bench-improve — Sessions 4 (deeper) and 7 (longer) were experimentally valuable but produced no headline delta.
+
+3. **Sampling was the entire 1/30 → 13/30 jump.** Same 2-block × 3000-step checkpoint scored 1/30 under `--k 1` argmax, 13/30 under `--k 10 --temp 0.8` sampling. A pure decoder change. Argmax at char-perplexity ~30 collapses to whitespace because `\n` is the most frequent char in the stdlib corpus; sampling exposes the model's learned tail.
+
+### Spur-0.1 is officially the 2-block model
+
+Following the ablation: the model card names **Spur-0.1 = d=256 × 2-block × HalfTensor × 3000 steps**. 1.74M params, 84 min training, 13/30 (σ ≈ 0-1) bench.
+
+The 4-block variants (Sessions 4 and 7) remain in the repo as honest side-experiments documenting "deeper/longer did not help here."
+
+### One more note on what we learned
+
+The series of sessions that built the 4-block + 6000-step pipeline was not wasted despite its zero delta. What it produced:
+
+- **Resume CLI** (`--resume <prefix>`), shipped and validated end-to-end in Session 7.
+- **Generic N-block infer harness**, auto-detecting block count from manifest weight count.
+- **Save / load of HalfTensor checkpoints** via `save_half_checkpoint` / `load_half_model_into` / `load_adam_states_into`.
+- **Bench reliability under swap pressure** understanding — the "leaks" and "dyld errors" we chased were attributable to memory pressure from two concurrent MLX servers, not code bugs.
+- **The full re-rank + whitespace-filter infrastructure** shipped in `flywheel-local/bench_railnative_rerank.rail` and `lm_infer_v3_half.rail`. Neither was needed for the 5/30 deadline (sampling alone cleared it) but both are available for future experiments that might push toward 20+/30.
+
+None of that capability existed at the start of the day. All of it survives, documented.
