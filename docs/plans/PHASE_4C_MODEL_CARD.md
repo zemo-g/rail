@@ -241,6 +241,10 @@ cd tools/metal && clang -shared -fobjc-arc \
   tensor_gpu_lib.m -o libtensor_gpu.dylib
 ```
 
+## Spur-Fix (diagnostic-corpus training) — attempted, deferred
+
+Documented in `docs/plans/PHASE_5G_SPUR_FIX_NEGATIVE.md`. Two variants trained (v0.1 pure triples, v0.2 mixed corpus). Neither exceeded Spur-0.1's 25/30. v0.1 failed catastrophically on cold prompts (collapsed to protocol markers). v0.2 matched Spur-0.1 at single-sample (14/30) but the `<BROKEN>/<DIAG>/<FIXED>` fix-loop produced zero additional passes. Root cause: 247 triples at ~10% of training volume is ~2 orders of magnitude too few to install the fix-generation capability reliably. Infrastructure (mutate + diagnose + gen_triples + lm_v3_mixed + bench_railnative_fix) is shipped and reusable. Open for a Session 10+ v0.3 attempt with larger triple corpus and loss masking.
+
 ## Scaling position
 
 The architecture shipped here (RMSNorm + RoPE + SwiGLU + tied embeddings + HalfTensor forward + f64 backward) is the same recipe used at 7B-70B scale by Llama / Mistral / Qwen. It is not a dead-end shape. On a Studio-class M1 Ultra (128 GB unified memory), the theoretical ceiling of this stack is approximately:
