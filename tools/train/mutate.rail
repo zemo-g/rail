@@ -1,0 +1,168 @@
+-- mutate.rail — text-level mutation operators for generating
+-- (broken_code, fixed_code) training pairs from valid Rail programs.
+--
+-- Given any valid Rail source `src` and a mutation op id `op`, produces
+-- a broken version of `src` that will fail to compile in a predictable
+-- way. The original `src` IS the fixed version — we don't compute an
+-- inverse, we just keep the input.
+--
+-- Mutations are deterministic given (src, op, seed). Each returns a
+-- string. Use in pairs with diagnose.rail to capture the compiler's
+-- error message, then emit (broken, diag, src) triples.
+
+import "stdlib/tokenizer.rail"
+
+cat parts = join "" parts
+
+-- ── LCG rng in a float_arr[1] (reuses the pattern from the trainer).
+lcg_state_new seed =
+  let a = float_arr_new 1 0.0
+  let _ = float_arr_set a 0 (int_to_float seed)
+  a
+
+lcg_next state =
+  let s = float_to_int (float_arr_get state 0)
+  let new_s = (s * 1664525 + 1013904223) % 2147483648
+  let _ = float_arr_set state 0 (int_to_float new_s)
+  new_s
+
+-- Bounded random in [0, n).
+rand_mod state n =
+  let r = lcg_next state
+  r % n
+
+-- ── mut_delete_line: drop a random line from the source. Compiler
+-- almost always produces a parse or link error (removed a decl or
+-- broke a multi-line expression).
+mut_delete_line src rng =
+  let lines = split "\n" src
+  let n = length lines
+  if n < 2 then src  -- too short to usefully mutate
+  else
+    let idx = rand_mod rng n
+    let kept = delete_at lines idx 0 []
+    join "\n" kept
+
+delete_at lines target i acc =
+  if length lines == 0 then reverse acc
+  else if i == target then delete_at (tail lines) target (i + 1) acc
+  else delete_at (tail lines) target (i + 1) (cons (head lines) acc)
+
+-- ── mut_remove_main: strip the `main = ...` line. Produces
+-- `ld: Undefined symbols: _main` at link time. Most common real-world
+-- bug for small programs.
+mut_remove_main src rng =
+  let lines = split "\n" src
+  let kept = filter_not_main lines []
+  join "\n" kept
+
+filter_not_main lines acc =
+  if length lines == 0 then reverse acc
+  else
+    let l = head lines
+    if starts_with "main " l then filter_not_main (tail lines) acc
+    else if starts_with "main=" l then filter_not_main (tail lines) acc
+    else filter_not_main (tail lines) (cons l acc)
+
+starts_with prefix s =
+  let ps = chars prefix
+  let ss = chars s
+  starts_with_loop ps ss
+
+starts_with_loop ps ss =
+  if length ps == 0 then 1 == 1  -- sentinel true
+  else if length ss == 0 then 1 == 0
+  else if head ps == head ss then starts_with_loop (tail ps) (tail ss)
+  else 1 == 0
+
+-- ── mut_truncate_let: find `let <name> = ` followed by an expression
+-- and chop the expression. Produces parse error at end-of-let.
+mut_truncate_let src rng =
+  let i = str_find "let " src
+  if i < 0 then src
+  else
+    -- Find the `=` after "let "
+    let after_let = str_sub src i (length (chars src) - i)
+    let eq_off = str_find " = " after_let
+    if eq_off < 0 then src
+    else
+      -- Cut from (i + eq_off + 3) through end of line.
+      let cut_start = i + eq_off + 3
+      let tail_s = str_sub src cut_start (length (chars src) - cut_start)
+      let nl_off = str_find "\n" tail_s
+      if nl_off < 0 then str_sub src 0 cut_start
+      else
+        let before = str_sub src 0 cut_start
+        let after = str_sub src (cut_start + nl_off) (length (chars src) - cut_start - nl_off)
+        cat [before, after]
+
+-- ── mut_typo_keyword: replace "then" with "thn" at first occurrence.
+-- Produces parse error "expected expression after 'then'".
+mut_typo_keyword src rng =
+  let i = str_find "then" src
+  if i < 0 then src
+  else
+    let before = str_sub src 0 i
+    let after = str_sub src (i + 4) (length (chars src) - i - 4)
+    cat [before, "thn", after]
+
+-- ── mut_insert_stray_paren: insert `)` after the first `=`.
+-- Produces "unmatched )" parse error.
+mut_insert_stray_paren src rng =
+  let i = str_find " = " src
+  if i < 0 then src
+  else
+    let before = str_sub src 0 (i + 3)
+    let after = str_sub src (i + 3) (length (chars src) - i - 3)
+    cat [before, ") ", after]
+
+-- ── mut_swap_add_sub: change first `+` to `-`.
+-- Produces a compiling but semantically-wrong program. This is a
+-- different failure mode — compile-pass but runtime-wrong. We keep it
+-- because diagnostic-aware training should learn `semantic != syntactic`.
+mut_swap_add_sub src rng =
+  str_replace_first " + " " - " src
+
+-- Helper: replace first occurrence only (str_replace replaces all).
+str_replace_first needle replacement haystack =
+  let i = str_find needle haystack
+  if i < 0 then haystack
+  else
+    let nl = length (chars needle)
+    let before = str_sub haystack 0 i
+    let after = str_sub haystack (i + nl) (length (chars haystack) - i - nl)
+    cat [before, replacement, after]
+
+-- ── Dispatcher: given op id, apply that mutation.
+mutate op src rng =
+  if op == 0 then mut_delete_line src rng
+  else if op == 1 then mut_remove_main src rng
+  else if op == 2 then mut_truncate_let src rng
+  else if op == 3 then mut_typo_keyword src rng
+  else if op == 4 then mut_insert_stray_paren src rng
+  else if op == 5 then mut_swap_add_sub src rng
+  else src
+
+n_mutations = 6
+
+-- ── Smoke: apply each op to a tiny test program, print broken versions.
+-- Run with: ./rail_native run tools/train/mutate.rail
+test_src = cat [
+  "add a b = a + b\n",
+  "main = let x = add 2 3\n",
+  "  print (show x)\n"]
+
+smoke_loop op =
+  if op >= n_mutations then 0
+  else
+    let rng = lcg_state_new (42 + op)
+    let broken = mutate op test_src rng
+    let _ = print (cat ["=== op ", show op, " ==="])
+    let _ = print broken
+    smoke_loop (op + 1)
+
+main =
+  let _ = print "--- original ---"
+  let _ = print test_src
+  let _ = smoke_loop 0
+  0

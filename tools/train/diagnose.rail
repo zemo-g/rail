@@ -1,0 +1,110 @@
+-- diagnose.rail — compile a source string, capture the compiler's
+-- stderr+stdout, extract structured diagnostic info.
+--
+-- Invoke the real rail_native compiler on the source (written to a
+-- temp path) and grep out the first error line. Returns a string
+-- suitable for embedding as the <DIAG> block of a training triple.
+--
+-- Compiler output formats observed in stdlib/compile.rail:
+--   1. Parse errors:   "<path>:<line>:<col>: error: <message>"
+--   2. Type warnings:  "  WARNING [typecheck] in <fn>: <description>"
+--   3. Link errors:    "ld: Undefined symbols for architecture arm64:\n  _<symbol>"
+--   4. Success:        "  as: OK\n  ld: OK"
+-- Our diagnostic extractor prioritizes (1) > (3) > (2) since compile
+-- errors are more actionable than warnings.
+
+import "stdlib/tokenizer.rail"
+
+cat parts = join "" parts
+
+-- ── Shell out to compile a source. Returns the compiler's full output
+-- (stdout+stderr interleaved). The /tmp path is bench-local so we
+-- don't collide with rail_native's own /tmp/rail_out.
+--
+-- CAUTION: this invokes `./rail_native` which writes to /tmp/rail_out.
+-- If another process is mid-compile-and-copy, we'd clobber. For
+-- batch triple generation, serialize — don't run in parallel with
+-- other rail_native invocations.
+compile_and_capture src =
+  let _ = write_file "/tmp/rail_diag_in.rail" src
+  shell "cd ~/projects/rail && ./rail_native /tmp/rail_diag_in.rail 2>&1"
+
+-- ── Extract the first error line from compiler output.
+-- Priority: parse error (file:line:col: error) > link error > warning.
+-- If nothing matches, return empty string (compile succeeded).
+extract_diagnostic out =
+  let lines = split "\n" out
+  pick_best_diag lines ""
+
+pick_best_diag lines best =
+  if length lines == 0 then best
+  else
+    let l = head lines
+    let is_parse = if str_contains ": error: " l then 1 else 0
+    let is_link = if str_contains "Undefined symbol" l then 1 else 0
+    let is_warn = if str_contains "WARNING" l then 1 else 0
+    let is_linker = if str_contains "_main" l then 1 else 0
+    let priority = if is_parse == 1 then 3
+                   else if is_link == 1 then 2
+                   else if is_linker == 1 then 2
+                   else if is_warn == 1 then 1
+                   else 0
+    let best_priority = diag_priority best
+    if priority > best_priority then pick_best_diag (tail lines) (trim_line l)
+    else pick_best_diag (tail lines) best
+
+-- Assess the priority of an already-captured diagnostic.
+diag_priority d =
+  if length (chars d) == 0 then 0
+  else if str_contains ": error: " d then 3
+  else if str_contains "Undefined symbol" d then 2
+  else if str_contains "_main" d then 2
+  else if str_contains "WARNING" d then 1
+  else 0
+
+trim_line s =
+  let cs = chars s
+  trim_leading cs
+
+trim_leading cs =
+  if length cs == 0 then ""
+  else if head cs == " " then trim_leading (tail cs)
+  else join "" cs
+
+-- ── Top-level: diagnose a source string. Returns (compile_ok, diag).
+-- compile_ok = 1 if the compiler emitted "ld: OK" and we saw no parse
+-- errors. diag = the extracted first error line, or "" if clean.
+diagnose src =
+  let out = compile_and_capture src
+  let ok = if str_contains "ld: OK" out then 1 else 0
+  let has_error = if str_contains ": error: " out then 1 else 0
+  let compile_ok = if ok == 1 then (if has_error == 1 then 0 else 1) else 0
+  let diag = extract_diagnostic out
+  cons compile_ok (cons diag [])
+
+-- ── Smoke: try a clean program, an obviously-broken one, and one that
+-- has a warning but compiles. Verify we pick the right diagnostic class.
+
+smoke_clean = "main = let _ = print 42\n  0\n"
+
+smoke_parse = "main = let x = \n  0\n"  -- truncate_let-style
+
+smoke_link = "add a b = a + b\n"  -- no main
+
+smoke_typo = "fact n = if n <= 1 thn 1 else n * fact (n - 1)\nmain = let _ = print (show (fact 5))\n  0\n"
+
+print_diag label src =
+  let _ = print (cat ["--- ", label, " ---"])
+  let result = diagnose src
+  let ok = head result
+  let diag = head (tail result)
+  let _ = print (cat ["  compile_ok=", show ok])
+  let _ = print (cat ["  diag=", diag])
+  0
+
+main =
+  let _ = print_diag "clean" smoke_clean
+  let _ = print_diag "parse_truncate" smoke_parse
+  let _ = print_diag "link_no_main" smoke_link
+  let _ = print_diag "typo_thn" smoke_typo
+  0
