@@ -1,0 +1,148 @@
+-- gen_triples.rail — harvest (broken, diagnostic, fixed) triples for
+-- diagnostic-corpus training.
+--
+-- Walk a list of seed programs (compile-clean Rail snippets). For each
+-- seed and each mutation op, produce:
+--   1. broken_src = apply op to seed
+--   2. diag = compile broken_src, extract first error/warning/link line
+--   3. fixed_src = seed (original, unmutated)
+-- Emit to an output file as concatenated <BROKEN>/<DIAG>/<FIXED>/<END>
+-- blocks — the training format from DIAGNOSTIC_CORPUS.md.
+--
+-- WARNING: invokes ./rail_native on the filesystem (via diagnose),
+-- which writes /tmp/rail_out. Don't run concurrently with the bench's
+-- oracle-compile shellouts — they share the same /tmp/rail_out path
+-- without locking on Studio. Safe to run after Phase 2 of a sweep
+-- finishes.
+--
+-- Output format (pure text, one triple block per entry):
+--   <BROKEN>
+--   <src...>
+--   <DIAG>
+--   <diagnostic line>
+--   <FIXED>
+--   <src...>
+--   <END>
+--   (blank line)
+--
+-- Skips triples where:
+--   - mutation was a no-op (broken == fixed)
+--   - diagnostic was empty (mutation produced compile-clean code —
+--     semantically different, but no error signal to train on)
+
+import "tools/train/mutate.rail"
+import "tools/train/diagnose.rail"
+
+-- ── Seed programs. Each must compile cleanly on its own. Short, simple,
+-- covers diverse patterns (let, match, recursion, ADTs, ops, literals).
+
+seed_01 = "main = let _ = print 42\n  0\n"
+
+seed_02 = cat [
+  "add a b = a + b\n",
+  "main = let _ = print (show (add 2 3))\n  0\n"]
+
+seed_03 = cat [
+  "fact n = if n <= 1 then 1 else n * fact (n - 1)\n",
+  "main = let _ = print (show (fact 5))\n  0\n"]
+
+seed_04 = cat [
+  "type Opt = | Some x | None\n",
+  "unwrap o = match o | Some x -> x | None -> 0\n",
+  "main = let _ = print (show (unwrap (Some 7)))\n  0\n"]
+
+seed_05 = cat [
+  "sum_list xs = fold add 0 xs\n",
+  "main = let _ = print (show (sum_list [1, 2, 3, 4, 5]))\n  0\n"]
+
+seed_06 = cat [
+  "double x = x * 2\n",
+  "main = let _ = print (show (double 21))\n  0\n"]
+
+seed_07 = cat [
+  "reverse_str s = join \"\" (reverse (chars s))\n",
+  "main = let _ = print (reverse_str \"hello\")\n  0\n"]
+
+seed_08 = cat [
+  "type Tree = | Leaf | Node v l r\n",
+  "count t = match t | Leaf -> 0 | Node _ l r -> 1 + count l + count r\n",
+  "main = let _ = print (show (count (Node 1 Leaf Leaf)))\n  0\n"]
+
+seed_09 = cat [
+  "fib n = if n <= 1 then n else fib (n - 1) + fib (n - 2)\n",
+  "main = let _ = print (show (fib 7))\n  0\n"]
+
+seed_10 = cat [
+  "square x = x * x\n",
+  "main = let _ = print (show (square 9))\n  0\n"]
+
+all_seeds = cons seed_01 (cons seed_02 (cons seed_03 (cons seed_04 (cons seed_05 (cons seed_06 (cons seed_07 (cons seed_08 (cons seed_09 (cons seed_10 [])))))))))
+
+-- ── Triple emission. Builds a single block-of-text triple; caller
+-- appends to the output file.
+format_triple broken diag fixed =
+  cat [
+    "<BROKEN>\n",
+    broken,
+    if starts_with_newline broken then "" else "\n",
+    "<DIAG>\n",
+    diag,
+    "\n<FIXED>\n",
+    fixed,
+    if starts_with_newline fixed then "" else "\n",
+    "<END>\n\n"]
+
+starts_with_newline s =
+  if length (chars s) == 0 then 1 == 0
+  else (head (chars s)) == "\n"
+
+-- ── Per-seed loop: try each mutation op, emit valid triples.
+process_seed_loop seed op rng fh acc_count =
+  if op >= n_mutations then acc_count
+  else
+    let broken = mutate op seed rng
+    -- Skip no-op mutations.
+    if broken == seed then
+      process_seed_loop seed (op + 1) rng fh (acc_count + 0)
+    else
+      let diag_pair = diagnose broken
+      let compile_ok = head diag_pair
+      let diag = head (tail diag_pair)
+      -- Skip if mutation didn't produce a detectable error (broke
+      -- semantics but still compiled, e.g. op 5 swap_add_sub often).
+      if length (chars diag) == 0 then
+        process_seed_loop seed (op + 1) rng fh (acc_count + 0)
+      else
+        let triple = format_triple broken diag seed
+        let _ = append_to_file fh triple
+        let _ = print (cat ["  op=", show op, " diag=", diag])
+        process_seed_loop seed (op + 1) rng fh (acc_count + 1)
+
+append_to_file path text =
+  -- Rail's write_file overwrites; use shell-append for our accumulator.
+  let _ = write_file "/tmp/rail_triple_part.txt" text
+  shell (cat ["cat /tmp/rail_triple_part.txt >> ", path])
+
+-- ── Outer loop: walk all seeds.
+process_seeds_loop seeds idx fh total =
+  if length seeds == 0 then total
+  else
+    let seed = head seeds
+    let _ = print (cat ["seed ", show idx, " (", show (length (chars seed)), " chars)"])
+    let rng = lcg_state_new (1000 + idx * 37)
+    let got = process_seed_loop seed 0 rng fh 0
+    process_seeds_loop (tail seeds) (idx + 1) fh (total + got)
+
+main =
+  let out_path = "training/triples_v1.txt"
+  let _ = shell (cat ["rm -f ", out_path])
+  let _ = write_file out_path ""  -- truncate / create empty
+  let _ = print (cat ["writing triples → ", out_path])
+  let total = process_seeds_loop all_seeds 0 out_path 0
+  let _ = print (cat ["\nharvested ", show total, " triples across ", show (length all_seeds), " seeds"])
+  let size_cmd = cat ["wc -c < ", out_path]
+  let sz = trim (shell size_cmd)
+  let _ = print (cat ["corpus size: ", sz, " chars"])
+  0
+
+trim s = head (split "\n" s)
