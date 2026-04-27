@@ -38,12 +38,13 @@ import "stdlib/checkpoint.rail"
 -- Must be < corpus_len so we have valid offsets to sample.
 seq_len = 1024
 
--- Spur-Fix v0.2 corpus: stdlib (544KB) + triples (59KB) concatenated.
--- v0.1 trained on pure triples collapsed to block-markers at inference
--- because it never saw raw code outside protocol blocks. v0.2 mixes,
--- so the model learns raw code (from stdlib) + <BROKEN>/<DIAG>/<FIXED>
--- protocol (from triples). 247 triples inside a 603KB training stream.
-corpus_path = "training/corpus_mixed_v1.txt"
+-- Spur-Fix v0.3 corpus: stdlib (544KB) + triples_v2 (709KB) concatenated.
+-- 18 mutation ops × 120 seeds × 12 rng yielded 2,357 triples (vs v0.2's 247).
+-- Pairs with loss masking (this file): only chars inside <FIXED>...<END>
+-- (and all stdlib chars before the first <BROKEN>) contribute gradient.
+-- BROKEN/DIAG content + the protocol marker tokens themselves get mask=0,
+-- focusing gradient on fix-content quality rather than marker structure.
+corpus_path = "training/corpus_mixed_v3.txt"
 
 -- Phase 1d: multi-chunk eval + memory instrumentation (2026-04-20 PM).
 -- `eval_interval` train steps between multi-chunk evals.
@@ -55,8 +56,8 @@ eval_interval = 100
 n_eval_chunks = 10
 eval_seed = 1337
 rss_interval = 500
-rss_log_path = "/tmp/t5_mixed_rss.txt"
-eval_log_path = "/tmp/t5_mixed_eval.txt"
+rss_log_path = "/tmp/t5_v03_rss.txt"
+eval_log_path = "/tmp/t5_v03_eval.txt"
 
 -- ── HalfTensor cast shims. Drop-in replacements that round-trip through
 -- f64 until Mini ships real half kernels. Numerically equivalent (same
@@ -172,28 +173,34 @@ fill_labels_arr arr ids_arr seq offset i =
     fill_labels_arr arr ids_arr seq offset (i + 1)
 
 -- Given batch_ctx, sample a fresh chunk in place into x_data and labels_data.
--- batch_ctx layout: [x, labels, ids_arr, rng, corpus_len, eval_offsets]
--- (eval_offsets is optional — added in Phase 1d; indices 0-4 unchanged for
--- backward compat with sample_chunk / m_eval_loss callers.)
+-- batch_ctx layout (Phase 5h.2): [x, labels, ids_arr, rng, corpus_len,
+-- eval_offsets, mask_global, mask_chunk].
+-- Indices 0-5 unchanged from Phase 1d; 6 + 7 added for loss masking.
 sample_chunk batch_ctx V seq =
   let x = list_nth 0 batch_ctx
   let labels = list_nth 1 batch_ctx
   let ids_arr = list_nth 2 batch_ctx
   let rng = list_nth 3 batch_ctx
   let corpus_len = list_nth 4 batch_ctx
+  let mask_global = list_nth 6 batch_ctx
+  let mask_chunk = list_nth 7 batch_ctx
   let r = lcg_next rng
   -- Ensure offset + seq + 1 <= corpus_len (need labels[seq-1] = ids[offset+seq])
   let max_off = corpus_len - seq - 1
   let offset = r % max_off
   match x | Tensor xd _ _ ->
     match labels | Tensor ld _ _ ->
-      let _ = zero_range xd (seq * V) 0
-      let _ = fill_onehot_arr xd ids_arr V seq offset 0
-      let _ = fill_labels_arr ld ids_arr seq offset 0
-      offset
+      match mask_chunk | Tensor mcd _ _ ->
+        let _ = zero_range xd (seq * V) 0
+        let _ = fill_onehot_arr xd ids_arr V seq offset 0
+        let _ = fill_labels_arr ld ids_arr seq offset 0
+        let _ = fill_mask_chunk_arr mcd mask_global seq offset 0
+        offset
 
 -- Variant of sample_chunk that takes a FIXED offset (for held-out eval).
--- Does not consume the training rng.
+-- Does not consume the training rng. Eval uses unmasked CE so we don't
+-- bother filling the mask_chunk here — m_eval_loss / m_eval_multi_loop
+-- call the unmasked m_ce_loss path.
 sample_chunk_at batch_ctx V seq offset =
   let x = list_nth 0 batch_ctx
   let labels = list_nth 1 batch_ctx
@@ -222,7 +229,124 @@ gen_eval_loop offsets rng n max_off i =
     let _ = float_arr_set offsets i (int_to_float off)
     gen_eval_loop offsets rng n max_off (i + 1)
 
+-- ─────────────────────────────────────────────────────────────────────
+-- Phase 5h.2 — Loss masking
+-- ─────────────────────────────────────────────────────────────────────
+-- Build a global per-char mask over the full corpus. Mask=1.0 for chars
+-- the model should predict (stdlib code + content inside <FIXED>...<END>);
+-- mask=0.0 for chars whose gradient we want to suppress (BROKEN/DIAG
+-- content + the protocol marker tokens themselves). At sample time we
+-- slice this mask the same way we slice ids → labels, so each chunk's
+-- mask vector matches its labels vector position-for-position.
+
+-- Find first occurrence of `needle` in `haystack` at or after `from_pos`,
+-- returning -1 if not found. CRITICAL: hl (length of haystack) is passed
+-- explicitly. `length (chars haystack)` allocates a 1.25M-element list and
+-- walks it; doing that per call to find_from blew up an overnight smoke
+-- run (~407 CPU minutes before kill).
+find_from_text needle haystack hl from_pos =
+  let nl = length (chars needle)
+  find_from_loop needle nl haystack hl from_pos
+
+find_from_loop needle nl haystack hl pos =
+  if pos < 0 then 0 - 1
+  else if pos > hl - nl then 0 - 1
+  else
+    let sub = str_sub haystack pos nl
+    if sub == needle then pos
+    else find_from_loop needle nl haystack hl (pos + 1)
+
+-- Fill mask_arr[start..end_excl] with `value`.
+fill_range_arr arr start end_excl value =
+  if start >= end_excl then 0
+  else
+    let _ = float_arr_set arr start value
+    fill_range_arr arr (start + 1) end_excl value
+
+-- Walk the triples region marking each <FIXED>\n...<END>\n\n block's
+-- CONTENT (between the two markers, marker bytes themselves stay 0).
+mark_fixed_blocks_loop mask text n cur =
+  if cur >= n then 0
+  else
+    let fixed_start = find_from_text "<FIXED>\n" text n cur
+    if fixed_start < 0 then 0
+    else
+      let content_start = fixed_start + 8  -- length of "<FIXED>\n"
+      let end_start = find_from_text "<END>" text n content_start
+      if end_start < 0 then 0
+      else
+        let _ = fill_range_arr mask content_start end_start 1.0
+        mark_fixed_blocks_loop mask text n end_start
+
+build_loss_mask text n =
+  let mask = float_arr_new n 0.0
+  -- Stdlib region = everything before the first <BROKEN>. If the corpus
+  -- has no triples (pure stdlib run), everything stays mask=1.
+  let first_broken = find_from_text "<BROKEN>" text n 0
+  let stdlib_end = if first_broken < 0 then n else first_broken
+  let _ = fill_range_arr mask 0 stdlib_end 1.0
+  let _ = mark_fixed_blocks_loop mask text n stdlib_end
+  mask
+
+-- Slice mask_global[offset..offset+seq-1] into the per-chunk mask Tensor's
+-- internal float_arr. Symmetric to fill_labels_arr.
+fill_mask_chunk_arr arr mask_arr seq offset i =
+  if i >= seq then 0
+  else
+    let m = float_arr_get mask_arr (offset + i)
+    let _ = float_arr_set arr i m
+    fill_mask_chunk_arr arr mask_arr seq offset (i + 1)
+
+-- Sum over the chunk's mask = number of "kept" (unmasked) positions.
+mask_sum_loop arr seq i acc =
+  if i >= seq then acc
+  else
+    let m = float_arr_get arr i
+    mask_sum_loop arr seq (i + 1) (acc + m)
+
+-- Masked CE loss: sum of -log p(target) over kept positions, divided by
+-- max(1, n_kept). Equivalent to standard CE on a sub-batch of kept tokens.
+m_ce_loss_masked_loop pd ld mask seq V acc i =
+  if i >= seq then 0
+  else
+    let m = float_arr_get mask i
+    if m < 0.5 then m_ce_loss_masked_loop pd ld mask seq V acc (i + 1)
+    else
+      let target = float_to_int (float_arr_get ld i)
+      let p = float_arr_get pd (i * V + target)
+      let p2 = if p < 0.00000001 then 0.00000001 else p
+      let cur = float_arr_get acc 0
+      let _ = float_arr_set acc 0 (cur - log p2)
+      m_ce_loss_masked_loop pd ld mask seq V acc (i + 1)
+
+m_ce_loss_masked probs labels mask seq V n_kept = match probs
+  | Tensor pd _ _ -> match labels
+    | Tensor ld _ _ -> match mask
+      | Tensor md _ _ ->
+        let acc = float_arr_new 1 0.0
+        let _ = m_ce_loss_masked_loop pd ld md seq V acc 0
+        let denom = if n_kept < 1.0 then 1.0 else n_kept
+        (float_arr_get acc 0) / denom
+
+-- Masked CE grad: zero-gradient on mask=0 positions; on kept positions,
+-- normalize by 1/n_kept (NOT 1/seq) so each kept token contributes equal
+-- weight regardless of how many other tokens were masked in this chunk.
+m_ce_grad_masked_loop dst probs labels mask seq V invKept i =
+  if i >= seq * V then 0
+  else
+    let row = i / V
+    let col = i % V
+    let m = float_arr_get mask row
+    let target = float_to_int (float_arr_get labels row)
+    let p = float_arr_get probs i
+    let g_raw = if col == target then (p - 1.0) * invKept else p * invKept
+    let g = g_raw * m
+    let _ = float_arr_set dst i g
+    m_ce_grad_masked_loop dst probs labels mask seq V invKept (i + 1)
+
 -- ── Standard cross-entropy + grad (identical to lm_v3_multi).
+-- Kept for held-out eval (m_eval_loss / m_eval_multi_loop) so the eval
+-- number reflects raw next-token CE on each chunk, comparable across runs.
 m_ce_loss_loop pd ld seq V acc i =
   if i >= seq then 0
   else
@@ -489,7 +613,7 @@ m_forward x w_e_h blocks_h gf_h seq V d =
 -- HalfTensor. Forward runs on halves, bwd casts to f64 at each
 -- m_block_bwd entry, adam updates use half_adam_update to pack the
 -- updated f64 weight back into the HalfTensor cell in place.
-m_train_step x labels blocks_h w_e_h gf_h adams_e adams_gf adams_blocks seq V d dlog_buf lr =
+m_train_step x labels mask_chunk blocks_h w_e_h gf_h adams_e adams_gf adams_blocks seq V d dlog_buf lr =
   let result = m_forward x w_e_h blocks_h gf_h seq V d
   let probs = list_nth 0 result
   let x_final = list_nth 1 result
@@ -497,16 +621,20 @@ m_train_step x labels blocks_h w_e_h gf_h adams_e adams_gf adams_blocks seq V d 
   let cache1 = list_nth 3 result
   let cache0 = list_nth 4 result
 
-  let loss = m_ce_loss probs labels seq V
-
   -- γ LR multiplier: RMSNorm γs learn too fast at global lr; ported from
   -- lm_v3_chunked_4block.rail:425 (tuning from commit 924e0c5). Applied to
   -- gf + g1/g2 across both blocks — 5 γ tensors total at depth=2.
   let lr_g = lr * adam_lr_mult_gamma
 
-  match probs | Tensor pd _ _ -> match labels | Tensor ld _ _ ->
-    let invN = 1.0 / int_to_float seq
-    let _ = m_ce_grad_loop dlog_buf pd ld seq V invN 0
+  -- Phase 5h.2: masked CE. n_kept counts unmasked positions; loss is the
+  -- per-kept-token CE; gradient zeros masked positions and normalizes by
+  -- 1/n_kept so each kept token contributes unit weight regardless of
+  -- how many other positions in this chunk were masked.
+  match mask_chunk | Tensor mcd _ _ -> match probs | Tensor pd _ _ -> match labels | Tensor ld _ _ ->
+    let n_kept = mask_sum_loop mcd seq 0 0.0
+    let loss = m_ce_loss_masked probs labels mask_chunk seq V n_kept
+    let invKept = if n_kept < 1.0 then 0.0 else 1.0 / n_kept
+    let _ = m_ce_grad_masked_loop dlog_buf pd ld mcd seq V invKept 0
     let dlog_t = Tensor dlog_buf (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
 
     let w_e_f = tensor_of_half w_e_h
@@ -594,10 +722,11 @@ m_train_loop batch_ctx blocks w_e gf adams_e adams_gf adams_blocks seq V d dlog_
     let _ = maybe_eval batch_ctx blocks w_e gf seq V d step
     let x = list_nth 0 batch_ctx
     let labels = list_nth 1 batch_ctx
+    let mask_chunk = list_nth 7 batch_ctx
     let _ = sample_chunk batch_ctx V seq
     let lr = cosine_decay step warmup max_steps base_lr
     let mk = arena_mark 0
-    let loss = m_train_step x labels blocks w_e gf adams_e adams_gf adams_blocks seq V d dlog_buf lr
+    let loss = m_train_step x labels mask_chunk blocks w_e gf adams_e adams_gf adams_blocks seq V d dlog_buf lr
     let _ = arena_reset mk
     let cur_min = float_arr_get min_buf 0
     let new_min = if loss < cur_min then loss else cur_min
@@ -751,11 +880,21 @@ main =
   let eval_offsets = gen_eval_offsets n_eval_chunks max_off eval_seed
   let _ = print (cat ["eval set: ", show n_eval_chunks, " held-out chunks, seed=", show eval_seed])
 
+  -- Phase 5h.2 — build the global loss mask over the full corpus, then
+  -- pre-allocate the per-chunk mask Tensor that sample_chunk will fill.
+  let _ = print "building loss mask over corpus..."
+  let mask_global = build_loss_mask text corpus_len
+  let kept_total = mask_sum_loop mask_global corpus_len 0 0.0
+  let kept_pct = 100.0 * kept_total / int_to_float corpus_len
+  let _ = print (cat ["mask: kept=", show_float kept_total, "/", show corpus_len, " chars (", show_float kept_pct, "%)"])
+  let mask_chunk_data = float_arr_new seq 0.0
+  let mask_chunk = Tensor mask_chunk_data (cons seq []) (cons 1 [])
+
   -- Fresh log files for this run (truncate).
   let _ = shell (cat ["echo '' > ", rss_log_path])
   let _ = shell (cat ["echo '' > ", eval_log_path])
 
-  let batch_ctx = cons x (cons labels (cons ids_arr (cons rng (cons corpus_len (cons eval_offsets [])))))
+  let batch_ctx = cons x (cons labels (cons ids_arr (cons rng (cons corpus_len (cons eval_offsets (cons mask_global (cons mask_chunk [])))))))
 
   let d = 256
   let d_ff = 3 * d
@@ -805,7 +944,7 @@ main =
   -- [w_e, gf, b0[q,k,v,o,gate,up,down,g1,g2], b1[q,k,v,o,gate,up,down,g1,g2]]
   -- = 20 weights. Adam states follow the same order. Loader side is
   -- lm_infer_v3_half.rail (same flatten order).
-  let ckpt = "training/rail_native/checkpoints/spur_fix_v02_step3000"
+  let ckpt = "training/rail_native/checkpoints/spur_fix_v03_step3000"
   let _ = shell "mkdir -p training/rail_native/checkpoints"
   let weights_flat = append (cons w_e (cons gf [])) (append block0 block1)
   let adams_flat = append (cons st_we (cons st_gf [])) (append block0_adams block1_adams)
