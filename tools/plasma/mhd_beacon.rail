@@ -1,0 +1,132 @@
+-- tools/plasma/mhd_beacon.rail — Rail-native ledatic.org entropy beacon
+--
+-- Replaces the numpy mhd_ot_beacon.py driver.  Same Lax-Friedrichs
+-- ideal-MHD core (now in stdlib/mhd_kernel.rail), same Orszag-Tang IC,
+-- same reset-at-t=π behaviour, same ~3-4 Hz publish rate.  All physics
+-- is in Rail; mhd_beacon_pack.py is a 30-line packer that consumes
+-- six ASCII plane dumps + a metadata file and emits the canonical
+-- /tmp/plasma_live.bin in the byte-format that entropy_beacon.sh +
+-- the Pi witness Ed25519 chain + the homepage ticker already speak.
+--
+-- The dance per frame:
+--   1. STEPS_PER_FRAME LF steps with CFL-adaptive dt
+--   2. Reset state if sim_time has crossed t=π (keeps the chaos live)
+--   3. Dump 6 primitive planes (rho, vx, vy, p, bx, by) as ASCII
+--   4. Dump frame metadata (frame_id, dt, sim_time, m0, e0)
+--   5. shell out to the Python packer to assemble /tmp/plasma_live.bin
+--   6. Throttle to TARGET_FPS via shell sleep, then loop
+
+import "stdlib/mhd_kernel.rail"
+
+-- Frame paths (intermediate files; the packer assembles the binary).
+beacon_dir = "/tmp/mhd_beacon"
+beacon_meta = "/tmp/mhd_beacon/meta.txt"
+beacon_plane_path field = cat [beacon_dir, "/plane_", show field, ".txt"]
+
+-- Steps and frame-rate cadence (mirrors mhd_ot_beacon.py's defaults).
+steps_per_frame = 4
+target_fps = 4
+-- 1.0 / 4 = 0.25 s
+
+-- t-reset window mirrors the numpy beacon.
+t_reset = 3.14159265358979
+
+dump_one_plane state field =
+  mk_dump_primitive state field (beacon_plane_path field)
+
+dump_planes state f =
+  if f >= 6 then 0
+  else
+    let _ = dump_one_plane state f
+    dump_planes state (f + 1)
+
+-- Metadata block consumed by the packer.  Newline-separated, one value
+-- per line, fixed order.  ASCII keeps things debuggable; the packer
+-- writes binary.
+write_meta frame_id dt sim_time m0 e0 mass energy divb rho_min =
+  let body = cat [
+        show frame_id, "\n",
+        show_float dt, "\n",
+        show_float sim_time, "\n",
+        show_float m0, "\n",
+        show_float e0, "\n",
+        show_float mass, "\n",
+        show_float energy, "\n",
+        show_float divb, "\n",
+        show_float rho_min, "\n"
+      ]
+  write_file beacon_meta body
+
+-- Shell out to the packer.  The wrapper script (mhd_beacon.sh) writes
+-- /tmp/mhd_beacon/run_packer with the absolute python invocation —
+-- decouples the Rail binary from any assumption about its CWD, since
+-- Rail's `shell` does not inherit the parent's working directory.
+run_packer =
+  shell "/tmp/mhd_beacon/run_packer"
+
+throttle =
+  shell "sleep 0.25"
+
+-- Multi-step LF inner loop.  ctx[0] = sim_time accumulator.
+inner_step state ctx i =
+  if i >= steps_per_frame then state
+  else
+    let dt = mk_compute_dt state
+    let ns = mk_lxf_step state dt
+    let _ = float_arr_set ctx 0 (float_arr_get ctx 0 + dt)
+    let _ = float_arr_set ctx 1 dt
+    inner_step ns ctx (i + 1)
+
+-- Reset to a fresh OT state when sim_time has accumulated past t=π,
+-- keeping the chaos visibly alive.  Returns (new_state, new_sim_time).
+maybe_reset state ctx =
+  let t = float_arr_get ctx 0
+  if t > t_reset then
+    let _ = print "beacon: t > pi, resetting"
+    let _ = float_arr_set ctx 0 0.0
+    mk_init_state
+  else state
+
+-- Beacon main loop.  The exit-on-step-count is the heartbeat budget;
+-- launchd / shell wrapper restarts the process if it exits.  We give
+-- it a generous frame budget so the daemon stays warm across resets.
+beacon_loop state ctx frame_id max_frames =
+  if frame_id >= max_frames then 0
+  else
+    let s_after_reset = maybe_reset state ctx
+    let s_after_steps = inner_step s_after_reset ctx 0
+    let dt = float_arr_get ctx 1
+    let sim_time = float_arr_get ctx 0
+    let m0 = float_arr_get ctx 2
+    let e0 = float_arr_get ctx 3
+    let mass = mk_total_mass s_after_steps
+    let energy = mk_total_energy s_after_steps
+    let divb = mk_max_div_b s_after_steps
+    let rho_min = mk_min_density s_after_steps
+    let _ = dump_planes s_after_steps 0
+    let _ = write_meta frame_id dt sim_time m0 e0 mass energy divb rho_min
+    let _ = run_packer
+    let _ = throttle
+    let _ = if frame_id % 40 == 0 then
+              print (cat ["beacon: frame ", show frame_id, " t=", show_float sim_time, " dm=", show_float ((mass - m0) / m0), " divB=", show_float divb])
+            else 0
+    beacon_loop s_after_steps ctx (frame_id + 1) max_frames
+
+main =
+  let _ = print "================================================="
+  let _ = print "  ledatic.org entropy beacon (Rail-native driver)"
+  let _ = print "  128x128 Orszag-Tang, ideal MHD, LF + reset@t=pi"
+  let _ = print "================================================="
+  let _ = shell (cat ["mkdir -p ", beacon_dir])
+  let state = mk_init_state
+  let m0 = mk_total_mass state
+  let e0 = mk_total_energy state
+  let _ = print (cat ["IC: mass=", show_float m0, " energy=", show_float e0])
+  let ctx = float_arr_new 4 0.0
+  let _ = float_arr_set ctx 2 m0
+  let _ = float_arr_set ctx 3 e0
+  -- 100k frames at 4 fps is ~7 hours — plenty for one process lifetime;
+  -- the launchd wrapper restarts on exit.  Set BEACON_FRAMES env (read
+  -- via shell) for short test runs without recompiling.
+  let _ = beacon_loop state ctx 0 100000
+  0
