@@ -101,7 +101,7 @@ The full X.509 chain for `api.anthropic.com` (leaf → WE1 intermediate → GTS 
 --   passes harvested → training data feeds next round
 ```
 
-The compiler is the fitness function. Programs that compile become training data; programs that don't are the gradient. Three independent lineages (LoRA on Gemma, Metal-GPU MLP, PCFG-REINFORCE) all use the same compiler as the binary verifier. 92 % strict pass rate on the PCFG lineage in 30 ticks.
+The compiler is the fitness function. Programs that compile become training data; programs that don't are the gradient. The runners (orchestrator + dataset pipeline + experiment configs) live in the private `Ledatic-Empire/rail-training` repo; this repo ships the library primitives those runners depend on — `stdlib/anthropic_client.rail`, `stdlib/mlx_client.rail`, `stdlib/checkpoint.rail`, `stdlib/autograd.rail`, `stdlib/transformer.rail`, `stdlib/optim.rail`, `stdlib/bpe.rail`, `stdlib/tokenizer.rail` — plus `tools/train/self_train.rail` as the canonical 25-level curriculum.
 
 ## Why Rail
 
@@ -161,6 +161,14 @@ main =
 Tail-recursive loops match C `-O2` (5 instructions per iteration). The full architecture is documented in [`CHANGELOG.md`](CHANGELOG.md) — see v2.0.0 for the compiler/runtime; v3.0.0 for the TLS stack.
 
 ## Releases
+
+### v3.7.0 — 2026-04-28 — *Releases physicified*
+
+Every tagged release, every `./rail_native test` pass, and every 2-pass byte-identical self-compile is now signed against a live entropy beacon `pulse_id` by the project's Pi-hosted `fleet0` Ed25519 witness key (`pk_fp = cac5f21a70564aeb`).  Verify any release in five lines — see [§ Provenance](#provenance).  Backfilled coverage: v2.0.0 → v3.6.1.  Live mission control at [ledatic.org/system](https://ledatic.org/system).  CI also restored: built `tools/metal/libtensor_gpu.dylib` before the test suite, ending 14 days of red on tensor link errors.
+
+### v3.6.1 — 2026-04-27 — *Compiler hardening*
+
+Two codegen + parser fixes; both gated by 2-pass byte-identical self-bootstrap.  Undefined identifiers fail at link with a named symbol (`_RAIL_UNDEFINED_IDENT_<name>`) instead of a silent runtime SIGSEGV.  Parser accepts multi-line compound expressions inside unclosed brackets.  `returns_float` now tracks let-bound floats through V (variable) AST nodes, fixing two latent miscompile bugs.  137/137 green.
 
 ### v3.0.0 — 2026-04-18 — *Rail speaks TLS*
 
@@ -236,13 +244,13 @@ control at [ledatic.org/system](https://ledatic.org/system).
 
 ## Honest limits
 
-Things Rail v3.0.0 **doesn't** do, so you don't hit them as surprises:
+Things Rail v3.6.1 **doesn't** do, so you don't hit them as surprises:
 
-- TLS ships one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one ECDHE group (`x25519`), and three sig-algs (`rsa_pss_rsae_sha256 | ecdsa_secp256r1_sha256 | rsa_pkcs1_sha256`). Modern CDN fronts work; legacy servers may not.
-- No TLS session resumption, no 0-RTT, no client certificates.
+- TLS ships one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one ECDHE group (`x25519`), and a fixed sig-alg set: `rsa_pss_rsae_sha256 | rsa_pkcs1_sha256 | ecdsa_secp256r1_sha256 | ecdsa_secp384r1_sha384 | ecdsa_secp521r1_sha512` plus `ed25519` (verify-only, in stdlib). Modern CDN fronts work; legacy servers may not.
+- No TLS session resumption, no 0-RTT, no client certificates. Keep-alive landed in v3.3.0 (multiple GETs over one socket).
 - No constant-time or side-channel resistance guarantees. This is not OpenSSL; don't ship it to a Defense customer.
-- Each HTTPS connection is 5–8 seconds wall time (public-key verify dominates). Great for one-shot API calls, not for an HTTP proxy.
-- Response body is assembled via `join ""` — O(N²), caps cleanly around 64 KB. Streaming is a v3.1 item.
+- HTTPS handshakes are public-key-verify dominated: ~4 s on RSA paths (Amazon DigiCert), ~17 s on RSA paths through ISRG (Slack), ~90 s on the GTS R4 P-384 chain (Anthropic). Great for one-shot API calls, not an HTTP proxy. The slow P-384 path is a scalar-multiplier issue, not an architectural limit.
+- Streaming response bodies shipped in v3.2.0; the legacy `join ""` O(N²) accumulator is parked under the `_unsafe_noverify` names.
 - Rail is not ANSI-standardised. There is no formal type system or soundness proof. Use it because it's fast, small, and honest — not because it's Haskell.
 
 ## License
