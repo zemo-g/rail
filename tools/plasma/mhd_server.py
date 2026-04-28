@@ -57,9 +57,15 @@ class PlasmaHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.end_headers()
             self.wfile.write(data)
+        elif self.path == "/" or self.path == "/viewer":
+            # New uncached live-OT-plasma viewer (Rail-driven).  The /live
+            # path below still serves the legacy MPD thruster viewer for
+            # back-compat with anyone who has it bookmarked.
+            self.path = "/live_viewer.html"
+            super().do_GET()
         elif self.path == "/live":
             self.path = "/thruster_live.html"
             super().do_GET()
