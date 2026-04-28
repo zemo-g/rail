@@ -1,0 +1,84 @@
+-- tools/plasma/neural_mhd_gen_data.rail — training data for the v2 surrogate
+--
+-- Replaces gen_mhd_data.rail's bespoke 64×64 LxF copy with the unified
+-- kernel from stdlib/mhd_kernel.rail.  Single source of truth for the
+-- physics: whatever the kernel does is what the surrogate learns to
+-- predict.
+--
+-- Output format (matches what neural_mhd_v2 + the GPU trainer expect):
+--   /tmp/mhd_train.txt — one example per line, space-separated
+--   36 values per line: 30 input (5-cell stencil × 6 fields) + 6 target
+--   target = the center-cell state at the next time step
+--
+-- We emit ~N_STEPS × N_INTERIOR_CELLS examples.  The v2 trainer reads
+-- this file directly (neural_mhd_gpu_host.m, lines 116-136) so swapping
+-- the data generator is the only change needed — no trainer edit.
+
+import "stdlib/mhd_kernel.rail"
+
+-- Small helper for one training example: read the 5-cell stencil
+-- (center + 4 neighbors × 6 fields = 30 values) from `s` at (x, y),
+-- then read the center cell's 6 fields from `s_next` as the target.
+emit_field s f x y acc =
+  cat [acc, " ", show_float (mk_get s f x y)]
+
+emit_stencil s x y acc f =
+  if f >= 6 then acc
+  else
+    let a1 = emit_field s f  x      y       acc
+    let a2 = emit_field s f (x + 1) y       a1
+    let a3 = emit_field s f (x - 1) y       a2
+    let a4 = emit_field s f  x     (y + 1)  a3
+    let a5 = emit_field s f  x     (y - 1)  a4
+    emit_stencil s x y a5 (f + 1)
+
+emit_target s_next x y acc f =
+  if f >= 6 then acc
+  else emit_target s_next x y (emit_field s_next f x y acc) (f + 1)
+
+emit_example s s_next x y =
+  let stencil = emit_stencil s x y "" 0
+  let with_target = emit_target s_next x y stencil 0
+  cat [with_target, "\n"]
+
+-- Sweep interior cells.  Uses 1..nn-2 to keep the 5-cell stencil
+-- always in-bounds (mk_wrap also handles wrap-around but the
+-- numpy-side trainer used 1..N-2 for its 64² grid; matching here.)
+emit_row s s_next y acc x =
+  if x >= mk_nn - 1 then acc
+  else emit_row s s_next y (cat [acc, emit_example s s_next x y]) (x + 1)
+
+emit_grid s s_next y acc =
+  if y >= mk_nn - 1 then acc
+  else emit_grid s s_next (y + 1) (emit_row s s_next y acc 1)
+
+-- Main step driver.  Takes one LF step, harvests examples comparing
+-- s -> ns, persists state, repeats.
+step_and_emit s ctx step max_steps fp =
+  if step >= max_steps then s
+  else
+    let dt = mk_compute_dt s
+    let ns = mk_lxf_step s dt
+    -- Append this step's examples to the output file via shell
+    let chunk = emit_grid s ns 1 ""
+    let chunk_path = "/tmp/mhd_train_chunk.txt"
+    let _ = write_file chunk_path chunk
+    let _ = shell (cat ["cat ", chunk_path, " >> ", fp])
+    let _ = if step % 5 == 0 then print (cat ["  step ", show step, "/", show max_steps]) else 0
+    step_and_emit ns ctx (step + 1) max_steps fp
+
+main =
+  let _ = print "============================================"
+  let _ = print "  neural_mhd training data — unified kernel"
+  let _ = print "  128×128 OT, 20 LxF steps, ~317K examples"
+  let _ = print "============================================"
+  let out_path = "/tmp/mhd_train.txt"
+  let _ = shell (cat ["rm -f ", out_path])
+  let s0 = mk_init_state
+  let m0 = mk_total_mass s0
+  let _ = print (cat ["IC mass=", show_float m0])
+  let ctx = float_arr_new 1 0.0
+  let _ = step_and_emit s0 ctx 0 20 out_path
+  let _ = shell (cat ["wc -l ", out_path])
+  let _ = print "Done. v2 trainer can ingest /tmp/mhd_train.txt directly."
+  0
