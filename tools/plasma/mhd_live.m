@@ -282,8 +282,13 @@ int main(int argc, char *argv[]) {
         float Bt_peak = MU0_F * ctrl.I / (2 * M_PI * r_mid);
         float rho_init = ctrl.mdot / (500.0f * M_PI * (ctrl.ra*ctrl.ra - ctrl.rc*ctrl.rc));
         float va = Bt_peak / sqrtf(MU0_F * rho_init);
-        float dt = 0.1f * fminf(dr, dz) / (500.0f + cs + va); // CFL = 0.1 (conservative)
-        dt = fminf(dt, 5e-8f); // hard ceiling
+        // 2026-04-28: kernel was rewritten to MUSCL+minmod+Rusanov with
+        // positivity-preserving recon (mhd_axisym.metal).  Stable up to
+        // CFL ~ 0.3, but we keep CFL = 0.1 here for conservatism and
+        // retain the 5e-8 ceiling as a sanity belt against degenerate
+        // smax estimates from the downsampled wave-speed scan below.
+        float dt = 0.1f * fminf(dr, dz) / (500.0f + cs + va);
+        dt = fminf(dt, 5e-8f);
 
         NSLog(@"Starting MHD live compute. NR=%d NZ=%d dt=%.2e", NR, NZ, dt);
         NSLog(@"Geometry: rc=%.1fmm ra=%.1fmm L=%.0fmm I=%.0fA B=%.3fT",
