@@ -233,6 +233,251 @@ mk_compute_dt state =
   0.00981747704246810 / smax
 
 -- ═══════════════════════════════════════════════════════════
+-- MUSCL + MINMOD RECONSTRUCTION (2nd-order space, 1st-order time)
+-- Positivity-preserving via density floor + pressure floor in flux.
+-- This is the recon path missing from the retired Metal axisym solver
+-- (mhd_live.m) — Lax-Friedrichs alone smears shocks and lets thin
+-- current sheets seed NaN under stiff source terms.
+--
+-- ∇·B caveat: cell-centered MUSCL+Rusanov does not preserve ∇·B = 0
+-- in the 2D Cartesian 6-field case. Verified on Orszag-Tang: |∇·B|_max
+-- grows to ~1 over 100 steps (vs 1e-15 for LF). The public-surface
+-- beacon stays on LF for that reason. MUSCL is intended for the
+-- axisymmetric MPD case (step 5), where B_θ is the only evolving B
+-- component (B_r, B_z come from static applied coils), so ∇·B in the
+-- (r,z) plane is structurally zero by symmetry. Powell or GLM
+-- divergence cleaning would be the path to a Cartesian MUSCL beacon
+-- if we ever want one — deferred until there's a caller that needs it.
+-- ═══════════════════════════════════════════════════════════
+
+-- minmod: zero at extrema, smaller-magnitude argument otherwise.
+mk_minmod a b =
+  if a > 0.0 then
+    if b > 0.0 then (if a < b then a else b) else 0.0
+  else if a < 0.0 then
+    if b < 0.0 then (if a > b then a else b) else 0.0
+  else 0.0
+
+mk_slope_x_at state f x y =
+  let dl = mk_get state f x y - mk_get state f (x - 1) y
+  let dr = mk_get state f (x + 1) y - mk_get state f x y
+  mk_minmod dl dr
+
+mk_slope_y_at state f x y =
+  let dl = mk_get state f x y - mk_get state f x (y - 1)
+  let dr = mk_get state f x (y + 1) - mk_get state f x y
+  mk_minmod dl dr
+
+mk_slope_cell_fields state slx sly x y f =
+  if f >= 6 then 0
+  else
+    let _ = float_arr_set slx (mk_idx f x y) (mk_slope_x_at state f x y)
+    let _ = float_arr_set sly (mk_idx f x y) (mk_slope_y_at state f x y)
+    mk_slope_cell_fields state slx sly x y (f + 1)
+
+mk_slope_loop state slx sly i =
+  if i >= mk_nn2 then 0
+  else
+    let _ = mk_slope_cell_fields state slx sly (i % mk_nn) (i / mk_nn) 0
+    mk_slope_loop state slx sly (i + 1)
+
+-- Reconstruct conserved field f at the right side of cell x (interface x+1/2):
+-- Left state of interface = cell x + half slope.
+-- Right state of interface = cell x+1 - half slope.
+mk_recon_xL state slx f x y =
+  mk_get state f x y + 0.5 * float_arr_get slx (mk_idx f x y)
+
+mk_recon_xR state slx f x y =
+  mk_get state f (x + 1) y - 0.5 * float_arr_get slx (mk_idx f (x + 1) y)
+
+mk_recon_yL state sly f x y =
+  mk_get state f x y + 0.5 * float_arr_get sly (mk_idx f x y)
+
+mk_recon_yR state sly f x y =
+  mk_get state f x (y + 1) - 0.5 * float_arr_get sly (mk_idx f x (y + 1))
+
+-- Pack reconstructed conserved vectors into 6-element arrays at an x-interface.
+mk_pack_xL state slx x y u f =
+  if f >= 6 then 0
+  else
+    let _ = float_arr_set u f (mk_recon_xL state slx f x y)
+    mk_pack_xL state slx x y u (f + 1)
+
+mk_pack_xR state slx x y u f =
+  if f >= 6 then 0
+  else
+    let _ = float_arr_set u f (mk_recon_xR state slx f x y)
+    mk_pack_xR state slx x y u (f + 1)
+
+mk_pack_yL state sly x y u f =
+  if f >= 6 then 0
+  else
+    let _ = float_arr_set u f (mk_recon_yL state sly f x y)
+    mk_pack_yL state sly x y u (f + 1)
+
+mk_pack_yR state sly x y u f =
+  if f >= 6 then 0
+  else
+    let _ = float_arr_set u f (mk_recon_yR state sly f x y)
+    mk_pack_yR state sly x y u (f + 1)
+
+-- Ideal MHD flux from a 6-element conserved vector.
+-- Includes positivity floors on density and pressure — drives the
+-- positivity-preserving property of the whole MUSCL scheme.
+mk_x_flux_from_u u fa =
+  let rho_raw = float_arr_get u 0
+  let rho = if rho_raw < 0.000001 then 0.000001 else rho_raw
+  let mx  = float_arr_get u 1
+  let my  = float_arr_get u 2
+  let bx  = float_arr_get u 3
+  let by  = float_arr_get u 4
+  let e   = float_arr_get u 5
+  let vx = mx / rho
+  let vy = my / rho
+  let v2 = vx * vx + vy * vy
+  let b2 = bx * bx + by * by
+  let p_raw = 0.6666666666666667 * (e - 0.5 * rho * v2 - 0.5 * b2)
+  let p = if p_raw < 0.0000000001 then 0.0000000001 else p_raw
+  let pt = p + 0.5 * b2
+  let vdb = vx * bx + vy * by
+  let _ = float_arr_set fa 0 mx
+  let _ = float_arr_set fa 1 (mx * vx + pt - bx * bx)
+  let _ = float_arr_set fa 2 (mx * vy - bx * by)
+  let _ = float_arr_set fa 3 0.0
+  let _ = float_arr_set fa 4 (vx * by - vy * bx)
+  float_arr_set fa 5 ((e + pt) * vx - bx * vdb)
+
+mk_y_flux_from_u u fa =
+  let rho_raw = float_arr_get u 0
+  let rho = if rho_raw < 0.000001 then 0.000001 else rho_raw
+  let mx  = float_arr_get u 1
+  let my  = float_arr_get u 2
+  let bx  = float_arr_get u 3
+  let by  = float_arr_get u 4
+  let e   = float_arr_get u 5
+  let vx = mx / rho
+  let vy = my / rho
+  let v2 = vx * vx + vy * vy
+  let b2 = bx * bx + by * by
+  let p_raw = 0.6666666666666667 * (e - 0.5 * rho * v2 - 0.5 * b2)
+  let p = if p_raw < 0.0000000001 then 0.0000000001 else p_raw
+  let pt = p + 0.5 * b2
+  let vdb = vx * bx + vy * by
+  let _ = float_arr_set fa 0 my
+  let _ = float_arr_set fa 1 (my * vx - bx * by)
+  let _ = float_arr_set fa 2 (my * vy + pt - by * by)
+  let _ = float_arr_set fa 3 (vy * bx - vx * by)
+  let _ = float_arr_set fa 4 0.0
+  float_arr_set fa 5 ((e + pt) * vy - by * vdb)
+
+mk_wave_speed_u u =
+  let rho_raw = float_arr_get u 0
+  let rho = if rho_raw < 0.000001 then 0.000001 else rho_raw
+  let mx  = float_arr_get u 1
+  let my  = float_arr_get u 2
+  let bx  = float_arr_get u 3
+  let by  = float_arr_get u 4
+  let e   = float_arr_get u 5
+  let vx = mx / rho
+  let vy = my / rho
+  let v2 = vx * vx + vy * vy
+  let b2 = bx * bx + by * by
+  let p_raw = 0.6666666666666667 * (e - 0.5 * rho * v2 - 0.5 * b2)
+  let p = if p_raw < 0.0000000001 then 0.0000000001 else p_raw
+  let a2 = 1.6666666666666667 * p / rho
+  let va2 = b2 / rho
+  let cf = sqrt (a2 + va2)
+  sqrt v2 + cf
+
+-- Rusanov / local-Lax-Friedrichs interface flux assembler.
+-- F_iface = ½(F(uL) + F(uR)) - ½α(uR - uL),  α = max(c_L, c_R).
+mk_rusanov_assemble uL uR fL fR fi alpha f =
+  if f >= 6 then 0
+  else
+    let f_avg = 0.5 * (float_arr_get fL f + float_arr_get fR f)
+    let f_diss = 0.5 * alpha * (float_arr_get uR f - float_arr_get uL f)
+    let _ = float_arr_set fi f (f_avg - f_diss)
+    mk_rusanov_assemble uL uR fL fR fi alpha (f + 1)
+
+mk_rusanov_x uL uR fL fR fi =
+  let _ = mk_x_flux_from_u uL fL
+  let _ = mk_x_flux_from_u uR fR
+  let aL = mk_wave_speed_u uL
+  let aR = mk_wave_speed_u uR
+  let alpha = if aL > aR then aL else aR
+  mk_rusanov_assemble uL uR fL fR fi alpha 0
+
+mk_rusanov_y uL uR fL fR fi =
+  let _ = mk_y_flux_from_u uL fL
+  let _ = mk_y_flux_from_u uR fR
+  let aL = mk_wave_speed_u uL
+  let aR = mk_wave_speed_u uR
+  let alpha = if aL > aR then aL else aR
+  mk_rusanov_assemble uL uR fL fR fi alpha 0
+
+-- Apply the interface-flux divergence to one cell, all 6 fields.
+-- Density floor enforced post-update; pressure floor lives in fluxes.
+mk_muscl_apply state ns dt_dx dt_dy fxR fxL fyU fyD x y f =
+  if f >= 6 then 0
+  else
+    let u = mk_get state f x y
+    let dfx = float_arr_get fxR f - float_arr_get fxL f
+    let dfy = float_arr_get fyU f - float_arr_get fyD f
+    let val = u - dt_dx * dfx - dt_dy * dfy
+    let val_safe = if f == mk_f_rho then (if val < 0.000001 then 0.000001 else val) else val
+    let _ = float_arr_set ns (mk_idx f x y) val_safe
+    mk_muscl_apply state ns dt_dx dt_dy fxR fxL fyU fyD x y (f + 1)
+
+mk_muscl_cell state slx sly ns dt_dx dt_dy uL uR fL fR fxR fxL fyU fyD x y =
+  -- F_{x+1/2}: L=cell(x), R=cell(x+1)
+  let _ = mk_pack_xL state slx x y uL 0
+  let _ = mk_pack_xR state slx x y uR 0
+  let _ = mk_rusanov_x uL uR fL fR fxR
+  -- F_{x-1/2}: L=cell(x-1), R=cell(x)
+  let _ = mk_pack_xL state slx (x - 1) y uL 0
+  let _ = mk_pack_xR state slx (x - 1) y uR 0
+  let _ = mk_rusanov_x uL uR fL fR fxL
+  -- G_{y+1/2}: L=cell(y), R=cell(y+1)
+  let _ = mk_pack_yL state sly x y uL 0
+  let _ = mk_pack_yR state sly x y uR 0
+  let _ = mk_rusanov_y uL uR fL fR fyU
+  -- G_{y-1/2}: L=cell(y-1), R=cell(y)
+  let _ = mk_pack_yL state sly x (y - 1) uL 0
+  let _ = mk_pack_yR state sly x (y - 1) uR 0
+  let _ = mk_rusanov_y uL uR fL fR fyD
+  mk_muscl_apply state ns dt_dx dt_dy fxR fxL fyU fyD x y 0
+
+mk_muscl_loop state slx sly ns dt_dx dt_dy uL uR fL fR fxR fxL fyU fyD i =
+  if i >= mk_nn2 then 0
+  else
+    let _ = mk_muscl_cell state slx sly ns dt_dx dt_dy uL uR fL fR fxR fxL fyU fyD (i % mk_nn) (i / mk_nn)
+    mk_muscl_loop state slx sly ns dt_dx dt_dy uL uR fL fR fxR fxL fyU fyD (i + 1)
+
+mk_muscl_step state dt =
+  let dt_dx = dt / 0.04908738521234052
+  let dt_dy = dt / 0.04908738521234052
+  let slx = float_arr_new mk_state_size 0.0
+  let sly = float_arr_new mk_state_size 0.0
+  let _ = mk_slope_loop state slx sly 0
+  let uL = float_arr_new 6 0.0
+  let uR = float_arr_new 6 0.0
+  let fL = float_arr_new 6 0.0
+  let fR = float_arr_new 6 0.0
+  let fxR = float_arr_new 6 0.0
+  let fxL = float_arr_new 6 0.0
+  let fyU = float_arr_new 6 0.0
+  let fyD = float_arr_new 6 0.0
+  let ns = float_arr_new mk_state_size 0.0
+  let _ = mk_muscl_loop state slx sly ns dt_dx dt_dy uL uR fL fR fxR fxL fyU fyD 0
+  ns
+
+-- MUSCL + Rusanov + forward-Euler is stable up to CFL ≈ 0.5 in 2D;
+-- 0.3 leaves comfortable headroom and matches the LF dt scale.
+mk_compute_dt_muscl state =
+  let smax = mk_max_speed state
+  0.01472621556370216 / smax
+
+-- ═══════════════════════════════════════════════════════════
 -- CONSERVATION DIAGNOSTICS
 -- ═══════════════════════════════════════════════════════════
 
