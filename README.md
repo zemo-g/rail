@@ -10,13 +10,19 @@
 </p>
 
 <p align="center">
-  <a href="#install"><img src="https://img.shields.io/badge/tests-137%2F137-brightgreen" alt="tests 137/137"></a>
-  <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
-  <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
+  <a href="https://ledatic.org/builds/latest/index.json"><img src="https://img.shields.io/endpoint?url=https://ledatic.org/attest/badge/builds.json" alt="build · attested live"></a>
+  <a href="https://ledatic.org/selfhost/latest/index.json"><img src="https://img.shields.io/endpoint?url=https://ledatic.org/attest/badge/selfhost.json" alt="self-host · attested live"></a>
+  <a href="#why-rail"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/C%20dependencies-0-brightgreen" alt="0 C dependencies"></a>
   <a href="#releases"><img src="https://img.shields.io/badge/backends-4-orange" alt="4 backends"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL%201.1-green" alt="BSL 1.1"></a>
+</p>
+
+<p align="center">
+  <sub>Build + self-host badges are <em>live</em>: each refresh re-resolves
+  <code>/&lt;kind&gt;/latest</code> against current production via the Pi-hosted
+  Ed25519 witness chain. A red badge means production drift, attested.</sub>
 </p>
 
 <p align="center">
