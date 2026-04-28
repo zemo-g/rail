@@ -1,0 +1,326 @@
+-- stdlib/mhd_kernel.rail — Unified 2D ideal MHD core
+--
+-- The shared physics kernel that backs every MHD surface in the project:
+-- the entropy beacon (ledatic.org/entropy), the offline data generator
+-- for the neural surrogate, the WASM browser demo (/plasma/mhd), the
+-- Metal GPU live solver (/plasma/live), and the Rail CLI bench.
+--
+-- Algorithm: Lax-Friedrichs on a 128x128 periodic grid, ideal MHD
+-- (gamma = 5/3), 6 conserved fields (rho, mx, my, bx, by, energy).
+--
+-- Future-extending plug points (added in subsequent steps):
+--   - reconstruction: LF (here) -> MUSCL+minmod (step 3)
+--   - source terms:   ideal (here) -> MPD pack (step 4: Lorentz, Ohmic, 1/r)
+--
+-- Frame format mirrors mhd_ot_beacon.py so /tmp/plasma_live.bin remains
+-- the canonical beacon contract: any host that calls mk_write_frame_bin
+-- below is wire-compatible with entropy_beacon.sh + the Pi witness chain.
+--
+-- WORKAROUNDS (inherited from tools/plasma/mhd.rail):
+--   - float-heavy code in dedicated functions (TCO clobbers d-registers)
+--   - no top-level float globals (segfault when accessed under TCO chain)
+--   - all derived constants as precomputed literals
+--   - 1D loops only (3+ arg 2D recursive loops do not TCO reliably)
+
+-- ═══════════════════════════════════════════════════════════
+-- GRID CONSTANTS (integer only at top level)
+-- ═══════════════════════════════════════════════════════════
+
+mk_nn         = 128
+mk_nn2        = 16384
+mk_state_size = 98304
+
+mk_f_rho = 0
+mk_f_mx  = 1
+mk_f_my  = 2
+mk_f_bx  = 3
+mk_f_by  = 4
+mk_f_en  = 5
+
+-- dx = 2*pi/128 = 0.04908738521234052
+-- 2*dx        = 0.09817477042468104
+-- gamma       = 5/3 = 1.6666666666666667
+-- gamma - 1   = 0.6666666666666667
+
+-- ═══════════════════════════════════════════════════════════
+-- GRID ACCESS — periodic wrap
+-- ═══════════════════════════════════════════════════════════
+
+mk_wrap i = if i < 0 then i + mk_nn else if i >= mk_nn then i - mk_nn else i
+mk_idx f x y = f * mk_nn2 + mk_wrap y * mk_nn + mk_wrap x
+mk_get state f x y = float_arr_get state (mk_idx f x y)
+mk_put state f x y v = float_arr_set state (mk_idx f x y) v
+
+-- ═══════════════════════════════════════════════════════════
+-- ORSZAG-TANG INITIAL CONDITION
+-- ═══════════════════════════════════════════════════════════
+
+mk_init_cell state i =
+  let x = i % mk_nn
+  let y = i / mk_nn
+  let xp = to_float x * 0.04908738521234052
+  let yp = to_float y * 0.04908738521234052
+  let rho = 2.77777777777778
+  let vx = 0.0 - sin yp
+  let vy = sin xp
+  let bx = 0.0 - sin yp
+  let by = sin (2.0 * xp)
+  let p = 1.6666666666666667
+  let ke = 0.5 * rho * (vx * vx + vy * vy)
+  let me = 0.5 * (bx * bx + by * by)
+  let e = p / 0.6666666666666667 + ke + me
+  let _ = mk_put state mk_f_rho x y rho
+  let _ = mk_put state mk_f_mx  x y (rho * vx)
+  let _ = mk_put state mk_f_my  x y (rho * vy)
+  let _ = mk_put state mk_f_bx  x y bx
+  let _ = mk_put state mk_f_by  x y by
+  mk_put state mk_f_en x y e
+
+mk_init_loop state i =
+  if i >= mk_nn2 then 0
+  else
+    let _ = mk_init_cell state i
+    mk_init_loop state (i + 1)
+
+mk_init_state =
+  let state = float_arr_new mk_state_size 0.0
+  let _ = mk_init_loop state 0
+  state
+
+-- ═══════════════════════════════════════════════════════════
+-- PRIMITIVE VARIABLE RECOVERY
+-- ═══════════════════════════════════════════════════════════
+
+mk_pressure state x y =
+  let rho = mk_get state mk_f_rho x y
+  let mx  = mk_get state mk_f_mx x y
+  let my  = mk_get state mk_f_my x y
+  let bx  = mk_get state mk_f_bx x y
+  let by  = mk_get state mk_f_by x y
+  let e   = mk_get state mk_f_en x y
+  let v2 = (mx * mx + my * my) / (rho * rho)
+  let b2 = bx * bx + by * by
+  let p = 0.6666666666666667 * (e - 0.5 * rho * v2 - 0.5 * b2)
+  if p < 0.0000000001 then 0.0000000001 else p
+
+-- ═══════════════════════════════════════════════════════════
+-- IDEAL MHD FLUXES (x and y directions)
+-- ═══════════════════════════════════════════════════════════
+
+mk_x_flux state x y fa =
+  let rho = mk_get state mk_f_rho x y
+  let mx  = mk_get state mk_f_mx x y
+  let my  = mk_get state mk_f_my x y
+  let bx  = mk_get state mk_f_bx x y
+  let by  = mk_get state mk_f_by x y
+  let e   = mk_get state mk_f_en x y
+  let vx = mx / rho
+  let vy = my / rho
+  let b2 = bx * bx + by * by
+  let p = mk_pressure state x y
+  let pt = p + 0.5 * b2
+  let vdb = vx * bx + vy * by
+  let _ = float_arr_set fa 0 mx
+  let _ = float_arr_set fa 1 (mx * vx + pt - bx * bx)
+  let _ = float_arr_set fa 2 (mx * vy - bx * by)
+  let _ = float_arr_set fa 3 0.0
+  let _ = float_arr_set fa 4 (vx * by - vy * bx)
+  float_arr_set fa 5 ((e + pt) * vx - bx * vdb)
+
+mk_y_flux state x y fa =
+  let rho = mk_get state mk_f_rho x y
+  let mx  = mk_get state mk_f_mx x y
+  let my  = mk_get state mk_f_my x y
+  let bx  = mk_get state mk_f_bx x y
+  let by  = mk_get state mk_f_by x y
+  let e   = mk_get state mk_f_en x y
+  let vx = mx / rho
+  let vy = my / rho
+  let b2 = bx * bx + by * by
+  let p = mk_pressure state x y
+  let pt = p + 0.5 * b2
+  let vdb = vx * bx + vy * by
+  let _ = float_arr_set fa 0 my
+  let _ = float_arr_set fa 1 (my * vx - bx * by)
+  let _ = float_arr_set fa 2 (my * vy + pt - by * by)
+  let _ = float_arr_set fa 3 (vy * bx - vx * by)
+  let _ = float_arr_set fa 4 0.0
+  float_arr_set fa 5 ((e + pt) * vy - by * vdb)
+
+-- ═══════════════════════════════════════════════════════════
+-- WAVE SPEED — fast magnetosonic + |v|
+-- ═══════════════════════════════════════════════════════════
+
+mk_cell_speed state x y =
+  let rho = mk_get state mk_f_rho x y
+  let mx  = mk_get state mk_f_mx x y
+  let my  = mk_get state mk_f_my x y
+  let bx  = mk_get state mk_f_bx x y
+  let by  = mk_get state mk_f_by x y
+  let p = mk_pressure state x y
+  let vx = mx / rho
+  let vy = my / rho
+  let b2 = bx * bx + by * by
+  let a2 = 1.6666666666666667 * p / rho
+  let va2 = b2 / rho
+  let cf = sqrt (a2 + va2)
+  sqrt (vx * vx + vy * vy) + cf
+
+mk_speed_check state i acc =
+  let s = mk_cell_speed state (i % mk_nn) (i / mk_nn)
+  let cur = float_arr_get acc 0
+  if s > cur then float_arr_set acc 0 s else 0
+
+mk_speed_loop state i acc =
+  if i >= mk_nn2 then 0
+  else
+    let _ = mk_speed_check state i acc
+    mk_speed_loop state (i + 1) acc
+
+mk_max_speed state =
+  let acc = float_arr_new 1 0.0
+  let _ = mk_speed_loop state 0 acc
+  float_arr_get acc 0
+
+-- ═══════════════════════════════════════════════════════════
+-- LAX-FRIEDRICHS INTEGRATOR
+-- coeffs[0] = dt/(2*dx), coeffs[1] = dt/(2*dy)
+-- ═══════════════════════════════════════════════════════════
+
+mk_lxf_update_fields state ns coeffs fxr fxl fyu fyd x y f =
+  if f >= 6 then 0
+  else
+    let avg = (mk_get state f (x - 1) y + mk_get state f (x + 1) y + mk_get state f x (y - 1) + mk_get state f x (y + 1)) / 4.0
+    let dfx = float_arr_get fxr f - float_arr_get fxl f
+    let dfy = float_arr_get fyu f - float_arr_get fyd f
+    let cx = float_arr_get coeffs 0
+    let cy = float_arr_get coeffs 1
+    let val = avg - cx * dfx - cy * dfy
+    let _ = float_arr_set ns (mk_idx f x y) val
+    mk_lxf_update_fields state ns coeffs fxr fxl fyu fyd x y (f + 1)
+
+mk_lxf_update_cell state ns coeffs fxr fxl fyu fyd x y =
+  let _ = mk_x_flux state (x + 1) y fxr
+  let _ = mk_x_flux state (x - 1) y fxl
+  let _ = mk_y_flux state x (y + 1) fyu
+  let _ = mk_y_flux state x (y - 1) fyd
+  mk_lxf_update_fields state ns coeffs fxr fxl fyu fyd x y 0
+
+mk_lxf_step_cell state ns coeffs fxr fxl fyu fyd i =
+  mk_lxf_update_cell state ns coeffs fxr fxl fyu fyd (i % mk_nn) (i / mk_nn)
+
+mk_lxf_loop state ns coeffs fxr fxl fyu fyd i =
+  if i >= mk_nn2 then 0
+  else
+    let _ = mk_lxf_step_cell state ns coeffs fxr fxl fyu fyd i
+    mk_lxf_loop state ns coeffs fxr fxl fyu fyd (i + 1)
+
+mk_lxf_step state dt =
+  let coeffs = float_arr_new 2 0.0
+  let _ = float_arr_set coeffs 0 (dt / 0.09817477042468104)
+  let _ = float_arr_set coeffs 1 (dt / 0.09817477042468104)
+  let ns = float_arr_new mk_state_size 0.0
+  let fxr = float_arr_new 6 0.0
+  let fxl = float_arr_new 6 0.0
+  let fyu = float_arr_new 6 0.0
+  let fyd = float_arr_new 6 0.0
+  let _ = mk_lxf_loop state ns coeffs fxr fxl fyu fyd 0
+  ns
+
+-- CFL: dt = 0.2 * dx / max_speed = 0.00981747704246810 / smax
+mk_compute_dt state =
+  let smax = mk_max_speed state
+  0.00981747704246810 / smax
+
+-- ═══════════════════════════════════════════════════════════
+-- CONSERVATION DIAGNOSTICS
+-- ═══════════════════════════════════════════════════════════
+
+mk_sum_field state f i acc =
+  if i >= mk_nn2 then 0
+  else
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + float_arr_get state (f * mk_nn2 + i))
+    mk_sum_field state f (i + 1) acc
+
+mk_total_mass state =
+  let acc = float_arr_new 1 0.0
+  let _ = mk_sum_field state mk_f_rho 0 acc
+  float_arr_get acc 0
+
+mk_total_energy state =
+  let acc = float_arr_new 1 0.0
+  let _ = mk_sum_field state mk_f_en 0 acc
+  float_arr_get acc 0
+
+mk_divb_cell state i =
+  let x = i % mk_nn
+  let y = i / mk_nn
+  let dbx = (mk_get state mk_f_bx (x + 1) y - mk_get state mk_f_bx (x - 1) y) / 0.09817477042468104
+  let dby = (mk_get state mk_f_by x (y + 1) - mk_get state mk_f_by x (y - 1)) / 0.09817477042468104
+  let div = dbx + dby
+  if div < 0.0 then 0.0 - div else div
+
+mk_divb_check state i acc =
+  let adiv = mk_divb_cell state i
+  let cur = float_arr_get acc 0
+  if adiv > cur then float_arr_set acc 0 adiv else 0
+
+mk_divb_loop state i acc =
+  if i >= mk_nn2 then 0
+  else
+    let _ = mk_divb_check state i acc
+    mk_divb_loop state (i + 1) acc
+
+mk_max_div_b state =
+  let acc = float_arr_new 1 0.0
+  let _ = mk_divb_loop state 0 acc
+  float_arr_get acc 0
+
+mk_minrho_check state i acc =
+  let rho = float_arr_get state i
+  let cur = float_arr_get acc 0
+  if rho < cur then float_arr_set acc 0 rho else 0
+
+mk_minrho_loop state i acc =
+  if i >= mk_nn2 then 0
+  else
+    let _ = mk_minrho_check state i acc
+    mk_minrho_loop state (i + 1) acc
+
+mk_min_density state =
+  let acc = float_arr_new 1 999999999999.0
+  let _ = mk_minrho_loop state 0 acc
+  float_arr_get acc 0
+
+-- ═══════════════════════════════════════════════════════════
+-- ASCII FRAME DUMP (one field per file, space-separated rows)
+-- Compatible with the existing tools/plasma/mhd.rail driver.
+-- ═══════════════════════════════════════════════════════════
+
+mk_dump_row state field y i acc =
+  if i >= mk_nn then acc
+  else
+    let v = mk_get state field i y
+    let sep = if i == mk_nn - 1 then "\n" else " "
+    mk_dump_row state field y (i + 1) (cat [acc, show_float v, sep])
+
+mk_dump_field_rows state field y acc =
+  if y >= mk_nn then acc
+  else mk_dump_field_rows state field (y + 1) (cat [acc, mk_dump_row state field y 0 ""])
+
+mk_dump_field state field path =
+  let data = mk_dump_field_rows state field 0 ""
+  write_file path data
+
+-- ═══════════════════════════════════════════════════════════
+-- DIAGNOSTICS PRINTER (one-line per call)
+-- ═══════════════════════════════════════════════════════════
+
+mk_print_diag step state m0 e0 dt t =
+  let mass = mk_total_mass state
+  let energy = mk_total_energy state
+  let divb = mk_max_div_b state
+  let minrho = mk_min_density state
+  let dm = (mass - m0) / m0
+  let de = (energy - e0) / e0
+  print (cat ["step ", show step, " t=", show_float t, " dt=", show_float dt, " dm=", show_float dm, " dE=", show_float de, " divB=", show_float divb, " rho_min=", show_float minrho])
