@@ -136,7 +136,7 @@ Rail side: update `stdlib/tensor.rail` so `gpu_matmul_dispatch` tries daemon soc
 Build command:
 
 ```bash
-cd ~/projects/rail/tools/metal
+cd ~/projects/rail-https/tools/metal
 clang -fobjc-arc -framework Metal -framework Foundation \
   tensor_daemond.m -o tensor_daemond
 ```

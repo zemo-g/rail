@@ -126,7 +126,7 @@ Round wall: ~2 min at N=16 vs ~19 min serial (10.6× on Studio).
   crash the server under concurrent load; auto-restart via KeepAlive
   should cover.
 - **No adapter path** on the plist currently — the previous
-  `adapter-path /Users/ledaticempire/projects/rail/training/adapters_4b_v5_mlx`
+  `adapter-path /Users/ledaticempire/projects/rail-https/training/adapters_4b_v5_mlx`
   (in `tools/train/mlx_watchdog.sh`) was killed by the 2026-04-20 reorg.
   Adapter for this model is baked into the distilled checkpoint.
 - **Parallel session coordination:** parallel Mini session owns
@@ -153,7 +153,7 @@ Round wall: ~2 min at N=16 vs ~19 min serial (10.6× on Studio).
 
 ```bash
 # State check
-cd ~/projects/rail && git log --oneline -15
+cd ~/projects/rail-https && git log --oneline -15
 git rev-parse HEAD origin/next     # must match
 
 # Parallel session's overnight status

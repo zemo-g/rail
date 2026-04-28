@@ -8,7 +8,7 @@
 
 set -u
 
-RAIL_DIR="${RAIL_DIR:-/Users/ledaticempire/projects/rail}"
+RAIL_DIR="${RAIL_DIR:-/Users/ledaticempire/projects/rail-https}"
 RAIL_BIN="${RAIL_DIR}/rail_native"
 BEACON_RAIL="${RAIL_DIR}/tools/plasma/mhd_beacon.rail"
 DAEMON_PY="${RAIL_DIR}/tools/plasma/mhd_beacon_daemon.py"

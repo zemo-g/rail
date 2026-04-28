@@ -6,7 +6,7 @@
 ## One-Line Sanity
 
 ```bash
-cd ~/projects/rail && ./rail_native test && ./rail_native run tools/train/three_class_mlp.rail | tail -3
+cd ~/projects/rail-https && ./rail_native test && ./rail_native run tools/train/three_class_mlp.rail | tail -3
 ```
 
 Expect `105/105 tests passed` followed by the final loss and `100%` accuracy.
@@ -82,7 +82,7 @@ Expect `105/105 tests passed` followed by the final loss and `100%` accuracy.
 
 ## Start here next session
 
-1. `cd ~/projects/rail`
+1. `cd ~/projects/rail-https`
 2. `./rail_native test` → `105/105 tests passed`
 3. `./rail_native run tools/train/three_class_mlp.rail | tail -3` → `100%`
 4. `cat CHANGELOG.md` → latest entries
@@ -96,7 +96,7 @@ rm -f /tmp/tensor_gpu.metallib
 xcrun metal -c tensor_gpu.metal -o /tmp/tensor_gpu.air
 xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib
 clang -shared -fobjc-arc -framework Metal -framework Foundation \
-  -install_name /Users/ledaticempire/projects/rail/tools/metal/libtensor_gpu.dylib \
+  -install_name /Users/ledaticempire/projects/rail-https/tools/metal/libtensor_gpu.dylib \
   tensor_gpu_lib.m -o libtensor_gpu.dylib
 ./smoke_test  # verify all 29 C-side checks still pass
 ```

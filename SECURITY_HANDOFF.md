@@ -21,7 +21,7 @@ rules.  See `tools/fleet/pf_ledatic_fleet.v2.conf` for the ready version.
 
 **Command (per node):**
 ```bash
-sudo bash ~/projects/rail/tools/fleet/security_bootstrap.sh
+sudo bash ~/projects/rail-https/tools/fleet/security_bootstrap.sh
 ```
 (re-run is idempotent; picks up the new anchor text automatically)
 
@@ -77,7 +77,7 @@ that runs `pfctl -e` at boot, idempotent.
 
 **Command (per node):**
 ```bash
-sudo cp ~/projects/rail/tools/fleet/com.ledatic.pf_enable.plist /Library/LaunchDaemons/
+sudo cp ~/projects/rail-https/tools/fleet/com.ledatic.pf_enable.plist /Library/LaunchDaemons/
 sudo chown root:wheel /Library/LaunchDaemons/com.ledatic.pf_enable.plist
 sudo chmod 644       /Library/LaunchDaemons/com.ledatic.pf_enable.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.ledatic.pf_enable.plist
@@ -136,7 +136,7 @@ endpoint still responds on each.
 
 **Command (Mini-only, run once per rotation):**
 ```bash
-bash ~/projects/rail/tools/fleet/rotate_fleet_token.sh
+bash ~/projects/rail-https/tools/fleet/rotate_fleet_token.sh
 ```
 Script prompts for confirmation, new token → Mini → Studio → Air → Pi,
 validates `curl -H "X-Fleet-Token: <new>" http://<node>:9101/health`
@@ -158,7 +158,7 @@ inside the fleet trust boundary.
 ```bash
 tailscale status | awk 'NR>1 {print $2}' | sort > ~/.fleet/allowed_tailnet_peers
 chmod 600 ~/.fleet/allowed_tailnet_peers
-sudo cp ~/projects/rail/tools/fleet/com.ledatic.tailscale_peer_check.plist /Library/LaunchDaemons/
+sudo cp ~/projects/rail-https/tools/fleet/com.ledatic.tailscale_peer_check.plist /Library/LaunchDaemons/
 sudo chown root:wheel /Library/LaunchDaemons/com.ledatic.tailscale_peer_check.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.ledatic.tailscale_peer_check.plist
 ```
@@ -192,7 +192,7 @@ one stolen file away from catastrophe.
 
 **Command (Mini):**
 ```bash
-bash ~/projects/rail/tools/deploy/audit_cf_token.sh
+bash ~/projects/rail-https/tools/deploy/audit_cf_token.sh
 ```
 
 **Remediation if broad:** create a new scoped token (KV write + cache
@@ -249,7 +249,7 @@ additive WAF rules; your IP is on the allow list, so you bypass both.
 After any subset, run:
 
 ```bash
-bash ~/projects/rail/tools/fleet/security_status.sh
+bash ~/projects/rail-https/tools/fleet/security_status.sh
 ```
 
 Prints a one-screen summary: pf status per node, sshd PasswordAuth

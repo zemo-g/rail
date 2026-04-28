@@ -2,6 +2,79 @@
 
 All notable changes to Rail are documented here.
 
+## v3.7.0 — 2026-04-28 — Releases physicified (attestation)
+
+Every tagged release, every `./rail_native test` pass, and every
+2-pass self-compile fixed point now binds to a live entropy beacon
+`pulse_id` and an Ed25519 signature from the project's `fleet0` Pi
+witness (`pk_fp = cac5f21a70564aeb`).  The signed artifacts ship in
+`releases/<tag>/`, are mirrored at `https://ledatic.org/releases/<tag>/`,
+and are reproducible offline with `https://ledatic.org/attest/verify.sh`.
+
+- `tools/attest/` — primitive + per-surface drivers.
+  `attest.sh` signs `sha256(input) ⊗ pulse_id ⊗ value_hex` via the Pi
+  witness using a namespace-prefixed message (`attest|v1|...`) so
+  attestation sigs can never collide with beacon-witness sigs.
+  `attest_release.sh` / `attest_test_run.sh` / `attest_selfhost.sh`
+  call the primitive on the binary, the test log, and the byte-identical
+  fixed point respectively.  `verify.sh` re-derives the digest, fetches
+  the public key from `ledatic.org/attest/fleet0.pub.pem`, runs the
+  Ed25519 verify, and exits non-zero on tamper.
+
+- `tools/attest/backfill_releases.sh` — extracts each historical tag's
+  `rail_native` + `tools/compile.rail` blobs (no checkout) and signs
+  them.  v2.0.0 → v3.6.1 are all attested + downloadable on the
+  public surface.
+
+- `tools/attest/daily.sh` — LaunchAgent `com.ledatic.attest_daily`
+  re-attests production every morning at 06:00 local.  Updates
+  `/builds/latest` and `/selfhost/latest` pointers so consumers don't
+  need to know today's SHA.  Production drift = "latest" pointer
+  falls behind the live tree, immediately self-evident.
+
+- `tools/attest/fleet_status_publisher.sh` — LaunchAgent
+  `com.ledatic.fleet_attest` polls each fleet node's `/health` every
+  60 s, fetches the current pulse, signs the bundle, and publishes
+  to `https://ledatic.org/fleet/status.json`.  Snapshot age + pulse
+  delta render as a "live / stale" mark on the public mission-control
+  page.
+
+- Public mission control at `https://ledatic.org/system` — five panels
+  (beacon · witness · fleet · build · selfhost) each resolve to a
+  signed JSON artifact, refresh on 2.5 s cadence, and self-mark "live"
+  or "stale" based on signature freshness.
+
+- CI fix as part of this work: `.github/workflows/ci.yml` now builds
+  `tools/metal/libtensor_gpu.dylib` before running the test suite.
+  Four tensor tests had been failing at link with "Undefined symbols
+  for architecture arm64: _tgl_init …" since the Metal-FFI
+  introduction (~2026-04-15); CI returned to green.
+
+The verb: Rail releases are no longer claims, they're physical events
+anchored to real time.
+
+## v3.6.1 — 2026-04-27 — Compiler hardening
+
+Two codegen + parser fixes; both gated by 2-pass byte-identical
+self-bootstrap.  137/137 green.
+
+- Undefined identifiers now fail at link time with a named symbol
+  (`_RAIL_UNDEFINED_IDENT_<name>`) instead of silently producing a
+  binary that segfaults at runtime.  Codegen patched in both ARM64
+  and x86_64 V-node "undefined" branches.  (`77c4f5f`)
+
+- Parser accepts multi-line compound expressions (cons chains,
+  nested calls, list literals) inside unclosed `(...)`/`[...]` or
+  before strictly-greater-indented `(`/`[`.  New `strip_nl_pp`
+  post-tokenizer pass routes both `tokenize` and `tokenize_with_pos`
+  through the same logic so error positions stay aligned.  (`f4f3e07`)
+
+- `returns_float` in `compile.rail` now tracks let-bound floats
+  through V (variable) AST nodes, fixing two latent miscompile bugs
+  in the MHD axisym + MPD source-term paths.  (`61425b7`)
+
+Byte-identical self-bootstrap verified (`md5 14af7d5d…`).
+
 ## v3.6.0 — 2026-04-20 — Unified HTTPS client
 
 Chain-walked verification is now the default. `https_get_url` /

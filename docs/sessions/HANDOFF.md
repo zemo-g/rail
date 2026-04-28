@@ -11,7 +11,7 @@ You are continuing a multi-session build of **pure-Rail TLS 1.3** on branch `tra
 - **Worktree:** `/Users/ledaticempire/projects/rail-https`
 - **Branch:** `track-h-https` (cut from `next-v2.10`)
 - **HEAD at handoff:** `260aebc` (`rail: stdlib/tls13_client — Layer 5b.6`)
-- **Do not touch:** `/Users/ledaticempire/projects/rail/` (main tree), `master`, `rail-checkpoint`, `rail-bpe-perf`, etc. This branch is isolated by design.
+- **Do not touch:** `/Users/ledaticempire/projects/rail-https/` (main tree), `master`, `rail-checkpoint`, `rail-bpe-perf`, etc. This branch is isolated by design.
 
 Start every session with:
 ```bash

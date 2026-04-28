@@ -311,7 +311,7 @@ The effects example crashed the Mac Mini due to exponential memory growth.
 
 ## CURRENT RAIL ARCHITECTURE (for fresh session context)
 
-### Codebase: `~/projects/rail/` — 7,044 lines across 13 Rust modules
+### Codebase: `~/projects/rail-https/` — 7,044 lines across 13 Rust modules
 
 ```
 src/
@@ -423,7 +423,7 @@ Fix both bugs BEFORE starting effects work — they're small parser/precedence f
 - **36 tasks**: 9 easy (100%), 15 medium (86.7%), 12 hard (100%)
 - **2 failures**: fizzbuzz_15 (precedence bug), count_down (parser bug) — both language bugs, not model weakness
 - **27B model** (Qwen3.5-27B-Claude-Opus-Distilled-4bit) hitting same ceiling as 9B — confirms these are language bugs
-- **Autoresearch script**: `~/projects/rail/tools/autoresearch.py`
-- **Results**: `~/projects/rail/tools/autoresearch_results/results.jsonl`
+- **Autoresearch script**: `~/projects/rail-https/tools/autoresearch.py`
+- **Results**: `~/projects/rail-https/tools/autoresearch_results/results.jsonl`
 - **MLX 27B**: on :8082 (PID 97009), idle, ready for 50-100 iteration overnight run
 - **Timing**: ~20 min/iteration on 27B, so 50 iterations ≈ 17 hours, 100 ≈ 33 hours
