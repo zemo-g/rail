@@ -108,8 +108,12 @@ class PlasmaHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        # Quiet the /frame spam
-        if "/frame" not in args[0]:
+        # Quiet the /frame spam.  Python 3.14's BaseHTTPRequestHandler can
+        # pass an HTTPStatus enum as args[0] for error logs (not a str), so
+        # coerce before substring-checking — without this guard every error
+        # response inside the request handler raises a TypeError that the
+        # framework converts into a 502 to the client.
+        if args and "/frame" not in str(args[0]):
             super().log_message(format, *args)
 
 
