@@ -138,14 +138,39 @@ Runners and data live in `Ledatic-Empire/rail-training`; the library code that m
 ## Site generation (dynamic pages)
 
 ```bash
-./rail_native run tools/deploy/gen_mission_control.rail    # /system mission control
-./rail_native run tools/deploy/gen_changelog.rail          # /changelog
 ./rail_native run tools/deploy/gen_feed.rail               # Atom feed
-./rail_native run tools/deploy/gen_plasma_landing.rail     # /plasma
 ./rail_native run tools/deploy/daily_deploy.rail           # cron orchestrator
 ```
 
-Pure-static pages live in `Ledatic-Empire/ledatic-site` and deploy with a shell script there.
+`/system` mission control + `/changelog` + `/plasma` + `/rail` and the rest of ledatic.org are hand-rolled HTML/JS in `Ledatic-Empire/ledatic-site` (deploy with `./deploy.sh` over there). The `gen_mission_control.rail` / `gen_changelog.rail` / `gen_plasma_landing.rail` generators were retired alongside the site2030 rebuild — pure-static pages won.
+
+## Attestation (release + build provenance)
+
+`tools/attest/` signs every tagged release, every `./rail_native test` pass, and every 2-pass self-compile fixed point against a live entropy beacon `pulse_id` and the Pi-hosted `fleet0` Ed25519 witness key (`pk_fp = cac5f21a70564aeb`).
+
+```bash
+tools/attest/attest.sh <input> <out>           # core primitive: sha256 ⊗ pulse ⊗ Ed25519
+tools/attest/verify.sh <input> <attestation>   # re-derive, fetch pubkey, Ed25519 verify
+tools/attest/attest_release.sh [tag]           # sign rail_native + tools/compile.rail at HEAD/tag
+tools/attest/attest_test_run.sh                # bracket ./rail_native test with pulses, sign result
+tools/attest/attest_selfhost.sh                # 2-pass byte-identical claim, signed
+tools/attest/backfill_releases.sh [tags…]      # extract historical tag blobs (no checkout) + sign
+tools/attest/publish.sh [dirs…]                # push releases/, builds/, selfhost/ to ledatic.org
+```
+
+Output lives in `releases/<tag>/`, `builds/<short>/`, `selfhost/<short>/` — JSON-only; raw binaries (`rail_native`, `compile.rail`) are alongside their attestation in releases/.
+
+Public surfaces:
+- `ledatic.org/releases/<tag>/{rail_native, compile.rail, *.attestation.json, index.json}`
+- `ledatic.org/builds/<short>/{result.json, result.json.attestation.json}` + `/builds/latest`
+- `ledatic.org/selfhost/<short>/...` + `/selfhost/latest`
+- `ledatic.org/fleet/status.json` — signed fleet-health snapshot, refreshed every 60 s
+- `ledatic.org/attest/verify.sh` + `ledatic.org/attest/fleet0.pub.pem` — public verifier + key
+- `ledatic.org/system` — live mission control: 5 panels reading the above
+
+LaunchAgents on Mini drive the cadences: `com.ledatic.attest_daily` (06:00 daily, re-attest production), `com.ledatic.fleet_attest` (60 s, fleet snapshot signing).
+
+The Pi-side signer at `~/.ledatic/witness/sign_attestation.sh` (fleet0, `100.87.231.45`) reuses the same Ed25519 key as the entropy beacon witness chain. Distinct namespace prefix (`attest|v1|...`) prevents cross-domain sig collisions.
 
 ## Cross-compile (Linux ARM64 for Pi Zero / similar)
 

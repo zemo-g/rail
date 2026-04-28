@@ -285,7 +285,7 @@ spike, not engineering. **Expect to learn something either way.**
    `python3 flywheel/train_cuda.py --load-only`
 3. The 14/30 baseline is still reproducible — run `flywheel/bench.rail`
    once and confirm we're at the same starting point as the README
-4. Free `~/projects/rail` disk for new checkpoints (REINFORCE will
+4. Free `~/projects/rail-https` disk for new checkpoints (REINFORCE will
    want to save every 10 steps × 100 steps = 10 checkpoints × ~50 MB
    = ~500 MB)
 5. The intervention ledger is up to date so we can compare before/after

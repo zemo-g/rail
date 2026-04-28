@@ -6,11 +6,11 @@
 </p>
 
 <p align="center">
-  <a href="#releases"><img src="https://img.shields.io/badge/v3.0.0-Rail%20speaks%20TLS-ff5500?style=for-the-badge" alt="v3.0.0"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/v3.6.1-compiler%20hardening-ff5500?style=for-the-badge" alt="v3.6.1"></a>
 </p>
 
 <p align="center">
-  <a href="#install"><img src="https://img.shields.io/badge/tests-116%2F116-brightgreen" alt="tests 116/116"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/tests-137%2F137-brightgreen" alt="tests 137/137"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
   <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
@@ -29,12 +29,12 @@
 
 ---
 
-Rail compiles itself. The compiler — 4,687 lines of Rail — produces a 729 KB ARM64 binary that compiles the compiler again and reaches byte-identical fixed point. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. As of v3.0.0, the TLS 1.3 client is Rail too: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat.
+Rail compiles itself. The compiler — 5,921 lines of Rail — produces a 901 KB ARM64 binary that compiles the compiler again and reaches byte-identical fixed point. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. As of v3.0.0, the TLS 1.3 client is Rail too: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat. Each tagged release is signed by the project's Pi-hosted Ed25519 witness key against a live entropy beacon — see [§ Provenance](#provenance) below.
 
 ```
 ./rail_native self && cp /tmp/rail_self ./rail_native
 ./rail_native self && cmp rail_native /tmp/rail_self  # byte-identical
-./rail_native test                                     # 116/116
+./rail_native test                                     # 137/137
 ```
 
 ## Quick start
@@ -50,7 +50,7 @@ Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, an
 ```bash
 ./rail_native <file.rail>        # compile to /tmp/rail_out
 ./rail_native run <file.rail>    # compile + execute
-./rail_native test               # run the 116-test suite
+./rail_native test               # run the 137-test suite
 ./rail_native self               # self-compile, fixed point
 ./rail_native x86 <file.rail>    # cross-compile to Linux x86_64
 ./rail_native linux <file.rail>  # cross-compile to Linux ARM64
@@ -210,6 +210,29 @@ Native floats in ARM64 d-registers, effect handlers via setjmp/longjmp, GC in as
 | **v1.3** | 2026-03-21 | MCP server, 32-layer LoRA, open source |
 | **v1.1** | 2026-03-20 | Metal GPU, WASM, x86_64, fibers, flywheel |
 | **v1.0** | 2026-03-17 | Self-hosting. Rust deleted. 67 tests. |
+
+## Provenance
+
+Every tagged release binds `sha256(rail_native)` to a live entropy
+beacon `pulse_id` and an Ed25519 signature from the project's
+fleet0 Pi witness (`pk_fp = cac5f21a70564aeb`). Each `releases/<tag>/`
+directory in this tree carries the raw artifact, its
+`*.attestation.json`, and an `index.json` manifest. The same files
+are mirrored at `https://ledatic.org/releases/<tag>/`.
+
+Verify a release in five lines:
+
+```bash
+curl -sf https://ledatic.org/attest/verify.sh -o /tmp/v.sh && chmod +x /tmp/v.sh
+curl -sf https://ledatic.org/releases/v3.6.1/rail_native             -o /tmp/rn
+curl -sf https://ledatic.org/releases/v3.6.1/rail_native.attestation.json -o /tmp/rn.att.json
+/tmp/v.sh /tmp/rn /tmp/rn.att.json
+# → ok  artifact=rail_native  pulse_id=…  pk_fp=cac5f21a70564aeb
+```
+
+The same primitive (`tools/attest/`) attests the daily `./rail_native
+test` pass and the 2-pass byte-identical self-compile. Live mission
+control at [ledatic.org/system](https://ledatic.org/system).
 
 ## Honest limits
 

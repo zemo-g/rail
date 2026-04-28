@@ -3,7 +3,7 @@
 ## Verdict (2026-04-15): ABANDONED in favor of daemon IPC.
 
 Path A (direct dlopen) is preserved here for historical reference. Fork B adopts
-**Path B (Rail-native Metal daemon)** — see `~/projects/rail/FORK_B_PLAN.md` §M3.
+**Path B (Rail-native Metal daemon)** — see `~/projects/rail-https/FORK_B_PLAN.md` §M3.
 A small ObjC binary on a Unix socket keeps the ObjC runtime hermetic in a
 separate process; Rail talks to it via `stdlib/socket.rail`. No Python in the
 inner training loop. Existing `tensor_daemon.py` is the working reference

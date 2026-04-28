@@ -31,7 +31,7 @@ without me. Authored at the end of a 6-hour session that landed Phase
 ## State of the world (run these on session start)
 
 ```bash
-cd ~/projects/rail
+cd ~/projects/rail-https
 git log --oneline -10                           # confirm HEAD = e1bd472 or later
 git rev-parse HEAD origin/next                  # both should match
 git status --short                              # uncommitted: lm_v3_chunked.rail, self_train.rail (see below)
@@ -109,7 +109,7 @@ memory file but worth surfacing:
 
 ```bash
 # 0. Wake-up state
-cd ~/projects/rail && git log --oneline -10 && git rev-parse HEAD origin/next
+cd ~/projects/rail-https && git log --oneline -10 && git rev-parse HEAD origin/next
 
 # 1. Did labrat survive the night?
 cat /tmp/labrat_stability_summary

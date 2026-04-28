@@ -7,7 +7,7 @@
 #   {
 #     "mcpServers": {
 #       "rail": {
-#         "command": "/Users/ledaticempire/projects/rail/tools/mcp/mcp_loop.sh"
+#         "command": "/Users/ledaticempire/projects/rail-https/tools/mcp/mcp_loop.sh"
 #       }
 #     }
 #   }
