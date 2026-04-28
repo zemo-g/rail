@@ -12,7 +12,7 @@
 # Wiring: ~/Library/LaunchAgents/com.ledatic.attest_daily.plist runs
 # this at 06:00 local each day.
 
-set -euo pipefail
+set -uo pipefail
 
 cd /Users/ledaticempire/projects/rail-https
 mkdir -p ~/.ledatic/attest
@@ -20,26 +20,28 @@ mkdir -p ~/.ledatic/attest
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo "[$ts] daily attest run starting" >> ~/.ledatic/attest/daily.log
 
+# run() — never aborts the script on inner failure.  Failure attestation
+# is the whole point: we publish red attestations the same way as green,
+# so production drift becomes a citable physical event rather than a
+# silent "cron didn't run today."
 run() {
   local label=$1; shift
   echo "[$(date -u +%H:%M:%SZ)] $label ..." >> ~/.ledatic/attest/daily.log
   if "$@" >> ~/.ledatic/attest/daily.log 2>&1; then
     echo "[$(date -u +%H:%M:%SZ)] $label ok" >> ~/.ledatic/attest/daily.log
   else
-    echo "[$(date -u +%H:%M:%SZ)] $label FAIL" >> ~/.ledatic/attest/daily.log
-    return 1
+    local rc=$?
+    echo "[$(date -u +%H:%M:%SZ)] $label FAIL rc=$rc" >> ~/.ledatic/attest/daily.log
   fi
 }
 
-# Generate fresh attestations.  attest_test_run + attest_selfhost both
-# write under builds/<short>/ + selfhost/<short>/, keyed by HEAD's
-# short SHA.  Re-runs against the same commit overwrite that day's
-# evidence — the most recent run is the canonical record for that SHA.
+# Generate fresh attestations.  attest_test_run + attest_selfhost write
+# their result.json regardless of pass/fail (status field carries the
+# verdict), so a failure still produces a signed record we can publish.
 run "test_run"  ./tools/attest/attest_test_run.sh
 run "selfhost"  ./tools/attest/attest_selfhost.sh
 
-# Publish individual SHA records, then mirror them to /builds/latest
-# and /selfhost/latest so consumers don't need to know today's SHA.
+# Publish whatever landed — pass OR fail.  A red day attests as red.
 short=$(git rev-parse --short HEAD)
 dirty=""
 git diff --quiet 2>/dev/null || dirty="-dirty"
