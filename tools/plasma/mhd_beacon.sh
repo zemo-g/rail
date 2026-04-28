@@ -12,14 +12,18 @@ RAIL_DIR="${RAIL_DIR:-/Users/ledaticempire/projects/rail}"
 RAIL_BIN="${RAIL_DIR}/rail_native"
 BEACON_RAIL="${RAIL_DIR}/tools/plasma/mhd_beacon.rail"
 PACKER_PY="${RAIL_DIR}/tools/plasma/mhd_beacon_pack.py"
+# Output path: canonical /tmp/plasma_live.bin in production, side path
+# /tmp/plasma_live_rail.bin by default so dev runs don't clobber a live
+# numpy beacon.  We bake this into the run_packer shim because Rail's
+# `shell()` does not inherit the parent's environment, so passing it
+# via launchd's EnvironmentVariables alone would not reach the packer.
+MHD_BEACON_OUT="${MHD_BEACON_OUT:-/tmp/plasma_live_rail.bin}"
 
 mkdir -p /tmp/mhd_beacon
 
-# Emit the small shim the Rail beacon shells out to.  Absolute paths
-# in here so we don't have to reason about Rail's runtime CWD.
 cat > /tmp/mhd_beacon/run_packer <<EOF
 #!/bin/sh
-python3 "${PACKER_PY}"
+MHD_BEACON_OUT="${MHD_BEACON_OUT}" python3 "${PACKER_PY}"
 EOF
 chmod +x /tmp/mhd_beacon/run_packer
 
