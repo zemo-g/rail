@@ -2,6 +2,22 @@
 
 All notable changes to Rail are documented here.
 
+## v3.6.1 — 2026-04-27 — Compiler hardening
+
+Two codegen + parser fixes; both gated by 2-pass byte-identical
+self-bootstrap. 137/137 green.
+
+- Undefined identifiers now fail at link time with a named symbol
+  (`_RAIL_UNDEFINED_IDENT_<name>`) instead of silently producing a
+  binary that segfaults at runtime. Codegen patched in both ARM64
+  and x86_64 V-node "undefined" branches. (`77c4f5f`)
+- Parser accepts multi-line compound expressions (cons chains, nested
+  calls, list literals) inside unclosed `(...)`/`[...]` or before
+  strictly-greater-indented `(`/`[`. New `strip_nl_pp` post-tokenizer
+  pass routes both `tokenize` and `tokenize_with_pos` through the
+  same logic so error positions stay aligned. (`f4f3e07`)
+- Byte-identical self-bootstrap verified (`md5 14af7d5d…`).
+
 ## v3.6.0 — 2026-04-20 — Unified HTTPS client
 
 Chain-walked verification is now the default. `https_get_url` /
