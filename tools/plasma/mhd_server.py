@@ -61,10 +61,13 @@ class PlasmaHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path == "/" or self.path == "/viewer":
-            # New uncached live-OT-plasma viewer (Rail-driven).  The /live
-            # path below still serves the legacy MPD thruster viewer for
-            # back-compat with anyone who has it bookmarked.
+            # Full-page Rail-driven viewer (HUD, legend, conservation, etc.)
             self.path = "/live_viewer.html"
+            super().do_GET()
+        elif self.path == "/embed":
+            # Minimal canvas-only build for embedding inside another page
+            # (e.g., ledatic.org/plasma).  No chrome, transparent background.
+            self.path = "/live_viewer_embed.html"
             super().do_GET()
         elif self.path == "/live":
             self.path = "/thruster_live.html"
