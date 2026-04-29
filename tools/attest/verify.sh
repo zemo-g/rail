@@ -36,9 +36,16 @@ expected_fp=$(python3 -c "import json;print(json.load(open('$att'))['witness']['
 got_fp=$(openssl pkey -in "$pub" -pubin -outform DER 2>/dev/null | shasum -a 256 | cut -c1-16)
 [ "$expected_fp" = "$got_fp" ] || { echo "pk_fp mismatch: expected $expected_fp, got $got_fp" >&2; exit 4; }
 
-# Re-derive digest and check.
+# Re-derive digest and check.  Accept either the standard
+# `artifact: {sha256, name}` schema OR the frame-attestation
+# `frame: {sha256, url}` schema (used by /entropy/frame/* sidecars).
 have_digest=$(shasum -a 256 "$input" | awk '{print $1}')
-want_digest=$(python3 -c "import json;print(json.load(open('$att'))['artifact']['sha256'])")
+want_digest=$(python3 -c "
+import json,sys
+a = json.load(open('$att'))
+print((a.get('artifact') or a.get('frame') or {}).get('sha256',''))
+")
+[ -n "$want_digest" ] || { echo "no sha256 in attestation" >&2; exit 5; }
 [ "$have_digest" = "$want_digest" ] || { echo "digest mismatch: file=$have_digest att=$want_digest" >&2; exit 5; }
 
 # Reconstruct canonical message and verify Ed25519 sig.
@@ -53,7 +60,14 @@ PY
 python3 -c "import json,base64,sys;a=json.load(open('$att'));sys.stdout.buffer.write(base64.b64decode(a['witness']['sig']))" > /tmp/attest_sig.bin
 
 if openssl pkeyutl -verify -pubin -inkey "$pub" -rawin -in /tmp/attest_msg.bin -sigfile /tmp/attest_sig.bin >/dev/null 2>&1; then
-  echo "ok  artifact=$(python3 -c "import json;print(json.load(open('$att'))['artifact']['name'])")  pulse_id=$(python3 -c "import json;print(json.load(open('$att'))['witness']['pulse_id'])")  pk_fp=$got_fp"
+  name=$(python3 -c "
+import json
+a = json.load(open('$att'))
+art = a.get('artifact') or a.get('frame') or {}
+print(art.get('name') or art.get('url','?'))
+")
+  pulse=$(python3 -c "import json;print(json.load(open('$att'))['witness']['pulse_id'])")
+  echo "ok  artifact=$name  pulse_id=$pulse  pk_fp=$got_fp"
   rm -f /tmp/attest_msg.bin /tmp/attest_sig.bin
   exit 0
 else
