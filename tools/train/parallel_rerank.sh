@@ -39,10 +39,12 @@ MAX_PARALLEL=8
 NO_WS_FIRST="0"
 RUN_ID="$$"
 DYLD_PATH="tools/metal"
+BIN_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --harness)     HARNESS="$2"; shift 2 ;;
+    --bin)         BIN_OVERRIDE="$2"; shift 2 ;;
     --prefix)      PREFIX="$2"; shift 2 ;;
     --prompt)      PROMPT="$2"; shift 2 ;;
     --max)         MAX="$2"; shift 2 ;;
@@ -72,17 +74,27 @@ if [[ ! -f "$HARNESS" ]]; then
 fi
 
 # Pre-compile the harness once so the N subprocesses don't all race on the
-# Rail compiler. The compiled output goes to /tmp/rail_out by default; we
-# redirect to a per-run path to avoid colliding with concurrent Rail builds.
-COMPILED_BIN="/tmp/rail_rerank_${RUN_ID}"
-echo "tgl: pre-compiling harness once -> $COMPILED_BIN" >&2
-DYLD_LIBRARY_PATH="$DYLD_PATH" ./rail_native "$HARNESS" >/dev/null 2>&1
-if [[ ! -x /tmp/rail_out ]]; then
-  echo "ERROR: harness compile failed; /tmp/rail_out not produced" >&2
-  exit 1
+# Rail compiler. With --bin, skip pre-compile and use the supplied binary
+# directly (caller has already compiled it; lets the bench harness avoid
+# redundant compiles and keeps /tmp/rail_out free for compile-grading).
+if [[ -n "$BIN_OVERRIDE" ]]; then
+  if [[ ! -x "$BIN_OVERRIDE" ]]; then
+    echo "ERROR: --bin path is not executable: $BIN_OVERRIDE" >&2
+    exit 1
+  fi
+  COMPILED_BIN="$BIN_OVERRIDE"
+  echo "tgl: using pre-built binary -> $COMPILED_BIN" >&2
+else
+  COMPILED_BIN="/tmp/rail_rerank_${RUN_ID}"
+  echo "tgl: pre-compiling harness once -> $COMPILED_BIN" >&2
+  DYLD_LIBRARY_PATH="$DYLD_PATH" ./rail_native "$HARNESS" >/dev/null 2>&1
+  if [[ ! -x /tmp/rail_out ]]; then
+    echo "ERROR: harness compile failed; /tmp/rail_out not produced" >&2
+    exit 1
+  fi
+  cp /tmp/rail_out "$COMPILED_BIN"
+  codesign -s - --force "$COMPILED_BIN" 2>/dev/null || true
 fi
-cp /tmp/rail_out "$COMPILED_BIN"
-codesign -s - --force "$COMPILED_BIN" 2>/dev/null || true
 
 # Launch N samples with rolling parallelism. Each sample uses a unique seed
 # so the topk multinomial draws diverge. All share the same prefix/prompt.
