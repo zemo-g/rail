@@ -98,6 +98,7 @@ typedef struct {
 
 static pool_tier_t g_pools[NUM_STORAGE_MODES][NUM_TIERS];
 static int         g_pools_inited = 0;
+static int         g_pool_disable = 0;  // RAIL_GPU_POOL_DISABLE=1 → always miss
 
 static dispatch_once_t g_pool_once;
 
@@ -106,6 +107,11 @@ static void pool_init_once(void) {
         for (int m = 0; m < NUM_STORAGE_MODES; m++)
             for (int t = 0; t < NUM_TIERS; t++)
                 g_pools[m][t].capacity = TIER_INITIAL_CAP;
+        const char *d = getenv("RAIL_GPU_POOL_DISABLE");
+        if (d && d[0] && d[0] != '0') {
+            g_pool_disable = 1;
+            fprintf(stderr, "tgl: RAIL_GPU_POOL_DISABLE=1 (pool best-fit bypassed)\n");
+        }
         g_pools_inited = 1;
     });
 }
@@ -153,6 +159,10 @@ static id<MTLBuffer> pool_acquire_mode(NSUInteger bytes, MTLResourceOptions opt)
     int t   = tier_for_bytes(bytes);
     pool_tier_t *pt = &g_pools[sm][t];
 
+    // RAIL_GPU_POOL_DISABLE=1 → skip best-fit reuse, force a fresh allocation
+    // each call (falsification test for sequential-collapse hypothesis).
+    if (g_pool_disable) goto miss_path;
+
     // Best-fit within tier — pick smallest idle slot ≥ bytes.
     int best = -1;
     for (int i = 0; i < pt->count; i++) {
@@ -167,6 +177,7 @@ static id<MTLBuffer> pool_acquire_mode(NSUInteger bytes, MTLResourceOptions opt)
         if (pt->in_use > pt->peak_in_use) pt->peak_in_use = pt->in_use;
         return pt->slots[best].buf;
     }
+miss_path:;
 
     // Miss — allocate.
     NSUInteger rounded = round_up_for_tier(bytes, t);
