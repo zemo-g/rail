@@ -1452,6 +1452,65 @@ int tgl_matmul_half_host(const double *A, const double *B, double *C,
     return 1;
 }
 
+// Rail-native mixed precision matmul: f64 activations x fp16 weights -> f64.
+//
+// X arrives as a Rail Tensor (f64 float_arr); W arrives as a Rail HalfTensor
+// (fp16 packed in a float_arr-shaped buffer). Y is a Rail Tensor (f64).
+// Host casts f64->f32 for X on input and f32->f64 for Y on output; GPU side
+// holds X/Y in fp32, W in fp16, dot product in fp64. The Rail-side caller
+// stays entirely in f64 land — same surface as matmul_half but precision-
+// preserving across sequential calls.
+//
+// See tools/metal/tensor_gpu.metal:matmul_f32x_halfw for the kernel and
+// the precision rationale.
+int tgl_matmul_f32x_halfw_host(const double *X_f64, const double *W_half,
+                               double *Y_f64, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double   *Xptr = X_f64 + 1;
+    const uint16_t *Wptr = (const uint16_t *)(W_half + 1);
+    double         *Yptr = Y_f64 + 1;
+
+    @autoreleasepool {
+        uint32_t sX = M*K, sW = K*N, sY = M*N;
+        // X and Y in fp32 (4 bytes/element); W in fp16 (2 bytes/element).
+        id<MTLBuffer> bufX = pool_acquire(sX*4);
+        id<MTLBuffer> bufW = pool_acquire(sW*2);
+        id<MTLBuffer> bufY = pool_acquire(sY*4);
+
+        // f64 -> f32 cast host-side at the GPU boundary.
+        float *X_f32 = (float *)bufX.contents;
+        for (uint32_t i = 0; i < sX; i++) X_f32[i] = (float)Xptr[i];
+
+        // fp16 weights: zero-cast memcpy from Rail HalfTensor payload.
+        memcpy(bufW.contents, Wptr, sW*2);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_f32x_halfw");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufX offset:0 atIndex:0];
+        [enc setBuffer:bufW offset:0 atIndex:1];
+        [enc setBuffer:bufY offset:0 atIndex:2];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:3];
+        [enc setBytes:&ku length:4 atIndex:4];
+        [enc setBytes:&nu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        // f32 -> f64 cast host-side; Rail caller sees Tensor (f64) output.
+        const float *Y_f32 = (const float *)bufY.contents;
+        for (uint32_t i = 0; i < sY; i++) Yptr[i] = (double)Y_f32[i];
+
+        pool_release(bufX); pool_release(bufW); pool_release(bufY);
+    }
+    return 1;
+}
+
 // Zero-cast fp16 element-wise add. Inputs + output are packed-half
 // float_arrs; GPU keeps accumulator in fp32 and casts back to half at
 // store. Uses the tensor_add_f16 kernel (gid-per-element, 1-D).

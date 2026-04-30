@@ -736,6 +736,54 @@ kernel void matmul_blocked_f16(
     }
 }
 
+// Rail-native mixed precision: fp32 X x fp16 W -> fp32 Y, fp64 accumulator.
+//
+// Distinct from NVIDIA tensor-core path (fp32 accumulator). Apple Silicon
+// Metal compute kernels support fp64; for small Rail-on-Rail models the
+// fp64 dot-product cost is negligible while the precision win is durable.
+// Eliminates the fp16-cast compounding that flips argmax across deep
+// transformer inference (see dylib_investigation_2026-04-30.md).
+//
+// Buffer convention:
+//   buffer(0): X    fp32  M x K activations (cast f64->f32 host-side once)
+//   buffer(1): W    fp16  K x N weights     (zero-cast from disk)
+//   buffer(2): Y    fp32  M x N activations (cast f32->f64 host-side once)
+//
+// Why each precision:
+//   - W in fp16: memory-bandwidth win; weights are static, the precision
+//     loss happened once at training save and is now sunk cost.
+//   - X/Y in fp32: enough headroom to carry RMSNorm-scaled activations
+//     through residual sums without saturation; 4 bytes/element matches
+//     GPU register width.
+//   - Accumulator in fp64: the dot product is where precision dies in
+//     deep networks. fp64 here is the Rail innovation.
+kernel void matmul_f32x_halfw(
+    device const float *X     [[buffer(0)]],
+    device const half  *W     [[buffer(1)]],
+    device float       *Y     [[buffer(2)]],
+    constant uint      &M     [[buffer(3)]],
+    constant uint      &K     [[buffer(4)]],
+    constant uint      &N     [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint row = gid.y; uint col = gid.x;
+    threadgroup float Xs[TILE][TILE];
+    threadgroup half  Ws[TILE][TILE];
+    float sum = 0.0f;
+    uint numTiles = (K + TILE - 1) / TILE;
+    for (uint t = 0; t < numTiles; t++) {
+        uint xCol = t * TILE + lid.x;
+        uint wRow = t * TILE + lid.y;
+        Xs[lid.y][lid.x] = (row < M && xCol < K) ? X[row * K + xCol] : 0.0f;
+        Ws[lid.y][lid.x] = (wRow < K && col < N) ? W[wRow * N + col] : half(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < TILE; i++) sum += Xs[lid.y][i] * float(Ws[i][lid.x]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < M && col < N) Y[row * N + col] = sum;
+}
+
 kernel void matmul_bias_relu_f16(
     device const half *A    [[buffer(0)]],
     device const half *B    [[buffer(1)]],
