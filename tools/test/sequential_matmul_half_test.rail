@@ -1,0 +1,107 @@
+-- sequential_matmul_half_test.rail — H5 falsification probe.
+--
+-- Question: does tgl_matmul_half_host produce different output when called
+-- many times in sequence vs once?
+--
+-- If yes → primitive-level state corruption in the dylib. If no → bug
+-- is in composition of multiple primitives, not in matmul itself.
+--
+-- Run: DYLD_LIBRARY_PATH=tools/metal ./rail_native run \
+--      tools/test/sequential_matmul_half_test.rail
+
+import "stdlib/tensor.rail"
+
+foreign tgl_init dummy -> int
+
+unwrap_t t = match t | Tensor d _ _ -> d
+unwrap_h h = match h | HalfTensor d _ _ -> d
+
+fill_seeded arr n seed i =
+  if i >= n then 0
+  else
+    let x = (i + seed) % 100
+    let v = int_to_float x / 100.0 - 0.5
+    let _ = float_arr_set arr i v
+    fill_seeded arr n seed (i + 1)
+
+make_tensor m n seed =
+  let arr = float_arr_new (m * n) 0.0
+  let _ = fill_seeded arr (m * n) seed 0
+  Tensor arr (cons m (cons n [])) (compute_strides (cons m (cons n [])))
+
+max_diff_f64 a b n i best =
+  if i >= n then best
+  else
+    let raw = float_arr_get a i - float_arr_get b i
+    let d = if raw > 0.0 then raw else 0.0 - raw
+    let b2 = if d > best then d else best
+    max_diff_f64 a b n (i + 1) b2
+
+warm_loop a b c m k n iters i =
+  if i >= iters then 0
+  else
+    let _ = tgl_matmul_half_host a b c m k n
+    warm_loop a b c m k n iters (i + 1)
+
+snapshot_half_to_f64 c_half =
+  let t = tensor_of_half c_half
+  unwrap_t t
+
+main =
+  let _ = tgl_init 0
+
+  let m = 128
+  let A = make_tensor m m 0
+  let B = make_tensor m m 37
+  let Ah = half_of_tensor A
+  let Bh = half_of_tensor B
+
+  let C1 = half_tensor_new (cons m (cons m []))
+  let C2 = half_tensor_new (cons m (cons m []))
+
+  let ahd = unwrap_h Ah
+  let bhd = unwrap_h Bh
+  let c1d = unwrap_h C1
+  let c2d = unwrap_h C2
+
+  let n_elem = m * m
+
+  -- Test 1: two back-to-back identical calls.
+  let _ = tgl_matmul_half_host ahd bhd c1d m m m
+  let s1 = snapshot_half_to_f64 C1
+  let _ = tgl_matmul_half_host ahd bhd c2d m m m
+  let s2 = snapshot_half_to_f64 C2
+  let d_pair = max_diff_f64 s1 s2 n_elem 0 0.0
+  let _ = print (cat ["pair_diff (call_1 vs call_2) max_abs=", show_float d_pair])
+
+  -- Test 2: 1 call → 100 warmup calls into scratch → 1 call. Compare.
+  let scratch = half_tensor_new (cons m (cons m []))
+  let scd = unwrap_h scratch
+  let _ = tgl_matmul_half_host ahd bhd c1d m m m
+  let s1b = snapshot_half_to_f64 C1
+  let _ = warm_loop ahd bhd scd m m m 100 0
+  let _ = tgl_matmul_half_host ahd bhd c2d m m m
+  let s2b = snapshot_half_to_f64 C2
+  let d_after = max_diff_f64 s1b s2b n_elem 0 0.0
+  let _ = print (cat ["after_100_warmups max_abs=", show_float d_after])
+
+  -- Test 3: 1000 calls into the same buffer; sample first vs last result.
+  let _ = tgl_matmul_half_host ahd bhd c1d m m m
+  let s1c = snapshot_half_to_f64 C1
+  let _ = warm_loop ahd bhd c1d m m m 1000 0
+  let s1d = snapshot_half_to_f64 C1
+  let d_long = max_diff_f64 s1c s1d n_elem 0 0.0
+  let _ = print (cat ["after_1000_same_buf max_abs=", show_float d_long])
+
+  let pair_fail = d_pair > 0.001
+  let after_fail = d_after > 0.001
+  let long_fail = d_long > 0.001
+  let any_fail = pair_fail
+  let any_fail = if after_fail then 1 > 0 else any_fail
+  let any_fail = if long_fail then 1 > 0 else any_fail
+  if any_fail then
+    let _ = print "DIVERGENCE: sequential matmul_half produces non-deterministic output"
+    1
+  else
+    let _ = print "ok sequential_matmul_half: deterministic across calls"
+    0
