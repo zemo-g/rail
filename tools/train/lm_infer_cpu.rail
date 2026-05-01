@@ -1,0 +1,371 @@
+-- lm_infer_cpu.rail — Pure-CPU f64 reference inference for the v3
+-- architecture (RMSNorm + RoPE + SwiGLU). Mechanical fork of
+-- lm_infer_v3_half.rail with every *_half kernel replaced by its f64
+-- equivalent in stdlib/transformer.rail / stdlib/tensor.rail. No
+-- HalfTensor wrap/unwrap, no libtensor_gpu dispatch.
+--
+-- Purpose: deterministic substrate-of-truth inference for benching and
+-- for the verifier-augmented training loop. Slow (~minutes/sample at
+-- d=256) but immune to dylib state and fp16 numerical surprise. When
+-- this and the GPU/fp16 path disagree, this is the source of truth.
+--
+-- Run with `tools/metal/.no_gpu` present so f64 ops in stdlib/tensor.rail
+-- skip their dylib fast path — that's the whole point of this file.
+--
+-- CLI matches lm_infer_v3_half.rail exactly so flywheel benches can swap
+-- this in without changes:
+--   ./rail_native run tools/train/lm_infer_cpu.rail \
+--       --prefix training/rail_native/checkpoints/d256_half_step3000 \
+--       --prompt "main = " --max 128 --k 10 --temp 0.8 --seed 100
+
+import "stdlib/transformer.rail"
+import "stdlib/optim.rail"
+import "stdlib/tokenizer.rail"
+import "stdlib/checkpoint.rail"
+
+corpus_path = "training/rail_corpus_stdlib.txt"
+default_prefix = "training/rail_native/checkpoints/d256_half_step3000"
+default_prompt = "main = "
+default_max_gen_str = "128"
+seq_len = 1024
+
+unwrap t = match t | Tensor d _ _ -> d
+
+m_hadamard_loop ad bd cd n i =
+  if i >= n then 0
+  else
+    let a = float_arr_get ad i
+    let b = float_arr_get bd i
+    let _ = float_arr_set cd i (a * b)
+    m_hadamard_loop ad bd cd n (i + 1)
+
+m_hadamard a b = match a
+  | Tensor ad a_shape _ -> match b
+    | Tensor bd _ _ ->
+      let n = list_product a_shape
+      let cd = float_arr_new n 0.0
+      let _ = m_hadamard_loop ad bd cd n 0
+      Tensor cd a_shape (compute_strides a_shape)
+
+-- Block forward — pure f64. Each step uses the f64 equivalent of the
+-- corresponding half kernel; no precision conversions.
+infer_block_fwd x w_block seq d =
+  let w_q = list_nth 0 w_block
+  let w_k = list_nth 1 w_block
+  let w_v = list_nth 2 w_block
+  let w_o = list_nth 3 w_block
+  let w_gate = list_nth 4 w_block
+  let w_up = list_nth 5 w_block
+  let w_down = list_nth 6 w_block
+  let g1 = list_nth 7 w_block
+  let g2 = list_nth 8 w_block
+
+  let pack1 = rmsnorm_save x g1
+  let ln1 = head pack1
+
+  let q = matmul ln1 w_q
+  let k = matmul ln1 w_k
+  let v = matmul ln1 w_v
+  let _ = rope_apply q
+  let _ = rope_apply k
+
+  let kt = tensor_transpose k
+  let scores = matmul q kt
+  let scale = 1.0 / sqrt (int_to_float d)
+  let scaled = tensor_scale scores scale
+  let sd = unwrap scaled
+  let _ = apply_causal_mask_loop sd seq 0 0
+  let attn = tensor_softmax scaled
+  let attn_val = matmul attn v
+  let attn_out = matmul attn_val w_o
+  let x_attn = tensor_add x attn_out
+
+  let pack2 = rmsnorm_save x_attn g2
+  let ln2 = head pack2
+
+  let h_gate = matmul ln2 w_gate
+  let h_up = matmul ln2 w_up
+  let silu_pack = silu_forward h_gate
+  let h_gate_silu = head silu_pack
+  let h_act = m_hadamard h_gate_silu h_up
+  let h_out = matmul h_act w_down
+  let x_out = tensor_add x_attn h_out
+  x_out
+
+-- Unpack a single 9-weight block from `weights` starting at `base`.
+unpack_one_block weights base =
+  let w0 = list_nth base weights
+  let w1 = list_nth (base + 1) weights
+  let w2 = list_nth (base + 2) weights
+  let w3 = list_nth (base + 3) weights
+  let w4 = list_nth (base + 4) weights
+  let w5 = list_nth (base + 5) weights
+  let w6 = list_nth (base + 6) weights
+  let w7 = list_nth (base + 7) weights
+  let w8 = list_nth (base + 8) weights
+  cons w0 (cons w1 (cons w2 (cons w3 (cons w4 (cons w5 (cons w6 (cons w7 (cons w8 []))))))))
+
+unpack_blocks_loop weights idx count acc =
+  if count <= 0 then reverse acc
+  else
+    let b = unpack_one_block weights idx
+    unpack_blocks_loop weights (idx + 9) (count - 1) (cons b acc)
+
+unpack_blocks weights start n_blocks =
+  unpack_blocks_loop weights start n_blocks []
+
+infer_blocks_loop x blocks seq d i n =
+  if i >= n then x
+  else
+    let b_weights = list_nth i blocks
+    let next_x = infer_block_fwd x b_weights seq d
+    infer_blocks_loop next_x blocks seq d (i + 1) n
+
+-- Full forward. Returns probs tensor [seq, V].
+infer_forward x w_e blocks gf seq V d =
+  let x_embed = matmul x w_e
+
+  let n_blocks = length blocks
+  let x_last = infer_blocks_loop x_embed blocks seq d 0 n_blocks
+
+  let packf = rmsnorm_save x_last gf
+  let x_final = head packf
+
+  let we_t = tensor_transpose w_e
+  let logits = matmul x_final we_t
+  tensor_softmax logits
+
+-- ── Argmax across the V-wide row `row` of probs.
+argmax_row_loop pd V base best_id best_val v =
+  if v >= V then best_id
+  else
+    let cur = float_arr_get pd (base + v)
+    if cur > best_val then argmax_row_loop pd V base v cur (v + 1)
+    else argmax_row_loop pd V base best_id best_val (v + 1)
+
+argmax_row probs row V = match probs
+  | Tensor pd _ _ ->
+    let base = row * V
+    let v0 = float_arr_get pd base
+    argmax_row_loop pd V base 0 v0 1
+
+-- ── Top-k weighted-multinomial sampling.
+copy_row_loop src dst V base i =
+  if i >= V then 0
+  else
+    let _ = float_arr_set dst i (float_arr_get src (base + i))
+    copy_row_loop src dst V base (i + 1)
+
+amax_avail_loop buf V best_id best_val i =
+  if i >= V then best_id
+  else
+    let cur = float_arr_get buf i
+    if cur > best_val then amax_avail_loop buf V i cur (i + 1)
+    else amax_avail_loop buf V best_id best_val (i + 1)
+
+topk_fill_loop buf V k i ids ws =
+  if i >= k then 0
+  else
+    let v0 = float_arr_get buf 0
+    let top_id = amax_avail_loop buf V 0 v0 1
+    let top_val = float_arr_get buf top_id
+    let _ = float_arr_set ids i (int_to_float top_id)
+    let _ = float_arr_set ws i top_val
+    let _ = float_arr_set buf top_id (0.0 - 1.0)
+    topk_fill_loop buf V k (i + 1) ids ws
+
+sum_ws_loop ws k i acc =
+  if i >= k then acc
+  else sum_ws_loop ws k (i + 1) (acc + float_arr_get ws i)
+
+rng_next buf slot =
+  let s = float_to_int (float_arr_get buf slot)
+  let new_s = (s * 1664525 + 1013904223) % 2147483648
+  let _ = float_arr_set buf slot (int_to_float new_s)
+  new_s
+
+sample_walk_loop ids ws k i u acc =
+  if i >= k - 1 then float_to_int (float_arr_get ids (k - 1))
+  else
+    let w = float_arr_get ws i
+    let new_acc = acc + w
+    if u < new_acc then float_to_int (float_arr_get ids i)
+    else sample_walk_loop ids ws k (i + 1) u new_acc
+
+topk_sample probs row V samp = match probs
+  | Tensor pd _ _ ->
+    let base = row * V
+    let k = float_to_int (float_arr_get samp 0)
+    let buf = float_arr_new V 0.0
+    let _ = copy_row_loop pd buf V base 0
+    let no_ws_rem = float_to_int (float_arr_get samp 2)
+    let sp_id = float_to_int (float_arr_get samp 3)
+    let nl_id = float_to_int (float_arr_get samp 4)
+    let _ = if no_ws_rem > 0 then
+              let _ = if sp_id >= 0 then float_arr_set buf sp_id (0.0 - 1.0) else 0
+              let _ = if nl_id >= 0 then float_arr_set buf nl_id (0.0 - 1.0) else 0
+              0
+            else 0
+    let ids = float_arr_new k 0.0
+    let ws = float_arr_new k 0.0
+    let _ = topk_fill_loop buf V k 0 ids ws
+    let sum = sum_ws_loop ws k 0 0.0
+    let r = rng_next samp 1
+    let u = (int_to_float (r % 1000000)) / 1000000.0 * sum
+    let _ = if no_ws_rem > 0 then float_arr_set samp 2 (int_to_float (no_ws_rem - 1)) else 0
+    sample_walk_loop ids ws k 0 u 0.0
+
+zero_range arr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set arr i 0.0
+    zero_range arr n (i + 1)
+
+fill_prompt_loop xd ids_list V pos =
+  if length ids_list == 0 then pos
+  else
+    let id = head ids_list
+    let _ = float_arr_set xd (pos * V + id) 1.0
+    fill_prompt_loop xd (tail ids_list) V (pos + 1)
+
+-- KV-cache-equivalent via shape narrowing. xd_full is the underlying
+-- one-hot float_arr sized seq_len * V — positions [0..cur_pos) hold
+-- prompt + already-generated tokens, [cur_pos..seq_len) is zeros.
+-- Each step we create a Tensor wrapping that SAME memory but with shape
+-- [active, V] where active = cur_pos. No copy — just the shape is
+-- narrowed. Every downstream matmul/softmax then scales to `active`
+-- instead of `seq_len`, taking attention from O(seq²) to O(active·N).
+-- ── 2026-04-30 compiler-codegen workaround ─────────────────────────
+-- The combination of `arena_reset` followed by `float_arr_set xd_full IDX V`
+-- where IDX is a multiply-add expression (cur_pos * V + next_id) caused
+-- silent freelist corruption surfacing as SIGSEGV in _rail_chained_malloc
+-- on a subsequent allocation. The 1.0 fp64 bit pattern ended up in the
+-- size-class-0 freelist head (`_rail_small_fl[0]`), dereferenced as a
+-- kernel-space pointer.
+--
+-- Bisection (deterministic per seed at active=65, 11th iteration with the
+-- fact-prompt; 50%+ of seeds hit it across typical bench prompts):
+--   • float_arr_set arr CONST val             → works (any val)
+--   • float_arr_set arr (var + var) val        → works
+--   • float_arr_set arr (var * const) val      → works
+--   • float_arr_set arr (var * const + var) val → CRASHES (with arena_reset)
+--   • Same call path WITHOUT arena_reset       → works
+--
+-- Heisenbug: any in-source instrumentation (let-rebind, helper-fn wrap,
+-- `print`) shifts heap layout enough to hide the trigger. lldb attach hangs.
+-- Root cause stays open in compile.rail's interaction between arena_reset
+-- emit and the multiply-add expression evaluation. Probable reason: a
+-- register clobber or stack-discipline mismatch around the float-literal
+-- atof call inlined for the `1.0` argument; the actual address landing in
+-- `_rail_small_fl[0]` couldn't be traced without live debugger access.
+--
+-- Workaround: drop arena_reset from gen_loop. Each iteration's intermediate
+-- tensors then accumulate in the bump arena. At inference scale (--max ≤ 128
+-- typical, d=256 × 2-block) the per-iteration footprint is ~few MB; the
+-- 1GB default RAIL_ARENA_MB easily holds the full bounded run. For larger
+-- max or deeper models, set RAIL_ARENA_MB=4096.
+--
+-- TODO: fix root in compile.rail — see inference_segfault_analysis.md and
+--       inference_seed_segfault.md for the precise reproducer.
+gen_loop xd_full blocks w_e gf V d acc cur_pos end_pos samp =
+  if cur_pos >= end_pos then reverse acc
+  else
+    let active = cur_pos
+    let active_shape = cons active (cons V [])
+    let x_active = Tensor xd_full active_shape (compute_strides active_shape)
+    let probs = infer_forward x_active w_e blocks gf active V d
+    let pred_row = active - 1
+    let k = float_to_int (float_arr_get samp 0)
+    let next_id = if k <= 1 then argmax_row probs pred_row V
+                  else topk_sample probs pred_row V samp
+    let _ = float_arr_set xd_full (cur_pos * V + next_id) 1.0
+    gen_loop xd_full blocks w_e gf V d (cons next_id acc) (cur_pos + 1) end_pos samp
+
+ids_to_string_loop ids vocab acc =
+  if length ids == 0 then acc
+  else ids_to_string_loop (tail ids) vocab (cat [acc, id_char vocab (head ids)])
+
+ids_to_string ids vocab = ids_to_string_loop ids vocab ""
+
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if head xs == key then
+    if length (tail xs) > 0 then head (tail xs) else ""
+  else argv_get_loop (tail xs) key
+
+argv_get argv key default_val =
+  let v = argv_get_loop argv key
+  if length (chars v) == 0 then default_val else v
+
+sanitize_loop ids acc =
+  if length ids == 0 then reverse acc
+  else
+    let id = head ids
+    let fixed = if id < 0 then 0 else id
+    sanitize_loop (tail ids) (cons fixed acc)
+
+sanitize_ids ids = sanitize_loop ids []
+
+main =
+  let prefix = argv_get args "--prefix" default_prefix
+  let prompt = argv_get args "--prompt" default_prompt
+  let max_str = argv_get args "--max" default_max_gen_str
+  let k_str = argv_get args "--k" "1"
+  let _tau_str = argv_get args "--temp" "1.0"
+  let seed_str = argv_get args "--seed" "42"
+  let no_ws_str = argv_get args "--no-ws-first" "0"
+
+  let max_gen = parse_int max_str
+
+  let text = read_file corpus_path
+  let vocab = build_vocab text
+  let V = vocab_size vocab
+
+  let have_ckpt = ckpt_exists prefix
+  if not have_ckpt then
+    let _ = print (cat ["ERROR: no committed checkpoint at ", prefix])
+    0
+  else
+    let weights = load_model prefix
+    let n_weights = length weights
+    let n_blocks = (n_weights - 2) / 9
+    if n_weights < 11 then
+      let _ = print (cat ["ERROR: need at least 11 weights; got ", show n_weights])
+      0
+    else if n_weights != 2 + 9 * n_blocks then
+      let _ = print (cat ["ERROR: n_weights ", show n_weights, " is not 2 + 9*N"])
+      0
+    else
+      let w_e = list_nth 0 weights
+      let gf = list_nth 1 weights
+      let blocks = unpack_blocks weights 2 n_blocks
+
+      let raw_ids = encode vocab prompt
+      let prompt_ids = sanitize_ids raw_ids
+      let prompt_len = length prompt_ids
+      if prompt_len == 0 then
+        let _ = print "ERROR: prompt encoded to 0 tokens (vocab mismatch?)"
+        0
+      else if prompt_len + max_gen >= seq_len then
+        let _ = print (cat ["ERROR: prompt_len (", show prompt_len, ") + max_gen (", show max_gen, ") exceeds seq_len (", show seq_len, ")"])
+        0
+      else
+        let x_data = float_arr_new (seq_len * V) 0.0
+        let _ = fill_prompt_loop x_data prompt_ids V 0
+
+        let end_pos = prompt_len + max_gen
+        let k_val = parse_int k_str
+        let seed_val = parse_int seed_str
+        let no_ws_val = parse_int no_ws_str
+        let sp_id = char_id vocab " "
+        let nl_id = char_id vocab "\n"
+        let samp = float_arr_new 5 0.0
+        let _ = float_arr_set samp 0 (int_to_float k_val)
+        let _ = float_arr_set samp 1 (int_to_float seed_val)
+        let _ = float_arr_set samp 2 (int_to_float no_ws_val)
+        let _ = float_arr_set samp 3 (int_to_float sp_id)
+        let _ = float_arr_set samp 4 (int_to_float nl_id)
+        let gen_ids = gen_loop x_data blocks w_e gf V 256 [] prompt_len end_pos samp
+        let gen_text = ids_to_string gen_ids vocab
+        let _ = print (cat [prompt, gen_text])
+        0
