@@ -1,0 +1,156 @@
+-- tools/attest/publish.rail — Rail-native attestation publisher
+--
+-- Drop-in replacement for tools/attest/publish.sh, written entirely
+-- in Rail.  Pushes attestation artifacts to ledatic.org via HTTPS PUT
+-- (leaf-only TLS; auth is via X-Beacon-Token header).  Zero curl,
+-- zero shell HTTP -- just Rail.
+--
+-- Usage:
+--   ./rail_native run tools/attest/publish.rail <kind>/<ident>
+--
+-- Example:
+--   ./rail_native run tools/attest/publish.rail releases/v3.8.0
+--
+-- Requires:
+--   ~/.ledatic/entropy/beacon_token  -- the publish worker auth token
+--   <kind>/<ident>/                  -- directory under repo root
+--
+-- Allowed kinds: releases | builds | selfhost.  Same allowlist the
+-- worker enforces server-side.
+--
+-- KNOWN ISSUE (filed 2026-05-01): pure-Rail HTTPS POST/PUT to
+-- ledatic.org currently hangs and never receives a response, even
+-- though the same client's GET works fine and PUT to non-Cloudflare
+-- targets has been verified at the wire layer.  Symptom: TLS
+-- handshake completes, request bytes go out, server never sends
+-- response, connection eventually times out (~40 s) with SIGPIPE.
+-- The verb-builder + chain-of-functions are correct; the issue is
+-- isolated to Cloudflare-edge interaction on non-GET methods.
+-- Until that's tracked down, this script is preserved as the
+-- correct call site shape -- shell out to publish.sh for actual
+-- pushes.
+
+import "stdlib/https_strict.rail"
+import "stdlib/file.rail"
+import "stdlib/env.rail"
+import "stdlib/dirent.rail"
+
+site_base _ = "https://ledatic.org"
+
+-- ── Helpers ──────────────────────────────────────────────────────────
+
+usage _ =
+  let _ = print "usage: publish.rail <kind>/<ident>"
+  let _ = print "       e.g. publish.rail releases/v3.8.0"
+  2
+
+valid_kind k =
+  if k == "releases" then 1
+  else if k == "builds" then 1
+  else if k == "selfhost" then 1
+  else 0
+
+-- Strip whitespace + trailing newline from a string (token files
+-- often end with "\n").
+trim_line s =
+  let cs = chars s
+  trim_line_acc cs ""
+
+trim_line_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    if c == "\n" then acc
+    else if c == "\r" then acc
+    else trim_line_acc (tail cs) (cat [acc, c])
+
+-- Pick a Content-Type based on filename suffix.
+ctype_of_path path =
+  if str_ends_with path ".json" then "application/json"
+  else "application/octet-stream"
+
+str_ends_with s suffix =
+  let ls = length (chars s)
+  let lf = length (chars suffix)
+  if lf > ls then 0
+  else (str_sub s (ls - lf) lf) == suffix
+
+-- Decide whether a file in a publish dir should be PUT.  JSON always
+-- goes; raw release artifacts (rail_native, compile.rail) only go
+-- under releases/ -- the publish.sh allowlist.
+should_publish kind name =
+  if str_ends_with name ".json" then 1
+  else if kind == "releases" then
+    if name == "rail_native" then 1
+    else if name == "compile.rail" then 1
+    else 0
+  else 0
+
+-- ── Main publish loop ────────────────────────────────────────────────
+
+put_one kind ident name token =
+  let local = cat [kind, "/", ident, "/", name]
+  let url = cat [site_base 0, "/", kind, "/", ident, "/", name]
+  let body = read_file local
+  let ctype = ctype_of_path name
+  let hdr = cat ["X-Beacon-Token: ", token]
+  -- Leaf-only: auth comes from X-Beacon-Token, not TLS identity, and
+  -- the strict chain-walk takes ~90 s per request on Cloudflare's
+  -- chain (P-384 scalar-mult bottleneck) -- too slow for a multi-
+  -- file push.
+  let result = https_put_url_unsafe_noverify url ctype body [hdr]
+  let (status, _resp) = result
+  let mark = if status == 200 then "ok " else "FAIL"
+  let _ = print (cat [mark, " ", url, " status=", show status])
+  if status == 200 then 0 else 1
+
+publish_loop kind ident files token ok_n fail_n =
+  if length files == 0 then (ok_n, fail_n)
+  else
+    let name = head files
+    if length (chars name) == 0 then publish_loop kind ident (tail files) token ok_n fail_n
+    else if should_publish kind name == 0 then publish_loop kind ident (tail files) token ok_n fail_n
+    else
+      let rc = put_one kind ident name token
+      let on1 = if rc == 0 then ok_n + 1 else ok_n
+      let fn1 = if rc == 0 then fail_n else fail_n + 1
+      publish_loop kind ident (tail files) token on1 fn1
+
+publish_dir kind ident =
+  let token_path = cat [getenv "HOME", "/.ledatic/entropy/beacon_token"]
+  let token = trim_line (read_file token_path)
+  if length (chars token) == 0 then
+    let _ = print (cat ["missing beacon token: ", token_path])
+    3
+  else
+    let local_dir = cat [kind, "/", ident]
+    let files = list_dir local_dir
+    if length files == 0 then
+      let _ = print (cat ["empty or missing dir: ", local_dir])
+      4
+    else
+      let counts = publish_loop kind ident files token 0 0
+      let (ok_n, fail_n) = counts
+      let _ = print (cat [kind, "/", ident, ": ", show ok_n, " ok, ", show fail_n, " fail"])
+      if fail_n == 0 then 0 else 5
+
+-- Split "<kind>/<ident>" into its two parts.
+split_target s =
+  let parts = str_split "/" s
+  if length parts < 2 then ("", "")
+  else (head parts, head (tail parts))
+
+main =
+  let user_args = tail args
+  if length user_args < 1 then usage 0
+  else
+    let target = head user_args
+    let split = split_target target
+    let (kind, ident) = split
+    if valid_kind kind == 0 then
+      let _ = print (cat ["bad kind: ", kind, " (allowed: releases | builds | selfhost)"])
+      6
+    else if length (chars ident) == 0 then
+      let _ = print "missing <ident> after <kind>/"
+      7
+    else publish_dir kind ident
