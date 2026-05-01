@@ -33,6 +33,8 @@
 -- correctly here.
 
 import "stdlib/https_strict.rail"
+-- https_strict transitively imports https_client (which gives us
+-- https_put_unsafe_noverify) and dns (dns_resolve_a).
 import "stdlib/file.rail"
 import "stdlib/env.rail"
 import "stdlib/dirent.rail"
@@ -95,9 +97,10 @@ should_publish kind name =
 
 -- ── Main publish loop ────────────────────────────────────────────────
 
-put_one kind ident name token =
+put_one kind ident name token ip =
   let local = cat [kind, "/", ident, "/", name]
   let url = cat [site_base 0, "/", kind, "/", ident, "/", name]
+  let path = cat ["/", kind, "/", ident, "/", name]
   let body = read_file local
   let ctype = ctype_of_path name
   let hdr = cat ["X-Beacon-Token: ", token]
@@ -105,23 +108,27 @@ put_one kind ident name token =
   -- the strict chain-walk takes ~90 s per request on Cloudflare's
   -- chain (P-384 scalar-mult bottleneck) -- too slow for a multi-
   -- file push.
-  let result = https_put_url_unsafe_noverify url ctype body [hdr]
+  --
+  -- We've already resolved the IP once at the start of publish_dir
+  -- and reuse it across all PUTs to avoid the DNS-UDP intermittent
+  -- hang on Tailscale MagicDNS for back-to-back queries.
+  let result = https_put_unsafe_noverify "ledatic.org" ip 443 path ctype body [hdr]
   let (status, _resp) = result
   let mark = if status == 200 then "ok " else "FAIL"
   let _ = print (cat [mark, " ", url, " status=", show status])
   if status == 200 then 0 else 1
 
-publish_loop kind ident files token ok_n fail_n =
+publish_loop kind ident files token ip ok_n fail_n =
   if length files == 0 then (ok_n, fail_n)
   else
     let name = head files
-    if length (chars name) == 0 then publish_loop kind ident (tail files) token ok_n fail_n
-    else if should_publish kind name == 0 then publish_loop kind ident (tail files) token ok_n fail_n
+    if length (chars name) == 0 then publish_loop kind ident (tail files) token ip ok_n fail_n
+    else if should_publish kind name == 0 then publish_loop kind ident (tail files) token ip ok_n fail_n
     else
-      let rc = put_one kind ident name token
+      let rc = put_one kind ident name token ip
       let on1 = if rc == 0 then ok_n + 1 else ok_n
       let fn1 = if rc == 0 then fail_n else fail_n + 1
-      publish_loop kind ident (tail files) token on1 fn1
+      publish_loop kind ident (tail files) token ip on1 fn1
 
 publish_dir kind ident =
   let token_path = cat [getenv "HOME", "/.ledatic/entropy/beacon_token"]
@@ -135,11 +142,22 @@ publish_dir kind ident =
     if length files == 0 then
       let _ = print (cat ["empty or missing dir: ", local_dir])
       4
-    else
-      let counts = publish_loop kind ident files token 0 0
-      let (ok_n, fail_n) = counts
-      let _ = print (cat [kind, "/", ident, ": ", show ok_n, " ok, ", show fail_n, " fail"])
-      if fail_n == 0 then 0 else 5
+    else publish_dir_resolved kind ident files token
+
+publish_dir_resolved kind ident files token =
+  -- Resolve ledatic.org once and reuse the IP for every PUT.  Each
+  -- fresh dns_resolve_a opens a new UDP socket and sometimes hits
+  -- Tailscale-MagicDNS lossy state on back-to-back queries; pinning
+  -- to the first successful resolution sidesteps that.
+  let ip = dns_resolve_a "ledatic.org"
+  if length ip == 0 then
+    let _ = print "DNS resolve failed for ledatic.org"
+    8
+  else
+    let counts = publish_loop kind ident files token ip 0 0
+    let (ok_n, fail_n) = counts
+    let _ = print (cat [kind, "/", ident, ": ", show ok_n, " ok, ", show fail_n, " fail"])
+    if fail_n == 0 then 0 else 5
 
 -- Split "<kind>/<ident>" into its two parts.
 split_target s =
