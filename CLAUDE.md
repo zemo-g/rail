@@ -2,6 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Output Length
+
+Keep responses concise. Avoid verbose explanations and large code dumps in chat. When pasting prompt content or artifacts, write to a file rather than echoing in-chat. The 500-token output limit is real—prefer bullet points, structured reports, and file-based deliverables over long prose.
+
+## Environment
+
+This machine is the Mac Studio (not the Mini). When working on Thunderbolt bridge / Studio↔Mini coordination, confirm host with `hostname` before assuming a side. Parallel session prompts labeled for other lanes (Stream 4, Session B, Mini-side) should be declined unless explicitly retargeted.
+
+## Verification Discipline
+
+Before declaring a hypothesis confirmed, run the falsification test (e.g., for fp16/precision claims, compare bit-identical loss across runs; for parse-pass criteria, include adversarial garbage-continuation cases). Read runtime/asm before guessing at allocator or memory-pressure causes.
+
 ## Rail Compiler
 
 Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64, x86_64, and Linux ARM64.
@@ -120,6 +132,27 @@ After editing `tools/compile.rail`:
 **IMPORTANT**: If you change the runtime (`rt_core`, `rt_list`, `rt_string`, etc.), the old binary generates the old runtime. You must bootstrap: compile → install → compile again with new binary.
 
 **DATA SECTION BUG**: Changes to the `data` string literal in `compile_program` may not propagate. If you need new data section labels, construct strings at runtime via `malloc` + byte stores in the ARM64 assembly instead. See polymorphic show implementation in `rshow` for the pattern.
+
+**BOOTSTRAP CYCLE PATTERN**: The self-hosting bootstrap has subtleties that have wasted hours. Use this mental model:
+
+| Edit type | Cycles needed | Why |
+|---|---|---|
+| Source-only logic (e.g., `all_params_int` predicate, parser branches) | **1 cycle** | Compile-time decisions take effect when next binary parses code |
+| String literals embedded in `rt_*` runtime asm constants (e.g., `_rail_alloc` body) | **2 cycles** | Cycle 1 puts new strings in data section; cycle 2's emit USES them as runtime |
+| New runtime functions or data section symbols | **2 cycles** | Same — needs cycle 2 to bake the new emit pattern |
+| Both source + runtime asm in one edit | **2 cycles** | Source effect is immediate; runtime effect needs one more |
+| Verifying byte-identical fixed point | **3 cycles** | Cycle 3 compares to cycle 2 to prove convergence |
+
+**Diagnostic pattern**: After bootstrapping, if your edit doesn't seem to take, check:
+
+1. `grep <new-symbol-or-string> tools/compile.rail` — confirm source has it
+2. `grep <new-symbol-or-string> /tmp/rail_self.s` — confirm asm output has it
+3. `nm rail_native | grep <symbol>` — confirm binary has it
+4. Test the actual behavior
+
+If steps 1–3 pass but 4 fails, you probably need another cycle. If step 2 fails despite step 1 passing, the running compiler doesn't know how to emit your new construct — that's almost always "cycle 1 has the new strings in data, but its compile_program function still uses the old data_section_asm or runtime_asm constant". Run cycle 2 to land it.
+
+**ASCII-only inside string literals emitted to asm**: avoid em-dashes (—), curly quotes, etc. inside any string that flows into `.asciz` output. The lexer handles UTF-8 in literals but the assembler can be unhappy with multi-byte content in some contexts. Use `-` (hyphen-minus) and `'` (apostrophe). Comments (outside string literals) can use anything Unicode you want.
 
 ## Related repos
 

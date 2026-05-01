@@ -273,3 +273,264 @@ d6f37ea labrat: end-to-end working — prompt v3, float-compare workaround, vali
 
 Rail-on-Rail in Rail. Every item above feeds a model that writes Rail,
 verified by the Rail compiler. Don't lose the thread.
+
+---
+
+## Session A result (2026-04-21 AM, Task #19 — Phase 4a Rail-side fp16 wiring)
+
+**Status: landed.** The 4 labrat-produced fp16 kernels are now callable from
+Rail, numerically verified, and measured on a real training step.
+
+### Commits (on `next`, via Mini proxy)
+
+- `stdlib: fp16 matmul foreign decls (Phase 4a wiring)` — four new `foreign
+  tgl_*_f16` decls in `stdlib/tensor.rail` mirroring the f64 siblings.
+  Rail-side types stay `float_arr` (f64); conversion happens in the dylib.
+- `metal: fp16 matmul host dispatchers (Phase 4a wiring)` — four `tgl_*_f16`
+  entry points in `tools/metal/tensor_gpu_lib.m`. A/B/C stage f64 → half on
+  input, half → f64 on output via new `f64_to_f16` / `f16_to_f64` bit-op
+  helpers. Bias buffers stay fp32 on GPU per the fp32-bias task-spec hint.
+- `test: fp16 matmul smoke — 128×128 numerical equivalence` —
+  `tools/test/fp16_matmul_smoke.rail`. Runs f64 and f16 on the same
+  fixed-seed 128×128 inputs, compares max-abs diff against 1e-2 tolerance.
+- `bench: fp16 forward-only 10-step training measurement` — this handoff
+  section (no source-file delta beyond docs).
+
+### Verification
+
+- `./rail_native run tools/test/fp16_matmul_smoke.rail`:
+  `max_abs_diff=8.19e-4  → ok fp16` (well under the 1e-2 tolerance).
+- `./rail_native test`: 136/137 — the sole failure is the pre-existing
+  `gpu_map` test (needs `xcrun metal` which Studio doesn't have). No
+  regression vs the pre-change baseline.
+
+### Bench numbers
+
+10-step training run of `lm_v3_chunked` at `seq=1024, d=128, 2-block`, eval
+disabled (`eval_interval=100000`), two iterations each for stability:
+
+| variant                        | run 1 (real) | run 2 (real) |
+|--------------------------------|--------------|--------------|
+| baseline (f64 everywhere)      | 28.34 s      | 28.34 s      |
+| f16 in `m_block_fwd` only      | 27.88 s      | 27.93 s      |
+
+Wall-time speedup: **1.016×** (≈1.6% reduction, 0.44 s saved over 10 steps).
+Peak RSS: ~460 MB either way (activations/weights still host-side f64).
+Per-step loss values are within ~0.03 of the f64 run — the fp16 forward
+path is a faithful numerical substitute.
+
+### Why the speedup is modest (and honest about it)
+
+The 1.7–1.9× fp16 speedup demonstrated by `fp16_probe.m` was a **pure matmul
+microbenchmark at N=1024**. The 1.6% we measure on a real training step is
+a floor dominated by:
+
+1. **Startup dominates 10 steps.** Rail compile + 544 KB corpus load +
+   tokenize + weight init + one pre-training forward pass consume most of
+   the 28 s wall. Training-loop time is a small fraction.
+2. **Backward pass still runs f64.** `m_block_bwd` has ~15 matmul calls
+   per block (grad-input + grad-weight), comparable or greater FLOP than
+   forward. The current wiring only touches forward-path matmuls.
+3. **Host-side f64↔f16 conversion on every call.** Not free: for each call
+   we spin over M·K + K·N doubles casting to half and the C outputs back.
+   The kernel itself is faster; the end-to-end path adds per-call overhead
+   the microbenchmark doesn't have.
+
+### Open follow-ups surfaced by this work
+
+- Bigger signal would come from swapping the backward-pass matmuls too
+  (`m_block_bwd` in `lm_v3_chunked.rail` has 14 matmul calls per block).
+  Would need a careful grad-numerical-equivalence check first — grad
+  precision matters more than forward precision.
+- Host-side f64↔f16 conversion is a bottleneck. A `half_arr` Rail type
+  that lets weights/activations stay half on the host would eliminate the
+  per-call cast. Scope creep for Phase 4a; log it for Phase 4b.
+- The `bias_relu_f16` / `bias_gelu_f16` dispatchers are wired but not yet
+  used by any call site. Phase 4b should plumb them into the FFN path —
+  that's where the fp32-bias trick lands the largest wins per the labrat
+  results (1.7–1.8×).
+
+### Files touched (Session A)
+
+```
+stdlib/tensor.rail                       +10
+tools/metal/tensor_gpu_lib.m            +202
+tools/test/fp16_matmul_smoke.rail       +66 (new)
+docs/plans/SESSION_PROMPT_RAIL_ON_RAIL  +this section
+```
+
+### Files deliberately NOT touched (Session B boundary)
+
+- `tools/compile.rail` (Session B owns — leak fix territory)
+- `tools/linux_libc.s` (Session B may be editing)
+- `rail_native` (toolchain-local; never commit from Studio)
+- `tools/metal/libtensor_gpu.dylib` (rebuilt locally with
+  `-install_name /Users/user/…` override; canonical Mini path stays
+  intact in `tensor_gpu_lib.m` — do not commit the install_name line)
+
+### Next task to pick up
+
+Task #12 (4-block depth) is the natural next step — unblocks Phase 4b
+soak and 4c model card. `lm_v3_chunked_4block.rail` should be cloned
+from the current `lm_v3_chunked.rail` (not the /tmp bench variant).
+Staged 10 → 50 → 500 → 3000. Target eval mean below d=128×2-block's 2.87.
+
+
+---
+
+## Session B Phase 4b result (2026-04-21 PM, Mini)
+
+Rail-side wiring of the four fp16 foreigns landed as commits:
+
+- `35e96d4` stdlib: `matmul_f16` / `matmul_bias_relu_f16` / `matmul_bias_gelu_f16`
+- `6779569` train: `lm_v3_chunked_fp16` — forward-only fp16 variant
+- `5b4a726` bench: phase 4b fp16 vs f64 — 10-step seq=1024 d=128
+
+**Wall-time:** 1.067× speedup (f64 7.52 s → fp16 7.05 s median, 4 runs
+at seq=1024 d=128 10-step). Below the 1.3× target.
+
+**Convergence:** forward-only fp16 tracks f64 within ~0.2 nats over
+500 steps (final loss f64=2.04, fp16=2.27). Two intermediate samples
+exceed the 0.1 window but trajectory is real and stable.
+
+**Backward stays f64.** Tried two aggressive configs (all 23 bwd
+matmuls in fp16, then just grad-input bwd in fp16); both diverged by
+~1 full nat at step 500. Backward gradients have wider dynamic range
+than forward activations and fp16's 5-bit exponent rounds too
+aggressively for Adam to recover.
+
+**Why speedup under target:** half the matmuls are still f64, and the
+dylib's per-call f64↔f16 host cast eats most of the isolated-kernel
+win. A persistent-fp16-activation representation (cast once at block
+entry, not per-matmul) would push past 1.3×. See
+`docs/plans/PHASE_4B_BENCH.md` for the full write-up.
+
+**Gotcha log:**
+
+1. `/usr/bin/time` strips `DYLD_LIBRARY_PATH` on macOS 26 due to SIP —
+   use shell `time` for benches that need the dylib.
+2. `tools/metal/libtensor_gpu.dylib` is gitignored. Any change to
+   `tensor_gpu_lib.m` needs a per-machine rebuild (`clang -shared
+   -framework Metal -framework Foundation -fobjc-arc …` from
+   `tools/metal/`). Session A's fp16 dispatcher commit (`2680e20`) did
+   not come with an updated dylib, so Mini's was stale until rebuilt.
+
+**Files:** `stdlib/tensor.rail`, `tools/train/lm_v3_chunked_fp16.rail`,
+`docs/plans/PHASE_4B_BENCH.md`. No changes to
+`tools/train/lm_v3_chunked.rail` or
+`tools/train/lm_v3_chunked_4block.rail`.
+
+---
+
+## Session A Phase 2b result — 4-block × d=128 × 3000 steps (2026-04-21 PM, Studio)
+
+Code landed as `6019786 train: lm_v3_chunked_4block` (committed before
+the run). Run result follows.
+
+### Eval trajectory (seq=1024, d=128, 2-block baseline 2.87 ± 0.18 at 3000)
+
+| step | mean | std | notes |
+|---:|---:|---:|---|
+| 0    | 12.42 | 0.72 | uniform-ish baseline |
+| 400  | 3.40  | 0.20 | warmup + early descent |
+| 1000 | 3.21  | 0.19 | plateau-like |
+| 2000 | 2.94  | 0.23 | |
+| 2500 | 2.92  | 0.23 | |
+| 2700 | 2.89  | 0.22 | |
+| 2900 | **2.88** | 0.23 | **final multi-chunk eval** |
+
+Final single-chunk loss (fresh chunk, step 3000): 2.01. Min during run:
+**0.965** (vs 2-block's 1.31).
+
+### The read
+
+**Depth alone doesn't buy average eval improvement at d=128.**
+4-block's 2.88 and 2-block's 2.87 are within 1σ. The multi-chunk eval
+distribution is indistinguishable — the held-out set that 2-block saw
+as "2.87-hard" is still "2.88-hard" to 4-block.
+
+**But min-chunk loss dropped 26%** (1.31 → 0.97). The deeper model CAN
+memorize the easiest chunks better than 2-block; it just doesn't
+generalize the gains across the held-out set. Classic under-parameterized-
+for-corpus signal: d=128 × 2-block is already at capacity for this
+544 KB corpus at 3000 steps. More depth → more memorization of the
+easy set, no lift on the harder chunks.
+
+**γ lr multiplier worked.** No γ bounce observed anywhere in the
+trajectory (the 349→399 bounce in `924e0c5` is the reason for
+`adam_lr_mult_gamma = 0.3`). Trajectory is smooth; std is stable around
+0.22 from step 1500 onward.
+
+**B's leak fix held spectacularly.** Peak RSS **515 MB flat** across
+the entire 2.6 h run — same as at step 10, same as at step 500. The
+residual 2 MB/step B documented as "macOS VA accounting not real leak"
+is indistinguishable from noise at this scale. Leak is functionally
+closed for 4-block × 3000-step workloads.
+
+**Wall:** 9382 s (2.6 h), ~3.1 s/step (vs 2-block's ~1.5 s/step).
+Doubling depth doubles per-step time, as expected.
+
+### What this changes for the roadmap
+
+Phase 2b's goal was "clear 2.87." We didn't, strictly. But we proved:
+- 4-block trains cleanly end-to-end at d=128.
+- γ lr_mult discipline stops the divergence Phase 2a never resolved.
+- Leak fix scales to 2.6-hour runs at 515 MB flat.
+
+**Next capacity dial: width, not depth.** d=256 × 2-block likely buys
+more than d=128 × 4-block. Reasoning: min-chunk loss improvement on
+4-block suggests representation capacity isn't the issue, but parameter
+count / rank is. Width doubles per-token mixing rank; depth repeats it.
+
+**B's HalfTensor is perfectly timed.** Session 1 (`e366f4a`/`abdc2f0`/
+`876e90e`) ships the ADT + zero-cast dispatcher at 4.77× on 1024² and
+5.20× on 512². Byte-identical accuracy vs the old cast path. For
+training workloads (seq=1024 d=128) the matmul speedup is in the
+3-5× zone, not the 1.86× floor. Session 2 will ship the half training
+pipeline with a 1.6× wall target.
+
+**Phase 5 composed experiment (future session):**
+d=256 × 2-block × 3000 × HalfTensor. Weight memory halves (HalfTensor)
+while parameter count doubles (width) — net ~same RSS budget as
+today's d=128 × 2-block f64. If eval mean drops below 2.7, we have a
+real capacity-win to show for Phase 4c's model card.
+
+### Files (Session A this round)
+
+```
+tools/train/lm_v3_chunked_4block.rail     +772 (new, commit 6019786)
+docs/plans/SESSION_PROMPT_RAIL_ON_RAIL.md +this section
+```
+
+### Files deliberately NOT touched
+
+- `tools/train/lm_v3_chunked.rail` (2-block baseline, preserved for
+  comparison — no edits)
+- Anything in `tools/compile.rail` / `tools/metal/*` (B's territory
+  this round)
+
+### Gotchas (this session)
+
+1. **`/tmp/rail_out` race with concurrent sessions.** While my 3000-step
+   run held `/tmp/rail_out` (via `/bin/sh -c /tmp/rail_out`), any attempt
+   to compile-and-run another Rail file on Studio (`./rail_native run
+   foo.rail`) failed at the ld step with "Undefined symbols" — because
+   ld couldn't write the new `/tmp/rail_out` over the running one, and
+   the printed output bled through from the still-running rail_out
+   process. Workaround: either wait, or run on the other machine. This
+   is an old known race but it surfaces in multi-session tempo work.
+2. **Studio dylib rebuild is required after B lands a new foreign.**
+   After B's `abdc2f0` added `tgl_matmul_half_host`, Studio's local
+   `libtensor_gpu.dylib` didn't have the symbol; B's Session 1 smoke
+   failed to link here until I rebuilt it. Same build line as always
+   with `-install_name /Users/user/…` override — don't commit the
+   override.
+
+### Next task to pick up
+
+Phase 5 composed experiment: d=256 × 2-block × HalfTensor × 3000 steps,
+benchmarked against today's d=128 × 4-block f64 (eval 2.88) and the
+earlier d=128 × 2-block f64 (eval 2.87). Prerequisite: B ships
+HalfTensor Session 2 (training pipeline + 500-step convergence + 10-step
+wall bench). See `docs/plans/HALFTENSOR_SESSION1_RESULT.md` for that
+scope.
