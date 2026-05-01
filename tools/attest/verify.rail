@@ -2,143 +2,31 @@
 --
 -- Drop-in replacement for tools/attest/verify.sh, written entirely in
 -- Rail.  Closes the meta-loop: a Rail release can now be verified by
--- a Rail program.  No openssl, no python, no shell — just Rail.
+-- a Rail program.  No openssl, no python, no shell -- just Rail.
 --
 -- Usage:
 --   ./rail_native run tools/attest/verify.rail <input> <attestation> [pubkey.pem]
 --
--- Notes:
---   * Reads the input file via fread directly into a byte array, so
---     digesting a 900 KB binary doesn't touch the chars-of-string path
---     (which is O(N^2) on multi-hundred-KB inputs).
---   * Skips stdlib/json.rail (currently un-parseable in this binary --
---     pre-existing stdlib bug, see CHANGELOG roadmap).  Instead we
---     extract the six fields we actually need with str_find / str_sub.
+-- Current scope: TEXT artifacts (compile.rail attestations, release
+-- manifests, frame metadata, fleet status snapshots).  Binary releases
+-- (`rail_native`) need a byte-aware file reader: the `read_file`
+-- builtin is C-string-style and truncates at the first NUL.  See the
+-- thesis-audit memory for the runtime punch list.
 
 import "stdlib/sha256.rail"
--- stdlib/sha256.rail transitively imports stdlib/bytes.rail (which
--- gives us string_to_bytes, hex_to_bytes, bytes_to_hex, etc.).
+-- transitively imports stdlib/bytes.rail (string_to_bytes / hex_to_bytes
+-- / bytes_to_hex / be32_write / arr_slice / sha_*).
 import "stdlib/x25519.rail"
 import "stdlib/sha512.rail"
 import "stdlib/ed25519.rail"
+import "stdlib/base64.rail"
+import "stdlib/json.rail"
 import "stdlib/env.rail"
 
--- ── Local base64 decode (string -> byte array) ────────────────────────
--- stdlib/base64.rail returns a string and goes through `char_code`
--- which shells out per character; both are unfit for our use here.
--- This decoder reads chars directly and writes into a pre-sized int
--- array.  Padding ('=') and whitespace are skipped.
+-- ── PEM armor strip + extract Ed25519 raw pubkey ─────────────────────
+-- Ed25519 SubjectPublicKeyInfo DER = 12-byte prefix + 32 bytes raw key.
+-- We take the trailing 32 bytes of the decoded body.
 
-b64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-b64_idx_of c =
-  let n = char_to_int c
-  if n >= 65 then if n <= 90 then n - 65 else b64_idx_of_lo c
-  else b64_idx_of_lo c
-
-b64_idx_of_lo c =
-  let n = char_to_int c
-  if n >= 97 then if n <= 122 then n - 71 else b64_idx_of_dig c
-  else b64_idx_of_dig c
-
-b64_idx_of_dig c =
-  let n = char_to_int c
-  if n >= 48 then if n <= 57 then n + 4 else b64_idx_of_sym c
-  else b64_idx_of_sym c
-
-b64_idx_of_sym c =
-  if c == "+" then 62
-  else if c == "/" then 63
-  else 0 - 1
-
--- Filter padding + whitespace + linebreaks; build a list of valid
--- alphabet chars only.
-b64_filter cs acc =
-  if length cs == 0 then reverse acc
-  else
-    let c = head cs
-    let keep = b64_idx_of c >= 0
-    if keep then b64_filter (tail cs) (cons c acc)
-    else b64_filter (tail cs) acc
-
--- Decode 4 alphabet chars at a time into 3 output bytes.  If a 2- or
--- 3-char tail is left after full groups (the trailing "=" or "==" of
--- the encoded form, already stripped by b64_filter), emit 1 or 2
--- trailing bytes accordingly.
-b64_dec_loop cs out off =
-  if length cs == 0 then off
-  else if length cs >= 4 then b64_dec_full cs out off
-  else if length cs == 3 then b64_dec_tail3 cs out off
-  else if length cs == 2 then b64_dec_tail2 cs out off
-  else off
-
-b64_dec_full cs out off =
-  let c0 = head cs
-  let c1 = head (tail cs)
-  let c2 = head (tail (tail cs))
-  let c3 = head (tail (tail (tail cs)))
-  let i0 = b64_idx_of c0
-  let i1 = b64_idx_of c1
-  let i2 = b64_idx_of c2
-  let i3 = b64_idx_of c3
-  let b0 = bit_or (bit_and (i0 * 4) 255) (bit_and (i1 / 16) 3)
-  let b1 = bit_or (bit_and (i1 * 16) 255) (bit_and (i2 / 4) 15)
-  let b2 = bit_or (bit_and (i2 * 64) 255) (bit_and i3 63)
-  let _ = arr_set out off b0
-  let _ = arr_set out (off + 1) b1
-  let _ = arr_set out (off + 2) b2
-  b64_dec_loop (drop 4 cs) out (off + 3)
-
--- Three encoded chars => two output bytes (one '=' was stripped).
-b64_dec_tail3 cs out off =
-  let c0 = head cs
-  let c1 = head (tail cs)
-  let c2 = head (tail (tail cs))
-  let i0 = b64_idx_of c0
-  let i1 = b64_idx_of c1
-  let i2 = b64_idx_of c2
-  let b0 = bit_or (bit_and (i0 * 4) 255) (bit_and (i1 / 16) 3)
-  let b1 = bit_or (bit_and (i1 * 16) 255) (bit_and (i2 / 4) 15)
-  let _ = arr_set out off b0
-  let _ = arr_set out (off + 1) b1
-  off + 2
-
--- Two encoded chars => one output byte (two '=' were stripped).
-b64_dec_tail2 cs out off =
-  let c0 = head cs
-  let c1 = head (tail cs)
-  let i0 = b64_idx_of c0
-  let i1 = b64_idx_of c1
-  let b0 = bit_or (bit_and (i0 * 4) 255) (bit_and (i1 / 16) 3)
-  let _ = arr_set out off b0
-  off + 1
-
--- Compute decoded byte length from filtered input length.
-b64_decoded_len n =
-  let full = n / 4
-  let rem = n - (full * 4)
-  if rem == 3 then full * 3 + 2
-  else if rem == 2 then full * 3 + 1
-  else full * 3
-
-base64_decode_bytes s =
-  let raw = b64_filter (chars s) []
-  let n = length raw
-  let out = arr_new (b64_decoded_len n) 0
-  let _ = b64_dec_loop raw out 0
-  out
-
--- This verifier currently handles TEXT artifacts only — attestations
--- of source files (`compile.rail`), JSON manifests, frame metadata,
--- fleet snapshots, etc.  Binary releases (`rail_native`) need a
--- byte-aware file reader that doesn't truncate at NUL: `read_file`
--- is C-string-style in this build, and `fopen`/`fread` via foreign
--- decl currently mis-tag the FILE* return value (returns "1", which
--- in Rail's tagged-int encoding is NULL).  Those are runtime patches,
--- not stdlib changes.  See `rail-thesis-audit-2026-05-01.md`.
-
--- Strip PEM armor and concatenate base64 body.  Ed25519 SPKI = 12-byte
--- DER prefix + 32 bytes raw public key = 44 bytes; we take the last 32.
 pem_strip_step lines acc =
   let line = head lines
   let rest = tail lines
@@ -157,107 +45,12 @@ pem_extract_pubkey pem_text =
   let n = arr_len der
   arr_slice der (n - 32) 32
 
--- sha256 over a pre-loaded byte array.
-sha256_bytes msg_bytes msg_len =
-  let h = sha256_h_init 0
-  let k_tbl = sha256_k_table 0
-  let state = arr_new 8 0
-  let end = sha_process_from msg_bytes msg_len h state k_tbl 0
-  let _ = sha_final_block msg_bytes msg_len h state k_tbl end
-  let out = arr_new 32 0
-  let _ = be32_write out 0 (arr_get h 0)
-  let _ = be32_write out 4 (arr_get h 1)
-  let _ = be32_write out 8 (arr_get h 2)
-  let _ = be32_write out 12 (arr_get h 3)
-  let _ = be32_write out 16 (arr_get h 4)
-  let _ = be32_write out 20 (arr_get h 5)
-  let _ = be32_write out 24 (arr_get h 6)
-  let _ = be32_write out 28 (arr_get h 7)
-  out
-
-sha256_hex_bytes msg_bytes msg_len =
-  bytes_to_hex (sha256_bytes msg_bytes msg_len) 32
-
--- ── Minimal JSON-field extraction ─────────────────────────────────────
--- The witness JSON we read has fixed shape:
---   "<key>": "<string>"   or   "<key>": <int>
--- Trim whitespace either side of ':'.  These extractors find the first
--- occurrence of "<key>" and parse the value after it.
-
--- Extract a string-valued field.  Returns "" if missing.
-field_str text key =
-  let needle = cat ["\"", key, "\""]
-  let idx = str_find needle text
-  if idx < 0 then ""
-  else field_str_after text (idx + str_length_chars needle)
-
--- After locating the key, scan forward for the next '"' and read until
--- the matching close-quote.
-field_str_after text from =
-  let q1 = str_find_from "\"" text from
-  if q1 < 0 then ""
-  else field_str_body text (q1 + 1)
-
-field_str_body text from =
-  let q2 = str_find_from "\"" text from
-  if q2 < 0 then ""
-  else str_sub text from (q2 - from)
-
--- Extract an integer-valued field.
-field_int text key =
-  let needle = cat ["\"", key, "\""]
-  let idx = str_find needle text
-  if idx < 0 then 0
-  else field_int_after text (idx + str_length_chars needle)
-
-field_int_after text from =
-  -- Skip ':' and any spaces.  Then read digits until non-digit.
-  let colon = str_find_from ":" text from
-  if colon < 0 then 0
-  else parse_int_digits text (colon + 1) 0
-
-parse_int_digits text i acc =
-  if i >= str_length_chars text then acc
-  else
-    let c = str_char_at text i
-    if c == " " then parse_int_digits text (i + 1) acc
-    else if is_digit_char c then
-      parse_int_digits text (i + 1) (acc * 10 + (char_to_int c - 48))
-    else acc
-
-is_digit_char c =
-  let n = char_to_int c
-  if n >= 48 then n <= 57 else 0
-
--- str_length_chars and str_char_at don't exist as primitives, so we
--- pre-compute char arrays once and index into them.
-str_length_chars s = length (chars s)
-
-str_char_at s i =
-  let cs = chars s
-  list_at cs i
-
-list_at xs i =
-  if i == 0 then head xs
-  else list_at (tail xs) (i - 1)
-
--- str_find_from emulates str_find starting at offset `from`.  Slice
--- the substring once and add the offset back.
-str_find_from needle text from =
-  let total = str_length_chars text
-  if from >= total then 0 - 1
-  else
-    let tail_text = str_sub text from (total - from)
-    let rel = str_find needle tail_text
-    if rel < 0 then 0 - 1
-    else rel + from
-
--- ── Reconstruct the canonical message the witness signed ──────────────
+-- ── Reconstruct the canonical message the witness signed ─────────────
 build_message digest pulse_id value_hex witnessed_at =
   cat ["attest|v1|", digest, "|", show pulse_id, "|", value_hex, "|", show witnessed_at]
 
--- ── Verifier stages ────────────────────────────────────────────────────
-verify_sig att_text pub_path want_digest pulse_id value_hex witnessed_at sig_b64 pk_fp name =
+-- ── Verifier stages ──────────────────────────────────────────────────
+verify_sig pub_path want_digest pulse_id value_hex witnessed_at sig_b64 pk_fp name =
   let pem_text = read_file pub_path
   let pub_bytes = pem_extract_pubkey pem_text
   let msg = build_message want_digest pulse_id value_hex witnessed_at
@@ -272,34 +65,43 @@ verify_sig att_text pub_path want_digest pulse_id value_hex witnessed_at sig_b64
     let _ = print "BAD signature"
     6
 
+-- Pull the artifact's display name from either schema (artifact.name
+-- or frame.url).
+pick_artifact_name att =
+  let artifact = json_get att "artifact"
+  let frame = json_get att "frame"
+  let n_art = if (head artifact) == "obj" then json_str (json_get artifact "name") else ""
+  let n_frame = if (head frame) == "obj" then json_str (json_get frame "url") else ""
+  if length (chars n_art) > 0 then n_art else n_frame
+
 verify_one input_path att_path pub_path =
   let att_text = read_file att_path
-  let want_digest = field_str att_text "digest_sha256"
-  let pulse_id = field_int att_text "pulse_id"
-  let value_hex = field_str att_text "value_hex"
-  let witnessed_at = field_int att_text "witnessed_at"
-  let sig_b64 = field_str att_text "sig"
-  let pk_fp = field_str att_text "pk_fp"
-  let name_art = field_str att_text "name"
-  let name_url = field_str att_text "url"
-  let name = if str_length_chars name_art > 0 then name_art else name_url
+  let att = parse_json att_text
+  let witness = json_get att "witness"
+  let want_digest = json_str (json_get witness "digest_sha256")
+  let pulse_id = json_int (json_get witness "pulse_id")
+  let value_hex = json_str (json_get witness "value_hex")
+  let witnessed_at = json_int (json_get witness "witnessed_at")
+  let sig_b64 = json_str (json_get witness "sig")
+  let pk_fp = json_str (json_get witness "pk_fp")
+  let name = pick_artifact_name att
   let body = read_file input_path
   let have_digest = sha256_hex body
   if have_digest != want_digest then
     let _ = print (cat ["BAD digest mismatch: file=", have_digest, " att=", want_digest])
     5
-  else verify_sig att_text pub_path want_digest pulse_id value_hex witnessed_at sig_b64 pk_fp name
+  else verify_sig pub_path want_digest pulse_id value_hex witnessed_at sig_b64 pk_fp name
 
 default_pub_path _ = cat [getenv "HOME", "/.ledatic/witness/fleet0.pub.pem"]
 
 nth_user_arg user_args n =
-  let rest = drop n user_args
+  let rest = drop_n n user_args
   head rest
 
-drop n xs =
+drop_n n xs =
   if n == 0 then xs
   else if length xs == 0 then xs
-  else drop (n - 1) (tail xs)
+  else drop_n (n - 1) (tail xs)
 
 resolve_pub_path user_args argc =
   if argc < 3 then default_pub_path 0

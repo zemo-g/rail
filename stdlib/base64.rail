@@ -81,26 +81,92 @@ b64_dec indices acc =
     let b2 = ((i2 % 4) * 64) + i3
     b64_dec (tail (tail (tail (tail indices)))) (cat [acc, from_char_code b0, from_char_code b1, from_char_code b2])
 
--- char_code and from_char_code — needs FFI or builtin
--- For now, use ordinal values for ASCII
--- These are placeholders that work via shell
-char_code c =
-  let out = shell (cat ["printf '%d' \"'", c, "\""])
-  to_int (head (split "\n" out))
+-- char_code / from_char_code: use the runtime primitives directly.
+-- The previous version shelled out via `printf '%d'` per character,
+-- which made any base64 op O(N) forks (a 64-byte sig = 64 forks).
+char_code c = char_to_int c
+from_char_code n = char_from_int n
 
-from_char_code n =
-  let out = shell (cat ["printf '\\x", hex_byte n, "'"])
-  head (split "\n" out)
+-- ── Byte-array decode (fast path for crypto callers) ──────────────────
+-- Returns an int array (length = decoded byte count) instead of a
+-- string.  Use when you need the raw bytes -- e.g. an Ed25519 sig --
+-- and don't want to round-trip through string_to_bytes.
 
-hex_byte n =
-  let hi = n / 16
-  let lo = n % 16
-  append (hex_digit hi) (hex_digit lo)
+b64_idx_of_byte c =
+  let n = char_to_int c
+  if n >= 65 then if n <= 90 then n - 65 else b64_idx_of_byte_lo n
+  else b64_idx_of_byte_lo n
 
-hex_digit n =
-  if n == 0 then "0" else if n == 1 then "1" else if n == 2 then "2"
-  else if n == 3 then "3" else if n == 4 then "4" else if n == 5 then "5"
-  else if n == 6 then "6" else if n == 7 then "7" else if n == 8 then "8"
-  else if n == 9 then "9" else if n == 10 then "a" else if n == 11 then "b"
-  else if n == 12 then "c" else if n == 13 then "d" else if n == 14 then "e"
-  else "f"
+b64_idx_of_byte_lo n =
+  if n >= 97 then if n <= 122 then n - 71 else b64_idx_of_byte_dig n
+  else b64_idx_of_byte_dig n
+
+b64_idx_of_byte_dig n =
+  if n >= 48 then if n <= 57 then n + 4 else b64_idx_of_byte_sym n
+  else b64_idx_of_byte_sym n
+
+b64_idx_of_byte_sym n =
+  if n == 43 then 62           -- '+'
+  else if n == 47 then 63      -- '/'
+  else 0 - 1
+
+b64_filter_bytes cs acc =
+  if length cs == 0 then reverse acc
+  else
+    let c = head cs
+    if b64_idx_of_byte c >= 0 then b64_filter_bytes (tail cs) (cons c acc)
+    else b64_filter_bytes (tail cs) acc
+
+b64_decoded_byte_len n =
+  let full = n / 4
+  let rem = n - (full * 4)
+  if rem == 3 then full * 3 + 2
+  else if rem == 2 then full * 3 + 1
+  else full * 3
+
+b64_dec_full_bytes cs out off =
+  let c0 = head cs
+  let c1 = head (tail cs)
+  let c2 = head (tail (tail cs))
+  let c3 = head (tail (tail (tail cs)))
+  let i0 = b64_idx_of_byte c0
+  let i1 = b64_idx_of_byte c1
+  let i2 = b64_idx_of_byte c2
+  let i3 = b64_idx_of_byte c3
+  let _ = arr_set out off       (bit_or (bit_and (i0 * 4) 255) (bit_and (i1 / 16) 3))
+  let _ = arr_set out (off + 1) (bit_or (bit_and (i1 * 16) 255) (bit_and (i2 / 4) 15))
+  let _ = arr_set out (off + 2) (bit_or (bit_and (i2 * 64) 255) (bit_and i3 63))
+  b64_dec_loop_bytes (drop_str 4 cs) out (off + 3)
+
+b64_dec_tail3_bytes cs out off =
+  let c0 = head cs
+  let c1 = head (tail cs)
+  let c2 = head (tail (tail cs))
+  let i0 = b64_idx_of_byte c0
+  let i1 = b64_idx_of_byte c1
+  let i2 = b64_idx_of_byte c2
+  let _ = arr_set out off       (bit_or (bit_and (i0 * 4) 255) (bit_and (i1 / 16) 3))
+  let _ = arr_set out (off + 1) (bit_or (bit_and (i1 * 16) 255) (bit_and (i2 / 4) 15))
+  off + 2
+
+b64_dec_tail2_bytes cs out off =
+  let c0 = head cs
+  let c1 = head (tail cs)
+  let i0 = b64_idx_of_byte c0
+  let i1 = b64_idx_of_byte c1
+  let _ = arr_set out off (bit_or (bit_and (i0 * 4) 255) (bit_and (i1 / 16) 3))
+  off + 1
+
+b64_dec_loop_bytes cs out off =
+  if length cs == 0 then off
+  else if length cs >= 4 then b64_dec_full_bytes cs out off
+  else if length cs == 3 then b64_dec_tail3_bytes cs out off
+  else if length cs == 2 then b64_dec_tail2_bytes cs out off
+  else off
+
+base64_decode_bytes s =
+  let raw = b64_filter_bytes (chars s) []
+  let n = length raw
+  let out = arr_new (b64_decoded_byte_len n) 0
+  let _ = b64_dec_loop_bytes raw out 0
+  out
