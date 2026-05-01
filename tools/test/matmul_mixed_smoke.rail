@@ -1,0 +1,99 @@
+-- matmul_mixed_smoke.rail — Phase 5/v3-mixed kernel correctness check.
+--
+-- Verifies the new Rail-native mixed-precision matmul:
+--   f64 activations × fp16 weights → f64 activations,
+--   fp32 GPU accumulator, fp16 weight storage retained.
+--
+-- Two checks:
+--   (1) Correctness: matmul_mixed vs reference matmul (full f64) on random
+--       128×128 inputs. Tolerance is *tighter* than matmul_half's 1e-2 —
+--       only the weight side casts to fp16, so the loss surface is half
+--       what the all-fp16 path pays.
+--   (2) Sequential determinism: 100 calls into the same buffer are
+--       byte-identical to the first call (stress test for cross-call state).
+--
+-- Run: DYLD_LIBRARY_PATH=tools/metal ./rail_native run \
+--      tools/test/matmul_mixed_smoke.rail
+
+import "stdlib/tensor.rail"
+
+foreign tgl_init dummy -> int
+
+unwrap_t t = match t | Tensor d _ _ -> d
+
+fill_seeded arr n seed i =
+  if i >= n then 0
+  else
+    let x = (i + seed) % 100
+    let v = int_to_float x / 100.0 - 0.5
+    let _ = float_arr_set arr i v
+    fill_seeded arr n seed (i + 1)
+
+make_tensor m n seed =
+  let arr = float_arr_new (m * n) 0.0
+  let _ = fill_seeded arr (m * n) seed 0
+  Tensor arr (cons m (cons n [])) (compute_strides (cons m (cons n [])))
+
+max_diff_loop a b n i best =
+  if i >= n then best
+  else
+    let raw = float_arr_get a i - float_arr_get b i
+    let d = if raw > 0.0 then raw else 0.0 - raw
+    let b2 = if d > best then d else best
+    max_diff_loop a b n (i + 1) b2
+
+call_loop a w c iters i =
+  if i >= iters then 0
+  else
+    let _ = tgl_matmul_f32x_halfw_host a w c 128 128 128
+    call_loop a w c iters (i + 1)
+
+main =
+  let _ = tgl_init 0
+
+  let m = 128
+  let A = make_tensor m m 0
+  let B = make_tensor m m 37
+
+  -- Reference: full f64 matmul.
+  let C_ref = matmul A B
+
+  -- Mixed path: weights cast to fp16, acts stay f64.
+  let B_h = half_of_tensor B
+  let C_mixed = matmul_mixed A B_h
+
+  let md = max_diff_loop (unwrap_t C_ref) (unwrap_t C_mixed) (m * m) 0 0.0
+  let md_scaled = float_to_int (md * 100000.0)
+  let _ = print (cat ["matmul_mixed 128x128 max_abs_diff=", show_float md, "  scaled_1e5=", show md_scaled])
+
+  -- Half-side reference for comparison: all-fp16 path's typical diff.
+  let A_h = half_of_tensor A
+  let C_half = matmul_half A_h B_h
+  let C_half_f64 = tensor_of_half C_half
+  let md_half = max_diff_loop (unwrap_t C_ref) (unwrap_t C_half_f64) (m * m) 0 0.0
+  let _ = print (cat ["matmul_half  128x128 max_abs_diff=", show_float md_half, "  (reference for comparison)"])
+
+  -- Sequential determinism: 100 calls, output byte-identical to call 1.
+  let A_data = unwrap_t A
+  let B_h_data = match B_h | HalfTensor d _ _ -> d
+  let C1 = float_arr_new (m * m) 0.0
+  let C2 = float_arr_new (m * m) 0.0
+  let _ = tgl_matmul_f32x_halfw_host A_data B_h_data C1 m m m
+  let _ = call_loop A_data B_h_data C2 100 0
+  let d_seq = max_diff_loop C1 C2 (m * m) 0 0.0
+  let _ = print (cat ["sequential_100 max_abs_diff=", show_float d_seq])
+
+  -- Correctness threshold: matmul_mixed should beat matmul_half by a meaningful
+  -- factor (only one operand casts to fp16, not two). Use 1e-3 as a hard cap.
+  let corr_fail = md_scaled >= 100
+  let seq_fail = d_seq > 0.0
+  if corr_fail then
+    let _ = print "FAIL matmul_mixed: correctness diff too large vs f64 reference"
+    1
+  else
+    if seq_fail then
+      let _ = print "FAIL matmul_mixed: non-deterministic across sequential calls"
+      1
+    else
+      let _ = print "ok matmul_mixed"
+      0

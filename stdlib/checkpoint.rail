@@ -248,6 +248,100 @@ load_checkpoint prefix =
   else []
 
 -- ────────────────────────────────────────────────────────────────────
+-- HalfTensor save/load.
+-- Payload stays f32 on disk. Round-trip: HalfTensor → tensor_of_half →
+-- f64 Tensor → existing save_loop → .f32 files. The same round-trip in
+-- reverse on load: .f32 → f64 Tensor → half_of_tensor → HalfTensor.
+-- Rationale: the bench/inference tooling only needs to read .f32 files,
+-- not parse packed fp16. Rail's f32 I/O builtins already handle the
+-- f64↔f32 narrowing. An fp16-native format would save one narrowing
+-- and half the bytes, but the format churn isn't justified at current
+-- model sizes (d=256 × 2-block is ~2 MB on disk either way).
+-- tgl_f64_to_half / tgl_half_to_f64 are CPU-only pack/unpack foreigns.
+-- ────────────────────────────────────────────────────────────────────
+
+save_half_loop prefix halftensors i =
+  if length halftensors == 0 then 0
+  else match head halftensors
+    | HalfTensor _ shape _ ->
+      let t = tensor_of_half (head halftensors)
+      match t | Tensor data _ _ ->
+        let fname = cat [prefix, ".", show i, ".f32"]
+        let size = list_product shape
+        let _ = float_arr_to_f32_file fname data size
+        save_half_loop prefix (tail halftensors) (i + 1)
+
+build_half_manifest halftensors acc =
+  if length halftensors == 0 then acc
+  else match head halftensors
+    | HalfTensor _ shape _ ->
+      build_half_manifest (tail halftensors) (cat [acc, shape_line shape, "\n"])
+
+save_half_model prefix halftensors =
+  let count = length halftensors
+  let header = cat [show count, "\n"]
+  let body = build_half_manifest halftensors ""
+  let _ = write_file (cat [prefix, ".manifest"]) (cat [header, body])
+  save_half_loop prefix halftensors 0
+
+load_half_loop prefix lines i count acc =
+  if i >= count then reverse acc
+  else
+    let shape = parse_shape_line (head lines)
+    let fname = cat [prefix, ".", show i, ".f32"]
+    let size = list_product shape
+    let f64_data = float_arr_new size 0.0
+    let _ = float_arr_from_f32_file fname f64_data size
+    let f64_t = Tensor f64_data shape (compute_strides shape)
+    let h = half_of_tensor f64_t
+    load_half_loop prefix (tail lines) (i + 1) count (cons h acc)
+
+load_half_model prefix =
+  let text = read_file (cat [prefix, ".manifest"])
+  let lines = split "\n" text
+  let count = parse_int (head lines)
+  load_half_loop prefix (tail lines) 0 count []
+
+-- Full checkpoint save with HalfTensor weights (atomic via commit sentinel).
+-- Adam states are f64 on both the training side and on disk (unchanged
+-- from save_checkpoint) — only the weights round-trip through the half
+-- pack.
+save_half_checkpoint prefix halftensors adam_states step best_val =
+  let _ = clear_committed prefix
+  let _ = save_half_model prefix halftensors
+  let _ = save_adam_states prefix adam_states
+  let _ = save_meta prefix step best_val
+  let _ = mark_committed prefix
+  0
+
+load_half_checkpoint prefix =
+  if ckpt_exists prefix then
+    let w = load_half_model prefix
+    let a = load_adam_states prefix
+    let s = meta_step prefix
+    let b = meta_best_val prefix
+    cons w (cons a (cons s (cons b [])))
+  else []
+
+-- In-place variant for training resume: HalfTensor weights are already
+-- allocated by the caller (same shape); overwrite their packed-half
+-- buffers in place. Mirrors load_model_into but with the f32→f64→half
+-- round-trip per tensor.
+overwrite_half_model_loop prefix halftensors i =
+  if length halftensors == 0 then 0
+  else match head halftensors
+    | HalfTensor h_data shape _ ->
+      let fname = cat [prefix, ".", show i, ".f32"]
+      let size = list_product shape
+      let f64_data = float_arr_new size 0.0
+      let _ = float_arr_from_f32_file fname f64_data size
+      let _ = tgl_f64_to_half f64_data h_data size
+      overwrite_half_model_loop prefix (tail halftensors) (i + 1)
+
+load_half_model_into prefix halftensors =
+  overwrite_half_model_loop prefix halftensors 0
+
+-- ────────────────────────────────────────────────────────────────────
 -- In-place reload variants.
 -- For training resume, the caller has already allocated weight and
 -- Adam tensors with the right shapes (shape and Adam-state size are

@@ -2,7 +2,7 @@
 
 All notable changes to Rail are documented here.
 
-## v3.7.0 — 2026-04-28 — Releases physicified (attestation)
+## v3.8.0 — 2026-05-01 — Releases physicified (attestation)
 
 Every tagged release, every `./rail_native test` pass, and every
 2-pass self-compile fixed point now binds to a live entropy beacon
@@ -52,6 +52,123 @@ and are reproducible offline with `https://ledatic.org/attest/verify.sh`.
 
 The verb: Rail releases are no longer claims, they're physical events
 anchored to real time.
+
+## v3.7.0 — 2026-04-30 — Float-TCO root fix, mixed-precision inference, parallel rerank
+
+Substantial substrate work. Seven commits, three real bugs (one fixed at
+root, one workaround'd at source, one falsified), one substantial new
+feature (Rail-native mixed-precision GPU inference), one substantial new
+tool (parallel rerank wrapper), and a precise reproducer for one bug
+that stayed open. 137/137 tests green; byte-identical self-bootstrap
+verified.
+
+### Compiler / runtime
+- **Float-TCO root fix.** Re-added `body_has_float` guard to
+  `all_params_int` in `tools/compile.rail:1992`. Closes a 17-day silent
+  wrong-result bug introduced by commit `82516e4` (2026-04-13) that
+  caused tail-recursive float helpers (e.g. `rms_row_apply`) to
+  reinterpret float bits as ints in register-ABI calls, producing
+  garbage. Headline affected sites: RMSNorm CPU path, AdamW weight
+  decay, LayerNorm CPU backward. (`7752738`)
+- **Runtime-mmap arena (A1.P4).** `RAIL_ARENA_MB` env var (default 1 GB,
+  scales to 4 GB+ via mmap). Replaces the fixed 512 MB BSS arena that
+  was bumping the macOS dyld static-data ceiling. envp passthrough via
+  `_rail_envp` so env vars reach `./rail_native run` child processes.
+  Long-context training (seq=2048+) now mechanically tractable on
+  macOS. (`7752738`)
+- **Diagnostic counters (A1.P5).** `alloc_stats_snapshot` returns 17
+  ints now: per-class freelist misses (0–11), munmap_count (12),
+  mmap_large_count (13), arena_spill_count (14), gc_count (15),
+  arena_spill_bytes (16). Plus `RAIL_ARENA_TRACE=1` for stderr-emitted
+  spill events. (`7752738`)
+- **Parser multi-line compound expressions.** Cons chains, nested calls,
+  list literals inside unclosed `(...)`/`[...]` now parse cleanly. Same
+  post-tokenizer pass routes both `tokenize` and `tokenize_with_pos`.
+  (`7752738`)
+- **`./rail_native quick`.** 15 critical tests in ~5s, vs the full
+  suite's 10+ min. Use between code edits. (`7752738`)
+
+### Inference path
+- **Rail-native mixed-precision matmul.** New Metal kernel
+  `matmul_f32x_halfw` (fp32 activations × fp16 weights → fp32, fp32
+  accumulator). Host wrapper `tgl_matmul_f32x_halfw_host` casts
+  f64↔f32 once at the GPU boundary; Rail-side surface stays in f64.
+  `stdlib/tensor.rail:matmul_mixed`. Primitive correctness:
+  `max_abs_diff = 0.00042` vs f64 reference (vs 0.00082 for the
+  all-fp16 path — 2× tighter). Byte-deterministic across 100+
+  sequential calls. New harness at
+  `tools/train/lm_infer_v3_mixed.rail`. Right substrate for d=384+
+  scaling; not the d=256 winner today (CPU+KV-narrowing remains
+  faster for current model). (`ee6bdce`)
+- **Parallel rerank wrapper.** `tools/train/parallel_rerank.sh` fans
+  out N inference subprocesses concurrently with distinct seeds,
+  pre-compiling the harness once for amortization. Validated 7.1×
+  wall-clock at N=8, ~11× projected at N=20 — bench projection drops
+  from 2.25hr to ~13min for 30 prompts × N=20 rerank. `--bin <path>`
+  flag (added in v3.7.0 as a follow-on) lets orchestrators skip the
+  built-in pre-compile. (`ee6bdce`, `73043e2`)
+- **`tools/train/parity_check.sh`.** Three-way diff harness running
+  CPU (f64), GPU half (existing v3_half), and GPU mixed (new) on the
+  same checkpoint+prompt+seed. Useful for reasoning about which
+  precision path is producing which degenerate argmax token under
+  undertrained models. (`ee6bdce`)
+- **`tools/test/sequential_matmul_half_test.rail`.** Regression test
+  verifying `tgl_matmul_half_host` is byte-deterministic across 1000
+  sequential calls. Eliminates the "primitive corruption" hypothesis
+  for any future GPU-collapse investigation. (`7752738`)
+
+### Diagnostic infrastructure
+- **`RAIL_GPU_POOL_DISABLE=1` env flag** in `tools/metal/tensor_gpu_lib.m`.
+  Bypasses MTLBuffer pool best-fit reuse, forcing fresh
+  `newBufferWithLength` on every acquire. Falsifies the standing
+  hypothesis that pool reuse caused GPU sequential-inference collapse;
+  with the flag set, collapse is byte-identical to baseline. (`7752738`)
+
+### Inference workaround
+- `tools/train/lm_infer_cpu.rail:gen_loop` no longer calls `arena_reset`.
+  Eliminates a compiler-codegen interaction (between `arena_reset` and
+  multiply-add expressions in `float_arr_set`) that corrupted
+  `_rail_small_fl[0]` with the value being stored, surfacing as
+  SIGSEGV in `_rail_chained_malloc` on a subsequent allocation. Bug
+  was seed-deterministic (~50% of seeds at `--max 128 --k 10`), and
+  silently confounded all post-04-13 single-sample compile-rate
+  measurements. Workaround eliminates the trigger; per-iteration
+  intermediate tensors now accumulate in the bump arena, which the
+  default 1 GB easily holds for bounded inference runs. 30/30 stress
+  tests pass. The compiler-level fix remains open with a precise
+  one-line reproducer documented. (`f215039`)
+
+### Documentation
+- `docs/SESSION_HANDOFF_2026-04-30_EOD.md` — full afternoon arc.
+- `docs/SPUR_HANDOFF_2026-04-30.md`, `docs/MODEL_SESSION_HANDOFF.md`,
+  `docs/ROADMAP_2026-04-30.md` — morning arc + 6-month framing.
+- `docs/RAIL_ENGINEER_SESSION_PROMPT_2026-04-30_NIGHT.md` —
+  forward-looking prompt for the engineer picking up the open compiler
+  bug + remaining substrate debt.
+- Six new design notes: `arena-design.md`,
+  `arena-leak-fix-strategy.md`, `data-section-quirk.md`,
+  `backlog-deferred-design-notes.md`, `strict-typecheck-design.md`,
+  `garmin-research-notes.md`.
+
+### What was falsified (negatives)
+- **GPU sequential-collapse "MTLBuffer pool reuse" hypothesis** —
+  falsified via `RAIL_GPU_POOL_DISABLE`. Collapse byte-identical with
+  pool off. Surviving cause: fp16 precision compounding across 22
+  matmul round-trips/token (intrinsic, not a fixable substrate bug).
+- **2026-04-15 "10 MB/step leak" hypothesis** — falsified by
+  `arena_reset` chain-drain test (10 cycles, byte-tight). The
+  allocator is sound; remaining leak suspects are GPU-side
+  (MTLBuffer pool) or `gpu_available 0` re-eval churn.
+- **Static 2 GB arena** — tested, breaks dyld at link time. 1 GB is
+  the macOS BSS ceiling; runtime mmap (A1.P4) is the path beyond.
+
+### Memory entries
+Fifteen entries in `~/.claude/projects/-Users-user/memory/` capture
+today's earned knowledge: substrate findings, discipline rules
+(`feedback_verify_removals`, `feedback_diagnostics_first`,
+`feedback_honest_backlog`), the dylib investigation chain, the
+mixed-precision and parallel-rerank specs, and the segfault
+bisection.
 
 ## v3.6.1 — 2026-04-27 — Compiler hardening
 

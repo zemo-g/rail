@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="#releases"><img src="https://img.shields.io/badge/v3.6.1-compiler%20hardening-ff5500?style=for-the-badge" alt="v3.6.1"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/v3.8.0-releases%20physicified-ff5500?style=for-the-badge" alt="v3.8.0"></a>
 </p>
 
 <p align="center">
@@ -168,9 +168,13 @@ Tail-recursive loops match C `-O2` (5 instructions per iteration). The full arch
 
 ## Releases
 
-### v3.7.0 — 2026-04-28 — *Releases physicified*
+### v3.8.0 — 2026-05-01 — *Releases physicified*
 
-Every tagged release, every `./rail_native test` pass, and every 2-pass byte-identical self-compile is now signed against a live entropy beacon `pulse_id` by the project's Pi-hosted `fleet0` Ed25519 witness key (`pk_fp = cac5f21a70564aeb`).  Verify any release in five lines — see [§ Provenance](#provenance).  Backfilled coverage: v2.0.0 → v3.6.1.  Live mission control at [ledatic.org/system](https://ledatic.org/system).  CI also restored: built `tools/metal/libtensor_gpu.dylib` before the test suite, ending 14 days of red on tensor link errors.
+Every tagged release, every `./rail_native test` pass, and every 2-pass byte-identical self-compile is now signed against a live entropy beacon `pulse_id` by the project's Pi-hosted `fleet0` Ed25519 witness key (`pk_fp = cac5f21a70564aeb`).  Verify any release in five lines — see [§ Provenance](#provenance).  Backfilled coverage: v2.0.0 → v3.7.0.  Live mission control at [ledatic.org/system](https://ledatic.org/system).  CI also restored: built `tools/metal/libtensor_gpu.dylib` before the test suite, ending 14 days of red on tensor link errors.
+
+### v3.7.0 — 2026-04-30 — *Float-TCO root fix, mixed-precision inference, parallel rerank*
+
+Float-TCO root fix re-instates the `body_has_float` guard in `all_params_int` (`tools/compile.rail:1992`), closing a 17-day silent wrong-result bug that reinterpreted float bits as ints in tail-recursive register-ABI calls (RMSNorm CPU path, AdamW weight decay, LayerNorm CPU backward).  Runtime-mmap arena via `RAIL_ARENA_MB` (default 1 GB, scales to 4 GB+).  17-counter `alloc_stats_snapshot` builtin + `RAIL_ARENA_TRACE`.  Parser accepts multi-line compound expressions.  `./rail_native quick` runs 15 critical tests in ~5 s.  New Rail-native fp32-acts × fp16-weights × fp32-accum GPU matmul (`stdlib/tensor.rail:matmul_mixed`) — 2× tighter than all-fp16.  `parallel_rerank.sh` validated 7.1× wall-clock at N=8.  137/137 green; byte-identical self-bootstrap verified.
 
 ### v3.6.1 — 2026-04-27 — *Compiler hardening*
 
@@ -238,8 +242,8 @@ Verify a release in five lines:
 
 ```bash
 curl -sf https://ledatic.org/attest/verify.sh -o /tmp/v.sh && chmod +x /tmp/v.sh
-curl -sf https://ledatic.org/releases/v3.6.1/rail_native             -o /tmp/rn
-curl -sf https://ledatic.org/releases/v3.6.1/rail_native.attestation.json -o /tmp/rn.att.json
+curl -sf https://ledatic.org/releases/v3.8.0/rail_native             -o /tmp/rn
+curl -sf https://ledatic.org/releases/v3.8.0/rail_native.attestation.json -o /tmp/rn.att.json
 /tmp/v.sh /tmp/rn /tmp/rn.att.json
 # → ok  artifact=rail_native  pulse_id=…  pk_fp=cac5f21a70564aeb
 ```
@@ -250,7 +254,7 @@ control at [ledatic.org/system](https://ledatic.org/system).
 
 ## Honest limits
 
-Things Rail v3.6.1 **doesn't** do, so you don't hit them as surprises:
+Things Rail v3.8.0 **doesn't** do, so you don't hit them as surprises:
 
 - TLS ships one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one ECDHE group (`x25519`), and a fixed sig-alg set: `rsa_pss_rsae_sha256 | rsa_pkcs1_sha256 | ecdsa_secp256r1_sha256 | ecdsa_secp384r1_sha384 | ecdsa_secp521r1_sha512` plus `ed25519` (verify-only, in stdlib). Modern CDN fronts work; legacy servers may not.
 - No TLS session resumption, no 0-RTT, no client certificates. Keep-alive landed in v3.3.0 (multiple GETs over one socket).

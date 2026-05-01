@@ -24,7 +24,7 @@ int main(void) {
         id<MTLComputePipelineState> blocked = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matmul_blocked"] error:&err];
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
-        int sizes[] = {128, 256, 512, 1024};
+        int sizes[] = {1024, 2048, 4096};
         for (int si = 0; si < 4; si++) {
             uint32_t sz = sizes[si];
             NSUInteger bytes = sz * sz * sizeof(float);

@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <sys/time.h>
 
 static id<MTLDevice>               g_device = nil;
 static id<MTLCommandQueue>         g_queue = nil;
@@ -97,6 +98,7 @@ typedef struct {
 
 static pool_tier_t g_pools[NUM_STORAGE_MODES][NUM_TIERS];
 static int         g_pools_inited = 0;
+static int         g_pool_disable = 0;  // RAIL_GPU_POOL_DISABLE=1 → always miss
 
 static dispatch_once_t g_pool_once;
 
@@ -105,6 +107,11 @@ static void pool_init_once(void) {
         for (int m = 0; m < NUM_STORAGE_MODES; m++)
             for (int t = 0; t < NUM_TIERS; t++)
                 g_pools[m][t].capacity = TIER_INITIAL_CAP;
+        const char *d = getenv("RAIL_GPU_POOL_DISABLE");
+        if (d && d[0] && d[0] != '0') {
+            g_pool_disable = 1;
+            fprintf(stderr, "tgl: RAIL_GPU_POOL_DISABLE=1 (pool best-fit bypassed)\n");
+        }
         g_pools_inited = 1;
     });
 }
@@ -152,6 +159,10 @@ static id<MTLBuffer> pool_acquire_mode(NSUInteger bytes, MTLResourceOptions opt)
     int t   = tier_for_bytes(bytes);
     pool_tier_t *pt = &g_pools[sm][t];
 
+    // RAIL_GPU_POOL_DISABLE=1 → skip best-fit reuse, force a fresh allocation
+    // each call (falsification test for sequential-collapse hypothesis).
+    if (g_pool_disable) goto miss_path;
+
     // Best-fit within tier — pick smallest idle slot ≥ bytes.
     int best = -1;
     for (int i = 0; i < pt->count; i++) {
@@ -166,6 +177,7 @@ static id<MTLBuffer> pool_acquire_mode(NSUInteger bytes, MTLResourceOptions opt)
         if (pt->in_use > pt->peak_in_use) pt->peak_in_use = pt->in_use;
         return pt->slots[best].buf;
     }
+miss_path:;
 
     // Miss — allocate.
     NSUInteger rounded = round_up_for_tier(bytes, t);
@@ -364,6 +376,39 @@ static inline void f32_to_f64(const float *src, double *dst, int n) {
     for (int i = 0; i < n; i++) dst[i] = (double)src[i];
 }
 
+// IEEE 754 double → half (flush subnormals to zero; saturate on overflow).
+// Used by the fp16 matmul entry points. Bias buffers stay fp32 on the GPU
+// side — only activations/weights go through half conversion.
+static inline void f64_to_f16(const double *src, uint16_t *dst, int n) {
+    for (int i = 0; i < n; i++) {
+        float f = (float)src[i];
+        union { float f; uint32_t u; } v; v.f = f;
+        uint32_t sign = (v.u >> 31) & 0x1;
+        int32_t  exp  = (int32_t)((v.u >> 23) & 0xFF) - 127 + 15;
+        uint32_t mant = v.u & 0x7FFFFF;
+        if (exp <= 0)       dst[i] = (uint16_t)(sign << 15);
+        else if (exp >= 31) dst[i] = (uint16_t)((sign << 15) | (0x1F << 10));
+        else                dst[i] = (uint16_t)((sign << 15) | ((uint32_t)exp << 10) | (mant >> 13));
+    }
+}
+
+// IEEE 754 half → double. Subnormals flush to zero (kernels produce
+// normalized outputs for trained workloads).
+static inline void f16_to_f64(const uint16_t *src, double *dst, int n) {
+    for (int i = 0; i < n; i++) {
+        uint16_t h = src[i];
+        uint32_t sign = (h >> 15) & 0x1;
+        uint32_t exp  = (h >> 10) & 0x1F;
+        uint32_t mant = h & 0x3FF;
+        uint32_t f32;
+        if (exp == 0)       f32 = sign << 31;
+        else if (exp == 31) f32 = (sign << 31) | 0x7F800000 | (mant << 13);
+        else                f32 = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+        union { uint32_t u; float f; } v; v.u = f32;
+        dst[i] = (double)v.f;
+    }
+}
+
 // Dispatch a 1D "gid < n" kernel with N threads. Threadgroup 256 covers typical sizes.
 static void dispatch_1d(id<MTLComputeCommandEncoder> enc, uint32_t n) {
     NSUInteger tg = 256;
@@ -534,6 +579,175 @@ int tgl_matmul_batched_f64(const double *A, const double *B, double *C,
 
         f32_to_f64((float*)bC.contents, Cptr, sC);
         pool_release(bA); pool_release(bB); pool_release(bC);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// fp16 MATMUL variants (Phase 4a Option A, 2026-04-21).
+// A/B/C stage through f64 → half on input, half → f64 on output.
+// Bias (when present) stays fp32 on GPU — see docs/plans/LABRAT_FIRST_WIN.md
+// for the "fp32-bias" hint that made the fused kernels land 1.7–1.8×.
+// ────────────────────────────────────────────────────────────────────
+
+int tgl_matmul_f16(const double *A, const double *B, double *C, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A + 1, *Bptr = B + 1;
+    double *Cptr = C + 1;
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        f64_to_f16(Aptr, (uint16_t*)bufA.contents, sA);
+        f64_to_f16(Bptr, (uint16_t*)bufB.contents, sB);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufC offset:0 atIndex:2];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:3];
+        [enc setBytes:&ku length:4 atIndex:4];
+        [enc setBytes:&nu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f16_to_f64((uint16_t*)bufC.contents, Cptr, sC);
+        pool_release(bufA); pool_release(bufB); pool_release(bufC);
+    }
+    return 1;
+}
+
+int tgl_matmul_blocked_f16(const double *A, const double *B, double *C, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A + 1, *Bptr = B + 1;
+    double *Cptr = C + 1;
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        f64_to_f16(Aptr, (uint16_t*)bufA.contents, sA);
+        f64_to_f16(Bptr, (uint16_t*)bufB.contents, sB);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_blocked_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufC offset:0 atIndex:2];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:3];
+        [enc setBytes:&ku length:4 atIndex:4];
+        [enc setBytes:&nu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((N+63)/64, (M+63)/64, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f16_to_f64((uint16_t*)bufC.contents, Cptr, sC);
+        pool_release(bufA); pool_release(bufB); pool_release(bufC);
+    }
+    return 1;
+}
+
+int tgl_matmul_bias_relu_f16(const double *A, const double *B, const double *bias,
+                             double *C, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A + 1, *Bptr = B + 1, *Bsptr = bias + 1;
+    double *Cptr = C + 1;
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufBias = pool_acquire(N*4);   // fp32 bias per task-spec hint
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        f64_to_f16(Aptr, (uint16_t*)bufA.contents, sA);
+        f64_to_f16(Bptr, (uint16_t*)bufB.contents, sB);
+        f64_to_f32(Bsptr, (float*)bufBias.contents, N);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_bias_relu_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufBias offset:0 atIndex:2];
+        [enc setBuffer:bufC offset:0 atIndex:3];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:4];
+        [enc setBytes:&ku length:4 atIndex:5];
+        [enc setBytes:&nu length:4 atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f16_to_f64((uint16_t*)bufC.contents, Cptr, sC);
+        pool_release(bufA); pool_release(bufB);
+        pool_release(bufBias); pool_release(bufC);
+    }
+    return 1;
+}
+
+int tgl_matmul_bias_gelu_f16(const double *A, const double *B, const double *bias,
+                             double *C, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A + 1, *Bptr = B + 1, *Bsptr = bias + 1;
+    double *Cptr = C + 1;
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufBias = pool_acquire(N*4);
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        f64_to_f16(Aptr, (uint16_t*)bufA.contents, sA);
+        f64_to_f16(Bptr, (uint16_t*)bufB.contents, sB);
+        f64_to_f32(Bsptr, (float*)bufBias.contents, N);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_bias_gelu_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufBias offset:0 atIndex:2];
+        [enc setBuffer:bufC offset:0 atIndex:3];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:4];
+        [enc setBytes:&ku length:4 atIndex:5];
+        [enc setBytes:&nu length:4 atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        f16_to_f64((uint16_t*)bufC.contents, Cptr, sC);
+        pool_release(bufA); pool_release(bufB);
+        pool_release(bufBias); pool_release(bufC);
     }
     return 1;
 }
@@ -1145,6 +1359,304 @@ int tgl_unary_from_source(const char *src, const char *kname,
 
         f32_to_f64((float *)bY.contents, Yp, N);
         pool_release(bX); pool_release(bY);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Sub-ms wall clock for microbenches. Rail's stdlib/time.rail `time`
+// is Unix-second granularity; this returns float ms since epoch.
+// ────────────────────────────────────────────────────────────────────
+
+double tgl_now_ms(int _ignored) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// HalfTensor path (Phase 4b follow-on, 2026-04-21).
+//
+// These entry points skip the f64↔f16 cast that tgl_matmul_f16 pays on
+// every call. A HalfTensor's Rail-side storage is a float_arr whose
+// data area is reinterpreted as packed uint16_t[n]. Pack/unpack crosses
+// the Rail↔C boundary once at cast time (init, checkpoint) rather than
+// per-matmul. Kernels still use the existing matmul_f16 shader — only
+// the host-side entry changes.
+//
+// ABI: Rail's float_arr layout is [length(8), data...]. We pass the
+// float_arr pointer as `double*` for ABI consistency and cast to
+// `uint16_t*` internally. That cast plus the `+1` offset gives a
+// pointer to the first packed half.
+// ────────────────────────────────────────────────────────────────────
+
+// f64 array → packed-half float_arr (host-side). Callers pass two Rail
+// float_arrs; after the call, dst's data area holds n packed halfs.
+int tgl_f64_to_half(const double *src, double *dst, int n) {
+    const double *Sp = src + 1;
+    uint16_t *Dp = (uint16_t *)(dst + 1);
+    f64_to_f16(Sp, Dp, n);
+    return 1;
+}
+
+// Inverse: packed-half float_arr → f64 array.
+int tgl_half_to_f64(const double *src, double *dst, int n) {
+    const uint16_t *Sp = (const uint16_t *)(src + 1);
+    double *Dp = dst + 1;
+    f16_to_f64(Sp, Dp, n);
+    return 1;
+}
+
+// Zero-cast fp16 matmul. Inputs and output are packed-half float_arrs.
+// Kernel is the existing matmul_f16 shader; only the host side changes:
+// memcpy in, dispatch, memcpy out. No f64 staging buffer, no per-element
+// cast. This is the Phase 4b "eliminate the language's need for the
+// cast" line item.
+int tgl_matmul_half_host(const double *A, const double *B, double *C,
+                         int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    const uint16_t *Bptr = (const uint16_t *)(B + 1);
+    uint16_t *Cptr       = (uint16_t       *)(C + 1);
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        memcpy(bufA.contents, Aptr, sA*2);
+        memcpy(bufB.contents, Bptr, sB*2);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufC offset:0 atIndex:2];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:3];
+        [enc setBytes:&ku length:4 atIndex:4];
+        [enc setBytes:&nu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, sC*2);
+        pool_release(bufA); pool_release(bufB); pool_release(bufC);
+    }
+    return 1;
+}
+
+// Rail-native mixed precision matmul: f64 activations x fp16 weights -> f64.
+//
+// X arrives as a Rail Tensor (f64 float_arr); W arrives as a Rail HalfTensor
+// (fp16 packed in a float_arr-shaped buffer). Y is a Rail Tensor (f64).
+// Host casts f64->f32 for X on input and f32->f64 for Y on output; GPU side
+// holds X/Y in fp32, W in fp16, dot product in fp64. The Rail-side caller
+// stays entirely in f64 land — same surface as matmul_half but precision-
+// preserving across sequential calls.
+//
+// See tools/metal/tensor_gpu.metal:matmul_f32x_halfw for the kernel and
+// the precision rationale.
+int tgl_matmul_f32x_halfw_host(const double *X_f64, const double *W_half,
+                               double *Y_f64, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double   *Xptr = X_f64 + 1;
+    const uint16_t *Wptr = (const uint16_t *)(W_half + 1);
+    double         *Yptr = Y_f64 + 1;
+
+    @autoreleasepool {
+        uint32_t sX = M*K, sW = K*N, sY = M*N;
+        // X and Y in fp32 (4 bytes/element); W in fp16 (2 bytes/element).
+        id<MTLBuffer> bufX = pool_acquire(sX*4);
+        id<MTLBuffer> bufW = pool_acquire(sW*2);
+        id<MTLBuffer> bufY = pool_acquire(sY*4);
+
+        // f64 -> f32 cast host-side at the GPU boundary.
+        float *X_f32 = (float *)bufX.contents;
+        for (uint32_t i = 0; i < sX; i++) X_f32[i] = (float)Xptr[i];
+
+        // fp16 weights: zero-cast memcpy from Rail HalfTensor payload.
+        memcpy(bufW.contents, Wptr, sW*2);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_f32x_halfw");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufX offset:0 atIndex:0];
+        [enc setBuffer:bufW offset:0 atIndex:1];
+        [enc setBuffer:bufY offset:0 atIndex:2];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:3];
+        [enc setBytes:&ku length:4 atIndex:4];
+        [enc setBytes:&nu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        // f32 -> f64 cast host-side; Rail caller sees Tensor (f64) output.
+        const float *Y_f32 = (const float *)bufY.contents;
+        for (uint32_t i = 0; i < sY; i++) Yptr[i] = (double)Y_f32[i];
+
+        pool_release(bufX); pool_release(bufW); pool_release(bufY);
+    }
+    return 1;
+}
+
+// Zero-cast fp16 element-wise add. Inputs + output are packed-half
+// float_arrs; GPU keeps accumulator in fp32 and casts back to half at
+// store. Uses the tensor_add_f16 kernel (gid-per-element, 1-D).
+int tgl_add_half_host(const double *A, const double *B, double *C, int n) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    const uint16_t *Bptr = (const uint16_t *)(B + 1);
+    uint16_t       *Cptr = (uint16_t       *)(C + 1);
+
+    @autoreleasepool {
+        NSUInteger bytes = (NSUInteger)n * 2;
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufB = pool_acquire(bytes);
+        id<MTLBuffer> bufC = pool_acquire(bytes);
+
+        memcpy(bufA.contents, Aptr, bytes);
+        memcpy(bufB.contents, Bptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_add_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufC offset:0 atIndex:2];
+        uint32_t nu = n;
+        [enc setBytes:&nu length:4 atIndex:3];
+
+        NSUInteger tg = 256;
+        [enc dispatchThreadgroups:MTLSizeMake((n + tg - 1) / tg, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, bytes);
+        pool_release(bufA); pool_release(bufB); pool_release(bufC);
+    }
+    return 1;
+}
+
+// Zero-cast fp16 element-wise scale. Scalar is passed via a 1-element
+// Rail float_arr (same ABI as tgl_scale_f64): scalar_arr[1] holds the
+// f64 value, narrowed to fp32 on the GPU side.
+int tgl_scale_half_host(const double *A, double *C,
+                        const double *scalar_arr, int n) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    uint16_t       *Cptr = (uint16_t       *)(C + 1);
+    float sf = (float)scalar_arr[1];
+
+    @autoreleasepool {
+        NSUInteger bytes = (NSUInteger)n * 2;
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufC = pool_acquire(bytes);
+
+        memcpy(bufA.contents, Aptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_scale_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufC offset:0 atIndex:1];
+        [enc setBytes:&sf length:4 atIndex:2];
+        uint32_t nu = n;
+        [enc setBytes:&nu length:4 atIndex:3];
+        dispatch_1d(enc, n);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, bytes);
+        pool_release(bufA); pool_release(bufC);
+    }
+    return 1;
+}
+
+// Zero-cast fp16 matrix transpose: B[N×M] = A[M×N]^T. Packed-half
+// storage in + out, no f64 boundary cross.
+int tgl_transpose_half_host(const double *A, double *B, int M, int N) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    uint16_t       *Bptr = (uint16_t       *)(B + 1);
+    NSUInteger bytes = (NSUInteger)M * (NSUInteger)N * 2;
+
+    @autoreleasepool {
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufB = pool_acquire(bytes);
+        memcpy(bufA.contents, Aptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_transpose_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        uint32_t mu = M, nu = N;
+        [enc setBytes:&mu length:4 atIndex:2];
+        [enc setBytes:&nu length:4 atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(N, M, 1)
+          threadsPerThreadgroup:MTLSizeMake(N < 16 ? N : 16, M < 16 ? M : 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Bptr, bufB.contents, bytes);
+        pool_release(bufA); pool_release(bufB);
+    }
+    return 1;
+}
+
+// Zero-cast fp16 row-wise softmax. Log-sum-exp reformulation keeps
+// exp() inputs ≤ 0 on the GPU so no fp16 overflow even when raw
+// logits would have saturated. Accumulators stay fp32.
+int tgl_softmax_half_host(const double *A, double *C, int rows, int cols) {
+    if (ensure_init() != 1) return -1;
+    const uint16_t *Aptr = (const uint16_t *)(A + 1);
+    uint16_t       *Cptr = (uint16_t       *)(C + 1);
+    NSUInteger bytes = (NSUInteger)rows * (NSUInteger)cols * 2;
+
+    @autoreleasepool {
+        id<MTLBuffer> bufA = pool_acquire(bytes);
+        id<MTLBuffer> bufC = pool_acquire(bytes);
+        memcpy(bufA.contents, Aptr, bytes);
+
+        id<MTLComputePipelineState> p = pso(@"tensor_softmax_f16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufC offset:0 atIndex:1];
+        uint32_t ru = rows, cu = cols;
+        [enc setBytes:&ru length:4 atIndex:2];
+        [enc setBytes:&cu length:4 atIndex:3];
+        dispatch_1d(enc, rows);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        memcpy(Cptr, bufC.contents, bytes);
+        pool_release(bufA); pool_release(bufC);
     }
     return 1;
 }

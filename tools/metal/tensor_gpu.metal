@@ -736,6 +736,54 @@ kernel void matmul_blocked_f16(
     }
 }
 
+// Rail-native mixed precision: fp32 X x fp16 W -> fp32 Y, fp64 accumulator.
+//
+// Distinct from NVIDIA tensor-core path (fp32 accumulator). Apple Silicon
+// Metal compute kernels support fp64; for small Rail-on-Rail models the
+// fp64 dot-product cost is negligible while the precision win is durable.
+// Eliminates the fp16-cast compounding that flips argmax across deep
+// transformer inference (see dylib_investigation_2026-04-30.md).
+//
+// Buffer convention:
+//   buffer(0): X    fp32  M x K activations (cast f64->f32 host-side once)
+//   buffer(1): W    fp16  K x N weights     (zero-cast from disk)
+//   buffer(2): Y    fp32  M x N activations (cast f32->f64 host-side once)
+//
+// Why each precision:
+//   - W in fp16: memory-bandwidth win; weights are static, the precision
+//     loss happened once at training save and is now sunk cost.
+//   - X/Y in fp32: enough headroom to carry RMSNorm-scaled activations
+//     through residual sums without saturation; 4 bytes/element matches
+//     GPU register width.
+//   - Accumulator in fp64: the dot product is where precision dies in
+//     deep networks. fp64 here is the Rail innovation.
+kernel void matmul_f32x_halfw(
+    device const float *X     [[buffer(0)]],
+    device const half  *W     [[buffer(1)]],
+    device float       *Y     [[buffer(2)]],
+    constant uint      &M     [[buffer(3)]],
+    constant uint      &K     [[buffer(4)]],
+    constant uint      &N     [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint row = gid.y; uint col = gid.x;
+    threadgroup float Xs[TILE][TILE];
+    threadgroup half  Ws[TILE][TILE];
+    float sum = 0.0f;
+    uint numTiles = (K + TILE - 1) / TILE;
+    for (uint t = 0; t < numTiles; t++) {
+        uint xCol = t * TILE + lid.x;
+        uint wRow = t * TILE + lid.y;
+        Xs[lid.y][lid.x] = (row < M && xCol < K) ? X[row * K + xCol] : 0.0f;
+        Ws[lid.y][lid.x] = (wRow < K && col < N) ? W[wRow * N + col] : half(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < TILE; i++) sum += Xs[lid.y][i] * float(Ws[i][lid.x]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < M && col < N) Y[row * N + col] = sum;
+}
+
 kernel void matmul_bias_relu_f16(
     device const half *A    [[buffer(0)]],
     device const half *B    [[buffer(1)]],
@@ -798,5 +846,71 @@ kernel void matmul_bias_gelu_f16(
     const float c = 0.7978845608f;
     float inner = c * (x + 0.044715f * x * x * x);
     C[row * N + col] = half(0.5f * x * (1.0f + tanh(inner)));
+}
+
+// ═══════════════════════════════════════════════════════════
+// fp16 ELEMENT-WISE (HalfTensor zero-cast — S2 Mini)
+// Accumulators stay fp32 on the GPU; storage stays fp16.
+// ═══════════════════════════════════════════════════════════
+
+kernel void tensor_add_f16(
+    device const half *A  [[buffer(0)]],
+    device const half *B  [[buffer(1)]],
+    device half       *C  [[buffer(2)]],
+    constant uint     &n  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    C[gid] = half(float(A[gid]) + float(B[gid]));
+}
+
+kernel void tensor_scale_f16(
+    device const half *A       [[buffer(0)]],
+    device half       *C       [[buffer(1)]],
+    constant float    &scalar  [[buffer(2)]],
+    constant uint     &n       [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    C[gid] = half(float(A[gid]) * scalar);
+}
+
+kernel void tensor_transpose_f16(
+    device const half *A  [[buffer(0)]],
+    device half       *B  [[buffer(1)]],
+    constant uint     &M  [[buffer(2)]],
+    constant uint     &N  [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.y >= M || gid.x >= N) return;
+    B[gid.x * M + gid.y] = A[gid.y * N + gid.x];
+}
+
+// Row-wise softmax in log-sum-exp form. One thread per row; all
+// reductions in fp32 so exp(x - rowmax) never overflows fp16's
+// ~65504 ceiling even when raw logits would. Output clamps to
+// [0, 1] by construction. Cast back to half at store.
+kernel void tensor_softmax_f16(
+    device const half *A     [[buffer(0)]],
+    device half       *C     [[buffer(1)]],
+    constant uint     &rows  [[buffer(2)]],
+    constant uint     &cols  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= rows) return;
+    uint row_off = gid * cols;
+    float mx = float(A[row_off]);
+    for (uint j = 1; j < cols; j++) {
+        float v = float(A[row_off + j]);
+        if (v > mx) mx = v;
+    }
+    float s = 0.0f;
+    for (uint j = 0; j < cols; j++) {
+        s += exp(float(A[row_off + j]) - mx);
+    }
+    float inv = 1.0f / max(s, 1e-20f);
+    for (uint j = 0; j < cols; j++) {
+        C[row_off + j] = half(exp(float(A[row_off + j]) - mx) * inv);
+    }
 }
 
