@@ -304,6 +304,15 @@ hc_bytes_to_str_loop arr off n acc =
 -- terminate we allocate one buffer of the exact total size and copy
 -- each chunk in place, then convert bytes→string once. Overall work
 -- is O(body_len) instead of the old O(body_len²).
+--
+-- Termination: previously we read until the socket closed. That
+-- silently hung against any HTTP/1.1 server that returned
+-- `Connection: keep-alive` (Cloudflare's edge does this for non-GET
+-- methods even when the request asked for `Connection: close`). Now,
+-- after each record we peek at the accumulated bytes; once we can
+-- parse the response headers + Content-Length and the body is
+-- complete, we return. If Content-Length is absent (or we never see
+-- header end), we fall back to the close-delimited path.
 hc_recv_response fd key iv seq acc =
   hc_recv_loop fd key iv seq [] 0
 
@@ -326,8 +335,96 @@ hc_recv_loop fd key iv seq chunks total =
           let pair = arr_new 2 0
           let _ = arr_set pair 0 frag
           let _ = arr_set pair 1 flen
-          hc_recv_loop fd key iv (seq + 1) (cons pair chunks) (total + flen)
+          hc_recv_loop_check fd key iv seq (cons pair chunks) (total + flen)
         else hc_recv_loop fd key iv (seq + 1) chunks total
+
+-- After each application-data record, decode chunks-so-far into a
+-- buffer and ask whether we have a complete HTTP/1.1 response. If
+-- yes, finalize; otherwise keep reading.
+hc_recv_loop_check fd key iv seq chunks total =
+  if hc_response_complete chunks total then hc_recv_finalize chunks total
+  else hc_recv_loop fd key iv (seq + 1) chunks total
+
+hc_response_complete chunks total =
+  if total < 12 then 0
+  else
+    let buf = arr_new total 0
+    let _ = hc_copy_chunks buf (reverse chunks) 0
+    let h_end = hc_find_double_crlf buf total 0
+    if h_end < 0 then 0
+    else hc_response_complete_known buf total h_end
+
+hc_response_complete_known buf total h_end =
+  let cl = hc_parse_content_length buf h_end
+  if cl < 0 then 0
+  else
+    let need = h_end + 4 + cl
+    if total >= need then 1 else 0
+
+-- Find the first occurrence of CRLF CRLF (0x0d 0x0a 0x0d 0x0a) in
+-- buf[0..total).  Returns the offset of the first CR, or -1.
+hc_find_double_crlf buf total i =
+  if i + 4 > total then 0 - 1
+  else if hc_dcrlf_at buf i then i
+  else hc_find_double_crlf buf total (i + 1)
+
+hc_dcrlf_at buf i =
+  if arr_get buf i != 13 then 0
+  else if arr_get buf (i + 1) != 10 then 0
+  else if arr_get buf (i + 2) != 13 then 0
+  else if arr_get buf (i + 3) != 10 then 0
+  else 1
+
+-- Search the header region (buf[0..h_end]) for "Content-Length:" and
+-- parse the integer that follows.  Case-insensitive on the field name.
+-- Returns -1 if not found.
+hc_parse_content_length buf h_end =
+  hc_find_cl_at buf h_end 0
+
+hc_find_cl_at buf h_end i =
+  if i + 16 > h_end then 0 - 1
+  else if hc_cl_match_at buf i then hc_parse_cl_value buf h_end (i + 16)
+  else hc_find_cl_at buf h_end (i + 1)
+
+-- Match "Content-Length:" or "content-length:" (15 chars + ":" = 16).
+hc_cl_match_at buf i =
+  let c0 = arr_get buf i
+  let cm = if c0 == 67 then 1 else if c0 == 99 then 1 else 0
+  if cm == 0 then 0
+  else hc_cl_match_rest buf i
+
+hc_cl_match_rest buf i =
+  let lit = "ontent-Length:"
+  hc_cl_match_walk buf (i + 1) (chars lit) 0
+
+hc_cl_match_walk buf bi cs ci =
+  if length cs == 0 then 1
+  else
+    let want = char_to_int (head cs)
+    let got = arr_get buf bi
+    let ok = if got == want then 1
+             else if want >= 65 then if want <= 90 then if got == (want + 32) then 1 else 0 else 0
+             else if want >= 97 then if want <= 122 then if got == (want - 32) then 1 else 0 else 0
+             else 0
+    if ok == 0 then 0
+    else hc_cl_match_walk buf (bi + 1) (tail cs) (ci + 1)
+
+-- Skip leading spaces, then read digits, until CR.
+hc_parse_cl_value buf h_end i =
+  if i >= h_end then 0 - 1
+  else
+    let c = arr_get buf i
+    if c == 32 then hc_parse_cl_value buf h_end (i + 1)
+    else if c == 9 then hc_parse_cl_value buf h_end (i + 1)
+    else hc_parse_cl_digits buf h_end i 0
+
+hc_parse_cl_digits buf h_end i acc =
+  if i >= h_end then acc
+  else
+    let c = arr_get buf i
+    if c < 48 then acc
+    else if c > 57 then acc
+    else hc_parse_cl_digits buf h_end (i + 1) (acc * 10 + (c - 48))
 
 hc_recv_finalize chunks total =
   if total <= 0 then ""
