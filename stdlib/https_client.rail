@@ -715,6 +715,115 @@ hc_send_app_records fd key iv seq buf total off =
     let _ = hc_send_bytes fd (arr_get app_rec 0) (arr_get app_rec 1)
     hc_send_app_records fd key iv (seq + 1) buf total (off + chunk_len)
 
+-- ── Byte-body PUT (for binary uploads) ────────────────────────────────
+-- The string-body PUT path can't carry a body containing NUL bytes:
+-- hc_build_verb concatenates header + body as a string, and Rail's
+-- string ops truncate on NUL.  This variant takes a byte array
+-- (e.g. from read_file_bytes) and assembles the full request as a
+-- byte buffer end-to-end.
+
+-- Build "PUT <path> HTTP/1.1\r\n... \r\n\r\n" as a Rail string, then
+-- string_to_bytes it.  Headers are ASCII, no NUL, so this is safe.
+hc_build_verb_headers verb host path ctype body_len hdrs =
+  let eol = hc_crlf 0
+  let cl = join "" ["Content-Length: ", show body_len, eol]
+  let ct = if length ctype == 0 then "" else join "" ["Content-Type: ", ctype, eol]
+  let extra = if length hdrs == 0 then "" else join "" [join eol hdrs, eol]
+  join "" [verb, " ", path, " HTTP/1.1", eol,
+           "Host: ", host, eol,
+           ct, cl, extra,
+           "Connection: close", eol,
+           "User-Agent: rail-https/0.1", eol,
+           eol]
+
+-- Combine header bytes + body bytes into one contiguous byte array.
+hc_concat_bytes a alen b blen =
+  let total = alen + blen
+  let out = arr_new total 0
+  let _ = sha_copy_bytes a out 0 0 alen
+  let _ = sha_copy_bytes b out 0 alen blen
+  out
+
+https_put_url_bytes_unsafe_noverify url ctype body_arr body_len hdrs =
+  let parts = https_parse_url url
+  if arr_get parts 4 == 0 then (0, "bad URL")
+  else https_put_url_bytes_dispatch parts ctype body_arr body_len hdrs
+
+https_put_url_bytes_dispatch parts ctype body_arr body_len hdrs =
+  let host = arr_get parts 0
+  let port = arr_get parts 1
+  let path = arr_get parts 2
+  let ip = dns_resolve_a host
+  if length ip == 0 then (0, join "" ["DNS resolve failed for ", host])
+  else https_put_bytes_unsafe_noverify host ip port path ctype body_arr body_len hdrs
+
+https_put_bytes_unsafe_noverify host ip port path ctype body_arr body_len hdrs =
+  let fd = hc_connect_tcp ip port
+  if fd < 0 then (0, "connect failed")
+  else https_put_bytes_on_fd fd host path ctype body_arr body_len hdrs
+
+https_put_bytes_on_fd fd host path ctype body_arr body_len hdrs =
+  let kp = hc_gen_keypair 0
+  let priv = arr_get kp 0
+  let pub = arr_get kp 1
+  let random = hc_read_random 32
+  let sid = hc_read_random 32
+  let ch_rec = tls13_client_hello random sid pub host
+  let ch_wire = arr_get ch_rec 0
+  let ch_wire_len = arr_get ch_rec 1
+  let _ = hc_send_bytes fd ch_wire ch_wire_len
+  let ch_msg_len = ch_wire_len - 5
+  let ch_msg = arr_new ch_msg_len 0
+  let _ = sha_copy_bytes ch_wire ch_msg 5 0 ch_msg_len
+  let xh = hc_exchange_hello fd ch_msg ch_msg_len priv
+  if arr_get xh 5 == 0 then
+    let _ = close fd
+    hc_err "ServerHello parse failed"
+  else https_put_bytes_post_hello fd host path ctype body_arr body_len hdrs priv ch_msg ch_msg_len xh
+
+https_put_bytes_post_hello fd host path ctype body_arr body_len hdrs priv ch_msg ch_msg_len xh =
+  let sh_msg = arr_get xh 0
+  let sh_msg_len = arr_get xh 1
+  let s_hs_key = arr_get xh 2
+  let s_hs_iv = arr_get xh 3
+  let c_hs = arr_get xh 4
+  let flight = hc_read_server_flight fd s_hs_key s_hs_iv
+  let fb = arr_get flight 0
+  let fl = arr_get flight 1
+  if fl < 0 then
+    let _ = close fd
+    hc_err "flight decrypt failed"
+  else https_put_bytes_app_phase fd host path ctype body_arr body_len hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs
+
+https_put_bytes_app_phase fd host path ctype body_arr body_len hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs =
+  let fsm = tls13_client_handshake_offline priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl 1 host
+  if arr_get fsm 4 == 0 then
+    let _ = close fd
+    hc_err "handshake failed"
+  else
+    let c_ap = arr_get fsm 0
+    let s_ap = arr_get fsm 1
+    let cf_msg = arr_get fsm 2
+    let cf_len = arr_get fsm 3
+    let c_hs_key = tls13_derive_key c_hs
+    let c_hs_iv = tls13_derive_iv c_hs
+    let c_ap_key = tls13_derive_key c_ap
+    let c_ap_iv = tls13_derive_iv c_ap
+    let s_ap_key = tls13_derive_key s_ap
+    let s_ap_iv = tls13_derive_iv s_ap
+    let cf_rec = tls13_record_encrypt c_hs_key c_hs_iv 0 22 cf_msg cf_len
+    let _ = hc_send_bytes fd (arr_get cf_rec 0) (arr_get cf_rec 1)
+    let hdr_str = hc_build_verb_headers "PUT" host path ctype body_len hdrs
+    let hdr_bytes = string_to_bytes hdr_str
+    let hdr_len = string_length_bytes hdr_str
+    let req_buf = hc_concat_bytes hdr_bytes hdr_len body_arr body_len
+    let req_len = hdr_len + body_len
+    let _ = hc_send_app_records fd c_ap_key c_ap_iv 0 req_buf req_len 0
+    let body_resp = hc_recv_response fd s_ap_key s_ap_iv 0 ""
+    let _ = close fd
+    let status = hc_parse_status body_resp
+    (status, body_resp)
+
 -- URL-form POST: https_post_url_unsafe_noverify url content_type body extra_hdrs.
 -- Same threat model as https_post_unsafe_noverify — leaf-only.
 https_post_url_unsafe_noverify url ctype body hdrs =
