@@ -2,6 +2,78 @@
 
 All notable changes to Rail are documented here.
 
+## v3.9.0 — 2026-05-02 — Ed25519 sign + Rail-native attest pipeline
+
+The attestation pipeline that v3.8.0 introduced is now Rail-native
+end-to-end. Mac-side orchestrator, scalar arithmetic mod L, sign
+function, signer transport — all Rail. Only the Pi-side Ed25519 key
+material still talks to OpenSSL via the existing `sign_attestation.sh`
+shell signer, wrapped in a thin Python HTTP server.
+
+- `stdlib/ed25519_scalar.rail` — `sc_reduce` (64-byte mod L) and
+  `sc_muladd` ((a*b + c) mod L) in pure Rail. Byte-array shift-and-
+  subtract reduction; ~O(N²) but bounded N=65 and signed at
+  attestation cadence. 8/8 vectors pass including
+  `SHA-512('') mod L` matching the Python oracle byte-for-byte.
+
+- `stdlib/ed25519_sign.rail` — `ed25519_sk_expand` (SHA-512 + clamp),
+  `ed25519_pk_from_sk` (encode([a]B)), `ed25519_sign` (full RFC 8032
+  §5.1.6: r, R, k, S = sc_muladd(k, a, r), sig = R || S). RFC 8032
+  §A.4 vector 1 byte-identical for both pk and sig + round-trip
+  via existing `ed25519_verify` returns 1. PASS on first compile.
+
+- `tools/attest/attest.rail` — Rail-native attestation orchestrator.
+  Replaces `attest.sh` on the hot path: SHA-256 over input bytes,
+  HTTPS GET `/entropy/pulse`, JSON parse, HTTP POST signer, JSON
+  outer build, write to `<input>.attestation.json`. Zero shell-out
+  on the request path; `date -u +%s` is the lone remaining shell
+  call (no time builtin in Rail yet).
+
+- `tools/attest/pi_sign_server.py` + `com.ledatic.attest_sign.service`
+  — Pi HTTP signer (Path A from the v3.8.0 handoff). Replaces the
+  per-attest SSH dance with a localhost-tier HTTP `/sign` endpoint
+  on `fleet0:9102` over Tailscale. Token-authed via
+  `~/.ledatic/witness/sign_token` (chmod 600 both sides). The Python
+  server shells out to the existing `sign_attestation.sh` so wire
+  format and key material are unchanged from the SSH path.
+
+- `attest_release.sh` / `attest_test_run.sh` / `attest_selfhost.sh` /
+  `backfill_releases.sh` — every internal wrapper now invokes
+  `attest.rail` instead of `attest.sh`. `attest_release.sh` also
+  compiles `attest.rail` once and reuses the binary across both
+  artifacts: release-attest wall time **49 s → 27 s**.
+
+- `runtime` — `_rail_float_arr_to_f32_file` and
+  `_rail_float_arr_from_f32_file` were calling bare `_malloc` for
+  the f32 staging buffer (`_free` is a no-op stub, and for n*4 > 64 KB
+  the malloc path mmaps a fresh region per call). Routed both
+  through `_rail_chained_malloc` so `arena_reset`'s chain-drain
+  reclaims them. **Fixes the 5 GB / 25 min RSS leak in the MHD
+  plasma beacon**.
+
+- `tools/plasma/mhd_beacon.rail` — double-buffered LF state
+  (ping-pong via parity), pre-allocated flux scratch, in-place reset
+  via `mk_init_loop`, `arena_mark`/`arena_reset` per frame. Combined
+  with the runtime fix: 12 MB/s leak → 0 KB/s in the no-shell hot
+  path.
+
+- `tools/plasma/mhd_beacon.rail` — replaced `shell
+  "/tmp/mhd_beacon/run_packer"` with `write_file
+  "/tmp/mhd_beacon/ready" "1\n"`. The shim was itself just `echo 1 >
+  /tmp/mhd_beacon/ready`; the per-frame fork+exec was leaking
+  ~135 KB/s through macOS's slow VM-decommit on child exit. Direct
+  FIFO write eliminates the fork. **Beacon residual 135 KB/s →
+  ~2 KB/s**, stable over the 7 h launchd cycle.
+
+- `stdlib/mhd_kernel.rail` — added `mk_lxf_step_into state ns dt
+  coeffs fxr fxl fyu fyd` for long-running drivers that need
+  allocation-free LF stepping. Original `mk_lxf_step` preserved for
+  one-shot callers.
+
+`./rail_native test = 137/137`. 2-cycle byte-identical self-compile
+verified against the v3.9.0 binary. Existing v3.8.0 `verify.rail` +
+`publish.rail` paths unchanged; verifying older releases still works.
+
 ## v3.8.0 — 2026-05-01 — Releases physicified (attestation)
 
 Every tagged release, every `./rail_native test` pass, and every
