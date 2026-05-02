@@ -1,20 +1,20 @@
 -- tools/attest/attest.rail — Rail-native attestation orchestrator.
 --
--- Drop-in replacement for tools/attest/attest.sh on the Mac side.  The
--- Pi-side signer (sign_attestation.sh on fleet0) is still invoked via
--- SSH; replacing it with a pure-Rail Pi-hosted signer is gated on the
--- Linux ARM64 cross-compile fix (see rail-linux-cross-compile-broken.md).
+-- Drop-in replacement for tools/attest/attest.sh on the Mac side.
+-- 2026-05-02: Pi-side signer is now an HTTP POST to fleet0:9102/sign
+-- (com.ledatic.attest_sign systemd unit, see tools/attest/pi_sign_server.py).
+-- The previous SSH dance is gone from the Rail path.
 --
--- What's pure Rail now (was bash + python + curl):
+-- What's pure Rail now (was bash + python + curl + ssh):
 --   - SHA-256 of the input bytes (read_file_bytes + sha_process_from)
 --   - HTTPS GET https://ledatic.org/entropy/pulse (https_get_url)
 --   - JSON parsing of the pulse body (parse_json + json_get)
+--   - HTTP POST to fleet0:9102/sign (hc_connect_tcp + send_all_tcp +
+--     recv_http_request — over Tailscale, no TLS needed)
 --   - JSON construction of the outer attestation object
 --   - Output to <input>.attestation.json
 --
 -- What still shells out:
---   - `ssh -o ConnectTimeout=5 zemog@fleet0 sign_attestation.sh ...`
---     (one-shot capture; pure-Rail SSH is out of scope)
 --   - `date -u +%s` for created_at (Rail has no time builtin yet)
 --
 -- Usage: ./rail_native run tools/attest/attest.rail <input> [output]
@@ -29,8 +29,10 @@ import "stdlib/file.rail"
 import "stdlib/env.rail"
 
 beacon_url_default _ = "https://ledatic.org/entropy/pulse"
-witness_host_default _ = "zemog@100.87.231.45"
-signer_path_default _ = "/home/zemog/.ledatic/witness/sign_attestation.sh"
+signer_ip_default _ = "100.87.231.45"
+signer_port_default _ = 9102
+signer_path_default _ = "/sign"
+sign_token_path_default _ = cat [getenv "HOME", "/.ledatic/witness/sign_token"]
 
 env_or env_key fallback =
   let v = getenv env_key
@@ -121,19 +123,71 @@ parse_pulse body =
   let ts = json_str (json_get p "timestamp_utc")
   (pid, vhex, ts)
 
--- ── Pi signer over SSH ───────────────────────────────────────────────
+-- ── Pi signer over HTTP (Tailscale-internal, no TLS) ────────────────
 --
--- Returns the raw JSON the Pi printed (trailing whitespace trimmed).
--- Empty string on any failure; caller treats that as a hard error.
+-- POST {digest, pulse_id, value_hex} to fleet0:9102/sign with a
+-- shared X-Sign-Token header. Returns the raw JSON body the Pi printed
+-- (or "" on any failure — caller treats empty as a hard error).
+--
+-- Uses socket primitives + hc_connect_tcp pulled in transitively
+-- through https_strict so we don't have to import http_client (which
+-- would re-import socket and trigger duplicate-symbol link errors).
 
-sign_via_pi witness_host signer_path digest pulse_id value_hex =
-  let cmd = cat [
-        "ssh -o ConnectTimeout=5 -o BatchMode=yes ",
-        witness_host, " ",
-        signer_path, " ",
-        digest, " ", pulse_id, " ", value_hex
-      ]
-  trim_trailing (shell cmd)
+build_sign_body digest pulse_id value_hex =
+  cat [
+    "{\"digest\":\"", digest,
+    "\",\"pulse_id\":", pulse_id,
+    ",\"value_hex\":\"", value_hex, "\"}"
+  ]
+
+build_sign_request ip port path token body =
+  let crlf = cat [char_from_int 13, char_from_int 10]
+  let body_len = length (chars body)
+  cat [
+    "POST ", path, " HTTP/1.1", crlf,
+    "Host: ", ip, ":", show port, crlf,
+    "X-Sign-Token: ", token, crlf,
+    "Content-Type: application/json", crlf,
+    "Content-Length: ", show body_len, crlf,
+    "Connection: close", crlf, crlf,
+    body
+  ]
+
+-- Read until the peer closes the connection. recv_http_request from
+-- stdlib/socket.rail returns as soon as it sees CRLFCRLF in any single
+-- recv burst — fine for client→server reads where the body is already
+-- buffered, but it loses the body when the Pi signer's HTTP/1.0 reply
+-- arrives in two TCP segments (headers in segment 1, body in segment 2).
+-- We need full-body, so loop until recv returns 0.
+recv_until_eof fd =
+  let buf = malloc 8192
+  let s = recv_until_eof_loop fd buf ""
+  let _ = free buf
+  s
+
+recv_until_eof_loop fd buf acc =
+  let n = recv fd buf 8192 0
+  if n <= 0 then acc
+  else
+    let chunk = tcp_bytes_to_str buf 0 n ""
+    recv_until_eof_loop fd buf (join "" [acc, chunk])
+
+sign_via_pi_http ip port path token digest pulse_id value_hex =
+  let body = build_sign_body digest pulse_id value_hex
+  let req = build_sign_request ip port path token body
+  let fd = hc_connect_tcp ip port
+  if fd < 0 then ""
+  else
+    let _ = send_all_tcp fd req
+    let resp = recv_until_eof fd
+    let _ = close fd
+    extract_http_body resp
+
+extract_http_body resp =
+  let sep = http_crlf2 0
+  let i = str_find sep resp
+  if i < 0 then ""
+  else trim_trailing (str_sub resp (i + 4) (length (chars resp) - i - 4))
 
 -- ── Outer JSON build (matches attest.sh output schema byte-for-byte
 --    in field order; whitespace is JSON, not significant). ──────────
@@ -170,8 +224,18 @@ now_unix _ =
 
 attest input out =
   let beacon_url = env_or "BEACON_URL" (beacon_url_default 0)
-  let witness_host = env_or "WITNESS_HOST" (witness_host_default 0)
-  let signer_path = env_or "SIGNER" (signer_path_default 0)
+  let signer_ip = env_or "SIGNER_IP" (signer_ip_default 0)
+  let signer_port_s = env_or "SIGNER_PORT" (show (signer_port_default 0))
+  let signer_port = parse_int signer_port_s
+  let signer_path = env_or "SIGNER_PATH" (signer_path_default 0)
+  let token_path = env_or "SIGN_TOKEN_PATH" (sign_token_path_default 0)
+  let token = trim_trailing (read_file token_path)
+  if length (chars token) == 0 then
+    let _ = print (cat ["missing sign token: ", token_path])
+    7
+  else attest_step1 input out beacon_url signer_ip signer_port signer_path token
+
+attest_step1 input out beacon_url signer_ip signer_port signer_path token =
   let digest = sha256_hex_file input
   let size = file_size_bytes input
   let pulse = fetch_pulse beacon_url
@@ -179,10 +243,10 @@ attest input out =
   if length (chars pulse_id) == 0 then
     let _ = print (cat ["beacon unreachable: ", beacon_url])
     4
-  else attest_step2 input out beacon_url witness_host signer_path digest size pulse_id value_hex beacon_ts
+  else attest_step2 input out beacon_url signer_ip signer_port signer_path token digest size pulse_id value_hex beacon_ts
 
-attest_step2 input out beacon_url witness_host signer_path digest size pulse_id value_hex beacon_ts =
-  let inner = sign_via_pi witness_host signer_path digest pulse_id value_hex
+attest_step2 input out beacon_url signer_ip signer_port signer_path token digest size pulse_id value_hex beacon_ts =
+  let inner = sign_via_pi_http signer_ip signer_port signer_path token digest pulse_id value_hex
   if length (chars inner) == 0 then
     let _ = print "witness signer returned nothing"
     5
