@@ -66,25 +66,38 @@ run_packer =
 -- values via ctx slots [4..7].
 diag_every = 40
 
--- Multi-step LF inner loop.  ctx[0] = sim_time accumulator.
-inner_step state ctx i =
-  if i >= steps_per_frame then state
+-- Multi-step LF inner loop, double-buffered.  Reads from state[parity],
+-- writes to state[1-parity], swaps via the parity arg.  No per-step
+-- allocation of state — we keep two pre-allocated 768 KB buffers for
+-- the entire process lifetime.
+--
+-- buffers[0] = state A, buffers[1] = state B.
+-- coeffs/fxr/fxl/fyu/fyd are caller-owned scratch (allocated once in main).
+-- Returns the parity that holds the *current* state at end of frame.
+--
+-- ctx[0] = sim_time accumulator, ctx[1] = dt of last step.
+inner_step buffers parity ctx coeffs fxr fxl fyu fyd i =
+  if i >= steps_per_frame then parity
   else
-    let dt = mk_compute_dt state
-    let ns = mk_lxf_step state dt
+    let cur = arr_get buffers parity
+    let nxt = arr_get buffers (1 - parity)
+    let dt = mk_compute_dt cur
+    let _ = mk_lxf_step_into cur nxt dt coeffs fxr fxl fyu fyd
     let _ = float_arr_set ctx 0 (float_arr_get ctx 0 + dt)
     let _ = float_arr_set ctx 1 dt
-    inner_step ns ctx (i + 1)
+    inner_step buffers (1 - parity) ctx coeffs fxr fxl fyu fyd (i + 1)
 
--- Reset to a fresh OT state when sim_time has accumulated past t=π,
--- keeping the chaos visibly alive.  Returns (new_state, new_sim_time).
-maybe_reset state ctx =
+-- Reset in place — re-run mk_init_loop on the current buffer.  Avoids
+-- the 768 KB allocation that mk_init_state would do.  Returns 0 (parity
+-- unchanged).
+maybe_reset buffers parity ctx =
   let t = float_arr_get ctx 0
   if t > t_reset then
     let _ = print "beacon: t > pi, resetting"
     let _ = float_arr_set ctx 0 0.0
-    mk_init_state
-  else state
+    let _ = mk_init_loop (arr_get buffers parity) 0
+    0
+  else 0
 
 -- Beacon main loop.  The exit-on-step-count is the heartbeat budget;
 -- launchd / shell wrapper restarts the process if it exits.  We give
@@ -93,11 +106,13 @@ maybe_reset state ctx =
 -- main and reused — keeps per-frame allocation bounded so the bump
 -- arena and GC don't have to grind through 100 KB+ of new state every
 -- frame.
-beacon_loop state ctx buf frame_id max_frames =
+beacon_loop buffers parity ctx buf coeffs fxr fxl fyu fyd frame_id max_frames =
   if frame_id >= max_frames then 0
   else
-    let s_after_reset = maybe_reset state ctx
-    let s_after_steps = inner_step s_after_reset ctx 0
+    let mark = arena_mark 0
+    let _ = maybe_reset buffers parity ctx
+    let p2 = inner_step buffers parity ctx coeffs fxr fxl fyu fyd 0
+    let cur = arr_get buffers p2
     let dt = float_arr_get ctx 1
     let sim_time = float_arr_get ctx 0
     let m0 = float_arr_get ctx 2
@@ -105,26 +120,27 @@ beacon_loop state ctx buf frame_id max_frames =
     -- Diagnostics every diag_every frames; in between, reuse the
     -- last-computed values from ctx[4..7].  Saves ~50 ms/frame.
     let _ = if frame_id % diag_every == 0 then
-              let _ = float_arr_set ctx 4 (mk_total_mass s_after_steps)
-              let _ = float_arr_set ctx 5 (mk_total_energy s_after_steps)
-              let _ = float_arr_set ctx 6 (mk_max_div_b s_after_steps)
-              float_arr_set ctx 7 (mk_min_density s_after_steps)
+              let _ = float_arr_set ctx 4 (mk_total_mass cur)
+              let _ = float_arr_set ctx 5 (mk_total_energy cur)
+              let _ = float_arr_set ctx 6 (mk_max_div_b cur)
+              float_arr_set ctx 7 (mk_min_density cur)
             else 0
     let mass = float_arr_get ctx 4
     let energy = float_arr_get ctx 5
     let divb = float_arr_get ctx 6
     let rho_min = float_arr_get ctx 7
-    let _ = dump_planes s_after_steps buf
+    let _ = dump_planes cur buf
     let _ = write_meta frame_id dt sim_time m0 e0 mass energy divb rho_min
     let _ = run_packer
-    -- Throttle removed: entropy_beacon.sh polls /tmp/plasma_live.bin
-    -- at its own 1 Hz cadence regardless of how fast we write, so we
-    -- don't burn CF PUT budget by running the kernel as fast as the
-    -- CPU allows.  Frames between polls just get overwritten on disk.
     let _ = if frame_id % diag_every == 0 then
               print (cat ["beacon: frame ", show frame_id, " t=", show_float sim_time, " dm=", show_float ((mass - m0) / m0), " divB=", show_float divb])
             else 0
-    beacon_loop s_after_steps ctx buf (frame_id + 1) max_frames
+    -- Drain per-frame transient allocations (cat-built strings, small
+    -- scratch, stdlib bookkeeping).  All long-lived buffers (state[],
+    -- ctx, buf, flux scratch) were allocated before this mark, so
+    -- they survive the reset.
+    let _ = arena_reset mark
+    beacon_loop buffers p2 ctx buf coeffs fxr fxl fyu fyd (frame_id + 1) max_frames
 
 main =
   let _ = print "================================================="
@@ -132,9 +148,18 @@ main =
   let _ = print "  128x128 Orszag-Tang, ideal MHD, LF + reset@t=pi"
   let _ = print "================================================="
   let _ = shell (cat ["mkdir -p ", beacon_dir])
-  let state = mk_init_state
-  let m0 = mk_total_mass state
-  let e0 = mk_total_energy state
+  -- Double-buffered state. mk_init_state allocates and seeds buf A;
+  -- buf B is zeroed and filled by the first LF step.  Both buffers
+  -- are pre-allocated so the per-frame loop NEVER allocates a state
+  -- (768 KB × 4 steps × 4 fps would otherwise leak ~12 MB/s past the
+  -- conservative GC, as observed 2026-05-02).
+  let state_a = mk_init_state
+  let state_b = float_arr_new mk_state_size 0.0
+  let buffers = arr_new 2 0
+  let _ = arr_set buffers 0 state_a
+  let _ = arr_set buffers 1 state_b
+  let m0 = mk_total_mass state_a
+  let e0 = mk_total_energy state_a
   let _ = print (cat ["IC: mass=", show_float m0, " energy=", show_float e0])
   -- ctx layout:
   --   [0] sim_time accumulator     [4] last mass diagnostic
@@ -152,7 +177,14 @@ main =
   -- Allocated once; mk_fill_primitives reuses it every frame so we
   -- don't grow the bump arena per dump.
   let buf = float_arr_new mk_prim_buffer_size 0.0
+  -- Pre-allocated flux scratch — passed into mk_lxf_step_into so each
+  -- step is allocation-free.
+  let coeffs = float_arr_new 2 0.0
+  let fxr = float_arr_new 6 0.0
+  let fxl = float_arr_new 6 0.0
+  let fyu = float_arr_new 6 0.0
+  let fyd = float_arr_new 6 0.0
   -- 100k frames at 4 fps is ~7 hours — plenty for one process lifetime;
   -- the launchd wrapper restarts on exit.
-  let _ = beacon_loop state ctx buf 0 100000
+  let _ = beacon_loop buffers 0 ctx buf coeffs fxr fxl fyu fyd 0 100000
   0
