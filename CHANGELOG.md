@@ -2,6 +2,62 @@
 
 All notable changes to Rail are documented here.
 
+## v3.11.0 — 2026-05-02 — Linux self-host on Pi + arena_reset Linux fix + witness pubkey self-attestation
+
+Rail compiles itself ON the Pi. The Linux ARM64 self-host gate is open
+for medium-size programs. Three blocker bugs cleared along the way;
+witness pubkey now has a second trust source.
+
+- **Linux `_malloc` separate pool (master 5334d46).** The previous Linux
+  `_malloc` shared `_rail_heap_ptr` with `_rail_alloc`'s arena bump.
+  After `arena_reset` rolled the pointer back to mark, chunks that
+  `_rail_chained_malloc` had pushed onto `_rail_small_fl` were in
+  "freed" arena space; iter N+1's recv buffer overwrote them and the
+  next chained-small-pop SEGV'd reading garbage out of `chunk[0]`. New
+  Linux `_malloc` lazy-mmaps its own 4 MB chunks (matching Mac's
+  separate `_rail_malloc_ptr` / `_rail_malloc_end` pool). Plus
+  `_rail_malloc_chain_drain`'s munmap was Darwin-ABI; Linux variant
+  added.
+
+- **Pi self-host (master 01c09e5).** Three nested issues kept
+  `rail_native test` from running on Pi:
+  - The strip awk that removed Mac runtime stubs ran only on
+    cross-compile-from-Mac (`if uname != Linux`); native-Linux builds
+    got duplicate-symbol errors at `as`.
+  - The native-Linux branch shortcut routed through fleet0's
+    /home/zemog/tools/transform.sh, which lacked the new
+    `__mod_init_func` awk and runtime-stub strip. Always use the
+    in-tree sed+awk now.
+  - The sed pattern `s/\.section __DATA,__data/.data/` matched its
+    own string literal when compile.rail cross-compiled itself —
+    same shape as the awk-self-strip bug fixed earlier. All
+    section-level patterns now anchored to `^`.
+  - `linux_data.s` was being appended unconditionally; duplicates
+    `_fmt_int` / `_rail_nil` / etc. with compile.rail's own emit.
+    Drop it.
+
+- **Pi self-host status:** `print 42`, `fact 10 = 3628800`,
+  `fold add 0 (range 101) = 5050`, all crypto/file/shell paths
+  exercised cross-compiled and live. Test suite: **98/137 pass on
+  Pi** (from 6/137 pre-fix). Remaining 39 are mostly missing-stdlib
+  imports (rsync `stdlib/` to Pi to fix most) plus 2-3 fixtures that
+  need triage.
+
+- **Witness pubkey self-attestation (master 7fac18c).**
+  `tools/attest/attest_witness_pubkey.sh` runs `attest.rail` on
+  `~/.ledatic/witness/fleet0.pub.pem` and publishes
+  `releases/witness-fleet0/fleet0.pub.pem.attestation.json`. The
+  attestation binds (sha256(pubkey), beacon_pulse_id) with the same
+  Ed25519 key the pubkey represents. A verifier can now
+  cryptographically check that the witness was alive at a recent
+  pulse and intentionally re-vouched for the public key — a key swap
+  or revocation manifests as a different attestation; a stale
+  pulse_id reveals a silent witness. Live at
+  https://ledatic.org/releases/witness-fleet0/fleet0.pub.pem.attestation.json
+
+`./rail_native test = 137/137` Mac side. Self-host fixed point
+preserved.
+
 ## v3.10.0 — 2026-05-02 — Path B: Rail-native Pi signer + Linux backend complete
 
 The attestation pipeline is now Rail-native end-to-end including the
