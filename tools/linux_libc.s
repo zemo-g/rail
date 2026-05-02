@@ -268,6 +268,160 @@ _rail_print:
     ldp x29, x30, [sp], #64
     ret
 
+// _rail_print_float — Linux variant. fmov-style branch is impossible
+// from x0 because Mac _rail_print_float is called with d0 already set;
+// the codegen for show_float / print_float dispatches via fmov d0, x0
+// at the call site. Same convention here.
+_rail_print_float:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    str d0, [x29, #16]
+    mov x0, #32
+    bl _malloc
+    str x0, [x29, #24]
+    ldr d0, [x29, #16]
+    str d0, [sp, #-16]!
+    ldr x0, [x29, #24]
+    mov x1, #32
+    adrp x2, _fmt_gbare
+    add x2, x2, :lo12:_fmt_gbare
+    bl _snprintf
+    add sp, sp, #16
+    ldr x0, [x29, #24]
+    bl _strlen
+    mov x2, x0
+    mov x0, #1
+    ldr x1, [x29, #24]
+    mov x8, #64
+    svc #0
+    mov w0, #10
+    strb w0, [x29, #32]
+    mov x0, #1
+    add x1, x29, #32
+    mov x2, #1
+    mov x8, #64
+    svc #0
+    ldr x0, [x29, #24]
+    bl _free
+    mov x0, #1
+    ldp x29, x30, [sp], #48
+    ret
+
+// _rail_shell — Linux variant. Mac uses Darwin syscalls 42 (pipe),
+// 2 (fork), 90 (dup2), 6 (close), 59 (execve), 1 (exit), 3 (read),
+// 7 (waitpid). Linux equivalents: 59 (pipe2), 220 (clone), 24 (dup3),
+// 57 (close), 221 (execve), 93 (exit), 63 (read), 260 (wait4).
+//
+// We use clone with SIGCHLD flag for fork-equivalence, dup3 with
+// flags=0 for dup2-equivalence, pipe2 with flags=0 for pipe-equivalence.
+// Linux ABI for clone: x0=flags, x1=child_stack (NULL=share parent's
+// via copy-on-write). We pass SIGCHLD (0x11) so wait4 works.
+_rail_shell:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    bl _str_unwrap
+    str x0, [x29, #16]               // saved cmd string
+    // pipe2(fds, 0)
+    add x0, x29, #24
+    mov x1, #0
+    mov x8, #59                       // pipe2
+    svc #0
+    // ldr fds: x29#24 = read fd (32 bits), x29#28 = write fd
+    // clone(SIGCHLD, NULL, ...)
+    mov x0, #0x11                     // SIGCHLD
+    mov x1, #0
+    mov x2, #0
+    mov x3, #0
+    mov x4, #0
+    mov x8, #220                      // clone
+    svc #0
+    cbz x0, .Lsh_l_child
+    // parent: store pid
+    str x0, [x29, #32]
+    ldr w0, [x29, #28]                // close write end
+    mov x8, #57                       // close
+    svc #0
+    // malloc 64K read buffer
+    mov x0, #65536
+    bl _malloc
+    str x0, [x29, #40]
+    str xzr, [x29, #48]
+.Lsh_l_read:
+    ldr w0, [x29, #24]
+    ldr x1, [x29, #40]
+    ldr x2, [x29, #48]
+    add x1, x1, x2
+    mov x2, #4096
+    mov x8, #63                       // read
+    svc #0
+    cmp x0, #0
+    b.le .Lsh_l_done
+    ldr x1, [x29, #48]
+    add x1, x1, x0
+    str x1, [x29, #48]
+    b .Lsh_l_read
+.Lsh_l_done:
+    ldr w0, [x29, #24]
+    mov x8, #57                       // close
+    svc #0
+    // wait4(-1, &status, 0, NULL)
+    mov x0, #-1
+    add x1, x29, #56
+    mov x2, #0
+    mov x3, #0
+    mov x8, #260                      // wait4
+    svc #0
+    // null-terminate buf
+    ldr x0, [x29, #40]
+    ldr x1, [x29, #48]
+    mov w2, #0
+    strb w2, [x0, x1]
+    ldr x0, [x29, #40]
+    bl _rail_wrap_str
+    str x0, [x29, #56]
+    ldr x0, [x29, #40]
+    bl _free
+    ldr x0, [x29, #56]
+    ldp x29, x30, [sp], #96
+    ret
+.Lsh_l_child:
+    // child: dup3(write_fd, 1, 0)
+    ldr w0, [x29, #28]
+    mov x1, #1
+    mov x2, #0
+    mov x8, #24                       // dup3
+    svc #0
+    ldr w0, [x29, #24]
+    mov x8, #57
+    svc #0
+    ldr w0, [x29, #28]
+    mov x8, #57
+    svc #0
+    // execve("/bin/sh", argv, envp)
+    adr x0, .Lsh_l_binsh
+    str x0, [x29, #48]
+    adr x0, .Lsh_l_cflag
+    str x0, [x29, #56]
+    ldr x0, [x29, #16]
+    str x0, [x29, #64]
+    str xzr, [x29, #72]
+    adr x0, .Lsh_l_binsh
+    add x1, x29, #48
+    adrp x2, _rail_envp
+    ldr x2, [x2, :lo12:_rail_envp]
+    mov x8, #221                      // execve
+    svc #0
+    // exec failed; exit
+    mov x0, #1
+    mov x8, #93
+    svc #0
+.Lsh_l_binsh:
+    .asciz "/bin/sh"
+    .p2align 2
+.Lsh_l_cflag:
+    .asciz "-c"
+    .p2align 2
+
 // _getenv(name) -> char* | 0 — Linux stub. The full impl would walk
 // _rail_envp comparing each entry against name+'='. We're only called
 // from _rail_arena_init (RAIL_ARENA_MB / RAIL_ARENA_TRACE), and
@@ -446,16 +600,112 @@ _snprintf:
     b .Lsnpf_done
 
 .Lsnpf_float:
-    ldr x0, [x29, #16]
+    // d0 still holds the float value (callers do `str d0, [sp, #-16]!`
+    // before bl _snprintf, but that's a Mac-vararg quirk; AAPCS64
+    // keeps it in d0 and we never clobber it before this point).
+    ldr x4, [x29, #16]   // buf
+    mov x7, #0            // write idx
+    // sign
+    fmov x1, d0
+    tst x1, #0x8000000000000000
+    b.eq .Lsnpf_f_pos
+    fneg d0, d0
+    mov w1, #45           // '-'
+    strb w1, [x4, x7]
+    add x7, x7, #1
+.Lsnpf_f_pos:
+    // zero
+    fcmp d0, #0.0
+    b.ne .Lsnpf_f_nonzero
     mov w1, #48           // '0'
-    strb w1, [x0]
+    strb w1, [x4, x7]
+    add x7, x7, #1
+    b .Lsnpf_f_emit_done
+.Lsnpf_f_nonzero:
+    // d0 *= 1e6 (shift 6 decimal places into the integer part).
+    adrp x0, _1e6_f64
+    ldr d1, [x0, :lo12:_1e6_f64]
+    fmul d0, d0, d1
+    frinta d0, d0
+    fcvtzs x0, d0
+    // Push x0's decimal digits (LSD first) onto the stack in 16-byte
+    // slots, count digits in x2.
+    mov x2, #0
+    mov x3, #10
+    cbnz x0, .Lsnpf_f_div
+    // After multiply+round, x0 is 0 — the original was so small it
+    // collapsed. Emit "0" and exit.
+    mov w1, #48
+    strb w1, [x4, x7]
+    add x7, x7, #1
+    b .Lsnpf_f_emit_done
+.Lsnpf_f_div:
+    udiv x5, x0, x3
+    msub x6, x5, x3, x0
+    add x6, x6, #48
+    str x6, [sp, #-16]!
+    add x2, x2, #1
+    mov x0, x5
+    cbnz x0, .Lsnpf_f_div
+    // Pad with leading zeros so total digit count is at least 7
+    // (leaves room for the implicit "0." prefix on values < 1).
+.Lsnpf_f_pad:
+    cmp x2, #7
+    b.ge .Lsnpf_f_pad_done
+    mov x6, #48
+    str x6, [sp, #-16]!
+    add x2, x2, #1
+    b .Lsnpf_f_pad
+.Lsnpf_f_pad_done:
+    // x2 = total digit count. Decimal point goes at column (x2-6) from
+    // the left (so the last 6 digits become the fractional part).
+    sub x3, x2, #6
+    mov x9, #0
+.Lsnpf_f_emit:
+    cmp x9, x3
+    b.ne .Lsnpf_f_emit_no_dot
+    cbz x9, .Lsnpf_f_emit_no_dot
+    mov w1, #46           // '.'
+    strb w1, [x4, x7]
+    add x7, x7, #1
+.Lsnpf_f_emit_no_dot:
+    ldr x6, [sp], #16
+    strb w6, [x4, x7]
+    add x7, x7, #1
+    add x9, x9, #1
+    cmp x9, x2
+    b.lt .Lsnpf_f_emit
+    // Trim trailing zeros after the decimal. Walk back from x7-1 while
+    // we see '0'. If we end on '.', drop it too.
+    sub x9, x7, #1
+.Lsnpf_f_trim:
+    ldrb w6, [x4, x9]
+    cmp w6, #48
+    b.ne .Lsnpf_f_trim_done
+    sub x9, x9, #1
+    sub x7, x7, #1
+    b .Lsnpf_f_trim
+.Lsnpf_f_trim_done:
+    cmp w6, #46
+    b.ne .Lsnpf_f_emit_done
+    sub x7, x7, #1
+.Lsnpf_f_emit_done:
+    // NUL-terminate
     mov w1, #0
-    strb w1, [x0, #1]
-    mov x0, #1
+    strb w1, [x4, x7]
+    mov x0, x7
+    b .Lsnpf_done
 
 .Lsnpf_done:
     ldp x29, x30, [sp], #48
     ret
+
+// 1e6 as IEEE-754 double: 0x412E848000000000.
+.section .rodata
+.p2align 3
+_1e6_f64:
+    .quad 0x412E848000000000
+.text
 
 // ---- File I/O via syscalls ----
 
@@ -670,8 +920,126 @@ _pclose:
     ret
 
 
+// _atof(const char *s) -> double
+// Parses [sign]? [digits]? [.digits]? ([eE][sign]?digits]+)? per the
+// usual rules. Was a stub returning 0.0; replaced 2026-05-02 because
+// the cross-compile path emits float literals as `_atof("X.YY")` and
+// every literal was reading as 0. Standard scan-and-build approach;
+// no IEEE rounding subtleties addressed (just plain accumulate-then-
+// scale) which is fine for the magnitudes we use.
 _atof:
-    fmov d0, xzr
+    mov x1, x0                  // s pointer
+    fmov d0, xzr                // accumulator
+    fmov d1, xzr                // sign as f64; 0.0=positive
+    mov x2, #1                  // sign multiplier (int): 1 or -1
+    // skip whitespace (space, tab)
+.Latof_ws:
+    ldrb w3, [x1]
+    cmp w3, #32
+    b.eq .Latof_ws_inc
+    cmp w3, #9
+    b.ne .Latof_sign
+.Latof_ws_inc:
+    add x1, x1, #1
+    b .Latof_ws
+.Latof_sign:
+    cmp w3, #45                  // '-'
+    b.ne .Latof_plus
+    mov x2, #-1
+    add x1, x1, #1
+    b .Latof_int
+.Latof_plus:
+    cmp w3, #43                  // '+'
+    b.ne .Latof_int
+    add x1, x1, #1
+.Latof_int:
+    // d0 = integer part (as f64)
+    fmov d2, #10.0
+.Latof_int_loop:
+    ldrb w3, [x1]
+    cmp w3, #48
+    b.lt .Latof_after_int
+    cmp w3, #57
+    b.gt .Latof_after_int
+    sub w3, w3, #48
+    scvtf d3, x3                 // d3 = digit
+    fmul d0, d0, d2              // d0 *= 10
+    fadd d0, d0, d3              // d0 += digit
+    add x1, x1, #1
+    b .Latof_int_loop
+.Latof_after_int:
+    // optional fractional part
+    cmp w3, #46                  // '.'
+    b.ne .Latof_after_frac
+    add x1, x1, #1
+    fmov d4, #1.0                // place value
+.Latof_frac_loop:
+    ldrb w3, [x1]
+    cmp w3, #48
+    b.lt .Latof_after_frac
+    cmp w3, #57
+    b.gt .Latof_after_frac
+    sub w3, w3, #48
+    scvtf d3, x3
+    fdiv d4, d4, d2              // place /= 10
+    fmul d3, d3, d4              // d3 = digit * place
+    fadd d0, d0, d3
+    add x1, x1, #1
+    b .Latof_frac_loop
+.Latof_after_frac:
+    // optional exponent: [eE][+-]?digits
+    cmp w3, #69                  // 'E'
+    b.eq .Latof_exp
+    cmp w3, #101                 // 'e'
+    b.ne .Latof_done
+.Latof_exp:
+    add x1, x1, #1
+    mov x4, #1                   // exp sign
+    mov x5, #0                   // exp value
+    ldrb w3, [x1]
+    cmp w3, #45
+    b.ne .Latof_exp_plus
+    mov x4, #-1
+    add x1, x1, #1
+    b .Latof_exp_loop
+.Latof_exp_plus:
+    cmp w3, #43
+    b.ne .Latof_exp_loop
+    add x1, x1, #1
+.Latof_exp_loop:
+    ldrb w3, [x1]
+    cmp w3, #48
+    b.lt .Latof_exp_apply
+    cmp w3, #57
+    b.gt .Latof_exp_apply
+    sub w3, w3, #48
+    mov x6, #10
+    mul x5, x5, x6
+    add x5, x5, x3
+    add x1, x1, #1
+    b .Latof_exp_loop
+.Latof_exp_apply:
+    // multiply d0 by 10^(x5*x4) via repeated mul/div
+    cmp x5, #0
+    b.eq .Latof_done
+    cmp x4, #0
+    b.ge .Latof_exp_pos
+    // negative exp: divide
+.Latof_exp_neg_loop:
+    fdiv d0, d0, d2
+    sub x5, x5, #1
+    cbnz x5, .Latof_exp_neg_loop
+    b .Latof_done
+.Latof_exp_pos:
+.Latof_exp_pos_loop:
+    fmul d0, d0, d2
+    sub x5, x5, #1
+    cbnz x5, .Latof_exp_pos_loop
+.Latof_done:
+    cmp x2, #0
+    b.ge .Latof_ret
+    fneg d0, d0
+.Latof_ret:
     ret
 
 // ============ Networking syscalls (added for dns-sink, 2026-04-07) ============
