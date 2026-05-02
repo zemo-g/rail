@@ -4,6 +4,12 @@
 # Given an input file, produce an attestation.json that binds:
 #   sha256(input) ⊗ live entropy beacon pulse_id ⊗ Ed25519 sig from fleet0
 #
+# Bash escape hatch — the canonical path is tools/attest/attest.rail.
+# Both share the same Pi-side HTTP signer (com.ledatic.attest_sign on
+# fleet0:9102) since v3.9.0; the Pi-side SSH signer is no longer used
+# by either path, but sign_attestation.sh still exists on the Pi and
+# the Python HTTP server shells out to it.
+#
 # The attestation proves:
 #   - what the artifact's bytes were (sha256)
 #   - that the artifact existed at or before pulse_id N (lower-bound on time)
@@ -15,6 +21,8 @@
 #
 # Usage: attest.sh <input_path> [output_path]
 #   default output_path = <input_path>.attestation.json
+#
+# Env overrides: BEACON_URL, SIGNER_URL, SIGN_TOKEN_PATH
 
 set -euo pipefail
 
@@ -26,8 +34,11 @@ out=${2:-${input}.attestation.json}
 [ -f "$input" ] || { echo "no such file: $input" >&2; exit 3; }
 
 BEACON_URL=${BEACON_URL:-https://ledatic.org/entropy/pulse}
-WITNESS_HOST=${WITNESS_HOST:-zemog@100.87.231.45}
-SIGNER=${SIGNER:-/home/zemog/.ledatic/witness/sign_attestation.sh}
+SIGNER_URL=${SIGNER_URL:-http://100.87.231.45:9102/sign}
+SIGN_TOKEN_PATH=${SIGN_TOKEN_PATH:-$HOME/.ledatic/witness/sign_token}
+
+[ -r "$SIGN_TOKEN_PATH" ] || { echo "missing sign token: $SIGN_TOKEN_PATH" >&2; exit 7; }
+sign_token=$(tr -d '\r\n' < "$SIGN_TOKEN_PATH")
 
 digest=$(shasum -a 256 "$input" | awk '{print $1}')
 size=$(stat -f%z "$input" 2>/dev/null || stat -c%s "$input")
@@ -39,7 +50,8 @@ pulse_id=$(printf '%s' "$raw" | python3 -c "import sys,json;print(json.load(sys.
 value_hex=$(printf '%s' "$raw" | python3 -c "import sys,json;print(json.load(sys.stdin)['value_hex'])")
 beacon_ts=$(printf '%s' "$raw" | python3 -c "import sys,json;print(json.load(sys.stdin)['timestamp_utc'])")
 
-inner=$(ssh -o ConnectTimeout=5 "$WITNESS_HOST" "$SIGNER $digest $pulse_id $value_hex")
+inner=$(curl -sf --max-time 10 -H "X-Sign-Token: $sign_token" -H "Content-Type: application/json" \
+  -d "{\"digest\":\"$digest\",\"pulse_id\":$pulse_id,\"value_hex\":\"$value_hex\"}" "$SIGNER_URL")
 [ -n "$inner" ] || { echo "witness signer returned nothing" >&2; exit 5; }
 
 artifact_name=$(basename "$input")
