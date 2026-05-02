@@ -121,6 +121,163 @@ _strstr:
 _free:
     ret
 
+// ============ Rail runtime (Linux replacements) ============
+// compile.rail emits Mac-ABI versions of the following _rail_* runtime
+// stubs (svc #0x80 + Darwin syscall classes in x16). build_linux's
+// strip awk drops them; these replacements use Linux conventions
+// (svc #0, syscall # in x8). Keep both lists in sync — anything added
+// here must also be added to the strip awk in build_linux.
+
+// _rail_arena_init — Linux variant.
+// Mach-O auto-invokes via __mod_init_func; on ELF we drop that stanza
+// and call this explicitly from _start. Sets up the 1 GB _rail_heap
+// region (BSS-allocated by build_linux's bss snippet) as the bump
+// arena. No mmap needed since _rail_heap is statically reserved.
+_rail_arena_init:
+    adrp x0, _rail_heap
+    add x0, x0, :lo12:_rail_heap
+    adrp x1, _rail_heap_base
+    add x1, x1, :lo12:_rail_heap_base
+    str x0, [x1]
+    adrp x1, _rail_heap_ptr
+    add x1, x1, :lo12:_rail_heap_ptr
+    str x0, [x1]
+    mov x2, #0x40000000            // 1 GB
+    add x2, x0, x2
+    adrp x1, _rail_heap_end
+    add x1, x1, :lo12:_rail_heap_end
+    str x2, [x1]
+    ret
+
+// _rail_print — Linux variant.
+// Same shape as the Mac version but with Linux syscall conventions
+// (write = 64 in x8, svc #0). Handles tagged ints, heap floats, and
+// heap strings. Always appends a trailing '\n'.
+_rail_print:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    tst x0, #1
+    b.eq .Lprnt_l_heap
+    asr x0, x0, #1
+    mov x1, #0
+    cmp x0, #0
+    b.ge .Lprnt_l_pos
+    neg x0, x0
+    mov x1, #1
+.Lprnt_l_pos:
+    str x1, [x29, #48]
+    mov x2, #0
+    mov x3, #10
+    add x4, x29, #16
+.Lprnt_l_div:
+    udiv x5, x0, x3
+    msub x6, x5, x3, x0
+    add x6, x6, #48
+    str x6, [sp, #-16]!
+    add x2, x2, #1
+    mov x0, x5
+    cbnz x0, .Lprnt_l_div
+    cbz x2, .Lprnt_l_zero
+    mov x7, #0
+    ldr x1, [x29, #48]
+    cbz x1, .Lprnt_l_nosign
+    mov w1, #45
+    strb w1, [x4, x7]
+    add x7, x7, #1
+.Lprnt_l_nosign:
+.Lprnt_l_rev:
+    ldr x6, [sp], #16
+    strb w6, [x4, x7]
+    add x7, x7, #1
+    sub x2, x2, #1
+    cbnz x2, .Lprnt_l_rev
+    mov w1, #10
+    strb w1, [x4, x7]
+    add x7, x7, #1
+    mov x0, #1
+    mov x1, x4
+    mov x2, x7
+    mov x8, #64
+    svc #0
+    b .Lprnt_l_done
+.Lprnt_l_zero:
+    mov w0, #48
+    strb w0, [x4]
+    mov w0, #10
+    strb w0, [x4, #1]
+    mov x0, #1
+    mov x1, x4
+    mov x2, #2
+    mov x8, #64
+    svc #0
+    b .Lprnt_l_done
+.Lprnt_l_heap:
+    ldr x1, [x0]
+    and x1, x1, #0x7fffffffffffffff
+    cmp x1, #6
+    b.eq .Lprnt_l_float
+    bl _str_unwrap
+    str x0, [x29, #16]
+    bl _strlen
+    mov x2, x0
+    mov x0, #1
+    ldr x1, [x29, #16]
+    mov x8, #64
+    svc #0
+    mov w0, #10
+    strb w0, [x29, #24]
+    mov x0, #1
+    add x1, x29, #24
+    mov x2, #1
+    mov x8, #64
+    svc #0
+    b .Lprnt_l_done
+.Lprnt_l_float:
+    // Float printing path uses _snprintf (already in linux_libc.s).
+    ldr d0, [x0, #8]
+    str d0, [x29, #16]
+    mov x0, #32
+    bl _malloc
+    str x0, [x29, #24]
+    ldr d0, [x29, #16]
+    str d0, [sp, #-16]!
+    ldr x0, [x29, #24]
+    mov x1, #32
+    adrp x2, _fmt_gbare
+    add x2, x2, :lo12:_fmt_gbare
+    bl _snprintf
+    add sp, sp, #16
+    ldr x0, [x29, #24]
+    bl _strlen
+    mov x2, x0
+    mov x0, #1
+    ldr x1, [x29, #24]
+    mov x8, #64
+    svc #0
+    mov w0, #10
+    strb w0, [x29, #32]
+    mov x0, #1
+    add x1, x29, #32
+    mov x2, #1
+    mov x8, #64
+    svc #0
+    ldr x0, [x29, #24]
+    bl _free
+.Lprnt_l_done:
+    mov x0, #1
+    ldp x29, x30, [sp], #64
+    ret
+
+// _getenv(name) -> char* | 0 — Linux stub. The full impl would walk
+// _rail_envp comparing each entry against name+'='. We're only called
+// from _rail_arena_init (RAIL_ARENA_MB / RAIL_ARENA_TRACE), and
+// _rail_envp is populated by _main's prologue which hasn't run yet
+// at arena-init time. Returning 0 (env-var-not-found) is correct: the
+// caller falls through to defaults (1 GB arena, no trace).
+_getenv:
+    mov x0, #0
+    ret
+
 // read(fd, buf, count) — syscall 63
 _read:
     mov x8, #63               // read
