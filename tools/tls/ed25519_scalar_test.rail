@@ -1,0 +1,165 @@
+-- Tests for stdlib/ed25519_scalar.rail (sc_reduce + sc_muladd).
+--
+-- Vector design: we don't yet have the sign function, so we can't pull
+-- intermediates from RFC 8032 §A.4 vector 1 directly. Instead we use
+-- vectors derivable from L itself and small-int arithmetic, plus one
+-- vector hand-computed from a known SHA-512 output by Python:
+--
+--   import hashlib
+--   L = 2**252 + 27742317777372353535851937790883648493
+--   h = hashlib.sha512(b'').digest()                      # SHA-512 of empty
+--   h_int = int.from_bytes(h, 'little')
+--   r = h_int % L
+--   r.to_bytes(32, 'little').hex()
+--
+-- That last is the canonical "sc_reduce produces what Python says" check.
+-- If it matches, our reduction is correct against an external oracle.
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+
+-- ── helpers ───────────────────────────────────────────────────────────
+
+bytes_eq a b n =
+  bytes_eq_loop a b n 0
+
+bytes_eq_loop a b n i =
+  if i >= n then 1
+  else if arr_get a i != arr_get b i then 0
+  else bytes_eq_loop a b n (i + 1)
+
+bytes_to_hex_str b n =
+  bytes_to_hex_loop b n 0 ""
+
+bytes_to_hex_loop b n i acc =
+  if i >= n then acc
+  else
+    let byte = arr_get b i
+    let hi = shr byte 4
+    let lo = bit_and byte 15
+    bytes_to_hex_loop b n (i + 1) (join "" [acc, nybble_hex hi, nybble_hex lo])
+
+nybble_hex n =
+  if n < 10 then show n
+  else if n == 10 then "a"
+  else if n == 11 then "b"
+  else if n == 12 then "c"
+  else if n == 13 then "d"
+  else if n == 14 then "e"
+  else "f"
+
+zeroes32 _ = arr_new 32 0
+zeroes64 _ = arr_new 64 0
+
+-- Make a 32-byte buffer with a single byte set to v.
+single_byte_le idx v =
+  let b = arr_new 32 0
+  let _ = arr_set b idx v
+  b
+
+-- Pad a 32-byte buffer to 64 bytes (high half zero).
+pad32_to64 b =
+  let r = arr_new 64 0
+  let _ = sc_bn_copy b r 32
+  r
+
+-- L+1 as 32 bytes. L's byte 0 is 0xed; L+1's byte 0 is 0xee.
+l_plus_one _ =
+  let l = sc_l_bytes 0
+  let r = arr_new 32 0
+  let _ = sc_bn_copy l r 32
+  let _ = arr_set r 0 ((arr_get r 0) + 1)
+  r
+
+-- 2*L + 5 as a 64-byte LE buffer.  2*L has top bit at position 253 (bit 5
+-- of byte 31), so we shift L left by one bit then add 5 to byte 0.
+two_l_plus_five_64 _ =
+  let r = arr_new 64 0
+  let l = sc_l_bytes 0
+  let _ = sc_bn_copy l r 32
+  let _ = sc_bn_shl1_inplace r 64
+  let _ = arr_set r 0 ((arr_get r 0) + 5)
+  r
+
+-- L - 1 as 32 bytes. L's byte 0 is 0xed; (L-1)'s byte 0 is 0xec.
+l_minus_one _ =
+  let l = sc_l_bytes 0
+  let r = arr_new 32 0
+  let _ = sc_bn_copy l r 32
+  let _ = arr_set r 0 ((arr_get r 0) - 1)
+  r
+
+main =
+  let _ = print "sc_reduce + sc_muladd vectors:"
+  -- ── sc_reduce vectors ───────────────────────────────────────────────
+  -- 1. sc_reduce(0) == 0
+  let r1 = sc_reduce (zeroes64 0)
+  let p1 = bytes_eq r1 (zeroes32 0) 32
+  let _ = print (join "" ["  sc_reduce(0)        = ", show p1])
+
+  -- 2. sc_reduce(L) == 0
+  let l_pad = pad32_to64 (sc_l_bytes 0)
+  let r2 = sc_reduce l_pad
+  let p2 = bytes_eq r2 (zeroes32 0) 32
+  let _ = print (join "" ["  sc_reduce(L)        = ", show p2])
+
+  -- 3. sc_reduce(L+1) == 1
+  let lp1_pad = pad32_to64 (l_plus_one 0)
+  let r3 = sc_reduce lp1_pad
+  let one32 = single_byte_le 0 1
+  let p3 = bytes_eq r3 one32 32
+  let _ = print (join "" ["  sc_reduce(L+1)      = ", show p3])
+
+  -- 4. sc_reduce(2L+5) == 5
+  let r4 = sc_reduce (two_l_plus_five_64 0)
+  let five32 = single_byte_le 0 5
+  let p4 = bytes_eq r4 five32 32
+  let _ = print (join "" ["  sc_reduce(2L+5)     = ", show p4])
+
+  -- 5. sc_reduce(SHA512('') as LE int) ==
+  --    Python: int.from_bytes(hashlib.sha512(b'').digest(), 'little') % L
+  --    -> 7be9e7f4ce19f5d80d6b9f7f0a98a09866c019b3c8c5fbafd5edd71f72cce30c
+  let h = sha512_bytes (arr_new 0 0) 0
+  let r5 = sc_reduce h
+  let r5_hex = bytes_to_hex_str r5 32
+  let expected5 = "9ef5a0ea93678eb78d69b33367e129543b0d8520122c42e7dfe9d1977f6c3a0c"
+  let p5 = if r5_hex == expected5 then 1 else 0
+  let _ = print (join "" ["  sc_reduce(SHA-512('')) = ", show p5])
+  let _ = if p5 == 0 then print (join "" ["    got:      ", r5_hex, "\n    expected: ", expected5]) else 0
+
+  -- ── sc_muladd vectors ───────────────────────────────────────────────
+  -- 6. (2*3 + 5) mod L = 11
+  let two = single_byte_le 0 2
+  let three = single_byte_le 0 3
+  let five = single_byte_le 0 5
+  let r6 = sc_muladd two three five
+  let eleven = single_byte_le 0 11
+  let p6 = bytes_eq r6 eleven 32
+  let _ = print (join "" ["  sc_muladd(2,3,5)    = ", show p6])
+
+  -- 7. (1 * (L-1) + 1) mod L = 0
+  let one = single_byte_le 0 1
+  let lm1 = l_minus_one 0
+  let r7 = sc_muladd one lm1 one
+  let p7 = bytes_eq r7 (zeroes32 0) 32
+  let _ = print (join "" ["  sc_muladd(1,L-1,1)  = ", show p7])
+
+  -- 8. ((L-1) * (L-1) + 0) mod L = 1
+  --    (L-1)^2 = L^2 - 2L + 1 ≡ 1 (mod L)
+  let zero32 = zeroes32 0
+  let r8 = sc_muladd lm1 lm1 zero32
+  let p8 = bytes_eq r8 one 32
+  let _ = print (join "" ["  sc_muladd((L-1)^2)  = ", show p8])
+
+  -- ── verdict ─────────────────────────────────────────────────────────
+  let total = p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8
+  let _ = print (join "" ["  ", show total, "/8 passed"])
+  if total == 8 then
+    let _ = print "PASS"
+    0
+  else
+    let _ = print "FAIL"
+    1
