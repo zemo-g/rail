@@ -422,6 +422,64 @@ _rail_shell:
     .asciz "-c"
     .p2align 2
 
+// _rail_malloc_chain_drain — Linux variant.
+// Walk the malloc chain back to _rail_chain_mark, releasing chunks.
+// The Mac stub uses Darwin syscall #0x80 + class-0x02000000 munmap (73)
+// in x16. On Linux, svc #0x80 with x8 holding stale data triggers
+// arbitrary syscalls — the SEGV in pi_sign_server's serve_loop on the
+// 2nd request was traced to that.
+_rail_malloc_chain_drain:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    str x19, [x29, #16]
+    str x20, [x29, #24]
+    adrp x19, _rail_malloc_chain
+    add x19, x19, :lo12:_rail_malloc_chain
+    adrp x20, _rail_chain_mark
+    add x20, x20, :lo12:_rail_chain_mark
+.Lmdrn_l_loop:
+    ldr x0, [x19]
+    ldr x1, [x20]
+    cmp x0, x1
+    b.eq .Lmdrn_l_done
+    cbz x0, .Lmdrn_l_done
+    ldr x2, [x0]
+    str x2, [x19]
+    ldr x3, [x0, #8]
+    cmp x3, #0x10000             // 65536
+    b.ls .Lmdrn_l_small
+    // large chunk: munmap. Linux munmap = syscall 215, x0=addr,
+    // x1=length. The Mac version was svc #0x80 with x16=73|0x02000000.
+    str x0, [x29, #32]
+    str x3, [x29, #40]
+    mov x1, x3
+    mov x8, #215
+    svc #0
+    adrp x4, _rail_munmap_count
+    add x4, x4, :lo12:_rail_munmap_count
+    ldr x5, [x4]
+    add x5, x5, #1
+    str x5, [x4]
+    b .Lmdrn_l_loop
+.Lmdrn_l_small:
+    sub x4, x3, #1
+    clz x4, x4
+    mov x5, #64
+    sub x4, x5, x4
+    sub x4, x4, #5
+    adrp x5, _rail_small_fl
+    add x5, x5, :lo12:_rail_small_fl
+    add x5, x5, x4, lsl #3
+    ldr x6, [x5]
+    str x6, [x0]
+    str x0, [x5]
+    b .Lmdrn_l_loop
+.Lmdrn_l_done:
+    ldr x20, [x29, #24]
+    ldr x19, [x29, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
 // _getenv(name) -> char* | 0 — Linux stub. The full impl would walk
 // _rail_envp comparing each entry against name+'='. We're only called
 // from _rail_arena_init (RAIL_ARENA_MB / RAIL_ARENA_TRACE), and
@@ -1208,46 +1266,81 @@ _longjmp:
 // (_rail_heap + _rail_heap_ptr) used by _rail_alloc for cons cells / tuples
 // / closures. We share that same arena for _malloc.
 //
-// We deliberately do NOT write a size header (unlike _rail_alloc), because
-// _malloc callers expect raw bytes starting at the returned pointer.
-// Side effect: if the GC ever runs a sweep, it cant walk past these
-// header-less buffers. dns-sink stays well under 512 MB so GC never runs;
-// for any program that does, this fast _malloc would be unsafe.
+// _malloc — separate-pool bump allocator for Linux.
 //
-// Overflow falls back to the original mmap path so we still work when the
-// bump arena is exhausted.
+// Earlier impl piggybacked on _rail_heap_ptr (the same bump pointer
+// _rail_alloc uses), so arena_reset would roll the pointer back through
+// chunks that _rail_chained_malloc had pushed onto its small free-list
+// (_rail_small_fl). Iter 2's recv buffer would then overwrite those
+// chunks; the next chained_malloc small-bin pop read garbage out of
+// chunk[0] and either crashed at `ldr x7, [x6]` (when the garbage
+// looked like a small/junk pointer like 0x1) or kept walking corrupt
+// state until it tripped a NULL deref.
+//
+// Mac's _malloc uses _rail_malloc_ptr / _rail_malloc_end — a separate
+// 4 MB-chunked pool that arena_reset never touches. Match that.
+// _rail_malloc_ptr / _rail_malloc_end are declared in compile.rail's
+// data section, both initialized to 0 (lazy-init on first call).
 _malloc:
-    // x0 = requested size, in bytes.
-    // Align up to 8 (matching _rail_allocs alignment so the shared
-    // bump pointer stays 8-aligned for both allocators). Stash in x9
-    // and keep x0 intact for the mmap fallback path below.
-    add x9, x0, #7
-    and x9, x9, #-8
-    // Load current bump pointer.
-    adrp x10, _rail_heap_ptr
-    add x10, x10, :lo12:_rail_heap_ptr
+    // x0 = requested size in bytes.
+    add x9, x0, #15
+    and x9, x9, #-16
+    cmp x9, #0x10000              // 65536
+    b.hi .Lmalloc_large_l
+    str x9, [sp, #-16]!
+    // Load _rail_malloc_ptr; if NULL, fall through to newpage.
+    adrp x10, _rail_malloc_ptr
+    add x10, x10, :lo12:_rail_malloc_ptr
     ldr x11, [x10]
-    add x12, x11, x9            // new bump pointer
-    // Boundary check against _rail_heap_end.
-    adrp x13, _rail_heap_end
-    add x13, x13, :lo12:_rail_heap_end
+    cbz x11, .Lmalloc_newpage_l
+    add x12, x11, x9
+    adrp x13, _rail_malloc_end
+    add x13, x13, :lo12:_rail_malloc_end
     ldr x13, [x13]
     cmp x12, x13
-    b.hi .Lmalloc_mmap_fallback
-    // Fast path: commit and return.
+    b.hi .Lmalloc_newpage_l
     str x12, [x10]
+    add sp, sp, #16
     mov x0, x11
     ret
-.Lmalloc_mmap_fallback:
-    // Slow path: original mmap-per-call. x0 still has original requested size.
-    mov x1, x0
+.Lmalloc_newpage_l:
+    // mmap 4 MB, set _rail_malloc_ptr = base + size, end = base + 4 MB.
     mov x0, #0
-    mov x2, #3                  // PROT_READ|PROT_WRITE
-    mov x3, #0x22               // MAP_PRIVATE|MAP_ANONYMOUS
+    mov x1, #0x400000
+    mov x2, #3
+    mov x3, #0x22                 // MAP_PRIVATE|MAP_ANONYMOUS (Linux)
     mov x4, #-1
     mov x5, #0
-    mov x8, #222                // mmap
+    mov x8, #222                  // mmap
     svc #0
+    cmn x0, #4095
+    b.hs .Lmalloc_fail_l
+    ldr x9, [sp], #16
+    adrp x10, _rail_malloc_ptr
+    add x10, x10, :lo12:_rail_malloc_ptr
+    add x11, x0, x9
+    str x11, [x10]
+    adrp x10, _rail_malloc_end
+    add x10, x10, :lo12:_rail_malloc_end
+    add x11, x0, #0x400000
+    str x11, [x10]
+    ret
+.Lmalloc_large_l:
+    // size > 64K: direct mmap. The chained-malloc chain walker (Lmdrn_l)
+    // will munmap this chunk on arena_reset.
+    mov x1, x9
+    mov x0, #0
+    mov x2, #3
+    mov x3, #0x22
+    mov x4, #-1
+    mov x5, #0
+    mov x8, #222
+    svc #0
+    cmn x0, #4095
+    b.hs .Lmalloc_fail_l
+    ret
+.Lmalloc_fail_l:
+    mov x0, #0
     ret
 
 // ============ fputs (used by dns/log.rail) ============
