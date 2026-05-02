@@ -33,8 +33,8 @@ bin_att="$dest/$(basename "$bin").attestation.json"
 src_att="$dest/$(basename "$src").attestation.json"
 
 echo "attest_release: tag=$tag commit=$short"
-./tools/attest/attest.sh "$bin" "$bin_att"
-./tools/attest/attest.sh "$src" "$src_att"
+./rail_native run tools/attest/attest.rail "$bin" "$bin_att"
+./rail_native run tools/attest/attest.rail "$src" "$src_att"
 
 # Stage the bytes alongside their attestations so publish.sh ships
 # both — attestation without the artifact is unverifiable.

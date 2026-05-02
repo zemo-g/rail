@@ -76,7 +76,7 @@ out["status"] = "ok" if (out["exit_code"] == 0 and out["pass"] == out["total"] a
 print(json.dumps(out, indent=2))
 PY
 
-./tools/attest/attest.sh "$result" "$result.attestation.json"
+./rail_native run tools/attest/attest.rail "$result" "$result.attestation.json"
 
 echo "----"
 cat "$result"

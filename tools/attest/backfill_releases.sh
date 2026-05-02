@@ -40,8 +40,8 @@ for tag in "${tags[@]}"; do
 
   bin_att="$dest/rail_native.attestation.json"
   src_att="$dest/compile.rail.attestation.json"
-  ./tools/attest/attest.sh "$dest/rail_native"  "$bin_att"
-  ./tools/attest/attest.sh "$dest/compile.rail" "$src_att"
+  ./rail_native run tools/attest/attest.rail "$dest/rail_native"  "$bin_att"
+  ./rail_native run tools/attest/attest.rail "$dest/compile.rail" "$src_att"
 
   bin_pulse=$(python3 -c "import json;print(json.load(open('$bin_att'))['witness']['pulse_id'])")
   src_pulse=$(python3 -c "import json;print(json.load(open('$src_att'))['witness']['pulse_id'])")
