@@ -31,14 +31,11 @@ python3 "${DAEMON_PY}" >> /Users/ledaticempire/.ledatic/logs/mhd_packer.log 2>&1
 DAEMON_PID=$!
 trap "kill ${DAEMON_PID} 2>/dev/null" EXIT
 
-# The Rail beacon shells out to /tmp/mhd_beacon/run_packer once per
-# frame.  This shim now just signals the daemon — open + write 2 bytes
-# + close, ~1 ms vs the previous 50 ms python startup.
-cat > /tmp/mhd_beacon/run_packer <<'EOF'
-#!/bin/sh
-echo 1 > /tmp/mhd_beacon/ready
-EOF
-chmod +x /tmp/mhd_beacon/run_packer
+# The Rail beacon used to shell out to /tmp/mhd_beacon/run_packer once
+# per frame; that shim is no longer used since v3.9.0 — the beacon now
+# write_files the FIFO directly to avoid the per-frame fork+exec
+# (which leaked ~135 KB/s through macOS's slow VM-decommit on child
+# exit). The daemon still drains /tmp/mhd_beacon/ready the same way.
 
 cd "${RAIL_DIR}"
 
