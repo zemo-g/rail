@@ -33,8 +33,16 @@ bin_att="$dest/$(basename "$bin").attestation.json"
 src_att="$dest/$(basename "$src").attestation.json"
 
 echo "attest_release: tag=$tag commit=$short"
-./rail_native run tools/attest/attest.rail "$bin" "$bin_att"
-./rail_native run tools/attest/attest.rail "$src" "$src_att"
+# Compile attest.rail once, then run the binary twice. Each
+# `./rail_native run` recompile costs ~20s; doing it once saves ~half
+# the wall time on the release-attest pipeline.
+attest_bin=$(mktemp -t attest.XXXXXX)
+trap 'rm -f "$attest_bin"' EXIT
+./rail_native tools/attest/attest.rail >/dev/null
+cp -p /tmp/rail_out "$attest_bin"
+codesign --sign - --force "$attest_bin" >/dev/null 2>&1 || true
+"$attest_bin" "$bin" "$bin_att"
+"$attest_bin" "$src" "$src_att"
 
 # Stage the bytes alongside their attestations so publish.sh ships
 # both — attestation without the artifact is unverifiable.
