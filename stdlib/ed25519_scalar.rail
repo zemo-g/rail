@@ -1,0 +1,195 @@
+-- stdlib/ed25519_scalar.rail — scalar arithmetic mod L for Ed25519 sign.
+--
+-- L = 2^252 + 27742317777372353535851937790883648493
+--   = 0x1000000000000000000000000000000014DEF9DEA2F79CD65812631A5CF5D3ED
+--
+-- Public API (all inputs/outputs are 32- or 64-byte little-endian arrays
+-- of ints in [0,255], allocated with arr_new):
+--
+--   sc_reduce  bytes64           -> bytes32   -- bytes64 mod L (RFC 8032 §5.1.6 step 5/7)
+--   sc_muladd  a32 b32 c32       -> bytes32   -- (a*b + c) mod L
+--
+-- Design choice: schoolbook multi-precision in 8-bit byte limbs, with a
+-- shift-and-subtract reduction. ~O(N^2) but N is tiny (≤65 bytes) and we
+-- only sign at attestation-cadence (seconds-to-minutes apart). Trades
+-- speed for "obviously correct against a reference" — every step can be
+-- diffed against a 5-line Python reference.
+--
+-- Caller must NOT mutate the returned buffer; it's the live result.
+--
+-- Loaded by stdlib/ed25519.rail's signer path. Verify-only callers can
+-- skip this file — the surface stays opt-in.
+
+-- ── L as 32-byte LE constant ──────────────────────────────────────────
+sc_l_bytes _ = hex_to_bytes "edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010"
+
+-- ── Multi-precision byte primitives ───────────────────────────────────
+
+-- a += b, both n-byte LE buffers. Returns carry-out (0 or 1).
+sc_bn_add_inplace a b n =
+  sc_bn_add_loop a b n 0 0
+
+sc_bn_add_loop a b n i carry =
+  if i >= n then carry
+  else
+    let s = arr_get a i + arr_get b i + carry
+    let _ = arr_set a i (bit_and s 255)
+    sc_bn_add_loop a b n (i + 1) (shr s 8)
+
+-- a -= b, both n-byte LE buffers. Returns borrow (0 or 1). Caller is
+-- responsible for ensuring a >= b before calling (use sc_bn_ge).
+sc_bn_sub_inplace a b n =
+  sc_bn_sub_loop a b n 0 0
+
+sc_bn_sub_loop a b n i borrow =
+  if i >= n then borrow
+  else
+    let d = arr_get a i - arr_get b i - borrow
+    if d < 0 then
+      let _ = arr_set a i (d + 256)
+      sc_bn_sub_loop a b n (i + 1) 1
+    else
+      let _ = arr_set a i d
+      sc_bn_sub_loop a b n (i + 1) 0
+
+-- Returns 1 if a >= b (n-byte LE), else 0.
+sc_bn_ge a b n =
+  sc_bn_ge_loop a b (n - 1)
+
+sc_bn_ge_loop a b i =
+  if i < 0 then 1   -- equal
+  else
+    let ai = arr_get a i
+    let bi = arr_get b i
+    if ai > bi then 1
+    else if ai < bi then 0
+    else sc_bn_ge_loop a b (i - 1)
+
+-- Shift n-byte LE buffer left by 1 bit, in-place. Returns the bit shifted
+-- out of the top.
+sc_bn_shl1_inplace a n =
+  sc_bn_shl1_loop a n 0 0
+
+sc_bn_shl1_loop a n i carry =
+  if i >= n then carry
+  else
+    let v = (shl (arr_get a i) 1) + carry
+    let _ = arr_set a i (bit_and v 255)
+    sc_bn_shl1_loop a n (i + 1) (shr v 8)
+
+-- Shift n-byte LE buffer right by 1 bit, in-place. Bit shifted in from
+-- the top is 0.
+sc_bn_shr1_inplace a n =
+  sc_bn_shr1_from_top a (n - 1) 0
+
+sc_bn_shr1_from_top a i carry =
+  if i < 0 then 0
+  else
+    let v = arr_get a i
+    let new_v = (shr v 1) + (shl carry 7)
+    let _ = arr_set a i (bit_and new_v 255)
+    sc_bn_shr1_from_top a (i - 1) (bit_and v 1)
+
+-- Schoolbook multiply: out[0..(alen+blen)] = a * b. out must be pre-zeroed.
+sc_bn_mul a alen b blen out =
+  sc_bn_mul_outer a alen b blen out 0
+
+sc_bn_mul_outer a alen b blen out i =
+  if i >= alen then 0
+  else
+    let _ = sc_bn_mul_inner a b blen out i 0 0
+    sc_bn_mul_outer a alen b blen out (i + 1)
+
+sc_bn_mul_inner a b blen out i j carry =
+  if j >= blen then
+    -- propagate final carry into out[i+blen], chained if needed
+    let _ = sc_bn_mul_carry_propagate out (i + blen) carry
+    0
+  else
+    let prod = (arr_get a i) * (arr_get b j) + (arr_get out (i + j)) + carry
+    let _ = arr_set out (i + j) (bit_and prod 255)
+    sc_bn_mul_inner a b blen out i (j + 1) (shr prod 8)
+
+sc_bn_mul_carry_propagate out idx carry =
+  if carry == 0 then 0
+  else
+    let s = (arr_get out idx) + carry
+    let _ = arr_set out idx (bit_and s 255)
+    sc_bn_mul_carry_propagate out (idx + 1) (shr s 8)
+
+-- Copy n bytes from src[0..n] to dst[0..n].
+sc_bn_copy src dst n =
+  sc_bn_copy_loop src dst n 0
+
+sc_bn_copy_loop src dst n i =
+  if i >= n then 0
+  else
+    let _ = arr_set dst i (arr_get src i)
+    sc_bn_copy_loop src dst n (i + 1)
+
+-- Zero n bytes of buf.
+sc_bn_zero buf n =
+  sc_bn_zero_loop buf n 0
+
+sc_bn_zero_loop buf n i =
+  if i >= n then 0
+  else
+    let _ = arr_set buf i 0
+    sc_bn_zero_loop buf n (i + 1)
+
+-- ── sc_reduce_bytes_n: input mod L, where input is n-byte LE ──────────
+--
+-- Method: classical shift-and-subtract long division.
+--   Build shifted_L = L << max_shift in an n-byte buffer (with L's top
+--   bit landing in input's top bit position).  Then for k = max_shift
+--   down to 0, conditionally subtract shifted_L if working >= shifted_L,
+--   then shift shifted_L right by 1 bit.  After the loop, working is in
+--   [0, L), i.e. the bottom 32 bytes are the result and bytes 32.. are
+--   guaranteed zero.
+--
+-- L's top bit is at position 252 (bit 4 of byte 31). For an n-byte input
+-- (top bit at most at position 8n-1), max_shift = (8n - 1) - 252 = 8n - 253.
+sc_reduce_bytes_n input n =
+  let working = arr_new n 0
+  let _ = sc_bn_copy input working n
+  let shifted = arr_new n 0
+  let l = sc_l_bytes 0
+  let _ = sc_bn_copy l shifted 32
+  -- Pre-shift L up by max_shift bits.
+  let max_shift = 8 * n - 253
+  let _ = sc_bn_shl_n_times shifted n max_shift
+  let _ = sc_reduce_loop working shifted n max_shift
+  -- Result: bottom 32 bytes of working.
+  let result = arr_new 32 0
+  let _ = sc_bn_copy working result 32
+  result
+
+sc_bn_shl_n_times a n k =
+  if k <= 0 then 0
+  else
+    let _ = sc_bn_shl1_inplace a n
+    sc_bn_shl_n_times a n (k - 1)
+
+sc_reduce_loop working shifted n k =
+  if k < 0 then 0
+  else
+    let _ = if sc_bn_ge working shifted n == 1 then sc_bn_sub_inplace working shifted n else 0
+    let _ = sc_bn_shr1_inplace shifted n
+    sc_reduce_loop working shifted n (k - 1)
+
+-- ── Public API ────────────────────────────────────────────────────────
+
+-- sc_reduce: 64-byte LE input -> 32-byte LE (input mod L).
+sc_reduce input =
+  sc_reduce_bytes_n input 64
+
+-- sc_muladd: (a*b + c) mod L. All inputs are 32-byte LE; output is 32-byte LE.
+sc_muladd a b c =
+  let prod = arr_new 64 0
+  let _ = sc_bn_mul a 32 b 32 prod
+  -- Add c (32 bytes) into low half of prod (64 bytes). Need to extend the
+  -- carry chain through the high half.
+  let c64 = arr_new 64 0
+  let _ = sc_bn_copy c c64 32
+  let _ = sc_bn_add_inplace prod c64 64
+  sc_reduce_bytes_n prod 64
