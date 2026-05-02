@@ -1,0 +1,205 @@
+-- tools/attest/attest.rail — Rail-native attestation orchestrator.
+--
+-- Drop-in replacement for tools/attest/attest.sh on the Mac side.  The
+-- Pi-side signer (sign_attestation.sh on fleet0) is still invoked via
+-- SSH; replacing it with a pure-Rail Pi-hosted signer is gated on the
+-- Linux ARM64 cross-compile fix (see rail-linux-cross-compile-broken.md).
+--
+-- What's pure Rail now (was bash + python + curl):
+--   - SHA-256 of the input bytes (read_file_bytes + sha_process_from)
+--   - HTTPS GET https://ledatic.org/entropy/pulse (https_get_url)
+--   - JSON parsing of the pulse body (parse_json + json_get)
+--   - JSON construction of the outer attestation object
+--   - Output to <input>.attestation.json
+--
+-- What still shells out:
+--   - `ssh -o ConnectTimeout=5 zemog@fleet0 sign_attestation.sh ...`
+--     (one-shot capture; pure-Rail SSH is out of scope)
+--   - `date -u +%s` for created_at (Rail has no time builtin yet)
+--
+-- Usage: ./rail_native run tools/attest/attest.rail <input> [output]
+
+import "stdlib/https_strict.rail"
+-- https_strict transitively pulls in everything we need: tls13_client →
+-- hkdf → hmac → sha256 → bytes (for be32_write / bytes_to_hex), plus
+-- x25519, sha512, dns. Importing any of those again here causes
+-- duplicate-symbol link errors, so the import surface is narrow.
+import "stdlib/json.rail"
+import "stdlib/file.rail"
+import "stdlib/env.rail"
+
+beacon_url_default _ = "https://ledatic.org/entropy/pulse"
+witness_host_default _ = "zemog@100.87.231.45"
+signer_path_default _ = "/home/zemog/.ledatic/witness/sign_attestation.sh"
+
+env_or env_key fallback =
+  let v = getenv env_key
+  if length (chars v) == 0 then fallback else v
+
+-- ── SHA-256 over a file's raw bytes (handles NUL bytes via read_file_bytes).
+-- Same pattern as verify.rail's local helper; kept local so attest.rail
+-- has no hidden coupling to verify's internals.
+
+sha256_hex_file path =
+  let bytes = read_file_bytes path
+  let n = arr_len bytes
+  let h = sha256_h_init 0
+  let k_tbl = sha256_k_table 0
+  let state = arr_new 8 0
+  let end = sha_process_from bytes n h state k_tbl 0
+  let _ = sha_final_block bytes n h state k_tbl end
+  let out = arr_new 32 0
+  let _ = be32_write out 0 (arr_get h 0)
+  let _ = be32_write out 4 (arr_get h 1)
+  let _ = be32_write out 8 (arr_get h 2)
+  let _ = be32_write out 12 (arr_get h 3)
+  let _ = be32_write out 16 (arr_get h 4)
+  let _ = be32_write out 20 (arr_get h 5)
+  let _ = be32_write out 24 (arr_get h 6)
+  let _ = be32_write out 28 (arr_get h 7)
+  bytes_to_hex out 32
+
+file_size_bytes path =
+  arr_len (read_file_bytes path)
+
+-- ── basename: strip leading directories ──────────────────────────────
+basename path =
+  let parts = str_split "/" path
+  basename_last parts ""
+
+basename_last parts last =
+  if parts == [] then last
+  else basename_last (tail parts) (head parts)
+
+-- ── Strip trailing newlines/whitespace (signer prints a trailing \n) ──
+trim_trailing s =
+  let cs = chars s
+  let rev = reverse cs
+  let trimmed = drop_ws rev
+  join "" (reverse trimmed)
+
+drop_ws cs =
+  if cs == [] then cs
+  else
+    let c = head cs
+    if c == "\n" then drop_ws (tail cs)
+    else if c == "\r" then drop_ws (tail cs)
+    else if c == " " then drop_ws (tail cs)
+    else if c == "\t" then drop_ws (tail cs)
+    else cs
+
+-- ── Beacon fetch ─────────────────────────────────────────────────────
+
+-- Use leaf-only TLS for the beacon GET. The pulse endpoint is public
+-- and unauthenticated; chain validation is overhead, and the strict
+-- variant burns minutes parsing the system trust store on first call
+-- (observed wedging at ~99% CPU in pem_load_trust_store).
+--
+-- Note: the body returned by https_get_url_unsafe_noverify is the FULL
+-- HTTP response (headers + blank line + body). Strip headers before
+-- parsing JSON.
+fetch_pulse url =
+  let result = https_get_url_unsafe_noverify url
+  let (status, raw) = result
+  if status != 200 then ("", "", "")
+  else parse_pulse (strip_http_headers raw)
+
+-- Rail's `\r` string literal is not escaped (it lands as backslash+r);
+-- synthesize CRLF + double-CRLF at runtime via char_from_int.
+http_crlf2 _ = cat [char_from_int 13, char_from_int 10, char_from_int 13, char_from_int 10]
+
+strip_http_headers raw =
+  let sep = http_crlf2 0
+  let i = str_find sep raw
+  if i < 0 then raw
+  else str_sub raw (i + 4) (length (chars raw) - i - 4)
+
+parse_pulse body =
+  let p = parse_json body
+  let pid = show (json_int (json_get p "pulse_id"))
+  let vhex = json_str (json_get p "value_hex")
+  let ts = json_str (json_get p "timestamp_utc")
+  (pid, vhex, ts)
+
+-- ── Pi signer over SSH ───────────────────────────────────────────────
+--
+-- Returns the raw JSON the Pi printed (trailing whitespace trimmed).
+-- Empty string on any failure; caller treats that as a hard error.
+
+sign_via_pi witness_host signer_path digest pulse_id value_hex =
+  let cmd = cat [
+        "ssh -o ConnectTimeout=5 -o BatchMode=yes ",
+        witness_host, " ",
+        signer_path, " ",
+        digest, " ", pulse_id, " ", value_hex
+      ]
+  trim_trailing (shell cmd)
+
+-- ── Outer JSON build (matches attest.sh output schema byte-for-byte
+--    in field order; whitespace is JSON, not significant). ──────────
+
+build_outer_json name size digest pulse_id value_hex beacon_ts witness_inner created_at beacon_url =
+  cat [
+    "{\n",
+    "  \"kind\": \"ledatic.attestation\",\n",
+    "  \"version\": 1,\n",
+    "  \"artifact\": {\n",
+    "    \"name\": \"", name, "\",\n",
+    "    \"size_bytes\": ", show size, ",\n",
+    "    \"sha256\": \"", digest, "\"\n",
+    "  },\n",
+    "  \"beacon\": {\n",
+    "    \"url\": \"", beacon_url, "\",\n",
+    "    \"pulse_id\": ", pulse_id, ",\n",
+    "    \"value_hex\": \"", value_hex, "\",\n",
+    "    \"timestamp_utc\": \"", beacon_ts, "\"\n",
+    "  },\n",
+    "  \"witness\": ", witness_inner, ",\n",
+    "  \"created_at\": ", show created_at, "\n",
+    "}\n"
+  ]
+
+-- `date -u +%s` shell-out for the wallclock created_at.  Rail has no
+-- time builtin yet.  We'd be tempted to use the beacon's unix_timestamp
+-- but that's an upper bound on artifact creation, not the time of the
+-- attestation build — they're different timestamps in attest.sh.
+now_unix _ =
+  parse_int (trim_trailing (shell "date -u +%s"))
+
+-- ── Main ─────────────────────────────────────────────────────────────
+
+attest input out =
+  let beacon_url = env_or "BEACON_URL" (beacon_url_default 0)
+  let witness_host = env_or "WITNESS_HOST" (witness_host_default 0)
+  let signer_path = env_or "SIGNER" (signer_path_default 0)
+  let digest = sha256_hex_file input
+  let size = file_size_bytes input
+  let pulse = fetch_pulse beacon_url
+  let (pulse_id, value_hex, beacon_ts) = pulse
+  if length (chars pulse_id) == 0 then
+    let _ = print (cat ["beacon unreachable: ", beacon_url])
+    4
+  else attest_step2 input out beacon_url witness_host signer_path digest size pulse_id value_hex beacon_ts
+
+attest_step2 input out beacon_url witness_host signer_path digest size pulse_id value_hex beacon_ts =
+  let inner = sign_via_pi witness_host signer_path digest pulse_id value_hex
+  if length (chars inner) == 0 then
+    let _ = print "witness signer returned nothing"
+    5
+  else
+    let name = basename input
+    let created_at = now_unix 0
+    let body = build_outer_json name size digest pulse_id value_hex beacon_ts inner created_at beacon_url
+    let _ = write_file out body
+    let _ = print (cat ["attestation: ", out, "  pulse_id=", pulse_id])
+    0
+
+main =
+  let user_args = tail args
+  if length user_args < 1 then
+    let _ = print "usage: attest.rail <input_path> [output_path]"
+    2
+  else
+    let input = head user_args
+    let out = if length user_args >= 2 then head (tail user_args) else cat [input, ".attestation.json"]
+    attest input out
