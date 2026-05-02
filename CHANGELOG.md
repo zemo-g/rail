@@ -2,6 +2,58 @@
 
 All notable changes to Rail are documented here.
 
+## v3.10.0 — 2026-05-02 — Path B: Rail-native Pi signer + Linux backend complete
+
+The attestation pipeline is now Rail-native end-to-end including the
+Pi-side HTTP signer. The hot path no longer touches Python at all.
+Linux ARM64 cross-compile produces useful binaries beyond hello-world.
+
+- `tools/attest/pi_sign_server.rail` — HTTP signer on fleet0:9102.
+  Replaces the ~110 LOC Python `pi_sign_server.py`. Same wire format
+  (X-Sign-Token + JSON `{digest, pulse_id, value_hex}`), same backing
+  shell signer (`sign_attestation.sh`). Cross-compiled to a 118 KB
+  ELF, deployed at `/home/zemog/.ledatic/witness/pi_sign_server_rail`,
+  systemd ExecStart updated. End-to-end verified: attest.rail (Mac)
+  → POST /sign (Pi Rail) → sign_attestation.sh → JSON → verify.rail
+  ok.
+
+- `linux_libc.s` — three real implementations replacing stubs that
+  silently did nothing:
+  - `_atof`: real number parser (sign + integer + fraction +
+    e±NN exponent). The previous stub returned 0.0; every Rail float
+    literal cross-compiled to Linux read as zero.
+  - `_snprintf .Lsnpf_float`: real %.15g-style formatter (sign +
+    zero + multiply-by-1e6 + frinta + fcvtzs + digit-extract +
+    decimal-point insertion + trailing-zero trim). Previous stub
+    wrote literal "0" for any float.
+  - `_rail_print_float`: Linux-ABI clone of the Mac stub, using
+    `svc #0 + x8` instead of `svc #0x80 + x16`. Strip awk extended.
+  - `_rail_shell`: full Linux clone+pipe2+execve+wait4 replacement
+    for the Mac fork+pipe+execve+wait7 stub. Strip awk extended.
+
+- `compile.rail` — three Linux-backend fixes:
+  - `_start` wrapper now computes envp = sp + 8*(argc+2) and stores
+    it in x2 before bl _main, AFTER `_rail_arena_init` returns
+    (which clobbers x0..x2 itself). Without this, every Linux
+    binary spawned shells with an empty environment.
+  - Strip awk pattern for `__mod_init_func` is now anchored to ^
+    so it doesn't accidentally match its own embedded string literal
+    when compile.rail cross-compiles itself.
+  - 8 user-facing runtime asm stubs (rprint, rshell, rreadfile,
+    rreadfilebytes, rstr_sub, rstr_replace, rshowf, rprintf)
+    rerouted from bare `_malloc` to `_rail_chained_malloc` so
+    arena_reset reclaims their temp buffers.
+
+Linux soak (5/5 pass on fleet0):
+  print_float (3.14159 * 2.0)         → 6.28318
+  shell "echo from-shell-on-linux"    → from-shell-on-linux
+  read_file round-trip                → contents OK
+  str_sub "abcdefghij" 2 5            → cdefg
+  str_replace "world" "Pi" "..."      → hello Pi today
+
+`./rail_native test = 137/137` Mac side. Self-host fixed point
+preserved (only Mach-O codesign blob differs round-to-round).
+
 ## v3.9.0 — 2026-05-02 — Ed25519 sign + Rail-native attest pipeline
 
 The attestation pipeline that v3.8.0 introduced is now Rail-native
