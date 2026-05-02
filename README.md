@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="#releases"><img src="https://img.shields.io/badge/v3.9.0-Ed25519%20sign%20%2B%20rail--native%20attest-ff5500?style=for-the-badge" alt="v3.9.0"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/v3.10.0-Path%20B%20%C2%B7%20rail--native%20Pi%20signer-ff5500?style=for-the-badge" alt="v3.10.0"></a>
 </p>
 
 <p align="center">
@@ -168,6 +168,10 @@ Tail-recursive loops match C `-O2` (5 instructions per iteration). The full arch
 
 ## Releases
 
+### v3.10.0 — 2026-05-02 — *Path B: Rail-native Pi signer + Linux backend complete*
+
+The attestation pipeline is now Rail-native end-to-end *including* the Pi-side HTTP signer.  The hot path no longer touches Python at all.  `tools/attest/pi_sign_server.rail` is an HTTP signer on `fleet0:9102` that replaces the ~110 LOC Python `pi_sign_server.py` with a 118 KB ELF — same wire format (`X-Sign-Token` + JSON `{digest, pulse_id, value_hex}`), same backing shell signer, end-to-end verified.  Linux ARM64 cross-compile gains real implementations for three previously-stub'd primitives in `linux_libc.s`: `_atof` (real number parser; the previous stub returned `0.0` for every Rail float literal cross-compiled to Linux), `_snprintf` `%.15g` formatter (real digit-extract; the previous stub wrote literal `"0"` for any float), and `_rail_print_float` (Linux-ABI clone of the Mac stub).  137/137 green; byte-identical self-bootstrap verified.
+
 ### v3.9.0 — 2026-05-02 — *Ed25519 sign + Rail-native attest pipeline*
 
 The attestation pipeline that v3.8.0 introduced is now Rail-native end-to-end.  `stdlib/ed25519_scalar.rail` implements `sc_reduce` (64-byte mod L) and `sc_muladd` ((a·b + c) mod L) in pure Rail; 8/8 vectors pass including SHA-512('') mod L matching the Python oracle byte-for-byte.  `stdlib/ed25519_sign.rail` implements full RFC 8032 §5.1.6 — RFC §A.4 vector 1 byte-identical for both pk and sig + round-trip verify=1, PASS on first compile.  `tools/attest/attest.rail` is the Rail-native attestation orchestrator (zero shell-out on the request path); `tools/attest/pi_sign_server.py` + `com.ledatic.attest_sign.service` replace the per-attest SSH dance with an HTTP `/sign` endpoint on `fleet0:9102` over Tailscale — release-attest wall time 49 s → 27 s.  Linux ARM64 cross-compile fixed: `./rail_native linux foo.rail` produces working ELF; hello/fact/fold run on Pi.  Plasma beacon RSS leak fixed: 5 GB / 31 GB swap → 21 MB / 90 s.  137/137 green; byte-identical self-bootstrap verified.
@@ -246,8 +250,8 @@ Verify a release in five lines:
 
 ```bash
 curl -sf https://ledatic.org/attest/verify.sh -o /tmp/v.sh && chmod +x /tmp/v.sh
-curl -sf https://ledatic.org/releases/v3.9.0/rail_native             -o /tmp/rn
-curl -sf https://ledatic.org/releases/v3.9.0/rail_native.attestation.json -o /tmp/rn.att.json
+curl -sf https://ledatic.org/releases/v3.10.0/rail_native             -o /tmp/rn
+curl -sf https://ledatic.org/releases/v3.10.0/rail_native.attestation.json -o /tmp/rn.att.json
 /tmp/v.sh /tmp/rn /tmp/rn.att.json
 # → ok  artifact=rail_native  pulse_id=…  pk_fp=cac5f21a70564aeb
 ```
@@ -258,7 +262,7 @@ control at [ledatic.org/system](https://ledatic.org/system).
 
 ## Honest limits
 
-Things Rail v3.9.0 **doesn't** do, so you don't hit them as surprises:
+Things Rail v3.10.0 **doesn't** do, so you don't hit them as surprises:
 
 - TLS ships one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one ECDHE group (`x25519`), and a fixed sig-alg set: `rsa_pss_rsae_sha256 | rsa_pkcs1_sha256 | ecdsa_secp256r1_sha256 | ecdsa_secp384r1_sha384 | ecdsa_secp521r1_sha512` plus `ed25519` (verify-only, in stdlib). Modern CDN fronts work; legacy servers may not.
 - No TLS session resumption, no 0-RTT, no client certificates. Keep-alive landed in v3.3.0 (multiple GETs over one socket).
