@@ -242,6 +242,28 @@ check_beacon() {
   fi
 }
 
+# ── check 5b: published artifact integrity (antibodies) ────────────
+# Asks: does each /releases/<tag>/<file> match its signed manifest's
+# claimed sha256, and does the manifest's git.commit hold a blob with
+# the same sha256? Catches CDN tampering, KV corruption, and lying
+# manifests. Empty MISMATCH = the public release tree is honest.
+check_published_integrity() {
+  log "check 5b: published binary integrity (antibodies)"
+  local out
+  out=$("$REPO/tools/attest/verify_published.sh" 2>&1)
+  local summary
+  summary=$(echo "$out" | grep '^summary:' | head -1 | sed 's/^summary: //')
+  local n_mismatch
+  n_mismatch=$(echo "$out" | grep -c '^  TAMPER ' || true)
+  if [ "$n_mismatch" -eq 0 ]; then
+    ok "released artifacts honest ($summary)"
+  else
+    local detail
+    detail=$(echo "$out" | grep -A1 '^  TAMPER ' | head -10 | tr '\n' ' ')
+    alert "TAMPER DETECTED in $n_mismatch published release(s) — $detail"
+  fi
+}
+
 # ── check 5: witness fresh + chain verified ────────────────────────
 check_witness() {
   log "check 5: /witness/fleet0/latest"
@@ -366,6 +388,7 @@ check_release_coverage
 check_build_freshness
 check_beacon
 check_witness
+check_published_integrity
 
 # Persist last-audit state so a consumer (heal.sh, /system page) can read it.
 emit_json > "$DRIFT_DIR/last_audit.json"
