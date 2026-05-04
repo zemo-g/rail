@@ -117,8 +117,20 @@ check_tag_vs_site() {
   done
   if [ ${#stale_pages[@]} -eq 0 ]; then
     ok "site banner up to date ($latest_tag across all 8 pages)"
+    return
+  fi
+  # Drift detected — open an auto-PR (or report the existing one).
+  if [ "$DRY" = "1" ]; then
+    alert "site banner stale: ${stale_pages[*]} (latest tag is $latest_tag) — would open PR via site_bump_pr.sh"
+    return
+  fi
+  log "site banner drift detected — opening PR for $latest_tag"
+  local pr_url
+  pr_url=$("$REPO/tools/attest/site_bump_pr.sh" "$latest_tag" 2>&1 | tail -1)
+  if [[ "$pr_url" =~ ^https://github.com/.*pull/[0-9]+$ ]]; then
+    fix "site banner bumped via PR: $pr_url"
   else
-    alert "site banner stale: ${stale_pages[*]} (latest tag is $latest_tag) — open PR with: ./tools/attest/drift_audit.sh --bump-pr"
+    alert "site banner stale (${#stale_pages[@]} pages); auto-PR FAILED — last line: $pr_url"
   fi
 }
 
