@@ -49,6 +49,9 @@ SLACK_TOKEN_FILE=${SLACK_TOKEN_FILE:-$HOME/.fleet/slack_token}
 SLACK_CHANNEL=${SLACK_CHANNEL:-D0ATHQ1BQD7}   # brockbro2 DM
 DRIFT_DIR=${DRIFT_DIR:-$HOME/.ledatic/drift}
 SITE_PAGES=(index.html rail.html entropy.html fleet.html manifesto.html plasma.html now.html changelog.html)
+# Tags that legitimately predate the rail_native binary in the repo —
+# nothing to attest. Skip silently rather than alert weekly.
+PRE_HISTORIC_TAGS=(v0.6.0)
 
 mkdir -p "$DRIFT_DIR"
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -122,11 +125,17 @@ check_tag_vs_site() {
 # ── check 2: every git tag has /releases/<tag>/ published ──────────
 check_release_coverage() {
   log "check 2: release attest coverage"
-  local missing=() unpublishable=()
+  local missing=() unpublishable=() skipped=0
   local all_tags
   all_tags=$(cd "$REPO" && git tag | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
   local total=0
   for tag in $all_tags; do
+    # Skip pre-historic tags (binary not in repo at that tag).
+    local skip=0
+    for pre in "${PRE_HISTORIC_TAGS[@]}"; do
+      [ "$tag" = "$pre" ] && skip=1 && break
+    done
+    [ "$skip" = "1" ] && skipped=$((skipped + 1)) && continue
     total=$((total + 1))
     local code
     code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 \
@@ -139,7 +148,11 @@ check_release_coverage() {
     fi
   done
   if [ ${#missing[@]} -eq 0 ] && [ ${#unpublishable[@]} -eq 0 ]; then
-    ok "releases: all $total tags published"
+    if [ "$skipped" -gt 0 ]; then
+      ok "releases: all $total tags published ($skipped pre-historic skipped)"
+    else
+      ok "releases: all $total tags published"
+    fi
     return
   fi
   if [ ${#missing[@]} -gt 0 ]; then
@@ -248,29 +261,43 @@ check_witness() {
 }
 
 # ── slack ──────────────────────────────────────────────────────────
+# Direct to slack.com (TLS 1.3 via macOS LibreSSL). The legacy socat
+# proxy at :8444 is from the pre-Rail-TLS era and currently has a TLS
+# version mismatch with modern Slack — bypassing it altogether.
 slack_post() {
   local msg="$1"
   [ "$DRY" = "1" ] && { log "[DRY] would slack: $msg"; return; }
   [ -s "$SLACK_TOKEN_FILE" ] || { log "no slack token; skip"; return; }
   local token
   token=$(tr -d '\n' < "$SLACK_TOKEN_FILE")
-  curl -s --max-time 8 -X POST "https://localhost:8444/api/chat.postMessage" \
-    --insecure \
+  local resp
+  resp=$(curl -s --max-time 8 -X POST "https://slack.com/api/chat.postMessage" \
     -H "Authorization: Bearer $token" \
     -H "Content-Type: application/json; charset=utf-8" \
     -d "$(jq -nc --arg ch "$SLACK_CHANNEL" --arg t "$msg" \
-        '{channel:$ch, text:$t, mrkdwn:true}')" >/dev/null 2>&1 || \
-    log "slack post failed (proxy down?)"
+        '{channel:$ch, text:$t, mrkdwn:true}')" 2>/dev/null)
+  if echo "$resp" | grep -q '"ok":true'; then
+    log "slack ok"
+  else
+    local err
+    err=$(echo "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error","unknown"))' 2>/dev/null || echo "no_response")
+    log "slack post failed: $err"
+  fi
 }
 
 # ── output ─────────────────────────────────────────────────────────
+# Bash gotcha: with `set -u`, `"${arr[@]}"` errors on an empty array.
+# We use the `${arr[@]+"${arr[@]}"}` idiom or guard with length checks.
+
 emit_text() {
   echo "[drift_audit $NOW]"
   echo "  ─── ok ─────────────────────────────────────"
-  for o in "${OK[@]}";     do echo "    ok    $o"; done
+  if [ ${#OK[@]} -gt 0 ]; then
+    for o in "${OK[@]}"; do echo "    ok    $o"; done
+  fi
   if [ ${#FIXED[@]} -gt 0 ]; then
     echo "  ─── auto-fixed ────────────────────────────"
-    for f in "${FIXED[@]}";  do echo "    fixed $f"; done
+    for f in "${FIXED[@]}"; do echo "    fixed $f"; done
   fi
   if [ ${#ALERTS[@]} -gt 0 ]; then
     echo "  ─── alerts ────────────────────────────────"
@@ -280,17 +307,31 @@ emit_text() {
   echo "    ${#OK[@]} ok · ${#FIXED[@]} fixed · ${#ALERTS[@]} alert"
 }
 
+# JSON emit — feed buckets to python as TSV lines on stdin so we don't
+# fight shell-quote rules inside a python -c string.
 emit_json() {
-  python3 -c "
-import json
+  {
+    [ ${#OK[@]}     -gt 0 ] && printf 'OK\t%s\n'    "${OK[@]}"
+    [ ${#FIXED[@]}  -gt 0 ] && printf 'FIXED\t%s\n' "${FIXED[@]}"
+    [ ${#ALERTS[@]} -gt 0 ] && printf 'ALERT\t%s\n' "${ALERTS[@]}"
+  } | python3 -c '
+import sys, json
+ts = sys.argv[1]
+n_ok, n_fix, n_alert = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+buckets = {"OK": [], "FIXED": [], "ALERT": []}
+for line in sys.stdin.read().splitlines():
+    if not line: continue
+    b, _, m = line.partition("\t")
+    if m and b in buckets:
+        buckets[b].append(m)
 print(json.dumps({
-    'ts': '$NOW',
-    'ok': $(printf '%s\n' "${OK[@]}" | jq -Rsc 'split(\"\n\") | map(select(. != \"\"))'),
-    'fixed': $(printf '%s\n' "${FIXED[@]}" | jq -Rsc 'split(\"\n\") | map(select(. != \"\"))'),
-    'alerts': $(printf '%s\n' "${ALERTS[@]}" | jq -Rsc 'split(\"\n\") | map(select(. != \"\"))'),
-    'summary': {'ok': ${#OK[@]}, 'fixed': ${#FIXED[@]}, 'alerts': ${#ALERTS[@]}},
+    "ts": ts,
+    "ok": buckets["OK"],
+    "fixed": buckets["FIXED"],
+    "alerts": buckets["ALERT"],
+    "summary": {"ok": n_ok, "fixed": n_fix, "alerts": n_alert},
 }, indent=2))
-"
+' "$NOW" "${#OK[@]}" "${#FIXED[@]}" "${#ALERTS[@]}"
 }
 
 build_slack_msg() {
