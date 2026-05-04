@@ -40,15 +40,21 @@ rotate_if_needed() {
   [ "$sz" -lt "$ROTATE_AT" ] && return 0
   local ts n path
   ts=$(date -u +%Y%m%dT%H%M%SZ)
-  n=$(ls "$WITNESS_DIR"/log.*.jsonl.gz 2>/dev/null | wc -l)
+  # find (not ls glob): an empty glob makes `ls` either fail under set -e
+  # + pipefail (no nullglob) or silently list cwd (with nullglob). find
+  # handles "no matches" cleanly. Earned 2026-05-04 after the rotation
+  # bug crashed the Pi witness in a loop for 80 h.
+  n=$(find "$WITNESS_DIR" -maxdepth 1 -name 'log.*.jsonl.gz' 2>/dev/null | wc -l)
   path="$WITNESS_DIR/log.${n}.${ts}.jsonl"
   mv "$LOG" "$path"
   gzip -9 "$path"
   : > "$LOG"
-  # prune
-  # shellcheck disable=SC2012
-  ls -t "$WITNESS_DIR"/log.*.jsonl.gz 2>/dev/null \
+  # prune — keep newest ROTATE_KEEP, drop the rest. find -printf '%T@ %p'
+  # gives mtime-sortable output that survives an empty match.
+  find "$WITNESS_DIR" -maxdepth 1 -name 'log.*.jsonl.gz' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn \
     | tail -n +"$((ROTATE_KEEP + 1))" \
+    | cut -d' ' -f2- \
     | xargs -r rm -f
 }
 
