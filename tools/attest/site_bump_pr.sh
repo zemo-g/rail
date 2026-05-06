@@ -133,16 +133,32 @@ log "bump $CURRENT -> $VERSION across ${#PAGES[@]} pages"
 # 7. Sed each page. Each pattern is the SPECIFIC banner location, not
 #    a blind global replace — we don't want to retroactively edit
 #    historical changelog cards.
+#
+# In DRY mode we sed onto copies in a tmpdir so the live tree stays
+# untouched. In non-DRY mode we sed in-place on the branched tree.
+SED_DIR="$SITE"
+if [ "$DRY" = "1" ]; then
+  SED_DIR=$(mktemp -d -t site-bump-dry-XXXXXX)
+  for page in "${PAGES[@]}"; do
+    [ -f "$page" ] && cp "$page" "$SED_DIR/$page"
+  done
+fi
+
 sed_in_place() {
-  # macOS-safe in-place: sed -i '' (empty extension)
+  # macOS-safe in-place: sed -i '' (empty extension).
+  # Replacement is escaped: `&` in the replacement is sed's whole-match
+  # backref, and our patterns include literal `&mdash;` / `&middot;`
+  # HTML entities — without escaping, they get expanded to the matched
+  # string and the page is silently corrupted.
   local file="$1" pattern="$2" replacement="$3"
-  sed -i '' "s|$pattern|$replacement|g" "$file"
+  local esc_repl="${replacement//&/\\&}"
+  sed -i '' "s|$pattern|$esc_repl|g" "$SED_DIR/$file"
 }
 
 bumped=0
 for page in "${PAGES[@]}"; do
-  [ -f "$page" ] || continue
-  before=$(grep -c "$CURRENT" "$page" 2>/dev/null || echo 0)
+  [ -f "$SED_DIR/$page" ] || continue
+  before=$(grep -c "$CURRENT" "$SED_DIR/$page" 2>/dev/null || echo 0)
   [ "$before" = "0" ] && continue
 
   case "$page" in
@@ -169,7 +185,7 @@ for page in "${PAGES[@]}"; do
       ;;
   esac
 
-  after=$(grep -c "$VERSION" "$page" 2>/dev/null || echo 0)
+  after=$(grep -c "$VERSION" "$SED_DIR/$page" 2>/dev/null || echo 0)
   if [ "$after" -gt 0 ]; then
     bumped=$((bumped + 1))
     log "  bumped $page"
@@ -180,14 +196,21 @@ done
 
 if [ "$bumped" = "0" ]; then
   log "ERROR: no pages were bumped — pattern mismatch"
+  [ "$DRY" = "1" ] && rm -rf "$SED_DIR"
   exit 1
 fi
 
 # 8. Commit.
 if [ "$DRY" = "1" ]; then
   log "[DRY] would commit, push, open PR for $bumped pages"
-  log "[DRY] git diff (stat) — bumped pages only:"
-  git diff --stat "${PAGES[@]}" 2>&1 | sed 's/^/  /'
+  log "[DRY] diff (changes that would land — first 8 lines per page):"
+  for page in "${PAGES[@]}"; do
+    if [ -f "$SED_DIR/$page" ] && ! diff -q "$page" "$SED_DIR/$page" >/dev/null 2>&1; then
+      log "  --- $page"
+      diff -u "$page" "$SED_DIR/$page" | tail -n +3 | head -8 | sed 's/^/    /'
+    fi
+  done
+  rm -rf "$SED_DIR"
   exit 0
 fi
 
