@@ -10,7 +10,7 @@
 
 set -u
 
-RAIL_DIR="${RAIL_DIR:-/Users/user/projects/rail}"
+RAIL_DIR="${RAIL_DIR:-$HOME/projects/rail}"
 SRC_DIR="$RAIL_DIR/tools/plasma"
 METALLIB=/tmp/mhd_ot_2d_256.metallib
 HOST_BIN=/tmp/mhd_ot_2d_256

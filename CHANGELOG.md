@@ -820,7 +820,7 @@ Live, in production, the day of the release:
 anthropic_chat "claude-haiku-4-5-20251001" "Reply with exactly: hello from pure rail"
   → status 200, reply "hello from pure rail"   (6.9 s, pure Rail → Anthropic API)
 
-slack_post_text "D0ATHQ1BQD7" "v3.0.0 smoke: pure-Rail TLS direct to slack.com"
+slack_post_text "<channel-id>" "v3.0.0 smoke: pure-Rail TLS direct to slack.com"
   → ok, HTTP 200 with x-slack-req-id            (1.0 s, pure Rail → Slack API)
 
 https_get_url "https://www.amazon.com/"
@@ -1008,7 +1008,7 @@ default HTTPS path stays ~6 s per connection rather than ~12.
 
 ```
 anthropic_live_test      — live call to api.anthropic.com, HTTP 200
-slack_live_test          — live DM to brockbro2, Slack ok=true
+slack_live_test          — live DM to your ops channel, Slack ok=true
 https_url_test           — https_get_url api.anthropic.com
 https_smoke_test         — ip-based https_get api.anthropic.com
 rfc8448_trace_test       — RFC 8448 §3 Simple 1-RTT vector, exact

@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-cd /Users/ledaticempire/projects/rail-https
+cd $HOME/projects/rail-https
 mkdir -p ~/.ledatic/attest
 
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)

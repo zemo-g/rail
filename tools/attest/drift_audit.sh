@@ -21,7 +21,7 @@
 # Alert (no auto-fix): site banner drift opens a PR against
 # Ledatic-Empire/ledatic-site so a human eye lands on the changelog
 # text before it goes public. Stale build/selfhost/beacon/witness
-# emit a Slack punch list to brockbro2.
+# emit a Slack punch list to the configured ops channel.
 #
 # Wiring: ~/Library/LaunchAgents/com.ledatic.drift_audit.plist runs
 # this Sundays 09:00 local. Idempotent — safe to invoke ad-hoc:
@@ -43,10 +43,11 @@ for arg in "$@"; do
   esac
 done
 
-REPO=${REPO:-/Users/ledaticempire/projects/rail-https}
-SITE=${SITE:-/Users/ledaticempire/projects/ledatic-site}
+REPO=${REPO:-$HOME/projects/rail-https}
+SITE=${SITE:-$HOME/projects/ledatic-site}
 SLACK_TOKEN_FILE=${SLACK_TOKEN_FILE:-$HOME/.fleet/slack_token}
-SLACK_CHANNEL=${SLACK_CHANNEL:-D0ATHQ1BQD7}   # brockbro2 DM
+SLACK_CHANNEL_FILE=${SLACK_CHANNEL_FILE:-$HOME/.fleet/slack_channel}
+SLACK_CHANNEL=${SLACK_CHANNEL:-$(cat "$SLACK_CHANNEL_FILE" 2>/dev/null || echo "")}
 DRIFT_DIR=${DRIFT_DIR:-$HOME/.ledatic/drift}
 SITE_PAGES=(index.html rail.html entropy.html fleet.html manifesto.html plasma.html now.html changelog.html)
 # Tags that legitimately predate the rail_native binary in the repo —

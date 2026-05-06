@@ -94,7 +94,7 @@ int main(int argc, char *argv[]) {
             const char *pathA = argv[5], *pathB = argv[6], *pathC = argv[7];
 
             // Compile shader (use cached metallib if exists)
-            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
+            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c $HOME/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
             (void)rc;
 
             NSError *err = nil;
@@ -133,7 +133,7 @@ int main(int argc, char *argv[]) {
             uint32_t M = atoi(argv[2]), K = atoi(argv[3]), N = atoi(argv[4]);
             const char *pathA = argv[5], *pathB = argv[6], *pathC = argv[7];
 
-            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
+            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c $HOME/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
             (void)rc;
 
             NSError *err = nil;
@@ -173,7 +173,7 @@ int main(int argc, char *argv[]) {
             const char *pathA = argv[4], *pathC = argv[5];
             uint32_t n = rows * cols;
 
-            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
+            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c $HOME/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
             (void)rc;
 
             NSError *err = nil;
@@ -232,7 +232,7 @@ int main(int argc, char *argv[]) {
             const char *pathA = argv[4], *pathC = argv[5];
             uint32_t n = M * N;
 
-            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
+            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c $HOME/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
             (void)rc;
 
             NSError *err = nil;
@@ -265,7 +265,7 @@ int main(int argc, char *argv[]) {
             uint32_t n = atoi(argv[2]);
             const char *pathA = argv[3], *pathB = argv[4], *pathC = argv[5];
 
-            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
+            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c $HOME/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
             (void)rc;
 
             NSError *err = nil;
@@ -302,7 +302,7 @@ int main(int argc, char *argv[]) {
             uint32_t n = atoi(argv[2]);
             const char *pathA = argv[3], *pathC = argv[4];
 
-            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
+            int rc = system("test -f /tmp/tensor_gpu.metallib || (xcrun metal -c $HOME/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null && xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null)");
             (void)rc;
 
             NSError *err = nil;
@@ -337,7 +337,7 @@ int main(int argc, char *argv[]) {
         }
 
         // Compile shader for binary/benchmark modes
-        int rc = system("xcrun metal -c /Users/ledaticempire/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null");
+        int rc = system("xcrun metal -c $HOME/projects/rail/tools/metal/tensor_gpu.metal -o /tmp/tensor_gpu.air 2>/dev/null");
         if (rc != 0) { fprintf(stderr, "metal compile failed\n"); return 1; }
         rc = system("xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib 2>/dev/null");
         if (rc != 0) { fprintf(stderr, "metallib failed\n"); return 1; }

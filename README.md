@@ -15,7 +15,7 @@
   <a href="#why-rail"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/C%20dependencies-0-brightgreen" alt="0 C dependencies"></a>
-  <a href="#releases"><img src="https://img.shields.io/badge/backends-4-orange" alt="4 backends"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/backends-3-orange" alt="3 backends"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL%201.1-green" alt="BSL 1.1"></a>
 </p>
 
@@ -51,7 +51,7 @@ cd rail
 ./rail_native run examples/hello.rail
 ```
 
-Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, and WASM backends are supported.
+Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64 and Linux x86_64 are also supported, with a WASM output for browser embedding.
 
 ```bash
 ./rail_native <file.rail>        # compile to /tmp/rail_out
@@ -115,7 +115,7 @@ The compiler is the fitness function. Programs that compile become training data
 - **Byte-identical self-compile.** `./rail_native self` produces output identical to the binary that produced it. The compiler's own source is the regression suite.
 - **The compiler is the source of truth.** Training loops, tests, site generation, HTTPS clients — they all get compiled by the same binary you cloned. If it compiles, it runs.
 - **Production surface is narrow and honest.** Rail v3.0.0 ships the crypto it uses (ChaCha20-Poly1305, x25519, SHA-256/384/512, ECDSA-P256/P384, RSA-PSS/PKCS1) and nothing more. Every primitive is NIST- or RFC-vector-validated.
-- **Four backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), Linux x86_64, and WASM — the same compiler cross-compiles to all of them.
+- **Three backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), and Linux x86_64 — the same compiler cross-compiles to all of them. A WASM output target is also bundled for browser embedding.
 
 ## The language
 
@@ -198,7 +198,7 @@ A complete pure-Rail TLS 1.3 stack + X.509 chain validation + HTTPS client. The 
 anthropic_chat "claude-haiku-4-5-20251001" "Reply with exactly: hello from pure rail"
   → HTTP 200, "hello from pure rail"       (6.9 s, pure Rail → Anthropic)
 
-slack_post_text "D0ATHQ1BQD7" "v3.0.0 smoke: pure-Rail TLS"
+slack_post_text "<channel-id>" "v3.0.0 smoke: pure-Rail TLS"
   → ok=true, HTTP 200                      (1.0 s, pure Rail → Slack)
 
 https_get_url "https://www.amazon.com/"

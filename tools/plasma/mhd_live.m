@@ -229,7 +229,7 @@ int main(int argc, char *argv[]) {
 
         // Compile shader
         NSLog(@"Compiling mhd_axisym.metal...");
-        int rc = system("xcrun metal -c /Users/ledaticempire/projects/rail/tools/plasma/mhd_axisym.metal -o /tmp/mhd_axisym.air 2>&1");
+        int rc = system("xcrun metal -c $HOME/projects/rail/tools/plasma/mhd_axisym.metal -o /tmp/mhd_axisym.air 2>&1");
         if (rc != 0) { NSLog(@"metal compile failed"); return 1; }
         rc = system("xcrun metallib /tmp/mhd_axisym.air -o /tmp/mhd_axisym.metallib 2>&1");
         if (rc != 0) { NSLog(@"metallib failed"); return 1; }

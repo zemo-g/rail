@@ -22,17 +22,24 @@ set -euo pipefail
 
 FLEET_TOKEN_FILE=${FLEET_TOKEN_FILE:-$HOME/.fleet/token}
 BEACON_TOKEN_FILE=${BEACON_TOKEN_FILE:-$HOME/.ledatic/entropy/beacon_token}
-WITNESS_HOST=${WITNESS_HOST:-zemog@100.87.231.45}
+WITNESS_HOST_FILE=${WITNESS_HOST_FILE:-$HOME/.ledatic/witness/host}
+WITNESS_HOST=${WITNESS_HOST:-$(cat "$WITNESS_HOST_FILE" 2>/dev/null || echo "")}
 SIGNER=${SIGNER:-/home/zemog/.ledatic/witness/sign_fleet_bundle.sh}
 SITE=${SITE:-https://ledatic.org}
 BEACON_URL=${BEACON_URL:-https://ledatic.org/entropy/pulse}
+NODES_FILE=${NODES_FILE:-$HOME/.ledatic/fleet/nodes}
 
 [ -s "$FLEET_TOKEN_FILE" ] || { echo "missing $FLEET_TOKEN_FILE" >&2; exit 2; }
 [ -s "$BEACON_TOKEN_FILE" ] || { echo "missing $BEACON_TOKEN_FILE" >&2; exit 2; }
+[ -n "$WITNESS_HOST" ] || { echo "no witness host (set WITNESS_HOST or write $WITNESS_HOST_FILE)" >&2; exit 4; }
+[ -s "$NODES_FILE" ] || { echo "missing $NODES_FILE (one 'name:ip' per line)" >&2; exit 4; }
 FLEET_TOKEN=$(cat "$FLEET_TOKEN_FILE")
 BEACON_TOKEN=$(cat "$BEACON_TOKEN_FILE")
 
-NODES=("mini:10.42.0.1" "studio:10.42.0.2" "air:10.42.0.3" "pi:100.87.231.45")
+NODES=()
+while IFS= read -r line; do
+  [ -n "$line" ] && NODES+=("$line")
+done < "$NODES_FILE"
 
 raw_pulse=$(curl -sf --max-time 4 "$BEACON_URL" || true)
 [ -n "$raw_pulse" ] || { echo "beacon unreachable" >&2; exit 3; }
