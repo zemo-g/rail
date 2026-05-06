@@ -36,13 +36,8 @@ preg vreg = vreg + 9
 --   prologue = stp_fp_lr + mov_x29_sp + stp_x19_x20 + mov_v0_x0 = 16
 --   epilogue = ldp_x19_x20 + ldp_fp_lr + ret = 12 (mov_x0_vN counted in op_ret)
 
--- Bytes per IR opcode.
--- ret: 4 (mov x0, vN) + 12 (ldp x19/x20 + ldp fp/lr + ret) = 16.
--- call: 4 (mov x0, arg) + 4 (bl) + 4 (mov dst, x0) = 12.
--- const: 16 (movz + 3 movk, fixed budget).
--- mov: 4 (mov xDst, xSrc).
--- arith: 4. lt: 8. jmp/jz: 4.
--- print_int: implemented via a thunk; size resolved when we lower it.
+-- Bytes per IR opcode (FIXED-size opcodes only).
+-- For variable-size opcodes (op_call), use ir_byte_size_at.
 ir_byte_size op =
   if op == op_const then 16
   else if op == op_add then 4
@@ -51,11 +46,23 @@ ir_byte_size op =
   else if op == op_lt then 8
   else if op == op_jmp then 4
   else if op == op_jz then 4
-  else if op == op_call then 12
   else if op == op_ret then 16
   else if op == op_print_int then 80
   else if op == op_mov then 4
+  else if op == op_str_lit then 4
+  else if op == op_print_str then 20
+  else if op == op_str_len then 4
   else 4
+
+-- Variable-size lookup. Reads the instruction's c slot for op_call
+-- to compute n_args, returning 4*(n_args+2) bytes. Other opcodes
+-- forward to ir_byte_size.
+ir_byte_size_at ir i =
+  let op = ir_op ir i
+  if op == op_call then
+    let n = call_n_args (ir_c ir i)
+    4 + 4 + 4 * n   -- bl(4) + mov dst,x0(4) + n arg-movs(4n)
+  else ir_byte_size op
 
 -- Pass 1: compute, for each IR instruction index i, the byte offset
 -- where its emitted ARM64 sequence starts, RELATIVE TO THE FUNCTION'S
@@ -72,8 +79,7 @@ fill_offsets ir n_instr off_arr i acc =
     0
   else
     let _ = arr_set off_arr i acc
-    let op = ir_op ir i
-    let sz = ir_byte_size op
+    let sz = ir_byte_size_at ir i
     fill_offsets ir n_instr off_arr (i + 1) (acc + sz)
 
 -- Total bytes for one function.
@@ -147,13 +153,7 @@ emit_one buf ir body_start body_offsets blocks fn_offsets i =
     let rel = target_off - off
     cb_emit buf off (enc_cbz_byte_off (preg a) rel)
   else if op == op_call then
-    let target_fn_start = arr_get fn_offsets b
-    let bl_off = off + 4
-    let rel = target_fn_start - bl_off
-    let _ = cb_emit buf       off       (enc_mov_reg 0 (preg c))
-    let _ = cb_emit buf (off + 4) (enc_bl_byte_off rel)
-    let _ = cb_emit buf (off + 8) (enc_mov_reg (preg a) 0)
-    0
+    emit_op_call buf off a b c fn_offsets
   else if op == op_ret then
     let _ = cb_emit buf       off       (enc_mov_reg 0 (preg a))
     let _ = cb_emit buf (off + 4)  inst_ldp_x19_x20_16
@@ -164,6 +164,12 @@ emit_one buf ir body_start body_offsets blocks fn_offsets i =
     cb_emit buf off (enc_mov_reg (preg a) (preg b))
   else if op == op_print_int then
     emit_print_int buf off (preg a)
+  else if op == op_str_lit then
+    emit_op_str_lit buf off (preg a) b fn_offsets
+  else if op == op_print_str then
+    emit_op_print_str buf off (preg a)
+  else if op == op_str_len then
+    emit_op_str_len buf off (preg a) (preg b)
   else
     -- Unknown op: emit a safe ret(0) so we never run garbage.
     let _ = cb_emit buf       off       (enc_mov_reg 0 0)
@@ -171,6 +177,27 @@ emit_one buf ir body_start body_offsets blocks fn_offsets i =
     let _ = cb_emit buf (off + 8)  inst_ldp_fp_lr_post
     let _ = cb_emit buf (off + 12) enc_ret
     0
+
+-- Multi-arg op_call emit. Decodes packed c (n_args + arg vregs), emits:
+--   for each i in 0..n-1: mov xi, x_preg(arg_i)
+--   bl <target_fn_offset>
+--   mov x_preg(dst), x0
+emit_op_call buf off a b c fn_offsets =
+  let n = call_n_args c
+  let arg0 = call_arg_0 c
+  let arg1 = call_arg_1 c
+  let arg2 = call_arg_2 c
+  let arg3 = call_arg_3 c
+  let _ = if n >= 1 then cb_emit buf       off       (enc_mov_reg 0 (preg arg0)) else 0
+  let _ = if n >= 2 then cb_emit buf (off + 4)  (enc_mov_reg 1 (preg arg1)) else 0
+  let _ = if n >= 3 then cb_emit buf (off + 8)  (enc_mov_reg 2 (preg arg2)) else 0
+  let _ = if n >= 4 then cb_emit buf (off + 12) (enc_mov_reg 3 (preg arg3)) else 0
+  let bl_off = off + 4 * n
+  let target_fn_start = arr_get fn_offsets b
+  let rel = target_fn_start - bl_off
+  let _ = cb_emit buf bl_off (enc_bl_byte_off rel)
+  let _ = cb_emit buf (bl_off + 4) (enc_mov_reg (preg a) 0)
+  0
 
 -- Helper: read slot a/b/c from instruction i. Slot 1=a, 2=b, 3=c.
 ir_op_a_or_b ir i which =
@@ -201,22 +228,34 @@ emit_one_function buf fn_start fn fn_offsets =
 emit_function fn =
   let total = fn_total_bytes fn
   let buf = make_codebuf (total / 4)
-  let fn_offsets = arr_new 1 0
+  let fn_offsets = arr_new 2 0
+  let _ = arr_set fn_offsets 1 total       -- total_code at last slot for op_str_lit
   let _ = emit_one_function buf 0 fn fn_offsets
   cons buf (cons total [])
 
--- Emit a multi-function program.
--- Input: fn_list = Rail list of function structs.
+-- Emit a multi-function program. With pool support.
+-- Input: fn_list = Rail list of function structs;
+--        pool    = [pool_buf int_arr, pool_size_cell int_arr] (or [] for none).
 -- Output: [buf, total_bytes, fn_offsets_arr]
---   fn_offsets_arr[k] = byte offset of fn_k's first instruction within buf.
---   Useful as the entry-point for call_jit (offset of fn_0 = 0).
-emit_program fn_list =
+--   fn_offsets_arr is sized n+1; slot n holds total_code_bytes for the
+--   adr-relative resolution of op_str_lit.
+emit_program fn_list pool =
   let n = list_len fn_list
-  let fn_offsets = arr_new n 0
-  let total = compute_fn_starts fn_list n fn_offsets 0 0
-  let buf = make_codebuf (total / 4)
+  let fn_offsets = arr_new (n + 1) 0
+  let total_code = compute_fn_starts fn_list n fn_offsets 0 0
+  let _ = arr_set fn_offsets n total_code
+  let pool_size = if pool == [] then 0 else arr_get (head (tail pool)) 0
+  let total_bytes = total_code + pool_size
+  let buf = arr_new total_bytes 0
   let _ = emit_each_function buf fn_list n fn_offsets 0
-  cons buf (cons total (cons fn_offsets []))
+  let _ = if pool_size > 0 then copy_pool_bytes buf total_code (head pool) pool_size 0 else 0
+  cons buf (cons total_bytes (cons fn_offsets []))
+
+copy_pool_bytes dst dst_off src_buf n_bytes i =
+  if i >= n_bytes then 0
+  else
+    let _ = arr_set dst (dst_off + i) (arr_get src_buf i)
+    copy_pool_bytes dst dst_off src_buf n_bytes (i + 1)
 
 -- Walk fn_list, fill fn_offsets[k] with running byte offset, return total bytes.
 compute_fn_starts fn_list n fn_offsets k acc =
@@ -247,6 +286,40 @@ nth_fn xs k =
 emitted_buf res = head res
 emitted_size res = head (tail res)
 emitted_offsets res = head (tail (tail res))
+
+-- ============================================================================
+-- String-op emitters
+-- ============================================================================
+
+-- op_str_lit: load PC-relative address of the pool entry into dst_preg.
+-- fn_offsets's last slot holds total_code_bytes (set by emit_program).
+emit_op_str_lit buf off dst_preg pool_offset fn_offsets =
+  let n = arr_len fn_offsets
+  let total_code = arr_get fn_offsets (n - 1)
+  let target = total_code + pool_offset
+  let rel = target - off
+  cb_emit buf off (enc_adr dst_preg rel)
+
+-- op_print_str: ptr in src_preg points to length-prefixed string.
+-- Sequence: ldr x2,[src,#0] ; add x1,src,#8 ; mov x0,#1 ; mov x16,#4 ; svc #0x80
+-- All constants verified via /tmp/asmtest_pstr.s + python conversion.
+emit_op_print_str buf off src_preg =
+  -- ldr x2, [src_preg, #0]   = 0xF9400002 | (src_preg<<5)
+  let _ = cb_emit buf       off       (bit_or 4181721090 (shl src_preg 5))
+  -- add x1, src_preg, #8     = 0x91002001 | (src_preg<<5)
+  let _ = cb_emit buf (off + 4)  (bit_or 2432704513 (shl src_preg 5))
+  -- mov x0, #1               = 0xD2800020
+  let _ = cb_emit buf (off + 8)  3531604000
+  -- mov x16, #4              = 0xD2800090
+  let _ = cb_emit buf (off + 12) 3531604112
+  -- svc #0x80                = 0xD4001001
+  let _ = cb_emit buf (off + 16) 3556773889
+  0
+
+-- op_str_len: dst = *src (8-byte length prefix at offset 0).
+-- ldr xdst, [xsrc, #0]   = 0xF9400000 | (src_preg<<5) | dst_preg
+emit_op_str_len buf off dst_preg src_preg =
+  cb_emit buf off (bit_or (bit_or 4181721088 dst_preg) (shl src_preg 5))
 
 -- ============================================================================
 -- emit_print_int: emit ARM64 that prints `src` (a non-negative int) as decimal
