@@ -1,0 +1,567 @@
+-- jit/lower.rail — Rail subset AST → JIT IR (FnList for emit_program).
+--
+-- Public entry point:
+--   lower_source src -> [tag, payload]
+--     tag = "ok"  : payload = list of FnStruct ready for emit_program
+--     tag = "err" : payload = error message string
+--
+-- Subset support (v1):
+--   * Single-arg user functions only (multi-arg → err)
+--   * Integer arithmetic (+, -, *), comparison (<)
+--   * `if c then a else b` — lowered with v_result merge
+--   * `let x = e in body` — extends env with x→vreg
+--   * Function calls f arg — resolved via registry; recursion supported
+--   * `print (show e)` — recognised as op_print_int, returns 0
+--   * Identifiers, integer literals, parens
+--
+-- Cross-call preservation: caller-save (v0..v9) values that must survive
+-- a function call are moved to callee-save (v10/v11) before the call.
+-- v1 caps at 2 cross-call slots (v10, v11). If lowering needs more, fails.
+
+-- NOTE: this file deliberately does NOT `import "jit/ir.rail"`. Rail imports
+-- aren't deduped, so each direct importer must include ir.rail exactly once.
+-- Canonical use: caller imports emit.rail (which brings ir.rail), then this
+-- file. See jit/test_lower.rail for the order.
+import "jit/lex.rail"
+import "jit/syntax.rail"
+
+-- ============================================================================
+-- State record (mutable cells via 1-element int_arrs)
+--
+--   ir       : int_arr of size 4*MAX_INSTR (instructions written here)
+--   ctr      : int_arr of size 6:
+--                [0] next_caller_vreg
+--                [1] next_callee_vreg
+--                [2] instr_idx
+--                [3] n_blocks reserved
+--                [4] max_vreg_seen
+--                [5] err_flag (0=ok, 1=err)
+--   blocks   : int_arr of size MAX_BLOCKS (block start instr indices)
+--   reg_buf  : int_arr of size 4 (per-fn) — currently-pinned cross-call vregs
+--                [0] = next callee slot to use (10 → 11 → -1 (overflow))
+--   err_msg  : 1-element Rail-list cell holding the error-message string
+-- ============================================================================
+
+max_instr_per_fn = 256
+max_blocks_per_fn = 32
+
+mk_state _ =
+  let ir = arr_new (4 * max_instr_per_fn) 0
+  let ctr = arr_new 7 0
+  let _ = arr_set ctr 0 0     -- (unused; caller-save now via live mask)
+  let _ = arr_set ctr 1 10    -- next_callee starts at v10
+  let _ = arr_set ctr 2 0     -- instr_idx
+  let _ = arr_set ctr 3 0     -- n_blocks
+  let _ = arr_set ctr 4 0     -- max_vreg_seen
+  let _ = arr_set ctr 5 0     -- err_flag
+  let _ = arr_set ctr 6 0     -- live caller-save bitmask (bit i = v(i) live)
+  let blocks = arr_new max_blocks_per_fn 0
+  let err_msg = cons "" []
+  cons ir (cons ctr (cons blocks (cons err_msg [])))
+
+st_ir       s = head s
+st_ctr      s = head (tail s)
+st_blocks   s = head (tail (tail s))
+st_err_msg  s = head (tail (tail (tail s)))
+
+st_get_caller s   = arr_get (st_ctr s) 0
+st_get_callee s   = arr_get (st_ctr s) 1
+st_get_instr s    = arr_get (st_ctr s) 2
+st_get_nblocks s  = arr_get (st_ctr s) 3
+st_get_maxreg s   = arr_get (st_ctr s) 4
+st_get_err s      = arr_get (st_ctr s) 5
+
+st_track_reg s v =
+  let mx = arr_get (st_ctr s) 4
+  if v > mx then arr_set (st_ctr s) 4 v
+  else 0
+
+-- Fail with a message; sets err_flag and stores the message.
+st_fail s msg =
+  let _ = arr_set (st_ctr s) 5 1
+  let cell = st_err_msg s
+  -- replace head of cell with msg (cell is `cons msg []`)
+  -- workaround: just store via a side-channel — we use a Rail list mutation hack:
+  -- Rail lists are immutable, so we store the err in the err_msg cell via
+  -- a different slot. For v1, we just print the err and rely on err_flag.
+  let _ = print (cat ["LOWER ERR: ", msg])
+  0 - 1     -- sentinel return
+
+-- Caller-save allocator: scans live mask for the lowest free bit in v1..v9.
+-- v0 is reserved for the input arg. Returns -1 (via st_fail) on overflow.
+st_alloc_caller s =
+  let live = arr_get (st_ctr s) 6
+  let v = find_free_caller_bit live 1
+  if v > 9 then st_fail s "caller-save vreg overflow (>9 simultaneously live)"
+  else lock_caller s v
+
+find_free_caller_bit live i =
+  if i > 9 then 10
+  else if (bit_and live (shl 1 i)) == 0 then i
+  else find_free_caller_bit live (i + 1)
+
+lock_caller s v =
+  let live = arr_get (st_ctr s) 6
+  let _ = arr_set (st_ctr s) 6 (bit_or live (shl 1 v))
+  let _ = st_track_reg s v
+  v
+
+-- Live-mask snapshot/restore at lower_expr boundaries. After dispatch we
+-- want only the saved live + the result vreg's bit (if it's a fresh
+-- caller-save vreg) to remain set. Everything else allocated within the
+-- expression is scratch and gets dropped.
+st_get_live s = arr_get (st_ctr s) 6
+
+st_restore_live s saved result_v =
+  let new = if result_v >= 10 then saved
+            else if result_v == 0 then saved
+            else if result_v < 0 then saved
+            else bit_or saved (shl 1 result_v)
+  arr_set (st_ctr s) 6 new
+
+st_alloc_callee s =
+  let v = arr_get (st_ctr s) 1
+  let _ = arr_set (st_ctr s) 1 (v + 1)
+  let _ = st_track_reg s v
+  if v >= 12 then st_fail s "callee-save vreg overflow (>= v12); v1 only saves x19/x20"
+  else v
+
+-- Reserve a new block; returns its index. Caller will set its start later.
+st_reserve_block s =
+  let idx = arr_get (st_ctr s) 3
+  let _ = arr_set (st_ctr s) 3 (idx + 1)
+  if idx >= max_blocks_per_fn then st_fail s "block overflow"
+  else idx
+
+st_set_block_start s blk_idx =
+  let cur = arr_get (st_ctr s) 2
+  arr_set (st_blocks s) blk_idx cur
+
+-- Emit one IR instruction; returns 0.
+st_emit s op a b c =
+  let i = arr_get (st_ctr s) 2
+  if i >= max_instr_per_fn then st_fail s "instruction overflow"
+  else
+    let _ = ir_emit (st_ir s) i op a b c
+    let _ = arr_set (st_ctr s) 2 (i + 1)
+    0
+
+-- ============================================================================
+-- Environment: list of (name, vreg) pairs. Most-recent binding shadows.
+-- ============================================================================
+
+env_empty _ = []
+env_extend env name vreg = cons (cons name (cons vreg [])) env
+env_lookup env name =
+  if env == [] then 0 - 1
+  else
+    let pair = head env
+    if (head pair) == name then head (tail pair)
+    else env_lookup (tail env) name
+
+-- ============================================================================
+-- Function-name registry: list of (name, fn_idx) pairs. Built once per lower.
+-- ============================================================================
+
+reg_empty _ = []
+reg_add r name idx = cons (cons name (cons idx [])) r
+reg_lookup r name =
+  if r == [] then 0 - 1
+  else
+    let pair = head r
+    if (head pair) == name then head (tail pair)
+    else reg_lookup (tail r) name
+
+-- Build registry from a list of fn_def AST nodes (in order).
+build_registry defs =
+  build_registry_loop defs 0 []
+
+build_registry_loop defs idx acc =
+  if defs == [] then acc
+  else
+    let fn = head defs
+    let name = head (tail fn)
+    build_registry_loop (tail defs) (idx + 1) (cons (cons name (cons idx [])) acc)
+
+-- ============================================================================
+-- contains_call: does an expression contain a function call (or print_show)?
+-- Used to decide whether to preserve LHS values across RHS evaluation.
+-- ============================================================================
+
+contains_call ast =
+  let tag = ast_tag ast
+  if tag == "int" then 0
+  else if tag == "var" then 0
+  else if tag == "op" then contains_call_op ast
+  else if tag == "if" then contains_call_if ast
+  else if tag == "let" then contains_call_let ast
+  else if tag == "app" then 1
+  else 0
+
+contains_call_op ast =
+  let lhs = head (tail (tail ast))
+  let rhs = head (tail (tail (tail ast)))
+  if (contains_call lhs) == 1 then 1
+  else contains_call rhs
+
+contains_call_if ast =
+  let c = head (tail ast)
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  if (contains_call c) == 1 then 1
+  else if (contains_call t) == 1 then 1
+  else contains_call e
+
+contains_call_let ast =
+  let v = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  if (contains_call v) == 1 then 1
+  else contains_call body
+
+-- ============================================================================
+-- Lowering
+-- ============================================================================
+
+-- Preserve a vreg into callee-save by allocating a fresh callee slot and
+-- emitting op_mov. Returns the new (callee-save) vreg. Skips if v is
+-- already in callee-save (>= 10) — re-preserving wastes a slot.
+preserve_callee s v =
+  if v >= 10 then v
+  else preserve_callee_force s v
+
+preserve_callee_force s v =
+  let v_safe = st_alloc_callee s
+  if (st_get_err s) == 1 then v_safe
+  else
+    let _ = st_emit s op_mov v_safe v 0
+    v_safe
+
+lower_expr s env ast =
+  if (st_get_err s) == 1 then 0 - 1
+  else lower_expr_scoped s env ast
+
+lower_expr_scoped s env ast =
+  let saved = st_get_live s
+  let v = lower_expr_dispatch s env ast
+  if (st_get_err s) == 1 then v
+  else
+    -- Env-bound vregs (var lookups) keep their live state via env, but
+    -- since lookups don't bump the mask, restore is a no-op for them.
+    -- Fresh allocations done inside `ast` get culled by restore-to-saved.
+    -- The result vreg, if caller-save and fresh, stays live.
+    let _ = st_restore_live s saved v
+    v
+
+lower_expr_dispatch s env ast =
+  let tag = ast_tag ast
+  if tag == "int" then lower_int s ast
+  else if tag == "var" then lower_var s env ast
+  else if tag == "op" then lower_op s env ast
+  else if tag == "if" then lower_if s env ast
+  else if tag == "let" then lower_let s env ast
+  else if tag == "app" then lower_app s env ast
+  else st_fail s (cat ["lower: unknown ast tag ", tag])
+
+lower_int s ast =
+  let n = head (tail ast)
+  let v = st_alloc_caller s
+  if (st_get_err s) == 1 then v
+  else
+    let _ = st_emit s op_const v n 0
+    v
+
+lower_var s env ast =
+  let name = head (tail ast)
+  let v = env_lookup env name
+  if v < 0 then st_fail s (cat ["lower: unbound variable ", name])
+  else v
+
+lower_op s env ast =
+  let op_str = head (tail ast)
+  let lhs = head (tail (tail ast))
+  let rhs = head (tail (tail (tail ast)))
+  let v_lhs = lower_expr s env lhs
+  if (st_get_err s) == 1 then v_lhs
+  else lower_op_after_lhs s env op_str rhs v_lhs
+
+lower_op_after_lhs s env op_str rhs v_lhs =
+  let v_lhs2 = if (contains_call rhs) == 1 then preserve_callee s v_lhs else v_lhs
+  if (st_get_err s) == 1 then v_lhs2
+  else
+    let v_rhs = lower_expr s env rhs
+    if (st_get_err s) == 1 then v_rhs
+    else lower_op_emit s op_str v_lhs2 v_rhs
+
+lower_op_emit s op_str v_lhs v_rhs =
+  let v_dst = st_alloc_caller s
+  if (st_get_err s) == 1 then v_dst
+  else
+    let opcode = ir_op_for_str op_str
+    if opcode < 0 then st_fail s (cat ["lower: unknown binary op ", op_str])
+    else
+      let _ = st_emit s opcode v_dst v_lhs v_rhs
+      v_dst
+
+ir_op_for_str s =
+  if s == "+" then op_add
+  else if s == "-" then op_sub
+  else if s == "*" then op_mul
+  else if s == "<" then op_lt
+  else 0 - 1
+
+lower_if s env ast =
+  let c = head (tail ast)
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  let v_c = lower_expr s env c
+  if (st_get_err s) == 1 then v_c
+  else lower_if_after_cond s env v_c t e
+
+lower_if_after_cond s env v_c t e =
+  -- v_result is caller-save: at the merge point (the after_block), no calls
+  -- happen between mov-into-result and the next outer use. If the outer
+  -- context is a let whose body has calls, lower_let will preserve it.
+  let v_result = st_alloc_caller s
+  if (st_get_err s) == 1 then v_result
+  else
+    let else_blk = st_reserve_block s
+    let after_blk = st_reserve_block s
+    let _ = st_emit s op_jz v_c else_blk 0
+    let v_t = lower_expr s env t
+    if (st_get_err s) == 1 then v_t
+    else lower_if_after_then s env v_result v_t else_blk after_blk e
+
+lower_if_after_then s env v_result v_t else_blk after_blk e =
+  let _ = st_emit s op_mov v_result v_t 0
+  let _ = st_emit s op_jmp after_blk 0 0
+  let _ = st_set_block_start s else_blk
+  let v_e = lower_expr s env e
+  if (st_get_err s) == 1 then v_e
+  else
+    let _ = st_emit s op_mov v_result v_e 0
+    let _ = st_set_block_start s after_blk
+    v_result
+
+lower_let s env ast =
+  let name = head (tail ast)
+  let val = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  let v_val = lower_expr s env val
+  if (st_get_err s) == 1 then v_val
+  else
+    -- If the body contains a call, the binding must survive it.
+    let v_safe = if (contains_call body) == 1 then preserve_callee s v_val else v_val
+    if (st_get_err s) == 1 then v_safe
+    else
+      let env2 = env_extend env name v_safe
+      lower_expr s env2 body
+
+-- App: function call OR `print (show e)` pattern.
+lower_app s env ast =
+  if (is_print_show ast) == 1 then lower_print_show s env ast
+  else lower_call s env ast
+
+is_print_show ast =
+  -- ast = app f arg, where f = var "print" and arg = app(var "show", e)
+  let f = head (tail ast)
+  let arg = head (tail (tail ast))
+  if (is_var_named f "print") == 0 then 0
+  else if (ast_tag arg) == "app" then is_var_named (head (tail arg)) "show"
+  else 0
+
+is_var_named ast name =
+  if (ast_tag ast) == "var" then
+    if (head (tail ast)) == name then 1 else 0
+  else 0
+
+lower_print_show s env ast =
+  -- Extract the inner expression e from app(var print, app(var show, e)).
+  let inner_app = head (tail (tail ast))
+  let e = head (tail (tail inner_app))
+  let v_e = lower_expr s env e
+  if (st_get_err s) == 1 then v_e
+  else lower_print_show_emit s v_e
+
+lower_print_show_emit s v_e =
+  let _ = st_emit s op_print_int v_e 0 0
+  -- print returns 0 (the integer)
+  let v_zero = st_alloc_caller s
+  if (st_get_err s) == 1 then v_zero
+  else
+    let _ = st_emit s op_const v_zero 0 0
+    v_zero
+
+-- A call: app(var fn_name, arg). Anything else fails (we don't handle
+-- multi-arg apps, anonymous functions, etc.).
+lower_call s env ast =
+  let f = head (tail ast)
+  let arg = head (tail (tail ast))
+  if (ast_tag f) == "var" then lower_call_named s env (head (tail f)) arg
+  else st_fail s "lower: nested application (multi-arg or HOF) not supported in v1"
+
+-- Look up `fname` in the registry stashed in the err_msg cell (we hijack it).
+-- For v1 we pass the registry separately via a global side-channel: a 1-elt
+-- Rail list. Simpler: take the registry as another arg through every call.
+-- To avoid threading it everywhere, we store it in a top-level var that is
+-- *set per lower_program invocation*. (Crude but works for v1.)
+
+global_registry_cell = arr_new 1 0    -- not used directly; see lower_program
+global_registry_list_cell = cons [] []  -- actual registry list lives here
+
+set_registry r =
+  -- Store the registry in a known module-level cell. Rail lists are
+  -- immutable, so we use an `int_arr` of capacity 1 holding... actually
+  -- we just rebind the top-level via a hack: store in a mutable IR-style
+  -- cell and use a getter.
+  -- Simpler: use a `int_arr` to hold a pointer/handle, but Rail doesn't
+  -- expose that. So we thread the registry via state instead — see
+  -- lower_call_named below.
+  0
+
+-- We pass the registry through state's err_msg cell? Awkward. Let me thread
+-- it explicitly via the state record itself. Refactor: state gains a 5th
+-- slot for the registry.
+
+lower_call_named s env fname arg =
+  let fn_idx = st_registry_lookup s fname
+  if fn_idx < 0 then st_fail s (cat ["lower: unknown function ", fname])
+  else lower_call_with_idx s env fn_idx arg
+
+lower_call_with_idx s env fn_idx arg =
+  let v_arg = lower_expr s env arg
+  if (st_get_err s) == 1 then v_arg
+  else
+    let v_dst = st_alloc_caller s
+    if (st_get_err s) == 1 then v_dst
+    else
+      let _ = st_emit s op_call v_dst fn_idx v_arg
+      v_dst
+
+-- Registry helpers on state. We extend state to carry the registry.
+-- Layout change:
+--   state = [ir, ctr, blocks, err_msg, registry_pairs]
+mk_state_with_registry registry =
+  let s = mk_state 0
+  cons (st_ir s) (cons (st_ctr s) (cons (st_blocks s) (cons (st_err_msg s) (cons registry []))))
+
+st_registry s = head (tail (tail (tail (tail s))))
+st_registry_lookup s name = reg_lookup (st_registry s) name
+
+-- ============================================================================
+-- Function lowering
+-- ============================================================================
+
+-- Lower one function definition; returns FnStruct or sets err.
+lower_fn_def fn_def registry =
+  let name = head (tail fn_def)
+  let args = head (tail (tail fn_def))
+  let body = head (tail (tail (tail fn_def)))
+  let n_args = list_len_local args
+  if n_args > 1 then mk_err_fn (cat ["multi-arg fn '", name, "' not supported in v1"])
+  else lower_fn_body name args body registry
+
+mk_err_fn msg =
+  let _ = print (cat ["LOWER ERR: ", msg])
+  -- A sentinel "error" function struct (caller checks).
+  cons "ERR" (cons msg [])
+
+lower_fn_body name args body registry =
+  let s = mk_state_with_registry registry
+  -- block 0 starts at instruction 0
+  let _ = st_set_block_start s (st_reserve_block s)
+  -- Bind args, optionally preserving to callee-save.
+  let env = build_arg_env s args body
+  if (st_get_err s) == 1 then mk_err_fn "lower failed during arg setup"
+  else lower_fn_after_args s env body
+
+build_arg_env s args body =
+  if args == [] then env_empty 0
+  else build_arg_env_one s (head args) body
+
+build_arg_env_one s arg_name body =
+  let _ = st_track_reg s 0
+  if (contains_call body) == 1 then
+    -- preserve v0 to v10 so the arg survives recursive/other calls
+    let v_safe = st_alloc_callee s
+    if (st_get_err s) == 1 then env_empty 0
+    else
+      let _ = st_emit s op_mov v_safe 0 0
+      env_extend (env_empty 0) arg_name v_safe
+  else
+    env_extend (env_empty 0) arg_name 0
+
+lower_fn_after_args s env body =
+  let v_result = lower_expr s env body
+  if (st_get_err s) == 1 then mk_err_fn "lower failed (see prior LOWER ERR)"
+  else lower_fn_finalize s v_result
+
+lower_fn_finalize s v_result =
+  let _ = st_emit s op_ret v_result 0 0
+  let n_instr = st_get_instr s
+  let n_regs = (st_get_maxreg s) + 1
+  let n_blocks = st_get_nblocks s
+  -- compact the blocks array down to the actually-reserved size
+  let blocks_compact = arr_new n_blocks 0
+  let _ = copy_blocks (st_blocks s) blocks_compact n_blocks 0
+  make_fn (st_ir s) n_instr n_regs blocks_compact
+
+copy_blocks src dst n i =
+  if i >= n then 0
+  else
+    let _ = arr_set dst i (arr_get src i)
+    copy_blocks src dst n (i + 1)
+
+list_len_local xs =
+  if xs == [] then 0
+  else 1 + list_len_local (tail xs)
+
+-- ============================================================================
+-- Public entry
+-- ============================================================================
+
+lower_source src =
+  let toks = tokenize src
+  let r = parse_program toks
+  if (is_err r) == 1 then cons "err" (cons (head (tail (res_ast r))) [])
+  else lower_program (res_ast r)
+
+lower_program program_ast =
+  let defs = head (tail program_ast)
+  if defs == [] then cons "err" (cons "empty program" [])
+  else
+    let registry = build_registry defs
+    -- The main entry point must be the LAST function (so it sees the registry
+    -- of preceding ones), but for op_call's relative offsets, fn_offsets are
+    -- assigned in list order. The training session expected `main` as fn 0
+    -- (the entry point). Reorder: put `main` first if it exists.
+    let ordered = move_main_first defs
+    let registry2 = build_registry ordered
+    lower_each ordered registry2 []
+
+lower_each defs registry acc =
+  if defs == [] then cons "ok" (cons (reverse acc) [])
+  else
+    let fn = lower_fn_def (head defs) registry
+    if (head fn) == "ERR" then cons "err" (cons (head (tail fn)) [])
+    else lower_each (tail defs) registry (cons fn acc)
+
+move_main_first defs =
+  if has_main defs == 0 then defs
+  else
+    let m = find_main defs
+    cons m (remove_main defs)
+
+has_main defs =
+  if defs == [] then 0
+  else if (head (tail (head defs))) == "main" then 1
+  else has_main (tail defs)
+
+find_main defs =
+  if defs == [] then []
+  else if (head (tail (head defs))) == "main" then head defs
+  else find_main (tail defs)
+
+remove_main defs =
+  if defs == [] then []
+  else if (head (tail (head defs))) == "main" then tail defs
+  else cons (head defs) (remove_main (tail defs))
