@@ -52,8 +52,8 @@ if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 2
 fi
 
-SITE=${SITE:-/Users/ledaticempire/projects/ledatic-site}
-RAIL_REPO=${RAIL_REPO:-/Users/ledaticempire/projects/rail-https}
+SITE=${SITE:-$HOME/projects/ledatic-site}
+RAIL_REPO=${RAIL_REPO:-$HOME/projects/rail-https}
 PAGES=(index.html rail.html entropy.html fleet.html manifesto.html plasma.html now.html changelog.html)
 BRANCH="auto/site-bump-$VERSION"
 

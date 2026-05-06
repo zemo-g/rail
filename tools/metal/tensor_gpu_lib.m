@@ -2,7 +2,7 @@
 //
 // Build:
 //   clang -shared -fobjc-arc -framework Metal -framework Foundation \
-//     -install_name /Users/ledaticempire/projects/rail/tools/metal/libtensor_gpu.dylib \
+//     -install_name $HOME/projects/rail/tools/metal/libtensor_gpu.dylib \
 //     tensor_gpu_lib.m -o libtensor_gpu.dylib
 //
 // Exports (C ABI, all return 1 on success / -1 on failure):

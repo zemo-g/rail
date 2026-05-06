@@ -34,7 +34,9 @@ out=${2:-${input}.attestation.json}
 [ -f "$input" ] || { echo "no such file: $input" >&2; exit 3; }
 
 BEACON_URL=${BEACON_URL:-https://ledatic.org/entropy/pulse}
-SIGNER_URL=${SIGNER_URL:-http://100.87.231.45:9102/sign}
+SIGNER_HOST_FILE=${SIGNER_HOST_FILE:-$HOME/.ledatic/witness/signer_url}
+SIGNER_URL=${SIGNER_URL:-$(cat "$SIGNER_HOST_FILE" 2>/dev/null || echo "")}
+[ -n "$SIGNER_URL" ] || { echo "no signer url configured (set SIGNER_URL or write $SIGNER_HOST_FILE)" >&2; exit 5; }
 SIGN_TOKEN_PATH=${SIGN_TOKEN_PATH:-$HOME/.ledatic/witness/sign_token}
 
 [ -r "$SIGN_TOKEN_PATH" ] || { echo "missing sign token: $SIGN_TOKEN_PATH" >&2; exit 7; }

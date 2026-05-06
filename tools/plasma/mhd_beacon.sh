@@ -8,7 +8,7 @@
 
 set -u
 
-RAIL_DIR="${RAIL_DIR:-/Users/ledaticempire/projects/rail-https}"
+RAIL_DIR="${RAIL_DIR:-$HOME/projects/rail-https}"
 RAIL_BIN="${RAIL_DIR}/rail_native"
 BEACON_RAIL="${RAIL_DIR}/tools/plasma/mhd_beacon.rail"
 DAEMON_PY="${RAIL_DIR}/tools/plasma/mhd_beacon_daemon.py"
@@ -27,7 +27,7 @@ mkdir -p /tmp/mhd_beacon
 # startup tax) — eliminating that fork tax is the whole point of #3.
 pkill -f mhd_beacon_daemon.py 2>/dev/null
 sleep 0.3
-python3 "${DAEMON_PY}" >> /Users/ledaticempire/.ledatic/logs/mhd_packer.log 2>&1 &
+python3 "${DAEMON_PY}" >> $HOME/.ledatic/logs/mhd_packer.log 2>&1 &
 DAEMON_PID=$!
 trap "kill ${DAEMON_PID} 2>/dev/null" EXIT
 

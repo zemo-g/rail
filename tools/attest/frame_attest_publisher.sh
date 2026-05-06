@@ -19,7 +19,9 @@ set -euo pipefail
 FRAME_PATH=${FRAME_PATH:-/tmp/plasma_live.bin}
 BEACON_URL=${BEACON_URL:-https://ledatic.org/entropy/pulse}
 BEACON_TOKEN_FILE=${BEACON_TOKEN_FILE:-$HOME/.ledatic/entropy/beacon_token}
-WITNESS_HOST=${WITNESS_HOST:-zemog@100.87.231.45}
+WITNESS_HOST_FILE=${WITNESS_HOST_FILE:-$HOME/.ledatic/witness/host}
+WITNESS_HOST=${WITNESS_HOST:-$(cat "$WITNESS_HOST_FILE" 2>/dev/null || echo "")}
+[ -n "$WITNESS_HOST" ] || { echo "no witness host (set WITNESS_HOST or write $WITNESS_HOST_FILE)" >&2; exit 4; }
 SIGNER=${SIGNER:-/home/zemog/.ledatic/witness/sign_attestation.sh}
 SITE=${SITE:-https://ledatic.org}
 
