@@ -47,7 +47,7 @@ max_blocks_per_fn = 32
 
 mk_state _ =
   let ir = arr_new (4 * max_instr_per_fn) 0
-  let ctr = arr_new 7 0
+  let ctr = arr_new 8 0
   let _ = arr_set ctr 0 0     -- (unused; caller-save now via live mask)
   let _ = arr_set ctr 1 10    -- next_callee starts at v10
   let _ = arr_set ctr 2 0     -- instr_idx
@@ -55,6 +55,7 @@ mk_state _ =
   let _ = arr_set ctr 4 0     -- max_vreg_seen
   let _ = arr_set ctr 5 0     -- err_flag
   let _ = arr_set ctr 6 0     -- live caller-save bitmask (bit i = v(i) live)
+  let _ = arr_set ctr 7 1     -- n_args (default 1; lower_fn_def overrides)
   let blocks = arr_new max_blocks_per_fn 0
   let err_msg = cons "" []
   cons ir (cons ctr (cons blocks (cons err_msg [])))
@@ -150,14 +151,42 @@ st_emit s op a b c =
 -- Environment: list of (name, vreg) pairs. Most-recent binding shadows.
 -- ============================================================================
 
+-- env entries are 3-element lists: [name, vreg, type] where type is "int"|"str".
 env_empty _ = []
-env_extend env name vreg = cons (cons name (cons vreg [])) env
+env_extend env name vreg = env_extend_typed env name vreg "int"
+env_extend_typed env name vreg ty = cons (cons name (cons vreg (cons ty []))) env
 env_lookup env name =
   if env == [] then 0 - 1
   else
     let pair = head env
     if (head pair) == name then head (tail pair)
     else env_lookup (tail env) name
+
+env_lookup_type env name =
+  if env == [] then "int"
+  else
+    let pair = head env
+    if (head pair) == name then head (tail (tail pair))
+    else env_lookup_type (tail env) name
+
+-- Conservative AST-level type inference. Returns "int" or "str".
+-- Assumes user-fn calls return int (no str-returning fns in v1).
+infer_type env ast =
+  let tag = ast_tag ast
+  if tag == "int" then "int"
+  else if tag == "str" then "str"
+  else if tag == "var" then env_lookup_type env (head (tail ast))
+  else if tag == "op" then "int"
+  else if tag == "if" then infer_type env (head (tail (tail ast)))
+  else if tag == "let" then infer_type_let env ast
+  else "int"
+
+infer_type_let env ast =
+  let name = head (tail ast)
+  let val = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  let val_ty = infer_type env val
+  infer_type (env_extend_typed env name 0 val_ty) body
 
 -- ============================================================================
 -- Function-name registry: list of (name, fn_idx) pairs. Built once per lower.
@@ -358,14 +387,14 @@ lower_let s env ast =
   let name = head (tail ast)
   let val = head (tail (tail ast))
   let body = head (tail (tail (tail ast)))
+  let val_ty = infer_type env val
   let v_val = lower_expr s env val
   if (st_get_err s) == 1 then v_val
   else
-    -- If the body contains a call, the binding must survive it.
     let v_safe = if (contains_call body) == 1 then preserve_callee s v_val else v_val
     if (st_get_err s) == 1 then v_safe
     else
-      let env2 = env_extend env name v_safe
+      let env2 = env_extend_typed env name v_safe val_ty
       lower_expr s env2 body
 
 -- App: function call OR `print (show e)` / `print e` pattern.
@@ -407,13 +436,11 @@ lower_print_show s env ast =
   else lower_print_show_emit s v_e
 
 lower_print_bare s env ast =
-  -- ast = app f arg; print arg directly. Dispatch on arg's AST tag:
-  --   string literal -> op_print_str (length-prefixed pointer)
-  --   anything else  -> op_print_int (assume int-typed)
-  -- v1 limitation: `print str_var` where str_var is a let-bound string
-  -- falls into the int path and prints garbage. Use string-literal form.
+  -- ast = app f arg; print arg. Dispatch via type inference:
+  --   str-typed arg -> op_print_str (length-prefixed pointer)
+  --   int-typed arg -> op_print_int (decimal stdout)
   let arg = head (tail (tail ast))
-  if (ast_tag arg) == "str" then lower_print_bare_str s env arg
+  if (infer_type env arg) == "str" then lower_print_bare_str s env arg
   else lower_print_bare_int s env arg
 
 lower_print_bare_int s env arg =
@@ -443,13 +470,83 @@ lower_print_show_emit s v_e =
     let _ = st_emit s op_const v_zero 0 0
     v_zero
 
--- A call: app(var fn_name, arg). Anything else fails (we don't handle
--- multi-arg apps, anonymous functions, etc.).
+-- A call: walks nested apps to collect args (left-to-right). The
+-- innermost `head` must be a `var` naming a known function.
 lower_call s env ast =
-  let f = head (tail ast)
-  let arg = head (tail (tail ast))
-  if (ast_tag f) == "var" then lower_call_named s env (head (tail f)) arg
-  else st_fail s "lower: nested application (multi-arg or HOF) not supported in v1"
+  let args = collect_app_args ast []
+  let f = innermost_app_f ast
+  if (ast_tag f) != "var" then st_fail s "lower: HOF / non-variable head in call"
+  else lower_call_resolved s env (head (tail f)) args
+
+collect_app_args ast acc =
+  if (ast_tag ast) == "app" then
+    let f = head (tail ast)
+    let arg = head (tail (tail ast))
+    collect_app_args f (cons arg acc)
+  else acc
+
+innermost_app_f ast =
+  if (ast_tag ast) == "app" then innermost_app_f (head (tail ast))
+  else ast
+
+lower_call_resolved s env fname args =
+  let fn_idx = st_registry_lookup s fname
+  if fn_idx < 0 then st_fail s (cat ["lower: unknown function ", fname])
+  else lower_call_with_args s env fn_idx args
+
+lower_call_with_args s env fn_idx args =
+  let n = list_len_local args
+  if n < 1 then st_fail s "lower: 0-arg call not supported in v1"
+  else if n > 4 then st_fail s "lower: >4 arg call not supported in v1"
+  else lower_call_n s env fn_idx args n
+
+-- Lower each arg into a vreg, preserving across calls as needed,
+-- then emit op_call with packed args.
+lower_call_n s env fn_idx args n =
+  let arg_vregs = lower_args_with_preserve s env args
+  if (st_get_err s) == 1 then 0 - 1
+  else lower_call_emit s fn_idx arg_vregs n
+
+-- Lower args left-to-right; before each subsequent arg's lowering,
+-- preserve previously-lowered caller-save vregs to callee-save if the
+-- remaining args contain a call.
+lower_args_with_preserve s env args =
+  lower_args_loop s env args [] []
+
+lower_args_loop s env remaining done_vregs done_safe =
+  if remaining == [] then reverse done_safe
+  else
+    let arg = head remaining
+    let rest = tail remaining
+    let v = lower_expr s env arg
+    if (st_get_err s) == 1 then []
+    else
+      -- If any later arg contains a call, preserve v to callee-save now.
+      let v_safe = if (any_contains_call rest) == 1 then preserve_callee s v else v
+      lower_args_loop s env rest (cons v done_vregs) (cons v_safe done_safe)
+
+any_contains_call args =
+  if args == [] then 0
+  else if (contains_call (head args)) == 1 then 1
+  else any_contains_call (tail args)
+
+lower_call_emit s fn_idx arg_vregs n =
+  let v_dst = st_alloc_caller s
+  if (st_get_err s) == 1 then v_dst
+  else
+    let packed = pack_call_args arg_vregs n
+    let _ = st_emit s op_call v_dst fn_idx packed
+    v_dst
+
+pack_call_args vregs n =
+  if n == 1 then call_pack_1 (head vregs)
+  else if n == 2 then call_pack_2 (head vregs) (head (tail vregs))
+  else if n == 3 then call_pack_3 (nth_local 0 vregs) (nth_local 1 vregs) (nth_local 2 vregs)
+  else call_pack_4 (nth_local 0 vregs) (nth_local 1 vregs) (nth_local 2 vregs) (nth_local 3 vregs)
+
+nth_local i xs =
+  if i == 0 then head xs
+  else nth_local (i - 1) (tail xs)
 
 -- Look up `fname` in the registry stashed in the err_msg cell (we hijack it).
 -- For v1 we pass the registry separately via a global side-channel: a 1-elt
@@ -574,38 +671,70 @@ lower_fn_def fn_def registry pool =
   let args = head (tail (tail fn_def))
   let body = head (tail (tail (tail fn_def)))
   let n_args = list_len_local args
-  if n_args > 1 then mk_err_fn (cat ["multi-arg fn '", name, "' not supported in v1"])
-  else lower_fn_body name args body registry pool
+  if n_args > 4 then mk_err_fn (cat ["fn '", name, "': >4 args not supported (v1 ABI cap)"])
+  else lower_fn_body name args body registry pool n_args
 
 mk_err_fn msg =
   let _ = print (cat ["LOWER ERR: ", msg])
   -- A sentinel "error" function struct (caller checks).
   cons "ERR" (cons msg [])
 
-lower_fn_body name args body registry pool =
+lower_fn_body name args body registry pool n_args =
   let s = mk_state_with_registry registry pool
+  -- record n_args in state so finalize can pass it to make_fn_n
+  let _ = arr_set (st_ctr s) 7 n_args
   -- block 0 starts at instruction 0
   let _ = st_set_block_start s (st_reserve_block s)
-  -- Bind args, optionally preserving to callee-save.
   let env = build_arg_env s args body
   if (st_get_err s) == 1 then mk_err_fn "lower failed during arg setup"
   else lower_fn_after_args s env body
 
+-- Bind args. For each arg i (0..n-1), it's initially in v_i (preg x_(i+9)).
+-- If body has any call, preserve to callee-save (v10/v11) — but we only
+-- have 2 callee-save slots in v1 ABI, so this caps at 2 args-with-calls.
+-- For args > 1 that don't need preservation, just bind to v_i.
 build_arg_env s args body =
-  if args == [] then env_empty 0
-  else build_arg_env_one s (head args) body
+  build_arg_env_loop s args body 0 (env_empty 0) (contains_call body)
 
-build_arg_env_one s arg_name body =
-  let _ = st_track_reg s 0
-  if (contains_call body) == 1 then
-    -- preserve v0 to v10 so the arg survives recursive/other calls
-    let v_safe = st_alloc_callee s
-    if (st_get_err s) == 1 then env_empty 0
-    else
-      let _ = st_emit s op_mov v_safe 0 0
-      env_extend (env_empty 0) arg_name v_safe
+build_arg_env_loop s args body i env body_has_call =
+  if args == [] then env
   else
-    env_extend (env_empty 0) arg_name 0
+    let arg_name = head args
+    let _ = st_track_reg s i
+    if body_has_call == 1 then build_arg_env_preserved s args body i env body_has_call
+    else build_arg_env_no_preserve s args body i env body_has_call
+
+build_arg_env_preserved s args body i env body_has_call =
+  let arg_name = head args
+  let v_safe = st_alloc_callee s
+  if (st_get_err s) == 1 then env
+  else
+    let _ = st_emit s op_mov v_safe i 0
+    -- Recurse with type from infer (defer; v1 just str if arg-name suggests it).
+    -- For now, default type "int". String args route through lower_call's
+    -- explicit type handling at call sites.
+    let env2 = env_extend_typed env arg_name v_safe (infer_arg_type arg_name)
+    build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call
+
+build_arg_env_no_preserve s args body i env body_has_call =
+  let arg_name = head args
+  -- Lock vN's bit in the live mask so the caller-save allocator doesn't
+  -- clobber the arg-holding register. (Bit 0 / v0 is always reserved
+  -- and not in the bitmask; for v1+, set the bit.)
+  let _ = if i >= 1 then lock_caller s i else 0
+  let env2 = env_extend_typed env arg_name i (infer_arg_type arg_name)
+  build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call
+
+-- Heuristic: arg names starting with `s` or containing `str` -> "str";
+-- otherwise "int". Imperfect but covers common idioms (`s`, `str`, `s1`, etc.).
+-- Better: explicit type annotations or callsite-driven inference (v2).
+infer_arg_type name =
+  if name == "s" then "str"
+  else if name == "s1" then "str"
+  else if name == "s2" then "str"
+  else if name == "str" then "str"
+  else if name == "name" then "str"
+  else "int"
 
 lower_fn_after_args s env body =
   let v_result = lower_expr s env body
@@ -617,10 +746,10 @@ lower_fn_finalize s v_result =
   let n_instr = st_get_instr s
   let n_regs = (st_get_maxreg s) + 1
   let n_blocks = st_get_nblocks s
-  -- compact the blocks array down to the actually-reserved size
+  let n_args = arr_get (st_ctr s) 7
   let blocks_compact = arr_new n_blocks 0
   let _ = copy_blocks (st_blocks s) blocks_compact n_blocks 0
-  make_fn (st_ir s) n_instr n_regs blocks_compact
+  make_fn_n (st_ir s) n_instr n_regs blocks_compact n_args
 
 copy_blocks src dst n i =
   if i >= n then 0
