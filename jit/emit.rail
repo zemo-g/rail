@@ -1,0 +1,140 @@
+-- jit/emit.rail — IR → ARM64 bytes.
+-- Register mapping (v1, simplest possible):
+--   IR virtual register vN  ->  ARM64 x(N + 9)
+--   x9..x28 are caller-save scratch; up to 20 IR regs.
+--   x0 holds the input arg on entry; we move it to v0's mapped reg first.
+
+import "jit/ir_c.rail"
+import "jit/arm64.rail"
+import "jit/codebuf.rail"
+
+-- IR vreg N -> physical x(N + 9).
+preg vreg = vreg + 9
+
+-- Bytes (= 4-byte ARM64 instructions) used per IR op.
+-- Const: 4 instrs (movz + 3 movk, fixed budget so block offsets are stable).
+-- add/sub/mul: 1 instr.
+-- lt: 2 instrs (cmp + cset).
+-- jmp: 1 instr (b).
+-- jz: 1 instr (cbz).
+-- ret: 2 instrs (mov x0,vN ; ret).
+ir_byte_size op =
+  if op == op_const then 16
+  else if op == op_add then 4
+  else if op == op_sub then 4
+  else if op == op_mul then 4
+  else if op == op_lt then 8
+  else if op == op_jmp then 4
+  else if op == op_jz then 4
+  else if op == op_ret then 8
+  else 4
+
+-- Pass 1: compute, for each IR instruction index i, the byte offset
+-- where its emitted ARM64 sequence starts. Returns an int_arr of size
+-- n_instr + 1 where slot[i] = byte offset of instr i, slot[n_instr] = total.
+compute_offsets ir n_instr =
+  let off_arr = arr_new (n_instr + 1) 0
+  let _ = fill_offsets ir n_instr off_arr 0 0
+  off_arr
+
+fill_offsets ir n_instr off_arr i acc =
+  if i >= n_instr then
+    let _ = arr_set off_arr i acc
+    0
+  else
+    let _ = arr_set off_arr i acc
+    let op = ir_op ir i
+    let sz = ir_byte_size op
+    fill_offsets ir n_instr off_arr (i + 1) (acc + sz)
+
+-- Find the byte offset of the first instruction of block k.
+-- blocks is an int_arr where blocks[k] = first instruction index of block k.
+block_byte_offset blocks offsets k =
+  let instr_idx = arr_get blocks k
+  arr_get offsets instr_idx
+
+-- Emit a 64-bit constant materialization sequence at byte offset `off`
+-- using up to 4 instructions (movz + movk x3). Always emits 4 slots so
+-- the byte budget is fixed. NOPs would be cleaner but for simplicity we
+-- emit movk with shift_n=1..3 even for small constants — when the
+-- corresponding 16-bit chunk is zero, movk sets nothing and is a no-op.
+emit_const buf off dst imm =
+  let p0 = bit_and imm 65535
+  let p1 = bit_and (shr imm 16) 65535
+  let p2 = bit_and (shr imm 32) 65535
+  let p3 = bit_and (shr imm 48) 65535
+  let _ = cb_emit buf       off       (enc_mov_imm16 dst p0)
+  let _ = cb_emit buf (off + 4)  (enc_movk dst p1 1)
+  let _ = cb_emit buf (off + 8)  (enc_movk dst p2 2)
+  let _ = cb_emit buf (off + 12) (enc_movk dst p3 3)
+  0
+
+-- Pass 2: emit ARM64 bytes for instruction i into buf at the correct offset.
+emit_one buf ir offsets blocks i =
+  let off = arr_get offsets i
+  let op = ir_op ir i
+  let a = ir_a ir i
+  let b = ir_b ir i
+  let c = ir_c ir i
+  if op == op_const then
+    emit_const buf off (preg a) b
+  else if op == op_add then
+    cb_emit buf off (enc_add (preg a) (preg b) (preg c))
+  else if op == op_sub then
+    cb_emit buf off (enc_sub (preg a) (preg b) (preg c))
+  else if op == op_mul then
+    cb_emit buf off (enc_mul (preg a) (preg b) (preg c))
+  else if op == op_lt then
+    let _ = cb_emit buf       off       (enc_cmp (preg b) (preg c))
+    let _ = cb_emit buf (off + 4) (enc_cset_lt (preg a))
+    0
+  else if op == op_jmp then
+    let target_off = block_byte_offset blocks offsets a
+    let rel = target_off - off
+    cb_emit buf off (enc_b_byte_off rel)
+  else if op == op_jz then
+    let target_off = block_byte_offset blocks offsets b
+    let rel = target_off - off
+    cb_emit buf off (enc_cbz_byte_off (preg a) rel)
+  else if op == op_ret then
+    let _ = cb_emit buf       off       (enc_mov_reg 0 (preg a))
+    let _ = cb_emit buf (off + 4) enc_ret
+    0
+  else
+    -- Unknown op; emit ret as a fail-safe so we don't run garbage.
+    let _ = cb_emit buf       off       (enc_mov_reg 0 0)
+    let _ = cb_emit buf (off + 4) enc_ret
+    0
+
+emit_loop buf ir offsets blocks i n_instr =
+  if i >= n_instr then 0
+  else
+    let _ = emit_one buf ir offsets blocks i
+    emit_loop buf ir offsets blocks (i + 1) n_instr
+
+-- Emit the function. Prepends a "mov v0_preg, x0" so the input arg
+-- (in x0 from the calling convention) lands in v0's mapped register
+-- before any IR instructions execute. Returns (codebuf, total_bytes).
+emit_function fn =
+  let ir = fn_ir fn
+  let n_instr = fn_ninstr fn
+  let blocks = fn_blocks fn
+  let offsets = compute_offsets ir n_instr
+  let body_bytes = arr_get offsets n_instr
+  -- Prologue: 1 instr (mov v0, x0). Total = 4 + body_bytes.
+  let total_bytes = 4 + body_bytes
+  let buf = make_codebuf (total_bytes / 4)
+  -- Bump every offset by 4 so the body sees the prologue.
+  let _ = bump_offsets offsets (n_instr + 1) 0
+  let _ = cb_emit buf 0 (enc_mov_reg (preg 0) 0)
+  let _ = emit_loop buf ir offsets blocks 0 n_instr
+  cons buf (cons total_bytes [])
+
+bump_offsets arr n i =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i ((arr_get arr i) + 4)
+    bump_offsets arr n (i + 1)
+
+emitted_buf res = head res
+emitted_size res = head (tail res)
