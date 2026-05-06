@@ -1,0 +1,58 @@
+-- jit/loader.rail — runtime mapping + indirect call.
+-- Strategy:
+--   1. mmap a single 4096-byte page RW (alloc_pages from stdlib/mmap.rail).
+--   2. byte_set the JITted bytes from the Rail-side codebuf into the page.
+--   3. mprotect the page RX.
+--   4. sys_icache_invalidate over the live byte range.
+--   5. pthread_create the page as the start_routine, with our int as `arg`.
+--   6. pthread_join to retrieve the void* return — that's the JIT result.
+--
+-- This sidesteps Rail's lack of an indirect-call primitive: pthread_create
+-- IS the indirect call. libSystem is auto-linked, so no extra dylib or
+-- compile.rail edits are required.
+
+import "stdlib/mmap.rail"
+import "jit/ffi.rail"
+
+page_size = 4096
+
+-- Copy the first n_bytes of the byte-granular codebuf into raw page p.
+copy_buf_to_page buf p i n_bytes =
+  if i >= n_bytes then 0
+  else
+    let _ = byte_set p i (arr_get buf i)
+    copy_buf_to_page buf p (i + 1) n_bytes
+
+-- Allocate an executable page, write `n_bytes` from `buf` into it,
+-- flip to RX, invalidate I-cache, and return the page pointer.
+make_executable buf n_bytes =
+  let page = alloc_pages page_size
+  let _ = copy_buf_to_page buf page 0 n_bytes
+  -- prot_read | prot_exec = 1 + 4 = 5
+  let _ = mprotect page page_size 5
+  let _ = sys_icache_invalidate page n_bytes
+  page
+
+-- Call the JIT'd function pointed to by `page` with one int arg.
+-- Returns the JIT's int return.
+call_jit page arg =
+  -- 8 bytes for pthread_t handle, 8 bytes for retval slot.
+  let tid_buf = malloc 8
+  let ret_buf = malloc 8
+  let _ = write_u64 tid_buf 0 0
+  let _ = write_u64 ret_buf 0 0
+  -- pthread_create(&tid, NULL, page, (void*)arg)
+  let rc = pthread_create tid_buf 0 page arg
+  if rc != 0 then
+    let _ = print (cat ["pthread_create failed rc=", show rc])
+    0 - 1
+  else
+    let tid = read_u64 tid_buf 0
+    let _ = pthread_join tid ret_buf
+    let result = read_u64 ret_buf 0
+    let _ = free tid_buf
+    let _ = free ret_buf
+    result
+
+-- Free the JIT page after we're done with it.
+free_jit page = free_pages page page_size
