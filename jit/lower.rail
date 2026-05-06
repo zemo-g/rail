@@ -255,12 +255,24 @@ lower_expr_scoped s env ast =
 lower_expr_dispatch s env ast =
   let tag = ast_tag ast
   if tag == "int" then lower_int s ast
+  else if tag == "str" then lower_str s ast
   else if tag == "var" then lower_var s env ast
   else if tag == "op" then lower_op s env ast
   else if tag == "if" then lower_if s env ast
   else if tag == "let" then lower_let s env ast
   else if tag == "app" then lower_app s env ast
   else st_fail s (cat ["lower: unknown ast tag ", tag])
+
+lower_str s ast =
+  let str_val = head (tail ast)
+  let off = pool_append s str_val
+  if (st_get_err s) == 1 then 0 - 1
+  else
+    let v = st_alloc_caller s
+    if (st_get_err s) == 1 then v
+    else
+      let _ = st_emit s op_str_lit v off 0
+      v
 
 lower_int s ast =
   let n = head (tail ast)
@@ -356,9 +368,13 @@ lower_let s env ast =
       let env2 = env_extend env name v_safe
       lower_expr s env2 body
 
--- App: function call OR `print (show e)` pattern.
+-- App: function call OR `print (show e)` / `print e` pattern.
+-- Inside the JIT's int-only world, `print e` for any lowerable e maps
+-- to op_print_int — the inner expression is necessarily int-typed
+-- because nothing else lowers.
 lower_app s env ast =
   if (is_print_show ast) == 1 then lower_print_show s env ast
+  else if (is_print_bare ast) == 1 then lower_print_bare s env ast
   else lower_call s env ast
 
 is_print_show ast =
@@ -368,6 +384,14 @@ is_print_show ast =
   if (is_var_named f "print") == 0 then 0
   else if (ast_tag arg) == "app" then is_var_named (head (tail arg)) "show"
   else 0
+
+is_print_bare ast =
+  -- ast = app f arg, where f = var "print" and arg is anything that's
+  -- NOT the show-wrapped form (which is_print_show already covers).
+  let f = head (tail ast)
+  if (is_var_named f "print") == 0 then 0
+  else if (is_print_show ast) == 1 then 0
+  else 1
 
 is_var_named ast name =
   if (ast_tag ast) == "var" then
@@ -381,6 +405,34 @@ lower_print_show s env ast =
   let v_e = lower_expr s env e
   if (st_get_err s) == 1 then v_e
   else lower_print_show_emit s v_e
+
+lower_print_bare s env ast =
+  -- ast = app f arg; print arg directly. Dispatch on arg's AST tag:
+  --   string literal -> op_print_str (length-prefixed pointer)
+  --   anything else  -> op_print_int (assume int-typed)
+  -- v1 limitation: `print str_var` where str_var is a let-bound string
+  -- falls into the int path and prints garbage. Use string-literal form.
+  let arg = head (tail (tail ast))
+  if (ast_tag arg) == "str" then lower_print_bare_str s env arg
+  else lower_print_bare_int s env arg
+
+lower_print_bare_int s env arg =
+  let v_e = lower_expr s env arg
+  if (st_get_err s) == 1 then v_e
+  else lower_print_show_emit s v_e
+
+lower_print_bare_str s env arg =
+  let v_ptr = lower_expr s env arg
+  if (st_get_err s) == 1 then v_ptr
+  else lower_print_str_emit s v_ptr
+
+lower_print_str_emit s v_ptr =
+  let _ = st_emit s op_print_str v_ptr 0 0
+  let v_zero = st_alloc_caller s
+  if (st_get_err s) == 1 then v_zero
+  else
+    let _ = st_emit s op_const v_zero 0 0
+    v_zero
 
 lower_print_show_emit s v_e =
   let _ = st_emit s op_print_int v_e 0 0
@@ -434,39 +486,104 @@ lower_call_with_idx s env fn_idx arg =
     let v_dst = st_alloc_caller s
     if (st_get_err s) == 1 then v_dst
     else
-      let _ = st_emit s op_call v_dst fn_idx v_arg
+      let _ = st_emit s op_call v_dst fn_idx (call_pack_1 v_arg)
       v_dst
 
--- Registry helpers on state. We extend state to carry the registry.
--- Layout change:
---   state = [ir, ctr, blocks, err_msg, registry_pairs]
-mk_state_with_registry registry =
+-- Registry + pool helpers on state. State layout:
+--   [ir, ctr, blocks, err_msg, registry, pool]
+-- pool = [pool_buf (int_arr of bytes), pool_size_cell (int_arr size 1)]
+-- The pool is shared across all functions in a program; the registry is
+-- read-only per program.
+mk_state_with_registry registry pool =
   let s = mk_state 0
-  cons (st_ir s) (cons (st_ctr s) (cons (st_blocks s) (cons (st_err_msg s) (cons registry []))))
+  cons (st_ir s) (cons (st_ctr s) (cons (st_blocks s) (cons (st_err_msg s) (cons registry (cons pool [])))))
 
 st_registry s = head (tail (tail (tail (tail s))))
 st_registry_lookup s name = reg_lookup (st_registry s) name
+
+st_pool s          = head (tail (tail (tail (tail (tail s)))))
+st_pool_buf s      = head (st_pool s)
+st_pool_size_cell s = head (tail (st_pool s))
+st_pool_size s     = arr_get (st_pool_size_cell s) 0
+st_pool_bump s n   = arr_set (st_pool_size_cell s) 0 ((st_pool_size s) + n)
+
+max_pool_bytes = 16384
+
+mk_empty_pool _ =
+  let buf = arr_new max_pool_bytes 0
+  let sz = arr_new 1 0
+  cons buf (cons sz [])
+
+-- Append a length-prefixed string to the pool. Returns the offset of the
+-- length prefix within the pool. Length is stored as 8-byte little-endian.
+pool_append s str =
+  let off = st_pool_size s
+  let buf = st_pool_buf s
+  let n = length str
+  if (off + 8 + n) > max_pool_bytes then
+    let _ = st_fail s "pool overflow (>16KB strings); raise max_pool_bytes"
+    0
+  else
+    let _ = write_le_u64 buf off n
+    let _ = write_str_bytes buf (off + 8) str 0 n
+    let _ = st_pool_bump s (8 + n)
+    off
+
+write_le_u64 buf off v =
+  let _ = arr_set buf       off       (bit_and v 255)
+  let _ = arr_set buf (off + 1) (bit_and (shr v 8)  255)
+  let _ = arr_set buf (off + 2) (bit_and (shr v 16) 255)
+  let _ = arr_set buf (off + 3) (bit_and (shr v 24) 255)
+  let _ = arr_set buf (off + 4) (bit_and (shr v 32) 255)
+  let _ = arr_set buf (off + 5) (bit_and (shr v 40) 255)
+  let _ = arr_set buf (off + 6) (bit_and (shr v 48) 255)
+  let _ = arr_set buf (off + 7) (bit_and (shr v 56) 255)
+  0
+
+write_str_bytes buf off str i n =
+  if i >= n then 0
+  else
+    let c = str_sub str i 1
+    let b = byte_at_str c
+    let _ = arr_set buf (off + i) b
+    write_str_bytes buf off str (i + 1) n
+
+-- One-character string -> byte value (ASCII printable + tab/newline only).
+-- For non-ASCII, returns 0. v1 corpus is ASCII-only so this suffices.
+byte_at_str c =
+  if c == "\n" then 10
+  else if c == "\t" then 9
+  else byte_printable c
+
+printable_set = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+byte_printable c =
+  if c == " " then 32
+  else
+    let i = str_find c printable_set
+    if i < 0 then 0
+    else 33 + i
 
 -- ============================================================================
 -- Function lowering
 -- ============================================================================
 
 -- Lower one function definition; returns FnStruct or sets err.
-lower_fn_def fn_def registry =
+lower_fn_def fn_def registry pool =
   let name = head (tail fn_def)
   let args = head (tail (tail fn_def))
   let body = head (tail (tail (tail fn_def)))
   let n_args = list_len_local args
   if n_args > 1 then mk_err_fn (cat ["multi-arg fn '", name, "' not supported in v1"])
-  else lower_fn_body name args body registry
+  else lower_fn_body name args body registry pool
 
 mk_err_fn msg =
   let _ = print (cat ["LOWER ERR: ", msg])
   -- A sentinel "error" function struct (caller checks).
   cons "ERR" (cons msg [])
 
-lower_fn_body name args body registry =
-  let s = mk_state_with_registry registry
+lower_fn_body name args body registry pool =
+  let s = mk_state_with_registry registry pool
   -- block 0 starts at instruction 0
   let _ = st_set_block_start s (st_reserve_block s)
   -- Bind args, optionally preserving to callee-save.
@@ -536,14 +653,15 @@ lower_program program_ast =
     -- (the entry point). Reorder: put `main` first if it exists.
     let ordered = move_main_first defs
     let registry2 = build_registry ordered
-    lower_each ordered registry2 []
+    let pool = mk_empty_pool 0
+    lower_each ordered registry2 pool []
 
-lower_each defs registry acc =
-  if defs == [] then cons "ok" (cons (reverse acc) [])
+lower_each defs registry pool acc =
+  if defs == [] then cons "ok" (cons (reverse acc) (cons pool []))
   else
-    let fn = lower_fn_def (head defs) registry
+    let fn = lower_fn_def (head defs) registry pool
     if (head fn) == "ERR" then cons "err" (cons (head (tail fn)) [])
-    else lower_each (tail defs) registry (cons fn acc)
+    else lower_each (tail defs) registry pool (cons fn acc)
 
 move_main_first defs =
   if has_main defs == 0 then defs
