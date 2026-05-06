@@ -1,0 +1,279 @@
+-- jit/parse.rail
+--
+-- Parses the tiny stack-VM bytecode text language into an IR function
+-- struct (see jit/ir.rail for the contract).
+--
+-- Source language (one instr per line, # for comments, blank lines OK):
+--   PUSH <int>
+--   ADD | SUB | MUL | LT
+--   JMP <label>
+--   JZ <label>
+--   RET
+--   LABEL <name>
+--
+-- Lowering rule (stack VM -> register IR): a virtual stack of register
+-- numbers is maintained at parse time.  PUSH allocates a fresh register
+-- and emits ir_const.  ADD/SUB/MUL/LT pop two regs, allocate one, emit a
+-- 3-address op.  JZ pops one.  RET pops one.  JMP/labels emit jumps with
+-- block-index targets resolved during a second pass.
+--
+-- Public entry point: parse_bytecode src_text -> function struct (see ir.rail).
+-- Errors are reported via `error "line N: msg"` and are catchable via `try`.
+--
+-- NOTE: this file deliberately does NOT `import "jit/ir.rail"`.  Rail imports
+-- are not deduped, so each direct importer must include ir.rail exactly once.
+-- See jit/test_parse.rail and jit/fixtures_ir.rail for the canonical order:
+--   import "jit/ir.rail"
+--   import "jit/parse.rail"
+--   import "jit/print.rail"
+
+-- Trim leading/trailing ASCII spaces from a string.
+trim_str s =
+  trim_right (trim_left s)
+
+trim_left s =
+  let n = length s
+  if n == 0 then s
+  else if str_sub s 0 1 == " " then trim_left (str_sub s 1 (n - 1))
+  else s
+
+trim_right s =
+  let n = length s
+  if n == 0 then s
+  else if str_sub s (n - 1) 1 == " " then trim_right (str_sub s 0 (n - 1))
+  else s
+
+-- Strip everything from the first '#' onward (comment).
+strip_comment s =
+  let i = str_find "#" s
+  if i < 0 then s
+  else str_sub s 0 i
+
+-- True (1) iff string is empty after trimming.
+is_blank s = length (trim_str s) == 0
+
+-- Split on ANY whitespace (space; LABEL/branch lines are simple enough that
+-- we only need single-space separation).  Keeps order; drops empties.
+split_words line =
+  filter is_nonempty_word (split " " line)
+
+is_nonempty_word s = length s > 0
+
+-- ---------------------------------------------------------------------------
+-- Pass 1a: walk source, build (raw_instrs, label_pairs).
+--
+-- raw_instrs: a Rail list of [opname_str, imm_int, label_str] in source order.
+-- label_pairs: a Rail list of [label_name, instr_idx] pairs.  instr_idx is
+--              the index of the NEXT non-LABEL instr emitted after the label.
+-- ---------------------------------------------------------------------------
+
+-- Returns a pair-list: [raw_instrs, label_pairs].  raw_instrs is reversed
+-- relative to source order; the caller reverses it.
+collect_lines src =
+  let lines = split "\n" src
+  collect_loop lines 0 1 [] []
+
+collect_loop lines i lineno raws labels =
+  if length lines == 0 then [reverse raws, reverse labels]
+  else
+    let line = head lines
+    let rest = tail lines
+    let cleaned = trim_str (strip_comment line)
+    if length cleaned == 0 then
+      collect_loop rest i (lineno + 1) raws labels
+    else
+      let parts = split_words cleaned
+      let head_tok = head parts
+      if head_tok == "LABEL" then
+        if length parts < 2 then
+          error (append (append "line " (show lineno)) ": LABEL needs a name")
+        else
+          let name = head (tail parts)
+          collect_loop rest i (lineno + 1) raws (cons [name, i] labels)
+      else
+        let raw = parse_one_instr parts lineno
+        collect_loop rest (i + 1) (lineno + 1) (cons raw raws) labels
+
+-- Parse a single non-LABEL line into [opname, imm, label].
+parse_one_instr parts lineno =
+  let op = head parts
+  if op == "PUSH" then
+    if length parts < 2 then
+      error (append (append "line " (show lineno)) ": PUSH needs an int")
+    else ["PUSH", parse_int (head (tail parts)), ""]
+  else if op == "ADD" then ["ADD", 0, ""]
+  else if op == "SUB" then ["SUB", 0, ""]
+  else if op == "MUL" then ["MUL", 0, ""]
+  else if op == "LT"  then ["LT",  0, ""]
+  else if op == "RET" then ["RET", 0, ""]
+  else if op == "JMP" then
+    if length parts < 2 then
+      error (append (append "line " (show lineno)) ": JMP needs a label")
+    else ["JMP", 0, head (tail parts)]
+  else if op == "JZ" then
+    if length parts < 2 then
+      error (append (append "line " (show lineno)) ": JZ needs a label")
+    else ["JZ", 0, head (tail parts)]
+  else
+    error (append (append (append "line " (show lineno)) ": unknown op '") (append op "'"))
+
+-- ---------------------------------------------------------------------------
+-- Pass 1b: compute block boundaries.
+--
+-- An int_arr `is_start` of length n_instr where 1 marks a block start.
+-- ---------------------------------------------------------------------------
+
+is_branch_op opname =
+  if opname == "JMP" then 1
+  else if opname == "JZ" then 1
+  else if opname == "RET" then 1
+  else 0
+
+mark_block_starts raws labels n =
+  let arr = arr_new n 0
+  let _ = if n > 0 then arr_set arr 0 1 else 0
+  let _ = mark_after_branches raws arr 0 n
+  let _ = mark_label_targets labels arr n
+  arr
+
+mark_after_branches raws arr i n =
+  if length raws == 0 then 0
+  else
+    let r = head raws
+    let opn = head r
+    let _ = if (is_branch_op opn) > 0 then
+              if (i + 1) < n then arr_set arr (i + 1) 1 else 0
+            else 0
+    mark_after_branches (tail raws) arr (i + 1) n
+
+mark_label_targets labels arr n =
+  if length labels == 0 then 0
+  else
+    let p = head labels
+    let idx = head (tail p)
+    let _ = if (idx >= 0) then
+              if idx < n then arr_set arr idx 1 else 0
+            else 0
+    mark_label_targets (tail labels) arr n
+
+-- Build block_offsets int_arr from the is_start mask.
+build_block_offsets is_start n =
+  let nb = count_starts is_start 0 n 0
+  let blocks = arr_new nb 0
+  let _ = fill_block_offsets is_start n blocks 0 0
+  blocks
+
+count_starts arr i n acc =
+  if i >= n then acc
+  else
+    let v = arr_get arr i
+    let next_acc = if v > 0 then acc + 1 else acc
+    count_starts arr (i + 1) n next_acc
+
+fill_block_offsets is_start n blocks i k =
+  if i >= n then 0
+  else
+    let v = arr_get is_start i
+    if v > 0 then
+      let _ = arr_set blocks k i
+      fill_block_offsets is_start n blocks (i + 1) (k + 1)
+    else
+      fill_block_offsets is_start n blocks (i + 1) k
+
+-- Map an instruction index to its containing block index.
+-- block_offsets is sorted ascending by construction; linear scan.
+instr_to_block_idx blocks instr_idx =
+  let nb = arr_len blocks
+  scan_blocks blocks nb instr_idx 0 0
+
+scan_blocks blocks nb instr_idx k best =
+  if k >= nb then best
+  else
+    let s = arr_get blocks k
+    if s <= instr_idx then scan_blocks blocks nb instr_idx (k + 1) k
+    else best
+
+-- Look up a label name in label_pairs, return its instr index, or -1.
+lookup_label labels name =
+  if length labels == 0 then 0 - 1
+  else
+    let p = head labels
+    if (head p) == name then head (tail p)
+    else lookup_label (tail labels) name
+
+-- ---------------------------------------------------------------------------
+-- Pass 2: emit IR.  A virtual register stack is maintained in a Rail list of
+-- ints (top = head).
+-- ---------------------------------------------------------------------------
+
+-- Return the function struct.  This is the public entry point.
+parse_bytecode src =
+  let pair = collect_lines src
+  let raws = head pair
+  let labels = head (tail pair)
+  let n = length raws
+  let is_start = mark_block_starts raws labels n
+  let blocks = build_block_offsets is_start n
+  let ir = make_ir n
+  let next_reg = emit_loop raws labels blocks ir [] 0 0
+  make_function ir n next_reg blocks
+
+-- emit_loop returns the final next_reg (so we know n_regs).
+emit_loop raws labels blocks ir stack i next_reg =
+  if length raws == 0 then next_reg
+  else
+    let r = head raws
+    let opn = head r
+    let imm = head (tail r)
+    let lbl = head (tail (tail r))
+    let result = emit_one ir labels blocks i opn imm lbl stack next_reg
+    let new_stack = head result
+    let new_next  = head (tail result)
+    emit_loop (tail raws) labels blocks ir new_stack (i + 1) new_next
+
+-- emit_one returns [new_stack, new_next_reg].
+emit_one ir labels blocks i opn imm lbl stack next_reg =
+  if opn == "PUSH" then
+    let dst = next_reg
+    let _ = ir_emit ir i (op_const 0) dst imm 0
+    [cons dst stack, next_reg + 1]
+  else if opn == "ADD" then emit_binop ir i (op_add 0) stack next_reg
+  else if opn == "SUB" then emit_binop ir i (op_sub 0) stack next_reg
+  else if opn == "MUL" then emit_binop ir i (op_mul 0) stack next_reg
+  else if opn == "LT"  then emit_binop ir i (op_lt 0)  stack next_reg
+  else if opn == "RET" then
+    let src = stack_pop_one stack i
+    let _ = ir_emit ir i (op_ret 0) src 0 0
+    [tail stack, next_reg]
+  else if opn == "JMP" then
+    let target_instr = lookup_label labels lbl
+    let _ = if target_instr < 0 then
+              error (append "JMP to unknown label: " lbl)
+            else 0
+    let target_block = instr_to_block_idx blocks target_instr
+    let _ = ir_emit ir i (op_jmp 0) target_block 0 0
+    [stack, next_reg]
+  else if opn == "JZ" then
+    let cond = stack_pop_one stack i
+    let target_instr = lookup_label labels lbl
+    let _ = if target_instr < 0 then
+              error (append "JZ to unknown label: " lbl)
+            else 0
+    let target_block = instr_to_block_idx blocks target_instr
+    let _ = ir_emit ir i (op_jz 0) cond target_block 0
+    [tail stack, next_reg]
+  else
+    -- Should never trigger; parse_one_instr rejects unknowns.
+    error (append "internal: unhandled op " opn)
+
+emit_binop ir i op stack next_reg =
+  let b = stack_pop_one stack i
+  let a = stack_pop_one (tail stack) i
+  let dst = next_reg
+  let _ = ir_emit ir i op dst a b
+  [cons dst (tail (tail stack)), next_reg + 1]
+
+stack_pop_one stack i =
+  if length stack == 0 then
+    error (append "stack underflow at instr " (show i))
+  else head stack
