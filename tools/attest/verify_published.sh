@@ -27,6 +27,12 @@ SITE_BASE="${SITE_BASE:-https://ledatic.org}"
 JSON=0
 TARGET_TAG=""
 
+# Tags from before binaries were checked into the repo. There is no
+# rail_native or compile.rail blob at these tags, so they were never
+# published and have no manifest to verify against. drift_audit.sh
+# uses the same list — keep them in sync.
+PRE_HISTORIC_TAGS=(v0.6.0)
+
 for arg in "$@"; do
   case "$arg" in
     --json) JSON=1 ;;
@@ -47,6 +53,26 @@ else
     CANDIDATES+=("$line")
   done < <(git tag | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
 fi
+
+# Drop pre-historic tags before walking — they have no manifest and
+# never will. Without this filter, the script reports them as `miss`
+# with a fix command (`./tools/attest/publish.sh releases/<tag>`)
+# that would fail because the local releases/<tag>/ directory
+# doesn't exist either.
+declare -a PREHISTORIC_SKIPPED=()
+filtered=()
+for tag in "${CANDIDATES[@]}"; do
+  is_prehistoric=0
+  for pre in "${PRE_HISTORIC_TAGS[@]}"; do
+    [ "$tag" = "$pre" ] && is_prehistoric=1 && break
+  done
+  if [ "$is_prehistoric" = "1" ]; then
+    PREHISTORIC_SKIPPED+=("$tag")
+  else
+    filtered+=("$tag")
+  fi
+done
+CANDIDATES=("${filtered[@]+"${filtered[@]}"}")
 
 declare -a OK=() MISMATCH=() MISSING=() SKIPPED=()
 
@@ -122,7 +148,17 @@ for a in d.get("artifacts", []):
 }
 
 # ── walk ───────────────────────────────────────────────────────────
-[ "$JSON" = "0" ] && echo "verifying ${#CANDIDATES[@]} tag(s) against $SITE_BASE"
+if [ "$JSON" = "0" ]; then
+  msg="verifying ${#CANDIDATES[@]} tag(s) against $SITE_BASE"
+  [ ${#PREHISTORIC_SKIPPED[@]} -gt 0 ] && msg="$msg ($((${#PREHISTORIC_SKIPPED[@]})) pre-historic skipped: ${PREHISTORIC_SKIPPED[*]})"
+  echo "$msg"
+fi
+
+# Edge: target was the only thing requested AND it's pre-historic.
+if [ ${#CANDIDATES[@]} -eq 0 ]; then
+  [ "$JSON" = "0" ] && echo "summary: 0 verifiable tags (all candidates were pre-historic)"
+  exit 0
+fi
 
 for tag in "${CANDIDATES[@]}"; do
   # Capture verify_one_tag's stdout into a buffer so we can decide
