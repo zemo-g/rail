@@ -128,6 +128,7 @@ dispatch() {
 \`audit dry\`      — drift_audit.sh --dry (no slack/publish)
 \`bump <ver>\`     — open site_bump_pr.sh PR (idempotent)
 \`tail <log>\`     — last 20 lines of a known log: heal | drift | attest
+\`brain <msg>\`    — feed message to brain.rail, post its response
 \`help\`           — this message"
       ;;
 
@@ -205,6 +206,25 @@ $pr_url"
 $(echo "$out" | tail -8)
 \`\`\`"
       fi
+      ;;
+
+    brain)
+      # Pipe everything after "brain " into brain.rail's perception
+      # file, run one tick, post the response. brain v0 is a stub so
+      # the response is a thought-trace; that will get richer as the
+      # cognition module wakes up.
+      local message
+      message=$(echo "$cmd" | sed -E 's/^brain[[:space:]]*//')
+      mkdir -p "$HOME/.ledatic/brain"
+      printf '%s' "$message" > "$HOME/.ledatic/brain/perception.txt"
+      "$RAIL_REPO/rail_native" run "$RAIL_REPO/tools/brain/brain.rail" >/dev/null 2>&1
+      local response
+      response=$(cat "$HOME/.ledatic/brain/last_response.txt" 2>/dev/null)
+      [ -z "$response" ] && response="(brain produced no response)"
+      post_reply "$thread_ts" "*brain*
+\`\`\`
+$response
+\`\`\`"
       ;;
 
     tail)
