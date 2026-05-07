@@ -5,18 +5,34 @@
 --     tag = "ok"  : payload = list of FnStruct ready for emit_program
 --     tag = "err" : payload = error message string
 --
--- Subset support (v1):
---   * Single-arg user functions only (multi-arg → err)
---   * Integer arithmetic (+, -, *), comparison (<)
---   * `if c then a else b` — lowered with v_result merge
---   * `let x = e in body` — extends env with x→vreg
---   * Function calls f arg — resolved via registry; recursion supported
---   * `print (show e)` — recognised as op_print_int, returns 0
---   * Identifiers, integer literals, parens
+-- Subset support (current, post-P4-ext):
+--   * User functions with 1..4 args (>4 args → err).
+--   * Integer arithmetic (+ - * / mod), comparison (< == > <= >=), bool
+--     (&& || not, parse-time desugar).
+--   * `if c then a else b` with both int- and float-typed branches.
+--   * `let x = e in body`; let-bound lambdas inline-substitute at call site.
+--   * Function calls (1..4 args, recursion supported); HOF dispatch via
+--     op_apply when callee is a let-bound named-fn alias.
+--   * String literals, length-prefixed pool, str_eq / str_len / str_at.
+--   * List literals [a,b,c], cons / head / tail / is_nil, match (nil|cons).
+--   * `print (show e)` for ints AND floats; `print str_lit`; `print str_var`.
+--   * `read_file path` builtin (open + lseek + read + close).
+--   * Floats (P4): literals + arithmetic + comparison + int↔float convert.
+--   * Float-returning user fns (P4-ext): registry tracks ret_type, op_call_
+--     fret captures via fmov, op_ret_float returns via fmov.
+--   * Cross-call float preservation (P4-ext): d8/d9 callee-save (2 slots).
 --
--- Cross-call preservation: caller-save (v0..v9) values that must survive
+-- Int cross-call preservation: caller-save (v0..v9) values that must survive
 -- a function call are moved to callee-save (v10/v11) before the call.
--- v1 caps at 2 cross-call slots (v10, v11). If lowering needs more, fails.
+-- Caps at 2 int cross-call slots (v10, v11) and 2 float cross-call slots
+-- (f8, f9). If lowering needs more, fails with a clear error.
+--
+-- Notable v1 limits NOT yet lifted (see CONTINUATION.md / SESSION_PROMPT.md):
+--   * Float-typed user fn args (per-arg inference is circular for binary
+--     ops; workaround: take int args, int_to_float internally).
+--   * Closures with capture-by-value (lambdas inline-substitute today).
+--   * 0-arg user fn calls (`pi = 3.14` defines but `pi` lowers as a
+--     fn_idx materialization, not a call).
 
 -- NOTE: this file deliberately does NOT `import "jit/ir.rail"`. Rail imports
 -- aren't deduped, so each direct importer must include ir.rail exactly once.
@@ -26,20 +42,25 @@ import "jit/lex.rail"
 import "jit/syntax.rail"
 
 -- ============================================================================
--- State record (mutable cells via 1-element int_arrs)
+-- State record (mutable cells via 1-element int_arrs).
+-- Layout: cons ir (cons ctr (cons blocks (cons err_msg (cons registry (cons pool [])))))
 --
 --   ir       : int_arr of size 4*MAX_INSTR (instructions written here)
---   ctr      : int_arr of size 6:
---                [0] next_caller_vreg
---                [1] next_callee_vreg
+--   ctr      : int_arr of size 10:
+--                [0] (unused; caller-save now via live mask in slot [6])
+--                [1] next_callee_vreg (int callee-save: 10..11)
 --                [2] instr_idx
 --                [3] n_blocks reserved
 --                [4] max_vreg_seen
 --                [5] err_flag (0=ok, 1=err)
+--                [6] live caller-save bitmask (bit i = v(i) live)
+--                [7] n_args (set by lower_fn_def)
+--                [8] next caller-save float vreg (0..7 = d0..d7)
+--                [9] next callee-save float slot (0..1 → f8/f9 = d8/d9; P4-ext)
 --   blocks   : int_arr of size MAX_BLOCKS (block start instr indices)
---   reg_buf  : int_arr of size 4 (per-fn) — currently-pinned cross-call vregs
---                [0] = next callee slot to use (10 → 11 → -1 (overflow))
 --   err_msg  : 1-element Rail-list cell holding the error-message string
+--   registry : list of [name, fn_idx, ret_ty] entries (P4-ext)
+--   pool     : [pool_buf, pool_size_cell] for the program string pool
 -- ============================================================================
 
 max_instr_per_fn = 256
@@ -1204,44 +1225,6 @@ pack_call_args vregs n =
 nth_local i xs =
   if i == 0 then head xs
   else nth_local (i - 1) (tail xs)
-
--- Look up `fname` in the registry stashed in the err_msg cell (we hijack it).
--- For v1 we pass the registry separately via a global side-channel: a 1-elt
--- Rail list. Simpler: take the registry as another arg through every call.
--- To avoid threading it everywhere, we store it in a top-level var that is
--- *set per lower_program invocation*. (Crude but works for v1.)
-
-global_registry_cell = arr_new 1 0    -- not used directly; see lower_program
-global_registry_list_cell = cons [] []  -- actual registry list lives here
-
-set_registry r =
-  -- Store the registry in a known module-level cell. Rail lists are
-  -- immutable, so we use an `int_arr` of capacity 1 holding... actually
-  -- we just rebind the top-level via a hack: store in a mutable IR-style
-  -- cell and use a getter.
-  -- Simpler: use a `int_arr` to hold a pointer/handle, but Rail doesn't
-  -- expose that. So we thread the registry via state instead — see
-  -- lower_call_named below.
-  0
-
--- We pass the registry through state's err_msg cell? Awkward. Let me thread
--- it explicitly via the state record itself. Refactor: state gains a 5th
--- slot for the registry.
-
-lower_call_named s env fname arg =
-  let fn_idx = st_registry_lookup s fname
-  if fn_idx < 0 then st_fail s (cat ["lower: unknown function ", fname])
-  else lower_call_with_idx s env fn_idx arg
-
-lower_call_with_idx s env fn_idx arg =
-  let v_arg = lower_expr s env arg
-  if (st_get_err s) == 1 then v_arg
-  else
-    let v_dst = st_alloc_caller s
-    if (st_get_err s) == 1 then v_dst
-    else
-      let _ = st_emit s op_call v_dst fn_idx (call_pack_1 v_arg)
-      v_dst
 
 -- Registry + pool helpers on state. State layout:
 --   [ir, ctr, blocks, err_msg, registry, pool]
