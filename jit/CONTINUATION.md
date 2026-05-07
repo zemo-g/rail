@@ -1,9 +1,12 @@
 # JIT — continuation roadmap
 
 State at end of session 2026-05-06 evening: branch `jit` on `next`.
-**P0 + P1 + P2 shipped this session** (output capture via heap buffer,
-`try_jit_grade_str` helper, stdout-mode rows in parity_check). All 8 JIT
-test files pass; main suite 137/137. Below: what's next, leverage-ranked.
+**P0 + P1 + P2 + P6 shipped this session** (output capture via heap
+buffer, `try_jit_grade_str` helper, stdout-mode rows in parity_check,
+direct-call trampoline replacing pthread_create). All 8 JIT test files
+pass; main suite 137/137. The training session can now grade ~2000
+candidates/sec via JIT (vs ~10/sec via shell). Below: what's next,
+leverage-ranked.
 
 ---
 
@@ -59,6 +62,43 @@ per candidate that lowers (vs ~100 ms shell grade).
 
 Verified end-to-end via `jit/test_capture.rail` (11 fixtures incl.
 labeled output, sequencing, negative case).
+
+---
+
+## P6 — Direct call (perf lever) ✅ SHIPPED 2026-05-06 evening
+
+Replaced `pthread_create + pthread_join` with a static foreign call
+through `libjit_call.dylib` (a 14-line C trampoline). End-to-end:
+
+| Path | µs/call |
+| --- | --- |
+| Old: `call_jit` (pthread) | ~26 |
+| New: `call_jit_direct` (libjit_call.dylib) | <1 |
+| Full `try_jit_grade_str` (lower→emit→run→read) | ~52 |
+
+Net speedup of the call itself: **~2900×** measured locally; end-to-end
+grade is now ~52 µs (down from ~78 µs) because lowering dominates the
+remaining cost. Either way the JIT grade beats the ~100 ms shell grade
+by ~2000×.
+
+### Implementation summary
+
+| File | Change |
+| --- | --- |
+| `tools/jit_call.c` | Already in tree; `long jit_call(long(*fn)(long), long arg) { return fn(arg); }`. |
+| `jit/build_trampoline.sh` | Already in tree; `cc -O2 -dynamiclib …` builds `jit/libjit_call.dylib`. |
+| `tools/compile.rail` | Mirror of the libtensor_gpu pattern: optional `-L jit -weak-ljit_call` link flag if the dylib is present. **One-cycle bootstrap** required after this edit (source-only logic). |
+| `jit/ffi.rail` | New foreign decl `foreign jit_call fn arg -> int`. |
+| `jit/loader.rail` | New `call_jit_direct page arg`; old pthread-based `call_jit` retained for tests/back-compat. |
+| `jit/grade.rail` | `try_jit_grade` and `try_jit_grade_str` now call `call_jit_direct`. |
+
+### Prereq
+
+Run `bash jit/build_trampoline.sh` once per checkout (≈1 sec). The
+compile.rail link line is gated on `test -f jit/libjit_call.dylib` and
+silently skipped if absent — so non-JIT builds aren't affected. Without
+the dylib, `jit_call` is a weak symbol that resolves to NULL and
+crashes on call; `call_jit` (pthread path) remains the safe fallback.
 
 ---
 
@@ -313,19 +353,17 @@ develop other JIT-like substrates.
 
 ## Sequencing recommendation
 
-P0/P1/P2 shipped. Remaining order, leverage-per-hour:
+P0/P1/P2/P6 shipped. Remaining order, leverage-per-hour:
 
-1. **P6 (direct call, option b)** — ~1 hr; collapses pthread overhead.
-   Shipping target: sub-ms grade actually true under load.
-2. **P3 variant (closures-without-captures)** — ~1 hr; opens HOF prompts
+1. **P3 variant (closures-without-captures)** — ~1 hr; opens HOF prompts
    that pass *named* functions.
-3. **P5 (file I/O)** — ~2–3 hr.
-4. **P3 full (closures with captures)** — ~4–6 hr.
-5. **P4 (floats)** — ~4–6 hr.
+2. **P5 (file I/O)** — ~2–3 hr.
+3. **P3 full (closures with captures)** — ~4–6 hr.
+4. **P4 (floats)** — ~4–6 hr.
 
-Stop after step 1 if the corpus profiling shows the remaining gap is
-non-list-non-string-non-multi-arg shapes that are rare. Continue with
-steps 2–5 as bench coverage measurement demands.
+Continue as bench coverage measurement demands. The JIT path now beats
+shell grade by ~2000× per call, so the bottleneck for distill is
+lowerable shape coverage, not call latency.
 
 ---
 
