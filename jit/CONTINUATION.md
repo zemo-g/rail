@@ -1,12 +1,11 @@
 # JIT — continuation roadmap
 
 State at end of session 2026-05-06 evening: branch `jit` on `next`.
-**P0 + P1 + P2 + P6 shipped this session** (output capture via heap
-buffer, `try_jit_grade_str` helper, stdout-mode rows in parity_check,
-direct-call trampoline replacing pthread_create). All 8 JIT test files
-pass; main suite 137/137. The training session can now grade ~2000
-candidates/sec via JIT (vs ~10/sec via shell). Below: what's next,
-leverage-ranked.
+**P0 + P1 + P2 + P6 + P3-variant + P5 + P3-full v1 shipped this
+session.** All 8 JIT test files pass; main suite 137/137. The training
+session can now grade ~2000 candidates/sec via JIT (vs ~10/sec via
+shell), and lowering covers ints/strings/lists/match/HOF-with-named-fns
+/inline-lambdas/file-read. Below: what's next, leverage-ranked.
 
 ---
 
@@ -353,13 +352,14 @@ develop other JIT-like substrates.
 
 ## Sequencing recommendation
 
-P0/P1/P2/P6 shipped. Remaining order, leverage-per-hour:
+P0/P1/P2/P6/P3-variant/P5/P3-full v1 shipped. Remaining:
 
-1. **P3 variant (closures-without-captures)** — ~1 hr; opens HOF prompts
-   that pass *named* functions.
-2. **P5 (file I/O)** — ~2–3 hr.
-3. **P3 full (closures with captures)** — ~4–6 hr.
-4. **P4 (floats)** — ~4–6 hr.
+1. **P3-full v2 (real closure values)** — ~3–4 hr; replaces inline
+   substitution with heap-allocated closure records so lambdas can be
+   *passed* as args (`map (\x -> ...) xs`). Currently inline-only.
+2. **P4 (floats)** — ~4–6 hr; biggest open work. Float printing is the
+   gnarly part — either dlsym printf via an extra C trampoline, or a
+   manual %g-style decimal formatter (~150 inst).
 
 Continue as bench coverage measurement demands. The JIT path now beats
 shell grade by ~2000× per call, so the bottleneck for distill is
