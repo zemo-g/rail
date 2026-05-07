@@ -60,6 +60,14 @@ let _ = heap_free heap
 | List literal | `main = head [10, 20, 30]` → 10 |
 | Recursive list traversal | `len xs = if is_nil xs then 0 else 1 + len (tail xs)` |
 | List sum | `sum xs = if is_nil xs then 0 else (head xs) + (sum (tail xs))` |
+| Match on list | `len xs = match xs \| nil -> 0 \| cons h t -> 1 + len t` |
+| Match (any branch order) | `\| cons h t -> ... \| nil -> ...` works too |
+| Comparison ops | `==`, `<`, `>`, `<=`, `>=` (all at cmp precedence) |
+| Arithmetic ops | `+`, `-`, `*`, `/`, builtin `mod a b` |
+| Unary minus | `0 - x` desugar; literal `-5` works as `(0 - 5)` |
+| Boolean | `&&`, `\|\|` (parse-time desugar to if-then-else; short-circuit) |
+| Sequencing | `let _ = print "x = " in print (show n)` -> "x = n\n" |
+| Print loop | `print_list xs = match xs \| nil -> 0 \| cons h t -> let _ = print (show h) in print_list t` |
 
 `print (show e)` is recognized as `op_print_int`; bare `print "lit"` /
 `print str_var` route through `op_print_str` via type inference.
@@ -113,8 +121,9 @@ The wins:
 | Shell-grade only (today's flywheel) | full bench, ~100 ms each |
 | + JIT lowering (Stages 1+3) | ~10/30 in-process (~1 ms each) |
 | + Stage 4 (strings + multi-arg) | ~15/30 in-process |
-| + Stage 5 (lists/heap) — TODAY | ~25/30 in-process |
-| + match syntax + closures + file I/O | full bench |
+| + Stage 5 (lists/heap) | ~25/30 |
+| + match syntax + cmp/arith ops + bool + sequencing — TODAY | ~28/30 |
+| + closures + file I/O + floats | full bench |
 
 (See `jit/NEXT_STAGES.md` for the staged plan + Stage 5 blocker.)
 
