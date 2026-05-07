@@ -77,6 +77,20 @@ ir_byte_size op =
   else if op == op_div then 4
   else if op == op_mod then 8
   else if op == op_read_file then 136
+  -- Float ops (P4):
+  else if op == op_fconst then 20      -- 4× movz/movk + fmov d,x
+  else if op == op_fadd then 4
+  else if op == op_fsub then 4
+  else if op == op_fmul then 4
+  else if op == op_fdiv then 4
+  else if op == op_flt then 8           -- fcmp + cset_mi
+  else if op == op_feq then 8           -- fcmp + cset_eq
+  else if op == op_fgt then 8           -- fcmp + cset_gt
+  else if op == op_fge then 8           -- fcmp + cset_ge
+  else if op == op_int_to_float then 4  -- scvtf
+  else if op == op_float_to_int then 4  -- fcvtzs
+  else if op == op_print_float then 20  -- ldr,ldr,fmov,blr,str (5 inst)
+  else if op == op_fmov then 4           -- fmov d_dst, d_src
   else 4
 
 -- Variable-size lookup. Reads the instruction's c slot for op_call
@@ -258,6 +272,41 @@ emit_one buf ir body_start body_offsets blocks fn_offsets i =
     emit_op_apply buf off (preg a) (preg b) (preg c) fn_offsets n_fns
   else if op == op_read_file then
     emit_op_read_file buf off (preg a) (preg b)
+  -- Float ops (P4). Float vregs map directly to d-regs (a/b/c are 0..15).
+  else if op == op_fconst then
+    emit_op_fconst buf off a b c
+  else if op == op_fadd then
+    cb_emit buf off (enc_fadd a b c)
+  else if op == op_fsub then
+    cb_emit buf off (enc_fsub a b c)
+  else if op == op_fmul then
+    cb_emit buf off (enc_fmul a b c)
+  else if op == op_fdiv then
+    cb_emit buf off (enc_fdiv a b c)
+  else if op == op_flt then
+    let _ = cb_emit buf       off       (enc_fcmp b c)
+    let _ = cb_emit buf (off + 4)  (enc_cset_mi (preg a))
+    0
+  else if op == op_feq then
+    let _ = cb_emit buf       off       (enc_fcmp b c)
+    let _ = cb_emit buf (off + 4)  (enc_cset_eq (preg a))
+    0
+  else if op == op_fgt then
+    let _ = cb_emit buf       off       (enc_fcmp b c)
+    let _ = cb_emit buf (off + 4)  (enc_cset_gt (preg a))
+    0
+  else if op == op_fge then
+    let _ = cb_emit buf       off       (enc_fcmp b c)
+    let _ = cb_emit buf (off + 4)  (enc_cset_ge (preg a))
+    0
+  else if op == op_int_to_float then
+    cb_emit buf off (enc_scvtf a (preg b))
+  else if op == op_float_to_int then
+    cb_emit buf off (enc_fcvtzs (preg a) b)
+  else if op == op_print_float then
+    emit_op_print_float buf off a
+  else if op == op_fmov then
+    cb_emit buf off (enc_fmov_d_d a b)
   else
     -- Unknown op: emit a safe ret(0) so we never run garbage. Pads to 20
     -- bytes (5 inst) to match op_ret's new size accounting.
@@ -679,6 +728,52 @@ emit_apply_branches buf off fn_idx_preg arg_preg fn_offsets n_fns k =
 --   add  sp, sp, #32
 --
 -- Total: 16 instructions = 64 bytes.
+
+-- ============================================================================
+-- Float emit helpers (P4)
+-- ============================================================================
+
+-- op_fconst: build a 64-bit double's bit pattern in x21, then fmov d_dst, x21.
+-- IR slot b = lo32 of the IEEE-754 bit pattern; slot c = hi32. Each is a
+-- 32-bit Rail int (computed at lower time via jit_float_bits_lo / _hi).
+-- 5 instructions = 20 bytes. Constants verified via /tmp/asmfloat.s.
+emit_op_fconst buf off d_dst lo32 hi32 =
+  let p0 = bit_and lo32 65535
+  let p1 = bit_and (shr lo32 16) 65535
+  let p2 = bit_and hi32 65535
+  let p3 = bit_and (shr hi32 16) 65535
+  let _ = cb_emit buf       off       (enc_mov_imm16 21 p0)
+  let _ = cb_emit buf (off + 4)  (enc_movk 21 p1 1)
+  let _ = cb_emit buf (off + 8)  (enc_movk 21 p2 2)
+  let _ = cb_emit buf (off + 12) (enc_movk 21 p3 3)
+  let _ = cb_emit buf (off + 16) (enc_fmov_d_x d_dst 21)
+  0
+
+-- op_print_float: call jit_print_float(d_src, cursor) → new_cursor.
+-- The jit_print_float absolute address is at heap[24..31] (set by heap_alloc).
+-- Sequence (5 instructions, 20 bytes):
+--   ldr   x1,  [x27, #8]    ; arg 1 = cursor
+--   ldr   x16, [x27, #24]   ; jit_print_float address
+--   fmov  d0,  d_src         ; arg 0 = value (d-reg)
+--   blr   x16
+--   str   x0,  [x27, #8]    ; new cursor returned
+-- Caller-save x9..x18 are clobbered by the blr (this is correctly
+-- handled by the vreg allocator's contains_call check).
+-- C signature: char *jit_print_float(double x, char *cursor);
+-- AAPCS64: double arg → d0, char* arg → x0. So cursor goes in x0.
+-- Sequence (5 instructions, 20 bytes):
+--   ldr   x0,  [x27, #8]    ; arg 0 = cursor (the char* second-positional arg)
+--   ldr   x16, [x27, #24]   ; jit_print_float address
+--   fmov  d0,  d_src         ; arg 1 = value (the double first-positional arg)
+--   blr   x16
+--   str   x0,  [x27, #8]    ; new cursor returned in x0
+emit_op_print_float buf off d_src =
+  let _ = cb_emit buf       off       (enc_ldr_x27 0 8)
+  let _ = cb_emit buf (off + 4)  (enc_ldr_x27 16 24)
+  let _ = cb_emit buf (off + 8)  (enc_fmov_d_d 0 d_src)
+  let _ = cb_emit buf (off + 12) (enc_blr 16)
+  let _ = cb_emit buf (off + 16) (enc_str_x27 0 8)
+  0
 
 emit_print_int_impl buf off src =
   -- 34-instruction emit (136 bytes). Handles negative ints, writes digits
