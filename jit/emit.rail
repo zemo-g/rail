@@ -35,17 +35,21 @@ preg vreg = vreg + 9
 
 -- Per-function fixed costs (inlined as literals to avoid Rail's
 -- nullary-int + let-bound-int sum bug).
---   prologue = stp_fp_lr_-48 (4) + mov_x29_sp (4) + stp_x19_x20 (4)
+--   prologue = stp_fp_lr_-64 (4) + mov_x29_sp (4) + stp_x19_x20 (4)
 --            + str_x27_32 (4)             -- save caller's x27 (= heap)
+--            + stp_d8_d9_48 (4)            -- save callee-save floats (P4-ext)
 --            + (mov x27, x0  if main, else nop) (4)
 --            + n_args movs (4 each)
---            = 20 + 4*n_args
---   op_ret   = mov x0, vN + ldr_x27_32 + ldp_x19_x20 + ldp_fp_lr_+48 + ret
---            = 20 bytes
+--            = 24 + 4*n_args
+--   op_ret   = mov x0, vN + ldp_d8_d9_48 + ldr_x27_32 + ldp_x19_x20
+--            + ldp_fp_lr_+64 + ret
+--            = 24 bytes
 -- ABI v2: heap_addr arrives in x0 from pthread_create. Only main captures
 -- it via `mov x27, x0`; inner functions inherit x27 from the caller (kept
 -- live by callee-save save/restore). All ops that need heap (op_cons,
 -- op_print_int, op_print_str) read x27.
+-- ABI P4-ext: d8/d9 are saved/restored as a callee-save pair to enable
+-- cross-call preservation of float values. Float vregs f8/f9 map to d8/d9.
 
 -- Bytes per IR opcode (FIXED-size opcodes only).
 -- For variable-size opcodes (op_call), use ir_byte_size_at.
@@ -57,7 +61,7 @@ ir_byte_size op =
   else if op == op_lt then 8
   else if op == op_jmp then 4
   else if op == op_jz then 4
-  else if op == op_ret then 20
+  else if op == op_ret then 24
   else if op == op_print_int then 136
   else if op == op_mov then 4
   else if op == op_str_lit then 4
@@ -91,6 +95,8 @@ ir_byte_size op =
   else if op == op_float_to_int then 4  -- fcvtzs
   else if op == op_print_float then 20  -- ldr,ldr,fmov,blr,str (5 inst)
   else if op == op_fmov then 4           -- fmov d_dst, d_src
+  else if op == op_fle then 8            -- fcmp + cset ls
+  else if op == op_ret_float then 24    -- fmov d0,d_v + epilogue (6 inst)
   else 4
 
 -- Variable-size lookup. Reads the instruction's c slot for op_call
@@ -102,6 +108,9 @@ ir_byte_size_at ir i n_fns =
   if op == op_call then
     let n = call_n_args (ir_c ir i)
     4 + 4 + 4 * n   -- bl(4) + mov dst,x0(4) + n arg-movs(4n)
+  else if op == op_call_fret then
+    let n = call_n_args (ir_c ir i)
+    4 + 4 + 4 * n   -- bl(4) + fmov f_dst,d0(4) + n arg-movs(4n) -- same total
   else if op == op_apply then
     20 * n_fns + 8  -- 5 inst/fn + (mov #0 + mov dst, x0)
   else ir_byte_size op
@@ -132,7 +141,8 @@ fn_total_bytes fn n_fns =
   let n_args = fn_nargs fn
   let body = compute_body_offsets ir n_instr n_fns
   let body_bytes = arr_get body n_instr
-  20 + (4 * n_args) + body_bytes
+  -- prologue_size (24 + 4*n_args, P4-ext) + body bytes
+  24 + (4 * n_args) + body_bytes
 
 -- emit_print_int: stub for now — body filled in below.
 emit_print_int buf off src =
@@ -151,21 +161,22 @@ emit_const buf off dst imm =
   0
 
 -- Emit prologue at the function's start byte offset in the buffer.
--- Writes (20 + 4*n_args) bytes: frame setup (48-byte frame, saving FP/LR,
--- x19/x20, and x27) + conditional `mov x27, x0` (main only) + per-arg moves.
--- For non-main functions, we emit a NOP in place of the heap-capture mov
--- so x27 stays equal to the caller's value (= heap, propagated as
+-- Writes (24 + 4*n_args) bytes: frame setup (64-byte frame, saving FP/LR,
+-- x19/x20, x27, and d8/d9) + conditional `mov x27, x0` (main only) + per-arg
+-- moves. For non-main functions, we emit a NOP in place of the heap-capture
+-- mov so x27 stays equal to the caller's value (= heap, propagated as
 -- callee-save through the str/ldr at offset #32).
 emit_prologue buf fn_start n_args is_main =
   let _ = cb_emit buf       fn_start       inst_stp_fp_lr_pre
   let _ = cb_emit buf (fn_start + 4)  inst_mov_x29_sp
   let _ = cb_emit buf (fn_start + 8)  inst_stp_x19_x20_16
   let _ = cb_emit buf (fn_start + 12) inst_str_x27_32
+  let _ = cb_emit buf (fn_start + 16) inst_stp_d8_d9_48
   -- mov x27, x0 ONLY for main (the JIT entry); else nop so x27 stays
   -- whatever the caller set it to (= heap by the callee-save chain).
   let cap = if is_main == 1 then enc_mov_reg 27 0 else inst_nop
-  let _ = cb_emit buf (fn_start + 16) cap
-  emit_arg_moves buf (fn_start + 20) 0 n_args
+  let _ = cb_emit buf (fn_start + 20) cap
+  emit_arg_moves buf (fn_start + 24) 0 n_args
 
 emit_arg_moves buf off i n =
   if i >= n then 0
@@ -215,10 +226,11 @@ emit_one buf ir body_start body_offsets blocks fn_offsets i =
     emit_op_call buf off a b c fn_offsets
   else if op == op_ret then
     let _ = cb_emit buf       off       (enc_mov_reg 0 (preg a))
-    let _ = cb_emit buf (off + 4)  inst_ldr_x27_32
-    let _ = cb_emit buf (off + 8)  inst_ldp_x19_x20_16
-    let _ = cb_emit buf (off + 12) inst_ldp_fp_lr_post
-    let _ = cb_emit buf (off + 16) enc_ret
+    let _ = cb_emit buf (off + 4)  inst_ldp_d8_d9_48
+    let _ = cb_emit buf (off + 8)  inst_ldr_x27_32
+    let _ = cb_emit buf (off + 12) inst_ldp_x19_x20_16
+    let _ = cb_emit buf (off + 16) inst_ldp_fp_lr_post
+    let _ = cb_emit buf (off + 20) enc_ret
     0
   else if op == op_mov then
     cb_emit buf off (enc_mov_reg (preg a) (preg b))
@@ -307,15 +319,50 @@ emit_one buf ir body_start body_offsets blocks fn_offsets i =
     emit_op_print_float buf off a
   else if op == op_fmov then
     cb_emit buf off (enc_fmov_d_d a b)
-  else
-    -- Unknown op: emit a safe ret(0) so we never run garbage. Pads to 20
-    -- bytes (5 inst) to match op_ret's new size accounting.
-    let _ = cb_emit buf       off       (enc_mov_reg 0 0)
-    let _ = cb_emit buf (off + 4)  inst_ldr_x27_32
-    let _ = cb_emit buf (off + 8)  inst_ldp_x19_x20_16
-    let _ = cb_emit buf (off + 12) inst_ldp_fp_lr_post
-    let _ = cb_emit buf (off + 16) enc_ret
+  else if op == op_fle then
+    let _ = cb_emit buf       off       (enc_fcmp b c)
+    let _ = cb_emit buf (off + 4)  (enc_cset_ls (preg a))
     0
+  else if op == op_call_fret then
+    emit_op_call_fret buf off a b c fn_offsets
+  else if op == op_ret_float then
+    let _ = cb_emit buf       off       (enc_fmov_d_d 0 a)
+    let _ = cb_emit buf (off + 4)  inst_ldp_d8_d9_48
+    let _ = cb_emit buf (off + 8)  inst_ldr_x27_32
+    let _ = cb_emit buf (off + 12) inst_ldp_x19_x20_16
+    let _ = cb_emit buf (off + 16) inst_ldp_fp_lr_post
+    let _ = cb_emit buf (off + 20) enc_ret
+    0
+  else
+    -- Unknown op: emit a safe ret(0) so we never run garbage. Pads to 24
+    -- bytes (6 inst) to match op_ret's new size accounting (P4-ext).
+    let _ = cb_emit buf       off       (enc_mov_reg 0 0)
+    let _ = cb_emit buf (off + 4)  inst_ldp_d8_d9_48
+    let _ = cb_emit buf (off + 8)  inst_ldr_x27_32
+    let _ = cb_emit buf (off + 12) inst_ldp_x19_x20_16
+    let _ = cb_emit buf (off + 16) inst_ldp_fp_lr_post
+    let _ = cb_emit buf (off + 20) enc_ret
+    0
+
+-- Float-returning variant. Same as op_call but the result capture is
+-- `fmov d_a, d0` (`a` is a float vreg, return value is in d0 per AAPCS64).
+-- Args are still int (in x0..x3); only the return path differs.
+emit_op_call_fret buf off a b c fn_offsets =
+  let n = call_n_args c
+  let arg0 = call_arg_0 c
+  let arg1 = call_arg_1 c
+  let arg2 = call_arg_2 c
+  let arg3 = call_arg_3 c
+  let _ = if n >= 1 then cb_emit buf       off       (enc_mov_reg 0 (preg arg0)) else 0
+  let _ = if n >= 2 then cb_emit buf (off + 4)  (enc_mov_reg 1 (preg arg1)) else 0
+  let _ = if n >= 3 then cb_emit buf (off + 8)  (enc_mov_reg 2 (preg arg2)) else 0
+  let _ = if n >= 4 then cb_emit buf (off + 12) (enc_mov_reg 3 (preg arg3)) else 0
+  let bl_off = off + 4 * n
+  let target_fn_start = arr_get fn_offsets b
+  let rel = target_fn_start - bl_off
+  let _ = cb_emit buf bl_off (enc_bl_byte_off rel)
+  let _ = cb_emit buf (bl_off + 4) (enc_fmov_d_d a 0)
+  0
 
 -- Multi-arg op_call emit. Decodes packed c (n_args + arg vregs), emits:
 --   for each i in 0..n-1: mov xi, x_preg(arg_i)
@@ -362,7 +409,7 @@ emit_one_function buf fn_start fn fn_offsets is_main n_fns =
   let blocks = fn_blocks fn
   let body_offsets = compute_body_offsets ir n_instr n_fns
   let body_bytes = arr_get body_offsets n_instr
-  let prologue_size = 20 + (4 * n_args)
+  let prologue_size = 24 + (4 * n_args)
   let body_start = fn_start + prologue_size
   let _ = emit_prologue buf fn_start n_args is_main
   let _ = emit_loop buf ir body_start body_offsets blocks fn_offsets 0 n_instr

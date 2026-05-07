@@ -32,6 +32,16 @@ Implementation: option (b), memory-buffer write.
 | `heap[32..16415]`   | output buffer (~16 KB; first byte = R+32) |
 | `heap[16416..]`     | cons cell area (~48 KB) |
 
+**Function frame layout** (64 bytes; bumped 48→64 by P4-ext):
+
+| Range | Purpose |
+| --- | --- |
+| `[sp+0..15]`        | stp x29, x30 (FP, LR) |
+| `[sp+16..31]`       | stp x19, x20 (int callee-save) |
+| `[sp+32..39]`       | x27 (heap addr; ABI v2 callee-save) |
+| `[sp+40..47]`       | pad (alignment) |
+| `[sp+48..63]`       | stp d8, d9 (float callee-save; P4-ext) |
+
 **Print op emission** (`jit/emit.rail`):
 - `op_print_int`: 116 → 136 bytes (29 → 34 inst). The `svc write(1, …)`
   block was replaced by a 9-instruction copy loop that appends bytes at
@@ -258,13 +268,17 @@ the corpus may not need captures. Worth profiling first.
 | int→float promotion | `lower_expr_float` promotes int-typed expressions via `op_int_to_float`. So `3 + 1.5` lowers cleanly. |
 | Float arith vs cmp | `lower_op_float_emit` checks `is_compare_op` and dispatches; arith returns float vreg, cmp returns int vreg. |
 
-### Limitations of v1 (documented stop conditions)
+### Limitations of v1 (status)
 
-- **No cross-call float preservation.** `lower_op_float` rejects (with a clear error) any float op whose rhs contains a function call. Bench prompts compute floats inline, so this is rarely hit.
-- **No float-typed function args.** `build_arg_env` assumes all args are ints (or strs by name heuristic). Float args coming in from the JIT entry would need to be loaded from `d0..d7` instead of `x0..x3`.
-- **No float-callee-save.** `let f = 3.14 in some_call_using_int (); f` — the second use of `f` would see d-reg space clobbered by the call. The let-form skips preservation when val_ty == "float".
-- **No `<=` for floats.** Encoder for `cset, ls` not added; if needed, derive as `not (>)`.
-- **`%g` format.** `42.0` prints as `42` (not `42.0`). Common surprise.
+- **~~No cross-call float preservation~~** ✅ LIFTED 2026-05-07. Frame extended 48→64 to add `stp d8, d9, [sp, #48]` callee-save. `preserve_callee_float` emits `op_fmov` to slots f8/f9 (=d8/d9) before any rhs-with-call. v1.5 limit: only 2 float callee-save slots (f8, f9).
+- **~~No `<=` for floats~~** ✅ LIFTED 2026-05-07. Added `op_fle` + `enc_cset_ls`. Uses `ls` cond (not `le`) for NaN-safety.
+- **~~No float-returning user fns~~** ✅ LIFTED 2026-05-07. Registry now tracks ret_type per fn (single-pass forward inference using `infer_type` with the registry-so-far seeded into env). `op_call_fret` (43) captures result via `fmov f_dst, d0`; `op_ret_float` (44) returns via `fmov d0, d_v`. `lower_call_emit` dispatches based on `reg_lookup_ret_ty`; `lower_fn_finalize` chooses `op_ret` vs `op_ret_float` based on `infer_type(body)`.
+- **No float-typed function args.** `build_arg_env` still assumes int args (with str/fn name heuristic). Float args would need:
+  1. Per-arg type detection at fn def (no clear name heuristic for float; inference from body usage is circular for binary ops; call-site inference is forward-only and O(n²)).
+  2. Prologue `fmov d_i, d_i` for float args (currently emits `mov x_i, x_i`).
+  3. Caller-side `fmov d_i, d_arg` for float args in op_call (currently emits `mov x_i, x_arg`).
+  Workaround for v1.5: write fns that take int args and convert internally via `int_to_float`, e.g., `scale n = int_to_float n * 1.5`. Bench programs handle this naturally.
+- **`%g` format.** `42.0` prints as `42` (not `42.0`). Common surprise — not a real limit, just a format choice.
 
 ### Bug fix log
 

@@ -47,7 +47,7 @@ max_blocks_per_fn = 32
 
 mk_state _ =
   let ir = arr_new (4 * max_instr_per_fn) 0
-  let ctr = arr_new 9 0
+  let ctr = arr_new 10 0
   let _ = arr_set ctr 0 0     -- (unused; caller-save now via live mask)
   let _ = arr_set ctr 1 10    -- next_callee starts at v10
   let _ = arr_set ctr 2 0     -- instr_idx
@@ -56,7 +56,8 @@ mk_state _ =
   let _ = arr_set ctr 5 0     -- err_flag
   let _ = arr_set ctr 6 0     -- live caller-save bitmask (bit i = v(i) live)
   let _ = arr_set ctr 7 1     -- n_args (default 1; lower_fn_def overrides)
-  let _ = arr_set ctr 8 0     -- next float vreg (P4; bumps per fresh f-reg, range 0..7)
+  let _ = arr_set ctr 8 0     -- next caller-save float vreg (0..7 = d0..d7)
+  let _ = arr_set ctr 9 0     -- next callee-save float slot (0..1 → f8/f9 = d8/d9)
   let blocks = arr_new max_blocks_per_fn 0
   let err_msg = cons "" []
   cons ir (cons ctr (cons blocks (cons err_msg [])))
@@ -128,15 +129,35 @@ st_alloc_callee s =
   if v >= 12 then st_fail s "callee-save vreg overflow (>= v12); v1 only saves x19/x20"
   else v
 
--- Float vreg allocator (P4). Float vregs map directly to d-regs 0..7
--- (caller-save). No cross-call preservation in v1 — long float computations
--- with intervening function calls aren't supported. Simple bumping counter
--- because the `3.14 * 2.0` style expressions only need 3-4 float regs.
+-- Float vreg allocator. Float vregs map directly to d-regs.
+--   f0..f7 = d0..d7 caller-save (clobbered by op_call).
+--   f8/f9  = d8/d9  callee-save (saved/restored by every prologue/epilogue
+--                    in P4-ext; allocated via st_alloc_float_callee).
 st_alloc_float s =
   let f = arr_get (st_ctr s) 8
   let _ = arr_set (st_ctr s) 8 (f + 1)
-  if f > 7 then st_fail s "float vreg overflow (>=f8); v1 caps at d0..d7 caller-save"
+  if f > 7 then st_fail s "float caller-save vreg overflow (>=f8); v1 caps at d0..d7"
   else f
+
+-- Allocate one of f8/f9 (callee-save). Slot 9 of ctr counts how many we've
+-- handed out (0..1). Returns the f-vreg (8 or 9), which maps to d8 or d9.
+st_alloc_float_callee s =
+  let n = arr_get (st_ctr s) 9
+  let _ = arr_set (st_ctr s) 9 (n + 1)
+  if n >= 2 then st_fail s "float callee-save overflow (>=f10); v1 saves only d8/d9"
+  else (n + 8)
+
+-- Preserve a float vreg into callee-save (d8/d9) so it survives a function
+-- call. Returns the new (callee-save) f-vreg. No-op if input is already
+-- callee-save.
+preserve_callee_float s f_v =
+  if f_v >= 8 then f_v
+  else
+    let f_safe = st_alloc_float_callee s
+    if (st_get_err s) == 1 then f_safe
+    else
+      let _ = st_emit s op_fmov f_safe f_v 0
+      f_safe
 
 -- Reserve a new block; returns its index. Caller will set its start later.
 st_reserve_block s =
@@ -243,13 +264,16 @@ infer_type_if env ast =
   else if (infer_type env e) == "float" then "float"
   else infer_type env t
 
--- Recognize str-returning and float-returning builtins via innermost-head fname.
+-- Recognize str-returning and float-returning builtins / user fns via
+-- innermost-head fname. User fn ret_types are seeded into env as
+-- "__USERFN_<name>" entries by lower_fn_body / build_registry.
 infer_type_app env ast =
   let f = innermost_app_f_pre ast
   if (ast_tag f) == "var" then
     let nm = head (tail f)
     if nm == "read_file" then "str"
     else if nm == "int_to_float" then "float"
+    else if (env_has env (cat ["__USERFN_", nm])) == 1 then env_lookup_type env (cat ["__USERFN_", nm])
     else "int"
   else "int"
 
@@ -266,11 +290,14 @@ infer_type_let env ast =
   infer_type (env_extend_typed env name 0 val_ty) body
 
 -- ============================================================================
--- Function-name registry: list of (name, fn_idx) pairs. Built once per lower.
+-- Function-name registry: list of [name, fn_idx, ret_ty] triples. Built
+-- once per lower. ret_ty (P4-ext) is "int" or "float" — inferred at registry
+-- build time by walking the body with infer_type, using the registry-so-far
+-- to resolve user fn calls. Forward refs default to "int".
 -- ============================================================================
 
 reg_empty _ = []
-reg_add r name idx = cons (cons name (cons idx [])) r
+reg_add r name idx = cons (cons name (cons idx (cons "int" []))) r
 reg_lookup r name =
   if r == [] then 0 - 1
   else
@@ -278,16 +305,40 @@ reg_lookup r name =
     if (head pair) == name then head (tail pair)
     else reg_lookup (tail r) name
 
+reg_lookup_ret_ty r name =
+  if r == [] then "int"
+  else
+    let pair = head r
+    if (head pair) == name then head (tail (tail pair))
+    else reg_lookup_ret_ty (tail r) name
+
+-- Seed an env with __USERFN_<name>:ret_ty entries for every entry in the
+-- registry. infer_type_app reads these to resolve user fn return types.
+seed_env_from_registry registry env =
+  if registry == [] then env
+  else
+    let entry = head registry
+    let nm = head entry
+    let ret_ty = head (tail (tail entry))
+    let env2 = env_extend_typed env (cat ["__USERFN_", nm]) 0 ret_ty
+    seed_env_from_registry (tail registry) env2
+
 -- Build registry from a list of fn_def AST nodes (in order).
+-- Each entry [name, idx, ret_ty] is determined by infer_type on the body
+-- with the registry-so-far seeded into the env. Forward-only inference.
 build_registry defs =
   build_registry_loop defs 0 []
 
 build_registry_loop defs idx acc =
-  if defs == [] then acc
+  if defs == [] then reverse acc
   else
     let fn = head defs
     let name = head (tail fn)
-    build_registry_loop (tail defs) (idx + 1) (cons (cons name (cons idx [])) acc)
+    let body = head (tail (tail (tail fn)))
+    let env_with_reg = seed_env_from_registry acc (env_empty 0)
+    let ret_ty = infer_type env_with_reg body
+    let entry = cons name (cons idx (cons ret_ty []))
+    build_registry_loop (tail defs) (idx + 1) (cons entry acc)
 
 -- ============================================================================
 -- contains_call: does an expression contain a function call (or print_show)?
@@ -503,18 +554,19 @@ lower_op s env ast =
 
 -- Float binary op: both operands lowered as float (with int→float promotion
 -- where needed). Result is float for arithmetic, int for comparison.
--- v1 limitation: float vregs aren't preserved across calls, so the rhs of a
--- float op must NOT contain a function call (which would clobber d-regs).
+-- Cross-call preservation: if rhs contains a call, the lhs's d-reg would be
+-- clobbered (caller-save d0..d7). Move it to a callee-save slot (d8/d9 — only
+-- 2 slots; overflow fails clean).
 lower_op_float s env op_str lhs rhs =
-  if (contains_call rhs) == 1 then
-    st_fail s (cat ["lower: float op '", op_str, "' rhs contains a call (no d-reg preservation in v1)"])
+  let f_lhs = lower_expr_float s env lhs
+  if (st_get_err s) == 1 then f_lhs
   else
-    let f_lhs = lower_expr_float s env lhs
-    if (st_get_err s) == 1 then f_lhs
+    let f_lhs2 = if (contains_call rhs) == 1 then preserve_callee_float s f_lhs else f_lhs
+    if (st_get_err s) == 1 then f_lhs2
     else
       let f_rhs = lower_expr_float s env rhs
       if (st_get_err s) == 1 then f_rhs
-      else lower_op_float_emit s op_str f_lhs f_rhs
+      else lower_op_float_emit s op_str f_lhs2 f_rhs
 
 lower_op_float_emit s op_str f_lhs f_rhs =
   if (is_compare_op op_str) == 1 then lower_op_float_cmp s op_str f_lhs f_rhs
@@ -552,6 +604,7 @@ float_cmp_op_for_str s =
   else if s == "==" then op_feq
   else if s == ">" then op_fgt
   else if s == ">=" then op_fge
+  else if s == "<=" then op_fle
   else 0 - 1
 
 lower_op_after_lhs s env op_str rhs v_lhs =
@@ -1117,12 +1170,30 @@ any_contains_call args =
   else any_contains_call (tail args)
 
 lower_call_emit s fn_idx arg_vregs n =
-  let v_dst = st_alloc_caller s
-  if (st_get_err s) == 1 then v_dst
+  -- Look up callee's ret_type from the registry. For "float" returns,
+  -- allocate a float vreg and emit op_call_fret (captures via fmov f, d0).
+  let ret_ty = reg_lookup_ret_ty (st_registry s) (reg_idx_to_name (st_registry s) fn_idx)
+  if ret_ty == "float" then
+    let f_dst = st_alloc_float s
+    if (st_get_err s) == 1 then f_dst
+    else
+      let packed = pack_call_args arg_vregs n
+      let _ = st_emit s op_call_fret f_dst fn_idx packed
+      f_dst
   else
-    let packed = pack_call_args arg_vregs n
-    let _ = st_emit s op_call v_dst fn_idx packed
-    v_dst
+    let v_dst = st_alloc_caller s
+    if (st_get_err s) == 1 then v_dst
+    else
+      let packed = pack_call_args arg_vregs n
+      let _ = st_emit s op_call v_dst fn_idx packed
+      v_dst
+
+reg_idx_to_name registry idx =
+  if registry == [] then ""
+  else
+    let entry = head registry
+    if (head (tail entry)) == idx then head entry
+    else reg_idx_to_name (tail registry) idx
 
 pack_call_args vregs n =
   if n == 1 then call_pack_1 (head vregs)
@@ -1282,8 +1353,12 @@ lower_fn_body name args body registry pool n_args =
 -- If body has any call, preserve to callee-save (v10/v11) — but we only
 -- have 2 callee-save slots in v1 ABI, so this caps at 2 args-with-calls.
 -- For args > 1 that don't need preservation, just bind to v_i.
+-- The starting env is seeded with __USERFN_<name>:ret_ty entries so
+-- infer_type_app can resolve user fn return types during lowering.
 build_arg_env s args body =
-  build_arg_env_loop s args body 0 (env_empty 0) (contains_call body)
+  let registry = st_registry s
+  let seed_env = seed_env_from_registry registry (env_empty 0)
+  build_arg_env_loop s args body 0 seed_env (contains_call body)
 
 build_arg_env_loop s args body i env body_has_call =
   if args == [] then env
@@ -1336,12 +1411,17 @@ infer_arg_type name =
   else "int"
 
 lower_fn_after_args s env body =
+  -- Determine the body's static type BEFORE lowering — env now has the
+  -- registry seed + arg bindings, so infer_type can resolve user fn calls
+  -- and float-arg references correctly.
+  let body_ty = infer_type env body
   let v_result = lower_expr s env body
   if (st_get_err s) == 1 then mk_err_fn "lower failed (see prior LOWER ERR)"
-  else lower_fn_finalize s v_result
+  else lower_fn_finalize s v_result body_ty
 
-lower_fn_finalize s v_result =
-  let _ = st_emit s op_ret v_result 0 0
+lower_fn_finalize s v_result body_ty =
+  let ret_op = if body_ty == "float" then op_ret_float else op_ret
+  let _ = st_emit s ret_op v_result 0 0
   let n_instr = st_get_instr s
   let n_regs = (st_get_maxreg s) + 1
   let n_blocks = st_get_nblocks s
