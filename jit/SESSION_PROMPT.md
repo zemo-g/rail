@@ -153,6 +153,29 @@ The wins:
 
 (See `jit/NEXT_STAGES.md` for the staged plan + Stage 5 blocker.)
 
+## Hard rules (load-bearing — break these and you'll lose hours)
+
+**ARM64 instruction constants: never hand-derive hex.** Every new opcode
+constant goes through this pipeline, no exceptions:
+
+```
+1. Write the asm in /tmp/asm_XXX.s
+2. as -arch arm64 /tmp/asm_XXX.s -o /tmp/asm_XXX.o
+3. otool -t /tmp/asm_XXX.o            # gives canonical hex
+4. python3 -c 'print(0xXXXXXXXX)'     # converts to decimal for Rail
+5. Add a fixture to jit/test_enc.rail that locks the constant in
+```
+
+Two known-failure modes that this catches:
+- Bit 9 of stp/ldp (writeback variant) — burned on `inst_stp_fp_lr_pre`,
+  off by 0x200 from hand-derivation.
+- Decimal typos when writing the literal — burned on `inst_stp_d8_d9_48`,
+  ended up at 0x6CFCE7E8 instead of 0x6D0327E8.
+
+If a JIT-emitted program crashes with EXC_BAD_ACCESS at a weird address,
+re-dump bytes via `arr_get` per byte and compare with `as`+`otool` byte
+sequences. The bytes don't lie; the constant does.
+
 ## Caveats to know cold
 
 1. **`pthread_create` per `call_jit`** (~50–200 µs Apple Silicon). Sub-ms
