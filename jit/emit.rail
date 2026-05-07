@@ -79,39 +79,43 @@ ir_byte_size op =
   else 4
 
 -- Variable-size lookup. Reads the instruction's c slot for op_call
--- to compute n_args, returning 4*(n_args+2) bytes. Other opcodes
--- forward to ir_byte_size.
-ir_byte_size_at ir i =
+-- to compute n_args; for op_apply, depends on n_fns (passed in by the
+-- caller — the dispatch chain has 5 inst per fn + 2 trailing inst).
+-- Other opcodes forward to ir_byte_size.
+ir_byte_size_at ir i n_fns =
   let op = ir_op ir i
   if op == op_call then
     let n = call_n_args (ir_c ir i)
     4 + 4 + 4 * n   -- bl(4) + mov dst,x0(4) + n arg-movs(4n)
+  else if op == op_apply then
+    20 * n_fns + 8  -- 5 inst/fn + (mov #0 + mov dst, x0)
   else ir_byte_size op
 
 -- Pass 1: compute, for each IR instruction index i, the byte offset
 -- where its emitted ARM64 sequence starts, RELATIVE TO THE FUNCTION'S
 -- BODY START (i.e., after the prologue). Returns int_arr of size n+1
 -- where slot[n] = total body bytes.
-compute_body_offsets ir n_instr =
+compute_body_offsets ir n_instr n_fns =
   let off_arr = arr_new (n_instr + 1) 0
-  let _ = fill_offsets ir n_instr off_arr 0 0
+  let _ = fill_offsets ir n_instr off_arr 0 0 n_fns
   off_arr
 
-fill_offsets ir n_instr off_arr i acc =
+fill_offsets ir n_instr off_arr i acc n_fns =
   if i >= n_instr then
     let _ = arr_set off_arr i acc
     0
   else
     let _ = arr_set off_arr i acc
-    let sz = ir_byte_size_at ir i
-    fill_offsets ir n_instr off_arr (i + 1) (acc + sz)
+    let sz = ir_byte_size_at ir i n_fns
+    fill_offsets ir n_instr off_arr (i + 1) (acc + sz) n_fns
 
--- Total bytes for one function.
-fn_total_bytes fn =
+-- Total bytes for one function. n_fns = number of fns in the program
+-- (needed to size op_apply's dispatch chain).
+fn_total_bytes fn n_fns =
   let ir = fn_ir fn
   let n_instr = fn_ninstr fn
   let n_args = fn_nargs fn
-  let body = compute_body_offsets ir n_instr
+  let body = compute_body_offsets ir n_instr n_fns
   let body_bytes = arr_get body n_instr
   20 + (4 * n_args) + body_bytes
 
@@ -248,6 +252,9 @@ emit_one buf ir body_start body_offsets blocks fn_offsets i =
     let _ = cb_emit buf       off       (enc_udiv 21 (preg b) (preg c))
     let _ = cb_emit buf (off + 4)  (enc_msub (preg a) 21 (preg c) (preg b))
     0
+  else if op == op_apply then
+    let n_fns = (arr_len fn_offsets) - 1
+    emit_op_apply buf off (preg a) (preg b) (preg c) fn_offsets n_fns
   else
     -- Unknown op: emit a safe ret(0) so we never run garbage. Pads to 20
     -- bytes (5 inst) to match op_ret's new size accounting.
@@ -295,12 +302,13 @@ emit_loop buf ir body_start body_offsets blocks fn_offsets i n_instr =
 -- is_main = 1 → prologue captures `mov x27, x0` (heap_addr from pthread arg).
 -- is_main = 0 → prologue emits a NOP in the same slot; x27 is preserved as
 -- callee-save through str/ldr at [sp, #32].
-emit_one_function buf fn_start fn fn_offsets is_main =
+-- n_fns = number of fns in the program (for op_apply dispatch chain sizing).
+emit_one_function buf fn_start fn fn_offsets is_main n_fns =
   let ir = fn_ir fn
   let n_instr = fn_ninstr fn
   let n_args = fn_nargs fn
   let blocks = fn_blocks fn
-  let body_offsets = compute_body_offsets ir n_instr
+  let body_offsets = compute_body_offsets ir n_instr n_fns
   let body_bytes = arr_get body_offsets n_instr
   let prologue_size = 20 + (4 * n_args)
   let body_start = fn_start + prologue_size
@@ -312,11 +320,11 @@ emit_one_function buf fn_start fn fn_offsets is_main =
 -- Returns [buf, total_bytes]. (heap arg unused; kept for backward compat.)
 -- Treated as main (is_main=1) since it's the JIT entry point.
 emit_function fn heap =
-  let total = fn_total_bytes fn
+  let total = fn_total_bytes fn 1
   let buf = make_codebuf (total / 4)
   let fn_offsets = arr_new 2 0
   let _ = arr_set fn_offsets 1 total
-  let _ = emit_one_function buf 0 fn fn_offsets 1
+  let _ = emit_one_function buf 0 fn fn_offsets 1 1
   cons buf (cons total [])
 
 -- Emit a multi-function program. With pool support.
@@ -328,7 +336,7 @@ emit_function fn heap =
 emit_program fn_list pool heap =
   let n = list_len fn_list
   let fn_offsets = arr_new (n + 1) 0
-  let total_code = compute_fn_starts fn_list n fn_offsets 0 0
+  let total_code = compute_fn_starts fn_list n fn_offsets 0 0 n
   let _ = arr_set fn_offsets n total_code
   let pool_size = if pool == [] then 0 else arr_get (head (tail pool)) 0
   let total_bytes = total_code + pool_size
@@ -344,13 +352,13 @@ copy_pool_bytes dst dst_off src_buf n_bytes i =
     copy_pool_bytes dst dst_off src_buf n_bytes (i + 1)
 
 -- Walk fn_list, fill fn_offsets[k] with running byte offset, return total bytes.
-compute_fn_starts fn_list n fn_offsets k acc =
+compute_fn_starts fn_list n fn_offsets k acc n_fns =
   if k >= n then acc
   else
     let _ = arr_set fn_offsets k acc
     let fn = nth_fn fn_list k
-    let sz = fn_total_bytes fn
-    compute_fn_starts fn_list n fn_offsets (k + 1) (acc + sz)
+    let sz = fn_total_bytes fn n_fns
+    compute_fn_starts fn_list n fn_offsets (k + 1) (acc + sz) n_fns
 
 emit_each_function buf fn_list n fn_offsets k =
   if k >= n then 0
@@ -359,7 +367,7 @@ emit_each_function buf fn_list n fn_offsets k =
     let fn_start = arr_get fn_offsets k
     -- main is at index 0 (lower's move_main_first guarantees this).
     let is_main = if k == 0 then 1 else 0
-    let _ = emit_one_function buf fn_start fn fn_offsets is_main
+    let _ = emit_one_function buf fn_start fn fn_offsets is_main n
     emit_each_function buf fn_list n fn_offsets (k + 1)
 
 -- Local helpers (don't depend on stdlib).
@@ -509,6 +517,52 @@ emit_op_is_nil buf off dst_preg src_preg =
   -- cset dst, eq             = 0x9A9F17E0 | dst
   let _ = cb_emit buf (off + 4)  (bit_or 2594117600 dst_preg)
   0
+
+-- op_apply: linear cmp+b.ne dispatch over n_fns top-level functions.
+-- Per fn k (k = 0..n_fns-1), emits 5 instructions at off + 20*k:
+--    cmp x_fn_idx, #k       ; check if runtime fn_idx == k
+--    b.ne +4_inst            ; if not, jump to next branch
+--    mov x0, x_arg           ; load arg into x0 for the call
+--    bl  fn_k_offset         ; call the k-th fn
+--    b   end                 ; jump past remaining branches
+-- After all branches, 2 more instructions:
+--    mov x0, #0              ; no-match fallback (shouldn't happen in well-typed code)
+--    mov x_dst, x0           ; (end label) capture return value
+-- Total bytes: 20*n_fns + 8.
+--
+-- Each "b end" target is at off + 20*n_fns + 4 (the final mov x_dst, x0).
+-- For branch k, "b end" is at off + 20*k + 16. Displacement (bytes) =
+--   (20*n_fns + 4) - (20*k + 16) = 20*(n_fns - k) - 12.
+emit_op_apply buf off dst_preg fn_idx_preg arg_preg fn_offsets n_fns =
+  let _ = emit_apply_branches buf off fn_idx_preg arg_preg fn_offsets n_fns 0
+  let after_branches = off + 20 * n_fns
+  -- mov x0, #0  (no-match fallback)
+  let _ = cb_emit buf       after_branches       3531603968
+  -- mov x_dst, x0   (end label)
+  let _ = cb_emit buf (after_branches + 4)  (enc_mov_reg dst_preg 0)
+  0
+
+emit_apply_branches buf off fn_idx_preg arg_preg fn_offsets n_fns k =
+  if k >= n_fns then 0
+  else
+    let branch_off = off + 20 * k
+    -- 0: cmp x_fn_idx, #k
+    let _ = cb_emit buf       branch_off       (enc_cmp_imm fn_idx_preg k)
+    -- 1: b.ne +4_inst (= +16 bytes, target = next branch's cmp or no-match)
+    let _ = cb_emit buf (branch_off + 4)  (enc_bne_byte_off 16)
+    -- 2: mov x0, x_arg
+    let _ = cb_emit buf (branch_off + 8)  (enc_mov_reg 0 arg_preg)
+    -- 3: bl fn_k (target = fn_offsets[k]; bl is at branch_off + 12)
+    let bl_off = branch_off + 12
+    let target = arr_get fn_offsets k
+    let bl_rel = target - bl_off
+    let _ = cb_emit buf bl_off (enc_bl_byte_off bl_rel)
+    -- 4: b end (target = off + 20*n_fns + 4)
+    let b_off = branch_off + 16
+    let end_off = off + 20 * n_fns + 4
+    let b_rel = end_off - b_off
+    let _ = cb_emit buf b_off (enc_b_byte_off b_rel)
+    emit_apply_branches buf off fn_idx_preg arg_preg fn_offsets n_fns (k + 1)
 
 -- ============================================================================
 -- emit_print_int: emit ARM64 that prints `src` (a non-negative int) as decimal
