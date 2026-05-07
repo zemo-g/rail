@@ -80,50 +80,32 @@ Backing memory: stack-allocated for short, mmap'd for longer. Copy semantics, no
 
 ---
 
-## Stage 5 blocker — Rail foreign-pointer ABI
+## Stage 5 — Lists + `match` + ADT (PARTIALLY SHIPPED 2026-05-06)
 
-**Status (2026-05-06):** Lowering, parsing, IR opcodes, and emit-time codegen
-for `op_nil/cons/head/tail/is_nil` are SHIPPED. Heap allocator
-(`jit/heap.rail`) shipped. List literals (`[1,2,3]`) parse and lower
-correctly. **Execution segfaults** on the first `ldr [x_heap]`.
+**Status:** `op_nil/cons/head/tail/is_nil` + list literals + heap allocator
+all WORK end-to-end. Verified via `len [1,2,3,4,5]` (recursive list
+traversal, returns 5), `sum [10,20,30]` (head + recurse, returns 60).
 
-**Root cause:** Rail represents pointers from `foreign` returns (e.g.,
-`alloc_pages`) as opaque handles, not real addresses. `bit_and` and `shr`
-operate on the handle representation. When we extract chunks of the heap
-pointer and bake them into the JIT page (either via `movz/movk` or as raw
-bytes loaded by `adr+ldr`), the JIT's runtime register holds a handle, not
-a real address. `ldr [handle]` hits unmapped memory → `EXC_BAD_ACCESS`.
+**Two key insights from the unblock:**
 
-**Empirical evidence:** Pass `p` (alloc_pages return) via `call_jit`'s arg
-to a JIT that returns `x0` unchanged. Compare Rail-side `bit_and p ...`
-chunks (sent) vs returned int chunks (recv). They consistently differ —
-the foreign-call boundary translates handle ↔ real_address, but Rail's
-`bit_and / shr / byte_set` operate on the handle.
+1. Rail represents pointers from `foreign` returns (e.g., `alloc_pages`)
+   as `(real_address >> 1)`. The foreign-call boundary multiplies by 2
+   (`shl 1`) when passing args to C. Verified: pass `p` via `call_jit`'s
+   arg, JIT receives `x0 = (p << 1) = real_address`.
 
-**What works:** The JIT can read from any address that arrives via x0
-(input arg passed through pthread_create). This was verified — pass
-`p` and do `ldr [x0]`, get correct value.
+2. Heap setup is "pass heap as pthread arg + capture in x27 in prologue."
+   `mov x27, x0` is the first useful instruction after frame setup.
+   `op_cons` reads the bump pointer via `ldr x21, [x27, #0]`.
 
-**Unblocking paths (pick one):**
+3. The bump pointer stored at `heap[0..7]` must be the REAL address
+   (not the Rail handle). `heap_alloc` does `shl p 1` before storing
+   the initial bump value (= real_addr | 8).
 
-1. **Pass heap as the entry-fn's arg.** Repurpose pthread's arg slot to
-   carry heap_addr (works because foreign translates handle → real_addr).
-   Tradeoff: entry fn loses its user-arg slot. For `main = expr` programs
-   with no user args, this is fine.
+**Still pending under Stage 5:**
 
-2. **Add a Rail builtin to convert handle → real_addr.** Investigate
-   compile.rail's `foreign` machinery; expose an `untag_ptr p -> int`
-   that returns the real address as a Rail int. Then bake that int.
-   Likely a 1-line compile.rail addition; needs investigation.
-
-3. **Don't bake — JIT-side foreign call.** Have the JIT itself call
-   `dlsym("heap_alloc")` and invoke heap allocation at runtime. Avoids
-   bake-time issue entirely. More complex; needs JIT-side foreign infra.
-
-Recommended: (1) — smallest change, unblocks Stage 5 today. The cost
-(losing user-arg) doesn't apply to the bench corpus pattern (`main = ...`).
-
-## Stage 5 — Lists + `match` + ADT
+- `match` syntax + lowering (parser extension; ADT dispatch via op_is_nil + op_jz pattern is doable today via if/then/else, but the surface syntax would be cleaner).
+- Closures (`\x -> body`) — needs heap-allocated closure record + indirect call. Substantial.
+- File I/O — needs more `foreign` bindings (open/read/write).
 
 **Motivation.** The remaining bench bands (`io`, `tools`, `adv`) use lists, `fold`/`map`/`filter`, ADT match, closures. Most of the bench depends on these.
 
