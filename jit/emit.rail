@@ -36,15 +36,15 @@ preg vreg = vreg + 9
 -- Per-function fixed costs (inlined as literals to avoid Rail's
 -- nullary-int + let-bound-int sum bug).
 --   prologue = stp_fp_lr (4) + mov_x29_sp (4) + stp_x19_x20 (4)
---            + adr x27, <heap_addr_slot> (4) + ldr x27, [x27] (4)
+--            + mov x27, x0 (4)             -- heap_addr from pthread arg
 --            + n_args movs (4 each)
---            = 20 + 4*n_args
+--            = 16 + 4*n_args
 --   epilogue = ldp_x19_x20 + ldp_fp_lr + ret = 12 (mov_x0_vN counted in op_ret)
--- The heap_addr is stored as 8 raw bytes in the JIT page itself, just
--- after the code (before the string pool). PC-relative adr loads its
--- address; we can't bake it via movz/movk because Rail's foreign-call
--- boundary mangles large pointer values when they flow through Rail's
--- arithmetic ops (verified empirically).
+-- The heap_addr is captured from x0 at fn entry. The caller (test driver)
+-- passes heap_addr as call_jit's arg. For programs with no user args
+-- (`main = expr` style), this is fine. For programs that need a user arg,
+-- they can read x0 too — but x0 will be the heap_addr; the user-arg slot
+-- is consumed. This is the ABI v2 (unblocks Stage 5; see NEXT_STAGES.md).
 
 -- Bytes per IR opcode (FIXED-size opcodes only).
 -- For variable-size opcodes (op_call), use ir_byte_size_at.
@@ -106,7 +106,7 @@ fn_total_bytes fn =
   let n_args = fn_nargs fn
   let body = compute_body_offsets ir n_instr
   let body_bytes = arr_get body n_instr
-  20 + (4 * n_args) + body_bytes
+  16 + (4 * n_args) + body_bytes
 
 -- emit_print_int: stub for now — body filled in below.
 emit_print_int buf off src =
@@ -125,20 +125,17 @@ emit_const buf off dst imm =
   0
 
 -- Emit prologue at the function's start byte offset in the buffer.
--- Writes (20 + 4*n_args) bytes: frame setup + heap_addr load + per-arg moves.
--- heap_addr_slot is the absolute byte offset of the 8-byte heap_addr
--- record in the JIT page (caller writes it there before mprotect).
-emit_prologue buf fn_start n_args heap_addr_slot =
+-- Writes (16 + 4*n_args) bytes: frame setup + capture x0 -> x27 + per-arg moves.
+-- The caller passes heap_addr as pthread_create's arg, which becomes x0
+-- at the JIT entry point. We stash it in x27 (callee-save) immediately so
+-- subsequent ops (cons/head/tail) can find heap.
+emit_prologue buf fn_start n_args =
   let _ = cb_emit buf       fn_start       inst_stp_fp_lr_pre
   let _ = cb_emit buf (fn_start + 4)  inst_mov_x29_sp
   let _ = cb_emit buf (fn_start + 8)  inst_stp_x19_x20_16
-  -- adr x27, <heap_addr_slot>          (PC-relative)
-  let adr_pc = fn_start + 12
-  let rel = heap_addr_slot - adr_pc
-  let _ = cb_emit buf (fn_start + 12) (enc_adr 27 rel)
-  -- ldr x27, [x27, #0]                 (dereference to get heap_addr)
-  let _ = cb_emit buf (fn_start + 16) (bit_or 4181721088 (bit_or (shl 27 5) 27))
-  emit_arg_moves buf (fn_start + 20) 0 n_args
+  -- mov x27, x0 (capture heap_addr)
+  let _ = cb_emit buf (fn_start + 12) (enc_mov_reg 27 0)
+  emit_arg_moves buf (fn_start + 16) 0 n_args
 
 emit_arg_moves buf off i n =
   if i >= n then 0
@@ -258,44 +255,28 @@ emit_loop buf ir body_start body_offsets blocks fn_offsets i n_instr =
     emit_loop buf ir body_start body_offsets blocks fn_offsets (i + 1) n_instr
 
 -- Emit one function into buf starting at fn_start. Returns the size in bytes.
-emit_one_function buf fn_start fn fn_offsets heap_addr_slot =
+emit_one_function buf fn_start fn fn_offsets =
   let ir = fn_ir fn
   let n_instr = fn_ninstr fn
   let n_args = fn_nargs fn
   let blocks = fn_blocks fn
   let body_offsets = compute_body_offsets ir n_instr
   let body_bytes = arr_get body_offsets n_instr
-  let prologue_size = 20 + (4 * n_args)
+  let prologue_size = 16 + (4 * n_args)
   let body_start = fn_start + prologue_size
-  let _ = emit_prologue buf fn_start n_args heap_addr_slot
+  let _ = emit_prologue buf fn_start n_args
   let _ = emit_loop buf ir body_start body_offsets blocks fn_offsets 0 n_instr
   prologue_size + body_bytes
 
 -- Emit a single-function program. For backward compat with existing tests.
--- Returns [buf, total_bytes]. Caller passes heap (use heap_alloc 0).
--- Layout: code | 8-byte heap_addr slot.
+-- Returns [buf, total_bytes]. (heap arg unused; kept for backward compat.)
 emit_function fn heap =
-  let code_total = fn_total_bytes fn
-  let total = code_total + 8
-  let buf = arr_new total 0
+  let total = fn_total_bytes fn
+  let buf = make_codebuf (total / 4)
   let fn_offsets = arr_new 2 0
-  let _ = arr_set fn_offsets 1 code_total
-  -- heap_addr slot lives at code_total .. code_total+7
-  let _ = emit_one_function buf 0 fn fn_offsets code_total
-  let _ = write_le_u64_to_buf buf code_total heap
+  let _ = arr_set fn_offsets 1 total
+  let _ = emit_one_function buf 0 fn fn_offsets
   cons buf (cons total [])
-
--- Write 8 little-endian bytes representing v into buf at offset off.
-write_le_u64_to_buf buf off v =
-  let _ = arr_set buf       off       (bit_and v 255)
-  let _ = arr_set buf (off + 1) (bit_and (shr v 8)  255)
-  let _ = arr_set buf (off + 2) (bit_and (shr v 16) 255)
-  let _ = arr_set buf (off + 3) (bit_and (shr v 24) 255)
-  let _ = arr_set buf (off + 4) (bit_and (shr v 32) 255)
-  let _ = arr_set buf (off + 5) (bit_and (shr v 40) 255)
-  let _ = arr_set buf (off + 6) (bit_and (shr v 48) 255)
-  let _ = arr_set buf (off + 7) (bit_and (shr v 56) 255)
-  0
 
 -- Emit a multi-function program. With pool support.
 -- Input: fn_list = Rail list of function structs;
@@ -307,18 +288,12 @@ emit_program fn_list pool heap =
   let n = list_len fn_list
   let fn_offsets = arr_new (n + 1) 0
   let total_code = compute_fn_starts fn_list n fn_offsets 0 0
-  -- Layout: code | heap_addr (8 bytes) | string pool
-  let heap_slot_offset = total_code
-  let pool_offset = total_code + 8
-  -- fn_offsets[n] must be set to pool_offset BEFORE emit_each_function so
-  -- emit_op_str_lit's adr resolves to the correct pool start.
-  let _ = arr_set fn_offsets n pool_offset
+  let _ = arr_set fn_offsets n total_code
   let pool_size = if pool == [] then 0 else arr_get (head (tail pool)) 0
-  let total_bytes = pool_offset + pool_size
+  let total_bytes = total_code + pool_size
   let buf = arr_new total_bytes 0
-  let _ = emit_each_function buf fn_list n fn_offsets 0 heap_slot_offset
-  let _ = write_le_u64_to_buf buf heap_slot_offset heap
-  let _ = if pool_size > 0 then copy_pool_bytes buf pool_offset (head pool) pool_size 0 else 0
+  let _ = emit_each_function buf fn_list n fn_offsets 0
+  let _ = if pool_size > 0 then copy_pool_bytes buf total_code (head pool) pool_size 0 else 0
   cons buf (cons total_bytes (cons fn_offsets []))
 
 copy_pool_bytes dst dst_off src_buf n_bytes i =
@@ -336,13 +311,13 @@ compute_fn_starts fn_list n fn_offsets k acc =
     let sz = fn_total_bytes fn
     compute_fn_starts fn_list n fn_offsets (k + 1) (acc + sz)
 
-emit_each_function buf fn_list n fn_offsets k heap_slot_offset =
+emit_each_function buf fn_list n fn_offsets k =
   if k >= n then 0
   else
     let fn = nth_fn fn_list k
     let fn_start = arr_get fn_offsets k
-    let _ = emit_one_function buf fn_start fn fn_offsets heap_slot_offset
-    emit_each_function buf fn_list n fn_offsets (k + 1) heap_slot_offset
+    let _ = emit_one_function buf fn_start fn fn_offsets
+    emit_each_function buf fn_list n fn_offsets (k + 1)
 
 -- Local helpers (don't depend on stdlib).
 list_len xs =
