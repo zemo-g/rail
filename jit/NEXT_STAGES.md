@@ -80,6 +80,49 @@ Backing memory: stack-allocated for short, mmap'd for longer. Copy semantics, no
 
 ---
 
+## Stage 5 blocker — Rail foreign-pointer ABI
+
+**Status (2026-05-06):** Lowering, parsing, IR opcodes, and emit-time codegen
+for `op_nil/cons/head/tail/is_nil` are SHIPPED. Heap allocator
+(`jit/heap.rail`) shipped. List literals (`[1,2,3]`) parse and lower
+correctly. **Execution segfaults** on the first `ldr [x_heap]`.
+
+**Root cause:** Rail represents pointers from `foreign` returns (e.g.,
+`alloc_pages`) as opaque handles, not real addresses. `bit_and` and `shr`
+operate on the handle representation. When we extract chunks of the heap
+pointer and bake them into the JIT page (either via `movz/movk` or as raw
+bytes loaded by `adr+ldr`), the JIT's runtime register holds a handle, not
+a real address. `ldr [handle]` hits unmapped memory → `EXC_BAD_ACCESS`.
+
+**Empirical evidence:** Pass `p` (alloc_pages return) via `call_jit`'s arg
+to a JIT that returns `x0` unchanged. Compare Rail-side `bit_and p ...`
+chunks (sent) vs returned int chunks (recv). They consistently differ —
+the foreign-call boundary translates handle ↔ real_address, but Rail's
+`bit_and / shr / byte_set` operate on the handle.
+
+**What works:** The JIT can read from any address that arrives via x0
+(input arg passed through pthread_create). This was verified — pass
+`p` and do `ldr [x0]`, get correct value.
+
+**Unblocking paths (pick one):**
+
+1. **Pass heap as the entry-fn's arg.** Repurpose pthread's arg slot to
+   carry heap_addr (works because foreign translates handle → real_addr).
+   Tradeoff: entry fn loses its user-arg slot. For `main = expr` programs
+   with no user args, this is fine.
+
+2. **Add a Rail builtin to convert handle → real_addr.** Investigate
+   compile.rail's `foreign` machinery; expose an `untag_ptr p -> int`
+   that returns the real address as a Rail int. Then bake that int.
+   Likely a 1-line compile.rail addition; needs investigation.
+
+3. **Don't bake — JIT-side foreign call.** Have the JIT itself call
+   `dlsym("heap_alloc")` and invoke heap allocation at runtime. Avoids
+   bake-time issue entirely. More complex; needs JIT-side foreign infra.
+
+Recommended: (1) — smallest change, unblocks Stage 5 today. The cost
+(losing user-arg) doesn't apply to the bench corpus pattern (`main = ...`).
+
 ## Stage 5 — Lists + `match` + ADT
 
 **Motivation.** The remaining bench bands (`io`, `tools`, `adv`) use lists, `fold`/`map`/`filter`, ADT match, closures. Most of the bench depends on these.
