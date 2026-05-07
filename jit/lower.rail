@@ -151,10 +151,15 @@ st_emit s op a b c =
 -- Environment: list of (name, vreg) pairs. Most-recent binding shadows.
 -- ============================================================================
 
--- env entries are 3-element lists: [name, vreg, type] where type is "int"|"str".
+-- env entries are 4-element lists: [name, vreg, type, payload]
+-- where type is "int"|"str"|"fn"|"lambda" and payload is opaque (used for
+-- carrying lambda AST when type=="lambda"; 0 otherwise).
 env_empty _ = []
 env_extend env name vreg = env_extend_typed env name vreg "int"
-env_extend_typed env name vreg ty = cons (cons name (cons vreg (cons ty []))) env
+env_extend_typed env name vreg ty = env_extend_full env name vreg ty 0
+env_extend_full env name vreg ty payload =
+  cons (cons name (cons vreg (cons ty (cons payload [])))) env
+
 env_lookup env name =
   if env == [] then 0 - 1
   else
@@ -168,6 +173,20 @@ env_lookup_type env name =
     let pair = head env
     if (head pair) == name then head (tail (tail pair))
     else env_lookup_type (tail env) name
+
+env_lookup_payload env name =
+  if env == [] then 0
+  else
+    let pair = head env
+    if (head pair) == name then head (tail (tail (tail pair)))
+    else env_lookup_payload (tail env) name
+
+env_has env name =
+  if env == [] then 0
+  else
+    let pair = head env
+    if (head pair) == name then 1
+    else env_has (tail env) name
 
 -- Conservative AST-level type inference. Returns "int" or "str".
 -- Assumes user-fn calls return int (no str-returning user fns in v1).
@@ -465,23 +484,29 @@ lower_let s env ast =
   let name = head (tail ast)
   let val = head (tail (tail ast))
   let body = head (tail (tail (tail ast)))
-  -- Type inference: `let X = var(known_top_level_fn)` gets type "fn" so that
-  -- subsequent `X arg` calls dispatch via op_apply (P3-variant).
-  let val_ty = infer_let_val_ty s env val
-  let v_val = lower_expr s env val
-  if (st_get_err s) == 1 then v_val
+  -- P3-full: `let f = \x -> body in body2`. Bind f as a "lambda" with the
+  -- AST as payload; each call site to f inlines the body (substituting the
+  -- lambda's param). Captures work for free since the inlined body sees
+  -- f's enclosing scope.
+  if (ast_tag val) == "lambda" then
+    let env2 = env_extend_full env name (0 - 1) "lambda" val
+    lower_expr s env2 body
   else
-    -- Only preserve to callee-save if `name` is actually used AFTER a call
-    -- in the body (liveness-aware). Without this, match-style desugars
-    -- exhaust the 2-slot callee-save bank on bindings that are used
-    -- immediately or only as call args.
-    let needs_preserve = if v_val >= 10 then 0
-                         else used_after_call name body 0
-    let v_safe = if needs_preserve == 1 then preserve_callee s v_val else v_val
-    if (st_get_err s) == 1 then v_safe
+    -- Type inference: `let X = var(known_top_level_fn)` gets type "fn" so
+    -- that subsequent `X arg` calls dispatch via op_apply (P3-variant).
+    let val_ty = infer_let_val_ty s env val
+    let v_val = lower_expr s env val
+    if (st_get_err s) == 1 then v_val
     else
-      let env2 = env_extend_typed env name v_safe val_ty
-      lower_expr s env2 body
+      -- Only preserve to callee-save if `name` is actually used AFTER a call
+      -- in the body (liveness-aware).
+      let needs_preserve = if v_val >= 10 then 0
+                           else used_after_call name body 0
+      let v_safe = if needs_preserve == 1 then preserve_callee s v_val else v_val
+      if (st_get_err s) == 1 then v_safe
+      else
+        let env2 = env_extend_typed env name v_safe val_ty
+        lower_expr s env2 body
 
 infer_let_val_ty s env val =
   if (ast_tag val) == "var" then
@@ -644,15 +669,32 @@ lower_call_resolved s env fname args =
   else
     let fn_idx = st_registry_lookup s fname
     if fn_idx >= 0 then lower_call_with_args s env fn_idx args
+    else if (env_has env fname) == 1 then
+      let ty = env_lookup_type env fname
+      if ty == "fn" then
+        lower_apply s env (env_lookup env fname) args
+      else if ty == "lambda" then
+        lower_lambda_call s env fname args
+      else st_fail s (cat ["lower: ", fname, " is not callable (env type ", ty, ")"])
+    else st_fail s (cat ["lower: unknown function ", fname])
+
+-- Inline a lambda call: `f arg` where f is bound to `\param -> body`.
+-- The body is lowered with param substituted to arg's vreg in env. Captures
+-- (free vars in body) are picked up from env naturally.
+lower_lambda_call s env fname args =
+  let n = list_len_local args
+  if n != 1 then st_fail s "lower: lambda call must have exactly 1 arg in v1"
+  else
+    let lam_ast = env_lookup_payload env fname
+    let param = head (tail lam_ast)
+    let body = head (tail (tail lam_ast))
+    let v_arg = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_arg
     else
-      -- Maybe `fname` is an env-bound fn-typed var (HOF parameter, or alias
-      -- via `let f = some_named_fn`). Dispatch via op_apply.
-      let v_fn = env_lookup env fname
-      if v_fn >= 0 then
-        if (env_lookup_type env fname) == "fn" then
-          lower_apply s env v_fn args
-        else st_fail s (cat ["lower: ", fname, " is not callable (env type ", env_lookup_type env fname, ")"])
-      else st_fail s (cat ["lower: unknown function ", fname])
+      -- Bind param → v_arg in a child env, then lower body. Result vreg is
+      -- the body's last expression value.
+      let env2 = env_extend_typed env param v_arg "int"
+      lower_expr s env2 body
 
 -- HOF dispatch: `f arg` where f holds a runtime fn_idx.
 -- v1 supports 1-arg apply only.
