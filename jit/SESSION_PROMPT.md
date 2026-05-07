@@ -66,6 +66,8 @@ let _ = heap_free heap
 | Arithmetic ops | `+`, `-`, `*`, `/`, builtin `mod a b` |
 | Unary minus | `0 - x` desugar; literal `-5` works as `(0 - 5)` |
 | Boolean | `&&`, `\|\|` (parse-time desugar to if-then-else; short-circuit) |
+| `not` builtin | `not e` -> `e == 0` (returns 1 if e is zero, else 0) |
+| Negative int print | `main = print (show (0 - 42))` -> "-42\n" (sign-aware op_print_int) |
 | Sequencing | `let _ = print "x = " in print (show n)` -> "x = n\n" |
 | Print loop | `print_list xs = match xs \| nil -> 0 \| cons h t -> let _ = print (show h) in print_list t` |
 
@@ -136,9 +138,9 @@ The wins:
    thousands of rollouts, call them.
 3. **No hardened-runtime entitlement** — works only because `./rail_native`
    is dev-built. Don't ship signed/notarized.
-4. **Negative-int corner case**: `op_const` and `op_print_int` haven't been
-   tested with negative integers (sign-extension untested in `emit_const`,
-   division-by-10 loop assumes non-negative).
+4. **Negative-int corner case**: `op_const` and `op_print_int` now handle
+   negatives correctly. `op_print_int` writes a `-` prefix when input is
+   negative; verified for {-5, -42, -12345, 0, 100}.
 5. **String pool 16 KB cap** per program (`max_pool_bytes` in lower.rail).
 6. **`infer_arg_type` is heuristic**: `s`/`s1`/`s2`/`str`/`name` route as
    "str", everything else as "int". If your generated code names a
