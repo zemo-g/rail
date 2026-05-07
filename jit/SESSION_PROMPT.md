@@ -97,13 +97,20 @@ the real address. ABI v2: heap is passed as `call_jit`'s arg slot.
 * `>4`-arg user functions (rejected with clear error).
 * Closures (`map (\x -> ...) xs` style — capture-by-value not yet
   supported in IR).
-* User functions returning floats (return type tracking is
-  conservative; only `int_to_float` recognised as float-returning).
 * Float function args (the prologue's `mov v_i, x_i` doesn't pull from
-  d-regs).
-* Float values held across function calls (rejected with clear error
-  in `lower_op_float` if rhs contains a call).
+  d-regs; workaround: write fns that take int and convert via
+  `int_to_float` inside).
 * Any string return from a user fn.
+
+## Lifted in P4-ext (2026-05-07)
+
+* Float `<=` (`op_fle` via `cset ls`).
+* Float values across function calls — `d8/d9` callee-save preservation
+  (frame grew 48→64). `preserve_callee_float` emits `op_fmov` to f8/f9
+  before a call. Limit: 2 float callee-save slots.
+* User functions that return floats — registry tracks ret_type per fn;
+  `op_call_fret` captures via `fmov f_dst, d0`; `op_ret_float` returns
+  via `fmov d0, d_v`. `infer_type_app` uses registry-via-env.
 
 ## Distillation integration sketch
 
