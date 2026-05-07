@@ -1,13 +1,28 @@
--- jit/heap.rail — bump-pointer heap for cons cells (Stage 5 lists).
--- A separate mmap'd RW page (NOT the JIT code page). The first 8 bytes
--- hold the bump pointer; cells start at heap_base + 8.
+-- jit/heap.rail — bump-pointer heap + output capture buffer.
 --
--- Public:
---   heap_alloc 0  -> ptr (heap base)
---   heap_free h   -> 0
+-- A separate mmap'd RW page (NOT the JIT code page). Two metadata cells
+-- live at the start of the page; cons cells start past a fixed-size
+-- output region.
 --
--- Each cons cell is 16 bytes: [head_value, tail_pointer].
--- nil sentinel = 0 (so any nonzero pointer is a valid cell).
+-- Layout (in the 64 KB mmap'd page; real address = R):
+--   R + 0..7      : bump pointer for cons cells (real addr; advances)
+--   R + 8..15     : output cursor for op_print_*  (real addr; advances)
+--   R + 16..16399 : output buffer (16 KB; first byte = R+16)
+--   R + 16400..   : cons cell area (~48 KB ≈ 3070 cells)
+--
+-- Initial values written by heap_alloc:
+--   bump   = R + 16400
+--   cursor = R + 16
+--
+-- ABI v2 prologue captures heap_addr as x27 = R (via pthread_create's
+-- arg slot). op_cons reads/writes [x27, #0]. op_print_int / op_print_str
+-- load/store the output cursor at [x27, #8] and append bytes between
+-- cursor and base.
+--
+-- Public API:
+--   heap_alloc 0        -> ptr (heap base)
+--   heap_free h         -> 0
+--   read_jit_output h   -> Rail string (in jit/loader.rail)
 --
 -- This file is the CANONICAL importer for stdlib/mmap.rail and jit/ffi.rail.
 -- Other files (jit/loader.rail, jit/emit.rail) DO NOT re-import them; they
@@ -16,23 +31,21 @@
 import "stdlib/mmap.rail"
 import "jit/ffi.rail"
 
-heap_page_size = 65536    -- 64 KB; ~4096 cells before exhaust
+heap_page_size = 65536    -- 64 KB
+output_cap     = 16384    -- 16 KB output buffer
+cells_offset   = 16400    -- output_offset (16) + output_cap (16384)
 
 heap_alloc _ =
   let p = alloc_pages heap_page_size
-  -- KEY INSIGHT: Rail represents pointers from `foreign` returns as
-  -- `real_address >> 1`. The foreign-call boundary multiplies by 2
-  -- when passing args to C (so byte_set, mmap etc. see the real address).
-  -- For the JIT to read the bump pointer correctly, we must store the
-  -- REAL address (not the Rail handle) in heap[0..7]. Compute via shl 1.
-  -- Verified empirically: a JIT receiving heap as its pthread arg sees
-  -- x0 = (handle << 1) = real_address.
+  -- KEY INSIGHT: Rail represents pointers from `foreign` returns as raw
+  -- 64-bit values; `shl p 1` produces a Rail tagged-int whose raw bytes
+  -- (when written via write_u64) equal the real address R. The JIT-side
+  -- `ldr x21, [x27, #N]` reads those bytes as a real pointer.
   let p_real = shl p 1
-  let p_real_plus_8 = bit_or p_real 8
-  let _ = write_u64 p 0 p_real_plus_8
+  let bump_init   = p_real + 16400    -- cells start past the output buffer
+  let cursor_init = p_real + 16        -- output starts at R+16
+  let _ = write_u64 p 0 bump_init
+  let _ = write_u64 p 8 cursor_init
   p
 
 heap_free p = free_pages p heap_page_size
-
-heap_bump_addr h = h
-heap_first_cell h = h + 8

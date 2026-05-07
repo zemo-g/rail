@@ -95,21 +95,26 @@ the real address. ABI v2: heap is passed as `call_jit`'s arg slot.
 
 ## Distillation integration sketch
 
+`jit/grade.rail` exposes a single-call API that hides the
+emit/load/run/capture dance:
+
+```rail
+import "jit/heap.rail"      -- canonical mmap+ffi importer
+import "jit/emit.rail"
+import "jit/loader.rail"
+import "jit/lower.rail"
+import "jit/grade.rail"
+
+let result = try_jit_grade_str candidate_src expected_stdout
+match result
+| ["jit_pass"]                 -> good rollout (count toward reward)
+| ["jit_fail", actual]         -> ran cleanly but stdout mismatched
+| ["err", reason]              -> couldn't lower; fall back to shell-grade
 ```
-for each candidate src from teacher:
-  r = lower_source src
-  if r.tag == "err":
-    grade via ./rail_native (slow path, ~100 ms)
-    continue
-  fns  = r.payload[0]
-  pool = r.payload[1]
-  heap = heap_alloc 0
-  bytes = emit_program fns pool heap
-  page = make_executable bytes
-  output = capture_stdout (call_jit page 0)
-  match against expected
-  free_jit page; heap_free heap
-```
+
+Output capture (P0) is wired up: `op_print_int` and `op_print_str` write
+into a 16 KB buffer at `heap[16..]` and update the cursor at `heap[8]`.
+`read_jit_output heap` returns the captured bytes as a Rail string.
 
 The wins:
 - Sub-ms grade per candidate that lowers (vs ~100 ms shell grade).
@@ -175,17 +180,14 @@ The wins:
 ## How to verify your environment is good
 
 ```bash
-./rail_native run jit/test_lower.rail
-# expect: ALL LOWER PASS  (covers Stages 3+4: 26 tests)
-
-./rail_native run jit/test_codegen.rail
-# expect: ALL PASS (8 hand-built IR fixtures, Stage 1)
-
-./rail_native test
-# expect: 137/137 tests passed
+./rail_native run jit/test_lower.rail      # expect: ALL LOWER PASS  (60+3 fixtures)
+./rail_native run jit/test_codegen.rail    # expect: ALL PASS (8 hand-built IR fixtures)
+./rail_native run jit/test_capture.rail    # expect: ALL CAPTURE PASS (P0/P1, 11 fixtures)
+./rail_native run jit/parity_check.rail    # expect: PARITY OK
+./rail_native test                          # expect: 137/137 tests passed
 ```
 
-If all three pass, JIT is live and integration is safe to start.
+If all five pass, JIT is live and distill integration is safe to start.
 
 ---
 

@@ -35,16 +35,17 @@ preg vreg = vreg + 9
 
 -- Per-function fixed costs (inlined as literals to avoid Rail's
 -- nullary-int + let-bound-int sum bug).
---   prologue = stp_fp_lr (4) + mov_x29_sp (4) + stp_x19_x20 (4)
---            + mov x27, x0 (4)             -- heap_addr from pthread arg
+--   prologue = stp_fp_lr_-48 (4) + mov_x29_sp (4) + stp_x19_x20 (4)
+--            + str_x27_32 (4)             -- save caller's x27 (= heap)
+--            + (mov x27, x0  if main, else nop) (4)
 --            + n_args movs (4 each)
---            = 16 + 4*n_args
---   epilogue = ldp_x19_x20 + ldp_fp_lr + ret = 12 (mov_x0_vN counted in op_ret)
--- The heap_addr is captured from x0 at fn entry. The caller (test driver)
--- passes heap_addr as call_jit's arg. For programs with no user args
--- (`main = expr` style), this is fine. For programs that need a user arg,
--- they can read x0 too — but x0 will be the heap_addr; the user-arg slot
--- is consumed. This is the ABI v2 (unblocks Stage 5; see NEXT_STAGES.md).
+--            = 20 + 4*n_args
+--   op_ret   = mov x0, vN + ldr_x27_32 + ldp_x19_x20 + ldp_fp_lr_+48 + ret
+--            = 20 bytes
+-- ABI v2: heap_addr arrives in x0 from pthread_create. Only main captures
+-- it via `mov x27, x0`; inner functions inherit x27 from the caller (kept
+-- live by callee-save save/restore). All ops that need heap (op_cons,
+-- op_print_int, op_print_str) read x27.
 
 -- Bytes per IR opcode (FIXED-size opcodes only).
 -- For variable-size opcodes (op_call), use ir_byte_size_at.
@@ -56,11 +57,11 @@ ir_byte_size op =
   else if op == op_lt then 8
   else if op == op_jmp then 4
   else if op == op_jz then 4
-  else if op == op_ret then 16
-  else if op == op_print_int then 116
+  else if op == op_ret then 20
+  else if op == op_print_int then 136
   else if op == op_mov then 4
   else if op == op_str_lit then 4
-  else if op == op_print_str then 20
+  else if op == op_print_str then 44
   else if op == op_str_len then 4
   else if op == op_str_eq then 72
   else if op == op_str_at then 8
@@ -112,7 +113,7 @@ fn_total_bytes fn =
   let n_args = fn_nargs fn
   let body = compute_body_offsets ir n_instr
   let body_bytes = arr_get body n_instr
-  16 + (4 * n_args) + body_bytes
+  20 + (4 * n_args) + body_bytes
 
 -- emit_print_int: stub for now — body filled in below.
 emit_print_int buf off src =
@@ -131,17 +132,21 @@ emit_const buf off dst imm =
   0
 
 -- Emit prologue at the function's start byte offset in the buffer.
--- Writes (16 + 4*n_args) bytes: frame setup + capture x0 -> x27 + per-arg moves.
--- The caller passes heap_addr as pthread_create's arg, which becomes x0
--- at the JIT entry point. We stash it in x27 (callee-save) immediately so
--- subsequent ops (cons/head/tail) can find heap.
-emit_prologue buf fn_start n_args =
+-- Writes (20 + 4*n_args) bytes: frame setup (48-byte frame, saving FP/LR,
+-- x19/x20, and x27) + conditional `mov x27, x0` (main only) + per-arg moves.
+-- For non-main functions, we emit a NOP in place of the heap-capture mov
+-- so x27 stays equal to the caller's value (= heap, propagated as
+-- callee-save through the str/ldr at offset #32).
+emit_prologue buf fn_start n_args is_main =
   let _ = cb_emit buf       fn_start       inst_stp_fp_lr_pre
   let _ = cb_emit buf (fn_start + 4)  inst_mov_x29_sp
   let _ = cb_emit buf (fn_start + 8)  inst_stp_x19_x20_16
-  -- mov x27, x0 (capture heap_addr)
-  let _ = cb_emit buf (fn_start + 12) (enc_mov_reg 27 0)
-  emit_arg_moves buf (fn_start + 16) 0 n_args
+  let _ = cb_emit buf (fn_start + 12) inst_str_x27_32
+  -- mov x27, x0 ONLY for main (the JIT entry); else nop so x27 stays
+  -- whatever the caller set it to (= heap by the callee-save chain).
+  let cap = if is_main == 1 then enc_mov_reg 27 0 else inst_nop
+  let _ = cb_emit buf (fn_start + 16) cap
+  emit_arg_moves buf (fn_start + 20) 0 n_args
 
 emit_arg_moves buf off i n =
   if i >= n then 0
@@ -191,9 +196,10 @@ emit_one buf ir body_start body_offsets blocks fn_offsets i =
     emit_op_call buf off a b c fn_offsets
   else if op == op_ret then
     let _ = cb_emit buf       off       (enc_mov_reg 0 (preg a))
-    let _ = cb_emit buf (off + 4)  inst_ldp_x19_x20_16
-    let _ = cb_emit buf (off + 8)  inst_ldp_fp_lr_post
-    let _ = cb_emit buf (off + 12) enc_ret
+    let _ = cb_emit buf (off + 4)  inst_ldr_x27_32
+    let _ = cb_emit buf (off + 8)  inst_ldp_x19_x20_16
+    let _ = cb_emit buf (off + 12) inst_ldp_fp_lr_post
+    let _ = cb_emit buf (off + 16) enc_ret
     0
   else if op == op_mov then
     cb_emit buf off (enc_mov_reg (preg a) (preg b))
@@ -243,11 +249,13 @@ emit_one buf ir body_start body_offsets blocks fn_offsets i =
     let _ = cb_emit buf (off + 4)  (enc_msub (preg a) 21 (preg c) (preg b))
     0
   else
-    -- Unknown op: emit a safe ret(0) so we never run garbage.
+    -- Unknown op: emit a safe ret(0) so we never run garbage. Pads to 20
+    -- bytes (5 inst) to match op_ret's new size accounting.
     let _ = cb_emit buf       off       (enc_mov_reg 0 0)
-    let _ = cb_emit buf (off + 4)  inst_ldp_x19_x20_16
-    let _ = cb_emit buf (off + 8)  inst_ldp_fp_lr_post
-    let _ = cb_emit buf (off + 12) enc_ret
+    let _ = cb_emit buf (off + 4)  inst_ldr_x27_32
+    let _ = cb_emit buf (off + 8)  inst_ldp_x19_x20_16
+    let _ = cb_emit buf (off + 12) inst_ldp_fp_lr_post
+    let _ = cb_emit buf (off + 16) enc_ret
     0
 
 -- Multi-arg op_call emit. Decodes packed c (n_args + arg vregs), emits:
@@ -284,27 +292,31 @@ emit_loop buf ir body_start body_offsets blocks fn_offsets i n_instr =
     emit_loop buf ir body_start body_offsets blocks fn_offsets (i + 1) n_instr
 
 -- Emit one function into buf starting at fn_start. Returns the size in bytes.
-emit_one_function buf fn_start fn fn_offsets =
+-- is_main = 1 → prologue captures `mov x27, x0` (heap_addr from pthread arg).
+-- is_main = 0 → prologue emits a NOP in the same slot; x27 is preserved as
+-- callee-save through str/ldr at [sp, #32].
+emit_one_function buf fn_start fn fn_offsets is_main =
   let ir = fn_ir fn
   let n_instr = fn_ninstr fn
   let n_args = fn_nargs fn
   let blocks = fn_blocks fn
   let body_offsets = compute_body_offsets ir n_instr
   let body_bytes = arr_get body_offsets n_instr
-  let prologue_size = 16 + (4 * n_args)
+  let prologue_size = 20 + (4 * n_args)
   let body_start = fn_start + prologue_size
-  let _ = emit_prologue buf fn_start n_args
+  let _ = emit_prologue buf fn_start n_args is_main
   let _ = emit_loop buf ir body_start body_offsets blocks fn_offsets 0 n_instr
   prologue_size + body_bytes
 
 -- Emit a single-function program. For backward compat with existing tests.
 -- Returns [buf, total_bytes]. (heap arg unused; kept for backward compat.)
+-- Treated as main (is_main=1) since it's the JIT entry point.
 emit_function fn heap =
   let total = fn_total_bytes fn
   let buf = make_codebuf (total / 4)
   let fn_offsets = arr_new 2 0
   let _ = arr_set fn_offsets 1 total
-  let _ = emit_one_function buf 0 fn fn_offsets
+  let _ = emit_one_function buf 0 fn fn_offsets 1
   cons buf (cons total [])
 
 -- Emit a multi-function program. With pool support.
@@ -345,7 +357,9 @@ emit_each_function buf fn_list n fn_offsets k =
   else
     let fn = nth_fn fn_list k
     let fn_start = arr_get fn_offsets k
-    let _ = emit_one_function buf fn_start fn fn_offsets
+    -- main is at index 0 (lower's move_main_first guarantees this).
+    let is_main = if k == 0 then 1 else 0
+    let _ = emit_one_function buf fn_start fn fn_offsets is_main
     emit_each_function buf fn_list n fn_offsets (k + 1)
 
 -- Local helpers (don't depend on stdlib).
@@ -380,19 +394,32 @@ emit_op_str_lit buf off dst_preg pool_offset fn_offsets =
   cb_emit buf off (enc_adr dst_preg rel)
 
 -- op_print_str: ptr in src_preg points to length-prefixed string.
--- Sequence: ldr x2,[src,#0] ; add x1,src,#8 ; mov x0,#1 ; mov x16,#4 ; svc #0x80
--- All constants verified via /tmp/asmtest_pstr.s + python conversion.
+-- Appends `len` bytes to the heap output buffer at [x27, #8].
+-- Uses x21 (cursor) and x22 (byte scratch) — outside the v1 vreg map.
+-- All constants verified via /tmp/asmtest_p0_v2.s + as+otool.
 emit_op_print_str buf off src_preg =
-  -- ldr x2, [src_preg, #0]   = 0xF9400002 | (src_preg<<5)
+  -- 0: ldr x2, [src_preg, #0]    = 0xF9400002 | (src_preg<<5)
   let _ = cb_emit buf       off       (bit_or 4181721090 (shl src_preg 5))
-  -- add x1, src_preg, #8     = 0x91002001 | (src_preg<<5)
+  -- 1: add x1, src_preg, #8      = 0x91002001 | (src_preg<<5)
   let _ = cb_emit buf (off + 4)  (bit_or 2432704513 (shl src_preg 5))
-  -- mov x0, #1               = 0xD2800020
-  let _ = cb_emit buf (off + 8)  3531604000
-  -- mov x16, #4              = 0xD2800090
-  let _ = cb_emit buf (off + 12) 3531604112
-  -- svc #0x80                = 0xD4001001
-  let _ = cb_emit buf (off + 16) 3556773889
+  -- 2: ldr x21, [x27, #8]        = 0xF9400775
+  let _ = cb_emit buf (off + 8)  4181722997
+  -- 3: cbz x2, +7 inst (skip)    = 0xB40000E2
+  let _ = cb_emit buf (off + 12) 3019899106
+  -- 4: ldrb w22, [x1]            = 0x39400036
+  let _ = cb_emit buf (off + 16) 960495670
+  -- 5: strb w22, [x21]           = 0x390002B6
+  let _ = cb_emit buf (off + 20) 956302006
+  -- 6: add x1, x1, #1            = 0x91000421
+  let _ = cb_emit buf (off + 24) 2432697377
+  -- 7: add x21, x21, #1          = 0x910006B5
+  let _ = cb_emit buf (off + 28) 2432698037
+  -- 8: sub x2, x2, #1            = 0xD1000442
+  let _ = cb_emit buf (off + 32) 3506439234
+  -- 9: cbnz x2, -5 inst          = 0xB5FFFF62
+  let _ = cb_emit buf (off + 36) 3053453154
+  -- 10: str x21, [x27, #8]       = 0xF9000775
+  let _ = cb_emit buf (off + 40) 4177528693
   0
 
 -- op_str_len: dst = *src (8-byte length prefix at offset 0).
@@ -520,18 +547,21 @@ emit_op_is_nil buf off dst_preg src_preg =
 -- Total: 16 instructions = 64 bytes.
 
 emit_print_int_impl buf off src =
-  -- 29-instruction emit (116 bytes). Handles negative ints by writing '-'
-  -- prefix after the digit loop. All constants verified via as+otool +
-  -- python int conversions. See /tmp/asmtest_negprint.s for the new
-  -- sign-handling instructions.
+  -- 34-instruction emit (136 bytes). Handles negative ints, writes digits
+  -- to a stack-local scratch buffer, then APPENDS bytes to the heap output
+  -- buffer at [x27, #8] (no syscall — output capture for distill grading).
+  -- Constants verified via /tmp/asmtest_negprint.s and /tmp/asmtest_p0_v2.s.
   --
   -- Layout:
   --   0     mov x12, x_src
   --   1-5   sign detection: x21=sign_flag, neg if negative
   --   6-10  scratch buf setup, '\n', divisor
-  --   11-17 digit loop (write digits backward)
+  --   11-17 digit loop (write digits backward into stack scratch)
   --   18-21 conditionally prepend '-' if x21==1
-  --   22-28 length calc + write syscall + restore sp
+  --   22-23 length calc (x9 = sp+24, x2 = x9-x10)
+  --   24-32 NEW: copy [x10, x10+x2) to [heap_cursor, heap_cursor+x2);
+  --             update cursor at [x27, #8]
+  --   33    add sp, sp, #32 (restore stack)
 
   -- 0: mov x12, x_src                  = 0xAA0003EC | (src<<16)
   let _ = cb_emit buf       off       (bit_or 2852127724 (shl src 16))
@@ -581,14 +611,24 @@ emit_print_int_impl buf off src =
   let _ = cb_emit buf (off + 88)  2432721897
   -- 23: sub x2, x9, x10                = 0xCB0A0122
   let _ = cb_emit buf (off + 92)  3406430498
-  -- 24: mov x1, x10                    = 0xAA0A03E1
-  let _ = cb_emit buf (off + 96)  2852783073
-  -- 25: mov x0, #1                     = 0xD2800020
-  let _ = cb_emit buf (off + 100) 3531604000
-  -- 26: mov x16, #4                    = 0xD2800090
-  let _ = cb_emit buf (off + 104) 3531604112
-  -- 27: svc #0x80                      = 0xD4001001
-  let _ = cb_emit buf (off + 108) 3556773889
-  -- 28: add sp, sp, #32                = 0x910083FF
-  let _ = cb_emit buf (off + 112) 2432730111
+  -- 24: ldr x21, [x27, #8]             = 0xF9400775
+  let _ = cb_emit buf (off + 96)  4181722997
+  -- 25: cbz x2, +7 inst (mem_done)     = 0xB40000E2
+  let _ = cb_emit buf (off + 100) 3019899106
+  -- 26: ldrb w22, [x10]                = 0x39400156
+  let _ = cb_emit buf (off + 104) 960495958
+  -- 27: strb w22, [x21]                = 0x390002B6
+  let _ = cb_emit buf (off + 108) 956302006
+  -- 28: add x10, x10, #1               = 0x9100054A
+  let _ = cb_emit buf (off + 112) 2432697674
+  -- 29: add x21, x21, #1               = 0x910006B5
+  let _ = cb_emit buf (off + 116) 2432698037
+  -- 30: sub x2, x2, #1                 = 0xD1000442
+  let _ = cb_emit buf (off + 120) 3506439234
+  -- 31: cbnz x2, -5 inst (mem_loop)    = 0xB5FFFF62
+  let _ = cb_emit buf (off + 124) 3053453154
+  -- 32: str x21, [x27, #8]             = 0xF9000775
+  let _ = cb_emit buf (off + 128) 4177528693
+  -- 33: add sp, sp, #32                = 0x910083FF
+  let _ = cb_emit buf (off + 132) 2432730111
   0
