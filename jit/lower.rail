@@ -248,11 +248,19 @@ infer_type env ast =
   if tag == "int" then "int"
   else if tag == "float" then "float"
   else if tag == "str" then "str"
-  else if tag == "var" then env_lookup_type env (head (tail ast))
+  else if tag == "var" then infer_type_var env (head (tail ast))
   else if tag == "op" then infer_type_op env ast
   else if tag == "if" then infer_type_if env ast
   else if tag == "let" then infer_type_let env ast
   else if tag == "app" then infer_type_app env ast
+  else "int"
+
+-- A bare var ref. If it's bound locally, use the local type. Otherwise, if it
+-- names a 0-arg user fn (registered as `__USERFN_<name>`), the var ref will
+-- lower as a 0-arg call; its type is the fn's ret_ty (v2-A).
+infer_type_var env name =
+  if (env_has env name) == 1 then env_lookup_type env name
+  else if (env_has env (cat ["__USERFN_", name])) == 1 then env_lookup_type env (cat ["__USERFN_", name])
   else "int"
 
 -- A binary op produces "float" if either operand is float (auto-promotion).
@@ -353,6 +361,13 @@ reg_lookup_arg_ty r name i =
   let meta = reg_lookup_meta r name
   if (arr_len meta) <= (i + 1) then "int"
   else if (arr_get meta (i + 1)) == 1 then "float" else "int"
+
+-- Returns the arity (n_args) of a registered fn, or -1 if not found.
+-- Meta length = 1 + n_args (slot 0 = ret_ty, slots 1..n = arg types).
+reg_lookup_arity r name =
+  let meta = reg_lookup_meta r name
+  if (arr_len meta) == 0 then 0 - 1
+  else (arr_len meta) - 1
 
 reg_set_ret_ty r name ty_str =
   let meta = reg_lookup_meta r name
@@ -523,24 +538,38 @@ propagate_arg_types_to_callee env fname args registry i acc =
 -- Safe builtins (cons/head/tail/is_nil/str_*) emit ops that touch only
 -- x21..x27 scratch and the explicit dst preg; they do NOT clobber other
 -- caller-save vregs, so we return 0 — but we recursively check their args.
-contains_call ast =
+-- v2-A: contains_call is registry-aware. A bare var ref to a 0-arg user fn
+-- (`pi` where `pi = 3.14` is registered) IS a call — lower_var emits op_call
+-- for it. registry is a list (or [] when called from contexts without state).
+contains_call_r ast registry =
   let tag = ast_tag ast
   if tag == "int" then 0
+  else if tag == "float" then 0
   else if tag == "str" then 0
-  else if tag == "var" then 0
-  else if tag == "op" then contains_call_op ast
-  else if tag == "if" then contains_call_if ast
-  else if tag == "let" then contains_call_let ast
-  else if tag == "app" then contains_call_app ast
+  else if tag == "var" then
+    let nm = head (tail ast)
+    if registry == [] then 0
+    else if (reg_lookup_arity registry nm) == 0 then 1
+    else 0
+  else if tag == "op" then contains_call_op_r ast registry
+  else if tag == "if" then contains_call_if_r ast registry
+  else if tag == "let" then contains_call_let_r ast registry
+  else if tag == "app" then contains_call_app_r ast registry
   else 0
 
-contains_call_app ast =
+-- Pure ast variant: kept for back-compat at callsites without state. Treats
+-- bare var refs as non-calls; correct for everything except 0-arg fn refs.
+contains_call ast = contains_call_r ast []
+
+contains_call_app_r ast registry =
   let f = innermost_app_f ast
   if (ast_tag f) != "var" then 1
-  else contains_call_named (head (tail f)) ast
+  else contains_call_named_r (head (tail f)) ast registry
 
-contains_call_named name ast =
-  if (is_safe_builtin name) == 1 then contains_call_app_args ast
+contains_call_app ast = contains_call_app_r ast []
+
+contains_call_named_r name ast registry =
+  if (is_safe_builtin name) == 1 then contains_call_app_args_r ast registry
   else 1
 
 is_safe_builtin name =
@@ -555,33 +584,33 @@ is_safe_builtin name =
   else if name == "not" then 1
   else 0
 
-contains_call_app_args ast =
+contains_call_app_args_r ast registry =
   if (ast_tag ast) != "app" then 0
   else
     let f = head (tail ast)
     let arg = head (tail (tail ast))
-    if (contains_call arg) == 1 then 1
-    else contains_call_app_args f
+    if (contains_call_r arg registry) == 1 then 1
+    else contains_call_app_args_r f registry
 
-contains_call_op ast =
+contains_call_op_r ast registry =
   let lhs = head (tail (tail ast))
   let rhs = head (tail (tail (tail ast)))
-  if (contains_call lhs) == 1 then 1
-  else contains_call rhs
+  if (contains_call_r lhs registry) == 1 then 1
+  else contains_call_r rhs registry
 
-contains_call_if ast =
+contains_call_if_r ast registry =
   let c = head (tail ast)
   let t = head (tail (tail ast))
   let e = head (tail (tail (tail ast)))
-  if (contains_call c) == 1 then 1
-  else if (contains_call t) == 1 then 1
-  else contains_call e
+  if (contains_call_r c registry) == 1 then 1
+  else if (contains_call_r t registry) == 1 then 1
+  else contains_call_r e registry
 
-contains_call_let ast =
+contains_call_let_r ast registry =
   let v = head (tail (tail ast))
   let body = head (tail (tail (tail ast)))
-  if (contains_call v) == 1 then 1
-  else contains_call body
+  if (contains_call_r v registry) == 1 then 1
+  else contains_call_r body registry
 
 -- ============================================================================
 -- Lowering
@@ -707,16 +736,20 @@ lower_var s env ast =
     if v >= 0 then v
     else
       -- Not in local env; maybe a top-level fn name being used as a value.
-      -- Materialize as `op_const v_new fn_idx 0` so the caller can pass it
-      -- to a HOF or alias-bind it. (P3-variant: closures-without-captures.)
+      -- v2-A: if the registered fn has arity 0 (e.g., `pi = 3.14`), emit a
+      -- 0-arg call so `pi` evaluates to its body. Otherwise materialize the
+      -- fn_idx as a constant (HOF / alias-bind use; P3-variant).
       let fn_idx = st_registry_lookup s name
       if fn_idx < 0 then st_fail s (cat ["lower: unbound variable ", name])
       else
-        let v_new = st_alloc_caller s
-        if (st_get_err s) == 1 then v_new
+        let arity = reg_lookup_arity (st_registry s) name
+        if arity == 0 then lower_call_with_args s env fn_idx []
         else
-          let _ = st_emit s op_const v_new fn_idx 0
-          v_new
+          let v_new = st_alloc_caller s
+          if (st_get_err s) == 1 then v_new
+          else
+            let _ = st_emit s op_const v_new fn_idx 0
+            v_new
 
 lower_nil_lit s =
   let v = st_alloc_caller s
@@ -747,7 +780,7 @@ lower_op_float s env op_str lhs rhs =
   let f_lhs = lower_expr_float s env lhs
   if (st_get_err s) == 1 then f_lhs
   else
-    let f_lhs2 = if (contains_call rhs) == 1 then preserve_callee_float s f_lhs else f_lhs
+    let f_lhs2 = if (contains_call_r rhs (st_registry s)) == 1 then preserve_callee_float s f_lhs else f_lhs
     if (st_get_err s) == 1 then f_lhs2
     else
       let f_rhs = lower_expr_float s env rhs
@@ -794,7 +827,7 @@ float_cmp_op_for_str s =
   else 0 - 1
 
 lower_op_after_lhs s env op_str rhs v_lhs =
-  let v_lhs2 = if (contains_call rhs) == 1 then preserve_callee s v_lhs else v_lhs
+  let v_lhs2 = if (contains_call_r rhs (st_registry s)) == 1 then preserve_callee s v_lhs else v_lhs
   if (st_get_err s) == 1 then v_lhs2
   else
     let v_rhs = lower_expr s env rhs
@@ -918,65 +951,73 @@ infer_let_val_ty s env val =
   if (ast_tag val) == "var" then
     let nm = head (tail val)
     if (env_lookup env nm) >= 0 then env_lookup_type env nm
-    else if (st_registry_lookup s nm) >= 0 then "fn"
+    else if (st_registry_lookup s nm) >= 0 then
+      -- v2-A: 0-arg user fn ref evaluates by calling, so let val_ty = ret_ty.
+      let arity = reg_lookup_arity (st_registry s) nm
+      if arity == 0 then reg_lookup_ret_ty (st_registry s) nm
+      else "fn"
     else "int"
   else infer_type env val
 
--- Returns 1 iff `name` is referenced in `ast` at a point AFTER any call.
--- Conservative: returns 1 if any call appears in a position before a use
--- of name. The `seen_call` arg threads "we've seen a call already".
-used_after_call name ast seen_call =
+-- Registry-aware used_after_call. A var ref to a 0-arg user fn counts as a
+-- call (so subsequent uses of `name` are "after-call"). registry is a list
+-- (or [] when called from contexts without state).
+used_after_call_r name ast seen_call registry =
   let tag = ast_tag ast
   if tag == "var" then
     if (head (tail ast)) == name then seen_call else 0
   else if tag == "int" then 0
+  else if tag == "float" then 0
   else if tag == "str" then 0
-  else if tag == "op" then used_after_call_op name ast seen_call
-  else if tag == "if" then used_after_call_if name ast seen_call
-  else if tag == "let" then used_after_call_let name ast seen_call
-  else if tag == "app" then used_after_call_app name ast seen_call
+  else if tag == "op" then used_after_call_op_r name ast seen_call registry
+  else if tag == "if" then used_after_call_if_r name ast seen_call registry
+  else if tag == "let" then used_after_call_let_r name ast seen_call registry
+  else if tag == "app" then used_after_call_app_r name ast seen_call registry
   else 0
 
-used_after_call_op name ast seen_call =
+-- Pure ast variant kept for callers without state.
+used_after_call name ast seen_call = used_after_call_r name ast seen_call []
+
+used_after_call_op_r name ast seen_call registry =
   let lhs = head (tail (tail ast))
   let rhs = head (tail (tail (tail ast)))
-  let after_lhs = used_after_call name lhs seen_call
+  let after_lhs = used_after_call_r name lhs seen_call registry
   if after_lhs == 1 then 1
   else
-    let new_seen = if (contains_call lhs) == 1 then 1 else seen_call
-    used_after_call name rhs new_seen
+    let new_seen = if (contains_call_r lhs registry) == 1 then 1 else seen_call
+    used_after_call_r name rhs new_seen registry
 
-used_after_call_if name ast seen_call =
+used_after_call_if_r name ast seen_call registry =
   let c = head (tail ast)
   let t = head (tail (tail ast))
   let e = head (tail (tail (tail ast)))
-  let after_c = used_after_call name c seen_call
+  let after_c = used_after_call_r name c seen_call registry
   if after_c == 1 then 1
   else
-    let new_seen = if (contains_call c) == 1 then 1 else seen_call
-    let after_t = used_after_call name t new_seen
+    let new_seen = if (contains_call_r c registry) == 1 then 1 else seen_call
+    let after_t = used_after_call_r name t new_seen registry
     if after_t == 1 then 1
-    else used_after_call name e new_seen
+    else used_after_call_r name e new_seen registry
 
-used_after_call_let name ast seen_call =
+used_after_call_let_r name ast seen_call registry =
   let inner_name = head (tail ast)
   let v = head (tail (tail ast))
   let body = head (tail (tail (tail ast)))
-  let after_v = used_after_call name v seen_call
+  let after_v = used_after_call_r name v seen_call registry
   if after_v == 1 then 1
   else if inner_name == name then 0   -- shadowed, no further uses count
   else
-    let new_seen = if (contains_call v) == 1 then 1 else seen_call
-    used_after_call name body new_seen
+    let new_seen = if (contains_call_r v registry) == 1 then 1 else seen_call
+    used_after_call_r name body new_seen registry
 
-used_after_call_app name ast seen_call =
+used_after_call_app_r name ast seen_call registry =
   -- Walk the app tree's args left-to-right; a call (the app itself) makes
   -- subsequent uses "after-call".
   let f = head (tail ast)
   let arg = head (tail (tail ast))
-  let after_f = used_after_call name f seen_call
+  let after_f = used_after_call_r name f seen_call registry
   if after_f == 1 then 1
-  else used_after_call name arg seen_call
+  else used_after_call_r name arg seen_call registry
 
 -- App: function call OR `print (show e)` / `print e` pattern.
 -- Inside the JIT's int-only world, `print e` for any lowerable e maps
@@ -1219,7 +1260,7 @@ lower_builtin_mod s env args n =
     let v_a = lower_expr s env (head args)
     if (st_get_err s) == 1 then v_a
     else
-      let v_a2 = if (contains_call (head (tail args))) == 1 then preserve_callee s v_a else v_a
+      let v_a2 = if (contains_call_r (head (tail args)) (st_registry s)) == 1 then preserve_callee s v_a else v_a
       if (st_get_err s) == 1 then v_a2
       else
         let v_b = lower_expr s env (head (tail args))
@@ -1237,7 +1278,7 @@ lower_builtin_cons s env args n =
     let v_head = lower_expr s env (head args)
     if (st_get_err s) == 1 then v_head
     else
-      let v_head2 = if (contains_call (head (tail args))) == 1 then preserve_callee s v_head else v_head
+      let v_head2 = if (contains_call_r (head (tail args)) (st_registry s)) == 1 then preserve_callee s v_head else v_head
       if (st_get_err s) == 1 then v_head2
       else
         let v_tail = lower_expr s env (head (tail args))
@@ -1277,7 +1318,7 @@ lower_builtin_str_at s env args n =
     let v_ptr = lower_expr s env (head args)
     if (st_get_err s) == 1 then v_ptr
     else
-      let v_ptr2 = if (contains_call (head (tail args))) == 1 then preserve_callee s v_ptr else v_ptr
+      let v_ptr2 = if (contains_call_r (head (tail args)) (st_registry s)) == 1 then preserve_callee s v_ptr else v_ptr
       if (st_get_err s) == 1 then v_ptr2
       else
         let v_idx = lower_expr s env (head (tail args))
@@ -1307,7 +1348,7 @@ lower_builtin_str_eq s env args n =
     let v_a = lower_expr s env (head args)
     if (st_get_err s) == 1 then v_a
     else
-      let v_a2 = if (contains_call (head (tail args))) == 1 then preserve_callee s v_a else v_a
+      let v_a2 = if (contains_call_r (head (tail args)) (st_registry s)) == 1 then preserve_callee s v_a else v_a
       if (st_get_err s) == 1 then v_a2
       else
         let v_b = lower_expr s env (head (tail args))
@@ -1321,8 +1362,7 @@ lower_builtin_str_eq s env args n =
 
 lower_call_with_args s env fn_idx args =
   let n = list_len_local args
-  if n < 1 then st_fail s "lower: 0-arg call not supported in v1"
-  else if n > 4 then st_fail s "lower: >4 arg call not supported in v1"
+  if n > 4 then st_fail s "lower: >4 arg call not supported in v1"
   else lower_call_n s env fn_idx args n
 
 -- Lower each arg into a vreg per the callee's per-arg types from the registry,
@@ -1359,16 +1399,18 @@ lower_args_loop_typed s env remaining arg_types done_vregs done_safe =
     let v = if arg_ty == "float" then lower_expr_float s env arg else lower_expr s env arg
     if (st_get_err s) == 1 then []
     else
-      let v_safe = if (any_contains_call rest) == 1 then
+      let v_safe = if (any_contains_call_r rest (st_registry s)) == 1 then
                      if arg_ty == "float" then preserve_callee_float s v
                      else preserve_callee s v
                    else v
       lower_args_loop_typed s env rest rest_types (cons v done_vregs) (cons v_safe done_safe)
 
-any_contains_call args =
+any_contains_call args = any_contains_call_r args []
+
+any_contains_call_r args registry =
   if args == [] then 0
-  else if (contains_call (head args)) == 1 then 1
-  else any_contains_call (tail args)
+  else if (contains_call_r (head args) registry) == 1 then 1
+  else any_contains_call_r (tail args) registry
 
 -- Emit a folded op_call (op_call_fret merged via bit 28). The c slot encodes
 -- arg vregs + per-arg type bits + ret type bit; emit_op_call decodes and
@@ -1534,7 +1576,7 @@ lower_fn_body name args body registry pool n_args =
 build_arg_env s args body self_name =
   let registry = st_registry s
   let seed_env = seed_env_from_registry registry (env_empty 0)
-  build_arg_env_loop s args body 0 seed_env (contains_call body) self_name 0 0
+  build_arg_env_loop s args body 0 seed_env (contains_call_r body registry) self_name 0 0
 
 build_arg_env_loop s args body i env body_has_call self_name int_slot float_slot =
   if args == [] then env
@@ -1545,15 +1587,15 @@ build_arg_env_loop s args body i env body_has_call self_name int_slot float_slot
     if arg_ty == "float" then build_arg_env_float_param s args body i env body_has_call self_name int_slot float_slot
     else
       let _ = st_track_reg s int_slot
-      if (used_after_call arg_name body 0) == 1 then build_arg_env_int_preserved s args body i env body_has_call self_name int_slot float_slot
+      if (used_after_call_r arg_name body 0 registry) == 1 then build_arg_env_int_preserved s args body i env body_has_call self_name int_slot float_slot
       else build_arg_env_int_no_preserve s args body i env body_has_call self_name int_slot float_slot
 
 build_arg_env_float_param s args body i env body_has_call self_name int_slot float_slot =
   let arg_name = head args
   -- For float params used after a call, preserve into a callee-save slot
-  -- (f8/f9 = d8/d9). Bind name to the safe slot. Bump ctr[8] past
-  -- the original arg slot so subsequent st_alloc_float skips it.
-  if (used_after_call arg_name body 0) == 1 then
+  -- (f8..f15 with v2-B's expanded frame). Bind name to the safe slot. Bump
+  -- ctr[8] past the original arg slot so subsequent st_alloc_float skips it.
+  if (used_after_call_r arg_name body 0 (st_registry s)) == 1 then
     let f_safe = st_alloc_float_callee s
     if (st_get_err s) == 1 then env
     else
