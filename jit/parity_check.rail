@@ -1,0 +1,175 @@
+-- jit/parity_check.rail — Stage 6 verifier scaffold.
+--
+-- For each lowerable program: run via JIT, run via `./rail_native run`,
+-- compare. Catches lowering bugs that produce wrong values silently.
+--
+-- v1 limitations (designed in; not bugs):
+--   1. Compares int-return programs only. The JIT call_jit returns the
+--      int via pthread_join. ./rail_native exposes the int as the process
+--      exit code (clamped to 0..255 mod 256).
+--   2. Test fixtures with int returns >= 256 require stdout-capture
+--      parity, which is gated on P0 (output capture, see CONTINUATION.md).
+--      Those tests are skipped in v1; flagged via `skip = 1` per row.
+--   3. Programs that print and return 0 are treated as int-return-0
+--      programs; their stdout isn't compared in v1.
+--
+-- Run: ./rail_native run jit/parity_check.rail
+-- Exit 0 if all tested programs match; 1 if any mismatch.
+
+import "jit/heap.rail"
+import "jit/emit.rail"
+import "jit/loader.rail"
+import "jit/lower.rail"
+
+-- ============================================================================
+-- Test cases: [label, source, expected_jit_return_int, mode]
+-- mode = "test"            -- run JIT and rail_native, compare exit codes
+-- mode = "skip_big"        -- return >= 256, exit-code wrap defeats parity (P0)
+-- mode = "known_diverge"   -- documented Rail-side bug or builtin gap
+-- ============================================================================
+
+cases = [
+  ["const_add",   "main = 7 + 13",                                     20,    "test"],
+  ["let_form",    "main = let x = 7 + 13 in x",                        20,    "test"],
+  ["let_chain",   "main = let a = 1 + 2 in let b = a * 5 in b - 4",    11,    "test"],
+  ["fact5",       "fact n = if n < 2 then 1 else n * fact (n - 1)\nmain = fact 5",  120,   "test"],
+  ["fact10",      "fact n = if n < 2 then 1 else n * fact (n - 1)\nmain = fact 10", 3628800, "skip_big"],
+  ["fib10",       "fib n = if n < 2 then n else (fib (n-1)) + (fib (n-2))\nmain = fib 10", 55, "known_diverge"],
+  ["tri100",      "tri n = if n < 1 then 0 else n + tri (n - 1)\nmain = tri 100", 5050, "skip_big"],
+  ["ssq5",        "ssq n = if n < 1 then 0 else n * n + ssq (n - 1)\nmain = ssq 5", 55,    "test"],
+  ["add_2arg",    "add a b = a + b\nmain = add 7 13",                  20,    "test"],
+  ["max_2arg",    "imax a b = if a < b then b else a\nmain = imax 7 13", 13,  "test"],
+  ["pow",         "pow b e = if e < 1 then 1 else b * pow b (e - 1)\nmain = pow 2 10", 1024, "skip_big"],
+  ["streq",       "main = if str_eq \"abc\" \"abc\" then 1 else 0",    1,     "test"],
+  ["strlen",      "main = str_len \"hello\"",                          5,     "known_diverge"],
+  ["match_len",   "len xs = match xs | nil -> 0 | cons h t -> 1 + len t\nmain = len [1,2,3,4,5]", 5, "known_diverge"],
+  ["match_max",   "imax xs = match xs | nil -> 0 | cons h t -> if (imax t) < h then h else imax t\nmain = imax [3, 7, 2, 9, 4]", 9, "known_diverge"]
+]
+
+-- Documented divergences (as of 2026-05-06):
+--   fib10:    Rail's auto-memoization (CLAUDE.md "Auto-memoization") gives
+--             wrong values for fib starting at n=2; JIT computes correctly.
+--   strlen:   JIT supports `str_len` as builtin; Rail uses `length s`.
+--             Mismatch is a builtin-name gap, not a semantic bug.
+--   match_*:  Rail's `match` requires an ADT type definition (e.g.,
+--             `type List a = | Nil | Cons a (List a)`); our JIT supports
+--             list-shape match without an explicit ADT def. Rail-side
+--             segfaults on the bare `match xs | nil -> ... | cons h t -> ...`.
+
+-- ============================================================================
+-- Run one fixture via JIT.
+-- ============================================================================
+
+run_jit src =
+  let r = lower_source src
+  if (head r) == "err" then cons "lower_err" (cons (head (tail r)) [])
+  else run_jit_lowered (head (tail r)) (head (tail (tail r)))
+
+run_jit_lowered fns pool =
+  let heap = heap_alloc 0
+  let res = emit_program fns pool heap
+  let buf = emitted_buf res
+  let n = emitted_size res
+  let page = make_executable buf n
+  let got = call_jit page heap
+  let _ = free_jit page
+  let _ = heap_free heap
+  cons "ok" (cons got [])
+
+-- ============================================================================
+-- Run via ./rail_native.
+-- This part is the SCAFFOLD STUB — wiring the actual shell invocation
+-- requires either:
+--   (a) a `shell_with_exit_code` foreign that returns the cmd's exit code, or
+--   (b) running shell with `; echo $? >/tmp/exit` and reading /tmp/exit.
+-- For v1 scaffold, we use (b) and rely on Rail's existing `shell` builtin
+-- (which exists per CLAUDE.md: `let _ = shell "command"`).
+-- ============================================================================
+
+shell_path = "/tmp/jit_parity_src.rail"
+exit_path  = "/tmp/jit_parity_exit"
+
+-- ./rail_native run X.rail returns 0 from rail_native itself; the user
+-- program's main return is exposed as the exit code of /tmp/rail_out
+-- when invoked directly. So we compile, then run /tmp/rail_out, then
+-- capture $?.
+run_rail_native src =
+  let _ = write_file shell_path src
+  let _ = shell (cat ["./rail_native ", shell_path, " > /dev/null 2>&1 && /tmp/rail_out > /dev/null 2>&1; echo $? > ", exit_path])
+  let exit_str = read_file exit_path
+  parse_int_trimmed exit_str
+
+-- Parse the int from the read-file string (assumes "<int>\n").
+parse_int_trimmed s =
+  let n = length s
+  parse_int_loop s 0 n 0
+
+parse_int_loop s i n acc =
+  if i >= n then acc
+  else
+    let c = str_sub s i 1
+    if c == "\n" then acc
+    else if c == " " then acc
+    else parse_int_loop s (i + 1) n (acc * 10 + (digit_at s i))
+
+digit_at s i =
+  let c = str_sub s i 1
+  if c == "0" then 0 else if c == "1" then 1
+  else if c == "2" then 2 else if c == "3" then 3
+  else if c == "4" then 4 else if c == "5" then 5
+  else if c == "6" then 6 else if c == "7" then 7
+  else if c == "8" then 8 else 9
+
+-- ============================================================================
+-- Main loop.
+-- ============================================================================
+
+run_one_case row =
+  let label    = nth_lc 0 row
+  let src      = nth_lc 1 row
+  let expected = nth_lc 2 row
+  let mode     = nth_lc 3 row
+  if mode == "skip_big" then run_skipped label "return >= 256, needs P0"
+  else if mode == "known_diverge" then run_skipped label "known divergence (see header)"
+  else run_compared label src expected
+
+run_skipped label reason =
+  let _ = print (cat ["[", label, "] skipped: ", reason])
+  0
+
+run_compared label src expected =
+  let jit_res = run_jit src
+  if (head jit_res) != "ok" then
+    let _ = print (cat ["[", label, "] JIT FAIL: ", head (tail jit_res)])
+    1
+  else
+    let jit_n = head (tail jit_res)
+    let rail_n = run_rail_native src
+    -- exit code is mod 256
+    let jit_mod = bit_and jit_n 255
+    if jit_mod == rail_n then
+      let _ = print (cat ["[", label, "] OK (jit=", show jit_n, " rail=", show rail_n, ")"])
+      0
+    else
+      let _ = print (cat ["[", label, "] MISMATCH jit=", show jit_n, " (mod256=", show jit_mod, ") rail=", show rail_n])
+      1
+
+nth_lc i xs =
+  if i == 0 then head xs
+  else nth_lc (i - 1) (tail xs)
+
+run_all rows acc =
+  if rows == [] then acc
+  else
+    let result = run_one_case (head rows)
+    run_all (tail rows) (acc + result)
+
+main =
+  let _ = print "=== Stage 6 parity check (JIT vs ./rail_native) ==="
+  let total = run_all cases 0
+  if total == 0 then
+    let _ = print "PARITY OK"
+    0
+  else
+    let _ = print (cat ["PARITY FAILS: ", show total])
+    1
