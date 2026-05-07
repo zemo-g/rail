@@ -9,15 +9,15 @@ into Spur RLVR / distillation / bench filtering work.
 ## What the JIT is
 
 A pure-Rail JIT that lowers a subset of Rail source → IR → ARM64 machine
-code → executes via `mmap+pthread_create`. End-to-end runnable today
-(2026-05-06, branch `jit` on `next`).
+code → executes via `mmap+pthread_create` (or direct `blr` via
+`libjit_call.dylib`). End-to-end runnable today (2026-05-07, branch
+`jit` on `next`).
 
-**Stages 1, 3, 4, and 5 (lists/heap) complete.** You no longer need to
-hand-build IR; pass a Rail source string and get a callable JIT.
-Multi-arg fns, string ops (literal print, `str_eq`/`str_len`/`str_at`),
-list ops (`cons`/`head`/`tail`/`is_nil` + `[a,b,c]` literals + recursive
-list traversal) all work end-to-end. `match` syntax sugar is the only
-Stage 5 piece still pending — list-ADT logic via `if is_nil` works today.
+**Lowering covers**: ints/strings/lists/match/HOF-with-named-fns/
+inline-lambdas/file-read AND **floats (P4)**. Multi-arg fns, string ops,
+list ops, comparison/arithmetic ops, boolean (&&,||), match desugar,
+print(show e). Float arithmetic (+,-,*,/), float comparison (<,==,>,>=),
+int↔float conversion, `print (show f)` formatting.
 
 ## One-line entry
 
@@ -51,6 +51,13 @@ let _ = heap_free heap
 | Multi-arg recursion | `pow b e = if e < 1 then 1 else b * pow b (e - 1)\nmain = pow 2 10` |
 | Two recursive calls per branch | `fib n = if n<2 then n else (fib (n-1)) + (fib (n-2))` |
 | Print int | `main = print (show (fact 5))` |
+| Float literal | `main = print (show 3.14)` → "3.14\n" |
+| Scientific notation | `main = print (show 1e3)` → "1000\n" |
+| Float arithmetic | `main = print (show (3.14 * 2.0))` → "6.28\n" |
+| Float compare | `main = if 1.5 < 2.5 then 1 else 0` → 1 |
+| Conditional float | `main = float_to_int (if 1.5 < 2.5 then 7.5 else 0.0)` → 7 |
+| int↔float convert | `main = float_to_int (int_to_float 42)` → 42 |
+| int→float promotion | `main = float_to_int (3 + 0.5)` → 3 (auto promotes) |
 | Print string literal | `main = print "hello"` |
 | Print let-bound string | `main = let s = "abc" in print s` |
 | String equality | `main = if str_eq "abc" "abc" then 1 else 0` |
@@ -88,10 +95,15 @@ the real address. ABI v2: heap is passed as `call_jit`'s arg slot.
 ## Fallback shapes (lower_source returns "err" → use `./rail_native` shell grade)
 
 * `>4`-arg user functions (rejected with clear error).
-* `match | C x -> ...` syntax — workaround: rewrite as `if is_nil ...`.
-* Closures, file I/O, floats — not in IR yet.
-* Any string return from a user fn (str-typed args at call sites work,
-  str-typed returns do not).
+* Closures (`map (\x -> ...) xs` style — capture-by-value not yet
+  supported in IR).
+* User functions returning floats (return type tracking is
+  conservative; only `int_to_float` recognised as float-returning).
+* Float function args (the prologue's `mov v_i, x_i` doesn't pull from
+  d-regs).
+* Float values held across function calls (rejected with clear error
+  in `lower_op_float` if rhs contains a call).
+* Any string return from a user fn.
 
 ## Distillation integration sketch
 

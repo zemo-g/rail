@@ -47,7 +47,7 @@ max_blocks_per_fn = 32
 
 mk_state _ =
   let ir = arr_new (4 * max_instr_per_fn) 0
-  let ctr = arr_new 8 0
+  let ctr = arr_new 9 0
   let _ = arr_set ctr 0 0     -- (unused; caller-save now via live mask)
   let _ = arr_set ctr 1 10    -- next_callee starts at v10
   let _ = arr_set ctr 2 0     -- instr_idx
@@ -56,6 +56,7 @@ mk_state _ =
   let _ = arr_set ctr 5 0     -- err_flag
   let _ = arr_set ctr 6 0     -- live caller-save bitmask (bit i = v(i) live)
   let _ = arr_set ctr 7 1     -- n_args (default 1; lower_fn_def overrides)
+  let _ = arr_set ctr 8 0     -- next float vreg (P4; bumps per fresh f-reg, range 0..7)
   let blocks = arr_new max_blocks_per_fn 0
   let err_msg = cons "" []
   cons ir (cons ctr (cons blocks (cons err_msg [])))
@@ -127,6 +128,16 @@ st_alloc_callee s =
   if v >= 12 then st_fail s "callee-save vreg overflow (>= v12); v1 only saves x19/x20"
   else v
 
+-- Float vreg allocator (P4). Float vregs map directly to d-regs 0..7
+-- (caller-save). No cross-call preservation in v1 — long float computations
+-- with intervening function calls aren't supported. Simple bumping counter
+-- because the `3.14 * 2.0` style expressions only need 3-4 float regs.
+st_alloc_float s =
+  let f = arr_get (st_ctr s) 8
+  let _ = arr_set (st_ctr s) 8 (f + 1)
+  if f > 7 then st_fail s "float vreg overflow (>=f8); v1 caps at d0..d7 caller-save"
+  else f
+
 -- Reserve a new block; returns its index. Caller will set its start later.
 st_reserve_block s =
   let idx = arr_get (st_ctr s) 3
@@ -188,25 +199,57 @@ env_has env name =
     if (head pair) == name then 1
     else env_has (tail env) name
 
--- Conservative AST-level type inference. Returns "int" or "str".
+-- Conservative AST-level type inference. Returns "int", "str", or "float".
 -- Assumes user-fn calls return int (no str-returning user fns in v1).
 infer_type env ast =
   let tag = ast_tag ast
   if tag == "int" then "int"
+  else if tag == "float" then "float"
   else if tag == "str" then "str"
   else if tag == "var" then env_lookup_type env (head (tail ast))
-  else if tag == "op" then "int"
-  else if tag == "if" then infer_type env (head (tail (tail ast)))
+  else if tag == "op" then infer_type_op env ast
+  else if tag == "if" then infer_type_if env ast
   else if tag == "let" then infer_type_let env ast
   else if tag == "app" then infer_type_app env ast
   else "int"
 
--- Recognize str-returning builtins via the innermost-head fname.
+-- A binary op produces "float" if either operand is float (auto-promotion).
+-- Comparison ops (`<`, `==`, etc.) always produce "int" (the 0/1 result),
+-- regardless of operand type.
+infer_type_op env ast =
+  let op_str = head (tail ast)
+  if (is_compare_op op_str) == 1 then "int"
+  else
+    let lhs = head (tail (tail ast))
+    let rhs = head (tail (tail (tail ast)))
+    if (infer_type env lhs) == "float" then "float"
+    else if (infer_type env rhs) == "float" then "float"
+    else "int"
+
+is_compare_op s =
+  if s == "<" then 1
+  else if s == ">" then 1
+  else if s == "==" then 1
+  else if s == "<=" then 1
+  else if s == ">=" then 1
+  else 0
+
+-- An if expression's type is the (then-branch ∪ else-branch) join.
+-- For v1: if either branch is float, the if is float; otherwise int.
+infer_type_if env ast =
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  if (infer_type env t) == "float" then "float"
+  else if (infer_type env e) == "float" then "float"
+  else infer_type env t
+
+-- Recognize str-returning and float-returning builtins via innermost-head fname.
 infer_type_app env ast =
   let f = innermost_app_f_pre ast
   if (ast_tag f) == "var" then
     let nm = head (tail f)
     if nm == "read_file" then "str"
+    else if nm == "int_to_float" then "float"
     else "int"
   else "int"
 
@@ -356,6 +399,7 @@ lower_expr_scoped s env ast =
 lower_expr_dispatch s env ast =
   let tag = ast_tag ast
   if tag == "int" then lower_int s ast
+  else if tag == "float" then lower_float s ast
   else if tag == "str" then lower_str s ast
   else if tag == "var" then lower_var s env ast
   else if tag == "op" then lower_op s env ast
@@ -382,6 +426,41 @@ lower_int s ast =
   else
     let _ = st_emit s op_const v n 0
     v
+
+-- Float literal: parse the literal string to a Rail double, split the bit
+-- pattern into 32-bit halves via the libjit_call.dylib helpers, emit op_fconst.
+lower_float s ast =
+  let lit = head (tail ast)
+  let f = parse_float lit
+  let lo = jit_float_bits_lo f
+  let hi = jit_float_bits_hi f
+  let f_dst = st_alloc_float s
+  if (st_get_err s) == 1 then f_dst
+  else
+    let _ = st_emit s op_fconst f_dst lo hi
+    f_dst
+
+-- Lower an expression so its result lands in a FLOAT vreg. If the expression
+-- is naturally float-typed, returns its float vreg directly. If int-typed,
+-- emits op_int_to_float for the promotion. Used by float ops (lower_op_float),
+-- print(show f), and explicit int_to_float builtin.
+lower_expr_float s env ast =
+  let ty = infer_type env ast
+  if ty == "float" then lower_expr s env ast
+  else if ty == "int" then lower_expr_promote s env ast
+  else
+    let _ = st_fail s (cat ["lower: cannot use ", ty, "-typed expression in float context"])
+    0 - 1
+
+lower_expr_promote s env ast =
+  let v_int = lower_expr s env ast
+  if (st_get_err s) == 1 then v_int
+  else
+    let f_dst = st_alloc_float s
+    if (st_get_err s) == 1 then f_dst
+    else
+      let _ = st_emit s op_int_to_float f_dst v_int 0
+      f_dst
 
 lower_var s env ast =
   let name = head (tail ast)
@@ -413,9 +492,67 @@ lower_op s env ast =
   let op_str = head (tail ast)
   let lhs = head (tail (tail ast))
   let rhs = head (tail (tail (tail ast)))
-  let v_lhs = lower_expr s env lhs
-  if (st_get_err s) == 1 then v_lhs
-  else lower_op_after_lhs s env op_str rhs v_lhs
+  let lhs_ty = infer_type env lhs
+  let rhs_ty = infer_type env rhs
+  if lhs_ty == "float" then lower_op_float s env op_str lhs rhs
+  else if rhs_ty == "float" then lower_op_float s env op_str lhs rhs
+  else
+    let v_lhs = lower_expr s env lhs
+    if (st_get_err s) == 1 then v_lhs
+    else lower_op_after_lhs s env op_str rhs v_lhs
+
+-- Float binary op: both operands lowered as float (with int→float promotion
+-- where needed). Result is float for arithmetic, int for comparison.
+-- v1 limitation: float vregs aren't preserved across calls, so the rhs of a
+-- float op must NOT contain a function call (which would clobber d-regs).
+lower_op_float s env op_str lhs rhs =
+  if (contains_call rhs) == 1 then
+    st_fail s (cat ["lower: float op '", op_str, "' rhs contains a call (no d-reg preservation in v1)"])
+  else
+    let f_lhs = lower_expr_float s env lhs
+    if (st_get_err s) == 1 then f_lhs
+    else
+      let f_rhs = lower_expr_float s env rhs
+      if (st_get_err s) == 1 then f_rhs
+      else lower_op_float_emit s op_str f_lhs f_rhs
+
+lower_op_float_emit s op_str f_lhs f_rhs =
+  if (is_compare_op op_str) == 1 then lower_op_float_cmp s op_str f_lhs f_rhs
+  else lower_op_float_arith s op_str f_lhs f_rhs
+
+lower_op_float_arith s op_str f_lhs f_rhs =
+  let f_dst = st_alloc_float s
+  if (st_get_err s) == 1 then f_dst
+  else
+    let opcode = float_arith_op_for_str op_str
+    if opcode < 0 then st_fail s (cat ["lower: unknown float arith op ", op_str])
+    else
+      let _ = st_emit s opcode f_dst f_lhs f_rhs
+      f_dst
+
+float_arith_op_for_str s =
+  if s == "+" then op_fadd
+  else if s == "-" then op_fsub
+  else if s == "*" then op_fmul
+  else if s == "/" then op_fdiv
+  else 0 - 1
+
+lower_op_float_cmp s op_str f_lhs f_rhs =
+  let v_dst = st_alloc_caller s
+  if (st_get_err s) == 1 then v_dst
+  else
+    let opcode = float_cmp_op_for_str op_str
+    if opcode < 0 then st_fail s (cat ["lower: unsupported float compare ", op_str, " (v1: < == > >=)"])
+    else
+      let _ = st_emit s opcode v_dst f_lhs f_rhs
+      v_dst
+
+float_cmp_op_for_str s =
+  if s == "<" then op_flt
+  else if s == "==" then op_feq
+  else if s == ">" then op_fgt
+  else if s == ">=" then op_fge
+  else 0 - 1
 
 lower_op_after_lhs s env op_str rhs v_lhs =
   let v_lhs2 = if (contains_call rhs) == 1 then preserve_callee s v_lhs else v_lhs
@@ -453,7 +590,35 @@ lower_if s env ast =
   let e = head (tail (tail (tail ast)))
   let v_c = lower_expr s env c
   if (st_get_err s) == 1 then v_c
-  else lower_if_after_cond s env v_c t e
+  else
+    let t_ty = infer_type env t
+    let e_ty = infer_type env e
+    if t_ty == "float" then lower_if_float s env v_c t e
+    else if e_ty == "float" then lower_if_float s env v_c t e
+    else lower_if_after_cond s env v_c t e
+
+-- Float-merge if: result lands in a float vreg via op_fmov from each branch.
+lower_if_float s env v_c t e =
+  let f_result = st_alloc_float s
+  if (st_get_err s) == 1 then f_result
+  else
+    let else_blk = st_reserve_block s
+    let after_blk = st_reserve_block s
+    let _ = st_emit s op_jz v_c else_blk 0
+    let f_t = lower_expr_float s env t
+    if (st_get_err s) == 1 then f_t
+    else lower_if_float_after_then s env f_result f_t else_blk after_blk e
+
+lower_if_float_after_then s env f_result f_t else_blk after_blk e =
+  let _ = st_emit s op_fmov f_result f_t 0
+  let _ = st_emit s op_jmp after_blk 0 0
+  let _ = st_set_block_start s else_blk
+  let f_e = lower_expr_float s env e
+  if (st_get_err s) == 1 then f_e
+  else
+    let _ = st_emit s op_fmov f_result f_e 0
+    let _ = st_set_block_start s after_blk
+    f_result
 
 lower_if_after_cond s env v_c t e =
   -- v_result is caller-save: at the merge point (the after_block), no calls
@@ -499,8 +664,10 @@ lower_let s env ast =
     if (st_get_err s) == 1 then v_val
     else
       -- Only preserve to callee-save if `name` is actually used AFTER a call
-      -- in the body (liveness-aware).
-      let needs_preserve = if v_val >= 10 then 0
+      -- in the body (liveness-aware). v1 doesn't preserve floats — float
+      -- values cannot live across calls.
+      let needs_preserve = if val_ty == "float" then 0
+                           else if v_val >= 10 then 0
                            else used_after_call name body 0
       let v_safe = if needs_preserve == 1 then preserve_callee s v_val else v_val
       if (st_get_err s) == 1 then v_safe
@@ -606,9 +773,22 @@ lower_print_show s env ast =
   -- Extract the inner expression e from app(var print, app(var show, e)).
   let inner_app = head (tail (tail ast))
   let e = head (tail (tail inner_app))
-  let v_e = lower_expr s env e
-  if (st_get_err s) == 1 then v_e
-  else lower_print_show_emit s v_e
+  if (infer_type env e) == "float" then lower_print_show_float s env e
+  else
+    let v_e = lower_expr s env e
+    if (st_get_err s) == 1 then v_e
+    else lower_print_show_emit s v_e
+
+lower_print_show_float s env e =
+  let f_e = lower_expr_float s env e
+  if (st_get_err s) == 1 then f_e
+  else
+    let _ = st_emit s op_print_float f_e 0 0
+    let v_zero = st_alloc_caller s
+    if (st_get_err s) == 1 then v_zero
+    else
+      let _ = st_emit s op_const v_zero 0 0
+      v_zero
 
 lower_print_bare s env ast =
   -- ast = app f arg; print arg. Dispatch via type inference:
@@ -722,6 +902,8 @@ is_builtin name =
   else if name == "mod" then 1
   else if name == "not" then 1
   else if name == "read_file" then 1
+  else if name == "int_to_float" then 1
+  else if name == "float_to_int" then 1
   else 0
 
 lower_builtin s env fname args =
@@ -736,7 +918,33 @@ lower_builtin s env fname args =
   else if fname == "mod" then lower_builtin_mod s env args n
   else if fname == "not" then lower_builtin_not s env args n
   else if fname == "read_file" then lower_builtin_read_file s env args n
+  else if fname == "int_to_float" then lower_builtin_int_to_float s env args n
+  else if fname == "float_to_int" then lower_builtin_float_to_int s env args n
   else st_fail s (cat ["lower: unimplemented builtin ", fname])
+
+lower_builtin_int_to_float s env args n =
+  if n != 1 then st_fail s "int_to_float: 1 arg required"
+  else
+    let v_int = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_int
+    else
+      let f_dst = st_alloc_float s
+      if (st_get_err s) == 1 then f_dst
+      else
+        let _ = st_emit s op_int_to_float f_dst v_int 0
+        f_dst
+
+lower_builtin_float_to_int s env args n =
+  if n != 1 then st_fail s "float_to_int: 1 arg required"
+  else
+    let f_src = lower_expr_float s env (head args)
+    if (st_get_err s) == 1 then f_src
+    else
+      let v_dst = st_alloc_caller s
+      if (st_get_err s) == 1 then v_dst
+      else
+        let _ = st_emit s op_float_to_int v_dst f_src 0
+        v_dst
 
 lower_builtin_read_file s env args n =
   if n != 1 then st_fail s "read_file: 1 arg (path string) required"

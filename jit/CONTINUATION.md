@@ -1,11 +1,19 @@
 # JIT — continuation roadmap
 
-State at end of session 2026-05-06 evening: branch `jit` on `next`.
-**P0 + P1 + P2 + P6 + P3-variant + P5 + P3-full v1 shipped this
-session.** All 8 JIT test files pass; main suite 137/137. The training
-session can now grade ~2000 candidates/sec via JIT (vs ~10/sec via
-shell), and lowering covers ints/strings/lists/match/HOF-with-named-fns
-/inline-lambdas/file-read. Below: what's next, leverage-ranked.
+State at end of session 2026-05-07: branch `jit` on `next`.
+**P4 (floats) shipped 2026-05-07** on top of the 2026-05-06 stack
+(P0 / P1 / P2 / P3-variant / P3-full v1 / P5 / P6).
+
+All baselines hold:
+- `jit/test_lower.rail`: 87 positive + 3 negative (12 new float fixtures).
+- `jit/test_capture.rail`: 23 positive + 1 negative (8 new float fixtures).
+- `jit/parity_check.rail`: PARITY OK.
+- `./rail_native test`: 137/137.
+
+DONE CRITERION:
+`try_jit_grade_str "main = print (show (3.14 * 2.0))" "6.28\n"` returns
+`["jit_pass"]`. Same for fadd/fsub/fmul/fdiv, int→float promotion,
+float compare, conditional float (`if cond then f1 else f2`).
 
 ---
 
@@ -13,14 +21,16 @@ shell), and lowering covers ints/strings/lists/match/HOF-with-named-fns
 
 Implementation: option (b), memory-buffer write.
 
-**Heap layout** (in 64 KB mmap'd page):
+**Heap layout** (in 64 KB mmap'd page; updated 2026-05-07 for P4):
 
 | Range | Purpose |
 | --- | --- |
 | `heap[0..7]`        | bump pointer for cons cells (real addr) |
 | `heap[8..15]`       | output cursor for op_print_*  (real addr) |
-| `heap[16..16399]`   | output buffer (16 KB capacity) |
-| `heap[16400..]`     | cons cell area (~48 KB) |
+| `heap[16..23]`      | reserved (alignment) |
+| `heap[24..31]`      | absolute address of `jit_print_float` (P4) |
+| `heap[32..16415]`   | output buffer (~16 KB; first byte = R+32) |
+| `heap[16416..]`     | cons cell area (~48 KB) |
 
 **Print op emission** (`jit/emit.rail`):
 - `op_print_int`: 116 → 136 bytes (29 → 34 inst). The `svc write(1, …)`
@@ -229,9 +239,41 @@ the corpus may not need captures. Worth profiling first.
 
 ---
 
-## P4 — Floats
+## P4 — Floats ✅ SHIPPED 2026-05-07
 
-Less common in compute-style bench prompts but bench has some.
+### What landed
+
+| Aspect | Implementation |
+|---|---|
+| Float literal lex | `3.14`, `0.5`, `1e6`, `2.5e-3` (decimal + scientific). `tokenize_float_after_dot` / `_after_exp` in `jit/lex.rail`. |
+| AST node | `["float", "3.14"]` (literal kept as string; `parse_float` runs at lower time). |
+| 12 new opcodes | `op_fconst` (29), `fadd/fsub/fmul/fdiv` (30..33), `flt/feq/fgt/fge` (34..37), `int_to_float` (38), `float_to_int` (39), `op_print_float` (40), `op_fmov` (41 — used for if-merge). |
+| Float vregs | `f0..f7` map to `d0..d7` (caller-save). Simple bumping allocator (`st_alloc_float`) — no live mask, no cross-call preservation. |
+| ARM64 encoders | `enc_fadd/fsub/fmul/fdiv/fcmp/scvtf/fcvtzs/fmov_d_x/fmov_d_d/cset_mi/ldr_x27/str_x27/blr` in `jit/arm64.rail`, all verified via `as`+`otool`+python. |
+| Float printing | `jit_print_float(d0=value, x0=cursor)` C trampoline; address `dlsym`-equivalent via `jit_print_float_addr` foreign, stored at `heap[24..31]`. JIT emits `ldr x0/x16, blr x16, str x0` (5 inst, 20B). Output format: `%g\n`. |
+| Heap layout | Bumped `cells_offset` 16400 → 16416 to reserve the float-print-addr slot at `heap[24..31]`. Cursor base moved from `heap+16` → `heap+32`. `read_jit_output` updated to read from `+32`. |
+| C trampolines | Added `jit_print_float`, `jit_float_bits_lo`, `jit_float_bits_hi`, `jit_print_float_addr` to `tools/jit_call.c`. Same `-weak-ljit_call` link-line gate as `jit_call`. |
+| Type inference | `infer_type` returns "float" when AST is float-typed; `infer_type_op` propagates float type through arithmetic; `infer_type_if` joins branches. Comparison ops always return "int". `int_to_float` builtin recognized. |
+| Lower path | `lower_op` dispatches to `lower_op_float` if either operand is float-typed. `lower_print_show` routes through `op_print_float` for float-typed inner. `lower_if` builds a float-merge variant (`lower_if_float`). |
+| int→float promotion | `lower_expr_float` promotes int-typed expressions via `op_int_to_float`. So `3 + 1.5` lowers cleanly. |
+| Float arith vs cmp | `lower_op_float_emit` checks `is_compare_op` and dispatches; arith returns float vreg, cmp returns int vreg. |
+
+### Limitations of v1 (documented stop conditions)
+
+- **No cross-call float preservation.** `lower_op_float` rejects (with a clear error) any float op whose rhs contains a function call. Bench prompts compute floats inline, so this is rarely hit.
+- **No float-typed function args.** `build_arg_env` assumes all args are ints (or strs by name heuristic). Float args coming in from the JIT entry would need to be loaded from `d0..d7` instead of `x0..x3`.
+- **No float-callee-save.** `let f = 3.14 in some_call_using_int (); f` — the second use of `f` would see d-reg space clobbered by the call. The let-form skips preservation when val_ty == "float".
+- **No `<=` for floats.** Encoder for `cset, ls` not added; if needed, derive as `not (>)`.
+- **`%g` format.** `42.0` prints as `42` (not `42.0`). Common surprise.
+
+### Bug fix log
+
+- The original spec said "x1 = cursor" for `jit_print_float`. AAPCS64 actually puts the `char *` arg in **x0** (since `double` goes to `d0` and `char *` is the first int-class arg). Bug surfaced as `cursor_after = h_real + 5` (snprintf wrote at h_real, not h_real+32). Fixed by changing `enc_ldr_x27 1 8` → `enc_ldr_x27 0 8` in `emit_op_print_float`.
+- Incremental fixtures landed first (arith without printing), then printing once the AAPCS bug was tracked.
+
+---
+
+## P4-future — float work not in v1
 
 ### Plan
 
@@ -352,14 +394,17 @@ develop other JIT-like substrates.
 
 ## Sequencing recommendation
 
-P0/P1/P2/P6/P3-variant/P5/P3-full v1 shipped. Remaining:
+P0/P1/P2/P3-variant/P3-full v1/P4/P5/P6 shipped. Remaining:
 
 1. **P3-full v2 (real closure values)** — ~3–4 hr; replaces inline
    substitution with heap-allocated closure records so lambdas can be
    *passed* as args (`map (\x -> ...) xs`). Currently inline-only.
-2. **P4 (floats)** — ~4–6 hr; biggest open work. Float printing is the
-   gnarly part — either dlsym printf via an extra C trampoline, or a
-   manual %g-style decimal formatter (~150 inst).
+2. **Float-callee-save** — ~2 hr; supports float values held across
+   function calls via op_float_to_int + op_int_to_float spill, or via
+   d8..d15 callee-save (would need 16-byte frame extension).
+3. **Float-typed user fn returns** — ~1 hr; `is_float` env tracking on
+   user-fn registry so `infer_type_app` knows the return type without
+   the special-case `int_to_float` only branch.
 
 Continue as bench coverage measurement demands. The JIT path now beats
 shell grade by ~2000× per call, so the bottleneck for distill is
@@ -369,22 +414,23 @@ lowerable shape coverage, not call latency.
 
 ## What's stable today (do NOT regress)
 
-- All 60 positive + 3 negative `test_lower.rail` fixtures.
+- All 87 positive + 3 negative `test_lower.rail` fixtures (12 new floats).
 - All 8 hand-built `test_codegen.rail` fixtures.
-- All 5 `test_print.rail` fixtures (now verifying captured output, not
-  stdout-eyeball).
-- 11 `test_capture.rail` fixtures (P0/P1 round-trip).
-- 17 `test_enc.rail` encoder fixtures (incl. 3 new: str_x27, ldr_x27, nop).
-- `parity_check.rail`: 11 PARITY OK rows (incl. 2 stdout-mode).
+- All 5 `test_print.rail` fixtures.
+- 23 `test_capture.rail` fixtures (8 new floats).
+- `test_enc.rail` encoder fixtures.
+- `parity_check.rail`: 11 PARITY OK rows.
 - 137/137 main suite.
 - Stage 5 list ops (cons/head/tail/is_nil + `[a,b,c]`).
 - Match syntax desugar.
 - All cmp/arith/bool ops.
 - Negative-int `op_print_int`.
+- P4 floats: arith / cmp / promotion / printing / if-merge.
 - The ABI-v2 prologue, with **48-byte frame and saved x27**:
     main: `stp fp/lr -48; mov fp,sp; stp x19/x20 +16; str x27 +32; mov x27,x0; <arg moves>`
     non-main: same but `mov x27,x0` → `nop`. x27 is callee-save and
     propagates from main throughout the call chain.
 
 Any change to the prologue, `op_call`'s packed encoding, or the heap
-layout (esp. `cells_offset = 16400`) affects everything.
+layout (esp. `cells_offset = 16416` post-P4, `output_offset = 32`,
+`heap[24..31] = jit_print_float addr`) affects everything.
