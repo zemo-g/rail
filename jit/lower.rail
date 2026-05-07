@@ -436,11 +436,73 @@ lower_let s env ast =
   let v_val = lower_expr s env val
   if (st_get_err s) == 1 then v_val
   else
-    let v_safe = if (contains_call body) == 1 then preserve_callee s v_val else v_val
+    -- Only preserve to callee-save if `name` is actually used AFTER a call
+    -- in the body (liveness-aware). Without this, match-style desugars
+    -- exhaust the 2-slot callee-save bank on bindings that are used
+    -- immediately or only as call args.
+    let needs_preserve = if v_val >= 10 then 0
+                         else used_after_call name body 0
+    let v_safe = if needs_preserve == 1 then preserve_callee s v_val else v_val
     if (st_get_err s) == 1 then v_safe
     else
       let env2 = env_extend_typed env name v_safe val_ty
       lower_expr s env2 body
+
+-- Returns 1 iff `name` is referenced in `ast` at a point AFTER any call.
+-- Conservative: returns 1 if any call appears in a position before a use
+-- of name. The `seen_call` arg threads "we've seen a call already".
+used_after_call name ast seen_call =
+  let tag = ast_tag ast
+  if tag == "var" then
+    if (head (tail ast)) == name then seen_call else 0
+  else if tag == "int" then 0
+  else if tag == "str" then 0
+  else if tag == "op" then used_after_call_op name ast seen_call
+  else if tag == "if" then used_after_call_if name ast seen_call
+  else if tag == "let" then used_after_call_let name ast seen_call
+  else if tag == "app" then used_after_call_app name ast seen_call
+  else 0
+
+used_after_call_op name ast seen_call =
+  let lhs = head (tail (tail ast))
+  let rhs = head (tail (tail (tail ast)))
+  let after_lhs = used_after_call name lhs seen_call
+  if after_lhs == 1 then 1
+  else
+    let new_seen = if (contains_call lhs) == 1 then 1 else seen_call
+    used_after_call name rhs new_seen
+
+used_after_call_if name ast seen_call =
+  let c = head (tail ast)
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  let after_c = used_after_call name c seen_call
+  if after_c == 1 then 1
+  else
+    let new_seen = if (contains_call c) == 1 then 1 else seen_call
+    let after_t = used_after_call name t new_seen
+    if after_t == 1 then 1
+    else used_after_call name e new_seen
+
+used_after_call_let name ast seen_call =
+  let inner_name = head (tail ast)
+  let v = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  let after_v = used_after_call name v seen_call
+  if after_v == 1 then 1
+  else if inner_name == name then 0   -- shadowed, no further uses count
+  else
+    let new_seen = if (contains_call v) == 1 then 1 else seen_call
+    used_after_call name body new_seen
+
+used_after_call_app name ast seen_call =
+  -- Walk the app tree's args left-to-right; a call (the app itself) makes
+  -- subsequent uses "after-call".
+  let f = head (tail ast)
+  let arg = head (tail (tail ast))
+  let after_f = used_after_call name f seen_call
+  if after_f == 1 then 1
+  else used_after_call name arg seen_call
 
 -- App: function call OR `print (show e)` / `print e` pattern.
 -- Inside the JIT's int-only world, `print e` for any lowerable e maps
@@ -857,7 +919,11 @@ build_arg_env_loop s args body i env body_has_call =
   else
     let arg_name = head args
     let _ = st_track_reg s i
-    if body_has_call == 1 then build_arg_env_preserved s args body i env body_has_call
+    -- Only preserve to callee-save if this specific arg is used AFTER a
+    -- call in the body. Args used only before calls (or as the call's
+    -- own arg) stay in v_i (caller-save). This frees callee slots for
+    -- match-style desugars that bind 2+ vars across recursive calls.
+    if (used_after_call arg_name body 0) == 1 then build_arg_env_preserved s args body i env body_has_call
     else build_arg_env_no_preserve s args body i env body_has_call
 
 build_arg_env_preserved s args body i env body_has_call =
