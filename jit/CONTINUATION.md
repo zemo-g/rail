@@ -1,139 +1,79 @@
 # JIT — continuation roadmap
 
-State at end of session 2026-05-06: branch `jit` @ `a885dd6` on `next`,
-~28/30 bench shapes lowerable. This doc breaks the remaining work into
-self-contained pieces. Each section names files to touch, sketches the
-design, and flags unknowns.
-
-The pieces are mostly independent — pick by leverage, not order.
+State at end of session 2026-05-06 evening: branch `jit` on `next`.
+**P0 + P1 + P2 shipped this session** (output capture via heap buffer,
+`try_jit_grade_str` helper, stdout-mode rows in parity_check). All 8 JIT
+test files pass; main suite 137/137. Below: what's next, leverage-ranked.
 
 ---
 
-## P0 — Output capture (gates distill integration)
+## P0 — Output capture ✅ SHIPPED 2026-05-06
 
-**Problem:** The training session's distill loop needs to *grade* a JIT'd
-program by comparing its stdout against an expected string. Today's JIT
-writes via `svc #0x80 write(1, ...)` which goes to the parent process's
-fd 1. To grade, the harness must capture that output.
+Implementation: option (b), memory-buffer write.
 
-### Three options
+**Heap layout** (in 64 KB mmap'd page):
 
-**(a) Stdout-pipe redirect.** Foreign-bind `dup`, `dup2`, `pipe`, `close`,
-`read`. Around `call_jit`: save fd 1 via `dup`, create a pipe, `dup2` the
-write end onto fd 1, run the JIT, `dup2` the saved fd back, read from the
-pipe's read end into a Rail buffer.
-
-- Pros: no JIT changes; works for any printing op.
-- Cons: ~6 new foreign declarations; pipe buffer ~64 KB per OS limits;
-  requires an explicit "drain" step before `dup2` restore.
-
-**(b) Memory-buffer write.** Replace `op_print_int`/`op_print_str` syscalls
-with byte-stores into a buffer. The buffer pointer + cursor live at known
-offsets in the heap page (already mmap'd by `heap_alloc`). After
-`call_jit`, the harness reads the buffer.
-
-- Pros: clean; no fd manipulation; deterministic capture.
-- Cons: every print op grows by ~5–8 instructions (load cursor, write
-  bytes, store cursor); changes the "print = visible-side-effect" mental
-  model — debug printing during JIT is harder.
-
-**(c) Temp-file write.** Open a temp file in Rail, point the JIT's syscall
-at its fd via a configurable `print_fd` baked into the page. Read the
-file after.
-
-- Pros: tiny code change (just the fd constant in `op_print_int` /
-  `op_print_str`); reads are simple file I/O.
-- Cons: filesystem hit per JIT call (~50–200 µs on macOS APFS); same
-  ballpark as the existing `pthread_create` overhead so no perf win.
-
-**Recommendation: (b).** Long-term it's the cleanest substrate. The print
-ops grow by ~24 bytes each but distill integration becomes trivial. It
-also future-proofs us for "log all op_call outcomes for process-reward
-training" — that's just another buffer write.
-
-### File-level changes for (b)
-
-| File | Change |
+| Range | Purpose |
 | --- | --- |
-| `jit/heap.rail` | Reserve heap[8..16] = output buffer cursor (was implicitly the bump pointer for cells; add a second cell). |
-| `jit/emit.rail` | `emit_op_print_int_impl`: replace the `svc` block with: ldr cursor from heap[8]; write byte sequence at heap[cursor..]; update cursor. Same for `emit_op_print_str`. |
-| `jit/loader.rail` | Add a `read_jit_output heap_addr` Rail function that reads the buffer up to cursor and returns the string. |
-| `jit/grade.rail` (new) | `try_jit_grade src expected -> [tag, payload]`. See P1. |
+| `heap[0..7]`        | bump pointer for cons cells (real addr) |
+| `heap[8..15]`       | output cursor for op_print_*  (real addr) |
+| `heap[16..16399]`   | output buffer (16 KB capacity) |
+| `heap[16400..]`     | cons cell area (~48 KB) |
 
-### File-level changes for (a) — alternative
+**Print op emission** (`jit/emit.rail`):
+- `op_print_int`: 116 → 136 bytes (29 → 34 inst). The `svc write(1, …)`
+  block was replaced by a 9-instruction copy loop that appends bytes at
+  `[x27, #8]` and advances the cursor.
+- `op_print_str`: 20 → 44 bytes (5 → 11 inst). Same shape: load cursor,
+  byte-copy loop, store cursor.
 
-| File | Change |
-| --- | --- |
-| `jit/ffi.rail` | Add `dup`, `dup2`, `pipe`, `close`, `read` foreign decls. |
-| `jit/loader.rail` | New `call_jit_capture page heap` that wraps `call_jit` with the pipe-redirect dance. |
-| `jit/grade.rail` (new) | Use `call_jit_capture`. |
+**Frame extension** (consequence of x27 use): every function's prologue/
+epilogue grew from 16 → 20 bytes to add `str x27, [sp, #32]` /
+`ldr x27, [sp, #32]`. x27 was previously clobbered by every prologue's
+`mov x27, x0`; now only main does that, while non-main functions emit a
+NOP placeholder so size stays uniform. Result: x27 propagates through
+the call chain as callee-save, so any op (cons/print) that needs heap
+finds it correctly.
 
-Either approach is ~1–2 hr to ship.
+**Reader** (`jit/loader.rail`): `read_jit_output h` returns the captured
+bytes as a Rail string (via `byte_at` + `char_from_int` + `cat`).
+Companion: `jit_output_len h`, `reset_jit_output h`.
 
 ---
 
-## P1 — Distill-integration helper (`jit/grade.rail`)
+## P1 — Distill-integration helper ✅ SHIPPED 2026-05-06
 
-A single Rail function the training session calls in its rollout loop:
+`jit/grade.rail` exports:
 
 ```rail
-import "jit/grade.rail"
+try_jit_grade_str src expected
+  -> ["jit_pass"]                 -- captured stdout == expected
+  -> ["jit_fail", actual_stdout]  -- ran cleanly but mismatched
+  -> ["err", reason]              -- couldn't lower (use shell fallback)
 
-let result = try_jit_grade candidate_rail_src expected_stdout
-match result
-| ["jit_pass"]                  -> good rollout
-| ["jit_fail", actual_stdout]   -> wrong but well-formed
-| ["err", reason]               -> fall back to shell-grade
+jit_grade_str src expected -> 1 | 0    -- same, returns int
 ```
 
-Internally:
+The training session's rollout loop is now a one-liner. Sub-ms grade
+per candidate that lowers (vs ~100 ms shell grade).
 
-```
-try_jit_grade src expected:
-  let r = lower_source src
-  if (head r) == "err" then ["err", err_msg]
-  else
-    let fns  = head (tail r)
-    let pool = head (tail (tail r))
-    let heap = heap_alloc 0
-    let res  = emit_program fns pool heap
-    let page = make_executable buf nbytes
-    let _    = call_jit page heap
-    let actual = read_jit_output heap   -- needs P0 first
-    let _ = free_jit page
-    let _ = heap_free heap
-    if str_eq_rail actual expected then ["jit_pass"]
-    else ["jit_fail", actual]
-```
-
-This is the function the training session imports. It hides the
-emit/load/run dance behind a one-liner.
-
-**Status:** blocked on P0.
+Verified end-to-end via `jit/test_capture.rail` (11 fixtures incl.
+labeled output, sequencing, negative case).
 
 ---
 
-## P2 — Stage 6 parity check (`jit/parity_check.rail`)
+## P2 — Stage 6 parity check ✅ EXTENDED 2026-05-06
 
-Confidence-builder for the JIT vs `./rail_native` semantics. For each
-int-return lowerable program:
+`jit/parity_check.rail` now supports two modes:
+- `"test"`: int-return programs, exit-code grade (mod 256).
+- `"stdout"`: programs that print, byte-equal stdout grade (uses the
+  P0 capture pipeline + `run_rail_native_stdout`).
 
-1. Run via JIT, get `N`.
-2. Compile + run via `./rail_native run file.rail`, capture exit code (0–255).
-3. If `N` (mod 256) ≠ exit code, report mismatch.
-
-**Limit:** Exit codes wrap mod 256, so test fixtures must return values
-< 256. `fact 5 = 120` ✓. `fact 10 = 3628800` ✗ (would need stdout grade
-via P0).
-
-For programs that print (no int return; main returns 0): use stdout
-grade — also needs P0.
-
-Without P0, parity_check.rail can verify ~half our int-return fixtures.
-Worth shipping anyway — it's a regression net.
-
-**Effort:** ~30 min once written. Just shells out to `./rail_native`
-via existing foreign-call infra and compares.
+`fact10` (3628800) and `tri100` (5050) moved from `skip_big` to `stdout`
+and pass cleanly. `pow` was promoted from `skip_big` to `stdout` and
+revealed a real Rail-side bug: `pow 2 10` returns 0 on `./rail_native`
+even though the JIT computes 1024 correctly. Marked as `known_diverge`
+with a header note (probable auto-memoization × multi-arg interaction).
 
 ---
 
@@ -373,22 +313,19 @@ develop other JIT-like substrates.
 
 ## Sequencing recommendation
 
-Given the training session's stated need (distill integration with
-sub-ms grading), the leverage-per-hour ranking:
+P0/P1/P2 shipped. Remaining order, leverage-per-hour:
 
-1. **P0 (output capture, option b)** — ~1–2 hr; *unblocks distill integration*.
-2. **P1 (`grade.rail` helper)** — ~30 min after P0.
-3. **P2 (parity check)** — ~30 min; partial without P0, full with.
-4. **P6 (direct call, option b)** — ~1 hr; collapses pthread overhead.
-5. **P3 variant (closures-without-captures)** — ~1 hr; opens HOF prompts
+1. **P6 (direct call, option b)** — ~1 hr; collapses pthread overhead.
+   Shipping target: sub-ms grade actually true under load.
+2. **P3 variant (closures-without-captures)** — ~1 hr; opens HOF prompts
    that pass *named* functions.
-6. **P5 (file I/O)** — ~2–3 hr.
-7. **P3 full (closures with captures)** — ~4–6 hr.
-8. **P4 (floats)** — ~4–6 hr.
+3. **P5 (file I/O)** — ~2–3 hr.
+4. **P3 full (closures with captures)** — ~4–6 hr.
+5. **P4 (floats)** — ~4–6 hr.
 
-Stop after step 4 if the corpus profiling shows the remaining gap is
+Stop after step 1 if the corpus profiling shows the remaining gap is
 non-list-non-string-non-multi-arg shapes that are rare. Continue with
-steps 5–8 as bench coverage measurement demands.
+steps 2–5 as bench coverage measurement demands.
 
 ---
 
@@ -396,12 +333,20 @@ steps 5–8 as bench coverage measurement demands.
 
 - All 60 positive + 3 negative `test_lower.rail` fixtures.
 - All 8 hand-built `test_codegen.rail` fixtures.
-- All 5 `test_print.rail` fixtures.
+- All 5 `test_print.rail` fixtures (now verifying captured output, not
+  stdout-eyeball).
+- 11 `test_capture.rail` fixtures (P0/P1 round-trip).
+- 17 `test_enc.rail` encoder fixtures (incl. 3 new: str_x27, ldr_x27, nop).
+- `parity_check.rail`: 11 PARITY OK rows (incl. 2 stdout-mode).
 - 137/137 main suite.
 - Stage 5 list ops (cons/head/tail/is_nil + `[a,b,c]`).
 - Match syntax desugar.
 - All cmp/arith/bool ops.
 - Negative-int `op_print_int`.
-- The ABI-v2 prologue (`mov x27, x0` captures heap_addr from pthread arg).
+- The ABI-v2 prologue, with **48-byte frame and saved x27**:
+    main: `stp fp/lr -48; mov fp,sp; stp x19/x20 +16; str x27 +32; mov x27,x0; <arg moves>`
+    non-main: same but `mov x27,x0` → `nop`. x27 is callee-save and
+    propagates from main throughout the call chain.
 
-Any change to the prologue or `op_call`'s packed encoding affects everything.
+Any change to the prologue, `op_call`'s packed encoding, or the heap
+layout (esp. `cells_offset = 16400`) affects everything.
