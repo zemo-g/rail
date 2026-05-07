@@ -68,7 +68,7 @@ max_blocks_per_fn = 32
 
 mk_state _ =
   let ir = arr_new (4 * max_instr_per_fn) 0
-  let ctr = arr_new 10 0
+  let ctr = arr_new 12 0
   let _ = arr_set ctr 0 0     -- (unused; caller-save now via live mask)
   let _ = arr_set ctr 1 10    -- next_callee starts at v10
   let _ = arr_set ctr 2 0     -- instr_idx
@@ -77,8 +77,10 @@ mk_state _ =
   let _ = arr_set ctr 5 0     -- err_flag
   let _ = arr_set ctr 6 0     -- live caller-save bitmask (bit i = v(i) live)
   let _ = arr_set ctr 7 1     -- n_args (default 1; lower_fn_def overrides)
-  let _ = arr_set ctr 8 0     -- next caller-save float vreg (0..7 = d0..d7)
-  let _ = arr_set ctr 9 0     -- next callee-save float slot (0..1 → f8/f9 = d8/d9)
+  let _ = arr_set ctr 8 0     -- next caller-save float vreg (high-water bump)
+  let _ = arr_set ctr 9 0     -- next callee-save float slot (0..7 → f8..f15, v2-B)
+  let _ = arr_set ctr 10 0    -- float caller-save free-bitmap (bits 0..7 = f0..f7 reusable)
+  let _ = arr_set ctr 11 0    -- float caller-save lock-mask (bit i = f_i is env-bound, never freed)
   let blocks = arr_new max_blocks_per_fn 0
   let err_msg = cons "" []
   cons ir (cons ctr (cons blocks (cons err_msg [])))
@@ -151,21 +153,61 @@ st_alloc_callee s =
   else v
 
 -- Float vreg allocator. Float vregs map directly to d-regs.
---   f0..f7 = d0..d7 caller-save (clobbered by op_call).
---   f8/f9  = d8/d9  callee-save (saved/restored by every prologue/epilogue
---                    in P4-ext; allocated via st_alloc_float_callee).
+--   f0..f7  = d0..d7  caller-save (clobbered by op_call).
+--   f8..f15 = d8..d15 callee-save (saved/restored by every prologue/epilogue
+--                     in v2-B's 112-byte frame; allocated via st_alloc_float_callee).
+-- Allocator strategy (v2-B): prefer the free-bitmap (ctr[10]) — slots that
+-- previous ops have explicitly freed. Otherwise bump ctr[8] (the high-water
+-- pointer). This lets `(call) + a + b + c + d` reuse the call-result slot
+-- across the chain instead of allocating a fresh slot per add.
 st_alloc_float s =
-  let f = arr_get (st_ctr s) 8
-  let _ = arr_set (st_ctr s) 8 (f + 1)
-  if f > 7 then st_fail s "float caller-save vreg overflow (>=f8); v1 caps at d0..d7"
-  else f
+  let free_mask = arr_get (st_ctr s) 10
+  if free_mask != 0 then
+    let f = lowest_bit_set free_mask 0
+    let _ = arr_set (st_ctr s) 10 (bit_and free_mask (bit_not_8 (shl 1 f)))
+    f
+  else
+    let f = arr_get (st_ctr s) 8
+    let _ = arr_set (st_ctr s) 8 (f + 1)
+    if f > 7 then st_fail s "float caller-save vreg overflow (>=f8); v1 caps at d0..d7"
+    else f
 
--- Allocate one of f8/f9 (callee-save). Slot 9 of ctr counts how many we've
--- handed out (0..1). Returns the f-vreg (8 or 9), which maps to d8 or d9.
+-- Find the lowest set bit position (0..7) in mask. Caller guarantees mask != 0.
+lowest_bit_set mask i =
+  if (bit_and mask (shl 1 i)) != 0 then i
+  else if i >= 7 then 7
+  else lowest_bit_set mask (i + 1)
+
+-- 8-bit bitwise NOT (Rail has bit_and / bit_or / shl but not bit_not).
+bit_not_8 x = bit_xor x 255
+
+-- Free a caller-save float slot so future allocations can reuse it. Only
+-- frees if the slot is NOT locked (locked slots are env-bound, e.g., params
+-- in d0..d7 or let-bindings — overwriting them would corrupt the binding).
+st_free_float_caller s f =
+  if f >= 8 then 0
+  else
+    let lock_mask = arr_get (st_ctr s) 11
+    if (bit_and lock_mask (shl 1 f)) != 0 then 0
+    else
+      let free_mask = arr_get (st_ctr s) 10
+      arr_set (st_ctr s) 10 (bit_or free_mask (shl 1 f))
+
+-- Mark a caller-save slot as env-bound (param or let-binding). Locked slots
+-- are not returned by alloc and are not freed by st_free_float_caller.
+st_lock_float_caller s f =
+  if f >= 8 then 0
+  else
+    let lock_mask = arr_get (st_ctr s) 11
+    arr_set (st_ctr s) 11 (bit_or lock_mask (shl 1 f))
+
+-- Allocate one of f8..f15 (callee-save). Slot 9 of ctr counts how many we've
+-- handed out (0..7). Returns the f-vreg (8..15), which maps to d8..d15.
+-- v2-B lifted the cap from 2 → 8; the prologue saves all 8 unconditionally.
 st_alloc_float_callee s =
   let n = arr_get (st_ctr s) 9
   let _ = arr_set (st_ctr s) 9 (n + 1)
-  if n >= 2 then st_fail s "float callee-save overflow (>=f10); v1 saves only d8/d9"
+  if n >= 8 then st_fail s "float callee-save overflow (>=f16); v2-B saves d8..d15 (8 slots)"
   else (n + 8)
 
 -- Preserve a float vreg into callee-save (d8/d9) so it survives a function
@@ -799,6 +841,11 @@ lower_op_float_arith s op_str f_lhs f_rhs =
     if opcode < 0 then st_fail s (cat ["lower: unknown float arith op ", op_str])
     else
       let _ = st_emit s opcode f_dst f_lhs f_rhs
+      -- v2-B: f_lhs and f_rhs are dead after this op. Free their caller-save
+      -- slots so future allocations recycle them. Locked slots (env-bound
+      -- params/let-bindings) are skipped by st_free_float_caller.
+      let _ = st_free_float_caller s f_lhs
+      let _ = st_free_float_caller s f_rhs
       f_dst
 
 float_arith_op_for_str s =
@@ -816,6 +863,9 @@ lower_op_float_cmp s op_str f_lhs f_rhs =
     if opcode < 0 then st_fail s (cat ["lower: unsupported float compare ", op_str, " (v1: < == > >=)"])
     else
       let _ = st_emit s opcode v_dst f_lhs f_rhs
+      -- v2-B: free caller-save float operands post-emit (cmp result is int).
+      let _ = st_free_float_caller s f_lhs
+      let _ = st_free_float_caller s f_rhs
       v_dst
 
 float_cmp_op_for_str s =
@@ -935,15 +985,27 @@ lower_let s env ast =
     let v_val = lower_expr s env val
     if (st_get_err s) == 1 then v_val
     else
-      -- Only preserve to callee-save if `name` is actually used AFTER a call
-      -- in the body (liveness-aware). v1 doesn't preserve floats — float
-      -- values cannot live across calls.
-      let needs_preserve = if val_ty == "float" then 0
+      -- Preserve to callee-save if `name` is used AFTER a call in the body.
+      -- v2-B extends preservation to floats: prior versions could not survive
+      -- a let-binding across a call. Now both int and float lets preserve.
+      let needs_preserve = if val_ty == "float" then
+                             if v_val >= 8 then 0
+                             else used_after_call_r name body 0 (st_registry s)
                            else if v_val >= 10 then 0
-                           else used_after_call name body 0
-      let v_safe = if needs_preserve == 1 then preserve_callee s v_val else v_val
+                           else used_after_call_r name body 0 (st_registry s)
+      let v_safe = if needs_preserve == 1 then
+                     if val_ty == "float" then preserve_callee_float s v_val
+                     else preserve_callee s v_val
+                   else v_val
       if (st_get_err s) == 1 then v_safe
       else
+        -- Lock the slot if it's a caller-save float — env binding outlives
+        -- the lower_op_float that produced v_val, so a later op must not free
+        -- this slot. (preserve_callee_float already moves to callee-save,
+        -- which is never freed, so we only lock if the binding stayed in d0..d7.)
+        let _ = if val_ty == "float" then
+                  if v_safe < 8 then st_lock_float_caller s v_safe else 0
+                else 0
         let env2 = env_extend_typed env name v_safe val_ty
         lower_expr s env2 body
 
@@ -1604,6 +1666,9 @@ build_arg_env_float_param s args body i env body_has_call self_name int_slot flo
       let _ = arr_set (st_ctr s) 8 (float_slot + 1)
       build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call self_name int_slot (float_slot + 1)
   else
+    -- Caller-save param. Lock the slot so st_free_float_caller leaves it
+    -- alone — env binding `arg_name → float_slot` outlives any single op.
+    let _ = st_lock_float_caller s float_slot
     let env2 = env_extend_typed env arg_name float_slot "float"
     let _ = arr_set (st_ctr s) 8 (float_slot + 1)
     build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call self_name int_slot (float_slot + 1)
