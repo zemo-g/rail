@@ -1,14 +1,14 @@
 # JIT — continuation roadmap
 
-State at end of session 2026-05-07 (afternoon): branch `jit` on `next`.
-**P4-arg (float user-fn args) shipped 2026-05-07** on top of the
-P0/P1/P2/P3-variant/P3-full v1/P4/P4-ext/P5/P6 stack. Last named v1
-limit closed.
+State at end of session 2026-05-07 (evening): branch `jit` on `next`.
+**v2-A (0-arg user fns), v2-B (8 float callee-save slots), v2-C (real
+closure values via lambda hoisting) shipped 2026-05-07** on top of the
+P0/P1/P2/P3-variant/P3-full v1/P4/P4-ext/P4-arg/P5/P6 stack.
 
 All baselines hold:
-- `jit/test_lower.rail`: 106 positive + 3 negative (6 new float-arg fixtures).
-- `jit/test_capture.rail`: 32 positive + 1 negative (6 new float-arg fixtures).
-- `jit/test_enc.rail`: 22 fixtures.
+- `jit/test_lower.rail`: 106 positive + 3 negative.
+- `jit/test_capture.rail`: 45 positive + 1 negative (+6 v2-A, +3 v2-B, +4 v2-C).
+- `jit/test_enc.rail`: 28 fixtures (+6 for v2-B 112-byte frame instructions).
 - `jit/parity_check.rail`: PARITY OK.
 - `./rail_native test`: 137/137.
 
@@ -36,7 +36,7 @@ Implementation: option (b), memory-buffer write.
 | `heap[32..16415]`   | output buffer (~16 KB; first byte = R+32) |
 | `heap[16416..]`     | cons cell area (~48 KB) |
 
-**Function frame layout** (64 bytes; bumped 48→64 by P4-ext):
+**Function frame layout** (112 bytes; bumped 64→112 by v2-B):
 
 | Range | Purpose |
 | --- | --- |
@@ -45,6 +45,9 @@ Implementation: option (b), memory-buffer write.
 | `[sp+32..39]`       | x27 (heap addr; ABI v2 callee-save) |
 | `[sp+40..47]`       | pad (alignment) |
 | `[sp+48..63]`       | stp d8, d9 (float callee-save; P4-ext) |
+| `[sp+64..79]`       | stp d10, d11 (float callee-save; v2-B) |
+| `[sp+80..95]`       | stp d12, d13 (float callee-save; v2-B) |
+| `[sp+96..111]`      | stp d14, d15 (float callee-save; v2-B) |
 
 **Print op emission** (`jit/emit.rail`):
 - `op_print_int`: 116 → 136 bytes (29 → 34 inst). The `svc write(1, …)`
@@ -408,17 +411,71 @@ develop other JIT-like substrates.
 
 ## Sequencing recommendation
 
-P0/P1/P2/P3-variant/P3-full v1/P4/P4-ext/P4-arg/P5/P6 shipped. All named
-v1 limits closed. Remaining work is exclusively v2-class:
+P0/P1/P2/P3-variant/P3-full v1/P4/P4-ext/P4-arg/P5/P6/v2-A/v2-B/v2-C
+all shipped 2026-05-07. The named v1 limits and the three v2 items
+listed in prior session are closed.
 
-1. **P3-full v2 (real closure values)** — ~3–4 hr; replaces inline
-   substitution with heap-allocated closure records so lambdas can be
-   *passed* as args (`map (\x -> ...) xs`). Currently inline-only.
-2. **0-arg user fn calls** — `pi = 3.14` defines but `pi` lowers as a
-   fn_idx materialization, not a call. ~1 hr (extend lower_call to
-   emit n=0 op_call; emit_op_call already supports n>=1 path).
-3. **More than 2 float callee-save slots** — currently caps at f8/f9.
-   Frame would need to grow beyond 64 bytes to add d10..d15.
+### What v2-A shipped (0-arg user fn calls)
+
+`pi = 3.14; main = print (show pi)` lowers `pi` as a 0-arg op_call
+instead of materializing the fn_idx. Touched: `lower_var` + new
+`reg_lookup_arity`, `infer_type` for var → 0-arg user fn, dropped
+`n<1` guard in `lower_call_with_args`, extended `call_pack_typed`
+in `ir.rail` for n=0. Also made `contains_call` and `used_after_call`
+registry-aware (suffix `_r`), since a bare `pi` reference IS a call —
+without that, `pi * r` fails to preserve `r` across the pi-call.
+
+### What v2-B shipped (8 float callee-save slots, was 2)
+
+Frame grew 64→112 bytes. Prologue saves d8..d15 unconditionally;
+epilogues restore them. `st_alloc_float_callee` cap raised 2→8.
+
+Caller-save f0..f7 now use a free-bitmap allocator (ctr[10]) with a
+lock-mask (ctr[11]) for env-bound slots (params, let-bindings).
+`lower_op_float_arith` and `lower_op_float_cmp` free their operands
+post-emit so chains like `(call) + a + b + c + d` reuse one
+caller-save slot instead of accumulating one per add. Also extended
+`lower_let` to preserve float bindings across calls (was no-op before).
+
+### What v2-C shipped (real closure values via lambda hoisting)
+
+Pre-pass `hoist_lambdas` in `lower_program` walks every fn_def body,
+hoists non-capturing lambdas to top-level synthetic fns named
+`__lam_<n>`, and rewrites the lambda site to `var __lam_n`. The
+existing P3-variant op_apply switch table dispatches HOF calls.
+This unblocks `applyfn (\x -> x*2) 7` patterns. Capturing lambdas
+remain inline (P3-full v1 substitution).
+
+Important nuance: a lambda that is the **direct val of a let** is
+NOT hoisted, even if it has no captures. `let f = \x -> x+1 in f 5`
+still uses inline substitution. This avoids a pre-existing bug in
+the chained op_apply path over let-bound fn refs (`let f = double in
+(f 7) + (f 3)` returns 0 today; reproduced on tip-of-tree pre-v2).
+Filing that bug as a separate v2.1 task — it affects HOF dispatch
+over any let-bound fn ref, not just hoisted lambdas.
+
+## Open: pre-existing op_apply chained-call bug
+
+Repro (works pre-v2 too — not a regression):
+```
+let f = double in (f 7) + (f 3)        -- returns 0, expected 20
+let f = double in let a = f 7 in let b = f 3 in print(show a)  -- 0
+```
+
+Single-call pattern works fine:
+```
+let f = double in print(show (f 7))   -- "14\n", correct
+```
+
+Fixed-point user-fn HOF (with `apply f x = f x`) works for the same
+shape:
+```
+(apply double 7) + (apply double 3)    -- "20\n", correct
+```
+
+So the bug is specific to two op_apply emissions in the same fn body
+where `f` is bound via let. Likely a vreg-allocator interaction
+across the second call. Investigation deferred.
 
 Continue as bench coverage measurement demands. The JIT path now beats
 shell grade by ~2000× per call, so the bottleneck for distill is
@@ -428,11 +485,11 @@ lowerable shape coverage, not call latency.
 
 ## What's stable today (do NOT regress)
 
-- All 106 positive + 3 negative `test_lower.rail` fixtures (6 new float-arg).
+- All 106 positive + 3 negative `test_lower.rail` fixtures.
 - All 8 hand-built `test_codegen.rail` fixtures.
 - All 5 `test_print.rail` fixtures.
-- 32 `test_capture.rail` fixtures (6 new float-arg).
-- `test_enc.rail` 22 encoder fixtures.
+- 45 `test_capture.rail` fixtures (+6 v2-A 0-arg, +3 v2-B float-slots, +4 v2-C lambda-hoist).
+- `test_enc.rail` 28 encoder fixtures (+6 v2-B for 112-byte frame).
 - `parity_check.rail`: 11 PARITY OK rows.
 - 137/137 main suite.
 - Stage 5 list ops (cons/head/tail/is_nil + `[a,b,c]`).
@@ -441,12 +498,17 @@ lowerable shape coverage, not call latency.
 - Negative-int `op_print_int`.
 - P4 floats: arith / cmp / promotion / printing / if-merge / cross-call /
   float-ret user fns / **mixed int+float user-fn args** (P4-arg).
-- The ABI prologue, with **64-byte frame** (P4-ext) and saved x27 + d8/d9:
-    main: `stp fp/lr -64; mov fp,sp; stp x19/x20 +16; str x27 +32; stp d8/d9 +48; mov x27,x0; <arg moves>`
+- The ABI prologue, with **112-byte frame** (v2-B) and saved x27 + d8..d15:
+    main: `stp fp/lr -112; mov fp,sp; stp x19/x20 +16; str x27 +32; stp d8/d9 +48; stp d10/d11 +64; stp d12/d13 +80; stp d14/d15 +96; mov x27,x0; <arg moves>`
     non-main: same but `mov x27,x0` → `nop`. x27 callee-save through chain.
     Per-arg moves: int → `mov x_int_slot+9, x_int_slot`; float → `fmov d_float_slot, d_float_slot` (no-op move). int_slot/float_slot index INDEPENDENTLY per AAPCS64.
 
 Any change to the prologue, `op_call`'s packed encoding (now 29 bits — bits
-0..3 n_args, 4..23 vregs, 24..27 arg-type bits, 28 ret-type bit), or the
-heap layout (esp. `cells_offset = 16416` post-P4, `output_offset = 32`,
-`heap[24..31] = jit_print_float addr`) affects everything.
+0..3 n_args, 4..23 vregs, 24..27 arg-type bits, 28 ret-type bit, with
+0..3 also accepting n=0 since v2-A), or the heap layout (esp.
+`cells_offset = 16416` post-P4, `output_offset = 32`, `heap[24..31] =
+jit_print_float addr`) affects everything.
+
+v2-B also changed the prologue size 24→36 bytes (3 more stps); op_ret/
+op_ret_float size 24→36 bytes (3 more ldps); fn_total_bytes prologue
+constant 24→36; emit_one_function's `prologue_size = 36 + 4*n_args`.

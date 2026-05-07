@@ -1750,6 +1750,200 @@ list_len_local xs =
   if xs == [] then 0
   else 1 + list_len_local (tail xs)
 
+list_contains_str xs nm =
+  if xs == [] then 0
+  else if (head xs) == nm then 1
+  else list_contains_str (tail xs) nm
+
+append_list a b =
+  if a == [] then b
+  else cons (head a) (append_list (tail a) b)
+
+union_str a b =
+  if a == [] then b
+  else if (list_contains_str b (head a)) == 1 then union_str (tail a) b
+  else cons (head a) (union_str (tail a) b)
+
+-- ============================================================================
+-- v2-C: Lambda hoisting pre-pass
+-- ============================================================================
+-- Walk every fn_def body. For each lambda node with NO free variables (modulo
+-- the lambda's own arg, top-level fn names, and builtins), hoist to a synthetic
+-- top-level fn `__lam_<n>` and rewrite the lambda site to `var __lam_<n>`.
+-- Capturing lambdas remain as-is (inline-substituted by P3-full v1).
+-- Result: lambdas without captures become first-class values that can be
+-- passed to HOFs via the existing P3-variant op_apply dispatch.
+
+-- Free-var analysis. Walks ast collecting names referenced but not in `bound`.
+-- Returns a list of free names (no dedup pressure — caller filters).
+free_vars ast bound =
+  let tag = ast_tag ast
+  if tag == "int" then []
+  else if tag == "float" then []
+  else if tag == "str" then []
+  else if tag == "var" then
+    let nm = head (tail ast)
+    if (list_contains_str bound nm) == 1 then [] else cons nm []
+  else if tag == "op" then
+    let lhs = head (tail (tail ast))
+    let rhs = head (tail (tail (tail ast)))
+    union_str (free_vars lhs bound) (free_vars rhs bound)
+  else if tag == "if" then
+    let c = head (tail ast)
+    let t = head (tail (tail ast))
+    let e = head (tail (tail (tail ast)))
+    union_str (union_str (free_vars c bound) (free_vars t bound)) (free_vars e bound)
+  else if tag == "let" then
+    let nm = head (tail ast)
+    let v = head (tail (tail ast))
+    let body = head (tail (tail (tail ast)))
+    let v_free = free_vars v bound
+    let body_free = free_vars body (cons nm bound)
+    union_str v_free body_free
+  else if tag == "app" then
+    let f = head (tail ast)
+    let arg = head (tail (tail ast))
+    union_str (free_vars f bound) (free_vars arg bound)
+  else if tag == "lambda" then
+    let arg = head (tail ast)
+    let body = head (tail (tail ast))
+    free_vars body (cons arg bound)
+  else []
+
+-- Filter out names that are top-level fns or JIT builtins. The remaining list
+-- is the lambda's TRUE captures.
+lambda_true_captures free_list top_names =
+  if free_list == [] then []
+  else
+    let nm = head free_list
+    if (list_contains_str top_names nm) == 1 then lambda_true_captures (tail free_list) top_names
+    else if (is_builtin nm) == 1 then lambda_true_captures (tail free_list) top_names
+    else cons nm (lambda_true_captures (tail free_list) top_names)
+
+-- Recursively walk an AST, hoisting lambdas. State (counter + accumulated
+-- synthetics) is threaded via an int_arr (counter at slot 0) and a list ref
+-- via the return value. Returns [new_ast, new_synth_list].
+walk_hoist ast outer_bound ctr top_names acc_synth =
+  let tag = ast_tag ast
+  if tag == "int" then cons ast (cons acc_synth [])
+  else if tag == "float" then cons ast (cons acc_synth [])
+  else if tag == "str" then cons ast (cons acc_synth [])
+  else if tag == "var" then cons ast (cons acc_synth [])
+  else if tag == "op" then walk_hoist_op ast outer_bound ctr top_names acc_synth
+  else if tag == "if" then walk_hoist_if ast outer_bound ctr top_names acc_synth
+  else if tag == "let" then walk_hoist_let ast outer_bound ctr top_names acc_synth
+  else if tag == "app" then walk_hoist_app ast outer_bound ctr top_names acc_synth
+  else if tag == "lambda" then walk_hoist_lambda ast outer_bound ctr top_names acc_synth
+  else cons ast (cons acc_synth [])
+
+walk_hoist_op ast outer_bound ctr top_names acc_synth =
+  let op_str = head (tail ast)
+  let lhs = head (tail (tail ast))
+  let rhs = head (tail (tail (tail ast)))
+  let r1 = walk_hoist lhs outer_bound ctr top_names acc_synth
+  let new_lhs = head r1
+  let acc1 = head (tail r1)
+  let r2 = walk_hoist rhs outer_bound ctr top_names acc1
+  let new_rhs = head r2
+  let acc2 = head (tail r2)
+  let new_op = cons "op" (cons op_str (cons new_lhs (cons new_rhs [])))
+  cons new_op (cons acc2 [])
+
+walk_hoist_if ast outer_bound ctr top_names acc_synth =
+  let c = head (tail ast)
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  let r1 = walk_hoist c outer_bound ctr top_names acc_synth
+  let r2 = walk_hoist t outer_bound ctr top_names (head (tail r1))
+  let r3 = walk_hoist e outer_bound ctr top_names (head (tail r2))
+  let new_if = cons "if" (cons (head r1) (cons (head r2) (cons (head r3) [])))
+  cons new_if (cons (head (tail r3)) [])
+
+walk_hoist_let ast outer_bound ctr top_names acc_synth =
+  let nm = head (tail ast)
+  let v = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  -- v2-C: a lambda that is the DIRECT val of a let is left inline so the
+  -- existing P3-full v1 substitution path handles it (avoids a pre-existing
+  -- bug in chained op_apply over let-bound fn refs). Still walk into the
+  -- lambda's body to hoist any deeper non-capturing lambdas.
+  let r1 = if (ast_tag v) == "lambda" then walk_hoist_let_lam_body v outer_bound ctr top_names acc_synth
+           else walk_hoist v outer_bound ctr top_names acc_synth
+  let body_bound = cons nm outer_bound
+  let r2 = walk_hoist body body_bound ctr top_names (head (tail r1))
+  let new_let = cons "let" (cons nm (cons (head r1) (cons (head r2) [])))
+  cons new_let (cons (head (tail r2)) [])
+
+-- Walk a lambda's body without hoisting the lambda itself. Used for let-bound
+-- lambdas, where inline substitution is preferred.
+walk_hoist_let_lam_body lam outer_bound ctr top_names acc_synth =
+  let lam_arg = head (tail lam)
+  let lam_body = head (tail (tail lam))
+  let inner_bound = cons lam_arg outer_bound
+  let rb = walk_hoist lam_body inner_bound ctr top_names acc_synth
+  let new_body = head rb
+  let acc1 = head (tail rb)
+  let new_lam = cons "lambda" (cons lam_arg (cons new_body []))
+  cons new_lam (cons acc1 [])
+
+walk_hoist_app ast outer_bound ctr top_names acc_synth =
+  let f = head (tail ast)
+  let arg = head (tail (tail ast))
+  let r1 = walk_hoist f outer_bound ctr top_names acc_synth
+  let r2 = walk_hoist arg outer_bound ctr top_names (head (tail r1))
+  let new_app = cons "app" (cons (head r1) (cons (head r2) []))
+  cons new_app (cons (head (tail r2)) [])
+
+walk_hoist_lambda ast outer_bound ctr top_names acc_synth =
+  let lam_arg = head (tail ast)
+  let lam_body = head (tail (tail ast))
+  -- Recurse into body with arg added to bound (handles nested lambdas first).
+  let inner_bound = cons lam_arg outer_bound
+  let rb = walk_hoist lam_body inner_bound ctr top_names acc_synth
+  let new_body = head rb
+  let acc1 = head (tail rb)
+  -- Free-var check: only lam_arg counts as bound for THIS lambda's hoistability.
+  -- Outer-bound names are captures.
+  let body_free = free_vars new_body (cons lam_arg [])
+  let captures = lambda_true_captures body_free top_names
+  if captures == [] then
+    let n = arr_get ctr 0
+    let _ = arr_set ctr 0 (n + 1)
+    let synth_name = cat ["__lam_", show n]
+    let synth_args = cons lam_arg []
+    let synth_def = cons "fn_def" (cons synth_name (cons synth_args (cons new_body [])))
+    let var_ref = cons "var" (cons synth_name [])
+    cons var_ref (cons (cons synth_def acc1) [])
+  else
+    let new_lam = cons "lambda" (cons lam_arg (cons new_body []))
+    cons new_lam (cons acc1 [])
+
+collect_top_names defs acc =
+  if defs == [] then reverse acc
+  else
+    let nm = head (tail (head defs))
+    collect_top_names (tail defs) (cons nm acc)
+
+hoist_each_def defs ctr top_names acc_orig acc_synth =
+  if defs == [] then
+    -- Originals first (preserving user order), synthetics appended at the end.
+    append_list (reverse acc_orig) (reverse acc_synth)
+  else
+    let fn_def = head defs
+    let name = head (tail fn_def)
+    let args = head (tail (tail fn_def))
+    let body = head (tail (tail (tail fn_def)))
+    let r = walk_hoist body args ctr top_names acc_synth
+    let new_body = head r
+    let new_synth = head (tail r)
+    let new_fn = cons "fn_def" (cons name (cons args (cons new_body [])))
+    hoist_each_def (tail defs) ctr top_names (cons new_fn acc_orig) new_synth
+
+hoist_lambdas defs =
+  let ctr = arr_new 1 0
+  let top_names = collect_top_names defs []
+  hoist_each_def defs ctr top_names [] []
+
 -- ============================================================================
 -- Public entry
 -- ============================================================================
@@ -1761,9 +1955,13 @@ lower_source src =
   else lower_program (res_ast r)
 
 lower_program program_ast =
-  let defs = head (tail program_ast)
-  if defs == [] then cons "err" (cons "empty program" [])
+  let raw_defs = head (tail program_ast)
+  if raw_defs == [] then cons "err" (cons "empty program" [])
   else
+    -- v2-C: hoist non-capturing lambdas to top-level synthetic fns. After
+    -- this pass, lambda values can be passed to HOFs via fn_idx materialization
+    -- and the existing P3-variant op_apply dispatch.
+    let defs = hoist_lambdas raw_defs
     let registry = build_registry defs
     -- The main entry point must be the LAST function (so it sees the registry
     -- of preceding ones), but for op_call's relative offsets, fn_offsets are
