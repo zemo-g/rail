@@ -311,14 +311,25 @@ infer_type_let env ast =
   infer_type (env_extend_typed env name 0 val_ty) body
 
 -- ============================================================================
--- Function-name registry: list of [name, fn_idx, ret_ty] triples. Built
--- once per lower. ret_ty (P4-ext) is "int" or "float" — inferred at registry
--- build time by walking the body with infer_type, using the registry-so-far
--- to resolve user fn calls. Forward refs default to "int".
+-- Function-name registry: list of [name, fn_idx, meta_arr] triples.
+-- meta_arr is an int_arr of size (n_args + 1), MUTABLE:
+--   meta[0]      = ret_ty bit (0=int, 1=float)
+--   meta[1..n]   = per-arg type bits (0=int, 1=float)
+--
+-- Mutability lets the fixed-point inference loop refine arg/ret types in
+-- place without rebuilding the registry list. Built in two phases:
+--   1. build_registry_initial: walks defs in order, seeds ret_ty via
+--      infer_type with all-int param assumption, all arg types 0.
+--   2. fixed_point_arg_types: refines arg types from call-site usage AND
+--      ret types from updated body inference. Caps at 4 iterations.
 -- ============================================================================
 
 reg_empty _ = []
-reg_add r name idx = cons (cons name (cons idx (cons "int" []))) r
+
+reg_add_meta r name idx n_args =
+  let meta = arr_new (n_args + 1) 0
+  cons (cons name (cons idx (cons meta []))) r
+
 reg_lookup r name =
   if r == [] then 0 - 1
   else
@@ -326,12 +337,34 @@ reg_lookup r name =
     if (head pair) == name then head (tail pair)
     else reg_lookup (tail r) name
 
-reg_lookup_ret_ty r name =
-  if r == [] then "int"
+reg_lookup_meta r name =
+  if r == [] then arr_new 0 0
   else
     let pair = head r
     if (head pair) == name then head (tail (tail pair))
-    else reg_lookup_ret_ty (tail r) name
+    else reg_lookup_meta (tail r) name
+
+reg_lookup_ret_ty r name =
+  let meta = reg_lookup_meta r name
+  if (arr_len meta) == 0 then "int"
+  else if (arr_get meta 0) == 1 then "float" else "int"
+
+reg_lookup_arg_ty r name i =
+  let meta = reg_lookup_meta r name
+  if (arr_len meta) <= (i + 1) then "int"
+  else if (arr_get meta (i + 1)) == 1 then "float" else "int"
+
+reg_set_ret_ty r name ty_str =
+  let meta = reg_lookup_meta r name
+  if (arr_len meta) == 0 then 0
+  else
+    let bit = if ty_str == "float" then 1 else 0
+    arr_set meta 0 bit
+
+reg_set_arg_ty_bit r name i v =
+  let meta = reg_lookup_meta r name
+  if (arr_len meta) <= (i + 1) then 0
+  else arr_set meta (i + 1) v
 
 -- Seed an env with __USERFN_<name>:ret_ty entries for every entry in the
 -- registry. infer_type_app reads these to resolve user fn return types.
@@ -340,26 +373,142 @@ seed_env_from_registry registry env =
   else
     let entry = head registry
     let nm = head entry
-    let ret_ty = head (tail (tail entry))
+    let meta = head (tail (tail entry))
+    let ret_ty = if (arr_len meta) == 0 then "int"
+                 else if (arr_get meta 0) == 1 then "float" else "int"
     let env2 = env_extend_typed env (cat ["__USERFN_", nm]) 0 ret_ty
     seed_env_from_registry (tail registry) env2
 
--- Build registry from a list of fn_def AST nodes (in order).
--- Each entry [name, idx, ret_ty] is determined by infer_type on the body
--- with the registry-so-far seeded into the env. Forward-only inference.
+-- Build registry: initial pass + fixed-point arg/ret-type refinement.
 build_registry defs =
-  build_registry_loop defs 0 []
+  let initial = build_registry_initial defs 0 []
+  fixed_point_arg_types initial defs 4
 
-build_registry_loop defs idx acc =
+build_registry_initial defs idx acc =
   if defs == [] then reverse acc
   else
     let fn = head defs
     let name = head (tail fn)
+    let args = head (tail (tail fn))
     let body = head (tail (tail (tail fn)))
-    let env_with_reg = seed_env_from_registry acc (env_empty 0)
+    let n_args = list_len_local args
+    let registry_so_far = reverse acc
+    let env_with_reg = seed_env_from_registry registry_so_far (env_empty 0)
+    -- Initial ret_ty inferred with all-int param assumption.
     let ret_ty = infer_type env_with_reg body
-    let entry = cons name (cons idx (cons ret_ty []))
-    build_registry_loop (tail defs) (idx + 1) (cons entry acc)
+    let meta = arr_new (n_args + 1) 0
+    let _ = if ret_ty == "float" then arr_set meta 0 1 else 0
+    let entry = cons name (cons idx (cons meta []))
+    build_registry_initial (tail defs) (idx + 1) (cons entry acc)
+
+-- One pass over all defs: refines arg types from call-site usage AND
+-- re-infers ret type from updated body. Returns 1 iff any change made.
+-- Cap at `cap` iterations to avoid infinite loops on pathological input.
+fixed_point_arg_types registry defs cap =
+  if cap <= 0 then registry
+  else
+    let changed = update_pass defs registry 0
+    if changed == 0 then registry
+    else fixed_point_arg_types registry defs (cap - 1)
+
+update_pass defs registry changed_acc =
+  if defs == [] then changed_acc
+  else
+    let fn = head defs
+    let new_acc = update_one_fn registry fn changed_acc
+    update_pass (tail defs) registry new_acc
+
+update_one_fn registry fn changed_acc =
+  let name = head (tail fn)
+  let args = head (tail (tail fn))
+  let body = head (tail (tail (tail fn)))
+  let env = seed_env_from_registry registry (env_empty 0)
+  let env_p = build_param_env_typed args registry name 0 env
+  -- Refine ret_ty from updated body type.
+  let new_ret_ty = infer_type env_p body
+  let cur_ret_ty = reg_lookup_ret_ty registry name
+  let changed_ret = if new_ret_ty == cur_ret_ty then 0
+                    else
+                      let _ = reg_set_ret_ty registry name new_ret_ty
+                      1
+  -- Refine arg types from call-site arg-expression types.
+  let changed_args = walk_calls_for_arg_types env_p body registry 0
+  bit_or (bit_or changed_acc changed_ret) changed_args
+
+build_param_env_typed args registry self_name i env =
+  if args == [] then env
+  else
+    let param_name = head args
+    let ty = reg_lookup_arg_ty registry self_name i
+    let env2 = env_extend_typed env param_name 0 ty
+    build_param_env_typed (tail args) registry self_name (i + 1) env2
+
+walk_calls_for_arg_types env ast registry acc =
+  let tag = ast_tag ast
+  if tag == "int" then acc
+  else if tag == "float" then acc
+  else if tag == "str" then acc
+  else if tag == "var" then acc
+  else if tag == "op" then walk_calls_op_argtype env ast registry acc
+  else if tag == "if" then walk_calls_if_argtype env ast registry acc
+  else if tag == "let" then walk_calls_let_argtype env ast registry acc
+  else if tag == "app" then walk_calls_app_argtype env ast registry acc
+  else acc
+
+walk_calls_op_argtype env ast registry acc =
+  let lhs = head (tail (tail ast))
+  let rhs = head (tail (tail (tail ast)))
+  let acc1 = walk_calls_for_arg_types env lhs registry acc
+  walk_calls_for_arg_types env rhs registry acc1
+
+walk_calls_if_argtype env ast registry acc =
+  let c = head (tail ast)
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  let a1 = walk_calls_for_arg_types env c registry acc
+  let a2 = walk_calls_for_arg_types env t registry a1
+  walk_calls_for_arg_types env e registry a2
+
+walk_calls_let_argtype env ast registry acc =
+  let nm = head (tail ast)
+  let val = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  let acc1 = walk_calls_for_arg_types env val registry acc
+  let val_ty = infer_type env val
+  let env2 = env_extend_typed env nm 0 val_ty
+  walk_calls_for_arg_types env2 body registry acc1
+
+walk_calls_app_argtype env ast registry acc =
+  let acc1 = walk_app_arg_exprs env ast registry acc
+  let f = innermost_app_f_pre ast
+  if (ast_tag f) != "var" then acc1
+  else
+    let fname = head (tail f)
+    if (reg_lookup registry fname) < 0 then acc1
+    else
+      let args_list = collect_app_args ast []
+      propagate_arg_types_to_callee env fname args_list registry 0 acc1
+
+walk_app_arg_exprs env ast registry acc =
+  if (ast_tag ast) != "app" then acc
+  else
+    let f = head (tail ast)
+    let arg = head (tail (tail ast))
+    let acc1 = walk_calls_for_arg_types env arg registry acc
+    walk_app_arg_exprs env f registry acc1
+
+propagate_arg_types_to_callee env fname args registry i acc =
+  if args == [] then acc
+  else
+    let arg = head args
+    let inferred = infer_type env arg
+    let new_acc = if inferred == "float" then
+                    if (reg_lookup_arg_ty registry fname i) == "int" then
+                      let _ = reg_set_arg_ty_bit registry fname i 1
+                      1
+                    else acc
+                  else acc
+    propagate_arg_types_to_callee env fname (tail args) registry (i + 1) new_acc
 
 -- ============================================================================
 -- contains_call: does an expression contain a function call (or print_show)?
@@ -457,16 +606,32 @@ lower_expr s env ast =
   else lower_expr_scoped s env ast
 
 lower_expr_scoped s env ast =
-  let saved = st_get_live s
+  let saved_live = st_get_live s
+  let saved_fctr = arr_get (st_ctr s) 8
+  let ty = infer_type env ast
   let v = lower_expr_dispatch s env ast
   if (st_get_err s) == 1 then v
   else
-    -- Env-bound vregs (var lookups) keep their live state via env, but
-    -- since lookups don't bump the mask, restore is a no-op for them.
-    -- Fresh allocations done inside `ast` get culled by restore-to-saved.
-    -- The result vreg, if caller-save and fresh, stays live.
-    let _ = st_restore_live s saved v
+    -- Int side: live mask snapshot/restore — see st_restore_live comment.
+    let _ = st_restore_live s saved_live v
+    -- Float side: caller-save d0..d7 are scoped scratch. After dispatch,
+    -- reset ctr[8] to high-water-mark = max(saved, result+1) for float
+    -- results in caller-save range, else just restore saved. This frees
+    -- intermediate caller-save floats for reuse, matching the int pattern.
+    -- Callee-save f8/f9 are preserved across calls explicitly via
+    -- preserve_callee_float; their counter (ctr[9]) is not reset here.
+    let _ = st_restore_float_ctr s saved_fctr v ty
     v
+
+st_restore_float_ctr s saved_fctr v_result ty =
+  if ty != "float" then
+    arr_set (st_ctr s) 8 saved_fctr
+  else if v_result >= 8 then
+    arr_set (st_ctr s) 8 saved_fctr
+  else
+    let need = v_result + 1
+    let new = if saved_fctr > need then saved_fctr else need
+    arr_set (st_ctr s) 8 new
 
 lower_expr_dispatch s env ast =
   let tag = ast_tag ast
@@ -1160,52 +1325,68 @@ lower_call_with_args s env fn_idx args =
   else if n > 4 then st_fail s "lower: >4 arg call not supported in v1"
   else lower_call_n s env fn_idx args n
 
--- Lower each arg into a vreg, preserving across calls as needed,
--- then emit op_call with packed args.
+-- Lower each arg into a vreg per the callee's per-arg types from the registry,
+-- preserving across calls as needed, then emit op_call with packed
+-- arg vregs + arg type bits + ret type bit.
 lower_call_n s env fn_idx args n =
-  let arg_vregs = lower_args_with_preserve s env args
+  let callee_name = reg_idx_to_name (st_registry s) fn_idx
+  let arg_types = collect_arg_types (st_registry s) callee_name n 0 []
+  let arg_vregs = lower_args_with_preserve_typed s env args arg_types
   if (st_get_err s) == 1 then 0 - 1
-  else lower_call_emit s fn_idx arg_vregs n
+  else lower_call_emit s fn_idx arg_vregs arg_types n
 
--- Lower args left-to-right; before each subsequent arg's lowering,
--- preserve previously-lowered caller-save vregs to callee-save if the
--- remaining args contain a call.
-lower_args_with_preserve s env args =
-  lower_args_loop s env args [] []
+collect_arg_types registry callee_name n i acc =
+  if i >= n then reverse acc
+  else
+    let ty = reg_lookup_arg_ty registry callee_name i
+    collect_arg_types registry callee_name n (i + 1) (cons ty acc)
 
-lower_args_loop s env remaining done_vregs done_safe =
+-- Lower args left-to-right per arg_types (int args via lower_expr, float args
+-- via lower_expr_float with int->float promotion). Before each subsequent
+-- arg's lowering, preserve previously-lowered caller-save vregs to callee-save
+-- if the remaining args contain a call. Float vregs go through
+-- preserve_callee_float (caps at 2 callee-save d-slots).
+lower_args_with_preserve_typed s env args arg_types =
+  lower_args_loop_typed s env args arg_types [] []
+
+lower_args_loop_typed s env remaining arg_types done_vregs done_safe =
   if remaining == [] then reverse done_safe
   else
     let arg = head remaining
+    let arg_ty = head arg_types
     let rest = tail remaining
-    let v = lower_expr s env arg
+    let rest_types = tail arg_types
+    let v = if arg_ty == "float" then lower_expr_float s env arg else lower_expr s env arg
     if (st_get_err s) == 1 then []
     else
-      -- If any later arg contains a call, preserve v to callee-save now.
-      let v_safe = if (any_contains_call rest) == 1 then preserve_callee s v else v
-      lower_args_loop s env rest (cons v done_vregs) (cons v_safe done_safe)
+      let v_safe = if (any_contains_call rest) == 1 then
+                     if arg_ty == "float" then preserve_callee_float s v
+                     else preserve_callee s v
+                   else v
+      lower_args_loop_typed s env rest rest_types (cons v done_vregs) (cons v_safe done_safe)
 
 any_contains_call args =
   if args == [] then 0
   else if (contains_call (head args)) == 1 then 1
   else any_contains_call (tail args)
 
-lower_call_emit s fn_idx arg_vregs n =
-  -- Look up callee's ret_type from the registry. For "float" returns,
-  -- allocate a float vreg and emit op_call_fret (captures via fmov f, d0).
-  let ret_ty = reg_lookup_ret_ty (st_registry s) (reg_idx_to_name (st_registry s) fn_idx)
+-- Emit a folded op_call (op_call_fret merged via bit 28). The c slot encodes
+-- arg vregs + per-arg type bits + ret type bit; emit_op_call decodes and
+-- dispatches per-arg int/float moves and int/float return capture.
+lower_call_emit s fn_idx arg_vregs arg_types n =
+  let callee_name = reg_idx_to_name (st_registry s) fn_idx
+  let ret_ty = reg_lookup_ret_ty (st_registry s) callee_name
+  let packed = pack_call_args_typed arg_vregs arg_types n ret_ty
   if ret_ty == "float" then
     let f_dst = st_alloc_float s
     if (st_get_err s) == 1 then f_dst
     else
-      let packed = pack_call_args arg_vregs n
-      let _ = st_emit s op_call_fret f_dst fn_idx packed
+      let _ = st_emit s op_call f_dst fn_idx packed
       f_dst
   else
     let v_dst = st_alloc_caller s
     if (st_get_err s) == 1 then v_dst
     else
-      let packed = pack_call_args arg_vregs n
       let _ = st_emit s op_call v_dst fn_idx packed
       v_dst
 
@@ -1216,11 +1397,19 @@ reg_idx_to_name registry idx =
     if (head (tail entry)) == idx then head entry
     else reg_idx_to_name (tail registry) idx
 
-pack_call_args vregs n =
-  if n == 1 then call_pack_1 (head vregs)
-  else if n == 2 then call_pack_2 (head vregs) (head (tail vregs))
-  else if n == 3 then call_pack_3 (nth_local 0 vregs) (nth_local 1 vregs) (nth_local 2 vregs)
-  else call_pack_4 (nth_local 0 vregs) (nth_local 1 vregs) (nth_local 2 vregs) (nth_local 3 vregs)
+pack_call_args_typed vregs arg_types n ret_ty =
+  let v0 = if n >= 1 then nth_local 0 vregs else 0
+  let v1 = if n >= 2 then nth_local 1 vregs else 0
+  let v2 = if n >= 3 then nth_local 2 vregs else 0
+  let v3 = if n >= 4 then nth_local 3 vregs else 0
+  let t0 = if n >= 1 then ty_bit (nth_local 0 arg_types) else 0
+  let t1 = if n >= 2 then ty_bit (nth_local 1 arg_types) else 0
+  let t2 = if n >= 3 then ty_bit (nth_local 2 arg_types) else 0
+  let t3 = if n >= 4 then ty_bit (nth_local 3 arg_types) else 0
+  let r = if ret_ty == "float" then 1 else 0
+  call_pack_typed n v0 v1 v2 v3 t0 t1 t2 t3 r
+
+ty_bit s = if s == "float" then 1 else 0
 
 nth_local i xs =
   if i == 0 then head xs
@@ -1328,53 +1517,71 @@ lower_fn_body name args body registry pool n_args =
   let _ = arr_set (st_ctr s) 7 n_args
   -- block 0 starts at instruction 0
   let _ = st_set_block_start s (st_reserve_block s)
-  let env = build_arg_env s args body
+  let env = build_arg_env s args body name
   if (st_get_err s) == 1 then mk_err_fn "lower failed during arg setup"
-  else lower_fn_after_args s env body
+  else lower_fn_after_args s env body name
 
--- Bind args. For each arg i (0..n-1), it's initially in v_i (preg x_(i+9)).
--- If body has any call, preserve to callee-save (v10/v11) — but we only
--- have 2 callee-save slots in v1 ABI, so this caps at 2 args-with-calls.
--- For args > 1 that don't need preservation, just bind to v_i.
--- The starting env is seeded with __USERFN_<name>:ret_ty entries so
--- infer_type_app can resolve user fn return types during lowering.
-build_arg_env s args body =
+-- Bind args. Each positional arg has a type from the registry's per-fn
+-- arg_types meta (set by build_registry's fixed-point inference). For each
+-- arg in declaration order, increment EITHER int_slot (for int args) OR
+-- float_slot (for float args). int_slot tracks AAPCS64 x0..x7 consumption,
+-- float_slot tracks d0..d7. They index INDEPENDENTLY per AAPCS64.
+--
+-- Int args bind name to caller-save vreg `int_slot` (preg = x_int_slot+9);
+-- float args bind name to f-vreg `float_slot` (= d_float_slot).
+-- Args used after a call get preserved into callee-save slots (v10/v11 for
+-- ints; f8/f9 for floats; each capped at 2).
+build_arg_env s args body self_name =
   let registry = st_registry s
   let seed_env = seed_env_from_registry registry (env_empty 0)
-  build_arg_env_loop s args body 0 seed_env (contains_call body)
+  build_arg_env_loop s args body 0 seed_env (contains_call body) self_name 0 0
 
-build_arg_env_loop s args body i env body_has_call =
+build_arg_env_loop s args body i env body_has_call self_name int_slot float_slot =
   if args == [] then env
   else
     let arg_name = head args
-    let _ = st_track_reg s i
-    -- Only preserve to callee-save if this specific arg is used AFTER a
-    -- call in the body. Args used only before calls (or as the call's
-    -- own arg) stay in v_i (caller-save). This frees callee slots for
-    -- match-style desugars that bind 2+ vars across recursive calls.
-    if (used_after_call arg_name body 0) == 1 then build_arg_env_preserved s args body i env body_has_call
-    else build_arg_env_no_preserve s args body i env body_has_call
+    let registry = st_registry s
+    let arg_ty = reg_lookup_arg_ty registry self_name i
+    if arg_ty == "float" then build_arg_env_float_param s args body i env body_has_call self_name int_slot float_slot
+    else
+      let _ = st_track_reg s int_slot
+      if (used_after_call arg_name body 0) == 1 then build_arg_env_int_preserved s args body i env body_has_call self_name int_slot float_slot
+      else build_arg_env_int_no_preserve s args body i env body_has_call self_name int_slot float_slot
 
-build_arg_env_preserved s args body i env body_has_call =
+build_arg_env_float_param s args body i env body_has_call self_name int_slot float_slot =
+  let arg_name = head args
+  -- For float params used after a call, preserve into a callee-save slot
+  -- (f8/f9 = d8/d9). Bind name to the safe slot. Bump ctr[8] past
+  -- the original arg slot so subsequent st_alloc_float skips it.
+  if (used_after_call arg_name body 0) == 1 then
+    let f_safe = st_alloc_float_callee s
+    if (st_get_err s) == 1 then env
+    else
+      let _ = st_emit s op_fmov f_safe float_slot 0
+      let env2 = env_extend_typed env arg_name f_safe "float"
+      let _ = arr_set (st_ctr s) 8 (float_slot + 1)
+      build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call self_name int_slot (float_slot + 1)
+  else
+    let env2 = env_extend_typed env arg_name float_slot "float"
+    let _ = arr_set (st_ctr s) 8 (float_slot + 1)
+    build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call self_name int_slot (float_slot + 1)
+
+build_arg_env_int_preserved s args body i env body_has_call self_name int_slot float_slot =
   let arg_name = head args
   let v_safe = st_alloc_callee s
   if (st_get_err s) == 1 then env
   else
-    let _ = st_emit s op_mov v_safe i 0
-    -- Recurse with type from infer (defer; v1 just str if arg-name suggests it).
-    -- For now, default type "int". String args route through lower_call's
-    -- explicit type handling at call sites.
+    let _ = st_emit s op_mov v_safe int_slot 0
     let env2 = env_extend_typed env arg_name v_safe (infer_arg_type arg_name)
-    build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call
+    build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call self_name (int_slot + 1) float_slot
 
-build_arg_env_no_preserve s args body i env body_has_call =
+build_arg_env_int_no_preserve s args body i env body_has_call self_name int_slot float_slot =
   let arg_name = head args
-  -- Lock vN's bit in the live mask so the caller-save allocator doesn't
-  -- clobber the arg-holding register. (Bit 0 / v0 is always reserved
-  -- and not in the bitmask; for v1+, set the bit.)
-  let _ = if i >= 1 then lock_caller s i else 0
-  let env2 = env_extend_typed env arg_name i (infer_arg_type arg_name)
-  build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call
+  -- Lock int_slot's bit in the live mask so the caller-save allocator doesn't
+  -- clobber the arg-holding register. v0 is reserved and not in the mask.
+  let _ = if int_slot >= 1 then lock_caller s int_slot else 0
+  let env2 = env_extend_typed env arg_name int_slot (infer_arg_type arg_name)
+  build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call self_name (int_slot + 1) float_slot
 
 -- Heuristic: arg names starting with `s` or containing `str` -> "str";
 -- otherwise "int". Imperfect but covers common idioms (`s`, `str`, `s1`, etc.).
@@ -1393,16 +1600,16 @@ infer_arg_type name =
   else if name == "func" then "fn"
   else "int"
 
-lower_fn_after_args s env body =
+lower_fn_after_args s env body name =
   -- Determine the body's static type BEFORE lowering — env now has the
   -- registry seed + arg bindings, so infer_type can resolve user fn calls
   -- and float-arg references correctly.
   let body_ty = infer_type env body
   let v_result = lower_expr s env body
   if (st_get_err s) == 1 then mk_err_fn "lower failed (see prior LOWER ERR)"
-  else lower_fn_finalize s v_result body_ty
+  else lower_fn_finalize s v_result body_ty name
 
-lower_fn_finalize s v_result body_ty =
+lower_fn_finalize s v_result body_ty name =
   let ret_op = if body_ty == "float" then op_ret_float else op_ret
   let _ = st_emit s ret_op v_result 0 0
   let n_instr = st_get_instr s
@@ -1411,7 +1618,20 @@ lower_fn_finalize s v_result body_ty =
   let n_args = arr_get (st_ctr s) 7
   let blocks_compact = arr_new n_blocks 0
   let _ = copy_blocks (st_blocks s) blocks_compact n_blocks 0
-  make_fn_n (st_ir s) n_instr n_regs blocks_compact n_args
+  let arg_types_arr = build_arg_types_arr (st_registry s) name n_args
+  make_fn_n_typed (st_ir s) n_instr n_regs blocks_compact n_args arg_types_arr
+
+build_arg_types_arr registry name n_args =
+  let arr = arr_new n_args 0
+  let _ = fill_arg_types_arr registry name arr n_args 0
+  arr
+
+fill_arg_types_arr registry name dst n_args i =
+  if i >= n_args then 0
+  else
+    let bit = if (reg_lookup_arg_ty registry name i) == "float" then 1 else 0
+    let _ = arr_set dst i bit
+    fill_arg_types_arr registry name dst n_args (i + 1)
 
 copy_blocks src dst n i =
   if i >= n then 0

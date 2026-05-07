@@ -166,24 +166,33 @@ emit_const buf off dst imm =
 -- moves. For non-main functions, we emit a NOP in place of the heap-capture
 -- mov so x27 stays equal to the caller's value (= heap, propagated as
 -- callee-save through the str/ldr at offset #32).
-emit_prologue buf fn_start n_args is_main =
+--
+-- Per-arg moves dispatch on arg_types[i]:
+--   int  arg → mov x_preg(int_slot), x_int_slot       (int_slot tracks AAPCS x0..x7)
+--   float arg → fmov d_float_slot,  d_float_slot     (no-op move, kept for size)
+-- int_slot and float_slot index INDEPENDENTLY per AAPCS64 mixed-arg rules.
+emit_prologue buf fn_start n_args is_main arg_types =
   let _ = cb_emit buf       fn_start       inst_stp_fp_lr_pre
   let _ = cb_emit buf (fn_start + 4)  inst_mov_x29_sp
   let _ = cb_emit buf (fn_start + 8)  inst_stp_x19_x20_16
   let _ = cb_emit buf (fn_start + 12) inst_str_x27_32
   let _ = cb_emit buf (fn_start + 16) inst_stp_d8_d9_48
-  -- mov x27, x0 ONLY for main (the JIT entry); else nop so x27 stays
-  -- whatever the caller set it to (= heap by the callee-save chain).
   let cap = if is_main == 1 then enc_mov_reg 27 0 else inst_nop
   let _ = cb_emit buf (fn_start + 20) cap
-  emit_arg_moves buf (fn_start + 24) 0 n_args
+  emit_arg_moves_typed buf (fn_start + 24) 0 n_args arg_types 0 0
 
-emit_arg_moves buf off i n =
+emit_arg_moves_typed buf off i n arg_types int_slot float_slot =
   if i >= n then 0
   else
-    -- mov preg(i), x_i
-    let _ = cb_emit buf off (enc_mov_reg (preg i) i)
-    emit_arg_moves buf (off + 4) (i + 1) n
+    let ty = arr_get arg_types i
+    if ty == 1 then
+      -- float arg in d_float_slot (AAPCS64 places it there); explicit no-op
+      -- fmov for byte-budget regularity.
+      let _ = cb_emit buf off (enc_fmov_d_d float_slot float_slot)
+      emit_arg_moves_typed buf (off + 4) (i + 1) n arg_types int_slot (float_slot + 1)
+    else
+      let _ = cb_emit buf off (enc_mov_reg (preg int_slot) int_slot)
+      emit_arg_moves_typed buf (off + 4) (i + 1) n arg_types (int_slot + 1) float_slot
 
 -- Block-byte-offset lookup, given the function's body start and its
 -- per-instruction body-relative offsets array.
@@ -344,46 +353,50 @@ emit_one buf ir body_start body_offsets blocks fn_offsets i =
     let _ = cb_emit buf (off + 20) enc_ret
     0
 
--- Float-returning variant. Same as op_call but the result capture is
--- `fmov d_a, d0` (`a` is a float vreg, return value is in d0 per AAPCS64).
--- Args are still int (in x0..x3); only the return path differs.
-emit_op_call_fret buf off a b c fn_offsets =
-  let n = call_n_args c
-  let arg0 = call_arg_0 c
-  let arg1 = call_arg_1 c
-  let arg2 = call_arg_2 c
-  let arg3 = call_arg_3 c
-  let _ = if n >= 1 then cb_emit buf       off       (enc_mov_reg 0 (preg arg0)) else 0
-  let _ = if n >= 2 then cb_emit buf (off + 4)  (enc_mov_reg 1 (preg arg1)) else 0
-  let _ = if n >= 3 then cb_emit buf (off + 8)  (enc_mov_reg 2 (preg arg2)) else 0
-  let _ = if n >= 4 then cb_emit buf (off + 12) (enc_mov_reg 3 (preg arg3)) else 0
-  let bl_off = off + 4 * n
-  let target_fn_start = arr_get fn_offsets b
-  let rel = target_fn_start - bl_off
-  let _ = cb_emit buf bl_off (enc_bl_byte_off rel)
-  let _ = cb_emit buf (bl_off + 4) (enc_fmov_d_d a 0)
-  0
-
--- Multi-arg op_call emit. Decodes packed c (n_args + arg vregs), emits:
---   for each i in 0..n-1: mov xi, x_preg(arg_i)
---   bl <target_fn_offset>
---   mov x_preg(dst), x0
+-- Folded multi-arg op_call emit. Decodes packed c slot:
+--   bits 0..3   = n_args (1..4)
+--   bits 4..23  = per-arg vregs (5 bits each)
+--   bits 24..27 = per-arg type bits (0=int, 1=float)
+--   bit  28     = ret type bit (0=int, 1=float; folds the old op_call_fret)
+--
+-- For each arg slot 0..n-1, dispatches per type:
+--   int   → mov x_int_slot,    x_preg(arg_i)        (preg = arg_i + 9)
+--   float → fmov d_float_slot, d_arg_i              (arg_i is the f-vreg = d-reg)
+-- int_slot and float_slot index INDEPENDENTLY per AAPCS64 mixed-arg rules.
+-- After bl, ret type dispatches:
+--   int   ret → mov x_preg(a), x0
+--   float ret → fmov d_a,      d0
 emit_op_call buf off a b c fn_offsets =
   let n = call_n_args c
-  let arg0 = call_arg_0 c
-  let arg1 = call_arg_1 c
-  let arg2 = call_arg_2 c
-  let arg3 = call_arg_3 c
-  let _ = if n >= 1 then cb_emit buf       off       (enc_mov_reg 0 (preg arg0)) else 0
-  let _ = if n >= 2 then cb_emit buf (off + 4)  (enc_mov_reg 1 (preg arg1)) else 0
-  let _ = if n >= 3 then cb_emit buf (off + 8)  (enc_mov_reg 2 (preg arg2)) else 0
-  let _ = if n >= 4 then cb_emit buf (off + 12) (enc_mov_reg 3 (preg arg3)) else 0
+  let _ = emit_call_args buf off c n 0 0 0
   let bl_off = off + 4 * n
   let target_fn_start = arr_get fn_offsets b
   let rel = target_fn_start - bl_off
   let _ = cb_emit buf bl_off (enc_bl_byte_off rel)
-  let _ = cb_emit buf (bl_off + 4) (enc_mov_reg (preg a) 0)
+  let ret_ty = call_ret_type c
+  let cap = if ret_ty == 1 then enc_fmov_d_d a 0 else enc_mov_reg (preg a) 0
+  let _ = cb_emit buf (bl_off + 4) cap
   0
+
+emit_call_args buf off c n i int_slot float_slot =
+  if i >= n then 0
+  else
+    let arg_n = call_arg_n c i
+    let arg_ty = call_arg_type_n c i
+    let inst_off = off + 4 * i
+    if arg_ty == 1 then
+      let _ = cb_emit buf inst_off (enc_fmov_d_d float_slot arg_n)
+      emit_call_args buf off c n (i + 1) int_slot (float_slot + 1)
+    else
+      let _ = cb_emit buf inst_off (enc_mov_reg int_slot (preg arg_n))
+      emit_call_args buf off c n (i + 1) (int_slot + 1) float_slot
+
+-- Back-compat: routes op_call_fret (43) to the folded emit_op_call by
+-- forcing the ret-type bit on. Lower no longer emits this opcode, but
+-- hand-built fixtures may.
+emit_op_call_fret buf off a b c fn_offsets =
+  let c_with_fret = bit_or c (shl 1 28)
+  emit_op_call buf off a b c_with_fret fn_offsets
 
 -- Helper: read slot a/b/c from instruction i. Slot 1=a, 2=b, 3=c.
 ir_op_a_or_b ir i which =
@@ -406,12 +419,13 @@ emit_one_function buf fn_start fn fn_offsets is_main n_fns =
   let ir = fn_ir fn
   let n_instr = fn_ninstr fn
   let n_args = fn_nargs fn
+  let arg_types = fn_arg_types fn
   let blocks = fn_blocks fn
   let body_offsets = compute_body_offsets ir n_instr n_fns
   let body_bytes = arr_get body_offsets n_instr
   let prologue_size = 24 + (4 * n_args)
   let body_start = fn_start + prologue_size
-  let _ = emit_prologue buf fn_start n_args is_main
+  let _ = emit_prologue buf fn_start n_args is_main arg_types
   let _ = emit_loop buf ir body_start body_offsets blocks fn_offsets 0 n_instr
   prologue_size + body_bytes
 

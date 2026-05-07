@@ -1,19 +1,23 @@
 # JIT — continuation roadmap
 
-State at end of session 2026-05-07: branch `jit` on `next`.
-**P4 (floats) shipped 2026-05-07** on top of the 2026-05-06 stack
-(P0 / P1 / P2 / P3-variant / P3-full v1 / P5 / P6).
+State at end of session 2026-05-07 (afternoon): branch `jit` on `next`.
+**P4-arg (float user-fn args) shipped 2026-05-07** on top of the
+P0/P1/P2/P3-variant/P3-full v1/P4/P4-ext/P5/P6 stack. Last named v1
+limit closed.
 
 All baselines hold:
-- `jit/test_lower.rail`: 87 positive + 3 negative (12 new float fixtures).
-- `jit/test_capture.rail`: 23 positive + 1 negative (8 new float fixtures).
+- `jit/test_lower.rail`: 106 positive + 3 negative (6 new float-arg fixtures).
+- `jit/test_capture.rail`: 32 positive + 1 negative (6 new float-arg fixtures).
+- `jit/test_enc.rail`: 22 fixtures.
 - `jit/parity_check.rail`: PARITY OK.
 - `./rail_native test`: 137/137.
 
 DONE CRITERION:
-`try_jit_grade_str "main = print (show (3.14 * 2.0))" "6.28\n"` returns
-`["jit_pass"]`. Same for fadd/fsub/fmul/fdiv, int→float promotion,
-float compare, conditional float (`if cond then f1 else f2`).
+`try_jit_grade_str "area r = 3.14 * r * r\nmain = print (show (area 5.0))" "78.5\n"`
+returns `["jit_pass"]`. Plus float-only `square`, mixed-arg `scaled n r`,
+reverse-mixed `combine r n`, two-float `add2 a b`, and recursive
+`pow b e = if e < 1.0 then 1.0 else b * pow b (e - 1.0)` (cross-call b
+preservation via f8 callee-save + 2-float-arg recursive call).
 
 ---
 
@@ -273,11 +277,7 @@ the corpus may not need captures. Worth profiling first.
 - **~~No cross-call float preservation~~** ✅ LIFTED 2026-05-07. Frame extended 48→64 to add `stp d8, d9, [sp, #48]` callee-save. `preserve_callee_float` emits `op_fmov` to slots f8/f9 (=d8/d9) before any rhs-with-call. v1.5 limit: only 2 float callee-save slots (f8, f9).
 - **~~No `<=` for floats~~** ✅ LIFTED 2026-05-07. Added `op_fle` + `enc_cset_ls`. Uses `ls` cond (not `le`) for NaN-safety.
 - **~~No float-returning user fns~~** ✅ LIFTED 2026-05-07. Registry now tracks ret_type per fn (single-pass forward inference using `infer_type` with the registry-so-far seeded into env). `op_call_fret` (43) captures result via `fmov f_dst, d0`; `op_ret_float` (44) returns via `fmov d0, d_v`. `lower_call_emit` dispatches based on `reg_lookup_ret_ty`; `lower_fn_finalize` chooses `op_ret` vs `op_ret_float` based on `infer_type(body)`.
-- **No float-typed function args.** `build_arg_env` still assumes int args (with str/fn name heuristic). Float args would need:
-  1. Per-arg type detection at fn def (no clear name heuristic for float; inference from body usage is circular for binary ops; call-site inference is forward-only and O(n²)).
-  2. Prologue `fmov d_i, d_i` for float args (currently emits `mov x_i, x_i`).
-  3. Caller-side `fmov d_i, d_arg` for float args in op_call (currently emits `mov x_i, x_arg`).
-  Workaround for v1.5: write fns that take int args and convert internally via `int_to_float`, e.g., `scale n = int_to_float n * 1.5`. Bench programs handle this naturally.
+- **~~No float-typed function args~~** ✅ LIFTED 2026-05-07 (P4-arg). Per-arg type via call-site fixed-point inference (cap 4 iterations). Registry entry shape `[name, idx, meta_arr]` where meta is mutable int_arr: slot 0 = ret_ty bit, slots 1..n = per-arg type bits. `op_call_fret` folded into `op_call` via bit 28 of c-slot; bits 24..27 carry per-arg type bits. AAPCS64 mixed-arg ABI: int_slot and float_slot index INDEPENDENTLY in both prologue arg-bind and caller-side arg moves. `lower_expr_scoped` now also save/restores `ctr[8]` (caller-save float counter) so deeply-nested float expressions don't overflow d0..d7.
 - **`%g` format.** `42.0` prints as `42` (not `42.0`). Common surprise — not a real limit, just a format choice.
 
 ### Bug fix log
@@ -408,17 +408,17 @@ develop other JIT-like substrates.
 
 ## Sequencing recommendation
 
-P0/P1/P2/P3-variant/P3-full v1/P4/P5/P6 shipped. Remaining:
+P0/P1/P2/P3-variant/P3-full v1/P4/P4-ext/P4-arg/P5/P6 shipped. All named
+v1 limits closed. Remaining work is exclusively v2-class:
 
 1. **P3-full v2 (real closure values)** — ~3–4 hr; replaces inline
    substitution with heap-allocated closure records so lambdas can be
    *passed* as args (`map (\x -> ...) xs`). Currently inline-only.
-2. **Float-callee-save** — ~2 hr; supports float values held across
-   function calls via op_float_to_int + op_int_to_float spill, or via
-   d8..d15 callee-save (would need 16-byte frame extension).
-3. **Float-typed user fn returns** — ~1 hr; `is_float` env tracking on
-   user-fn registry so `infer_type_app` knows the return type without
-   the special-case `int_to_float` only branch.
+2. **0-arg user fn calls** — `pi = 3.14` defines but `pi` lowers as a
+   fn_idx materialization, not a call. ~1 hr (extend lower_call to
+   emit n=0 op_call; emit_op_call already supports n>=1 path).
+3. **More than 2 float callee-save slots** — currently caps at f8/f9.
+   Frame would need to grow beyond 64 bytes to add d10..d15.
 
 Continue as bench coverage measurement demands. The JIT path now beats
 shell grade by ~2000× per call, so the bottleneck for distill is
@@ -428,23 +428,25 @@ lowerable shape coverage, not call latency.
 
 ## What's stable today (do NOT regress)
 
-- All 87 positive + 3 negative `test_lower.rail` fixtures (12 new floats).
+- All 106 positive + 3 negative `test_lower.rail` fixtures (6 new float-arg).
 - All 8 hand-built `test_codegen.rail` fixtures.
 - All 5 `test_print.rail` fixtures.
-- 23 `test_capture.rail` fixtures (8 new floats).
-- `test_enc.rail` encoder fixtures.
+- 32 `test_capture.rail` fixtures (6 new float-arg).
+- `test_enc.rail` 22 encoder fixtures.
 - `parity_check.rail`: 11 PARITY OK rows.
 - 137/137 main suite.
 - Stage 5 list ops (cons/head/tail/is_nil + `[a,b,c]`).
 - Match syntax desugar.
 - All cmp/arith/bool ops.
 - Negative-int `op_print_int`.
-- P4 floats: arith / cmp / promotion / printing / if-merge.
-- The ABI-v2 prologue, with **48-byte frame and saved x27**:
-    main: `stp fp/lr -48; mov fp,sp; stp x19/x20 +16; str x27 +32; mov x27,x0; <arg moves>`
-    non-main: same but `mov x27,x0` → `nop`. x27 is callee-save and
-    propagates from main throughout the call chain.
+- P4 floats: arith / cmp / promotion / printing / if-merge / cross-call /
+  float-ret user fns / **mixed int+float user-fn args** (P4-arg).
+- The ABI prologue, with **64-byte frame** (P4-ext) and saved x27 + d8/d9:
+    main: `stp fp/lr -64; mov fp,sp; stp x19/x20 +16; str x27 +32; stp d8/d9 +48; mov x27,x0; <arg moves>`
+    non-main: same but `mov x27,x0` → `nop`. x27 callee-save through chain.
+    Per-arg moves: int → `mov x_int_slot+9, x_int_slot`; float → `fmov d_float_slot, d_float_slot` (no-op move). int_slot/float_slot index INDEPENDENTLY per AAPCS64.
 
-Any change to the prologue, `op_call`'s packed encoding, or the heap
-layout (esp. `cells_offset = 16416` post-P4, `output_offset = 32`,
+Any change to the prologue, `op_call`'s packed encoding (now 29 bits — bits
+0..3 n_args, 4..23 vregs, 24..27 arg-type bits, 28 ret-type bit), or the
+heap layout (esp. `cells_offset = 16416` post-P4, `output_offset = 32`,
 `heap[24..31] = jit_print_float addr`) affects everything.

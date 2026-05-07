@@ -6,6 +6,19 @@ or jump to the stage tag for the relevant chunk.
 
 ---
 
+## P4-arg (COMPLETE — float user-fn args; last named v1 limit closed)
+
+- **jit: float user-fn args via call-site fixed-point inference**
+  - Registry shape: `[name, idx, ret_ty]` → `[name, idx, meta_arr]` where meta is a mutable int_arr; slot 0 = ret_ty bit, slots 1..n = per-arg type bits.
+  - `build_registry` now does initial pass + `fixed_point_arg_types` (cap 4 iterations). Each pass walks every fn body, propagates float arg types into callee registries via `walk_calls_for_arg_types` + `propagate_arg_types_to_callee`, and re-infers ret_ty with updated param types in env.
+  - `op_call_fret` (43) folded into `op_call` (7) via bit 28 of c-slot. Bits 24..27 carry per-arg type bits. New helpers in `ir.rail`: `call_pack_typed`, `call_arg_type_n`, `call_ret_type`, `call_arg_n`. Hand-built fixtures with op_call_fret still work via thin emit_op_call_fret wrapper that forces bit 28.
+  - `emit_op_call` decodes c-slot per-arg: int → `mov x_int_slot, x_preg(arg)`; float → `fmov d_float_slot, d_arg`. After bl, ret-type bit dispatches int (`mov x_preg(a), x0`) vs float (`fmov d_a, d0`) capture. AAPCS64 mixed-arg ABI: int_slot and float_slot index INDEPENDENTLY.
+  - `emit_prologue` reads new `arg_types` slot from fn struct and emits per-arg moves the same way. Same 4-byte-per-arg budget.
+  - `make_fn_n` now stores `arg_types_arr` (default all-int); `make_fn_n_typed` for explicit types. `fn_arg_types` accessor.
+  - `build_arg_env` consults registry's per-arg type. Float params bind name to f-vreg in caller-save range; if used after a call, preserved into f8/f9 (callee-save). Bumps ctr[8] past the param's slot so body's st_alloc_float skips it.
+  - `lower_expr_scoped` now also save/restores `ctr[8]` (caller-save float counter) at expression boundaries. Mirrors the int live-mask scope reset; lets deeply-nested float expressions (recursive pow with cross-call b preservation) reuse d0..d7 as scratch.
+  - 6 new fixtures in test_lower (fa1..fa6) and test_capture (fa_area..fa_pow). DONE CRITERION fixture: `area r = 3.14 * r * r; main = print (show (area 5.0))` → `78.5\n`. Recursive `pow b e = if e < 1.0 then 1.0 else b * pow b (e - 1.0)`; `pow 2.0 3.0` = 8.
+
 ## Stage 5 (PARTIAL — lowering shipped, execution blocked)
 
 - **`93ad7c1` jit: Stage 5 infrastructure (lists/heap/match-pending) + execution blocker**
