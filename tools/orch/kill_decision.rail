@@ -1,0 +1,349 @@
+-- tools/orch/kill_decision.rail — pure Rail σ-laggard kill decision.
+--
+-- Reads N val_loss.tsv files (one per running arm). Each tsv has lines
+-- `<step>\t<val_loss>`. arm_id is derived from the parent directory name
+-- (`runs/<arm_id>/val_loss.tsv`).
+--
+-- Decision algorithm:
+--   1. common_step = min over arms of the last recorded step
+--   2. If common_step < kill_min_step: decision=hold (early training is noisy)
+--   3. Leader = arm with lowest val_loss at common_step
+--   4. σ = population stddev over leader's last `kill_window` val_loss values
+--   5. Each non-leader at common_step: KILL if val_loss > leader_vl + kill_sigma·σ
+--
+-- Output (stdout, KEY=VALUE one per line):
+--   common_step=<S>
+--   decision=hold|kill|keep_all
+--   leader=<arm_id>
+--   leader_val_loss=<X>
+--   leader_sigma=<Y>
+--   kill_threshold=<Z>
+--   kill=<arm_id> <val_loss>      (one per arm to kill)
+--   keep=<arm_id> <val_loss>      (one per arm to keep)
+--
+-- Usage:
+--   kill_decision.rail [--kill_sigma 2.0] [--kill_min_step 500]
+--                      [--kill_window 10] runs/<id1>/val_loss.tsv ...
+
+import "stdlib/list.rail"
+
+cat parts = join "" parts
+
+-- ── String helpers ──────────────────────────────────────────────────
+
+trim_left_cs cs =
+  if length cs == 0 then []
+  else
+    let c = head cs
+    if (c == " ") || (c == "\t") then trim_left_cs (tail cs)
+    else cs
+
+trim s = join "" (reverse (trim_left_cs (reverse (trim_left_cs (chars s)))))
+
+-- ── argv_get for --flag VALUE ───────────────────────────────────────
+
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if length xs == 1 then ""
+  else if (head xs) == key then head (tail xs)
+  else argv_get_loop (tail xs) key
+
+argv_get argv key default_val =
+  let v = argv_get_loop argv key
+  if length (chars v) == 0 then default_val else v
+
+-- Collect positional args (anything not preceded by a `--flag`).
+collect_positionals xs acc =
+  if length xs == 0 then reverse acc
+  else
+    let x = head xs
+    let rest = tail xs
+    if length (chars x) >= 2 then
+      let cs = chars x
+      if (head cs == "-") && (head (tail cs) == "-") then
+        -- this is a flag; skip it AND its value
+        if length rest == 0 then reverse acc
+        else collect_positionals (tail rest) acc
+      else
+        collect_positionals rest (cons x acc)
+    else
+      collect_positionals rest (cons x acc)
+
+-- ── arm_id from path: basename of parent dir ────────────────────────
+-- e.g. "runs/halfB_s5555/val_loss.tsv" → "halfB_s5555"
+
+arm_id_from_path path =
+  let parts = split "/" path
+  let n = length parts
+  if n < 2 then path
+  else nth (n - 2) parts
+
+-- ── Parse TSV → list of [step, val_loss] pairs (each a 2-elem list) ─
+
+parse_tsv_line line =
+  let parts = split "\t" line
+  if length parts < 2 then []
+  else
+    let s_str = trim (head parts)
+    let v_str = trim (head (tail parts))
+    if length (chars s_str) == 0 then []
+    else
+      let s = parse_int s_str
+      let v = parse_float v_str
+      [int_to_float s, v]
+
+parse_tsv_loop lines acc =
+  if length lines == 0 then reverse acc
+  else
+    let line = head lines
+    let rest = tail lines
+    if length (chars line) == 0 then parse_tsv_loop rest acc
+    else
+      let entry = parse_tsv_line line
+      if length entry == 0 then parse_tsv_loop rest acc
+      else parse_tsv_loop rest (cons entry acc)
+
+read_series path =
+  let content = read_file path
+  if is_error content then []
+  else parse_tsv_loop (split "\n" content) []
+
+-- ── Series queries ─────────────────────────────────────────────────
+
+series_last_step series =
+  if length series == 0 then -1
+  else float_to_int (head (head (reverse series)))
+
+-- val_loss at the entry with highest step <= target. -1.0 if none.
+val_loss_at_or_before target series =
+  vl_loop target series (-1.0)
+
+vl_loop target series last_match =
+  if length series == 0 then last_match
+  else
+    let entry = head series
+    let s = float_to_int (head entry)
+    let v = head (tail entry)
+    if s > target then last_match
+    else vl_loop target (tail series) v
+
+-- Last K val_loss values from the series (just the val_loss component).
+take_n n xs =
+  if n <= 0 then []
+  else if length xs == 0 then []
+  else cons (head xs) (take_n (n - 1) (tail xs))
+
+last_k_vls series k =
+  let revd = reverse series
+  let taken = take_n k revd
+  map_vl taken
+
+map_vl entries =
+  if length entries == 0 then []
+  else cons (head (tail (head entries))) (map_vl (tail entries))
+
+-- ── Statistics ──────────────────────────────────────────────────────
+
+-- Cross-function float-return inference is fragile (see val_loss_at_or_before).
+-- Every public-call boundary wraps the return with `0.0 +` to force float context.
+
+sum_floats_loop xs acc =
+  if length xs == 0 then acc
+  else
+    let h = 0.0 + (head xs)
+    sum_floats_loop (tail xs) (acc + h)
+
+sum_floats xs = sum_floats_loop xs 0.0
+
+mean_floats xs =
+  if length xs == 0 then 0.0
+  else
+    let s = 0.0 + (sum_floats xs)
+    s / (int_to_float (length xs))
+
+sq_dev_loop xs m acc =
+  if length xs == 0 then acc
+  else
+    let h = 0.0 + (head xs)
+    let d = h - m
+    sq_dev_loop (tail xs) m (acc + d * d)
+
+stddev_floats xs =
+  let n = length xs
+  if n <= 1 then 0.0
+  else
+    let m = 0.0 + (mean_floats xs)
+    let sq = 0.0 + (sq_dev_loop xs m 0.0)
+    let var = sq / (int_to_float n)
+    sqrt var
+
+-- ── min over int list ──────────────────────────────────────────────
+
+min_int a b = if a < b then a else b
+
+list_min_int xs init =
+  if length xs == 0 then init
+  else list_min_int (tail xs) (min_int init (head xs))
+
+-- ── Build per-arm records: each arm = [arm_id, series] ─────────────
+
+build_arms paths =
+  if length paths == 0 then []
+  else
+    let path = head paths
+    let arm_id = arm_id_from_path path
+    let series = read_series path
+    cons [arm_id, series] (build_arms (tail paths))
+
+-- ── Find leader: arm with lowest val_loss at target step ───────────
+-- Returns the (best_idx, best_vl) pair. Iterates in order.
+
+-- Returns the int index of the leader arm (lowest val_loss at target step), -1 if none.
+-- Returns just an int (not a heterogeneous list) — Rail's float-and-int-in-same-list
+-- return tripped some calling-convention edge.
+find_leader_idx arms target = fl_idx_loop arms target 0 (-1) 1000000.0
+
+fl_idx_loop arms target idx best_idx best_vl =
+  if length arms == 0 then best_idx
+  else
+    let arm = head arms
+    let series = head (tail arm)
+    let vl = 0.0 + (val_loss_at_or_before target series)
+    let valid = vl >= 0.0
+    let no_leader_yet = best_idx < 0
+    let strictly_better = vl < best_vl
+    let new_or_better = no_leader_yet || strictly_better
+    let promote = valid && new_or_better
+    if promote then
+      fl_idx_loop (tail arms) target (idx + 1) idx vl
+    else
+      fl_idx_loop (tail arms) target (idx + 1) best_idx best_vl
+
+-- ── Output construction ────────────────────────────────────────────
+
+decide_per_arm arms target leader_idx threshold idx kill_lines keep_lines =
+  if length arms == 0 then
+    cons (cat ["__kills_marker__"]) (append (reverse kill_lines) (reverse keep_lines))
+  else
+    let arm = head arms
+    let arm_id = head arm
+    let series = head (tail arm)
+    let vl = 0.0 + (val_loss_at_or_before target series)
+    let rest = tail arms
+    if idx == leader_idx then
+      -- leader: skip
+      decide_per_arm rest target leader_idx threshold (idx + 1) kill_lines keep_lines
+    else if vl < 0.0 then
+      -- arm has no data yet at target; can't decide → keep
+      let line = cat ["keep=", arm_id, " no_data_at_step"]
+      decide_per_arm rest target leader_idx threshold (idx + 1) kill_lines (cons line keep_lines)
+    else if vl > threshold then
+      let line = cat ["kill=", arm_id, " ", show_float vl]
+      decide_per_arm rest target leader_idx threshold (idx + 1) (cons line kill_lines) keep_lines
+    else
+      let line = cat ["keep=", arm_id, " ", show_float vl]
+      decide_per_arm rest target leader_idx threshold (idx + 1) kill_lines (cons line keep_lines)
+
+-- ── Top-level decision ─────────────────────────────────────────────
+
+decide arms kill_sigma kill_min_step kill_window =
+  if length arms == 0 then
+    let _ = print "decision=error"
+    let _ = print "reason=no_arms"
+    1
+  else
+    -- last_step per arm
+    let last_steps = build_last_steps arms
+    if has_invalid_step last_steps then
+      let _ = print "decision=error"
+      let _ = print "reason=arm_with_no_data"
+      1
+    else
+      let common_step = list_min_int (tail last_steps) (head last_steps)
+      let _ = print (cat ["common_step=", show common_step])
+      if common_step < kill_min_step then
+        let _ = print "decision=hold"
+        let _ = print (cat ["reason=below_kill_min_step_", show kill_min_step])
+        0
+      else
+        let leader_idx = find_leader_idx arms common_step
+        if leader_idx < 0 then no_leader_path else
+          let leader_arm = nth leader_idx arms
+          let leader_series = head (tail leader_arm)
+          let leader_vl = 0.0 + (val_loss_at_or_before common_step leader_series)
+          decide_with_leader arms common_step leader_idx leader_vl kill_sigma kill_window
+
+no_leader_path =
+  let _ = print "decision=error"
+  let _ = print "reason=no_leader_found"
+  1
+
+decide_with_leader arms common_step leader_idx leader_vl kill_sigma kill_window =
+  let leader_arm = nth leader_idx arms
+  let leader_id = head leader_arm
+  let leader_series = head (tail leader_arm)
+  let last_k = last_k_vls leader_series kill_window
+  let sigma = 0.0 + (stddev_floats last_k)
+  let threshold = leader_vl + kill_sigma * sigma
+  let _ = print (cat ["leader=", leader_id])
+  let _ = print (cat ["leader_val_loss=", show_float leader_vl])
+  let _ = print (cat ["leader_sigma=", show_float sigma])
+  let _ = print (cat ["kill_threshold=", show_float threshold])
+  let result = decide_per_arm arms common_step leader_idx threshold 0 [] []
+  let lines = tail result
+  let kill_count = count_kills lines 0
+  if kill_count > 0 then emit_decision "decision=kill" lines
+  else emit_decision "decision=keep_all" lines
+
+emit_decision label lines =
+  let _ = print label
+  let _ = print_lines lines
+  0
+
+build_last_steps arms =
+  if length arms == 0 then []
+  else
+    let arm = head arms
+    let series = head (tail arm)
+    cons (series_last_step series) (build_last_steps (tail arms))
+
+has_invalid_step xs =
+  if length xs == 0 then false
+  else if head xs < 0 then true
+  else has_invalid_step (tail xs)
+
+count_kills lines acc =
+  if length lines == 0 then acc
+  else
+    let line = head lines
+    let rest = tail lines
+    if str_starts_with_kill line then count_kills rest (acc + 1)
+    else count_kills rest acc
+
+sw_loop pcs scs =
+  if length pcs == 0 then true
+  else if length scs == 0 then false
+  else if head pcs == head scs then sw_loop (tail pcs) (tail scs)
+  else false
+
+str_starts_with_kill s = sw_loop (chars "kill=") (chars s)
+
+print_lines lines =
+  if length lines == 0 then 0
+  else
+    let _ = print (head lines)
+    print_lines (tail lines)
+
+-- ── main ────────────────────────────────────────────────────────────
+
+main =
+  let argv = args
+  let kill_sigma_str = argv_get argv "--kill_sigma" "2.0"
+  let kill_min_step_str = argv_get argv "--kill_min_step" "500"
+  let kill_window_str = argv_get argv "--kill_window" "10"
+  let kill_sigma = parse_float kill_sigma_str
+  let kill_min_step = parse_int kill_min_step_str
+  let kill_window = parse_int kill_window_str
+  let positionals = collect_positionals (tail argv) []
+  let arms = build_arms positionals
+  decide arms kill_sigma kill_min_step kill_window
