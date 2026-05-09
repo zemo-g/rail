@@ -1,0 +1,108 @@
+-- tools/garmin/fuzz_fit_pass2.rail - Pass-2 FIT mutator.
+--
+-- Pass 1 established that the watch's FIT parser does deep validation
+-- before any record-walking - CRC + size + structural-bound + lookup-miss
+-- all checked at file-open. None of the obvious mutations reached the
+-- record processor.
+--
+-- Pass 2 strategy: PRESERVE the integrity gates (valid CRC, valid size,
+-- structural sanity) and corrupt fields INSIDE records. The watch's
+-- baseline.fit cycle showed that a valid file_id record with our serial
+-- number caused the firmware to UPDATE the most-recent activity. We
+-- amplify that signal with hostile values for the file_id fields and
+-- look at WHICH activity / how it gets touched.
+--
+-- Strategies (each preserves all integrity gates):
+--   P2-FID-FUTURE     file_id with time_created in year 2099
+--   P2-FID-PAST       file_id with time_created in year 1980 (FIT epoch underflow)
+--   P2-FID-OTHER-SN   file_id with a serial_number that doesn't match this watch
+--   P2-FID-WRONG-PRD  file_id with product=0 or product=0xFFFF
+--   P2-FID-MAX        file_id with EVERY uint field = 0xFFFFFFFF
+--   P2-FID-WRONG-MFG  file_id with manufacturer = 0 (not Garmin)
+--   P2-FID-TYPE-EDGE  file_id with type byte = 0x00 (invalid) and 0xFF (max)
+--   P2-EMPTY          a structurally valid FIT with ZERO data records
+--                     after the definition - just header + def + crc
+--
+-- All output files have correct CRC + correct data_size + valid structure.
+-- These should pass the integrity gates and reach the record processor.
+
+import "stdlib/fit_emit.rail"
+
+-- Field definitions for a standard file_id record (5 fields, 13 bytes body):
+--   field 3 (uint32z): serial_number   (4 bytes)
+--   field 4 (uint32):  time_created    (4 bytes)
+--   field 1 (uint16):  manufacturer    (2 bytes)
+--   field 2 (uint16):  product         (2 bytes)
+--   field 0 (enum):    type            (1 byte)
+file_id_fields _ =
+  let f5 = cons (fe_field 0 1 0) []
+  let f4 = cons (fe_field 2 2 132) f5
+  let f3 = cons (fe_field 1 2 132) f4
+  let f2 = cons (fe_field 4 4 134) f3
+  cons (fe_field 3 4 140) f2
+
+emit_file_id_payload s serial time_created manufacturer product type_byte =
+  let _ = fe_write_u32_le s serial
+  let _ = fe_write_u32_le s time_created
+  let _ = fe_write_u16_le s manufacturer
+  let _ = fe_write_u16_le s product
+  let _ = fe_write_u8 s type_byte
+  0
+
+-- Build a complete valid FIT with one custom file_id record.
+build_one path serial time_created manufacturer product type_byte =
+  let s = fe_new 256
+  let _ = fe_emit_header s 0
+  let _ = fe_emit_def s 0 0 0 (file_id_fields 0)
+  let _ = fe_write_u8 s 0      -- data record header (data, local_id 0)
+  let _ = emit_file_id_payload s serial time_created manufacturer product type_byte
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+-- Build an "empty" FIT: just header + definition + CRC, no data records.
+build_empty path =
+  let s = fe_new 256
+  let _ = fe_emit_header s 0
+  let _ = fe_emit_def s 0 0 0 (file_id_fields 0)
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+main =
+  let argv = args
+  let out_dir = if length argv >= 2 then head (tail argv)
+                else "/Users/user/garmin_recon/fuzz/fit_corpus_p2"
+  let _ = shell (cat ["mkdir -p '", out_dir, "'"])
+  let _ = print (cat ["pass-2 corpus -> ", out_dir])
+  -- Reference values:
+  --   our_serial = 3422906732 (matches device unit ID per GarminDevice.xml)
+  --   garmin_mfg = 1
+  --   instinct_product = 3126
+  --   activity_type = 4
+  --   normal time = ~ 1745000000 (a 2025 unix epoch, in normal range)
+  let _ = build_one (cat [out_dir, "/p2_fid_future.fit"]) 3422906732 4079542400 1 3126 4
+  -- year ~2099: unix 4079542400. But FIT time = unix - 631065600 epoch shift,
+  -- so to inject "future" we just use a valid uint32 in the FIT-time range
+  -- corresponding to far future
+  let _ = print "  p2_fid_future.fit (time_created = year 2099-ish FIT epoch)"
+  let _ = build_one (cat [out_dir, "/p2_fid_past.fit"]) 3422906732 0 1 3126 4
+  let _ = print "  p2_fid_past.fit (time_created = 0 = FIT epoch start = 1989)"
+  let _ = build_one (cat [out_dir, "/p2_fid_other_sn.fit"]) 1234567890 1145000000 1 3126 4
+  let _ = print "  p2_fid_other_sn.fit (foreign serial number)"
+  let _ = build_one (cat [out_dir, "/p2_fid_wrong_prd.fit"]) 3422906732 1145000000 1 65535 4
+  let _ = print "  p2_fid_wrong_prd.fit (product = 0xFFFF)"
+  let _ = build_one (cat [out_dir, "/p2_fid_max.fit"]) 4294967295 4294967295 65535 65535 255
+  let _ = print "  p2_fid_max.fit (every field maxed out)"
+  let _ = build_one (cat [out_dir, "/p2_fid_wrong_mfg.fit"]) 3422906732 1145000000 0 3126 4
+  let _ = print "  p2_fid_wrong_mfg.fit (manufacturer = 0)"
+  let _ = build_one (cat [out_dir, "/p2_fid_type_zero.fit"]) 3422906732 1145000000 1 3126 0
+  let _ = print "  p2_fid_type_zero.fit (type byte = 0)"
+  let _ = build_one (cat [out_dir, "/p2_fid_type_max.fit"]) 3422906732 1145000000 1 3126 255
+  let _ = print "  p2_fid_type_max.fit (type byte = 0xFF)"
+  let _ = build_empty (cat [out_dir, "/p2_empty.fit"])
+  let _ = print "  p2_empty.fit (header + def + CRC, zero data records)"
+  -- Sanity: also include a clean baseline so the user can re-validate the harness
+  let _ = build_one (cat [out_dir, "/p2_clean_baseline.fit"]) 3422906732 1145000000 1 3126 4
+  let _ = print "  p2_clean_baseline.fit (valid file_id with our serial; control)"
+  0

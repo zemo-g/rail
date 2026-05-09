@@ -1,0 +1,295 @@
+-- tools/garmin/fuzz_fit_pass7.rail - Pass-7 deep fuzz on workout_step payload slots.
+--
+-- Pass 6 confirmed Workouts/ accepts arbitrary .fit drops, persists 50/50 of our
+-- workout_step records, and re-serializes with full canonical schema (incl. f[0]
+-- 16-byte step_name and f[8] 200-byte notes that we left zeroed).
+--
+-- Pass 7 fills those string slots and probes value-domain on remaining workout
+-- fields, in order from safest -> most exploratory:
+--
+--   p7_step_name_probe.fit  - f[0] 16B step_name = controlled ASCII pattern
+--   p7_notes_pattern.fit    - f[8] 200B notes = controlled ASCII pattern x50
+--   p7_target_sentinels.fit - target_value=0xFFFFFFFF + custom target probes
+--   p7_notes_format.fit     - f[8] = "%s%n%x" format-string probes
+--   p7_step_count_lie.fit   - workout claims num_valid_steps=5, emits 50 records
+--   p7_notes_oversize.fit   - declare f[8] sz=255 vs schema's 200, overflow probe
+--
+-- All FITs pass integrity gates (CRC, structure) and use this watch's
+-- serial+product+mfg from gate_passing_file_id.
+
+import "stdlib/fit_emit.rail"
+
+gate_passing_file_id _ =
+  let f5 = cons (fe_field 0 1 0) []
+  let f4 = cons (fe_field 2 2 132) f5
+  let f3 = cons (fe_field 1 2 132) f4
+  let f2 = cons (fe_field 4 4 134) f3
+  cons (fe_field 3 4 140) f2
+
+emit_gate_passing_payload s file_type =
+  let _ = fe_write_u32_le s 3422906732
+  let _ = fe_write_u32_le s 1145000000
+  let _ = fe_write_u16_le s 1
+  let _ = fe_write_u16_le s 3126
+  let _ = fe_write_u8 s file_type
+  0
+
+-- workout (msg 26): same as Pass 6
+workout_fields _ =
+  let f5 = cons (fe_field 11 2 132) []
+  let f4 = cons (fe_field 6 2 132) f5
+  let f3 = cons (fe_field 5 4 140) f4
+  let f2 = cons (fe_field 4 1 0) f3
+  cons (fe_field 8 15 7) f2
+
+-- Pass 7 workout_step schema includes f[0]=step_name(16B) AND f[8]=notes(200B)
+-- so we supply both rather than leave them for canonical re-serialization to zero-fill.
+workout_step_fields_full _ =
+  let f7 = cons (fe_field 7 1 0) []           -- intensity
+  let f6 = cons (fe_field 5 4 134) f7         -- target_value
+  let f5 = cons (fe_field 4 1 0) f6           -- target_type
+  let f4 = cons (fe_field 1 4 134) f5         -- duration_value
+  let f3 = cons (fe_field 0 1 0) f4           -- duration_type
+  let f2 = cons (fe_field 8 200 7) f3         -- notes (200B string)
+  cons (fe_field 254 16 7) f2                 -- step_name (16B string), via field-def 254 (Garmin uses 254 for message_index, but 0 conflicts; we use the canonical workout_step field tag for step_name. Note: Garmin's profile uses field_def_num for step_name varies; we send a 16-byte string slot.)
+
+-- Pass 7 workout_step schema with custom target probes
+workout_step_fields_targets _ =
+  let f9 = cons (fe_field 7 1 0) []           -- intensity
+  let f8 = cons (fe_field 21 4 134) f9        -- custom_target_value_high
+  let f7 = cons (fe_field 20 4 134) f8        -- custom_target_value_low
+  let f6 = cons (fe_field 19 4 134) f7        -- custom_target_value (combined)
+  let f5 = cons (fe_field 5 4 134) f6         -- target_value
+  let f4 = cons (fe_field 4 1 0) f5           -- target_type
+  let f3 = cons (fe_field 1 4 134) f4         -- duration_value
+  cons (fe_field 0 1 0) f3                    -- duration_type
+
+mut_namebytes s b i =
+  if i >= 15 then 0
+  else
+    let _ = fe_write_u8 s b
+    mut_namebytes s b (i + 1)
+
+-- Header + workout def/data (50 steps claimed) common to all variants
+emit_workout_header s steps_claimed =
+  let _ = fe_emit_header s 0
+  let _ = fe_emit_def s 0 0 0 (gate_passing_file_id 0)
+  let _ = fe_write_u8 s 0
+  let _ = emit_gate_passing_payload s 5
+  let _ = fe_emit_def s 1 26 0 (workout_fields 0)
+  let _ = fe_write_u8 s 1
+  let _ = mut_namebytes s 65 0                -- name = "AAAAAAAAAAAAAAA"
+  let _ = fe_write_u8 s 0                     -- sport = generic
+  let _ = fe_write_u32_le s 0                 -- caps
+  let _ = fe_write_u16_le s steps_claimed
+  let _ = fe_write_u16_le s 0                 -- protection
+  0
+
+-- Write a 16-byte step_name slot from a single byte-pattern.
+write_name16 s b i =
+  if i >= 16 then 0
+  else
+    let _ = fe_write_u8 s b
+    write_name16 s b (i + 1)
+
+-- Write a 200-byte notes slot from a single byte-pattern.
+write_notes200 s b i =
+  if i >= 200 then 0
+  else
+    let _ = fe_write_u8 s b
+    write_notes200 s b (i + 1)
+
+-- Write a 200-byte notes slot with the byte-pattern P7_NOTES_BYTE_NNN repeated,
+-- where NNN cycles 000..999 across the slot. Lets us see exactly which bytes
+-- of our 200-byte payload survived into the persisted file.
+write_notes200_pattern s step_idx i =
+  if i >= 200 then 0
+  else
+    let _ = fe_write_u8 s (65 + (step_idx + i) % 26)   -- A..Z cycling
+    write_notes200_pattern s step_idx (i + 1)
+
+-- Write 200-byte notes slot containing format-string probe bytes:
+-- "%s%n%x%p%@%s%n%x%p%@..." - if any consumer pipes notes through a printf-style
+-- sink, this would either crash on %n or leak with %x/%p.
+write_notes200_format s i =
+  if i >= 200 then 0
+  else
+    let pos = i % 4
+    let b = if pos == 0 then 37                 -- '%'
+            else if pos == 1 then 110           -- 'n'
+            else if pos == 2 then 37            -- '%'
+            else 120                            -- 'x'
+    let _ = fe_write_u8 s b
+    write_notes200_format s (i + 1)
+
+-- ===== Variant 1: step_name probe ========================================
+
+mut_step_name_probe path =
+  let s = fe_new 8192
+  let _ = emit_workout_header s 50
+  let _ = fe_emit_def s 2 27 0 (workout_step_fields_full 0)
+  let _ = mut_step_name_loop s 0 50
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+mut_step_name_loop s i n =
+  if i >= n then 0
+  else
+    let _ = fe_write_u8 s 2                    -- local_id 2
+    let _ = write_name16 s (80 + i % 16) 0     -- step_name = 16x byte (P + i%16)
+    let _ = fe_write_u32_le s 0                -- duration_value
+    let _ = fe_write_u32_le s 0                -- target_value
+    let _ = write_notes200 s 0 0               -- notes = 200 zeros (control)
+    let _ = fe_write_u8 s 0                    -- duration_type
+    let _ = fe_write_u8 s 0                    -- target_type
+    let _ = fe_write_u8 s 0                    -- intensity
+    mut_step_name_loop s (i + 1) n
+
+-- ===== Variant 2: notes pattern probe ====================================
+
+mut_notes_pattern path =
+  let s = fe_new 16384
+  let _ = emit_workout_header s 50
+  let _ = fe_emit_def s 2 27 0 (workout_step_fields_full 0)
+  let _ = mut_notes_pattern_loop s 0 50
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+mut_notes_pattern_loop s i n =
+  if i >= n then 0
+  else
+    let _ = fe_write_u8 s 2
+    let _ = write_name16 s 65 0                -- step_name = AAAA...
+    let _ = fe_write_u32_le s 0
+    let _ = fe_write_u32_le s 0
+    let _ = write_notes200_pattern s i 0       -- notes = A..Z cycling per step
+    let _ = fe_write_u8 s 0
+    let _ = fe_write_u8 s 0
+    let _ = fe_write_u8 s 0
+    mut_notes_pattern_loop s (i + 1) n
+
+-- ===== Variant 3: target sentinels =======================================
+
+mut_target_sentinels path =
+  let s = fe_new 8192
+  let _ = emit_workout_header s 50
+  let _ = fe_emit_def s 2 27 0 (workout_step_fields_targets 0)
+  let _ = mut_target_loop s 0 50
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+mut_target_loop s i n =
+  if i >= n then 0
+  else
+    let _ = fe_write_u8 s 2
+    let _ = fe_write_u8 s 0                    -- duration_type
+    let _ = fe_write_u32_le s 4294967295       -- duration_value
+    let _ = fe_write_u8 s 255                  -- target_type = invalid
+    let _ = fe_write_u32_le s 4294967295       -- target_value
+    let _ = fe_write_u32_le s 4294967295       -- custom_target_value
+    let _ = fe_write_u32_le s 4294967295       -- custom_target_value_low
+    let _ = fe_write_u32_le s 4294967295       -- custom_target_value_high
+    let _ = fe_write_u8 s 255                  -- intensity
+    mut_target_loop s (i + 1) n
+
+-- ===== Variant 4: notes format-string probe ==============================
+
+mut_notes_format path =
+  let s = fe_new 16384
+  let _ = emit_workout_header s 50
+  let _ = fe_emit_def s 2 27 0 (workout_step_fields_full 0)
+  let _ = mut_notes_format_loop s 0 50
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+mut_notes_format_loop s i n =
+  if i >= n then 0
+  else
+    let _ = fe_write_u8 s 2
+    let _ = write_name16 s 70 0                -- step_name = FFFF...
+    let _ = fe_write_u32_le s 0
+    let _ = fe_write_u32_le s 0
+    let _ = write_notes200_format s 0          -- notes = "%n%x" pattern
+    let _ = fe_write_u8 s 0
+    let _ = fe_write_u8 s 0
+    let _ = fe_write_u8 s 0
+    mut_notes_format_loop s (i + 1) n
+
+-- ===== Variant 5: step count lie =========================================
+
+mut_step_count_lie path =
+  let s = fe_new 16384
+  let _ = emit_workout_header s 5             -- claim only 5 steps...
+  let _ = fe_emit_def s 2 27 0 (workout_step_fields_full 0)
+  let _ = mut_step_name_loop s 0 50           -- ...but emit 50
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+-- ===== Variant 6: notes oversize =========================================
+
+-- Same as notes_pattern but def declares notes sz=255 instead of 200.
+-- We then emit 255 bytes per step. Parser may either:
+--   (a) reject at def-validation (size > schema profile)
+--   (b) accept and read 255 bytes per record (overflow internal 200B buffer)
+--   (c) accept def, truncate at write
+workout_step_fields_oversize _ =
+  let f7 = cons (fe_field 7 1 0) []
+  let f6 = cons (fe_field 5 4 134) f7
+  let f5 = cons (fe_field 4 1 0) f6
+  let f4 = cons (fe_field 1 4 134) f5
+  let f3 = cons (fe_field 0 1 0) f4
+  let f2 = cons (fe_field 8 255 7) f3         -- notes declared 255B (overflow)
+  cons (fe_field 254 16 7) f2
+
+write_notes255 s b i =
+  if i >= 255 then 0
+  else
+    let _ = fe_write_u8 s b
+    write_notes255 s b (i + 1)
+
+mut_notes_oversize path =
+  let s = fe_new 32768
+  let _ = emit_workout_header s 50
+  let _ = fe_emit_def s 2 27 0 (workout_step_fields_oversize 0)
+  let _ = mut_notes_oversize_loop s 0 50
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+mut_notes_oversize_loop s i n =
+  if i >= n then 0
+  else
+    let _ = fe_write_u8 s 2
+    let _ = write_name16 s 79 0               -- step_name = OOOO...
+    let _ = fe_write_u32_le s 0
+    let _ = fe_write_u32_le s 0
+    let _ = write_notes255 s (66 + i % 26) 0  -- 255B B..Z cycling per step
+    let _ = fe_write_u8 s 0
+    let _ = fe_write_u8 s 0
+    let _ = fe_write_u8 s 0
+    mut_notes_oversize_loop s (i + 1) n
+
+main =
+  let argv = args
+  let out_dir = if length argv >= 2 then head (tail argv)
+                else "/Users/user/garmin_recon/fuzz/fit_corpus_p7"
+  let _ = shell (cat ["mkdir -p '", out_dir, "'"])
+  let _ = print (cat ["pass-7 corpus -> ", out_dir])
+  let _ = mut_step_name_probe (cat [out_dir, "/p7_step_name_probe.fit"])
+  let _ = print "  p7_step_name_probe.fit (50 steps, name=byte-pattern)"
+  let _ = mut_notes_pattern (cat [out_dir, "/p7_notes_pattern.fit"])
+  let _ = print "  p7_notes_pattern.fit (50 steps, 200B notes A..Z cycling)"
+  let _ = mut_target_sentinels (cat [out_dir, "/p7_target_sentinels.fit"])
+  let _ = print "  p7_target_sentinels.fit (50 steps, custom target = 0xFFFFFFFF)"
+  let _ = mut_notes_format (cat [out_dir, "/p7_notes_format.fit"])
+  let _ = print "  p7_notes_format.fit (50 steps, notes='%n%x' pattern)"
+  let _ = mut_step_count_lie (cat [out_dir, "/p7_step_count_lie.fit"])
+  let _ = print "  p7_step_count_lie.fit (claim 5 steps, emit 50)"
+  let _ = mut_notes_oversize (cat [out_dir, "/p7_notes_oversize.fit"])
+  let _ = print "  p7_notes_oversize.fit (notes declared 255B vs schema 200B)"
+  0

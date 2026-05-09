@@ -1,0 +1,97 @@
+-- tools/garmin/disasm.rail - Disassemble a region of an extracted firmware
+-- blob using the pure-Rail Thumb-2 decoder.
+--
+-- Usage:
+--   ./rail_native run tools/garmin/disasm.rail <bin> <hex-start-addr> <count>
+
+import "stdlib/gcd.rail"
+import "stdlib/thumb2.rail"
+
+-- Parse a hex string ("0xC304" or "C304") into an int. Stops at first non-hex.
+hex_digit_val c =
+  if c >= 48 && c <= 57 then c - 48
+  else if c >= 97 && c <= 102 then c - 87
+  else if c >= 65 && c <= 70 then c - 55
+  else 0 - 1
+
+parse_hex_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = hex_digit_val (char_to_int (head cs))
+    if d < 0 then acc
+    else parse_hex_acc (tail cs) (acc * 16 + d)
+
+parse_hex s =
+  let cs = chars s
+  if length cs == 0 then 0
+  else if (length cs >= 2) && (head cs == "0") && ((head (tail cs)) == "x") then
+    parse_hex_acc (tail (tail cs)) 0
+  else parse_hex_acc cs 0
+
+-- Slurp ONLY a [start, start+len) byte range from `path`. Uses dd via shell
+-- so we never run chars on the entire (potentially multi-MB) file. Output
+-- is hex-decoded into a fresh arr; absolute addresses in the disassembly
+-- correspond to the original file offsets, so the byte buffer's logical
+-- index 0 corresponds to file offset `start`.
+read_range path start length =
+  let cmd = cat ["dd if='", path, "' bs=1 skip=", show start,
+                 " count=", show length, " status=none 2>/dev/null | xxd -p | tr -d '\n'"]
+  let hex = shell cmd
+  let cs = chars hex
+  let arr = arr_new length 0
+  let _ = gcd_hex_decode_n cs arr 0 length
+  arr
+
+main =
+  let argv = args
+  if length argv < 4 then
+    let _ = print "usage: rail_native run tools/garmin/disasm.rail <bin> <hex-addr> <count-instructions>"
+    1
+  else
+    let path = head (tail argv)
+    let addr_str = head (tail (tail argv))
+    let count_str = head (tail (tail (tail argv)))
+    let addr = parse_hex addr_str
+    let count = gcd_parse_uint count_str
+    -- Read up to count*4 bytes (every Thumb-2 inst is 2 or 4 bytes).
+    let span = count * 4 + 16
+    let buf_local = read_range path addr span
+    -- t2_disasm expects buf indexed by absolute address. Offset by `addr`
+    -- so reads work: simulate via a dispatch buffer that only has the
+    -- slice. We re-implement the loop using base=addr and an indirection.
+    t2_disasm_loop_offset buf_local addr (addr + span) count addr 0
+
+-- Variant of t2_disasm that takes a slice loaded at `slice_origin` (so
+-- buf index = absolute_address - slice_origin). t2_decode computes branch
+-- targets relative to its `off` argument; since we feed a local offset,
+-- targets must have slice_origin added back to land in absolute address
+-- space.
+t2_disasm_loop_offset buf slice_origin limit max addr i =
+  if i >= max then 0
+  else if addr >= limit then 0
+  else
+    let local_off = addr - slice_origin
+    let r = t2_decode buf local_off
+    let length_b = arr_get r 2
+    let kind = arr_get r 0
+    let target_local = arr_get r 1
+    let op_hi = arr_get r 3
+    let op_lo = arr_get r 4
+    -- Adjust branch targets back into absolute address space. Kinds 1/2/3/4/5/9
+    -- all carry valid PC-relative targets in result[1] - even when the local
+    -- value is negative (slice didn't start at 0).
+    let is_branch = (kind == 1) || (kind == 2) || (kind == 3) || (kind == 4) || (kind == 5) || (kind == 9)
+    let target = if is_branch then target_local + slice_origin
+                 else target_local
+    let bytes_str = if length_b == 2 then t2_hex4 op_hi
+                    else cat [t2_hex4 op_hi, " ", t2_hex4 op_lo]
+    let mnem = if kind == 2 then cat ["b.", t2_cond_name op_lo, "  "]
+               else if kind == 5 then cat ["b.", t2_cond_name (bit_and (shr op_hi 6) 15), ".w"]
+               else t2_kind_name kind
+    let operand = if target >= 0 then cat ["0x", t2_hex8 target]
+                  else if kind == 6 then cat ["r", show (bit_and (shr op_hi 3) 15)]
+                  else if kind == 7 || kind == 8 then "{...}"
+                  else ""
+    let _ = print (cat ["0x", t2_hex8 addr, "  ", bytes_str, "  ", mnem, " ", operand])
+    if local_off + length_b > arr_len buf then 0
+    else t2_disasm_loop_offset buf slice_origin limit max (addr + length_b) (i + 1)
