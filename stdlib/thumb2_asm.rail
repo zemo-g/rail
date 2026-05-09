@@ -1,0 +1,328 @@
+-- stdlib/thumb2_asm.rail - Symbolic two-pass Thumb-2 assembler.
+--
+-- Sits on top of stdlib/thumb2_emit.rail. The encoder takes raw operand
+-- ints; this module lets the caller write something more like asm:
+-- declare a label at the current emit-pointer, emit instructions that
+-- branch to or load from labels, and have the assembler walk the
+-- two passes needed to resolve the addresses.
+--
+-- Why two passes: 16-bit B has +/-2046 range; 32-bit B.W has +/-16 MB
+-- range; BL is +/-16 MB; LDR PC-rel reaches 0..1020 forward. Whether
+-- a forward branch can use a 16-bit form depends on the resolved
+-- distance, which depends on intervening code size, which depends on
+-- whether other branches use 16- or 32-bit forms. Pass 1 over-estimates
+-- (always uses 32-bit forms for forward refs), gets exact size; pass 2
+-- re-walks with known label offsets, choosing the tightest encoding.
+--
+-- Usage:
+--   let asm = asm_new base_addr
+--   let _ = asm_label asm "main"
+--   let _ = asm_ins asm (mk_movw 0 0x7024)
+--   let _ = asm_ins asm (mk_movt 0 0x4004)
+--   let _ = asm_ins asm (mk_bl_label "init")
+--   let _ = asm_ins asm (mk_b_label "main")  -- backward; can use 16-bit
+--   let _ = asm_label asm "init"
+--   ...
+--   let _ = asm_finalize asm   -- runs pass 2, emits to internal buffer
+--   let buf = asm_buf asm
+--   let n   = asm_size asm
+--
+-- Internal layout of `asm` (an arr-of-arr):
+--   [0] base_addr (the address where buf[0] will live in flash)
+--   [1] buf (mutable byte buffer)
+--   [2] cur_off  (next-write offset into buf)
+--   [3] capacity (buf size)
+--   [4] insts    (list of instruction records, each itself an arr)
+--   [5] labels   (parallel arrs: name + offset)
+--   [6] label_count
+--   [7] label_capacity
+--   [8] finalized (0/1)
+--
+-- An instruction record (entry in insts) is:
+--   [0] kind      string mnemonic ("b", "bl", "bcond", "movw", ...)
+--   [1] op0..op4  five operand slots, ints. For label-referencing
+--                 instructions, the label is stored in the labels
+--                 table and op0 is its index there.
+--   The encoded length and final form (16- vs 32-bit) is decided in
+--   pass 2.
+--
+-- All numeric kind codes:
+--   0 RAW16  op0 = 16-bit value to emit verbatim
+--   1 RAW32  op0/op1 = hi/lo halfwords
+--   2 B_LBL  op0 = label index, must resolve to within +/-16 MB
+--   3 BL_LBL op0 = label index
+--   4 BCOND_LBL op0 = label index, op1 = cond
+--   5 BX_REG  op0 = Rm
+--   6 PUSH    op0 = reglist8, op1 = lr-bit
+--   7 POP     op0 = reglist8, op1 = pc-bit
+--   8 NOP
+--   9 MOVS_IMM8  op0 = Rd, op1 = imm8
+--  10 ADDS_IMM8  op0 = Rd, op1 = imm8
+--  11 SUBS_IMM8  op0 = Rd, op1 = imm8
+--  12 CMP_IMM8   op0 = Rd, op1 = imm8
+--  13 LDR_PC     op0 = Rt, op1 = pool index (resolved to imm8 in pass 2)
+--  14 MOV_REG    op0 = Rd, op1 = Rm
+--  15 MOVW       op0 = Rd, op1 = imm16
+--  16 MOVT       op0 = Rd, op1 = imm16
+--  17 LDR_W      op0 = Rt, op1 = Rn, op2 = imm12
+--  18 STR_W      op0 = Rt, op1 = Rn, op2 = imm12
+--
+-- For brevity the v0 assembler resolves only labels in branch targets;
+-- a literal-pool resolver for LDR_PC is sketched but emitted only when
+-- the caller uses asm_pool_const to register a constant.
+
+import "stdlib/thumb2_emit.rail"
+
+-- ---- Label table -------------------------------------------------------
+
+asm_new base_addr =
+  let s = arr_new 9 0
+  let _ = arr_set s 0 base_addr
+  let _ = arr_set s 1 (arr_new 16384 0)  -- buf (16 KB; bigger than typical Cortex-M payload)
+  let _ = arr_set s 2 0                  -- cur_off (also: inst_count * 6 pre-finalize)
+  let _ = arr_set s 3 16384
+  let _ = arr_set s 4 (arr_new 12288 0)  -- insts: 6 slots per inst -> 2048 insts
+  let _ = arr_set s 5 (arr_new 256 0)    -- label_offsets
+  let _ = arr_set s 6 0                  -- label_count
+  let _ = arr_set s 7 256                -- label_capacity
+  let _ = arr_set s 8 0
+  s
+
+asm_base s = arr_get s 0
+asm_buf s = arr_get s 1
+asm_cur_off s = arr_get s 2
+asm_capacity s = arr_get s 3
+asm_insts s = arr_get s 4
+asm_labels s = arr_get s 5
+asm_label_count s = arr_get s 6
+asm_inst_count_ref s = s   -- not used; insts grow via cur_off
+
+-- A label is a name -> offset mapping. We don't store names (string
+-- equality is awkward); we use INT label IDs and the caller tracks
+-- their own name -> id table. Label `i` lives at offsets[i].
+-- Use sentinel value -1 for "not yet defined".
+
+-- asm_decl_label: declare a fresh label, get back its id. Initially
+-- "unbound" (sentinel -1). The labels arr stores INST-INDEX values
+-- after asm_label_here, NOT byte offsets — pass-1 layout resolves them
+-- to byte offsets.
+asm_decl_label s =
+  let n = arr_get s 6
+  let _ = arr_set (arr_get s 5) n (0 - 1)
+  let _ = arr_set s 6 (n + 1)
+  n
+
+-- asm_label_here: bind label `id` to the offset of the NEXT instruction
+-- to be queued. We record the current inst count; layout converts that
+-- to a byte offset.
+asm_label_here s id =
+  let next_inst_index = asm_inst_count s
+  let _ = arr_set (arr_get s 5) id next_inst_index
+  0
+
+-- Legacy: explicit offset binding (still useful for raw-data labels).
+asm_define_label s id offset_or_index =
+  let _ = arr_set (arr_get s 5) id offset_or_index
+  0
+
+-- After pass-1 layout, label_offset is meaningful (byte offset). Before:
+-- it's an inst-index sentinel.
+asm_label_offset s id = arr_get (arr_get s 5) id
+
+-- ---- Instruction queueing ---------------------------------------------
+-- `insts` arr stores 6-int records: [kind, op0, op1, op2, op3, est_len]
+-- We size insts at 256 records of 6 ints = 1536 ints.
+
+asm_inst_count s = arr_get s 2 / 6   -- cur_off doubles as inst count *6
+
+asm_push_inst s kind op0 op1 op2 op3 est_len =
+  let n = asm_inst_count s
+  let arr = arr_get s 4
+  let base = n * 6
+  let _ = arr_set arr (base + 0) kind
+  let _ = arr_set arr (base + 1) op0
+  let _ = arr_set arr (base + 2) op1
+  let _ = arr_set arr (base + 3) op2
+  let _ = arr_set arr (base + 4) op3
+  let _ = arr_set arr (base + 5) est_len
+  let _ = arr_set s 2 ((n + 1) * 6)
+  n
+
+asm_inst_get s i =
+  let arr = arr_get s 4
+  let base = i * 6
+  let r = arr_new 6 0
+  let _ = arr_set r 0 (arr_get arr (base + 0))
+  let _ = arr_set r 1 (arr_get arr (base + 1))
+  let _ = arr_set r 2 (arr_get arr (base + 2))
+  let _ = arr_set r 3 (arr_get arr (base + 3))
+  let _ = arr_set r 4 (arr_get arr (base + 4))
+  let _ = arr_set r 5 (arr_get arr (base + 5))
+  r
+
+-- ---- v0 instruction builders (caller-facing) -------------------------
+-- Each `asm_emit_*` queues an instruction with a worst-case size estimate
+-- so pass 1 lays out conservative addresses.
+
+asm_b s label_id =
+  asm_push_inst s 2 label_id 0 0 0 4   -- assume 32-bit B.W until pass 2
+
+asm_bl s label_id =
+  asm_push_inst s 3 label_id 0 0 0 4
+
+asm_bcond s label_id cond =
+  asm_push_inst s 4 label_id cond 0 0 4
+
+asm_bx s rm = asm_push_inst s 5 rm 0 0 0 2
+asm_push s reglist8 lr = asm_push_inst s 6 reglist8 lr 0 0 2
+asm_pop s reglist8 pc = asm_push_inst s 7 reglist8 pc 0 0 2
+asm_nop s = asm_push_inst s 8 0 0 0 0 2
+
+asm_movs_imm8 s rd imm8 = asm_push_inst s 9 rd imm8 0 0 2
+asm_adds_imm8 s rd imm8 = asm_push_inst s 10 rd imm8 0 0 2
+asm_subs_imm8 s rd imm8 = asm_push_inst s 11 rd imm8 0 0 2
+asm_cmp_imm8  s rd imm8 = asm_push_inst s 12 rd imm8 0 0 2
+asm_mov_reg   s rd rm   = asm_push_inst s 14 rd rm 0 0 2
+
+asm_movw s rd imm16 = asm_push_inst s 15 rd imm16 0 0 4
+asm_movt s rd imm16 = asm_push_inst s 16 rd imm16 0 0 4
+asm_ldr_w s rt rn imm12 = asm_push_inst s 17 rt rn imm12 0 4
+asm_str_w s rt rn imm12 = asm_push_inst s 18 rt rn imm12 0 4
+
+-- For setting an arbitrary 32-bit value into a register, emit the
+-- canonical MOVW+MOVT pair. (Track A's literal pool is for v0.1.)
+asm_mov32 s rd value =
+  let lo = bit_and value 65535
+  let hi = bit_and (shr value 16) 65535
+  let _ = asm_movw s rd lo
+  asm_movt s rd hi
+
+-- ---- Pass 1: compute instruction offsets ------------------------------
+-- Walks the queued instructions in order, accumulating est_len (always
+-- the worst case, which is correct because we don't shrink in pass 2 yet).
+-- This v0 assembler is a fixed-size pass; everything stays at its est_len.
+
+asm_layout s =
+  let buf = arr_get s 1
+  let n_inst = asm_inst_count s
+  let total = asm_layout_loop s 0 0 n_inst
+  -- Now resolve labels: for each label whose value is an inst-index
+  -- (i.e. set by asm_label_here, between 0 and n_inst), convert to the
+  -- byte offset of that inst. Labels equal to n_inst (end-of-program)
+  -- get the final total. Labels manually set to a byte offset are
+  -- (heuristically) those >= 4096; we leave them alone.
+  let n_labels = arr_get s 6
+  let labels = arr_get s 5
+  let insts = arr_get s 4
+  let _ = asm_resolve_labels labels insts n_labels n_inst total 0
+  total
+
+asm_layout_loop s i off n =
+  if i >= n then off
+  else
+    let r = asm_inst_get s i
+    let est = arr_get r 5
+    let arr = arr_get s 4
+    let _ = arr_set arr (i * 6 + 4) off
+    asm_layout_loop s (i + 1) (off + est) n
+
+asm_resolve_labels labels insts n_labels n_inst total i =
+  if i >= n_labels then 0
+  else
+    let v = arr_get labels i
+    if v < 0 then asm_resolve_labels labels insts n_labels n_inst total (i + 1)
+    else if v == n_inst then
+      let _ = arr_set labels i total
+      asm_resolve_labels labels insts n_labels n_inst total (i + 1)
+    else if v < n_inst then
+      let off = arr_get insts (v * 6 + 4)
+      let _ = arr_set labels i off
+      asm_resolve_labels labels insts n_labels n_inst total (i + 1)
+    else asm_resolve_labels labels insts n_labels n_inst total (i + 1)
+
+-- ---- Pass 2: emit bytes -----------------------------------------------
+
+asm_emit_one s inst self_off =
+  let kind = arr_get inst 0
+  let op0 = arr_get inst 1
+  let op1 = arr_get inst 2
+  let op2 = arr_get inst 3
+  let buf = asm_buf s
+  let base = asm_base s
+  let addr = base + self_off
+  if kind == 2 then
+    -- B uncond to label
+    let tgt_off = asm_label_offset s op0
+    let target = base + tgt_off
+    let _ = te_b_w buf self_off addr target
+    self_off + 4
+  else if kind == 3 then
+    let tgt_off = asm_label_offset s op0
+    let target = base + tgt_off
+    let _ = te_bl buf self_off addr target
+    self_off + 4
+  else if kind == 4 then
+    let tgt_off = asm_label_offset s op0
+    let target = base + tgt_off
+    let _ = te_bcond_w buf self_off addr target op1
+    self_off + 4
+  else if kind == 5 then
+    let _ = te_bx buf self_off op0
+    self_off + 2
+  else if kind == 6 then
+    let _ = te_push buf self_off op0 op1
+    self_off + 2
+  else if kind == 7 then
+    let _ = te_pop buf self_off op0 op1
+    self_off + 2
+  else if kind == 8 then
+    let _ = te_nop buf self_off
+    self_off + 2
+  else if kind == 9 then
+    let _ = te_movs_imm8 buf self_off op0 op1
+    self_off + 2
+  else if kind == 10 then
+    let _ = te_adds_imm8 buf self_off op0 op1
+    self_off + 2
+  else if kind == 11 then
+    let _ = te_subs_imm8 buf self_off op0 op1
+    self_off + 2
+  else if kind == 12 then
+    let _ = te_cmp_imm8 buf self_off op0 op1
+    self_off + 2
+  else if kind == 14 then
+    let _ = te_mov_reg buf self_off op0 op1
+    self_off + 2
+  else if kind == 15 then
+    let _ = te_movw buf self_off op0 op1
+    self_off + 4
+  else if kind == 16 then
+    let _ = te_movt buf self_off op0 op1
+    self_off + 4
+  else if kind == 17 then
+    let _ = te_ldr_w buf self_off op0 op1 op2
+    self_off + 4
+  else if kind == 18 then
+    let _ = te_str_w buf self_off op0 op1 op2
+    self_off + 4
+  else self_off  -- unhandled; skip
+
+asm_emit_loop s i n =
+  if i >= n then 0
+  else
+    let inst = asm_inst_get s i
+    let self_off = arr_get inst 4
+    let _ = asm_emit_one s inst self_off
+    asm_emit_loop s (i + 1) n
+
+asm_finalize s =
+  let total = asm_layout s
+  let n = asm_inst_count s
+  let _ = asm_emit_loop s 0 n
+  let _ = arr_set s 8 1
+  let _ = arr_set s 2 total
+  total
+
+asm_size s =
+  if arr_get s 8 == 0 then 0 - 1
+  else arr_get s 2

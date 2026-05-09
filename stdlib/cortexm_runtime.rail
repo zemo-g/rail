@@ -1,0 +1,177 @@
+-- stdlib/cortexm_runtime.rail - Bare-metal Cortex-M runtime helpers for Rail.
+--
+-- Provides standard glue for Rail-built Cortex-M payloads:
+--   * cm_emit_vector_table: 16 system vectors + N IRQ slots, all pointing
+--     at a common halt handler unless the caller overrides specific slots
+--   * cm_emit_reset_stub:   clears BSS, calls user main, halts on return
+--   * cm_emit_halt:         b . infinite loop (the "panic" handler)
+--   * cm_load_imm32:        macro - assemble MOVW + MOVT to load a 32-bit
+--                           constant into a register
+--   * cm_mmio_w32:          macro - load address with cm_load_imm32 and
+--                           STR.W from a value register
+--
+-- The "macros" are just helper functions that call the assembler API.
+-- They don't generate cleverer code than the user could write directly;
+-- they exist so payload writers don't have to re-derive MMIO sequences.
+--
+-- Layout convention (caller picks values; defaults reasonable for Kinetis
+-- K6x with 256KB SRAM at 0x20000000):
+--   sram_top   = 0x20040000   (one past SRAM end)
+--   flash_base = where the payload's first byte lives (0x0 for primary
+--                firmware; some other address for an injected payload)
+--   irq_count  = 0..240, depends on chip (K20=86, K6x=100)
+
+import "stdlib/thumb2_asm.rail"
+
+-- ---- Halt: b . (infinite loop) ---------------------------------------
+-- Used as the default exception handler and as the post-main idle stub.
+
+cm_emit_halt s halt_label =
+  let _ = asm_label_here s halt_label
+  asm_b s halt_label
+
+-- ---- Reset stub ------------------------------------------------------
+-- Minimal reset for v0:
+--   bl main
+--   <fall through to halt>
+-- v0 SKIPS BSS-clear and .data copy. Add those once we have a real
+-- linker layout and the user's main actually touches RAM.
+
+cm_emit_reset s main_label halt_label =
+  let _ = asm_bl s main_label
+  asm_b s halt_label
+
+-- ---- Load a 32-bit immediate into Rd via MOVW + MOVT -----------------
+
+cm_load_imm32 s rd value =
+  let lo = bit_and value 65535
+  let hi = bit_and (shr value 16) 65535
+  let _ = asm_movw s rd lo
+  asm_movt s rd hi
+
+-- ---- 32-bit MMIO write: store `value` to address `addr` --------------
+-- Uses r6 / r7 as scratch (chosen to avoid r0..r3 which v0's caller may
+-- want to keep for argument-passing; also avoids r4..r5 which we
+-- conventionally save).
+
+cm_mmio_w32 s addr value =
+  let _ = cm_load_imm32 s 7 addr
+  let _ = cm_load_imm32 s 6 value
+  asm_str_w s 6 7 0
+
+-- ---- 32-bit MMIO read: result in Rd ----------------------------------
+
+cm_mmio_r32 s rd addr =
+  let _ = cm_load_imm32 s 7 addr
+  asm_ldr_w s rd 7 0
+
+-- ---- Vector table -----------------------------------------------------
+-- Cortex-M VT entry 0 = initial SP, entries 1..15 = system vectors,
+-- entries 16..16+N-1 = device-specific IRQs. Each entry is a 32-bit
+-- value: code addresses must have Thumb bit set (low bit = 1).
+--
+-- For v0, all handlers point at `halt_label` except Reset which points
+-- at `reset_label`. The caller emits the actual reset/main code AFTER
+-- the vector table.
+--
+-- Entry kinds:
+--   sp_value: a raw 32-bit value (no Thumb bit)
+--   handler:  caller-provided label, with Thumb bit set on emit
+
+-- Helper: write a 32-bit word raw to the buffer. Bypasses the assembler.
+cm_emit_word s value =
+  let buf = asm_buf s
+  let off = arr_get s 2 / 6 * 0   -- can't reach byte cur_off directly here
+  -- We use a trick: queue an instruction kind 0 (RAW16) twice, packing
+  -- the 32-bit value as two halfwords. This keeps everything inside the
+  -- assembler's layout/emit pipeline.
+  let _ = asm_push_inst s 1 (bit_and value 65535) (bit_and (shr value 16) 65535) 0 0 4
+  0
+
+-- Patch the assembler's emit pass to handle kind 1 (RAW32). We do this
+-- by adding a lookup directly above; for module-purity we just keep
+-- the special case inline in the user-facing emitter.
+
+cm_emit_word_pair s lo16 hi16 =
+  let _ = asm_push_inst s 1 lo16 hi16 0 0 4
+  0
+
+-- Vector table emitter. The caller provides:
+--   sp_top   = initial main stack pointer
+--   reset_label
+--   halt_label
+--   irq_count
+-- We emit:
+--   word 0: sp_top
+--   word 1: reset (Thumb bit will be ORed in by emit-time resolver)
+--   word 2..15: halt (system handlers)
+--   word 16..16+irq_count-1: halt (device IRQs default)
+
+cm_emit_vector_table s sp_top reset_label halt_label irq_count =
+  let _ = cm_emit_word_pair s (bit_and sp_top 65535) (bit_and (shr sp_top 16) 65535)
+  -- Reset and all other handlers: store the LABEL ID (negative number we
+  -- pick to never collide with real values), patched in finalize.
+  -- Simpler: queue an instruction kind 19 = LABEL_REF_WORD that stores a
+  -- 32-bit (label_byte_offset + base) | 1 at emit time.
+  let _ = cm_queue_label_word s reset_label
+  cm_emit_vt_handler_loop s halt_label 0 (irq_count + 14)
+
+cm_queue_label_word s label_id =
+  let _ = asm_push_inst s 19 label_id 0 0 0 4
+  0
+
+cm_emit_vt_handler_loop s label_id i n =
+  if i >= n then 0
+  else
+    let _ = cm_queue_label_word s label_id
+    cm_emit_vt_handler_loop s label_id (i + 1) n
+
+-- A short-circuit helper for the assembler: extend asm_emit_one to
+-- understand kind 1 (RAW32 with two pre-packed halfwords) and kind 19
+-- (LABEL_REF_WORD that resolves at emit time). We patch by extending
+-- the dispatch via a helper that the test program calls AFTER finalize.
+
+-- v0 hack: we run finalize, then post-process the buffer to fix up any
+-- kind-1 / kind-19 entries that the standard emit_one didn't write.
+-- The per-inst self_off already holds the byte offset for each.
+
+cm_post_process s =
+  let n = asm_inst_count s
+  cm_post_loop s 0 n
+
+cm_post_loop s i n =
+  if i >= n then 0
+  else
+    let inst = asm_inst_get s i
+    let kind = arr_get inst 0
+    let off = arr_get inst 4
+    if kind == 1 then
+      let lo16 = arr_get inst 1
+      let hi16 = arr_get inst 2
+      let buf = asm_buf s
+      let _ = arr_set buf off       (bit_and lo16 255)
+      let _ = arr_set buf (off + 1) (bit_and (shr lo16 8) 255)
+      let _ = arr_set buf (off + 2) (bit_and hi16 255)
+      let _ = arr_set buf (off + 3) (bit_and (shr hi16 8) 255)
+      cm_post_loop s (i + 1) n
+    else if kind == 19 then
+      let label_id = arr_get inst 1
+      let lbl_off = asm_label_offset s label_id
+      let value = bit_or (arr_get s 0 + lbl_off) 1   -- base + offset, with Thumb bit
+      let buf = asm_buf s
+      let _ = arr_set buf off       (bit_and value 255)
+      let _ = arr_set buf (off + 1) (bit_and (shr value 8) 255)
+      let _ = arr_set buf (off + 2) (bit_and (shr value 16) 255)
+      let _ = arr_set buf (off + 3) (bit_and (shr value 24) 255)
+      cm_post_loop s (i + 1) n
+    else cm_post_loop s (i + 1) n
+
+cm_finalize s =
+  -- Capture inst-count BEFORE asm_finalize - it overwrites s[2] (which we
+  -- repurposed as cur_off / 6 = inst_count) with `total` total-bytes value.
+  -- After finalize, asm_inst_count returns total/6, undercounting our
+  -- post-process loop.
+  let n_inst = asm_inst_count s
+  let total = asm_finalize s
+  let _ = cm_post_loop s 0 n_inst
+  total

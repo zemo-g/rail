@@ -9,9 +9,28 @@ alpha_upper = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", 
 
 has item lst = if length lst == 0 then false else if head lst == item then true else has item (tail lst)
 is_digit c = has c digits
+hex_letters = ["a", "b", "c", "d", "e", "f", "A", "B", "C", "D", "E", "F"]
+is_hex_digit c = is_digit c || has c hex_letters
 is_alpha c = has c alpha_lower || has c alpha_upper || c == "_"
 is_alnum c = is_digit c || is_alpha c
 is_space c = c == " " || c == "\t"
+
+hex_digit_val c =
+  if has c digits then char_to_int c - 48
+  else if c == "a" || c == "A" then 10
+  else if c == "b" || c == "B" then 11
+  else if c == "c" || c == "C" then 12
+  else if c == "d" || c == "D" then 13
+  else if c == "e" || c == "E" then 14
+  else if c == "f" || c == "F" then 15
+  else 0
+
+htint_acc cs acc =
+  if length cs == 0 then acc
+  else htint_acc (tail cs) (acc * 16 + hex_digit_val (head cs))
+
+htint s acc =
+  htint_acc (chars s) acc
 kw_list = ["let", "in", "if", "then", "else", "match", "type", "import", "module", "export", "effect", "perform", "handle", "with", "resume", "foreign", "link"]
 is_kw w = has w kw_list
 
@@ -56,6 +75,10 @@ tc cs acc pacc ln col =
     else if c == "\"" then
       let (s, af, sn) = lx_str r "" 0
       tc af (cons ("str", s) acc) (cons (ln, col) pacc) ln (col + 1 + sn)
+    else if c == "0" && nx == "x" then
+      let (hex_chars, af_h, hn) = lx_col is_hex_digit (tail r)
+      let val = htint hex_chars 0
+      tc af_h (cons ("int", show val) acc) (cons (ln, col) pacc) ln (col + 2 + hn)
     else if is_digit c then
       let (nr, af, nn) = lx_col is_digit r
       let whole = append c nr
@@ -5923,6 +5946,630 @@ compile_x86 path =
       let _ = print (cat ["  Try: scp /tmp/rail_x86.s Detro@100.109.63.37:~ && ssh Detro@100.109.63.37 'gcc -o rail_x86 rail_x86.s && ./rail_x86'"])
       0
 
+-- ============================================================
+-- Cortex-M4 (Thumb-2) backend - bare-metal codegen for Apollo2.
+-- Subset: integer return values from main, integer arithmetic,
+-- function calls, conditionals. No runtime, no GC, no malloc.
+-- Builds incrementally toward Stage 11 (Rail watchface on chip).
+-- ============================================================
+
+cm_emit_int v =
+  if v >= 0 then
+    if v <= 65535 then cat ["    movw r0, #", show v, "\n"]
+    else
+      let hi = v / 65536
+      let lo = v - (hi * 65536)
+      cat ["    movw r0, #", show lo, "\n    movt r0, #", show hi, "\n"]
+  else
+    let abs_v = 0 - v
+    let abs_hi = abs_v / 65536
+    let abs_lo = abs_v - (abs_hi * 65536)
+    let inv_lo = 65535 - abs_lo
+    let inv_hi = 65535 - abs_hi
+    let lo = if inv_lo == 65535 then 0 else inv_lo + 1
+    let hi = if inv_lo == 65535 then inv_hi + 1 else inv_hi
+    cat ["    movw r0, #", show lo, "\n    movt r0, #", show hi, "\n"]
+
+-- Env entries: ["P", name, reg_idx] for params (in r4..r6),
+--              ["L", name, slot_idx] for locals (at [r7, #-4*(slot+1)])
+-- r7 is the frame pointer (set in prologue).
+cm_env_lookup env name =
+  if length env == 0 then ["NONE"]
+  else
+    let e = head env
+    if head (tail e) == name then e
+    else cm_env_lookup (tail env) name
+
+cm_param_reg i =
+  if i == 0 then "r4"
+  else if i == 1 then "r5"
+  else if i == 2 then "r6"
+  else "r0"
+
+cm_emit_var env name =
+  let e = cm_env_lookup env name
+  if head e == "NONE" then
+    -- Not a param/local/ctor; treat as a 0-arg call to a global function.
+    -- Linker fails if the name isn't a defined Rail function.
+    cat ["    bl _rail_", name, "\n"]
+  else if head e == "P" then
+    let idx = head (tail (tail e))
+    cat ["    mov r0, ", cm_param_reg idx, "\n"]
+  else if head e == "C" then
+    -- Constructor reference: emit its tag (only valid for arity-0 ctors today).
+    let tag = head (tail (tail e))
+    cat ["    movw r0, #", show tag, "\n"]
+  else
+    let idx = head (tail (tail e))
+    cat ["    ldr r0, [r7, #-", show (4 * (idx + 1)), "]\n"]
+
+cm_count_locals_in_env env =
+  if length env == 0 then 0
+  else if head (head env) == "L" then 1 + cm_count_locals_in_env (tail env)
+  else cm_count_locals_in_env (tail env)
+
+cm_count_arms_sum arms =
+  if length arms == 0 then 0
+  else
+    let arm = head arms
+    let binds = head (tail arm)
+    let body = head (tail (tail arm))
+    length binds + cm_count_lets body + cm_count_arms_sum (tail arms)
+
+cm_count_lets node =
+  let tg = head node
+  if tg == "D" then 1 + cm_count_lets (head (tail (tail node))) + cm_count_lets (head (tail (tail (tail node))))
+  else if tg == "O" then cm_count_lets (head (tail (tail node))) + cm_count_lets (head (tail (tail (tail node))))
+  else if tg == "?" then cm_count_lets (head (tail node)) + cm_count_lets (head (tail (tail node))) + cm_count_lets (head (tail (tail (tail node))))
+  else if tg == "A" then cm_count_lets (head (tail node)) + cm_count_lets (head (tail (tail node)))
+  else if tg == "M" then cm_count_lets (head (tail node)) + cm_count_arms_sum (head (tail (tail node)))
+  else 0
+
+cm_build_param_env params i =
+  if length params == 0 then []
+  else cons ["P", head params, i] (cm_build_param_env (tail params) (i + 1))
+
+-- Constructor env entries: ["C", ctor_name, tag, arity].
+-- For tag-only ADTs (arity 0), the constructor reference emits movw r0, #tag.
+-- Constructors with payloads are NOT yet supported (arity ignored at use sites
+-- but available for future codegen).
+cm_variants_to_ctors vs =
+  if length vs == 0 then []
+  else
+    let v = head vs
+    let ctor = head v
+    let idx = head (tail v)
+    let ar = head (tail (tail v))
+    cons ["C", ctor, idx, ar] (cm_variants_to_ctors (tail vs))
+
+cm_build_ctor_env decls =
+  if length decls == 0 then []
+  else
+    let d = head decls
+    if head d == "TY" then
+      let variants = head (tail (tail d))
+      append (cm_variants_to_ctors variants) (cm_build_ctor_env (tail decls))
+    else cm_build_ctor_env (tail decls)
+
+cm_op_instr op =
+  if op == "+" then "    add r0, r0, r1\n"
+  else if op == "-" then "    sub r0, r0, r1\n"
+  else if op == "*" then "    mul r0, r0, r1\n"
+  else if op == "/" then "    sdiv r0, r0, r1\n"
+  else if op == "%" then "    sdiv r2, r0, r1\n    mul r2, r2, r1\n    sub r0, r0, r2\n"
+  else cat ["    @ unsupported op: ", op, "\n"]
+
+cm_collect_args node acc =
+  if head node == "A" then
+    cm_collect_args (head (tail node)) (cons (head (tail (tail node))) acc)
+  else (node, acc)
+
+cm_neg_branch op =
+  if op == "==" then "bne"
+  else if op == "!=" then "beq"
+  else if op == "<" then "bge"
+  else if op == ">" then "ble"
+  else if op == "<=" then "bgt"
+  else if op == ">=" then "blt"
+  else "beq"
+
+cm_op_to_cond op =
+  if op == "==" then "eq"
+  else if op == "!=" then "ne"
+  else if op == "<" then "lt"
+  else if op == ">" then "gt"
+  else if op == "<=" then "le"
+  else if op == ">=" then "ge"
+  else "eq"
+
+cm_neg_cond op =
+  if op == "==" then "ne"
+  else if op == "!=" then "eq"
+  else if op == "<" then "ge"
+  else if op == ">" then "le"
+  else if op == "<=" then "gt"
+  else if op == ">=" then "lt"
+  else "ne"
+
+cm_cmp_to_bool op =
+  let ct = cm_op_to_cond op
+  let cf = cm_neg_cond op
+  cat ["    ite ", ct, "\n    mov", ct, " r0, #1\n    mov", cf, " r0, #0\n"]
+
+cm_is_cmp op =
+  op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">="
+
+cm_push_args args env fname lc n_total =
+  if length args == 0 then ("", lc)
+  else if length args == 1 then
+    let (a, lc1) = cm_emit_expr (head args) env fname lc
+    let last_idx = n_total - 1
+    if last_idx == 0 then (a, lc1)
+    else (cat [a, "    mov r", show last_idx, ", r0\n"], lc1)
+  else
+    let (a, lc1) = cm_emit_expr (head args) env fname lc
+    let (rest, lc2) = cm_push_args (tail args) env fname lc1 n_total
+    (cat [a, "    push {r0}\n", rest], lc2)
+
+cm_pop_chain_rev cur =
+  if cur < 0 then ""
+  else cat ["    pop {r", show cur, "}\n", cm_pop_chain_rev (cur - 1)]
+
+cm_emit_ctor_payload tag arg env fname lc =
+  let (a, lc1) = cm_emit_expr arg env fname lc
+  (cat [a, "    lsl r0, r0, #4\n    orr r0, r0, #", show tag, "\n"], lc1)
+
+cm_emit_call env fname lc fn args =
+  if head fn == "V" then
+    let name = head (tail fn)
+    let n = length args
+    -- MMIO intrinsics: emit STR/LDR inline instead of `bl`.
+    if name == "mmio_write" && n == 2 then
+      let a0 = head args
+      let a1 = head (tail args)
+      let (aa, lc1) = cm_emit_expr a0 env fname lc
+      let (va, lc2) = cm_emit_expr a1 env fname lc1
+      (cat [aa, "    push {r0}\n", va, "    mov r1, r0\n    pop {r0}\n    str r1, [r0]\n"], lc2)
+    else if name == "mmio_read" && n == 1 then
+      let (aa, lc1) = cm_emit_expr (head args) env fname lc
+      (cat [aa, "    ldr r0, [r0]\n"], lc1)
+    else if (name == "bit_and" || name == "bit_or" || name == "bit_xor" || name == "shl" || name == "shr") && n == 2 then
+      let a0 = head args
+      let a1 = head (tail args)
+      let (la, lc1) = cm_emit_expr a0 env fname lc
+      let (ra, lc2) = cm_emit_expr a1 env fname lc1
+      let op_instr = if name == "bit_and" then "and"
+                     else if name == "bit_or" then "orr"
+                     else if name == "bit_xor" then "eor"
+                     else if name == "shl" then "lsl"
+                     else "lsr"
+      (cat [la, "    push {r0}\n", ra, "    mov r1, r0\n    pop {r0}\n    ", op_instr, " r0, r0, r1\n"], lc2)
+    else
+      let ce = cm_env_lookup env name
+      if head ce == "C" then
+        let tag = head (tail (tail ce))
+        let arity = head (tail (tail (tail ce)))
+        if arity == 1 && n == 1 then cm_emit_ctor_payload tag (head args) env fname lc
+        else (cat ["    @ ctor ", name, " arity=", show arity, " n=", show n, " unsupported\n    movs r0, #0\n"], lc)
+      else if n == 0 then (cat ["    bl _rail_", name, "\n"], lc)
+      else if n <= 4 then
+        let (push_asm, lc1) = cm_push_args args env fname lc n
+        (cat [push_asm, cm_pop_chain_rev (n - 2), "    bl _rail_", name, "\n"], lc1)
+      else (cat ["    @ ", show n, "-arg call not yet supported (>4 spilled args)\n    movs r0, #0\n"], lc)
+  else (cat ["    @ non-name function in call\n    movs r0, #0\n"], lc)
+
+cm_emit_cond_branch cond env fname lc else_lbl =
+  if head cond == "O" && cm_is_cmp (head (tail cond)) then
+    let op = head (tail cond)
+    let l = head (tail (tail cond))
+    let r = head (tail (tail (tail cond)))
+    let (la, lc1) = cm_emit_expr l env fname lc
+    let (ra, lc2) = cm_emit_expr r env fname lc1
+    (cat [la, "    push {r0}\n", ra, "    mov r1, r0\n    pop {r0}\n    cmp r0, r1\n    ", cm_neg_branch op, " ", else_lbl, "\n"], lc2)
+  else
+    let (ca, lc1) = cm_emit_expr cond env fname lc
+    (cat [ca, "    cmp r0, #0\n    beq ", else_lbl, "\n"], lc1)
+
+cm_emit_if cond then_e else_e env fname lc =
+  let lc0 = lc
+  let else_lbl = cat [".L", fname, "_else_", show lc0]
+  let end_lbl = cat [".L", fname, "_end_", show lc0]
+  let (cond_asm, lc1) = cm_emit_cond_branch cond env fname (lc + 1) else_lbl
+  let (then_asm, lc2) = cm_emit_expr then_e env fname lc1
+  let (else_asm, lc3) = cm_emit_expr else_e env fname lc2
+  (cat [cond_asm, then_asm, "    b ", end_lbl, "\n", else_lbl, ":\n", else_asm, end_lbl, ":\n"], lc3)
+
+cm_emit_let n v b env fname lc =
+  let (va, lc1) = cm_emit_expr v env fname lc
+  let slot = cm_count_locals_in_env env
+  let store = cat ["    str r0, [r7, #-", show (4 * (slot + 1)), "]\n"]
+  let new_env = cons ["L", n, slot] env
+  let (ba, lc2) = cm_emit_expr b new_env fname lc1
+  (cat [va, store, ba], lc2)
+
+cm_bind_payload binds env =
+  if length binds == 0 then ("", env)
+  else
+    let bn = head binds
+    let slot = cm_count_locals_in_env env
+    let extract = cat ["    ldr r0, [sp]\n    asr r0, r0, #4\n    str r0, [r7, #-", show (4 * (slot + 1)), "]\n"]
+    let new_env = cons ["L", bn, slot] env
+    let (rest_a, final_env) = cm_bind_payload (tail binds) new_env
+    (cat [extract, rest_a], final_env)
+
+cm_emit_arms arms i env fname lc end_lbl mid =
+  if length arms == 0 then ("", lc)
+  else
+    let arm = head arms
+    let ctor = head arm
+    let binds = head (tail arm)
+    let body = head (tail (tail arm))
+    let e = cm_env_lookup env ctor
+    let tag = if head e == "C" then head (tail (tail e)) else 0 - 1
+    let next_lbl = cat [".L", fname, "_arm_", show mid, "_", show i, "_next"]
+    let (bind_a, body_env) = cm_bind_payload binds env
+    let (body_a, lc1) = cm_emit_expr body body_env fname lc
+    let (rest_a, lc2) = cm_emit_arms (tail arms) (i + 1) env fname lc1 end_lbl mid
+    (cat ["    ldr r0, [sp]\n    and r0, r0, #15\n    cmp r0, #", show tag, "\n    bne ", next_lbl, "\n", bind_a, "    pop {r0}\n", body_a, "    b ", end_lbl, "\n", next_lbl, ":\n", rest_a], lc2)
+
+cm_emit_match scrut arms env fname lc =
+  let lc0 = lc
+  let end_lbl = cat [".L", fname, "_match_end_", show lc0]
+  let (scrut_a, lc1) = cm_emit_expr scrut env fname (lc + 1)
+  let (arms_a, lc2) = cm_emit_arms arms 0 env fname lc1 end_lbl lc0
+  (cat [scrut_a, "    push {r0}\n", arms_a, "    pop {r0}\n", end_lbl, ":\n"], lc2)
+
+cm_emit_expr node env fname lc =
+  let tg = head node
+  if tg == "I" then (cm_emit_int (parse_int (head (tail node))), lc)
+  else if tg == "V" then (cm_emit_var env (head (tail node)), lc)
+  else if tg == "O" then
+    let op = head (tail node)
+    let l = head (tail (tail node))
+    let r = head (tail (tail (tail node)))
+    let (la, lc1) = cm_emit_expr l env fname lc
+    let (ra, lc2) = cm_emit_expr r env fname lc1
+    if cm_is_cmp op then
+      (cat [la, "    push {r0}\n", ra, "    mov r1, r0\n    pop {r0}\n    cmp r0, r1\n", cm_cmp_to_bool op], lc2)
+    else
+      (cat [la, "    push {r0}\n", ra, "    mov r1, r0\n    pop {r0}\n", cm_op_instr op], lc2)
+  else if tg == "A" then
+    let (fn, args) = cm_collect_args node []
+    cm_emit_call env fname lc fn args
+  else if tg == "?" then
+    let c = head (tail node)
+    let t = head (tail (tail node))
+    let e = head (tail (tail (tail node)))
+    cm_emit_if c t e env fname lc
+  else if tg == "D" then
+    let n = head (tail node)
+    let v = head (tail (tail node))
+    let b = head (tail (tail (tail node)))
+    cm_emit_let n v b env fname lc
+  else if tg == "M" then
+    let scrut = head (tail node)
+    let arms = head (tail (tail node))
+    cm_emit_match scrut arms env fname lc
+  else (cat ["    @ unsupported expr node: ", tg, "\n    movs r0, #0\n"], lc)
+
+cm_save_params n i =
+  if i >= n then ""
+  else cat ["    mov r", show (4 + i), ", r", show i, "\n", cm_save_params n (i + 1)]
+
+cm_emit_func d ctors =
+  let name = head (tail d)
+  let params = head (tail (tail d))
+  let body = head (tail (tail (tail d)))
+  let lbl = if name == "main" then "_main" else cat ["_rail_", name]
+  let nparams = length params
+  let nlocals = cm_count_lets body
+  let param_env = cm_build_param_env params 0
+  let env = append param_env ctors
+  let alloc = if nlocals == 0 then "" else cat ["    sub sp, sp, #", show (4 * nlocals), "\n"]
+  let prologue = cat ["    push {r4-r7, lr}\n    mov r7, sp\n", cm_save_params nparams 0, alloc]
+  let (body_asm, _) = cm_emit_expr body env name 0
+  cat ["\n.global ", lbl, "\n.type ", lbl, ", %function\n", lbl, ":\n    .thumb_func\n", prologue, body_asm, "    mov sp, r7\n    pop {r4-r7, pc}\n"]
+
+cm_emit_decls decls ctors =
+  if length decls == 0 then ""
+  else
+    let d = head decls
+    if head d == "fn" then cat [cm_emit_func d ctors, cm_emit_decls (tail decls) ctors]
+    else cm_emit_decls (tail decls) ctors
+
+cm_compile_checked decls =
+  let header = ".syntax unified\n.thumb\n.cpu cortex-m4\n.text\n"
+  let ctors = cm_build_ctor_env decls
+  cat [header, cm_emit_decls decls ctors]
+
+compile_cortexm path =
+  let src = read_file path
+  let _ = print (cat ["Compiling ", path, " -> Cortex-M4 (Thumb-2)..."])
+  let (toks, positions) = tokenize_with_pos src
+  let ntoks = length toks
+  let decls = pprog toks
+  let errs = ce_decls decls
+  let nerrs = report_errors errs positions ntoks path
+  if nerrs > 0 then
+    let _ = print (cat [show nerrs, " error(s) found"])
+    1
+  else
+    let asm = cm_compile_checked decls
+    let _ = write_file "/tmp/rail_m4.s" asm
+    let _ = print (cat ["  Assembly: /tmp/rail_m4.s (", show (length asm), " chars)"])
+    let as_res = trim (shell "clang --target=thumbv7em-none-eabi -mthumb -mcpu=cortex-m4 -c /tmp/rail_m4.s -o /tmp/rail_m4.o 2>&1")
+    let _ = if length as_res > 0 then print (cat ["  as: ", as_res]) else print "  as: OK -> /tmp/rail_m4.o"
+    -- Compile bare-metal startup. Look in cwd/tools/cortexm_rt first, then binary dir.
+    let bindir = trim (shell (cat ["dirname '", head args, "'"]))
+    let rt_cwd = "tools/cortexm_rt/startup.s"
+    let rt_bin = cat [bindir, "/tools/cortexm_rt/startup.s"]
+    let rt_path = if length (read_file rt_cwd) > 0 then rt_cwd else rt_bin
+    let ld_cwd = "tools/cortexm_rt/apollo2.ld"
+    let ld_bin = cat [bindir, "/tools/cortexm_rt/apollo2.ld"]
+    let ld_path = if length (read_file ld_cwd) > 0 then ld_cwd else ld_bin
+    let su_res = trim (shell (cat ["clang --target=thumbv7em-none-eabi -mthumb -mcpu=cortex-m4 -c ", rt_path, " -o /tmp/rail_m4_rt.o 2>&1"]))
+    let _ = if length su_res > 0 then print (cat ["  startup as: ", su_res]) else print "  startup as: OK"
+    -- Link with ld.lld (homebrew). Falls back to a printed hint if missing.
+    let lld_path = trim (shell "which ld.lld 2>/dev/null")
+    if length lld_path == 0 then
+      let _ = print "  ld: ld.lld not found - install with: brew install lld"
+      0
+    else
+      let ld_res = trim (shell (cat [lld_path, " -T ", ld_path, " /tmp/rail_m4.o /tmp/rail_m4_rt.o -o /tmp/rail_m4.elf 2>&1"]))
+      let _ = if length ld_res > 0 then print (cat ["  ld: ", ld_res]) else print "  ld: OK -> /tmp/rail_m4.elf"
+      0
+
+-- ============================================================
+-- RISC-V (rv32imc) backend - mirrors cortexm subset with rv32 mnemonics.
+-- Frame layout: s0 = frame pointer; s1/s2/s3 = saved params (0..2);
+-- locals at -4*(slot+1)(s0). Function call via `call`.
+-- ============================================================
+
+cv_param_reg i =
+  if i == 0 then "s1"
+  else if i == 1 then "s2"
+  else if i == 2 then "s3"
+  else "a0"
+
+cv_emit_int v = cat ["    li a0, ", show v, "\n"]
+
+cv_emit_var env name =
+  let e = cm_env_lookup env name
+  if head e == "NONE" then cat ["    call _rail_", name, "\n"]
+  else if head e == "P" then
+    let idx = head (tail (tail e))
+    cat ["    mv a0, ", cv_param_reg idx, "\n"]
+  else if head e == "C" then
+    let tag = head (tail (tail e))
+    cat ["    li a0, ", show tag, "\n"]
+  else
+    let idx = head (tail (tail e))
+    cat ["    lw a0, -", show (4 * (idx + 1)), "(s0)\n"]
+
+cv_op_instr op =
+  if op == "+" then "    add a0, a0, a1\n"
+  else if op == "-" then "    sub a0, a0, a1\n"
+  else if op == "*" then "    mul a0, a0, a1\n"
+  else if op == "/" then "    div a0, a0, a1\n"
+  else if op == "%" then "    rem a0, a0, a1\n"
+  else cat ["    # unsupported op: ", op, "\n"]
+
+cv_emit_cmp_branch op else_lbl =
+  if op == "==" then cat ["    bne a0, a1, ", else_lbl, "\n"]
+  else if op == "!=" then cat ["    beq a0, a1, ", else_lbl, "\n"]
+  else if op == "<" then cat ["    bge a0, a1, ", else_lbl, "\n"]
+  else if op == ">" then cat ["    bge a1, a0, ", else_lbl, "\n"]
+  else if op == "<=" then cat ["    blt a1, a0, ", else_lbl, "\n"]
+  else if op == ">=" then cat ["    blt a0, a1, ", else_lbl, "\n"]
+  else cat ["    bne a0, a1, ", else_lbl, "\n"]
+
+cv_emit_cmp_value op =
+  if op == "==" then "    sub a0, a0, a1\n    seqz a0, a0\n"
+  else if op == "!=" then "    sub a0, a0, a1\n    snez a0, a0\n"
+  else if op == "<" then "    slt a0, a0, a1\n"
+  else if op == ">" then "    slt a0, a1, a0\n"
+  else if op == "<=" then "    slt a0, a1, a0\n    xori a0, a0, 1\n"
+  else if op == ">=" then "    slt a0, a0, a1\n    xori a0, a0, 1\n"
+  else "    li a0, 0\n"
+
+cv_collect_args node acc =
+  if head node == "A" then
+    cv_collect_args (head (tail node)) (cons (head (tail (tail node))) acc)
+  else (node, acc)
+
+cv_push_args args env fname lc n_total =
+  if length args == 0 then ("", lc)
+  else if length args == 1 then
+    let (a, lc1) = cv_emit_expr (head args) env fname lc
+    let last_idx = n_total - 1
+    if last_idx == 0 then (a, lc1)
+    else (cat [a, "    mv a", show last_idx, ", a0\n"], lc1)
+  else
+    let (a, lc1) = cv_emit_expr (head args) env fname lc
+    let (rest, lc2) = cv_push_args (tail args) env fname lc1 n_total
+    (cat [a, "    addi sp, sp, -16\n    sw a0, 0(sp)\n", rest], lc2)
+
+cv_pop_chain_rev cur =
+  if cur < 0 then ""
+  else cat ["    lw a", show cur, ", 0(sp)\n    addi sp, sp, 16\n", cv_pop_chain_rev (cur - 1)]
+
+cv_emit_ctor_payload tag arg env fname lc =
+  let (a, lc1) = cv_emit_expr arg env fname lc
+  (cat [a, "    slli a0, a0, 4\n    ori a0, a0, ", show tag, "\n"], lc1)
+
+cv_emit_call env fname lc fn args =
+  if head fn == "V" then
+    let name = head (tail fn)
+    let n = length args
+    let ce = cm_env_lookup env name
+    if head ce == "C" then
+      let tag = head (tail (tail ce))
+      let arity = head (tail (tail (tail ce)))
+      if arity == 1 && n == 1 then cv_emit_ctor_payload tag (head args) env fname lc
+      else (cat ["    # ctor ", name, " unsupported\n    li a0, 0\n"], lc)
+    else if n == 0 then (cat ["    call _rail_", name, "\n"], lc)
+    else if n <= 3 then
+      let (push_a, lc1) = cv_push_args args env fname lc n
+      (cat [push_a, cv_pop_chain_rev (n - 2), "    call _rail_", name, "\n"], lc1)
+    else (cat ["    # ", show n, "-arg call unsupported\n    li a0, 0\n"], lc)
+  else (cat ["    # non-name call\n    li a0, 0\n"], lc)
+
+cv_emit_cond_branch cond env fname lc else_lbl =
+  if head cond == "O" && cm_is_cmp (head (tail cond)) then
+    let op = head (tail cond)
+    let l = head (tail (tail cond))
+    let r = head (tail (tail (tail cond)))
+    let (la, lc1) = cv_emit_expr l env fname lc
+    let (ra, lc2) = cv_emit_expr r env fname lc1
+    (cat [la, "    addi sp, sp, -16\n    sw a0, 0(sp)\n", ra, "    mv a1, a0\n    lw a0, 0(sp)\n    addi sp, sp, 16\n", cv_emit_cmp_branch op else_lbl], lc2)
+  else
+    let (ca, lc1) = cv_emit_expr cond env fname lc
+    (cat [ca, "    beqz a0, ", else_lbl, "\n"], lc1)
+
+cv_emit_if cond t e env fname lc =
+  let lc0 = lc
+  let else_lbl = cat [".L", fname, "_else_", show lc0]
+  let end_lbl = cat [".L", fname, "_end_", show lc0]
+  let (cond_a, lc1) = cv_emit_cond_branch cond env fname (lc + 1) else_lbl
+  let (then_a, lc2) = cv_emit_expr t env fname lc1
+  let (else_a, lc3) = cv_emit_expr e env fname lc2
+  (cat [cond_a, then_a, "    j ", end_lbl, "\n", else_lbl, ":\n", else_a, end_lbl, ":\n"], lc3)
+
+cv_emit_let n v b env fname lc =
+  let (va, lc1) = cv_emit_expr v env fname lc
+  let slot = cm_count_locals_in_env env
+  let store = cat ["    sw a0, -", show (4 * (slot + 1)), "(s0)\n"]
+  let new_env = cons ["L", n, slot] env
+  let (ba, lc2) = cv_emit_expr b new_env fname lc1
+  (cat [va, store, ba], lc2)
+
+cv_bind_payload binds env =
+  if length binds == 0 then ("", env)
+  else
+    let bn = head binds
+    let slot = cm_count_locals_in_env env
+    let extract = cat ["    lw a0, 0(sp)\n    srai a0, a0, 4\n    sw a0, -", show (4 * (slot + 1)), "(s0)\n"]
+    let new_env = cons ["L", bn, slot] env
+    let (rest_a, final_env) = cv_bind_payload (tail binds) new_env
+    (cat [extract, rest_a], final_env)
+
+cv_emit_arms arms i env fname lc end_lbl mid =
+  if length arms == 0 then ("", lc)
+  else
+    let arm = head arms
+    let ctor = head arm
+    let binds = head (tail arm)
+    let body = head (tail (tail arm))
+    let e = cm_env_lookup env ctor
+    let tag = if head e == "C" then head (tail (tail e)) else 0 - 1
+    let next_lbl = cat [".L", fname, "_arm_", show mid, "_", show i, "_next"]
+    let (bind_a, body_env) = cv_bind_payload binds env
+    let (body_a, lc1) = cv_emit_expr body body_env fname lc
+    let (rest_a, lc2) = cv_emit_arms (tail arms) (i + 1) env fname lc1 end_lbl mid
+    (cat ["    lw a0, 0(sp)\n    andi a0, a0, 15\n    li a1, ", show tag, "\n    bne a0, a1, ", next_lbl, "\n", bind_a, "    addi sp, sp, 16\n", body_a, "    j ", end_lbl, "\n", next_lbl, ":\n    addi sp, sp, 16\n", rest_a], lc2)
+
+cv_emit_match scrut arms env fname lc =
+  let lc0 = lc
+  let end_lbl = cat [".L", fname, "_match_end_", show lc0]
+  let (scrut_a, lc1) = cv_emit_expr scrut env fname (lc + 1)
+  let (arms_a, lc2) = cv_emit_arms arms 0 env fname lc1 end_lbl lc0
+  (cat [scrut_a, "    addi sp, sp, -16\n    sw a0, 0(sp)\n", arms_a, end_lbl, ":\n"], lc2)
+
+cv_emit_expr node env fname lc =
+  let tg = head node
+  if tg == "I" then (cv_emit_int (parse_int (head (tail node))), lc)
+  else if tg == "V" then (cv_emit_var env (head (tail node)), lc)
+  else if tg == "O" then
+    let op = head (tail node)
+    let l = head (tail (tail node))
+    let r = head (tail (tail (tail node)))
+    let (la, lc1) = cv_emit_expr l env fname lc
+    let (ra, lc2) = cv_emit_expr r env fname lc1
+    if cm_is_cmp op then
+      (cat [la, "    addi sp, sp, -16\n    sw a0, 0(sp)\n", ra, "    mv a1, a0\n    lw a0, 0(sp)\n    addi sp, sp, 16\n", cv_emit_cmp_value op], lc2)
+    else
+      (cat [la, "    addi sp, sp, -16\n    sw a0, 0(sp)\n", ra, "    mv a1, a0\n    lw a0, 0(sp)\n    addi sp, sp, 16\n", cv_op_instr op], lc2)
+  else if tg == "A" then
+    let (fn, args) = cv_collect_args node []
+    cv_emit_call env fname lc fn args
+  else if tg == "?" then
+    let c = head (tail node)
+    let t = head (tail (tail node))
+    let e = head (tail (tail (tail node)))
+    cv_emit_if c t e env fname lc
+  else if tg == "D" then
+    let n = head (tail node)
+    let v = head (tail (tail node))
+    let b = head (tail (tail (tail node)))
+    cv_emit_let n v b env fname lc
+  else if tg == "M" then
+    let scrut = head (tail node)
+    let arms = head (tail (tail node))
+    cv_emit_match scrut arms env fname lc
+  else (cat ["    # unsupported expr: ", tg, "\n    li a0, 0\n"], lc)
+
+cv_save_params n i =
+  if i >= n then ""
+  else cat ["    mv s", show (1 + i), ", a", show i, "\n", cv_save_params n (i + 1)]
+
+cv_emit_func d ctors =
+  let name = head (tail d)
+  let params = head (tail (tail d))
+  let body = head (tail (tail (tail d)))
+  let lbl = if name == "main" then "_main" else cat ["_rail_", name]
+  let nparams = length params
+  let nlocals = cm_count_lets body
+  let param_env = cm_build_param_env params 0
+  let env = append param_env ctors
+  -- Frame: ra(4) + s0(4) + s1(4) + s2(4) + s3(4) = 20 + locals*4, padded to 16-byte align
+  let raw = 20 + 4 * nlocals
+  let pad = if raw % 16 == 0 then 0 else 16 - (raw % 16)
+  let frame = raw + pad
+  let prologue = cat ["    addi sp, sp, -", show frame, "\n    sw ra, ", show (frame - 4), "(sp)\n    sw s0, ", show (frame - 8), "(sp)\n    sw s1, ", show (frame - 12), "(sp)\n    sw s2, ", show (frame - 16), "(sp)\n    sw s3, ", show (frame - 20), "(sp)\n    addi s0, sp, ", show (frame - 20), "\n", cv_save_params nparams 0]
+  let (body_asm, _) = cv_emit_expr body env name 0
+  let epilogue = cat ["    lw s3, ", show (frame - 20), "(sp)\n    lw s2, ", show (frame - 16), "(sp)\n    lw s1, ", show (frame - 12), "(sp)\n    lw s0, ", show (frame - 8), "(sp)\n    lw ra, ", show (frame - 4), "(sp)\n    addi sp, sp, ", show frame, "\n    ret\n"]
+  cat ["\n.global ", lbl, "\n", lbl, ":\n", prologue, body_asm, epilogue]
+
+cv_emit_decls decls ctors =
+  if length decls == 0 then ""
+  else
+    let d = head decls
+    if head d == "fn" then cat [cv_emit_func d ctors, cv_emit_decls (tail decls) ctors]
+    else cv_emit_decls (tail decls) ctors
+
+cv_compile_checked decls =
+  let ctors = cm_build_ctor_env decls
+  cat [".section .text\n.option norvc\n", cv_emit_decls decls ctors]
+
+compile_riscv32 path =
+  let src = read_file path
+  let _ = print (cat ["Compiling ", path, " -> RISC-V (rv32imc)..."])
+  let (toks, positions) = tokenize_with_pos src
+  let ntoks = length toks
+  let decls = pprog toks
+  let errs = ce_decls decls
+  let nerrs = report_errors errs positions ntoks path
+  if nerrs > 0 then
+    let _ = print (cat [show nerrs, " error(s) found"])
+    1
+  else
+    let asm = cv_compile_checked decls
+    let _ = write_file "/tmp/rail_rv32.s" asm
+    let _ = print (cat ["  Assembly: /tmp/rail_rv32.s (", show (length asm), " chars)"])
+    let bindir = trim (shell (cat ["dirname '", head args, "'"]))
+    let rt_cwd = "tools/cortexm_rt/rv_startup.s"
+    let rt_path = if length (read_file rt_cwd) > 0 then rt_cwd else cat [bindir, "/tools/cortexm_rt/rv_startup.s"]
+    let ld_cwd = "tools/cortexm_rt/rv_virt.ld"
+    let ld_path = if length (read_file ld_cwd) > 0 then ld_cwd else cat [bindir, "/tools/cortexm_rt/rv_virt.ld"]
+    let cc = "/opt/homebrew/opt/llvm/bin/clang"
+    let as_res = trim (shell (cat [cc, " --target=riscv32-unknown-none-elf -march=rv32imc -mabi=ilp32 -c /tmp/rail_rv32.s -o /tmp/rail_rv32.o 2>&1"]))
+    let _ = if length as_res > 0 then print (cat ["  as: ", as_res]) else print "  as: OK"
+    let su_res = trim (shell (cat [cc, " --target=riscv32-unknown-none-elf -march=rv32imc -mabi=ilp32 -c ", rt_path, " -o /tmp/rail_rv32_rt.o 2>&1"]))
+    let _ = if length su_res > 0 then print (cat ["  startup: ", su_res]) else print "  startup: OK"
+    let ld_res = trim (shell (cat ["ld.lld -T ", ld_path, " /tmp/rail_rv32.o /tmp/rail_rv32_rt.o -o /tmp/rail_rv32.elf 2>&1"]))
+    let _ = if length ld_res > 0 then print (cat ["  ld: ", ld_res]) else print "  ld: OK -> /tmp/rail_rv32.elf"
+    0
+
 -- Parse optional --out-prefix <val> flag in the first slot.
 -- Returns (prefix, args-with-flag-stripped). Default prefix is /tmp/rail_out
 -- so all existing callers (including self-compile) are unaffected.
@@ -5953,6 +6600,14 @@ main =
     else if cmd == "linux" then
       if length a >= 3 then compile_linux (head (tail (tail a)))
       else let _ = print "Usage: rail linux <file.rail>"
+      1
+    else if cmd == "cortexm" then
+      if length a >= 3 then compile_cortexm (head (tail (tail a)))
+      else let _ = print "Usage: rail cortexm <file.rail>"
+      1
+    else if cmd == "riscv32" then
+      if length a >= 3 then compile_riscv32 (head (tail (tail a)))
+      else let _ = print "Usage: rail riscv32 <file.rail>"
       1
     else if cmd == "run" then
       if length a >= 3 then compile_and_run prefix (head (tail (tail a))) (join_args a 3)
