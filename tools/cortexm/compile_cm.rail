@@ -1,0 +1,327 @@
+-- tools/cortexm/compile_cm.rail - Mini Cortex-M Thumb-2 compiler.
+--
+-- Reads a line-based source language and emits a complete bare-metal
+-- ARM Cortex-M binary (vector table + reset + halt + main + payload code)
+-- via stdlib/thumb2_emit.rail + stdlib/thumb2_asm.rail + stdlib/cortexm_runtime.rail.
+--
+-- v0 source language (one statement per line, # for comments):
+--   set rN VALUE              load 32-bit constant into rN (rN in r0..r7)
+--   add rD rA rB              rD = rA + rB        (16-bit ADDS)
+--   sub rD rA rB              rD = rA - rB        (16-bit SUBS)
+--   mul rD rB                 rD = rD * rB        (16-bit MULS)
+--   mov rD rS                 rD = rS             (16-bit MOV)
+--   mmio_w ADDR_REG VAL_REG   *(addr) = val       (32-bit STR.W)
+--   mmio_r DST_REG ADDR_REG   dst = *(addr)       (32-bit LDR.W)
+--   load_imm32 rN VALUE       MOVW + MOVT pair to load arbitrary 32-bit into rN
+--   nop                       single Thumb NOP
+--   halt                      jump to halt loop (reset stub does this naturally)
+-- ADDR/VALUE are decimal or 0xHEX. Whitespace tolerant.
+--
+-- Output: a binary buffer ready to be flashed at base address 0x0
+-- (or any 4-aligned flash region with VTOR pointed at it).
+--
+-- v1 will add: let bindings (auto-allocated to r4..r7), expressions
+-- (parsed with precedence), control flow (while/if), function calls.
+
+import "stdlib/thumb2.rail"
+import "stdlib/cortexm_runtime.rail"
+
+-- ---- Source slurp ------------------------------------------------------
+
+cm_read_lines path =
+  let s = read_file path
+  str_split "\n" s
+
+-- ---- Lexer (per-line tokenizer) ----------------------------------------
+-- Splits a line on whitespace (spaces / tabs), drops comments after '#'.
+
+cm_drop_comment_acc cs acc =
+  if length cs == 0 then acc
+  else if head cs == "#" then acc
+  else cm_drop_comment_acc (tail cs) (cat [acc, head cs])
+
+cm_drop_comment line = cm_drop_comment_acc (chars line) ""
+
+cm_split_ws line =
+  let trimmed = cm_drop_comment line
+  -- str_split handles single-char and multi-char delimiters; use space.
+  let parts = str_split " " trimmed
+  cm_filter_nonempty parts
+
+cm_filter_nonempty xs =
+  if length xs == 0 then []
+  else
+    let h = head xs
+    if length (chars h) == 0 then cm_filter_nonempty (tail xs)
+    else cons h (cm_filter_nonempty (tail xs))
+
+-- ---- Number parsing: decimal or 0xHEX ---------------------------------
+
+cm_hex_digit c =
+  if c >= 48 && c <= 57 then c - 48
+  else if c >= 97 && c <= 102 then c - 87
+  else if c >= 65 && c <= 70 then c - 55
+  else 0 - 1
+
+cm_dec_digit c =
+  if c >= 48 && c <= 57 then c - 48
+  else 0 - 1
+
+cm_parse_hex_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = cm_hex_digit (char_to_int (head cs))
+    if d < 0 then acc
+    else cm_parse_hex_acc (tail cs) (acc * 16 + d)
+
+cm_parse_dec_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = cm_dec_digit (char_to_int (head cs))
+    if d < 0 then acc
+    else cm_parse_dec_acc (tail cs) (acc * 10 + d)
+
+cm_parse_int s =
+  let cs = chars s
+  if length cs == 0 then 0
+  else if length cs >= 2 && head cs == "0" && head (tail cs) == "x" then
+    cm_parse_hex_acc (tail (tail cs)) 0
+  else cm_parse_dec_acc cs 0
+
+-- ---- Register parsing: "rN" -> N, in 0..15 ----------------------------
+
+cm_parse_reg s =
+  let cs = chars s
+  if length cs < 2 then 0 - 1
+  else if head cs != "r" then 0 - 1
+  else cm_parse_dec_acc (tail cs) 0
+
+-- ---- Code emit per statement ------------------------------------------
+
+cm_emit_set asm rd value =
+  let lo = bit_and value 65535
+  let hi = bit_and (shr value 16) 65535
+  let _ = asm_movw asm rd lo
+  asm_movt asm rd hi
+
+cm_emit_add asm rd ra rb =
+  -- 16-bit ADDS Rd, Ra, Rb (low regs r0..r7)
+  -- 0x1800 | (Rb<<6) | (Ra<<3) | Rd
+  asm_push_inst asm 0 (bit_or 6144 (bit_or (shl rb 6) (bit_or (shl ra 3) rd))) 0 0 0 2
+
+cm_emit_sub asm rd ra rb =
+  -- 16-bit SUBS Rd, Ra, Rb -> 0x1A00 | (Rb<<6) | (Ra<<3) | Rd
+  asm_push_inst asm 0 (bit_or 6656 (bit_or (shl rb 6) (bit_or (shl ra 3) rd))) 0 0 0 2
+
+cm_emit_mul asm rd rb =
+  -- 16-bit MULS Rd, Rb (Rd = Rd * Rb) -> 0x4340 | (Rb<<3) | Rd
+  asm_push_inst asm 0 (bit_or 17216 (bit_or (shl rb 3) rd)) 0 0 0 2
+
+cm_emit_mov_reg asm rd rs = asm_mov_reg asm rd rs
+
+cm_emit_mmio_w asm addr_reg val_reg = asm_str_w asm val_reg addr_reg 0
+
+cm_emit_mmio_r asm dst_reg addr_reg = asm_ldr_w asm dst_reg addr_reg 0
+
+cm_emit_nop asm = asm_nop asm
+
+-- The assembler doesn't decode kind=0 specially; it falls through to the
+-- "unhandled" path in asm_emit_one, which doesn't write bytes. We need
+-- the assembler to know how to emit a raw 16-bit instruction. Patch it
+-- by piggybacking on the cm_post_process kind=1 (RAW32 with two halfwords)
+-- pathway: kind=0 with op0 = inst halfword, plus est_len=2.
+-- (cm_post_loop already handles this: kind 0 -> skip in post-process,
+-- but asm_emit_one returns self_off without writing. We need raw-emit
+-- handling. Add it via a post-pass too.)
+--
+-- Simpler: introduce a new kind code 20 = RAW16, op0 = halfword.
+-- Patch the assembler to write 2 bytes for kind=20 in emit_one.
+-- ... actually we can avoid touching asm_emit_one by handling kind=0
+-- (which I've been using above) in cm_post_process: write 2 bytes from
+-- op0.
+
+-- Override: re-export cm_post_loop with kind=0 handling for v0. We extend
+-- cm_post_loop directly via a CM-specific finalize wrapper.
+
+cm_finalize_with_raw asm =
+  let n_inst = asm_inst_count asm
+  let total = asm_finalize asm
+  let _ = cm_post_loop asm 0 n_inst
+  let _ = cm_raw_loop asm 0 n_inst
+  total
+
+cm_raw_loop asm i n =
+  if i >= n then 0
+  else
+    let inst = asm_inst_get asm i
+    let kind = arr_get inst 0
+    if kind == 0 then
+      let off = arr_get inst 4
+      let hw = arr_get inst 1
+      let buf = asm_buf asm
+      let _ = arr_set buf off       (bit_and hw 255)
+      let _ = arr_set buf (off + 1) (bit_and (shr hw 8) 255)
+      cm_raw_loop asm (i + 1) n
+    else cm_raw_loop asm (i + 1) n
+
+-- ---- Statement dispatch ------------------------------------------------
+
+cm_emit_stmt asm tokens =
+  if length tokens == 0 then 0
+  else
+    let op = head tokens
+    let rest = tail tokens
+    if op == "set" then cm_do_set asm rest
+    else if op == "load_imm32" then cm_do_set asm rest
+    else if op == "add" then cm_do_add asm rest
+    else if op == "sub" then cm_do_sub asm rest
+    else if op == "mul" then cm_do_mul asm rest
+    else if op == "mov" then cm_do_mov asm rest
+    else if op == "mmio_w" then cm_do_mmio_w asm rest
+    else if op == "mmio_r" then cm_do_mmio_r asm rest
+    else if op == "nop" then
+      let _ = cm_emit_nop asm
+      0
+    else if op == "halt" then
+      -- jump to halt label is implicit at end-of-program; "halt" inline
+      -- emits a B . self-loop here.
+      let _ = asm_push_inst asm 0 57342 0 0 0 2  -- 0xE7FE = b . (16-bit)
+      0
+    else 0
+
+cm_do_set asm rest =
+  if length rest < 2 then 0
+  else
+    let rd = cm_parse_reg (head rest)
+    let v = cm_parse_int (head (tail rest))
+    let _ = cm_emit_set asm rd v
+    0
+
+cm_do_add asm rest =
+  if length rest < 3 then 0
+  else
+    let rd = cm_parse_reg (head rest)
+    let ra = cm_parse_reg (head (tail rest))
+    let rb = cm_parse_reg (head (tail (tail rest)))
+    let _ = cm_emit_add asm rd ra rb
+    0
+
+cm_do_sub asm rest =
+  if length rest < 3 then 0
+  else
+    let rd = cm_parse_reg (head rest)
+    let ra = cm_parse_reg (head (tail rest))
+    let rb = cm_parse_reg (head (tail (tail rest)))
+    let _ = cm_emit_sub asm rd ra rb
+    0
+
+cm_do_mul asm rest =
+  if length rest < 2 then 0
+  else
+    let rd = cm_parse_reg (head rest)
+    let rb = cm_parse_reg (head (tail rest))
+    let _ = cm_emit_mul asm rd rb
+    0
+
+cm_do_mov asm rest =
+  if length rest < 2 then 0
+  else
+    let rd = cm_parse_reg (head rest)
+    let rs = cm_parse_reg (head (tail rest))
+    let _ = cm_emit_mov_reg asm rd rs
+    0
+
+cm_do_mmio_w asm rest =
+  if length rest < 2 then 0
+  else
+    let rA = cm_parse_reg (head rest)
+    let rV = cm_parse_reg (head (tail rest))
+    let _ = cm_emit_mmio_w asm rA rV
+    0
+
+cm_do_mmio_r asm rest =
+  if length rest < 2 then 0
+  else
+    let rD = cm_parse_reg (head rest)
+    let rA = cm_parse_reg (head (tail rest))
+    let _ = cm_emit_mmio_r asm rD rA
+    0
+
+-- ---- Program walker ----------------------------------------------------
+-- Walk every line, tokenize, dispatch to the appropriate emitter. Lines
+-- are skipped if blank or comment-only.
+
+cm_walk_lines asm lines =
+  if length lines == 0 then 0
+  else
+    let line = head lines
+    let toks = cm_split_ws line
+    let _ = cm_emit_stmt asm toks
+    cm_walk_lines asm (tail lines)
+
+-- ---- Top-level compile -------------------------------------------------
+-- Wraps the body in:
+--   vector table (32 entries)
+--   reset stub (bl main; b halt)
+--   halt (b .)
+--   main: push {r4, lr}; <user body>; pop {r4, pc}
+
+cm_compile_body asm body_lines =
+  -- Vector table + reset/halt stubs are emitted by the caller; we just
+  -- emit the user body's instructions here, surrounded by the prologue
+  -- and epilogue that an outer "main" function uses.
+  let _ = asm_push asm 240 1   -- push {r4, r5, r6, r7, lr}
+  let _ = cm_walk_lines asm body_lines
+  asm_pop asm 240 1            -- pop  {r4, r5, r6, r7, pc}
+
+cm_build asm sp_top src_lines =
+  let l_reset = asm_decl_label asm
+  let l_halt = asm_decl_label asm
+  let l_main = asm_decl_label asm
+  let _ = cm_emit_vector_table asm sp_top l_reset l_halt 16
+  let _ = asm_label_here asm l_reset
+  let _ = cm_emit_reset asm l_main l_halt
+  let _ = cm_emit_halt asm l_halt
+  let _ = asm_label_here asm l_main
+  let _ = cm_compile_body asm src_lines
+  cm_finalize_with_raw asm
+
+-- ---- Driver ------------------------------------------------------------
+
+cm_write_bin path buf n =
+  -- write bytes via xxd -r - the buffer goes through hex
+  let hex = cm_buf_to_hex buf n 0 ""
+  let _ = write_file (cat [path, ".hex"]) hex
+  let _ = shell (cat ["xxd -r -p '", path, ".hex' > '", path, "'"])
+  0
+
+cm_buf_to_hex buf n i acc =
+  if i >= n then acc
+  else
+    let b = arr_get buf i
+    let hi = bit_and (shr b 4) 15
+    let lo = bit_and b 15
+    let ch = if hi < 10 then char_from_int (48 + hi) else char_from_int (87 + hi)
+    let cl = if lo < 10 then char_from_int (48 + lo) else char_from_int (87 + lo)
+    cm_buf_to_hex buf n (i + 1) (cat [acc, ch, cl])
+
+main =
+  let argv = args
+  if length argv < 2 then
+    let _ = print "usage: rail_native run tools/cortexm/compile_cm.rail <source.cm> [out.bin]"
+    1
+  else
+    let src_path = head (tail argv)
+    let out_path = if length argv >= 3 then head (tail (tail argv))
+                   else cat [src_path, ".bin"]
+    let _ = print (cat ["compiling ", src_path, " -> ", out_path])
+    let lines = cm_read_lines src_path
+    let _ = print (cat ["  ", show (length lines), " lines of source"])
+    let asm = asm_new 8192
+    let total = cm_build asm 537001984 lines    -- sp_top = 0x20020000
+    let _ = print (cat ["  emitted ", show total, " bytes"])
+    let _ = cm_write_bin out_path (asm_buf asm) total
+    let _ = print (cat ["  wrote ", out_path])
+    let _ = print "  disassembly:"
+    let _ = t2_disasm (asm_buf asm) 0 total 256
+    0
