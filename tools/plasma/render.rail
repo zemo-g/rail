@@ -1,0 +1,609 @@
+-- tools/plasma/render.rail — Rail-WASM compute kernels for the holo viewer.
+--
+-- This is the substrate for Tier 3 (see docs/plans/PLASMA_RAIL_WASM_RENDERER.md).
+-- Compile native:  ./rail_native run    tools/plasma/render.rail
+-- Compile to WASM: ./rail_native wasm   tools/plasma/render.rail
+--
+-- Channel order (matches tools/plasma/mhd_beacon.rail's dump_primitives):
+--   0=ρ  1=vx  2=vy  3=p  4=Bx  5=By
+--
+-- Pattern follows mhd_wasm.rail: state stored in a single float_arr of
+-- size NFIELDS * N², plane-major C-row-major.  Helpers hide the indexing.
+
+-- ── Constants ────────────────────────────────────────────────────────
+nn      = 128
+nn2     = 16384
+nfields = 6
+state_size = 98304             -- nn2 * nfields
+
+-- Field indices (match the beacon's plane order)
+f_rho = 0
+f_vx  = 1
+f_vy  = 2
+f_p   = 3
+f_bx  = 4
+f_by  = 5
+
+-- ── Index + access helpers ───────────────────────────────────────────
+wrap i = if i < 0 then i + nn else if i >= nn then i - nn else i
+idx f x y = f * nn2 + wrap y * nn + wrap x
+sget state f x y = float_arr_get state (idx f x y)
+sset state f x y v = float_arr_set state (idx f x y) v
+
+-- ── decode_frame: synthetic frame seeded with the OT initial condition ─
+-- Real integration with the live beacon goes through the JS host — that
+-- writes f32 data into the Float64Array view of WASM memory at the
+-- state_ptr offset.  This native main() instead seeds with the canonical
+-- IC so we can sanity-check the kernels offline.
+seed_ot_cell state i =
+  let x = i % nn
+  let y = i / nn
+  let xp = to_float x * 0.04908738521234052
+  let yp = to_float y * 0.04908738521234052
+  let rho = 2.77777777777778
+  let vx  = 0.0 - sin yp
+  let vy  = sin xp
+  let bx  = 0.0 - sin yp
+  let by  = sin (2.0 * xp)
+  let p   = 1.6666666666666667
+  let _ = sset state f_rho x y rho
+  let _ = sset state f_vx  x y vx
+  let _ = sset state f_vy  x y vy
+  let _ = sset state f_p   x y p
+  let _ = sset state f_bx  x y bx
+  sset state f_by  x y by
+
+seed_ot state i =
+  if i >= nn2 then 0
+  else
+    let _ = seed_ot_cell state i
+    seed_ot state (i + 1)
+
+-- ── vorticity: ω = ∂vy/∂x − ∂vx/∂y, central differences, periodic ───
+vort_at state x y =
+  let vy_xp = sget state f_vy (x + 1) y
+  let vy_xm = sget state f_vy (x - 1) y
+  let vx_yp = sget state f_vx x (y + 1)
+  let vx_ym = sget state f_vx x (y - 1)
+  (vy_xp - vy_xm - vx_yp + vx_ym) * 0.5
+
+vorticity_loop state out i =
+  if i >= nn2 then 0
+  else
+    let x = i % nn
+    let y = i / nn
+    let _ = float_arr_set out i (vort_at state x y)
+    vorticity_loop state out (i + 1)
+
+vorticity state =
+  let out = float_arr_new nn2 0.0
+  let _ = vorticity_loop state out 0
+  out
+
+-- ── current_density: |J| = |∂By/∂x − ∂Bx/∂y| ────────────────────────
+jmag_at state x y =
+  let by_xp = sget state f_by (x + 1) y
+  let by_xm = sget state f_by (x - 1) y
+  let bx_yp = sget state f_bx x (y + 1)
+  let bx_ym = sget state f_bx x (y - 1)
+  let j = (by_xp - by_xm - bx_yp + bx_ym) * 0.5
+  if j < 0.0 then 0.0 - j else j
+
+current_density_loop state out i =
+  if i >= nn2 then 0
+  else
+    let x = i % nn
+    let y = i / nn
+    let _ = float_arr_set out i (jmag_at state x y)
+    current_density_loop state out (i + 1)
+
+current_density state =
+  let out = float_arr_new nn2 0.0
+  let _ = current_density_loop state out 0
+  out
+
+-- ── schlieren: |∇ρ| ─────────────────────────────────────────────────
+schlieren_at state x y =
+  let r_xp = sget state f_rho (x + 1) y
+  let r_xm = sget state f_rho (x - 1) y
+  let r_yp = sget state f_rho x (y + 1)
+  let r_ym = sget state f_rho x (y - 1)
+  let dx = (r_xp - r_xm) * 0.5
+  let dy = (r_yp - r_ym) * 0.5
+  sqrt (dx * dx + dy * dy)
+
+schlieren_loop state out i =
+  if i >= nn2 then 0
+  else
+    let x = i % nn
+    let y = i / nn
+    let _ = float_arr_set out i (schlieren_at state x y)
+    schlieren_loop state out (i + 1)
+
+schlieren state =
+  let out = float_arr_new nn2 0.0
+  let _ = schlieren_loop state out 0
+  out
+
+-- ── derive_metrics: 4 scalars: kinetic E, magnetic E, |∇·B|_max, mean ω
+ke_acc_loop state acc i =
+  if i >= nn2 then float_arr_get acc 0
+  else
+    let x = i % nn
+    let y = i / nn
+    let r  = sget state f_rho x y
+    let vx = sget state f_vx  x y
+    let vy = sget state f_vy  x y
+    let _ = float_arr_set acc 0
+              (float_arr_get acc 0 + 0.5 * r * (vx * vx + vy * vy))
+    ke_acc_loop state acc (i + 1)
+
+me_acc_loop state acc i =
+  if i >= nn2 then float_arr_get acc 0
+  else
+    let x = i % nn
+    let y = i / nn
+    let bx = sget state f_bx x y
+    let by = sget state f_by x y
+    let _ = float_arr_set acc 0
+              (float_arr_get acc 0 + 0.5 * (bx * bx + by * by))
+    me_acc_loop state acc (i + 1)
+
+divb_max_loop state acc i =
+  if i >= nn2 then float_arr_get acc 0
+  else
+    let x = i % nn
+    let y = i / nn
+    let bxp = sget state f_bx (x + 1) y
+    let bxm = sget state f_bx (x - 1) y
+    let byp = sget state f_by x (y + 1)
+    let bym = sget state f_by x (y - 1)
+    let div = (bxp - bxm + byp - bym) * 0.5
+    let absdiv = if div < 0.0 then 0.0 - div else div
+    let cur = float_arr_get acc 0
+    let _ = if absdiv > cur then float_arr_set acc 0 absdiv else 0
+    divb_max_loop state acc (i + 1)
+
+vort_mean_loop state acc i =
+  if i >= nn2 then float_arr_get acc 0 / 16384.0
+  else
+    let x = i % nn
+    let y = i / nn
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + vort_at state x y)
+    vort_mean_loop state acc (i + 1)
+
+total_kinetic_energy state =
+  let acc = float_arr_new 1 0.0
+  ke_acc_loop state acc 0
+
+total_magnetic_energy state =
+  let acc = float_arr_new 1 0.0
+  me_acc_loop state acc 0
+
+max_divb state =
+  let acc = float_arr_new 1 0.0
+  divb_max_loop state acc 0
+
+mean_vorticity state =
+  let acc = float_arr_new 1 0.0
+  vort_mean_loop state acc 0
+
+-- ── Tier 3-C: LIC (line integral convolution) ───────────────────────
+-- Streamline-aligned noise smear.  For each cell, walk forward and
+-- backward along the local velocity field for 12 steps each direction
+-- using nearest-neighbor stepping; accumulate noise samples; divide by
+-- 24.  Result is a [0, 1] field showing flow lines.
+--
+-- IMPORTANT: float register accumulators across self-recursion don't
+-- get reliably float-typed by the Rail WASM emitter (no caller-derived
+-- float marker on the param).  Workaround: thread the accumulator as a
+-- 1-cell float_arr — same pattern as ke_acc_loop.  This is the
+-- `acc_arr` argument throughout.
+--
+-- noise: caller-supplied float_arr of size nn², values in [0, 1).
+-- out:   caller-supplied float_arr of size nn², written in place.
+
+sign_f x = if x > 0.0 then 1 else if x < 0.0 then 0 - 1 else 0
+
+noise_get noise x y = float_arr_get noise (wrap y * nn + wrap x)
+
+lic_walk state noise acc_arr x y dx dy n =
+  if n <= 0 then 0
+  else
+    let xn = wrap (x + dx)
+    let yn = wrap (y + dy)
+    let nval = noise_get noise xn yn
+    let _ = float_arr_set acc_arr 0 (float_arr_get acc_arr 0 + nval)
+    let vx = sget state f_vx xn yn
+    let vy = sget state f_vy xn yn
+    let ndx = sign_f vx
+    let ndy = sign_f vy
+    lic_walk state noise acc_arr xn yn ndx ndy (n - 1)
+
+lic_at state noise acc_arr x y =
+  let _ = float_arr_set acc_arr 0 0.0
+  let vx = sget state f_vx x y
+  let vy = sget state f_vy x y
+  let dx = sign_f vx
+  let dy = sign_f vy
+  let _ = lic_walk state noise acc_arr x y dx dy 12
+  let _ = lic_walk state noise acc_arr x y (0 - dx) (0 - dy) 12
+  float_arr_get acc_arr 0 * 0.04166666666666667
+
+lic_loop state noise out acc_arr i =
+  if i >= nn2 then 0
+  else
+    let x = i % nn
+    let y = i / nn
+    let _ = float_arr_set out i (lic_at state noise acc_arr x y)
+    lic_loop state noise out acc_arr (i + 1)
+
+-- Public entry: caller provides noise (16384 cells, values in [0, 1))
+-- and out (16384 cells, written in place).  Internal acc_arr is one
+-- cell; lives until the next arena_reset.
+lic state noise out =
+  let acc_arr = float_arr_new 1 0.0
+  let _ = lic_loop state noise out acc_arr 0
+  out
+
+-- ── Tier 3-D: particle integrator ────────────────────────────────────
+-- RK2 advection of K tracers in the velocity field.  Particle storage
+-- is a flat float_arr of 2*K cells (interleaved x, y).  Periodic-wrap
+-- in float space.  Sampling uses nearest-neighbor.
+--
+-- dt is passed as a 1-cell float_arr (same float-typing workaround as
+-- LIC's accumulator).  Caller writes the desired dt into cell 0 of
+-- dt_arr before calling.
+
+wrap_f x = if x < 0.0 then x + 128.0 else if x >= 128.0 then x - 128.0 else x
+
+vsample_vx state x y =
+  let xi = float_to_int x
+  let yi = float_to_int y
+  sget state f_vx xi yi
+
+vsample_vy state x y =
+  let xi = float_to_int x
+  let yi = float_to_int y
+  sget state f_vy xi yi
+
+particle_step_one state particles dt_arr i =
+  let dt = float_arr_get dt_arr 0
+  let xi = float_arr_get particles (i * 2)
+  let yi = float_arr_get particles (i * 2 + 1)
+  -- RK2: midpoint velocity
+  let vx0 = vsample_vx state xi yi
+  let vy0 = vsample_vy state xi yi
+  let xm  = wrap_f (xi + 0.5 * dt * vx0)
+  let ym  = wrap_f (yi + 0.5 * dt * vy0)
+  let vxm = vsample_vx state xm ym
+  let vym = vsample_vy state xm ym
+  let xn  = wrap_f (xi + dt * vxm)
+  let yn  = wrap_f (yi + dt * vym)
+  let _ = float_arr_set particles (i * 2)     xn
+  float_arr_set particles (i * 2 + 1) yn
+
+particle_step_loop state particles dt_arr k i =
+  if i >= k then 0
+  else
+    let _ = particle_step_one state particles dt_arr i
+    particle_step_loop state particles dt_arr k (i + 1)
+
+-- Public entry: K passed as tagged int from JS.  dt_arr is a 1-cell
+-- float_arr; cell 0 holds the integration step.
+particle_step state particles k dt_arr =
+  let _ = particle_step_loop state particles dt_arr k 0
+  particles
+
+-- ── Tier 4: chamber renderer ─────────────────────────────────────────
+-- Volumetric raymarch through a cylindrical chamber containing the 2D
+-- plane field.  Output: 128×128 packed RGB8 (3 bytes per pixel, packed
+-- as floats in [0, 255]; the publisher narrows to u8 on attach).
+--
+-- Design: docs/plans/CHAMBER_PUBLISHER.md.  The same kernel runs
+-- server-side on Mini (ARM64 native) to attach a finished chamber
+-- image to each beacon pulse, AND in the browser (WebAssembly) as a
+-- byte-checkable audit path.  Single source of truth.
+
+img_w = 128
+img_h = 128
+img_n = 16384       -- img_w * img_h
+img_bytes = 49152   -- img_n * 3 (RGB8)
+
+march_steps = 24
+
+-- Camera (orthographic iso, fixed for v1).  origin = (96, 96, 50),
+-- looking at chamber center (0, 0, 0).  Basis vectors precomputed.
+cam_ox = 96.0
+cam_oy = 96.0
+cam_oz = 50.0
+cam_fwd_x = 0.0 - 0.6635
+cam_fwd_y = 0.0 - 0.6635
+cam_fwd_z = 0.0 - 0.3456
+cam_right_x = 0.0 - 0.7071
+cam_right_y = 0.7071
+cam_right_z = 0.0
+cam_up_x = 0.0 - 0.244
+cam_up_y = 0.0 - 0.244
+cam_up_z = 0.939
+view_extent = 100.0
+
+-- Cylinder geometry (chamber-space, axis along Z).
+cyl_radius = 50.0
+cyl_halfh  = 30.0
+
+-- ── helpers ───────────────────────────────────────────────────────
+-- Bilinear sample with periodic wrap.  Plane field is 128×128 cells.
+plane_sample state f x y =
+  let xw = if x < 0.0 then x + 128.0 else if x >= 128.0 then x - 128.0 else x
+  let yw = if y < 0.0 then y + 128.0 else if y >= 128.0 then y - 128.0 else y
+  let xi = float_to_int (floor xw)
+  let yi = float_to_int (floor yw)
+  let xn = (xi + 1) % 128
+  let yn = (yi + 1) % 128
+  let fx = xw - to_float xi
+  let fy = yw - to_float yi
+  let v00 = sget state f xi yi
+  let v10 = sget state f xn yi
+  let v01 = sget state f xi yn
+  let v11 = sget state f xn yn
+  let v0 = v00 * (1.0 - fx) + v10 * fx
+  let v1 = v01 * (1.0 - fx) + v11 * fx
+  v0 * (1.0 - fy) + v1 * fy
+
+-- Viridis 5-stop colormap, piecewise linear.  Returns one channel in [0, 1].
+viridis_r t =
+  let tt = if t < 0.0 then 0.0 else if t > 1.0 then 1.0 else t
+  if tt < 0.25 then 0.267 + (0.231 - 0.267) * (tt * 4.0)
+  else if tt < 0.50 then 0.231 + (0.129 - 0.231) * ((tt - 0.25) * 4.0)
+  else if tt < 0.75 then 0.129 + (0.365 - 0.129) * ((tt - 0.50) * 4.0)
+  else                   0.365 + (0.992 - 0.365) * ((tt - 0.75) * 4.0)
+
+viridis_g t =
+  let tt = if t < 0.0 then 0.0 else if t > 1.0 then 1.0 else t
+  if tt < 0.25 then 0.004 + (0.322 - 0.004) * (tt * 4.0)
+  else if tt < 0.50 then 0.322 + (0.565 - 0.322) * ((tt - 0.25) * 4.0)
+  else if tt < 0.75 then 0.565 + (0.788 - 0.565) * ((tt - 0.50) * 4.0)
+  else                   0.788 + (0.906 - 0.788) * ((tt - 0.75) * 4.0)
+
+viridis_b t =
+  let tt = if t < 0.0 then 0.0 else if t > 1.0 then 1.0 else t
+  if tt < 0.25 then 0.329 + (0.545 - 0.329) * (tt * 4.0)
+  else if tt < 0.50 then 0.545 + (0.553 - 0.545) * ((tt - 0.25) * 4.0)
+  else if tt < 0.75 then 0.553 + (0.388 - 0.553) * ((tt - 0.50) * 4.0)
+  else                   0.388 + (0.145 - 0.388) * ((tt - 0.75) * 4.0)
+
+-- ACES tonemap (Krzysztof Narkowicz's approximation).  In: linear
+-- HDR scalar.  Out: LDR in [0, 1].
+aces_curve x =
+  let xx = if x < 0.0 then 0.0 else x
+  let num = xx * (2.51 * xx + 0.03)
+  let den = xx * (2.43 * xx + 0.59) + 0.14
+  let r = num / den
+  if r > 1.0 then 1.0 else r
+
+-- ── ray-cylinder intersection ────────────────────────────────────
+-- All float params travel through ray_arr (int-handle param boundary
+-- is the only one Rail's native codegen handles reliably for user
+-- functions — same pattern as ke_acc_loop, particle_step_one).
+--   ray_arr[0..2]    : ox, oy, oz (caller fills)
+--   result_arr[0..2] : t_enter, t_exit, hit_bool (function writes)
+intersect_cylinder ray_arr result_arr =
+  let ox = float_arr_get ray_arr 0
+  let oy = float_arr_get ray_arr 1
+  let oz = float_arr_get ray_arr 2
+  -- Inline constants as local lets — nullary float-returning bindings
+  -- (`cam_fwd_x`, `cyl_radius`, etc.) get inferred as int by the type
+  -- checker on the first pass and trigger spurious mismatch warnings
+  -- + miscompiled comparisons that segfault at runtime.  Local lets
+  -- with literal RHSs are unambiguously float.
+  let dx = 0.0 - 0.6635
+  let dy = 0.0 - 0.6635
+  let dz = 0.0 - 0.3456
+  let radius2 = 2500.0     -- 50²
+  let halfh = 30.0
+  let a = dx * dx + dy * dy
+  let b = 2.0 * (ox * dx + oy * dy)
+  let c = ox * ox + oy * oy - radius2
+  let disc = b * b - 4.0 * a * c
+  if disc < 0.0 then
+    float_arr_set result_arr 2 0.0
+  else
+    let sqd = sqrt disc
+    let t_in_xy  = (0.0 - b - sqd) / (2.0 * a)
+    let t_out_xy = (0.0 - b + sqd) / (2.0 * a)
+    let t_z1 = (halfh - oz) / dz
+    let t_z2 = (0.0 - halfh - oz) / dz
+    let t_zmin = if t_z1 < t_z2 then t_z1 else t_z2
+    let t_zmax = if t_z1 < t_z2 then t_z2 else t_z1
+    let t_enter = if t_in_xy  > t_zmin then t_in_xy  else t_zmin
+    let t_exit  = if t_out_xy < t_zmax then t_out_xy else t_zmax
+    if t_enter < t_exit && t_exit > 0.0 then
+      let _ = float_arr_set result_arr 0 t_enter
+      let _ = float_arr_set result_arr 1 t_exit
+      float_arr_set result_arr 2 1.0
+    else
+      float_arr_set result_arr 2 0.0
+
+-- ── march loop ───────────────────────────────────────────────────
+-- All float state lives in ray_arr; only ints + array handles cross
+-- the function boundary.
+--   ray_arr[0..2] : ox, oy, oz
+--   ray_arr[3]    : current t (mutated each step)
+--   ray_arr[4]    : dt
+--   acc_arr[0..3] : r, g, b, alpha (HDR accumulator)
+march_loop state acc_arr ray_arr n =
+  if n <= 0 then 0
+  else
+    -- Inline camera forward (was `cam_fwd_x`/`cam_fwd_y`, nullary float
+    -- fns that the type checker can fail to mark in some contexts and
+    -- produce wrong-typed math at runtime).
+    let fx = 0.0 - 0.6635
+    let fy = 0.0 - 0.6635
+    let ox = float_arr_get ray_arr 0
+    let oy = float_arr_get ray_arr 1
+    let t  = float_arr_get ray_arr 3
+    let dt = float_arr_get ray_arr 4
+    let px = ox + t * fx
+    let py = oy + t * fy
+    let xs = px + 64.0
+    let ys = py + 64.0
+    let rho = plane_sample state f_rho xs ys
+    let vx  = plane_sample state f_vx  xs ys
+    let vy  = plane_sample state f_vy  xs ys
+    let bx  = plane_sample state f_bx  xs ys
+    let by  = plane_sample state f_by  xs ys
+    let rho_n = (rho - 0.2) * 0.25
+    let cr = viridis_r rho_n
+    let cg = viridis_g rho_n
+    let cb = viridis_b rho_n
+    let vort_proxy = vx * by - vy * bx
+    let tr = if vort_proxy > 0.0 then 0.7 else 1.0
+    let tg = if vort_proxy > 0.0 then 1.0 else 0.7
+    let er = cr * tr
+    let eg = cg * tg
+    let eb = cb * 0.95
+    let sigma = (rho - 0.5) * 0.025
+    let sigma_pos = if sigma < 0.0 then 0.0 else sigma
+    let alpha_step = 1.0 - exp (0.0 - sigma_pos * dt)
+    let one_minus_a = 1.0 - float_arr_get acc_arr 3
+    let weight = alpha_step * one_minus_a
+    let _ = float_arr_set acc_arr 0 (float_arr_get acc_arr 0 + er * weight)
+    let _ = float_arr_set acc_arr 1 (float_arr_get acc_arr 1 + eg * weight)
+    let _ = float_arr_set acc_arr 2 (float_arr_get acc_arr 2 + eb * weight)
+    let _ = float_arr_set acc_arr 3 (float_arr_get acc_arr 3 + weight)
+    let _ = float_arr_set ray_arr 3 (t + dt)
+    march_loop state acc_arr ray_arr (n - 1)
+
+-- ── put_rgb: write 3 bytes (as floats) at output index ───────────
+put_rgb out_rgb i r g b =
+  let _ = float_arr_set out_rgb (i * 3)     r
+  let _ = float_arr_set out_rgb (i * 3 + 1) g
+  float_arr_set out_rgb (i * 3 + 2) b
+
+-- ── per-pixel render ─────────────────────────────────────────────
+-- Floats stay inside this function — never crossed at param boundary.
+-- ray_arr (passed in by the loop) carries: [ox, oy, oz, t, dt] for the
+-- march helper; we fill it before calling.  isect_arr returns
+-- [t_enter, t_exit, hit_bool] from intersect_cylinder.
+chamber_pixel state out_rgb acc_arr isect_arr ray_arr px py =
+  -- Inline camera constants (avoid nullary-float-fn type-inference issues).
+  let cam_ox_l = 96.0
+  let cam_oy_l = 96.0
+  let cam_oz_l = 50.0
+  let right_x = 0.0 - 0.7071
+  let right_y = 0.7071
+  let up_x = 0.0 - 0.244
+  let up_y = 0.0 - 0.244
+  let up_z = 0.939
+  let extent = 100.0
+  let u = (to_float px / 128.0) - 0.5
+  let v = (to_float py / 128.0) - 0.5
+  let ox = cam_ox_l + u * extent * right_x + v * extent * up_x
+  let oy = cam_oy_l + u * extent * right_y + v * extent * up_y
+  let oz = cam_oz_l + v * extent * up_z
+  -- Stage origin into ray_arr for intersect_cylinder.
+  let _ = float_arr_set ray_arr 0 ox
+  let _ = float_arr_set ray_arr 1 oy
+  let _ = float_arr_set ray_arr 2 oz
+  let _ = intersect_cylinder ray_arr isect_arr
+  let hit = float_arr_get isect_arr 2
+  if hit < 0.5 then
+    put_rgb out_rgb (py * 128 + px) 8.0 14.0 28.0
+  else
+    let t_enter = float_arr_get isect_arr 0
+    let t_exit  = float_arr_get isect_arr 1
+    let dt = (t_exit - t_enter) / 12.0
+    let _ = float_arr_set acc_arr 0 0.0
+    let _ = float_arr_set acc_arr 1 0.0
+    let _ = float_arr_set acc_arr 2 0.0
+    let _ = float_arr_set acc_arr 3 0.0
+    -- Stage t and dt into ray_arr for march_loop.
+    let _ = float_arr_set ray_arr 3 (t_enter + 0.5 * dt)
+    let _ = float_arr_set ray_arr 4 dt
+    let _ = march_loop state acc_arr ray_arr 12
+    let r_lin = float_arr_get acc_arr 0
+    let g_lin = float_arr_get acc_arr 1
+    let b_lin = float_arr_get acc_arr 2
+    let r_t = aces_curve r_lin
+    let g_t = aces_curve g_lin
+    let b_t = aces_curve b_lin
+    put_rgb out_rgb (py * 128 + px) (r_t * 255.0) (g_t * 255.0) (b_t * 255.0)
+
+-- ── nested render loops ──────────────────────────────────────────
+chamber_loop_x state out_rgb acc_arr isect_arr ray_arr py px =
+  if px >= 128 then 0
+  else
+    let _ = chamber_pixel state out_rgb acc_arr isect_arr ray_arr px py
+    chamber_loop_x state out_rgb acc_arr isect_arr ray_arr py (px + 1)
+
+chamber_loop_y state out_rgb acc_arr isect_arr ray_arr py =
+  if py >= 128 then 0
+  else
+    let _ = chamber_loop_x state out_rgb acc_arr isect_arr ray_arr py 0
+    chamber_loop_y state out_rgb acc_arr isect_arr ray_arr (py + 1)
+
+-- Public entry: render the chamber into caller-allocated out_rgb.
+-- out_rgb must be a float_arr of img_bytes (49152) cells.
+chamber_render state out_rgb =
+  let acc_arr   = float_arr_new 4 0.0
+  let isect_arr = float_arr_new 3 0.0
+  let ray_arr   = float_arr_new 5 0.0
+  let _ = chamber_loop_y state out_rgb acc_arr isect_arr ray_arr 0
+  out_rgb
+
+-- ── Native sanity check ──────────────────────────────────────────────
+-- Seeds the OT IC, runs all kernels, prints expected vs computed values.
+-- The IC is well-defined so we know what to expect:
+--   ke_total(t=0)   = 0.5 * ρ₀ * <vx²+vy²>     ≈ 1.388 * <sin²>
+--   me_total(t=0)   = 0.5 * <bx²+by²>           = 0.5 * <sin²+sin²(2x)>
+--   max|∇·B|        ≈ machine zero  (sinusoidal ICs are solenoidal)
+--   <ω>             ≈ 0  (symmetric IC integrates to zero)
+
+main =
+  let _ = print "render.rail — Rail-WASM compute kernels"
+  let _ = print "Seeding Orszag-Tang initial condition (128² × 6 fields)"
+  let state = float_arr_new state_size 0.0
+  let _ = seed_ot state 0
+  let _ = print "Computing derived fields..."
+  let ke = total_kinetic_energy state
+  let me = total_magnetic_energy state
+  let div_max = max_divb state
+  let vort_mean = mean_vorticity state
+  let _ = print ""
+  let _ = print "──── derived metrics ────"
+  let _ = print (cat ["kinetic energy   = ", show_float ke,        "    (expect ~22755.56)"])
+  let _ = print (cat ["magnetic energy  = ", show_float me,        "    (expect ~8192)"])
+  let _ = print (cat ["max |∇·B|        = ", show_float div_max,   "    (expect ~0)"])
+  let _ = print (cat ["mean vorticity   = ", show_float vort_mean, "    (expect ~0)"])
+  let _ = print ""
+  let _ = print "── isect smoke test ────"
+  let test_in   = float_arr_new 3 0.0
+  let _ = float_arr_set test_in 0 96.0
+  let _ = float_arr_set test_in 1 96.0
+  let _ = float_arr_set test_in 2 50.0
+  let test_arr = float_arr_new 3 0.0
+  let _ = intersect_cylinder test_in test_arr
+  let _ = print (cat ["  hit=", show_float (float_arr_get test_arr 2),
+                      " enter=", show_float (float_arr_get test_arr 0),
+                      " exit=", show_float (float_arr_get test_arr 1)])
+  let _ = print ""
+  let _ = print "── chamber render (Tier 4) ────"
+  let chamber_buf = float_arr_new img_bytes 0.0
+  let _ = print "  rendering 128² pixels..."
+  let _ = chamber_render state chamber_buf
+  let _ = print "  done.  sampling output:"
+  -- Center pixel (px=64, py=64), edge pixel, corner.
+  let cidx = 64 * 128 + 64
+  let _ = print (cat ["    center (64,64): rgb = ",
+                      show_float (float_arr_get chamber_buf (cidx * 3)), ", ",
+                      show_float (float_arr_get chamber_buf (cidx * 3 + 1)), ", ",
+                      show_float (float_arr_get chamber_buf (cidx * 3 + 2))])
+  let cidx2 = 0
+  let _ = print (cat ["    corner (0,0):   rgb = ",
+                      show_float (float_arr_get chamber_buf (cidx2 * 3)), ", ",
+                      show_float (float_arr_get chamber_buf (cidx2 * 3 + 1)), ", ",
+                      show_float (float_arr_get chamber_buf (cidx2 * 3 + 2))])
+  let _ = print ""
+  let _ = print "── ready for WASM build:  ./rail_native wasm tools/plasma/render.rail"
+  0
