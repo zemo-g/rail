@@ -1,0 +1,207 @@
+-- tools/train/dpo_from_rerank.rail — Tier-C1 DPO pair extractor.
+--
+-- After a bench run with N=20 parallel rerank, every prompt has produced
+-- 20 sample files at /tmp/rerank_bench_<seed_base>_<0..19>.txt. Each file
+-- contains the full inference output (sample text + oracle stats footer
+-- with `ok=0/1` indicating compile-pass).
+--
+-- This tool mines those files into DPO training pairs:
+--   per prompt: pair each compile-pass with each compile-fail
+--   emit JSONL: {"prompt": <p>, "chosen": <pass_text>, "rejected": <fail_text>}
+--
+-- Pairs are capped per-prompt to avoid quadratic blowup on prompts with
+-- many passes. Default cap: 16 pairs/prompt (4 passes × 4 fails).
+--
+-- Usage:
+--   ./rail_native run tools/train/dpo_from_rerank.rail <bench_log_path> [out_path]
+--
+-- Reads the bench log (from `bench_railnative_rerank.rail` stdout) to
+-- extract the seed_bases (one per prompt) and the prompt strings, then
+-- walks /tmp/rerank_bench_<seed_base>_<i>.txt for each.
+
+import "stdlib/list.rail"
+
+cat parts = join "" parts
+
+-- Extract `ok=0/1` from a sample file's oracle-stats footer.
+-- Footer line format: "  oracle: ok=1 quality=12345 ..."
+extract_ok content =
+  let lines = split "\n" content
+  extract_ok_loop lines
+
+extract_ok_loop ls =
+  if length ls == 0 then -1
+  else
+    let line = head ls
+    if str_contains "oracle:" line then
+      if str_contains "ok=1" line then 1
+      else if str_contains "ok=0" line then 0
+      else -1
+    else extract_ok_loop (tail ls)
+
+-- Strip oracle-stats footer to get just the sample text.
+strip_footer content =
+  let lines = split "\n" content
+  let kept = take_until_oracle lines []
+  join "\n" (reverse kept)
+
+take_until_oracle ls acc =
+  if length ls == 0 then acc
+  else
+    let line = head ls
+    if str_contains "oracle:" line then acc
+    else take_until_oracle (tail ls) (cons line acc)
+
+-- Read all 20 sample files for a given seed_base. Returns list of
+-- (ok, text) pairs.
+read_samples seed_base =
+  read_samples_loop seed_base 0 []
+
+read_samples_loop seed_base i acc =
+  if i >= 20 then reverse acc
+  else
+    let path = cat ["/tmp/rerank_bench_", show seed_base, "_", show i, ".txt"]
+    let content = read_file path
+    if is_error content then read_samples_loop seed_base (i + 1) acc
+    else
+      let ok = extract_ok content
+      let text = strip_footer content
+      read_samples_loop seed_base (i + 1) (cons (cons ok text) acc)
+
+-- Generate DPO pairs: cartesian product of (compile-pass × compile-fail),
+-- capped at max_pairs per prompt.
+generate_pairs prompt samples max_pairs =
+  let passes = filter_pairs samples 1
+  let fails = filter_pairs samples 0
+  let n_p = length passes
+  let n_f = length fails
+  if n_p == 0 then []
+  else if n_f == 0 then []
+  else
+    let cap = min_int (n_p * n_f) max_pairs
+    pair_loop prompt passes fails 0 cap []
+
+filter_pairs samples target_ok =
+  filter_pairs_loop samples target_ok []
+
+filter_pairs_loop samples target_ok acc =
+  if length samples == 0 then reverse acc
+  else
+    let s = head samples
+    let ok = head s
+    let text = head (tail s)
+    if ok == target_ok then filter_pairs_loop (tail samples) target_ok (cons text acc)
+    else filter_pairs_loop (tail samples) target_ok acc
+
+min_int a b = if a < b then a else b
+
+pair_loop prompt passes fails idx cap acc =
+  if idx >= cap then reverse acc
+  else
+    let n_p = length passes
+    let n_f = length fails
+    let p_idx = idx mod n_p
+    let f_idx = (idx / n_p) mod n_f
+    let chosen = nth p_idx passes
+    let rejected = nth f_idx fails
+    let pair_json = cat [
+      "{\"prompt\": ", json_escape prompt, ", ",
+      "\"chosen\": ", json_escape chosen, ", ",
+      "\"rejected\": ", json_escape rejected, "}"]
+    pair_loop prompt passes fails (idx + 1) cap (cons pair_json acc)
+
+-- Minimal JSON string escape: escape backslash + quote + newline + tab.
+json_escape s =
+  let cs = chars s
+  let escaped = json_escape_loop cs []
+  cat ["\"", join "" escaped, "\""]
+
+json_escape_loop cs acc =
+  if length cs == 0 then reverse acc
+  else
+    let c = head cs
+    let esc = if c == "\"" then "\\\""
+              else if c == "\\" then "\\\\"
+              else if c == "\n" then "\\n"
+              else if c == "\t" then "\\t"
+              else if c == "\r" then "\\r"
+              else c
+    json_escape_loop (tail cs) (cons esc acc)
+
+-- Parse bench log to extract (seed_base, prompt) pairs. Bench log lines:
+--   "  task #N: <prompt-snippet>"
+--   "    seed=<base> ok=..."
+-- We track the last printed task line and use the first seed= line after
+-- it as that task's seed_base.
+parse_bench_log log_path =
+  let content = read_file log_path
+  if is_error content then []
+  else
+    let lines = split "\n" content
+    parse_log_loop lines "" []
+
+parse_log_loop lines current_prompt acc =
+  if length lines == 0 then reverse acc
+  else
+    let line = head lines
+    if str_starts_with "  task " line then
+      let p = extract_task_prompt line
+      parse_log_loop (tail lines) p acc
+    else if str_contains "seed=" line then
+      let sb = extract_seed_base line
+      if length current_prompt > 0 then
+        parse_log_loop (tail lines) current_prompt (cons (cons sb current_prompt) acc)
+      else parse_log_loop (tail lines) current_prompt acc
+    else parse_log_loop (tail lines) current_prompt acc
+
+extract_task_prompt line =
+  let idx = str_find ": " line
+  if idx < 0 then ""
+  else str_sub line (idx + 2) (length (chars line) - idx - 2)
+
+extract_seed_base line =
+  let idx = str_find "seed=" line
+  if idx < 0 then 0
+  else
+    let rest = str_sub line (idx + 5) 10
+    parse_int (take_digits rest)
+
+take_digits s = take_digits_loop (chars s) []
+take_digits_loop cs acc =
+  if length cs == 0 then join "" (reverse acc)
+  else
+    let c = head cs
+    if c >= "0" && c <= "9" then take_digits_loop (tail cs) (cons c acc)
+    else join "" (reverse acc)
+
+str_starts_with prefix s =
+  let pcs = chars prefix
+  let scs = chars s
+  starts_with_loop pcs scs
+
+starts_with_loop pcs scs =
+  if length pcs == 0 then true
+  else if length scs == 0 then false
+  else if head pcs == head scs then starts_with_loop (tail pcs) (tail scs)
+  else false
+
+main =
+  let cmdline = args
+  let log_path = if length cmdline < 2 then "/tmp/v09_proper.log" else nth 1 cmdline
+  let out_path = if length cmdline < 3 then "training/dpo_pairs.jsonl" else nth 2 cmdline
+
+  let _ = print (cat ["reading bench log: ", log_path])
+  let tasks = parse_bench_log log_path
+  let _ = print (cat ["parsed ", show (length tasks), " tasks"])
+
+  let all_pairs = flatten (map (\t ->
+    let sb = head t
+    let prompt = head (tail t)
+    let samples = read_samples sb
+    generate_pairs prompt samples 16) tasks)
+
+  let _ = print (cat ["generated ", show (length all_pairs), " DPO pairs"])
+  let body = join "\n" all_pairs
+  let _ = write_file out_path body
+  let _ = print (cat ["wrote ", out_path])
+  0
