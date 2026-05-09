@@ -1,0 +1,197 @@
+-- tools/train/grade_stage.rail — Tier-A1 staged-reward grader.
+--
+-- Wraps the existing rail_native compile + run pipeline and categorizes
+-- the outcome into the 8-stage ladder defined in PROCESS_REWARD_LADDER.md.
+-- Does NOT modify compile.rail (a future enhancement); instead infers the
+-- stage from compiler diagnostics and runtime exit codes.
+--
+-- Stages:
+--   0  any-output       (sample produced ≥1 byte)
+--   1  lexed            (no "unknown character" or empty-source diagnostic)
+--   2  parsed           (no "expected decl/expr/...")
+--   3  type-checked     (no "type error" warning treated-as-error)
+--   4  codegen-clean    (`as` step succeeds — diag absence)
+--   5  linked           (`ld` succeeds; binary exists at /tmp/rail_out)
+--   6  ran-no-trap      (binary executes; exit ≠ 138/SIGSEGV, ≠ 134/SIGABRT)
+--   7  produced-output  (stdout non-empty)
+--   8  output-correct   (stdout matches expected, when expected provided)
+--
+-- Reward weights (monotone-superadditive):
+--   stage 0 → 0.05, 1 → 0.10, 2 → 0.20, 3 → 0.30, 4 → 0.45,
+--   5 → 0.65, 6 → 0.80, 7 → 0.90, 8 → 1.00
+--
+-- Usage:
+--   ./rail_native run tools/train/grade_stage.rail <sample.rail> [expected_stdout]
+-- Output (JSON to stdout):
+--   {"stage": 5, "reward": 0.65, "diag": "...", "stdout": "..."}
+
+import "stdlib/list.rail"
+
+cat parts = join "" parts
+
+stage_reward s =
+  if s == 0 then 0.05
+  else if s == 1 then 0.10
+  else if s == 2 then 0.20
+  else if s == 3 then 0.30
+  else if s == 4 then 0.45
+  else if s == 5 then 0.65
+  else if s == 6 then 0.80
+  else if s == 7 then 0.90
+  else 1.00
+
+stage_name s =
+  if s == 0 then "any-output"
+  else if s == 1 then "lexed"
+  else if s == 2 then "parsed"
+  else if s == 3 then "type-checked"
+  else if s == 4 then "codegen-clean"
+  else if s == 5 then "linked"
+  else if s == 6 then "ran-no-trap"
+  else if s == 7 then "produced-output"
+  else "output-correct"
+
+-- ── Classify compiler diagnostic into the stage at which it failed.
+classify_diag diag =
+  if length (chars diag) == 0 then -1  -- no diag = compile succeeded
+  else if str_contains "unknown character" diag then 0
+  else if str_contains "lex error" diag then 0
+  else if str_contains "expected decl" diag then 1
+  else if str_contains "expected expr" diag then 1
+  else if str_contains "parse error" diag then 1
+  else if str_contains "expected" diag then 1
+  else if str_contains "type error" diag then 2
+  else if str_contains "non-exhaustive match" diag then 2
+  else if str_contains "as: error" diag then 3
+  else if str_contains "ld: error" diag then 4
+  else if str_contains "linker" diag then 4
+  else 5  -- compile succeeded but unknown post-compile failure
+
+-- ── Run rail_native to compile, capture combined stdout+stderr.
+-- Rail's compiler prints diagnostics to stdout, not stderr. Capture both
+-- via 2>&1 (in correct order — `2>&1 1>/dev/null` would have dropped stdout).
+-- Clear /tmp/rail_out first so we can use binary existence as the
+-- ground-truth signal for compile success (stages 5+).
+compile_capture src_path =
+  let _ = shell "rm -f /tmp/rail_out"
+  let cmd = cat ["./rail_native ", src_path, " 2>&1"]
+  shell cmd
+
+-- ── True iff the compiler produced /tmp/rail_out. Authoritative compile-success
+-- signal regardless of what diagnostics were emitted.
+binary_exists =
+  let result = shell "test -x /tmp/rail_out && echo YES || echo NO"
+  str_contains "YES" result
+
+-- ── Run /tmp/rail_out (the compiled binary), capture exit + stdout.
+-- 5s alarm via perl so hung rollouts (TCO infinite loops, etc.) can't
+-- stall the grader. perl is reliably present on macOS; SIGALRM on hit
+-- gives exit 142 which falls through to stage 5 ("ran but didn't clean
+-- exit") in the stage classifier.
+run_capture =
+  let cmd = "perl -e 'alarm 5; exec @ARGV' /tmp/rail_out 2>/dev/null; echo \"__EXIT=$?\""
+  shell cmd
+
+extract_exit_from_output out =
+  let lines = split "\n" out
+  extract_exit_loop (reverse lines)
+
+extract_exit_loop ls =
+  if length ls == 0 then -1
+  else
+    let line = head ls
+    if str_starts_with "__EXIT=" line then
+      let after = str_sub line 7 (length (chars line) - 7)
+      parse_int after
+    else extract_exit_loop (tail ls)
+
+strip_exit_marker out =
+  let lines = split "\n" out
+  let kept = filter_loop lines []
+  join "\n" kept
+
+filter_loop ls acc =
+  if length ls == 0 then reverse acc
+  else
+    let line = head ls
+    if str_starts_with "__EXIT=" line then filter_loop (tail ls) acc
+    else filter_loop (tail ls) (cons line acc)
+
+str_starts_with prefix s =
+  let pcs = chars prefix
+  let scs = chars s
+  starts_with_loop pcs scs
+
+starts_with_loop pcs scs =
+  if length pcs == 0 then true
+  else if length scs == 0 then false
+  else if head pcs == head scs then starts_with_loop (tail pcs) (tail scs)
+  else false
+
+-- ── Main grading pipeline.
+grade src_path expected =
+  -- stage 0: file has content
+  let src = read_file src_path
+  if is_error src then
+    cat ["{\"stage\": -1, \"reward\": 0.0, \"diag\": \"file unreadable\"}"]
+  else if length (chars src) == 0 then
+    cat ["{\"stage\": 0, \"reward\": 0.05, \"diag\": \"empty file\"}"]
+  else
+    let diag = compile_capture src_path
+    let compiled = binary_exists
+    if compiled then
+      -- compile succeeded; binary at /tmp/rail_out exists. Stages 5-8.
+      let raw_out = run_capture
+      let exit = extract_exit_from_output raw_out
+      let stdout = strip_exit_marker raw_out
+
+      let stage = if exit == 138 || exit == 134 || exit == 139 then 5
+                  else if exit != 0 && length (chars stdout) == 0 then 5
+                  else if length (chars stdout) == 0 then 6
+                  else if length (chars expected) == 0 then 7
+                  else if stdout == expected then 8
+                  else 7
+
+      cat ["{\"stage\": ", show stage, ", \"reward\": ",
+           show_float (stage_reward stage), ", \"exit\": ", show exit,
+           ", \"stdout\": \"", json_escape_value stdout, "\"}"]
+    else
+      -- compile failed; binary not produced. Stages 0-4 by diag classification.
+      let fail_stage = classify_diag diag
+      -- classify_diag returns -1 if no diag, 5 if unrecognized pattern.
+      -- In the failed-compile branch, both mean "unknown early failure" → 0.
+      let safe_stage = if fail_stage < 0 then 0
+                       else if fail_stage >= 5 then 0
+                       else fail_stage
+      cat ["{\"stage\": ", show safe_stage, ", \"reward\": ",
+           show_float (stage_reward safe_stage), ", \"diag\": \"",
+           json_escape_value diag, "\"}"]
+
+json_escape_value s =
+  let cs = chars s
+  let escaped = json_escape_loop cs []
+  join "" escaped
+
+json_escape_loop cs acc =
+  if length cs == 0 then reverse acc
+  else
+    let c = head cs
+    let esc = if c == "\"" then "\\\""
+              else if c == "\\" then "\\\\"
+              else if c == "\n" then "\\n"
+              else if c == "\t" then "\\t"
+              else if c == "\r" then "\\r"
+              else c
+    json_escape_loop (tail cs) (cons esc acc)
+
+main =
+  let cmdline = args
+  if length cmdline < 2 then
+    let _ = print "usage: grade_stage.rail <sample.rail> [expected_stdout]"
+    1
+  else
+    let src_path = nth 1 cmdline
+    let expected = if length cmdline < 3 then "" else nth 2 cmdline
+    let result = grade src_path expected
+    let _ = print result
+    0
