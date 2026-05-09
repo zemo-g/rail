@@ -36,6 +36,9 @@ BEACON_URL=${BEACON_URL:-https://ledatic.org/entropy/pulse}
 BEACON_TOKEN_FILE=${BEACON_TOKEN_FILE:-$HOME/.ledatic/entropy/beacon_token}
 WITNESS_HOST=${WITNESS_HOST:-zemog@100.87.231.45}
 SIGNER=${SIGNER:-/home/zemog/.ledatic/witness/sign_attestation.sh}
+LOCAL_SIGNER=${LOCAL_SIGNER:-$HOME/.ledatic/witness/sign_attestation.sh}
+LOCAL_WITNESS_NAME=${LOCAL_WITNESS_NAME:-studio}
+REQUIRE_LOCAL=${REQUIRE_LOCAL:-0}  # 1 = fail if local signer unavailable
 SITE=${SITE:-https://ledatic.org}
 
 [ -f "$PROMPT_FILE" ]      || { echo "no prompt file at $PROMPT_FILE" >&2; exit 2; }
@@ -60,23 +63,45 @@ response_size=$(stat -f%z "$RESPONSE_FILE" 2>/dev/null || stat -c%s "$RESPONSE_F
 inner_msg="report|v1|${REPORT_ID}|${MODEL_NAME}|${WEIGHTS_HASH}|${prompt_hash}|${response_hash}|${GENERATED_AT}|${CLIENT_ID}"
 digest=$(printf '%s' "$inner_msg" | shasum -a 256 | awk '{print $1}')
 
-# 4. Sign via fleet0 — Pi signs `attest|v1|<digest>|<pulse_id>|<value_hex>|<witnessed_at>`
-witness_json=$(ssh -o ConnectTimeout=4 -o BatchMode=yes "$WITNESS_HOST" \
+# 4. Sign via fleet0 (primary) and Studio (secondary) — both sign the SAME
+#    canonical message: "attest|v1|<digest>|<pulse_id>|<value_hex>|<witnessed_at>".
+#    fleet0 signature is required (the manifest fails without it). Studio
+#    signature is best-effort: if the local signer is missing, the manifest
+#    still ships with just fleet0 (set REQUIRE_LOCAL=1 to make Studio mandatory).
+fleet0_json=$(ssh -o ConnectTimeout=4 -o BatchMode=yes "$WITNESS_HOST" \
     "$SIGNER $digest $pulse_id $value_hex" 2>/dev/null || true)
-if [ -z "$witness_json" ]; then
-    echo "witness unreachable / signer failed" >&2
+if [ -z "$fleet0_json" ]; then
+    echo "fleet0 witness unreachable / signer failed" >&2
     exit 4
 fi
 
-# 5. Compose final manifest JSON.
+# Each signer self-identifies via its own WITNESS_NAME default (set per host
+# in the signer script itself: studio → "studio", mini → "mini"). Don't
+# override here — let the host's signer declare its own identity.
+local_json=""
+if [ -x "$LOCAL_SIGNER" ]; then
+    local_json=$("$LOCAL_SIGNER" "$digest" "$pulse_id" "$value_hex" 2>/dev/null || true)
+fi
+if [ -z "$local_json" ] && [ "$REQUIRE_LOCAL" = "1" ]; then
+    echo "local witness signer required but failed: $LOCAL_SIGNER" >&2
+    exit 4
+fi
+
+# 5. Compose final manifest JSON. `witness` (singular, fleet0) is kept for
+#    backward compat with rep_demo_001-era verifiers; `witnesses` (array)
+#    is the multi-witness array including all signers.
 manifest=$(python3 - "$REPORT_ID" "$MODEL_NAME" "$WEIGHTS_HASH" "$prompt_hash" "$response_hash" \
     "$prompt_size" "$response_size" "$GENERATED_AT" "$CLIENT_ID" "$pulse_id" "$value_hex" \
-    "$inner_msg" "$digest" "$witness_json" <<'PY'
+    "$inner_msg" "$digest" "$fleet0_json" "$local_json" <<'PY'
 import json, sys
 (report_id, model_name, weights_hash, prompt_hash, response_hash,
  prompt_size, response_size, generated_at, client_id,
- pulse_id, value_hex, inner_msg, digest, witness_json) = sys.argv[1:]
-witness = json.loads(witness_json)
+ pulse_id, value_hex, inner_msg, digest, fleet0_json, local_json) = sys.argv[1:]
+fleet0 = json.loads(fleet0_json)
+witnesses = [fleet0]
+if local_json:
+    local = json.loads(local_json)
+    witnesses.append(local)
 out = {
     "kind": "ledatic.report.provenance",
     "version": 1,
@@ -105,7 +130,8 @@ out = {
         "pulse_id": int(pulse_id),
         "value_hex": value_hex,
     },
-    "witness": witness,
+    "witness": fleet0,           # legacy / primary
+    "witnesses": witnesses,       # full array (one per node)
     "links": {
         "verify": f"https://ledatic.org/verify/{report_id}",
         "manifest": f"https://ledatic.org/provenance/manifest/{report_id}",
