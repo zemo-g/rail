@@ -2,17 +2,35 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Output Length
+## Output Discipline
 
-Keep responses concise. Avoid verbose explanations and large code dumps in chat. When pasting prompt content or artifacts, write to a file rather than echoing in-chat. The 500-token output limit is real—prefer bullet points, structured reports, and file-based deliverables over long prose.
+- Keep responses concise to avoid hitting the 500 output token limit; chunk long outputs across multiple turns.
+- Avoid verbose explanations and large code dumps in chat — prefer bullet points and structured reports.
+- When delivering reports/handoffs, or pasting prompt content/artifacts, write to a file rather than dumping inline.
 
 ## Environment
 
 This machine is the Mac Studio (not the Mini). When working on Thunderbolt bridge / Studio↔Mini coordination, confirm host with `hostname` before assuming a side. Parallel session prompts labeled for other lanes (Stream 4, Session B, Mini-side) should be declined unless explicitly retargeted.
 
+## Project Conventions
+
+- This is a Rail-on-Rail project: write tooling and helpers in pure Rail, not Python or other languages, unless explicitly asked.
+- Before assuming you're on Mini vs Studio, check `hostname` — sessions often run on Studio.
+
 ## Verification Discipline
 
 Before declaring a hypothesis confirmed, run the falsification test (e.g., for fp16/precision claims, compare bit-identical loss across runs; for parse-pass criteria, include adversarial garbage-continuation cases). Read runtime/asm before guessing at allocator or memory-pressure causes.
+
+## Hypothesis Discipline
+
+- Before spending >30 min on a perf/regression hypothesis, write it down and define the falsification test.
+- Read the actual runtime artifact (asm, logs, sentinel files like .no_gpu) before theorizing about exotic causes.
+- When a benchmark or measurement looks like a breakthrough, suspect a measurement bug first.
+
+## Session Resumption
+
+- At session start, check for a handoff doc (HANDOFF.md, NEXT_SESSION.md, or recent commit messages) before exploring.
+- Verify branch state with `git log --oneline -10` and `git status` before claiming what's merged — don't trust stale memory.
 
 ## Rail Compiler
 
