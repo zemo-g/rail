@@ -6,6 +6,14 @@ or jump to the stage tag for the relevant chunk.
 
 ---
 
+## Audit closure (2026-05-09 — README caveat #6 retired, no impl change)
+
+- **jit: README caveat #6 retired (negative-int op_print_int already shipped)**
+  - Dry run discovered the spec's premise was stale doc, not a real bug. `emit_print_int_impl` (jit/emit.rail:845) already detects sign, takes `neg`, and prepends `-` after the digit loop. Existing fixture `print_neg` (`0 - 5` → `-5\n`) was already passing.
+  - Added 2 regression-guard fixtures to `test_capture.rail`: `print_neg_42` (`-42\n`, the spec's DONE CRITERION program) and `print_neg_1` (`-1\n`).
+  - Marked `jit/README.md` caveat #6 ✅ CLOSED with a pointer to the implementation lines and the fixtures that lock it in.
+  - Audit log written to `jit/SCRATCH.md`. Agent dry-run critique at `jit/AGENT_DRY_RUN_2026-05-09.md`.
+
 ## P4-arg (COMPLETE — float user-fn args; last named v1 limit closed)
 
 - **jit: float user-fn args via call-site fixed-point inference**
