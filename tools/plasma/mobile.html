@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+<title>Plasma — mobile (Ledatic)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; color: #cfd6df; overflow: hidden;
+    font-family: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
+    -webkit-text-size-adjust: 100%;
+  }
+  .stage {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .stage canvas {
+    /* Display canvas backing buffer is sized to physical device pixels
+       (drawChamber sets it).  CSS just shows it at 1:1 pixel ratio. */
+    width:  min(100vw, 100vh);
+    height: min(100vw, 100vh);
+    background: #000;
+    filter: saturate(1.10) contrast(1.06);
+  }
+  .hud {
+    position: fixed; pointer-events: none; user-select: none;
+    font-size: 11px; line-height: 1.5; letter-spacing: 0.04em;
+    opacity: 0.85; text-shadow: 0 0 6px rgba(0,0,0,0.95);
+  }
+  .hud.tl { top: 0.65rem;    left: 0.75rem; }
+  .hud.bl { bottom: 0.65rem; left: 0.75rem; font-size: 10px; opacity: 0.7; }
+  .hud.tr { top: 0.65rem;    right: 0.75rem; text-align: right; font-size: 10px; opacity: 0.7; }
+  .k { color: #6cf; }
+  .err { color: #f88; }
+  /* Tappable footer link — leads back to the main site for context. */
+  .ledatic-link {
+    position: fixed; right: 0.75rem; bottom: 0.65rem;
+    pointer-events: auto;
+    color: #6cf; opacity: 0.55; font-size: 10px;
+    text-decoration: none; letter-spacing: 0.06em;
+    text-shadow: 0 0 6px rgba(0,0,0,0.95);
+  }
+  .ledatic-link:active { opacity: 0.9; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <canvas id="plasma" width="128" height="128"></canvas>
+</div>
+<div class="hud tl">
+  <div><span class="k">ledatic</span> / plasma · live</div>
+  <div><span class="k">solver</span> 2D MHD · 128² · OT</div>
+</div>
+<div class="hud tr">
+  <div><span class="k">pulse</span> <span id="pulse">…</span></div>
+  <div><span class="k">step</span> <span id="step">…</span></div>
+</div>
+<div class="hud bl">
+  <div><span class="k">ρ</span> <span id="rho_range">…</span></div>
+  <div id="ts">…</div>
+</div>
+<a class="ledatic-link" href="/">ledatic.org →</a>
+
+<!-- Optional: Rail-WASM kernels for richer per-pulse compositing
+     (vorticity tint, schlieren edges, magnetic glow, particle sparks).
+     If the script fails to load, the viewer falls back to plain viridis
+     density — bulletproof terminus property is preserved. -->
+<script src="_shared/wasm_render.js"></script>
+
+<script>
+"use strict";
+
+// ── beacon plumbing ──────────────────────────────────────────────────
+//
+// Same beacon as /holo and /live4k, but rendered with Canvas 2D + a
+// CPU colormap LUT.  No WebGL/WebGPU dependency, no float textures, no
+// shader compilation — works on every browser since ~2010.  This is
+// the third-tier viewer, intended as the unconditional fallback for
+// devices where WebGL2 is broken or limited (older iOS, low-end
+// Android, embedded WebViews).
+//
+// Frame format (matches tools/plasma/mhd_beacon.rail):
+//   header (48 B):
+//     u32 LE  width, height, channels, step
+//     f32 LE  m0, e0, mass, energy, divb, rho_min, dt, sim_time
+//   payload: width × height × channels × f32 LE, channel-planar
+//   channels: 0=ρ  1=vx  2=vy  3=p  4=Bx  5=By
+const FRAME_URL = '/entropy/frame/current';
+const PULSE_URL = '/entropy/pulse';
+const POLL_MS   = 2000;
+const N         = 128;
+const CH        = 6;
+const CH_RHO    = 0;
+const HEADER_BYTES = 48;
+
+const canvas = document.getElementById('plasma');
+const ctx    = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const img    = ctx.createImageData(N, N);
+
+// ── viridis-ish 5-stop colormap, baked once into a 256-entry LUT ────
+const LUT = new Uint8ClampedArray(256 * 4);
+(function buildLUT() {
+  const stops = [
+    [0.00,  68,  1, 84],
+    [0.25,  59, 82,139],
+    [0.50,  33,144,141],
+    [0.75,  93,201, 99],
+    [1.00, 253,231, 37],
+  ];
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let lo = stops[0], hi = stops[stops.length - 1];
+    for (let s = 0; s < stops.length - 1; s++) {
+      if (t >= stops[s][0] && t <= stops[s + 1][0]) {
+        lo = stops[s]; hi = stops[s + 1]; break;
+      }
+    }
+    const u = (t - lo[0]) / (hi[0] - lo[0] || 1);
+    LUT[i * 4 + 0] = lo[1] + (hi[1] - lo[1]) * u;
+    LUT[i * 4 + 1] = lo[2] + (hi[2] - lo[2]) * u;
+    LUT[i * 4 + 2] = lo[3] + (hi[3] - lo[3]) * u;
+    LUT[i * 4 + 3] = 255;
+  }
+})();
+
+function setError(target, msg) {
+  document.getElementById(target).innerHTML = `<span class="err">${msg}</span>`;
+}
+
+// ── Rail-WASM kernel handle (optional; falls back to plain viridis if unavailable)
+const wasm = (typeof window !== 'undefined' && window.createWasmRender)
+  ? window.createWasmRender({ N: N, CH: CH, tracerCount: 192, wasmURL: 'render.wasm' })
+  : null;
+
+// ── Chamber image fast path: blit pre-rendered RGB8 to the canvas ──
+// Two-canvas pipeline.  Source canvas holds the publisher's bytes at
+// native resolution (256²).  Display canvas matches the device's
+// physical pixel grid and is drawn from the source via drawImage
+// with imageSmoothingEnabled = false — the only reliably-honored way
+// to get true nearest-neighbor upscale on iOS Safari (CSS
+// image-rendering: pixelated is hint-only there).
+const _srcCanvas = document.createElement('canvas');
+const _srcCtx    = _srcCanvas.getContext('2d');
+let   _srcImgData = null;
+
+function drawChamber(buf, byteOffset, cw, ch) {
+  // Stage chamber bytes into the source canvas.
+  if (_srcCanvas.width !== cw || _srcCanvas.height !== ch) {
+    _srcCanvas.width  = cw;
+    _srcCanvas.height = ch;
+    _srcImgData = _srcCtx.createImageData(cw, ch);
+  }
+  const u8  = new Uint8ClampedArray(buf, byteOffset, cw * ch * 3);
+  const out = _srcImgData.data;
+  for (let i = 0, j = 0; i < cw * ch; i++) {
+    out[j++] = u8[3 * i + 0];
+    out[j++] = u8[3 * i + 1];
+    out[j++] = u8[3 * i + 2];
+    out[j++] = 255;
+  }
+  _srcCtx.putImageData(_srcImgData, 0, 0);
+
+  // Size the display canvas to physical pixels, draw with smoothing off.
+  const dpr  = window.devicePixelRatio || 1;
+  const side = Math.floor(Math.min(window.innerWidth, window.innerHeight) * dpr);
+  if (canvas.width !== side || canvas.height !== side) {
+    canvas.width  = side;
+    canvas.height = side;
+  }
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(_srcCanvas, 0, 0, side, side);
+}
+
+function uploadFrame(buf) {
+  if (buf.byteLength < HEADER_BYTES + N * N * CH * 4) {
+    setError('rho_range', `short frame (${buf.byteLength} B)`);
+    return;
+  }
+  const dv = new DataView(buf);
+  const w  = dv.getUint32(0, true);
+  const h  = dv.getUint32(4, true);
+  const c  = dv.getUint32(8, true);
+  const step = dv.getUint32(12, true);
+  if (w !== N || h !== N || c !== CH) {
+    setError('rho_range', `bad shape ${w}×${h}×${c}`);
+    return;
+  }
+
+  // Tier 4: if the publisher attached a chamber image, prefer it.  The
+  // chamber section is a 16-byte header (chamber_w, chamber_h, fmt,
+  // bytes) followed by raw RGB8 pixels.  See CHAMBER_PUBLISHER.md.
+  const PLANES_END = HEADER_BYTES + N * N * CH * 4;   // 393264
+  if (buf.byteLength >= PLANES_END + 16) {
+    const cw  = dv.getUint32(PLANES_END,      true);
+    const ch  = dv.getUint32(PLANES_END + 4,  true);
+    const fmt = dv.getUint32(PLANES_END + 8,  true);
+    const cb  = dv.getUint32(PLANES_END + 12, true);
+    if (fmt === 1 && cw > 0 && ch > 0 && cb === cw * ch * 3
+        && buf.byteLength >= PLANES_END + 16 + cb) {
+      drawChamber(buf, PLANES_END + 16, cw, ch);
+      // Update HUD without doing the CPU composite — chamber path owns the visual.
+      document.getElementById('rho_range').textContent = `chamber ${cw}×${ch}`;
+      document.getElementById('step').textContent = step;
+      return;
+    }
+  }
+
+  // Channel-planar f32 view over the whole frame (offsets 0=ρ, 1=vx, 2=vy, 3=p, 4=Bx, 5=By).
+  const all = new Float32Array(buf, HEADER_BYTES, N * N * CH);
+  const rho = all.subarray(CH_RHO * N * N, (CH_RHO + 1) * N * N);
+  const bx  = all.subarray(4       * N * N, 5 * N * N);
+  const by  = all.subarray(5       * N * N, 6 * N * N);
+
+  // Density min/max for normalization.
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < N * N; i++) { const v = rho[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+  const span = (mx - mn) || 1;
+
+  // Optional Rail-WASM derived fields.  Both kernels are CPU-side, ~1 ms
+  // each at 128² on M1 Air.  null means WASM didn't load — composite
+  // gracefully degrades to plain viridis density.
+  const vort = wasm ? wasm.computeVorticity(all) : null;
+  const schl = wasm ? wasm.computeLIC(all)        : null;   // misnomer kept for clarity below
+  const part = wasm ? wasm.stepParticles(all, 0.05) : null;
+
+  const data = img.data;
+  // Composite per cell.  Y-flip so the canvas orientation matches OT's
+  // "positive y up" convention.
+  for (let y = 0; y < N; y++) {
+    const ry = N - 1 - y;
+    const row = ry * N;
+    const outRow = y * N;
+    for (let x = 0; x < N; x++) {
+      const idx = row + x;
+
+      // Base layer: viridis-mapped density.
+      const t  = (rho[idx] - mn) / span;
+      const li = ((t * 255) | 0) * 4;
+      let r = LUT[li + 0];
+      let g = LUT[li + 1];
+      let b = LUT[li + 2];
+
+      // Vorticity tint — multiplicative.  ω > 0 → cyan-green,
+      // ω < 0 → magenta.  Saturated at |ω| ≈ 0.1 (peak on the OT IC).
+      if (vort !== null) {
+        const w = vort[idx];
+        const wt = w / 0.1;
+        const wn = wt > 1 ? 1 : wt < -1 ? -1 : wt;            // [-1, 1]
+        // Lerp toward (0.55, 1.0, 0.95) for CCW, (1.0, 0.6, 0.95) for CW.
+        const cR = wn > 0 ? 0.55 : 1.0;
+        const cG = wn > 0 ? 1.0  : 0.6;
+        const cB = 0.95;
+        const m  = Math.abs(wn);
+        const tintR = (1 - m * 0.55) + cR * m * 0.55;
+        const tintG = (1 - m * 0.55) + cG * m * 0.55;
+        const tintB = (1 - m * 0.55) + cB * m * 0.55;
+        r = (r * tintR) | 0;
+        g = (g * tintG) | 0;
+        b = (b * tintB) | 0;
+      }
+
+      // LIC layer (`schl` variable name is historical) — additive
+      // brightening proportional to streamline-aligned noise value.
+      // Range [0, 1]; full strength only adds about 35 luminance units
+      // so it textures the field without washing out the colormap.
+      if (schl !== null) {
+        const lic = schl[idx];           // [0, 1]
+        const add = (lic - 0.5) * 70;    // [-35, 35]
+        r += add; g += add; b += add;
+      }
+
+      // Magnetic glow — soft additive blue accumulating where |B|² is high.
+      // Cheap CPU calc, no kernel needed.
+      const bmag2 = bx[idx] * bx[idx] + by[idx] * by[idx];
+      if (bmag2 > 0.05) {
+        const k = Math.min(1, bmag2 * 0.3) * 28;
+        r += k * 0.2; g += k * 0.5; b += k * 1.0;
+      }
+
+      // Clamp and write.
+      const di = (outRow + x) * 4;
+      data[di + 0] = r > 255 ? 255 : r < 0 ? 0 : r;
+      data[di + 1] = g > 255 ? 255 : g < 0 ? 0 : g;
+      data[di + 2] = b > 255 ? 255 : b < 0 ? 0 : b;
+      data[di + 3] = 255;
+    }
+  }
+
+  // Particle sparks — small bright dots at tracer positions.  Direct
+  // ImageData writes are cheaper than per-particle Canvas 2D fillRect.
+  if (part !== null) {
+    const K = part.length / 2;
+    for (let p = 0; p < K; p++) {
+      const px = part[2 * p]     | 0;
+      const py = (N - 1 - (part[2 * p + 1] | 0));   // flip Y
+      if (px < 0 || px >= N || py < 0 || py >= N) continue;
+      const di = (py * N + px) * 4;
+      data[di + 0] = 255;
+      data[di + 1] = 240;
+      data[di + 2] = 200;
+      data[di + 3] = 255;
+    }
+  }
+
+  ctx.putImageData(img, 0, 0);
+  document.getElementById('rho_range').textContent = `[${mn.toFixed(3)}, ${mx.toFixed(3)}]`;
+  document.getElementById('step').textContent      = step;
+}
+
+// ── poll loops ──────────────────────────────────────────────────────
+let frameInflight = false;
+let lastPulseId   = null;
+
+async function pollFrame() {
+  if (frameInflight) return;
+  frameInflight = true;
+  try {
+    const r = await fetch(FRAME_URL + '?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) throw new Error(`frame ${r.status}`);
+    const buf = await r.arrayBuffer();
+    uploadFrame(buf);
+  } catch (e) {
+    setError('rho_range', e.message || String(e));
+  } finally {
+    frameInflight = false;
+  }
+}
+
+async function pollPulse() {
+  try {
+    const r = await fetch(PULSE_URL + '?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) throw new Error(`pulse ${r.status}`);
+    const j = await r.json();
+    if (j.pulse_id === lastPulseId) return;
+    lastPulseId = j.pulse_id;
+    document.getElementById('pulse').textContent = j.pulse_id;
+    document.getElementById('ts').textContent    = j.timestamp_utc;
+  } catch (e) {
+    setError('pulse', e.message || String(e));
+  }
+}
+
+let pulseTimer = null, frameTimer = null;
+function start() {
+  if (!pulseTimer) pulseTimer = setInterval(pollPulse, POLL_MS);
+  if (!frameTimer) frameTimer = setInterval(pollFrame, POLL_MS);
+}
+function stop() {
+  clearInterval(pulseTimer); pulseTimer = null;
+  clearInterval(frameTimer); frameTimer = null;
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stop(); else { start(); pollPulse(); pollFrame(); }
+});
+start();
+pollPulse();
+pollFrame();
+</script>
+</body>
+</html>

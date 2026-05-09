@@ -1,0 +1,231 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>render.wasm harness — Tier 3-A gate</title>
+<style>
+  body { font: 13px/1.45 ui-monospace, Menlo, monospace; background: #0b0d11; color: #cfd6df; margin: 0; padding: 24px; }
+  h1   { font: 600 16px/1.2 ui-monospace, Menlo, monospace; margin: 0 0 16px; color: #e6edf3; }
+  pre  { background: #11151b; border: 1px solid #1f242c; border-radius: 6px; padding: 12px 14px; overflow: auto; margin: 0 0 16px; }
+  .ok  { color: #5fb878; }
+  .bad { color: #ff6b6b; }
+  .dim { color: #6a7886; }
+  canvas { display: block; image-rendering: pixelated; border: 1px solid #1f242c; background: #000; }
+  .row { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  .col { flex: 1 1 360px; min-width: 360px; }
+</style>
+<h1>render.wasm — Tier 3-A browser harness</h1>
+<div class="row">
+  <div class="col">
+    <pre id="log">loading render.wasm...</pre>
+  </div>
+  <div class="col">
+    <div class="dim" style="margin-bottom:6px">rho field after seed_ot (128×128, scaled ×2)</div>
+    <canvas id="rho" width="128" height="128" style="width:256px;height:256px"></canvas>
+  </div>
+</div>
+<script>
+"use strict";
+
+const log_el = document.getElementById('log');
+let log_buf = '';
+function L(line, cls) {
+  const span = cls ? `<span class="${cls}">${line}</span>` : line;
+  log_buf += span + '\n';
+  log_el.innerHTML = log_buf;
+}
+
+// ── Rail-WASM i64 ABI helpers ────────────────────────────────────────
+// Tagged int:    tagged = (raw << 1) | 1
+//   encode: int → bigint
+const tagInt   = n => (BigInt(n) << 1n) | 1n;
+//   decode: bigint → int (number)
+const untagInt = b => Number(b >> 1n);
+
+// Float (f64) is passed as raw bit pattern in i64.
+const _scratch = new ArrayBuffer(8);
+const _f64v    = new Float64Array(_scratch);
+const _i64v    = new BigInt64Array(_scratch);
+function f64ToBits(x) { _f64v[0] = x; return _i64v[0]; }
+function bitsToF64(b) { _i64v[0] = b; return _f64v[0]; }
+
+// Float array handle: handle = (i32_ptr << 1)  (LSB=0)
+//   decode: bigint → byte offset (number)
+const handleToPtr = h => Number(h >> 1n);
+
+// ── WASI stubs (only needed for instantiation) ───────────────────────
+const wasi = {
+  fd_write:  (_fd, _iovs, _iovs_len, _nwritten) => 0,
+  proc_exit: (_code) => { throw new Error('proc_exit called'); },
+};
+
+// ── Run ──────────────────────────────────────────────────────────────
+async function run() {
+  const t0 = performance.now();
+
+  let mod;
+  try {
+    const resp = await fetch('render.wasm');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const bytes = await resp.arrayBuffer();
+    L(`fetched render.wasm (${bytes.byteLength} bytes)`, 'dim');
+    mod = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi });
+  } catch (e) {
+    L(`FAIL fetch/instantiate: ${e.message}`, 'bad');
+    return;
+  }
+  const inst = mod.instance.exports;
+  const expected = ['memory', 'float_arr_new', 'seed_ot',
+                    'total_kinetic_energy', 'total_magnetic_energy',
+                    'max_divb', 'mean_vorticity'];
+  const missing = expected.filter(n => !(n in inst));
+  if (missing.length) {
+    L(`FAIL missing exports: ${missing.join(', ')}`, 'bad');
+    return;
+  }
+  L(`exports: ${Object.keys(inst).filter(n => typeof inst[n] === 'function').join(', ')}`, 'dim');
+  L(`memory: ${inst.memory.buffer.byteLength} bytes (${inst.memory.buffer.byteLength / 65536} pages)`, 'dim');
+
+  // ── 1. Allocate state buffer (98304 cells = 128² × 6 fields) ──────
+  const N = 98304;
+  let stateHandle;
+  try {
+    stateHandle = inst.float_arr_new(tagInt(N), f64ToBits(0.0));
+  } catch (e) {
+    L(`FAIL float_arr_new(${N}): ${e.message}`, 'bad');
+    return;
+  }
+  const statePtr = handleToPtr(stateHandle);
+  L(`stateHandle = 0x${stateHandle.toString(16)}, ptr = 0x${statePtr.toString(16)} (= ${statePtr})`, 'dim');
+
+  // Verify length prefix.
+  const lenView = new BigInt64Array(inst.memory.buffer, statePtr, 1);
+  const storedLen = Number(lenView[0]);
+  if (storedLen !== N) {
+    L(`FAIL length prefix mismatch: got ${storedLen}, want ${N}`, 'bad');
+    return;
+  }
+  L(`length prefix at ptr+0 = ${storedLen} ✓`, 'ok');
+
+  // ── 2. Seed OT initial condition ──────────────────────────────────
+  const t1 = performance.now();
+  try {
+    inst.seed_ot(stateHandle, tagInt(0));
+  } catch (e) {
+    L(`FAIL seed_ot: ${e.message}`, 'bad');
+    return;
+  }
+  const t2 = performance.now();
+  L(`seed_ot done in ${(t2 - t1).toFixed(1)} ms`, 'dim');
+
+  // ── 3. Read rho[0,0] = f64View[idx(f_rho, 0, 0)] = f64View[0] ─────
+  // NOTE: the buffer can be detached if memory grew, so re-derive view.
+  const f64 = new Float64Array(inst.memory.buffer, statePtr + 8, N);
+  const rho00 = f64[0];
+  const rho_expected = 2.77777777777778;
+  const rho_ok = Math.abs(rho00 - rho_expected) < 1e-10;
+  L(`f64View[0] (rho[0,0]) = ${rho00}  ${rho_ok ? '✓' : '✗ (expected ' + rho_expected + ')'}`,
+    rho_ok ? 'ok' : 'bad');
+
+  // Spot-check a few more cells.
+  // idx(f_vy, 1, 0) = 2*16384 + 0*128 + 1 = 32769; vy = sin(0 * dx) = 0
+  // idx(f_vy, 32, 0) = 2*16384 + 0*128 + 32 = 32800; vy = sin(32 * 0.04908738521234052) ≈ sin(1.5707963) ≈ 1
+  const vy_at_32_0 = f64[2 * 16384 + 0 * 128 + 32];
+  L(`vy at (32,0)  = ${vy_at_32_0.toFixed(6)}  (expect ≈ 1.0)`,
+    Math.abs(vy_at_32_0 - 1.0) < 1e-3 ? 'ok' : 'bad');
+
+  // ── 4. Scalar metrics ─────────────────────────────────────────────
+  function fcall(name) {
+    const t = performance.now();
+    const bits = inst[name](stateHandle);
+    const v = bitsToF64(bits);
+    const dt = performance.now() - t;
+    return { v, dt };
+  }
+  const ke = fcall('total_kinetic_energy');
+  const me = fcall('total_magnetic_energy');
+  const mv = fcall('mean_vorticity');
+  const md = fcall('max_divb');
+
+  function check(label, got, want, tol, unit) {
+    const ok = Math.abs(got - want) <= tol;
+    L(`${label.padEnd(18)} = ${got.toFixed(6).padStart(14)}  (expect ${want}${unit ? ' ' + unit : ''}, tol ${tol})  ${ok ? '✓' : '✗'}`,
+      ok ? 'ok' : 'bad');
+    return ok;
+  }
+  let all_ok = rho_ok;
+  all_ok &= check('kinetic energy',   ke.v, 22759, 100);
+  all_ok &= check('magnetic energy',  me.v, 12288, 50);
+  all_ok &= check('mean vorticity',   mv.v, 0,     1e-6);
+  all_ok &= check('max |∇·B|',        md.v, 0,     1e-6);
+
+  // ── 5. Render rho heatmap to canvas (visual confirmation) ─────────
+  const cv = document.getElementById('rho');
+  const ctx = cv.getContext('2d');
+  const img = ctx.createImageData(128, 128);
+  // rho is sinusoidal-modulated around 2.7777 — but in this seed it's CONSTANT.
+  // Show vorticity field instead, computed cheaply on the fly from vx,vy.
+  const f_vx = 1, f_vy = 2;
+  const off_vx = f_vx * 16384;
+  const off_vy = f_vy * 16384;
+  let vmin = +Infinity, vmax = -Infinity;
+  const vort = new Float32Array(128 * 128);
+  for (let y = 0; y < 128; y++) {
+    for (let x = 0; x < 128; x++) {
+      const xp = (x + 1) & 127, xm = (x + 127) & 127;
+      const yp = (y + 1) & 127, ym = (y + 127) & 127;
+      const vy_xp = f64[off_vy + y * 128 + xp];
+      const vy_xm = f64[off_vy + y * 128 + xm];
+      const vx_yp = f64[off_vx + yp * 128 + x];
+      const vx_ym = f64[off_vx + ym * 128 + x];
+      const w = (vy_xp - vy_xm - vx_yp + vx_ym) * 0.5;
+      vort[y * 128 + x] = w;
+      if (w < vmin) vmin = w;
+      if (w > vmax) vmax = w;
+    }
+  }
+  const span = Math.max(Math.abs(vmin), Math.abs(vmax)) || 1;
+  for (let i = 0; i < 128 * 128; i++) {
+    const t = vort[i] / span;            // [-1, 1]
+    const r = t > 0 ? 255 * t : 0;
+    const b = t < 0 ? 255 * -t : 0;
+    const g = 60 * (1 - Math.abs(t));
+    img.data[i * 4 + 0] = r;
+    img.data[i * 4 + 1] = g;
+    img.data[i * 4 + 2] = b;
+    img.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  L(`vorticity range: [${vmin.toFixed(4)}, ${vmax.toFixed(4)}]  (rendered above)`, 'dim');
+
+  const tT = performance.now() - t0;
+  L('', 'dim');
+  const verdict = all_ok ? `PASS — Tier 3-A browser harness gate (total ${tT.toFixed(0)} ms)`
+                         : `FAIL — see x rows above (total ${tT.toFixed(0)} ms)`;
+  L(verdict, all_ok ? 'ok' : 'bad');
+
+  // Surface verdict via document.title so an external driver can read it.
+  document.title = (all_ok ? 'PASS' : 'FAIL') + ` rho=${rho00.toFixed(6)} ke=${ke.v.toFixed(2)} me=${me.v.toFixed(2)}`;
+
+  // ALSO send the verdict back as a GET request — the http.server logs
+  // every URL, so a Python harness can scrape /__verdict__/... from
+  // the access log without needing AppleScript.
+  const v = all_ok ? 'PASS' : 'FAIL';
+  const params = new URLSearchParams({
+    v,
+    rho:  rho00.toFixed(6),
+    vy32: vy_at_32_0.toFixed(6),
+    ke:   ke.v.toFixed(3),
+    me:   me.v.toFixed(3),
+    mv:   mv.v.toExponential(3),
+    md:   md.v.toExponential(3),
+    ms:   tT.toFixed(0),
+  });
+  fetch(`/__verdict__/?${params.toString()}`).catch(() => {});
+}
+
+run().catch(e => {
+  L(`UNCAUGHT: ${e.message}`, 'bad');
+  L(e.stack, 'dim');
+  fetch(`/__verdict__/?v=ERROR&msg=${encodeURIComponent(e.message)}`).catch(() => {});
+  document.title = 'ERROR ' + e.message;
+});
+</script>
