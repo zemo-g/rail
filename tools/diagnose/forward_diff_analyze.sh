@@ -16,7 +16,12 @@ set -u
 GPU_DUMP=/tmp/forward_dump_gpu
 CPU_DUMP=/tmp/forward_dump_cpu
 
-LAYERS=(x_embed block0_x_attn block0_x_out block1_x_attn block1_x_out x_final logits)
+LAYERS=(
+  x_embed
+  block0_ln1 block0_attn_out block0_x_attn block0_ln2 block0_h_out block0_x_out
+  block1_ln1 block1_attn_out block1_x_attn block1_ln2 block1_h_out block1_x_out
+  x_final logits
+)
 
 printf '\n%-20s  %-14s  %-14s  %-14s  %-8s\n' \
   "Layer" "max_abs_delta" "mean_abs_delta" "rms_delta" "n"
