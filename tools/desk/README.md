@@ -76,17 +76,21 @@ Settings → Privacy & Security → Accessibility.
 
 ## What still needs to land before this is "done"
 
-1. **Bridge ↔ Rail link path.** Either teach `compile.rail` to add a
-   `-L tools/desk -lquartz_bridge` flag when the program imports
-   `stdlib/quartz.rail`, or use `stdlib/dlopen.rail` to load the dylib at
-   runtime and resolve symbols dynamically. The Metal stack (`stdlib/tensor
-   .rail` ↔ `tools/metal/libtensor_gpu.dylib`) is the existing template.
-2. **A 50-line smoke binary.** `tools/desk/quartz_smoke.rail` that calls
-   `qz_init`, prints 100 events, then `qz_shutdown`. Confirms the round-trip
-   without any KVM logic.
-3. **`rail_kvm_server.rail` and `rail_kvm_client.rail`.** See protocol sketch
+1. ~~**Bridge ↔ Rail link path.**~~ DONE 2026-05-09. `compile.rail::build`
+   auto-adds `-L tools/desk -weak-lquartz_bridge` plus the four bridge
+   frameworks (CoreGraphics, Foundation, AppKit, ApplicationServices) when
+   `tools/desk/libquartz_bridge.dylib` is present. Mirrors the Metal /
+   JIT pattern. Smoke at `tools/desk/quartz_smoke.rail` confirms link.
+2. ~~**A 50-line smoke binary.**~~ DONE 2026-05-09. `tools/desk/quartz_smoke.rail`
+   calls `qb_init` + `qb_shutdown`. Confirms link path and that the
+   bridge runs (returns 0 even without Accessibility — the permission
+   error is a separate runtime gate, surfaces via NSLog, not link failure).
+3. **A real-event smoke.** `tools/desk/quartz_event_smoke.rail` that grants
+   Accessibility once, then prints the next 100 mouse-move events.
+   Validates the ring buffer + tap installation under sustained load.
+4. **`rail_kvm_server.rail` and `rail_kvm_client.rail`.** See protocol sketch
    below.
-4. **TLS over the link** (optional for v1 — LAN-only, plain TCP is fine to
+5. **TLS over the link** (optional for v1 — LAN-only, plain TCP is fine to
    start). When we ship to a stranger we'd wrap with `stdlib/tls.rail`.
 
 ## Protocol sketch (for rail_kvm_server ↔ rail_kvm_client)
