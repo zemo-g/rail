@@ -1,0 +1,116 @@
+-- tools/diagnose/weight_pack_diag.rail
+--
+-- H4 diagnostic for the GPU substrate divergence (per docs/plans/FIX_GPU_DIVERGENCE.md).
+-- Loads checkpoint twice — once via load_model (full f32) and once via
+-- load_half_model (fp16-packed) — then for each weight tensor computes
+-- max|w|, mean|w|, max|delta|, mean|delta| where delta = w - tensor_of_half(half_w).
+--
+-- Reading: if mean|delta| / mean|w| is bounded by ~10⁻³ (fp16 precision floor),
+-- the f32→fp16 pack is well-behaved. If any tensor shows >0.1 ratio, that
+-- tensor's weights have specific values that quantize catastrophically →
+-- H4 confirmed → scaled-fp16 packing is the fix lever.
+--
+-- Usage:
+--   ./rail_native run tools/diagnose/weight_pack_diag.rail \
+--       --prefix runs/smoke_v54_repro/checkpoints/smoke_v54_repro_best
+
+import "stdlib/transformer.rail"
+import "stdlib/optim.rail"
+import "stdlib/checkpoint.rail"
+
+cat parts = join "" parts
+
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if head xs == key then
+    if length (tail xs) > 0 then head (tail xs) else ""
+  else argv_get_loop (tail xs) key
+
+argv_get argv key default_val =
+  let v = argv_get_loop argv key
+  if length (chars v) == 0 then default_val else v
+
+unwrap t = match t | Tensor d _ _ -> d
+
+-- Walk paired f32 + reconstructed f64 arrays of length n, mutating a
+-- 4-slot stats float_arr in place: [max|w|, sum|w|, max|delta|, sum|delta|].
+walk_tensor_loop f32_data rec_data i n stats =
+  if i >= n then 0
+  else
+    let w = 0.0 + float_arr_get f32_data i
+    let h = 0.0 + float_arr_get rec_data i
+    let abs_w = if w < 0.0 then 0.0 - w else w + 0.0
+    let d = w - h
+    let abs_d = if d < 0.0 then 0.0 - d else d + 0.0
+    let max_w = 0.0 + float_arr_get stats 0
+    let max_d = 0.0 + float_arr_get stats 2
+    let _ = if abs_w > max_w then float_arr_set stats 0 abs_w else 0
+    let _ = float_arr_set stats 1 ((0.0 + float_arr_get stats 1) + abs_w)
+    let _ = if abs_d > max_d then float_arr_set stats 2 abs_d else 0
+    let _ = float_arr_set stats 3 ((0.0 + float_arr_get stats 3) + abs_d)
+    walk_tensor_loop f32_data rec_data (i + 1) n stats
+
+stats_for_pair f32_t half_t =
+  let rec_t = tensor_of_half half_t
+  match f32_t
+    | Tensor f32_data shape _ -> match rec_t
+      | Tensor rec_data _ _ ->
+        let n = list_product shape
+        let stats = float_arr_new 4 0.0
+        let _ = walk_tensor_loop f32_data rec_data 0 n stats
+        stats
+
+shape_str shape =
+  if length shape == 0 then "[]"
+  else if length shape == 1 then cat ["[", show (head shape), "]"]
+  else cat ["[", show (head shape), ",", show (head (tail shape)), "]"]
+
+t_shape t = match t | Tensor _ shape _ -> shape
+
+emit_one i f32_t half_t =
+  let stats = stats_for_pair f32_t half_t
+  let max_w = 0.0 + float_arr_get stats 0
+  let sum_w = 0.0 + float_arr_get stats 1
+  let max_d = 0.0 + float_arr_get stats 2
+  let sum_d = 0.0 + float_arr_get stats 3
+  let shape = t_shape f32_t
+  let n = list_product shape
+  let n_f = int_to_float n
+  let mean_w = sum_w / n_f
+  let mean_d = sum_d / n_f
+  let ratio = if mean_w > 0.0 then mean_d / mean_w else 0.0 + 0.0
+  let _ = print (cat [
+    "  W[", show i, "] ", shape_str shape, " n=", show n,
+    "  max|w|=", show_float max_w,
+    "  mean|w|=", show_float mean_w,
+    "  max|d|=", show_float max_d,
+    "  mean|d|=", show_float mean_d,
+    "  ratio=", show_float ratio
+  ])
+  0
+
+emit_loop i n f32_list half_list =
+  if i >= n then 0
+  else
+    let f32_t = list_nth i f32_list
+    let half_t = list_nth i half_list
+    let _ = emit_one i f32_t half_t
+    emit_loop (i + 1) n f32_list half_list
+
+main =
+  let prefix = argv_get args "--prefix" "runs/smoke_v54_repro/checkpoints/smoke_v54_repro_best"
+  let _ = print (cat ["loading f32 weights from ", prefix, " ..."])
+  let f32_w = load_model prefix
+  let _ = print (cat ["loading fp16 weights from ", prefix, " ..."])
+  let half_w = load_half_model prefix
+  let n_f32 = length f32_w
+  let n_half = length half_w
+  if n_f32 != n_half then
+    let _ = print (cat ["MISMATCH: f32=", show n_f32, " half=", show n_half])
+    1
+  else
+    let _ = print (cat ["paired ", show n_f32, " weight tensors:"])
+    let _ = print "  per-tensor f32 vs (tensor_of_half . half_of_tensor) round-trip:"
+    let _ = emit_loop 0 n_f32 f32_w half_w
+    let _ = print "  ratio = mean|delta| / mean|w|; >0.01 = severe quantization loss"
+    0
