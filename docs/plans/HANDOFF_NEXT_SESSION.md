@@ -46,26 +46,35 @@ regression test should anyone touch `emit_x1` again.
 
 ---
 
-## Bench finding (post-fix evening 2026-05-10)
+## Bench findings (post-fix evening 2026-05-10)
 
-**The historical 10/30 was inflated.** Re-bench post-fix on
-halfB_s7777_fresh + matched corpus = **6/30 (20%)**, not 10/30.
-Reason: pre-fix `seq_len * V = 0` (because of the LHS-nullary bug)
-made x_data empty → fill_prompt_loop silently OOB'd → matmul read
-zeros → model ran on **zero-input prompt** → outputs were driven by
-final-layer biases + sampling, not the prompt. That accidentally
-compiled at 10/30 for this ckpt. Post-fix the model uses actual
-embeddings → real context-aware generation → exposes the model's
-actual ability is ~6/30.
+**Three honest re-benches at GPU mixed substrate, matched corpus, N=20:**
 
-Implication: **the entire pre-2026-05-10 bench lineage is suspect**.
-Spur-v0.1's 25/30 ensemble, v54's 9/30 single-ckpt, halfB's 7/30 —
-all measured through the buggy substrate. Re-bench gives the honest
-number. The substrate-thesis 30/30 (naked Qwen + Rail spec) finding
-still stands; that bypasses Spur entirely.
+| Ckpt | Pre-fix | Post-fix | Δ |
+|---|---:|---:|---:|
+| halfB_s7777_fresh (V=96) | 10/30 | **6/30** | -4 |
+| smoke_v54_repro_best (V=93) | 9/30 single | **13/30** | **+4** |
+| d256_half_step3000 / Spur-v0.1 (V=130) | 25/30 ensemble | **1/30** | **-24** |
 
-**No "regression" to chase. Honest numbers compound; lucky-buggy
-ones don't.** The fix stays.
+**Spur-v0.1's flagship 25/30 collapsed to 1/30.** The pre-fix
+`seq_len * V = 0` made x_data empty for every prompt. Outputs were
+final-layer-bias + RNG noise, not context-aware generation. With
+N=20 reranks, sampling found compilable garbage 25× for Spur-v0.1
+(broad biases trained on diverse corpus); 9× for v54 (focused biases
+that didn't favor Rail syntax in absence of prompt); 10× for halfB.
+Honest post-fix:
+- v54 actually IMPROVED to 13/30 — its tight training on
+  back_quarter (90 KB compile.rail) is real signal, not bias artifact.
+- halfB's training surface modestly less effective than the bug-driven
+  benchmark suggested.
+- Spur-v0.1 essentially can't generate Rail at single-ckpt — the
+  flagship was a measurement artifact.
+
+**v54 is the new lead at 13/30.** Spur-v0.1 status retired. The
+substrate-thesis 30/30 (naked Qwen + Rail spec) is unaffected;
+that bypasses Spur entirely.
+
+**No regression to chase. The fix stays.**
 
 ## Re-rank for next session
 
