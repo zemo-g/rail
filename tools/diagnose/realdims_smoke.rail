@@ -1,0 +1,74 @@
+-- tools/diagnose/realdims_smoke.rail
+--
+-- Decisive resolution of the substrate divergence "matmul kernel" mystery.
+--
+-- Setup mirrors smoke_v54_repro_best's actual dims:
+--   V = 130 (from corpus training/rail_corpus_stdlib.txt)
+--   W[0] (embedding) shape = [93, 256] from the ckpt manifest
+--   x is [7, 130] one-hot at prompt token IDs (all <93 so legal lookups)
+--
+-- matmul_cpu computes y = x · w_e with k_dim = 130 (from x's tail), but
+-- w_e only has 93 rows of stride-256 → k=93..129 reads OOB into whatever
+-- memory follows w_e_data in the heap.
+--
+-- Result: SEGFAULT (this smoke) when OOB hits unmapped pages, OR garbage
+-- finite values (forward_dump_cpu_bin) when OOB lands on mapped memory.
+-- "Heisenbug" pattern from the comment in forward_dump_cpu.rail at line 305.
+--
+-- The "GPU substrate divergence" earlier (max_abs 1614 at block1_x_out)
+-- was therefore NOT a kernel/precision bug — it was matmul_cpu reading
+-- OOB memory while matmul_mixed (Metal kernel) correctly handled the
+-- shape mismatch (zero-pad or guarded loop). GPU is the oracle for this
+-- ckpt; CPU substrate is structurally wrong on any ckpt where V_corpus
+-- > W[0].rows.
+--
+-- Fix surfaces:
+--   1. Validate V_corpus == W[0].rows at load time; warn or clamp
+--   2. Use min(V_corpus, W[0].rows) as k_dim
+--   3. Re-train the model with the current corpus (V=130 embedding)
+--   4. Re-build corpus from the data the model was originally trained on (V=93)
+
+import "stdlib/transformer.rail"
+import "stdlib/optim.rail"
+import "stdlib/checkpoint.rail"
+cat parts = join "" parts
+
+matmul_cpu a b = match a
+  | Tensor a_data a_shape _ -> match b
+    | Tensor b_data b_shape _ ->
+      let m_dim = head a_shape
+      let k_dim = head (tail a_shape)
+      let n_dim = head (tail b_shape)
+      let c = tensor_zeros (cons m_dim (cons n_dim []))
+      let acc = float_arr_new 1 0.0
+      match c
+        | Tensor c_data _ _ ->
+          let _ = matmul_i a_data b_data c_data acc m_dim n_dim k_dim 0
+          c
+
+main =
+  let prefix = "runs/smoke_v54_repro/checkpoints/smoke_v54_repro_best"
+  let f32_w = load_model prefix
+  let w_e = list_nth 0 f32_w
+  match w_e | Tensor _ ws _ ->
+    let we_rows = head ws
+    let we_cols = head (tail ws)
+    let _ = print (cat ["w_e shape: [", show we_rows, ", ", show we_cols, "]"])
+    let seq = 7
+    let V = 130
+    let _ = print (cat ["x shape: [", show seq, ", ", show V, "] — k_dim=", show V, " > w_e rows=", show we_rows, " (OOB-prone)"])
+    let x_data = float_arr_new (seq * V) 0.0
+    let _ = float_arr_set x_data (0 * V + 57) 1.0
+    let _ = float_arr_set x_data (1 * V + 15) 1.0
+    let _ = float_arr_set x_data (2 * V + 12) 1.0
+    let _ = float_arr_set x_data (3 * V + 42) 1.0
+    let _ = float_arr_set x_data (4 * V + 2) 1.0
+    let _ = float_arr_set x_data (5 * V + 69) 1.0
+    let _ = float_arr_set x_data (6 * V + 2) 1.0
+    let x = Tensor x_data (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+    let _ = print "expected y[0,0] = w_e[57,0] = -0.10028"
+    let _ = print "(if matmul_cpu segfaults below, OOB hit unmapped memory)"
+    let y = matmul_cpu x w_e
+    match y | Tensor yd _ _ ->
+      let _ = print (cat ["y[0,0] = ", show_float (0.0 + float_arr_get yd 0), " (expect -0.10028)"])
+      0
