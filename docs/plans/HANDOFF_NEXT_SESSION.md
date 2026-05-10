@@ -46,12 +46,33 @@ regression test should anyone touch `emit_x1` again.
 
 ---
 
+## Bench finding (post-fix evening 2026-05-10)
+
+**The historical 10/30 was inflated.** Re-bench post-fix on
+halfB_s7777_fresh + matched corpus = **6/30 (20%)**, not 10/30.
+Reason: pre-fix `seq_len * V = 0` (because of the LHS-nullary bug)
+made x_data empty → fill_prompt_loop silently OOB'd → matmul read
+zeros → model ran on **zero-input prompt** → outputs were driven by
+final-layer biases + sampling, not the prompt. That accidentally
+compiled at 10/30 for this ckpt. Post-fix the model uses actual
+embeddings → real context-aware generation → exposes the model's
+actual ability is ~6/30.
+
+Implication: **the entire pre-2026-05-10 bench lineage is suspect**.
+Spur-v0.1's 25/30 ensemble, v54's 9/30 single-ckpt, halfB's 7/30 —
+all measured through the buggy substrate. Re-bench gives the honest
+number. The substrate-thesis 30/30 (naked Qwen + Rail spec) finding
+still stands; that bypasses Spur entirely.
+
+**No "regression" to chase. Honest numbers compound; lucky-buggy
+ones don't.** The fix stays.
+
 ## Re-rank for next session
 
 | Lever | Title | Status | ROI | Notes |
 |---|---|---|---|---|
-| **A1** | Re-bench CPU substrate at full scale | NEW | HIGH | Honest CPU number for the first time. Compare to 10/30 GPU baseline. ~2 hr. |
-| **A2** | Re-bench GPU mixed (sanity) | NEW | LOW | Should match prior 10/30; confirms compile fix didn't regress. ~25 min. |
+| **A1** | Re-bench CPU substrate at full scale | NEW | HIGH | First HONEST CPU number. CPU should match GPU (~6/30) since both are now correct. If they differ meaningfully, that's a new finding. ~2 hr. |
+| ~~A2~~ | Re-bench GPU mixed (sanity) | DONE | — | 6/30 measured. The 10/30 baseline is retired. |
 | B | GPU mixed segfault on V=93 ckpts (max≥24) | OPEN | MEDIUM | Was a separate Lever B; now that CPU substrate works, this is less urgent. May want to test if CPU at scale solves the V=93 problem instead. |
 | C | Retrain ckpts on V=130 corpus | OPEN | HIGH | `spur_halfB_better_than_full` lineage, ~1-2 hr training + ~25 min bench. Now-honest CPU bench could compare apples-to-apples. |
 | D | JIT lower.rail vreg widening | OPEN | MEDIUM | Carried over. `jit/lower.rail:121` allocator hard-fails on 10th simultaneous vreg. ~3-6 hr. |
