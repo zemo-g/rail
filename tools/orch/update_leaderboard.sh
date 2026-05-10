@@ -97,7 +97,9 @@ while IFS=$'\t' read -r key arm_id status best_vl bench_pass fund io tools comp 
     "$RANK" "$arm_id" "$status" "$best_vl" "$bench_pass" \
     "$fund" "$io" "$tools" "$comp" "$adv" "$compr" "$wall" \
     >> "$TMP"
-  if [ "$key" -gt "$SOTA_PASS" ] 2>/dev/null; then
+  # SOTA only counts BENCHED arms — failed/killed/queued/running don't qualify
+  # even if a stale bench_result.meta says bench_pass=N.
+  if [ "$status" = "benched" ] && [ "$key" -gt "$SOTA_PASS" ] 2>/dev/null; then
     SOTA_PASS=$key
     SOTA_ARM=$arm_id
   fi

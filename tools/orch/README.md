@@ -139,4 +139,4 @@ the leaderboard contains the right row.
 - [x] `write_handoff.sh` — leader/falsified/open/next-prompt
 - [x] `condense.sh` — per-prompt OR-ensemble across all bench logs
 - [x] `orchestrate.md` — runbook for Claude Code's wakeup loop
-- [ ] **end-to-end smoke** with `lm_fake_smoke.rail` arms (deferred — needs Studio idle)
+- [x] `tests/test_e2e.sh` — end-to-end smoke (8 stages green; uncovered + fixed 2 bugs)

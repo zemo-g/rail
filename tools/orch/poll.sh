@@ -65,11 +65,15 @@ if [ "$STATUS" = "running" ]; then
   if [ -n "${PID:-}" ] && kill -0 "$PID" 2>/dev/null; then
     ALIVE=yes
   else
-    # Process is dead. Decide completed vs failed based on log evidence.
-    if [ -f "$LOG" ] && grep -qE "(saved final checkpoint|saved best|saved at step=)" "$LOG"; then
+    # Process is dead. Decide completed vs failed by checkpoint presence at the
+    # arm's expected ckpt prefix. This is a stronger signal than log-text
+    # matching: any file matching <prefix>_best* means the trainer wrote
+    # something usable (the .committed sentinel, .meta, weight shards, or — for
+    # smoke trainers — a single _best file).
+    CKPT_PREFIX=$(get_key ckpt_prefix)
+    NEW_STATUS=failed
+    if [ -n "${CKPT_PREFIX:-}" ] && ls ${CKPT_PREFIX}_best* >/dev/null 2>&1; then
       NEW_STATUS=completed
-    else
-      NEW_STATUS=failed
     fi
     # Persist transition + completed_at timestamp (idempotent — only adds once)
     sed -i.bak "s|^status=running\$|status=$NEW_STATUS|" "$RUN_CARD"

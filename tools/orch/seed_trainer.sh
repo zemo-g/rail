@@ -71,15 +71,22 @@ OLD_SEED_HITS=$(grep -cE "^[[:space:]]*let rng = lcg_state_new ${OLD_SEED}[[:spa
 NEW_CKPT_HITS=$(grep -cF "${NEW_CKPT_PREFIX}_best" "$OUT" || true)
 OLD_CKPT_HITS=$(grep -cF "${OLD_CKPT_BASE}_best" "$OUT" || true)
 
-if [ "${NEW_SEED_HITS:-0}" -lt 1 ] || [ "${OLD_SEED_HITS:-0}" -gt 0 ]; then
-  echo "error: seed substitution failed (new=${NEW_SEED_HITS} old=${OLD_SEED_HITS})" >&2
-  rm -f "$OUT"
-  exit 6
+# Identity case: when new seed == old seed, the line is unchanged post-sed so
+# both NEW_SEED_HITS and OLD_SEED_HITS will be 1. Same for ckpt prefix. Only
+# enforce "no-old-stragglers" when the values actually differ.
+if [ "$NEW_SEED" != "$OLD_SEED" ]; then
+  if [ "${NEW_SEED_HITS:-0}" -lt 1 ] || [ "${OLD_SEED_HITS:-0}" -gt 0 ]; then
+    echo "error: seed substitution failed (new=${NEW_SEED_HITS} old=${OLD_SEED_HITS})" >&2
+    rm -f "$OUT"
+    exit 6
+  fi
 fi
-if [ "${NEW_CKPT_HITS:-0}" -lt 1 ] || [ "${OLD_CKPT_HITS:-0}" -gt 0 ]; then
-  echo "error: ckpt substitution failed (new=${NEW_CKPT_HITS} old=${OLD_CKPT_HITS})" >&2
-  rm -f "$OUT"
-  exit 7
+if [ "$OLD_CKPT_BASE" != "$NEW_CKPT_PREFIX" ]; then
+  if [ "${NEW_CKPT_HITS:-0}" -lt 1 ] || [ "${OLD_CKPT_HITS:-0}" -gt 0 ]; then
+    echo "error: ckpt substitution failed (new=${NEW_CKPT_HITS} old=${OLD_CKPT_HITS})" >&2
+    rm -f "$OUT"
+    exit 7
+  fi
 fi
 
 echo "ok: ${TEMPLATE} → ${OUT} (seed ${OLD_SEED}→${NEW_SEED}, ckpt ${OLD_CKPT_BASE}→${NEW_CKPT_PREFIX})"
