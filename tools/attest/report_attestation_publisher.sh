@@ -36,9 +36,13 @@ BEACON_URL=${BEACON_URL:-https://ledatic.org/entropy/pulse}
 BEACON_TOKEN_FILE=${BEACON_TOKEN_FILE:-$HOME/.ledatic/entropy/beacon_token}
 WITNESS_HOST=${WITNESS_HOST:-zemog@100.87.231.45}
 SIGNER=${SIGNER:-/home/zemog/.ledatic/witness/sign_attestation.sh}
-LOCAL_SIGNER=${LOCAL_SIGNER:-$HOME/.ledatic/witness/sign_attestation.sh}
-LOCAL_WITNESS_NAME=${LOCAL_WITNESS_NAME:-studio}
-REQUIRE_LOCAL=${REQUIRE_LOCAL:-0}  # 1 = fail if local signer unavailable
+# Secondary witness must NOT be the model host. By default we use Mini's
+# Tailscale-resident signer (independent machine; separate Ed25519 key).
+# To run a local-fallback secondary, set MINI_HOST="" and LOCAL_SIGNER to
+# a path on a non-model-host machine.
+MINI_HOST=${MINI_HOST:-user@100.79.50.108}
+MINI_SIGNER=${MINI_SIGNER:-$HOME/.ledatic/witness/sign_attestation.sh}
+REQUIRE_SECONDARY=${REQUIRE_SECONDARY:-${REQUIRE_LOCAL:-0}}
 SITE=${SITE:-https://ledatic.org}
 
 [ -f "$PROMPT_FILE" ]      || { echo "no prompt file at $PROMPT_FILE" >&2; exit 2; }
@@ -51,6 +55,12 @@ raw=$(curl -sf --max-time 4 "$BEACON_URL") || { echo "beacon unreachable" >&2; e
 pulse_id=$(printf '%s' "$raw" | python3 -c "import sys,json;print(json.load(sys.stdin)['pulse_id'])")
 value_hex=$(printf '%s' "$raw" | python3 -c "import sys,json;print(json.load(sys.stdin)['value_hex'])")
 
+# Validate pulse fields locally before composing any ssh command line.
+# Without this, a poisoned beacon (non-numeric pulse_id) yields shell-meta
+# in the remote command — see audits/findings_2026-05-09 F-29.
+case "$pulse_id"  in *[!0-9]*|"")        echo "bad pulse_id from beacon: $pulse_id" >&2; exit 3 ;; esac
+case "$value_hex" in *[!0-9a-fA-F]*|"")  echo "bad value_hex from beacon" >&2; exit 3 ;; esac
+
 # 2. Hash prompt + response (the thing the client gave + what the model produced).
 prompt_hash=$(shasum -a 256 "$PROMPT_FILE" | awk '{print $1}')
 response_hash=$(shasum -a 256 "$RESPONSE_FILE" | awk '{print $1}')
@@ -62,12 +72,13 @@ response_size=$(stat -f%z "$RESPONSE_FILE" 2>/dev/null || stat -c%s "$RESPONSE_F
 #    re-derive the digest from the manifest's individual fields.
 inner_msg="report|v1|${REPORT_ID}|${MODEL_NAME}|${WEIGHTS_HASH}|${prompt_hash}|${response_hash}|${GENERATED_AT}|${CLIENT_ID}"
 digest=$(printf '%s' "$inner_msg" | shasum -a 256 | awk '{print $1}')
+case "$digest" in *[!0-9a-fA-F]*|"") echo "bad digest computed locally" >&2; exit 5 ;; esac
 
-# 4. Sign via fleet0 (primary) and Studio (secondary) — both sign the SAME
+# 4. Sign via fleet0 (primary) and Mini (secondary) — both sign the SAME
 #    canonical message: "attest|v1|<digest>|<pulse_id>|<value_hex>|<witnessed_at>".
-#    fleet0 signature is required (the manifest fails without it). Studio
-#    signature is best-effort: if the local signer is missing, the manifest
-#    still ships with just fleet0 (set REQUIRE_LOCAL=1 to make Studio mandatory).
+#    Both witness machines are physically distinct from this host (the model
+#    host). fleet0 signature is required; Mini signature is best-effort
+#    unless REQUIRE_SECONDARY=1.
 fleet0_json=$(ssh -o ConnectTimeout=4 -o BatchMode=yes "$WITNESS_HOST" \
     "$SIGNER $digest $pulse_id $value_hex" 2>/dev/null || true)
 if [ -z "$fleet0_json" ]; then
@@ -78,12 +89,13 @@ fi
 # Each signer self-identifies via its own WITNESS_NAME default (set per host
 # in the signer script itself: studio → "studio", mini → "mini"). Don't
 # override here — let the host's signer declare its own identity.
-local_json=""
-if [ -x "$LOCAL_SIGNER" ]; then
-    local_json=$("$LOCAL_SIGNER" "$digest" "$pulse_id" "$value_hex" 2>/dev/null || true)
+mini_json=""
+if [ -n "$MINI_HOST" ]; then
+    mini_json=$(ssh -o ConnectTimeout=4 -o BatchMode=yes "$MINI_HOST" \
+        "$MINI_SIGNER $digest $pulse_id $value_hex" 2>/dev/null || true)
 fi
-if [ -z "$local_json" ] && [ "$REQUIRE_LOCAL" = "1" ]; then
-    echo "local witness signer required but failed: $LOCAL_SIGNER" >&2
+if [ -z "$mini_json" ] && [ "$REQUIRE_SECONDARY" = "1" ]; then
+    echo "secondary (Mini) witness required but failed: $MINI_HOST" >&2
     exit 4
 fi
 
@@ -92,16 +104,16 @@ fi
 #    is the multi-witness array including all signers.
 manifest=$(python3 - "$REPORT_ID" "$MODEL_NAME" "$WEIGHTS_HASH" "$prompt_hash" "$response_hash" \
     "$prompt_size" "$response_size" "$GENERATED_AT" "$CLIENT_ID" "$pulse_id" "$value_hex" \
-    "$inner_msg" "$digest" "$fleet0_json" "$local_json" <<'PY'
+    "$inner_msg" "$digest" "$fleet0_json" "$mini_json" <<'PY'
 import json, sys
 (report_id, model_name, weights_hash, prompt_hash, response_hash,
  prompt_size, response_size, generated_at, client_id,
- pulse_id, value_hex, inner_msg, digest, fleet0_json, local_json) = sys.argv[1:]
+ pulse_id, value_hex, inner_msg, digest, fleet0_json, mini_json) = sys.argv[1:]
 fleet0 = json.loads(fleet0_json)
 witnesses = [fleet0]
-if local_json:
-    local = json.loads(local_json)
-    witnesses.append(local)
+if mini_json:
+    mini = json.loads(mini_json)
+    witnesses.append(mini)
 out = {
     "kind": "ledatic.report.provenance",
     "version": 1,
