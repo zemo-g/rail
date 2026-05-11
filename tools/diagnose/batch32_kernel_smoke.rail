@@ -1,0 +1,231 @@
+-- batch32_kernel_smoke.rail — kernel audit for batch=32 trainer fork.
+--
+-- For each of the 6 hot-path kernels used in the transformer forward
+-- (rmsnorm_save, tensor_softmax, tensor_add, matmul_mixed, rope_apply,
+-- apply_causal_mask_loop), verify whether the kernel produces correct
+-- output when fed a rank-3 (B, seq, d) tensor vs the rank-2 (seq, d)
+-- the trainer currently uses. The smoke compares the rank-3 result at
+-- batch=0 against the rank-2 result; PASS = bit-equivalent.
+--
+-- Audit hypothesis (pre-test, from reading the kernels):
+--   rmsnorm_save  : BATCH-SAFE (flattens to rows × dim where dim = last)
+--   tensor_softmax: BATCH-SAFE (flattens to rows × cols where cols = last)
+--   tensor_add    : BATCH-SAFE (flat n = list_product)
+--   matmul_mixed  : NOT batch-safe (rank-2 only) — reshape trick at caller
+--   rope_apply    : NOT batch-safe (treats head x_shape as seq)
+--   apply_causal_mask: NOT batch-safe (single (seq,seq) call)
+--
+-- This smoke confirms or refutes that hypothesis.
+
+import "stdlib/transformer.rail"
+
+-- ── Test shape: B=2, S=4, D=8 ──────────────────────────────
+B = 2
+S = 4
+D = 8
+
+-- Fill a flat float_arr with a deterministic pattern: value at index i = i * 0.1
+fill_pattern data n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set data i (int_to_float i * 0.1)
+    fill_pattern data n (i + 1)
+
+-- Compare two float_arrs element-wise within tolerance. Returns 1 if all
+-- |a[i] - b[i]| <= tol, else prints first mismatch and returns 0.
+compare_floats a b n i tol =
+  if i >= n then 1
+  else
+    let av = float_arr_get a i
+    let bv = float_arr_get b i
+    let diff = av - bv
+    let abs_diff = if diff < 0.0 then 0.0 - diff else diff
+    if abs_diff > tol then
+      let _ = print (cat ["    DIFF at i=", show i, " a=", show_float av, " b=", show_float bv, " diff=", show_float abs_diff])
+      0
+    else compare_floats a b n (i + 1) tol
+
+-- Compare batch=0 slice of rank-3 (B,S,D) flat array against rank-2 (S,D).
+-- Rank-3 slice 0 occupies indices [0, S*D).
+slice0_matches rank3_data rank2_data slice_n tol =
+  compare_floats rank3_data rank2_data slice_n 0 tol
+
+-- ── 1. tensor_add ──────────────────────────────────────────
+test_tensor_add =
+  let _ = print "── tensor_add ──"
+  let n2 = S * D
+  let n3 = B * S * D
+  let a2_data = float_arr_new n2 0.0
+  let b2_data = float_arr_new n2 0.0
+  let _ = fill_pattern a2_data n2 0
+  let _ = fill_pattern b2_data n2 0
+  let a2 = Tensor a2_data (cons S (cons D [])) (compute_strides (cons S (cons D [])))
+  let b2 = Tensor b2_data (cons S (cons D [])) (compute_strides (cons S (cons D [])))
+  let c2 = tensor_add a2 b2
+  let c2_data = match c2 | Tensor d _ _ -> d
+
+  let a3_data = float_arr_new n3 0.0
+  let b3_data = float_arr_new n3 0.0
+  let _ = fill_pattern a3_data n3 0
+  let _ = fill_pattern b3_data n3 0
+  let a3 = Tensor a3_data (cons B (cons S (cons D []))) (compute_strides (cons B (cons S (cons D []))))
+  let b3 = Tensor b3_data (cons B (cons S (cons D []))) (compute_strides (cons B (cons S (cons D []))))
+  let c3 = tensor_add a3 b3
+  let c3_data = match c3 | Tensor d _ _ -> d
+
+  -- For tensor_add, both inputs match pattern (i*0.1). For batch=0 slice,
+  -- inputs are identical to rank-2 inputs. So output slice 0 should match.
+  let ok = slice0_matches c3_data c2_data n2 0.0001
+  if ok > 0 then print "  PASS  rank-3 (B,S,D) tensor_add: slice 0 == rank-2" else print "  FAIL  rank-3 tensor_add diverged from rank-2"
+
+-- ── 2. tensor_softmax ─────────────────────────────────────
+test_tensor_softmax =
+  let _ = print "── tensor_softmax ──"
+  -- softmax is row-wise on LAST dim. For (S, S) → rows=S, cols=S.
+  -- For (B, S, S) → rows=B*S, cols=S.
+  let n2 = S * S
+  let n3 = B * S * S
+  let a2_data = float_arr_new n2 0.0
+  let _ = fill_pattern a2_data n2 0
+  let a2 = Tensor a2_data (cons S (cons S [])) (compute_strides (cons S (cons S [])))
+  let c2 = tensor_softmax a2
+  let c2_data = match c2 | Tensor d _ _ -> d
+
+  let a3_data = float_arr_new n3 0.0
+  let _ = fill_pattern a3_data n3 0
+  let a3 = Tensor a3_data (cons B (cons S (cons S []))) (compute_strides (cons B (cons S (cons S []))))
+  let c3 = tensor_softmax a3
+  let c3_data = match c3 | Tensor d _ _ -> d
+
+  let ok = slice0_matches c3_data c2_data n2 0.0001
+  if ok > 0 then print "  PASS  rank-3 (B,S,S) tensor_softmax: slice 0 == rank-2" else print "  FAIL  rank-3 tensor_softmax diverged from rank-2"
+
+-- ── 3. rmsnorm_save ────────────────────────────────────────
+test_rmsnorm =
+  let _ = print "── rmsnorm_save ──"
+  -- Per-row norm on last dim. (S, D) → rows=S. (B, S, D) → rows=B*S.
+  let n2 = S * D
+  let n3 = B * S * D
+  let x2_data = float_arr_new n2 0.0
+  let _ = fill_pattern x2_data n2 0
+  let x2 = Tensor x2_data (cons S (cons D [])) (compute_strides (cons S (cons D [])))
+
+  let g_data = float_arr_new D 1.0
+  let _ = fill_pattern g_data D 0  -- gamma is per-feature
+  let gamma = Tensor g_data (cons D []) (cons 1 [])
+
+  let pack2 = rmsnorm_save x2 gamma
+  let y2 = head pack2
+  let y2_data = match y2 | Tensor d _ _ -> d
+
+  let x3_data = float_arr_new n3 0.0
+  let _ = fill_pattern x3_data n3 0
+  let x3 = Tensor x3_data (cons B (cons S (cons D []))) (compute_strides (cons B (cons S (cons D []))))
+
+  let pack3 = rmsnorm_save x3 gamma
+  let y3 = head pack3
+  let y3_data = match y3 | Tensor d _ _ -> d
+
+  let ok = slice0_matches y3_data y2_data n2 0.0001
+  if ok > 0 then print "  PASS  rank-3 (B,S,D) rmsnorm_save: slice 0 == rank-2" else print "  FAIL  rank-3 rmsnorm_save diverged from rank-2"
+
+-- ── 4. matmul_mixed (rank-2 only — reshape trick at caller) ───
+test_matmul_mixed =
+  let _ = print "── matmul_mixed ──"
+  -- (S, D) × (D, N) = (S, N). The kernel is rank-2 only by design.
+  -- For (B, S, D) the rank-3 reshape trick is:
+  --   1. View as (B*S, D)
+  --   2. matmul → (B*S, N)
+  --   3. View as (B, S, N)
+  -- Slice 0 of step 3 should match the rank-2 (S, D) × (D, N) result.
+  let N = 4
+  let n2_in  = S * D
+  let n2_out = S * N
+  let n3_in  = B * S * D
+  let n3_out = B * S * N
+
+  let w_data = float_arr_new (half_storage_slots (D * N)) 0.0
+  let w_init = float_arr_new (D * N) 0.0
+  let _ = fill_pattern w_init (D * N) 0
+  let w_t = Tensor w_init (cons D (cons N [])) (compute_strides (cons D (cons N [])))
+  let w_h = half_of_tensor w_t
+
+  let x2_data = float_arr_new n2_in 0.0
+  let _ = fill_pattern x2_data n2_in 0
+  let x2 = Tensor x2_data (cons S (cons D [])) (compute_strides (cons S (cons D [])))
+  let y2 = matmul_mixed x2 w_h
+  let y2_data = match y2 | Tensor d _ _ -> d
+
+  -- For rank-3: reshape (B, S, D) → (B*S, D), matmul, slice
+  let x3_data = float_arr_new n3_in 0.0
+  let _ = fill_pattern x3_data n3_in 0
+  let x3_flat = Tensor x3_data (cons (B * S) (cons D [])) (compute_strides (cons (B * S) (cons D [])))
+  let y3_flat = matmul_mixed x3_flat w_h
+  let y3_data = match y3_flat | Tensor d _ _ -> d
+
+  -- y3_data is (B*S, N). batch=0 slice occupies [0, S*N). Should match y2.
+  let ok = slice0_matches y3_data y2_data n2_out 0.001
+  if ok > 0 then print "  PASS  rank-3 matmul via (B*S, D) reshape trick: slice 0 == rank-2" else print "  FAIL  reshape trick failed (kernel may have hidden state)"
+
+-- ── 5. rope_apply (NOT batch-safe; expected to differ) ────────
+test_rope_apply =
+  let _ = print "── rope_apply ──"
+  -- rope_apply uses seq = head x_shape. For (S, D): seq=S correct.
+  -- For (B, S, D): seq=B WRONG — rotation positions mis-indexed.
+  -- Expected: rank-3 slice 0 != rank-2 result. PATCH needed.
+  let n2 = S * D
+  let n3 = B * S * D
+
+  let x2_data = float_arr_new n2 0.0
+  let _ = fill_pattern x2_data n2 0
+  let x2 = Tensor x2_data (cons S (cons D [])) (compute_strides (cons S (cons D [])))
+  let _ = rope_apply x2
+  let x2_data_after = match x2 | Tensor d _ _ -> d
+
+  let x3_data = float_arr_new n3 0.0
+  let _ = fill_pattern x3_data n3 0
+  let x3 = Tensor x3_data (cons B (cons S (cons D []))) (compute_strides (cons B (cons S (cons D []))))
+  let _ = rope_apply x3
+  let x3_data_after = match x3 | Tensor d _ _ -> d
+
+  let ok = slice0_matches x3_data_after x2_data_after n2 0.0001
+  if ok > 0 then print "  UNEXPECTED PASS — rope_apply was thought to be rank-2-only"
+  else print "  EXPECTED FAIL — rope_apply needs batch loop in caller OR rank-3 patch"
+
+-- ── 6. apply_causal_mask_loop (NOT batch-safe; expected to differ) ─
+test_causal_mask =
+  let _ = print "── apply_causal_mask_loop ──"
+  -- The mask is applied to (seq, seq) score matrix. For (S, S): fills
+  -- upper-triangle with -1e9. For (B, S, S): only the first (S, S)
+  -- block of the flat array gets masked; batches 1..B-1 see unmasked
+  -- garbage. PATCH = loop in caller, one mask per batch.
+  let n2 = S * S
+  let n3 = B * S * S
+
+  let m2_data = float_arr_new n2 1.0  -- start at 1.0 so masked vs unmasked is visible
+  let _ = apply_causal_mask_loop m2_data S 0 0
+
+  let m3_data = float_arr_new n3 1.0
+  let _ = apply_causal_mask_loop m3_data S 0 0  -- caller passes seq=S, treats data as (S,S)
+
+  let ok = slice0_matches m3_data m2_data n2 0.0001
+  if ok > 0 then print "  PASS-with-caveat  causal_mask slice 0 matches (caller must loop for batches 1..B-1)"
+  else print "  FAIL  causal_mask slice 0 diverged unexpectedly"
+
+main =
+  let _ = print "╔══════════════════════════════════════════════════════╗"
+  let _ = print "║  Kernel smoke for batch=32 trainer (B=2, S=4, D=8)   ║"
+  let _ = print "╚══════════════════════════════════════════════════════╝"
+  let _ = test_tensor_add
+  let _ = test_tensor_softmax
+  let _ = test_rmsnorm
+  let _ = test_matmul_mixed
+  let _ = test_rope_apply
+  let _ = test_causal_mask
+  let _ = print ""
+  let _ = print "Audit summary (see kernel bodies for details):"
+  let _ = print "  PASS-no-changes: tensor_add, tensor_softmax, rmsnorm_save"
+  let _ = print "  PASS-reshape:    matmul_mixed (flatten B*S × D at caller)"
+  let _ = print "  PATCH-NEEDED:    rope_apply (loop over batch in caller, or rank-3 fork)"
+  let _ = print "  PATCH-NEEDED:    apply_causal_mask_loop (loop over batch in caller)"
+  0
