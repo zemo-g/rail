@@ -121,34 +121,26 @@ Steps:
 Goal: Studio's #1 untouched lever. d=256 batch=32 vs the proven batch=1
 v54 recipe (or its 4-block variant). Same wall-clock comparison.
 
-### Step 2a — Smoke test the existing kernels at batch>1 (1-2 hrs)
+### Step 2a — Kernel audit (DONE 2026-05-10 evening)
 
-**This is the critical de-risk step.** Per
-`feedback_verify_removals.md`, write the smoke test BEFORE touching
-the trainer.
+`tools/diagnose/batch32_kernel_smoke.rail` shipped and run. Results:
 
-Audit each kernel in `stdlib/transformer.rail` for batch-dim handling.
-The current trainer feeds `(seq × V)` shapes; batch=32 will feed
-`(batch × seq × V)`. Kernels likely needing batch handling:
+| Kernel | Rank-3 status | Action |
+|---|---|---|
+| `tensor_add` | **batch-safe** (flat `list_product` n) | none |
+| `tensor_softmax` | **batch-safe** (rows = total/last_dim) | none |
+| `rmsnorm_save` | **batch-safe** (rows = total/last_dim) | none |
+| `matmul_mixed` | rank-2 only | **reshape at caller** (B,S,D)→(B*S,D) |
+| `rope_apply` | NOT batch-safe (uses head x_shape as seq) | **loop over batch in caller** |
+| `apply_causal_mask_loop` | NOT batch-safe (single (seq,seq) op) | **loop over batch in caller** |
 
-| Kernel | Current shape | Batch=32 shape | Risk |
-|---|---|---|---|
-| `matmul_mixed x w_e_h` | `(seq, V) × (V, d)` | `(B, seq, V) × (V, d)` | matmul should batch-broadcast |
-| `rope_apply q` | `(seq, d)` in place | `(B, seq, d)` in place | Q/K position indexing |
-| `apply_causal_mask` | `(seq, seq)` | `(B, seq, seq)` | per-batch mask repeat |
-| `tensor_softmax scaled` | `(seq, seq)` | `(B, seq, seq)` | row-wise per-batch |
-| `rmsnorm_save x g` | `(seq, d)` | `(B, seq, d)` | per-batch norm |
-| `tensor_add x attn_out` | `(seq, d)` | `(B, seq, d)` | elementwise broadcast |
+Run `./rail_native run tools/diagnose/batch32_kernel_smoke.rail` to
+re-verify before any trainer change. Expected output: 4 PASS + 1
+EXPECTED-FAIL (rope) + 1 PASS-with-caveat (causal_mask).
 
-Write `tools/diagnose/batch32_kernel_smoke.rail`:
-- Allocate fixed-value `(2, 4, 8)` tensor (B=2, seq=4, d=8)
-- Run each kernel on it
-- Print intermediate shapes + a sentinel value (e.g., element [0,1,3])
-- Compare against running same kernel on `(4, 8)` slice at B=0 → must match
-
-Any kernel that diverges OR errors → file the bug, patch the kernel,
-re-smoke. **Do NOT modify the trainer until all 6 kernels pass the
-smoke.**
+**No kernel patches needed** — all batch handling lives at the caller
+level. This is much cleaner than the worst-case scenario; the trainer
+fork is purely a forward-path restructure.
 
 ### Step 2b — Fork the trainer (1-2 hrs)
 
