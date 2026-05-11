@@ -26,29 +26,55 @@ this prompt, filled in with real numbers + a single sentence verdict.
 
 ---
 
-## ✅ Pre-flight checklist (do FIRST, in order)
+## ✅ Phase 0 — Check Day 1 status BEFORE any heavy operation
+
+The v54 sweep may still be running. Heavy pre-flight (137/137,
+self-compile) competes with the sweep for GPU and slows it. Lightweight
+checks first; wait for sweep if it's still running; THEN do full
+pre-flight.
 
 1. `[ ]` `hostname` → `studio`. `cd ~/projects/rail`.
-2. `[ ]` `git log --oneline -1` shows `db7885d` or later on `next`.
-3. `[ ]` `git status -sb` clean.
-4. `[ ]` `./rail_native test 2>&1 | tail -1` reports `137/137 tests passed`.
-5. `[ ]` `./rail_native self && cmp rail_native /tmp/rail_self && echo OK`
-   prints `OK` (cycle-2 byte-identical).
-6. `[ ]` Day 1 status check:
-   - `pgrep -fl 'train_v54|run_v54_sweep'` shows the sweep is running
-     (if midway) OR no processes (if complete)
-   - `tail -3 /tmp/v54_sweep.log` shows progress or `=== V54 SWEEP COMPLETE ===`
+2. `[ ]` Day 1 status check (read-only, no GPU contention):
+   - `pgrep -fl 'train_v54|run_v54_sweep'` — running or done?
+   - `tail -3 /tmp/v54_sweep.log` — should show progress or
+     `=== V54 SWEEP COMPLETE ===`
    - `grep -E 'spur_v54_BQ2_s(100|300|400|500)_post_fix' flywheel/bench_log.txt`
-     shows the new entries
-7. `[ ]` `tail -3 flywheel/bench_log.txt` shows post-fix tags. The most
-   recent line should be from one of the seed-sweep ckpts (or close to
-   it if sweep is mid-flight).
-8. `[ ]` `grep -n 'default_corpus_path' tools/train/lm_infer_v3_mixed.rail`
-   shows line 31 = `"training/rail_corpus_stdlib.txt"` (sweep restores
-   this at end).
+     — how many of the 4 seed benches landed?
 
-If Day 1 is still running, wait for it before starting Day 2 — they share
-the GPU. Use Monitor on `/tmp/v54_sweep.log` for the `SWEEP COMPLETE` line.
+3. **If sweep is still running** (any `pgrep` match): wait for completion
+   via Monitor on the sweep log:
+   ```
+   Monitor:
+     command:  tail -F /tmp/v54_sweep.log | grep -E --line-buffered '(SWEEP COMPLETE|DONE bench|loss=nan|panic)'
+     description: v54 sweep waiting for completion
+     timeout_ms: 3600000   # up to 1 hour per event
+     persistent: true       # keep until you see SWEEP COMPLETE
+   ```
+   Do not run pre-flight or any other rail_native invocation while sweep
+   is running. The sweep ETA from launch (2026-05-10 22:42 + ~14 hr paused
+   + ~5.6 hr active train + ~3 hr bench) is around 2026-05-11 7-10 AM
+   depending on resume time.
+
+## ✅ Phase 1 — Full pre-flight (after sweep complete)
+
+Sweep complete → safe to run heavy checks. Anything that fails halts the
+session.
+
+1. `[ ]` `git log --oneline -1` shows `f2ee298` or later on `next`.
+2. `[ ]` `git status -sb` clean (sweep may leave untracked
+   `tools/train/lm_v54_BQ2_s{100,300,400,500}.rail` forks — those are
+   OK as untracked; don't commit them).
+3. `[ ]` `./rail_native test 2>&1 | tail -1` reports `137/137 tests passed`.
+4. `[ ]` `./rail_native self && cmp rail_native /tmp/rail_self && echo OK`
+   prints `OK` (cycle-2 byte-identical).
+5. `[ ]` `tail -6 flywheel/bench_log.txt` shows 4 new entries with tags
+   `spur_v54_BQ2_s100_post_fix`, `s300`, `s400`, `s500` (or some subset
+   if sweep was interrupted).
+6. `[ ]` `grep -n 'default_corpus_path' tools/train/lm_infer_v3_mixed.rail`
+   shows line 31 = `"training/rail_corpus_stdlib.txt"` (sweep restores
+   this at end; flag if it doesn't).
+
+All 6 pass → record Day-1 best seed for Day 2 + proceed.
 
 ---
 
