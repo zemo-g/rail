@@ -1,122 +1,80 @@
-# Handoff — CPU substrate heisenbug ROOT-CAUSED & FIXED at compiler level
+# Handoff — 2026-05-10 evening — 10 honest re-benches landed; d=384 training in background
 
-**Headline.** The matmul_cpu "heisenbug" that haunted CPU substrate
-inference for months is a **compile.rail codegen bug** in the binary-op
-fast path: `emit_x1` (line 940-952) silently emitted `mov x1, x0` when
-the LHS variable wasn't in the local env. Top-level nullary bindings
-like `seq_len = 1024` therefore mis-compiled `seq_len * V` to
-`<previous-x0> * V`. After a conditional whose join leaves x0=1 (tagged
-0), the multiply yielded 0; x_data was allocated size 0;
-fill_prompt_loop OOB'd; matmul_cpu read garbage.
+**Headline.** Phase 1 of SESSION_PROMPT_2026-05-11 shipped: **10 honest
+re-benches** of the top historical Spur ckpts, post compile.rail fix.
+The post-fix ensemble ceiling is **~13–16/30** (upper bound on per-band
+max-pass), down from the bug-inflated pre-fix "24/30 ensemble." **v54
+remains the lead at 13/30**, with bq_s200 a NEW finding at 11/30.
 
-**Fix shipped** (commit `02a6a1d`): refined `both_simple` at line 1460
-so non-env LHS V vars take the slow path, where `cg`→`cg2` correctly
-emit `bl _<name>` for nullary fns. 2-cycle bootstrap, byte-identical
-fixed point, 137/137 green.
-
-Workarounds in `forward_dump_cpu.rail`, `lm_infer_cpu.rail`,
-`lm_infer_v3_mixed.rail` were applied first (commit `47e2e21`) and then
-REVERTED once the compile.rail fix landed.
-
-`tools/diagnose/cpu_bisect_v_full.rail` retains the TRIGGER LINE comment;
-it now PASSES (0.020599) with the conditional present and serves as the
-regression test should anyone touch `emit_x1` again.
+**Strategic directive in effect** (`exhaust_studio_before_renting.md`):
+Push Studio (M1 Ultra, 64 GB) to real limits — batch / d / blocks / seq /
+parallel seeds — before renting. Honest numbers non-negotiable.
 
 ---
 
 ## Current state
 
-**Branch:** `next` at `02a6a1d`. Studio = bare = GitHub.
+**Branch:** `next` at `39b9585` (ahead by: 2 untracked trainer forks).
 **Tests:** 137/137 green.
-**Substrates (post-fix):**
-- CPU substrate (`lm_infer_cpu.rail`, `forward_dump_cpu_bin`) — produces
-  correct outputs. `forward_dump_cpu_bin --max 1` on smoke_v54_repro_best
-  + matched back_quarter writes `x_embed[0]=0.020599365234375`.
-  Generation at --max 60 takes ~78 s on halfB_s7777_fresh.
-- GPU mixed substrate (`lm_infer_v3_mixed.rail`) — unchanged correct
-  output. The 10/30 baseline (halfB_s7777_fresh + matched + N=20)
-  should hold or shift slightly post-fix.
+**Substrates:** CPU + GPU mixed both correct post compile.rail fix at `02a6a1d`.
+**Training (background):** `d=384 × 4-block × V=130 stdlib × LR=0.005 ×
+warmup=200 × max_steps=6000`. PID 63461. ~5 hours of bench-driven
+SIGSTOP gap; resumed 21:21. Expect ~12 hours total runtime. Initial loss
+14.41, paused at step 43 / 13.78. Output: `/tmp/d384_train.log`. Ckpt
+will save to `training/rail_native/checkpoints/d384_4block_half_step6000`.
 
-**Memory entries updated:**
-- `cpu_substrate_conditional_trigger_2026-05-10.md` — full investigation,
-  fix details, regression test pointer.
-- `rail_top_level_int_add_bug.md` — marked FIXED, scope broadened from
-  "nullary + nullary" to "any binary op with top-level nullary LHS".
-- `MEMORY.md` index — both updated.
+**d=512 4-block tried first** and NaN'd at step 43 with LR=0.01. Fell
+back to d=384 per stop condition. The d=512 trainer is at
+`tools/train/lm_v3_chunked_d512_4block_half_3k.rail` (untracked).
 
 ---
 
-## Bench findings (post-fix evening 2026-05-10)
+## 10 honest re-bench results (post-fix, 2026-05-10)
 
-**Three honest re-benches at GPU mixed substrate, matched corpus, N=20:**
+| # | Ckpt | Corpus (V) | Pre-fix peak | **Post-fix** | Notes |
+|---:|---|---|---:|---:|---|
+| 1 | smoke_v54_repro_best | back_quarter (93) | 9 | **13/30** | Lead |
+| 2 | halfB_s7777_fresh | half_b (96) | 10 | 6/30 | |
+| 3 | Spur-v0.1 (d256_half_step3000) | stdlib (130) | 25 ens | 1/30 | -24, retired |
+| 4 | spur_v05_distill_step3000 | stdlib (130) | unk | 1/30 | |
+| 5 | d256_4block_half_step3000 | stdlib (130) 4-block | — | 1/30 | |
+| 6 | spur_v27_pushJ_best | half_b (96) | 7 | 1/30 | -6 collapse |
+| 7 | halfB_s5555_repro_best | half_b (96) | unk | **8/30** | NEW |
+| 8 | spur_v48_BQ_s100_best | back_quarter (93) | 8 | 7/30 | -1 stable |
+| 9 | spur_v54_BQ2_s77_best | back_quarter (93) | 9 | **13/30** | byte-id v54 (q=105969) |
+| 10 | bq_s200_repro_best | back_quarter (93) | unk | **11/30** | NEW high |
 
-| Ckpt | Pre-fix | Post-fix | Δ |
-|---|---:|---:|---:|
-| halfB_s7777_fresh (V=96) | 10/30 | **6/30** | -4 |
-| smoke_v54_repro_best (V=93) | 9/30 single | **13/30** | **+4** |
-| d256_half_step3000 / Spur-v0.1 (V=130) | 25/30 ensemble | **1/30** | **-24** |
+**Headlines:**
 
-**Spur-v0.1's flagship 25/30 collapsed to 1/30.** The pre-fix
-`seq_len * V = 0` made x_data empty for every prompt. Outputs were
-final-layer-bias + RNG noise, not context-aware generation. With
-N=20 reranks, sampling found compilable garbage 25× for Spur-v0.1
-(broad biases trained on diverse corpus); 9× for v54 (focused biases
-that didn't favor Rail syntax in absence of prompt); 10× for halfB.
-Honest post-fix:
-- v54 actually IMPROVED to 13/30 — its tight training on
-  back_quarter (90 KB compile.rail) is real signal, not bias artifact.
-- halfB's training surface modestly less effective than the bug-driven
-  benchmark suggested.
-- Spur-v0.1 essentially can't generate Rail at single-ckpt — the
-  flagship was a measurement artifact.
+1. **v54 is reproducible** — smoke_v54 = v54_BQ2 byte-identical at q=105969.
+2. **bq_s200 = 11/30** is the second-best ckpt, never previously measured.
+3. **All V=130 stdlib ckpts collapsed to 1/30** post-fix. Bigger corpus
+   without bigger compute does NOT generalize.
+4. **The 17-point gap** from v54 13/30 to substrate-thesis 30/30 stays
+   the mission target.
 
-**v54 is the new lead at 13/30.** Spur-v0.1 status retired. The
-substrate-thesis 30/30 (naked Qwen + Rail spec) is unaffected;
-that bypasses Spur entirely.
-
-**No regression to chase. The fix stays.**
-
-## Re-rank for next session
-
-| Lever | Title | Status | ROI | Notes |
-|---|---|---|---|---|
-| **A1** | Re-bench CPU substrate at full scale | NEW | HIGH | First HONEST CPU number. CPU should match GPU (~6/30) since both are now correct. If they differ meaningfully, that's a new finding. ~2 hr. |
-| ~~A2~~ | Re-bench GPU mixed (sanity) | DONE | — | 6/30 measured. The 10/30 baseline is retired. |
-| B | GPU mixed segfault on V=93 ckpts (max≥24) | OPEN | MEDIUM | Was a separate Lever B; now that CPU substrate works, this is less urgent. May want to test if CPU at scale solves the V=93 problem instead. |
-| C | Retrain ckpts on V=130 corpus | OPEN | HIGH | `spur_halfB_better_than_full` lineage, ~1-2 hr training + ~25 min bench. Now-honest CPU bench could compare apples-to-apples. |
-| D | JIT lower.rail vreg widening | OPEN | MEDIUM | Carried over. `jit/lower.rail:121` allocator hard-fails on 10th simultaneous vreg. ~3-6 hr. |
-| E | Quartz real-event smoke | OPEN | LOW-MED | Carried over. `tools/desk/README.md` punch list #3. |
-| F | forward_dump_gpu residual leak | OPEN | LOW | Was 141 GB → 11 GB after `_rail_join` fix. Distinct bug; CPU now runs to completion. Lever moved down because CPU dump pipeline works. |
-
-**Recommendation:** A2 first (cheap sanity), then A1 (~2 hr) to get the
-honest CPU number. Then revisit which substrate to use as the bench
-oracle going forward.
+Per-band best across the 10 (upper-bound ensemble ceiling):
+- FUND 4/5 + IO 3/5 + Tools 3/5 + Comp 4/5 + Adv 2/5 + Comprehend 0/5
+  = **16/30 upper bound**, ~13-15 realistic.
 
 ---
 
-## What's NOT broken anymore
+## What's NEXT (ranked by ROI for "exhaust Studio")
 
-- The "matmul_cpu produces deterministic-but-wrong x_embed in real-model
-  contexts" finding from `cpu_substrate_bisect_progress_2026-05-10.md`
-  is RESOLVED.
-- The Lever 1 falsification still holds at the symptom level — those 3
-  let-bind decompositions in matmul_k legitimately didn't help. The bug
-  was elsewhere.
-- The "conditional-in-let-chain trigger" from
-  `cpu_substrate_conditional_trigger_2026-05-10.md` is the same bug —
-  conditionals were just a way to leave x0=1 (tagged 0) before the
-  miscompiled multiply.
+| # | Lever | Cost | Expected lift | Notes |
+|---:|---|---|---|---|
+| 1 | **Batch size 1 → 16-32** | 1 day of trainer fork | Likely big sample-efficiency win | Studio is at batch=1 — biggest underutilized lever |
+| 2 | **d=384 bench (when training finishes)** | 1 hr bench | First post-fix data point at next size class | Required for scaling-law fit |
+| 3 | **d=512 with LR engineering** | 1 day | Either reaches d=512 or proves precision wall | Lower LR, gradient clipping, fp32 logits |
+| 4 | **Compile-loss training** | 2-3 days | +5-10 pts (structural lever) | `compile_loss_scaffolding.md` partly shipped |
+| 5 | **Distillation: Qwen → Rail student** | 3-5 days | +10-15 pts (substrate teacher) | Closes gap to 30/30 directly |
+| 6 | **Multi-process: 4 seeds concurrent** | 0.5 day | Honest ensemble curve at scale | Studio has cores spare |
 
-## What might still be true
-
-- The `inference_seed_segfault.md` repro at active=65 may or may not be
-  the same bug. The bisect entry talks about a `1.0` fp64 bit pattern
-  in the freelist — that's a separate symptom that may or may not be
-  driven by the same codegen bug. **Re-test the segfault repro post-fix
-  to confirm.**
-- `vocab_embedding_shape_mismatch_2026-05-10.md` (V_corpus > W[0].rows
-  causes OOB) is a distinct bug, also still relevant. The `--corpus`
-  flag is the workaround there.
+**Sequence rationale:**
+- (2) finishes overnight tonight — that's free data
+- (1) is the largest single Studio lever untouched, before anything else
+- (3) unlocks the d→d-scaling-law curve that justifies renting
+- (4-5) are structural levers; do AFTER (1-3) prove compute trajectory
 
 ---
 
@@ -124,44 +82,63 @@ oracle going forward.
 
 - 137/137 green
 - Byte-identical self-compile fixed point (cycle ≥ 2)
-- Push flow: `git push origin next` (relay handles GitHub)
-- v_full bisect harness produces 0.020599 (correct) on the trigger line —
-  if it ever flips again, emit_x1 has regressed.
+- `default_corpus_path` in `lm_infer_v3_mixed.rail` = `training/rail_corpus_stdlib.txt` ✅ (restored at end of bench loop)
+- v_full bisect harness produces 0.020599 (regression test for compile fix)
+- Don't quote pre-fix bench numbers (24/30, 25/30) as targets
+- Every claim cites a `flywheel/bench_log.txt` post-fix line
+
+---
 
 ## Reusable commands
 
 ```bash
-# Quick correctness check on CPU substrate
-rm -f /tmp/forward_dump_cpu/*.txt
-tools/diagnose/forward_dump_cpu_bin \
-  --prefix runs/smoke_v54_repro/checkpoints/smoke_v54_repro_best \
-  --corpus training/corpora/spur_compile_back_quarter.txt \
-  --prompt "main = " --max 1
-head -1 /tmp/forward_dump_cpu/x_embed.txt   # must be 0.020599365234375
+# Resume d=384 training if killed
+DYLD_LIBRARY_PATH=tools/metal /tmp/train_d384 \
+  --resume training/rail_native/checkpoints/d384_4block_half_step6000 \
+  > /tmp/d384_train.log 2>&1 &
 
-# Bisect harness regression test (must produce 0.020599)
-./rail_native run tools/diagnose/cpu_bisect_v_full.rail \
-  -- --prefix runs/smoke_v54_repro/checkpoints/smoke_v54_repro_best \
-     --corpus training/corpora/spur_compile_back_quarter.txt \
-     --prompt "main = " --max 1 --k 1
+# Bench any ckpt (set default_corpus_path to match training corpus first)
+DYLD_LIBRARY_PATH=tools/metal /tmp/rail_bench_strip \
+  --prefix <CKPT_PREFIX> \
+  --max 60 --k 10 --temp 0.8 \
+  --tag <TAG>_post_fix \
+  --gen-source tools/train/lm_infer_v3_mixed.rail
+
+# Corpus matching table:
+#   V=93  → training/corpora/spur_compile_back_quarter.txt
+#   V=96  → training/corpora/spur_compile_half_b.txt
+#   V=130 → training/rail_corpus_stdlib.txt  (default)
+
+# Sequential bench loop (matches halfB+BQ recipe)
+/tmp/run_bench_loop.sh  # if regenerated; see flywheel/ for inline
 
 # Self-compile + cycle check
 ./rail_native self && cmp rail_native /tmp/rail_self && echo "byte-identical"
 
-# Full GPU mixed bench (25 min) — sanity
-./rail_native flywheel-local/bench_strip.rail
-cp /tmp/rail_out /tmp/rail_bench_strip
-/tmp/rail_bench_strip \
-  --prefix runs/halfB_s7777_fresh/checkpoints/halfB_s7777_fresh_best \
-  --max 60 --k 10 --temp 0.8 \
-  --tag halfB_s7777_post_fix \
-  --gen-source tools/train/lm_infer_v3_mixed.rail
+# Regression test for codegen fix
+./rail_native run tools/diagnose/cpu_bisect_v_full.rail \
+  -- --prefix runs/smoke_v54_repro/checkpoints/smoke_v54_repro_best \
+     --corpus training/corpora/spur_compile_back_quarter.txt \
+     --prompt "main = " --max 1 --k 1
+# expect: BISECT x_embed[0]=0.020599365234375
 ```
 
-## Commits this session
+---
 
-```
-02a6a1d compile: fix nullary-LHS binary-op codegen — emit_x1 fast path skipped for non-env V
-47e2e21 substrate: fix CPU heisenbug — alias `seq_len` workaround for nullary-LHS codegen bug
-0b83f34 diagnose: cpu_bisect_{base,v_full,v_clone} — heisenbug trigger isolated
-```
+## Memory entries updated this session
+
+- `exhaust_studio_before_renting.md` — NEW. Strategic directive.
+- `honest_rebench_2026-05-10.md` — extended with 10-ckpt table + ensemble ceiling.
+- `MEMORY.md` — added the new exhaust-Studio entry near the top.
+
+---
+
+## What to NOT do next session
+
+- Don't rent a GPU rack until (1)+(3) prove compute scaling on Studio.
+- Don't bench against `rail_corpus_stdlib.txt` for V=93/96 ckpts (OOB → 0/30).
+- Don't try d=512 again without LR engineering FIRST. NaN at step 43 was real.
+- Don't quote pre-fix scores. The bug-inflation lesson is the load-bearing
+  one.
+- Don't lump multiple Studio levers in one experiment — change one thing
+  at a time so the scaling-law fit stays interpretable.
