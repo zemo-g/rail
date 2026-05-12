@@ -81,7 +81,57 @@ TESTS=(
 'error|1|main =\n  let e = error "oops"\n  let ok = is_error e\n  let bad = is_error 42\n  ok - bad'
 'char_to_int|65|main = char_to_int "A"'
 'parse_int|1134|main =\n  let a = parse_int "1234"\n  let b = parse_int "-100"\n  let _ = print (show (a + b))\n  0'
+# --- Extension: tests from run_tests t30-t72 not yet in the harness ---
+# Categorization (see classification table in commit message):
+#   portable        — uses only builtins already wired in x86_cg_bi*
+#   foreign-libc    — uses `foreign` and depends on Linux libc symbol resolution
+#   carry-through   — uses imports / stdlib paths that themselves stay portable
+'fileio|hello42|main =\n  let _ = write_file "/tmp/rail_test.txt" "hello42"\n  let s = read_file "/tmp/rail_test.txt"\n  let _ = print s\n  0'
+'shell_echo|hi|main =\n  let _ = print (head (split "\\n" (shell "echo hi")))\n  0'
+'integ|sum=9|cat2 parts = join "" parts\ndbl x = x * 2\nmain =\n  let xs = map dbl [3, 5, 7]\n  let (a, b) = (head xs, length xs)\n  let _ = print (cat2 ["sum=", show (a + b)])\n  0'
+'escape|{hello}|main =\n  let _ = print "\\{hello\\}"\n  0'
+'ffi_abs|5|foreign abs n\nmain =\n  let _ = print (show (abs (-5)))\n  0'
+'ffi_strlen|5|foreign strlen s\nmain =\n  let _ = print (show (strlen "hello"))\n  0'
+'ffi_getenv_root|/|foreign getenv s -> str\nmain =\n  let h = getenv "PWD"\n  let _ = print (str_sub h 0 1)\n  0'
+'arena|42|main =\n  let m = arena_mark 0\n  let _ = cons 1 [2, 3]\n  let _ = arena_reset m\n  42'
+'gpu_map_pass|1|main =\n  let r = gpu_map (\\x -> x * 3 + 1) (range 8)\n  let _ = print (show (head r))\n  0'
+'gpu_auto|1|main =\n  let r = map (\\x -> x * 2 + 1) (range 8)\n  let _ = print (show (head r))\n  0'
+# Diagnostic: stdlib string ops dispatched in x86_cg_bi2 but with no
+# corresponding _rail_* symbol in tools/x86_rt.s. Surfaces the gap.
+'str_find|1|main = str_find "b" "abc"'
+'str_contains|1|main = if str_contains "b" "abc" then 1 else 0'
+'str_sub|el|main =\n  let _ = print (str_sub "hello" 1 2)\n  0'
+'str_split|b|main =\n  let _ = print (head (tail (str_split ", " "a, b, c")))\n  0'
+'str_replace|hAllo|main =\n  let _ = print (str_replace "e" "A" "hello")\n  0'
 )
+
+# Phase 0: stage import targets for tests that use `import` / `import baremod`
+# t47 (import-path), t60 (qual_import), t71/t72 (bare_import[_as])
+mkdir -p "$STAGE/import_aux"
+printf "double x = x * 2\ntriple x = x * 3\n" > "$STAGE/import_aux/rail_importlib.rail"
+printf "double x = x * 2\n_private x = x\n" > "$STAGE/import_aux/rail_quallib.rail"
+# Bare imports look at: cwd, $(dirname $RAIL_BINARY)/stdlib/, ./stdlib/, ~/.rail/packages/
+# Harness cd's to repo root, so a baremod.rail in repo root resolves first.
+# Use a guard to avoid clobbering anything pre-existing.
+if [[ ! -e "baremod.rail" ]]; then
+  printf "square x = x * x\n" > baremod.rail
+  STAGED_BAREMOD=1
+fi
+trap '[[ ${STAGED_BAREMOD:-0} -eq 1 ]] && rm -f baremod.rail' EXIT
+
+# Tests with imports that need an aux file — emit pass uses the aux file by
+# absolute path so we don't pollute /tmp during parallel runs.
+IMP1="$STAGE/import_aux/rail_importlib.rail"
+IMP2="$STAGE/import_aux/rail_quallib.rail"
+IMPORT_TESTS=(
+  "import_path|45|import \"$IMP1\"\nmain = double 21 + triple 1"
+  "qual_import|42|import \"$IMP2\" as M\nmain = M_double 21"
+  "bare_import|49|import baremod\nmain = square 7"
+  "bare_import_as|36|import baremod as B\nmain = B_square 6"
+)
+for it in "${IMPORT_TESTS[@]}"; do
+  TESTS+=("$it")
+done
 
 # Phase 1: emit asm for every test
 EMITTED=()
