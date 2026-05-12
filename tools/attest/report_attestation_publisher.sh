@@ -10,6 +10,24 @@
 #   report_attestation_publisher.sh <report_id> <model_name> <weights_hash> \
 #                                   <prompt_file> <response_file> <generated_at> [client_id]
 #
+# Optional env (security-b, 2026-05-12):
+#   WEIGHTS_FILE  — path to the weights file the caller hashed at startup.
+#                   If set, the publisher re-hashes the file at sign-time and
+#                   aborts (exit 5) if the recomputed digest differs from
+#                   $WEIGHTS_HASH.  Closes the TOCTOU window between
+#                   startup-hash and sign-time (finding H6).  When unset,
+#                   trust $WEIGHTS_HASH as given (legacy callers).
+#
+# Format versions:
+#   v1 — inner_msg = report|v1|<id>|<model>|<weights>|<prompt>|<resp>|<gen_at>|<client>
+#        pulse_id NOT bound inside the digest — captured (digest, sig) is
+#        replayable against any future pulse.  Vulnerable.  Verifier still
+#        accepts v1 for already-issued manifests; publisher no longer emits v1.
+#   v2 — inner_msg = report|v2|<id>|<model>|<weights>|<prompt>|<resp>|<gen_at>|<client>|<pulse_id>
+#        Pulse_id is part of the digested+signed payload, so the (digest, sig)
+#        pair is bound to a single beacon pulse.  Replay across pulses is
+#        cryptographically detectable.  Publisher emits ONLY v2 going forward.
+#
 # Output:
 #   stdout: full manifest JSON (suitable for redirection to a file)
 #   stderr: one-line status
@@ -67,10 +85,35 @@ response_hash=$(shasum -a 256 "$RESPONSE_FILE" | awk '{print $1}')
 prompt_size=$(stat -f%z "$PROMPT_FILE" 2>/dev/null || stat -c%s "$PROMPT_FILE")
 response_size=$(stat -f%z "$RESPONSE_FILE" 2>/dev/null || stat -c%s "$RESPONSE_FILE")
 
+# 2a. Finding H6 — close the startup-hash → sign-time TOCTOU window. If the
+#     caller pointed us at the file via $WEIGHTS_FILE, re-hash it now and
+#     refuse to sign if the bytes on disk have changed since startup.  This
+#     prevents an attacker (or careless mv) from swapping in different weights
+#     after the caller computed $WEIGHTS_HASH but before this signer ran.
+if [ -n "${WEIGHTS_FILE:-}" ]; then
+    [ -f "$WEIGHTS_FILE" ] || { echo "weights file vanished: $WEIGHTS_FILE" >&2; exit 5; }
+    weights_hash_now=$(shasum -a 256 "$WEIGHTS_FILE" | awk '{print $1}')
+    case "$weights_hash_now" in *[!0-9a-fA-F]*|"")
+        echo "bad weights_hash_now computed locally" >&2; exit 5 ;;
+    esac
+    if [ "$weights_hash_now" != "$WEIGHTS_HASH" ]; then
+        echo "TOCTOU: weights file changed between startup-hash and sign-time" >&2
+        echo "  path:        $WEIGHTS_FILE" >&2
+        echo "  startup:     $WEIGHTS_HASH" >&2
+        echo "  sign-time:   $weights_hash_now" >&2
+        exit 5
+    fi
+else
+    echo "warn: WEIGHTS_FILE unset — trusting passed-in weights_hash without sign-time recheck (H6 mitigation skipped)" >&2
+fi
+
 # 3. Build the canonical inner message (what gets digested + signed).
 #    Format must be reproducible byte-for-byte by anything that wants to
 #    re-derive the digest from the manifest's individual fields.
-inner_msg="report|v1|${REPORT_ID}|${MODEL_NAME}|${WEIGHTS_HASH}|${prompt_hash}|${response_hash}|${GENERATED_AT}|${CLIENT_ID}"
+#    Finding H5 — bind pulse_id INSIDE the digest input (v2), not just at the
+#    witness layer.  Pre-fix (v1), capturing one (digest, sig) pair let an
+#    attacker re-witness it under a different pulse and pass verification.
+inner_msg="report|v2|${REPORT_ID}|${MODEL_NAME}|${WEIGHTS_HASH}|${prompt_hash}|${response_hash}|${GENERATED_AT}|${CLIENT_ID}|${pulse_id}"
 digest=$(printf '%s' "$inner_msg" | shasum -a 256 | awk '{print $1}')
 case "$digest" in *[!0-9a-fA-F]*|"") echo "bad digest computed locally" >&2; exit 5 ;; esac
 
@@ -116,7 +159,8 @@ if mini_json:
     witnesses.append(mini)
 out = {
     "kind": "ledatic.report.provenance",
-    "version": 1,
+    "version": 2,
+    "format_version": "v2",
     "report_id": report_id,
     "client_id": client_id,
     "generated_at": generated_at,
