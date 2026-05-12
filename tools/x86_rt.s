@@ -374,13 +374,18 @@ _rail_mod:
     ret
 
 # ── Comparison ───────────────────────────────────────────────────────────────
+# Mirror ARM64 _rail_eq (compile.rail:2622). Dispatch on the right operand's
+# tag bit. If right is tagged-int, raw-compare both sides — this handles the
+# `heap-ptr == 0` pattern (e.g., null_safe_eq test t103) without a SIGSEGV
+# in strcmp. If right is heap, fall through to type-aware compare:
+#   - either side raw zero  -> raw compare
+#   - left tagged-int but right heap -> mismatch (false)
+#   - both heap, tag==6      -> float compare
+#   - else                   -> strcmp (strings)
 .global _rail_eq
 _rail_eq:
     push rbp
     mov rbp, rsp
-    # Check if integer comparison
-    test rdi, 1
-    jz .Leq_heap
     test rsi, 1
     jz .Leq_heap
     cmp rdi, rsi
@@ -390,6 +395,18 @@ _rail_eq:
     pop rbp
     ret
 .Leq_heap:
+    test rsi, rsi
+    jz .Leq_raw_cmp
+    test rdi, rdi
+    jz .Leq_raw_cmp
+    test rdi, 1
+    jnz .Leq_mismatch
+    # Both heap. Check for float (tag 6) before falling through to strcmp.
+    mov rdx, [rsi]
+    mov r8, 0x7fffffffffffffff
+    and rdx, r8
+    cmp rdx, 6
+    je .Leq_float
     # String comparison
     sub rsp, 16
     call strcmp@PLT
@@ -400,13 +417,33 @@ _rail_eq:
     add rsp, 16
     pop rbp
     ret
+.Leq_raw_cmp:
+    cmp rdi, rsi
+    sete al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
+.Leq_mismatch:
+    mov rax, 1
+    pop rbp
+    ret
+.Leq_float:
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    sete al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
 
+# Mirror _rail_eq but negate the boolean result. Same null/type-mismatch
+# safety as eq — `heap-ptr != 0` no longer SIGSEGVs in strcmp.
 .global _rail_ne
 _rail_ne:
     push rbp
     mov rbp, rsp
-    test rdi, 1
-    jz .Lne_heap
     test rsi, 1
     jz .Lne_heap
     cmp rdi, rsi
@@ -416,6 +453,17 @@ _rail_ne:
     pop rbp
     ret
 .Lne_heap:
+    test rsi, rsi
+    jz .Lne_raw_cmp
+    test rdi, rdi
+    jz .Lne_raw_cmp
+    test rdi, 1
+    jnz .Lne_mismatch
+    mov rdx, [rsi]
+    mov r8, 0x7fffffffffffffff
+    and rdx, r8
+    cmp rdx, 6
+    je .Lne_float
     sub rsp, 16
     call strcmp@PLT
     test eax, eax
@@ -423,6 +471,26 @@ _rail_ne:
     movzx rax, al
     lea rax, [rax*2+1]
     add rsp, 16
+    pop rbp
+    ret
+.Lne_raw_cmp:
+    cmp rdi, rsi
+    setne al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
+.Lne_mismatch:
+    mov rax, 3
+    pop rbp
+    ret
+.Lne_float:
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setne al
+    movzx rax, al
+    lea rax, [rax*2+1]
     pop rbp
     ret
 
