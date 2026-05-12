@@ -10,12 +10,12 @@
 </p>
 
 <p align="center">
-  <a href="#install"><img src="https://img.shields.io/badge/tests-116%2F116-brightgreen" alt="tests 116/116"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/tests-140%2F140-brightgreen" alt="tests 140/140"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
   <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/C%20dependencies-0-brightgreen" alt="0 C dependencies"></a>
-  <a href="#releases"><img src="https://img.shields.io/badge/backends-4-orange" alt="4 backends"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/backends-6-orange" alt="6 backends"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL%201.1-green" alt="BSL 1.1"></a>
 </p>
 
@@ -29,12 +29,12 @@
 
 ---
 
-Rail compiles itself. The compiler — 4,687 lines of Rail — produces a 729 KB ARM64 binary that compiles the compiler again and reaches byte-identical fixed point. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. As of v3.0.0, the TLS 1.3 client is Rail too: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat.
+Rail compiles itself. The compiler — ~6,719 lines of Rail — produces a ~1.0 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. As of v3.0.0, the TLS 1.3 client is Rail too: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat.
 
 ```
-./rail_native self && cp /tmp/rail_self ./rail_native
-./rail_native self && cmp rail_native /tmp/rail_self  # byte-identical
-./rail_native test                                     # 116/116
+./rail_native self && cp /tmp/rail_self ./rail_native  # cycle 1
+./rail_native self && cmp rail_native /tmp/rail_self   # cycle 2 — byte-identical
+./rail_native test                                     # 140/140
 ```
 
 ## Quick start
@@ -45,15 +45,18 @@ cd rail
 ./rail_native run examples/hello.rail
 ```
 
-Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, and WASM backends are supported.
+Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, WebAssembly, Cortex-M4, and RISC-V rv32imc backends are supported.
 
 ```bash
 ./rail_native <file.rail>        # compile to /tmp/rail_out
 ./rail_native run <file.rail>    # compile + execute
-./rail_native test               # run the 116-test suite
-./rail_native self               # self-compile, fixed point
+./rail_native test               # run the 140-test suite
+./rail_native self               # self-compile, fixed point at gen2
 ./rail_native x86 <file.rail>    # cross-compile to Linux x86_64
 ./rail_native linux <file.rail>  # cross-compile to Linux ARM64
+./rail_native wasm <file.rail>   # compile to WebAssembly
+./rail_native cortexm <file.rail># compile to Cortex-M4 (Thumb-2)
+./rail_native riscv32 <file.rail># compile to RISC-V rv32imc
 ```
 
 ## What Rail does
@@ -61,12 +64,13 @@ Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, an
 ### 1. Compiles itself, byte-identical
 
 ```
-./rail_native self                    -- 4,687 lines of Rail →
-                                      --   a 729 KB ARM64 binary
-cp /tmp/rail_self ./rail_native
-./rail_native self                    -- that binary compiles the
-                                      --   compiler again
+./rail_native self                    -- ~6,719 lines of Rail →
+                                      --   a ~1.0 MB ARM64 binary
+cp /tmp/rail_self ./rail_native       -- cycle 1: install gen1
+./rail_native self                    -- cycle 2: that binary compiles
+                                      --   the compiler again (gen2)
 cmp rail_native /tmp/rail_self        -- and the output is identical
+                                      --   (byte-identical fixed point)
 ```
 
 The GC, allocator, and runtime support are ARM64 assembly embedded in the compiler itself. No `gcc`, no `libc`, no linker scripts — just `as` and `ld`.
@@ -109,7 +113,7 @@ The compiler is the fitness function. Programs that compile become training data
 - **Byte-identical self-compile.** `./rail_native self` produces output identical to the binary that produced it. The compiler's own source is the regression suite.
 - **The compiler is the source of truth.** Training loops, tests, site generation, HTTPS clients — they all get compiled by the same binary you cloned. If it compiles, it runs.
 - **Production surface is narrow and honest.** Rail v3.0.0 ships the crypto it uses (ChaCha20-Poly1305, x25519, SHA-256/384/512, ECDSA-P256/P384, RSA-PSS/PKCS1) and nothing more. Every primitive is NIST- or RFC-vector-validated.
-- **Four backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), Linux x86_64, and WASM — the same compiler cross-compiles to all of them.
+- **Six backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), Linux x86_64, WebAssembly, Cortex-M4 (Thumb-2), and RISC-V rv32imc — the same compiler cross-compiles to all of them.
 
 ## The language
 
