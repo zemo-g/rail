@@ -86,7 +86,7 @@ TESTS=(
 #   portable        — uses only builtins already wired in x86_cg_bi*
 #   foreign-libc    — uses `foreign` and depends on Linux libc symbol resolution
 #   carry-through   — uses imports / stdlib paths that themselves stay portable
-'fileio|hello42|main =\n  let _ = write_file "/tmp/rail_test.txt" "hello42"\n  let s = read_file "/tmp/rail_test.txt"\n  let _ = print s\n  0'
+'fileio|hello42|main =\n  let _ = write_file "/tmp/rail_x86conf_fileio.txt" "hello42"\n  let s = read_file "/tmp/rail_x86conf_fileio.txt"\n  let _ = print s\n  0'
 'shell_echo|hi|main =\n  let _ = print (head (split "\\n" (shell "echo hi")))\n  0'
 'integ|sum=9|cat2 parts = join "" parts\ndbl x = x * 2\nmain =\n  let xs = map dbl [3, 5, 7]\n  let (a, b) = (head xs, length xs)\n  let _ = print (cat2 ["sum=", show (a + b)])\n  0'
 'escape|{hello}|main =\n  let _ = print "\\{hello\\}"\n  0'
@@ -169,7 +169,7 @@ TESTS=(
 
 # t104, t106: float-array I/O + mixed int/float arithmetic
 # Expected: deferred-symbol:_rail_float_arr_* (multiple)
-'f32_io_roundtrip|-13|main =\n  let src = float_arr_new 3 0.0\n  let _ = float_arr_set src 0 1.5\n  let _ = float_arr_set src 1 (0.0 -. 3.25)\n  let _ = float_arr_set src 2 0.125\n  let _ = float_arr_to_f32_file "/tmp/rail_test_f32.bin" src 3\n  let dst = float_arr_new 3 0.0\n  let _ = float_arr_from_f32_file "/tmp/rail_test_f32.bin" dst 3\n  let s = float_arr_get dst 0 +. float_arr_get dst 1 +. float_arr_get dst 2\n  let _ = print (show (to_int (s *. 8.0)))\n  0'
+'f32_io_roundtrip|-13|main =\n  let src = float_arr_new 3 0.0\n  let _ = float_arr_set src 0 1.5\n  let _ = float_arr_set src 1 (0.0 -. 3.25)\n  let _ = float_arr_set src 2 0.125\n  let _ = float_arr_to_f32_file "/tmp/rail_x86conf_f32roundtrip.bin" src 3\n  let dst = float_arr_new 3 0.0\n  let _ = float_arr_from_f32_file "/tmp/rail_x86conf_f32roundtrip.bin" dst 3\n  let s = float_arr_get dst 0 +. float_arr_get dst 1 +. float_arr_get dst 2\n  let _ = print (show (to_int (s *. 8.0)))\n  0'
 'mixed_float_int_op|6|fill arr i =\n  if i >= 3 then 0\n  else\n    let _ = float_arr_set arr i (0.0 + (i + 1))\n    fill arr (i + 1)\nmain =\n  let a = float_arr_new 3 0.0\n  let _ = fill a 0\n  let s = float_arr_get a 0 + float_arr_get a 1 + float_arr_get a 2\n  to_int s'
 
 # t107: char_to_int on a runtime-extracted char
