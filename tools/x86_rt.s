@@ -1057,6 +1057,37 @@ _rail_args:
     leave
     ret
 
+# ── Mutable arrays ──────────────────────────────────────────────────────────
+# Layout matches ARM64: [tag=7 | length(untagged) | elem0 | elem1 | ...].
+# _rail_arr_new(size_tagged, init_tagged) -> ptr
+.global _rail_arr_new
+_rail_arr_new:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    sar rdi, 1               # untag size
+    mov [rbp-8], rdi         # save size (untagged)
+    mov [rbp-16], rsi        # save init (tagged)
+    lea rdi, [rdi*8+16]      # size*8 + 16 header
+    call _rail_alloc
+    mov [rbp-24], rax        # save buffer
+    mov qword ptr [rax], 7   # tag = 7
+    mov rcx, [rbp-8]
+    mov [rax+8], rcx         # length (untagged)
+    mov rsi, [rbp-16]        # init
+    xor rcx, rcx             # i = 0
+.Larn_loop:
+    cmp rcx, [rbp-8]
+    jae .Larn_done
+    lea rdx, [rcx+2]
+    mov [rax+rdx*8], rsi     # arr[(i+2)*8] = init
+    inc rcx
+    jmp .Larn_loop
+.Larn_done:
+    mov rax, [rbp-24]
+    leave
+    ret
+
 # ── GC stub (no-op for now) ─────────────────────────────────────────────────
 .global _rail_gc
 _rail_gc:
