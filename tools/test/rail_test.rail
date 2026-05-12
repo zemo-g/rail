@@ -1,0 +1,193 @@
+-- tools/test/rail_test.rail — Rail test runner v0
+--
+-- Usage:
+--   ./rail_native run tools/test/rail_test.rail <dir> [--timeout=SECS]
+--
+-- Discovers every file matching test_*.rail (recursively) under <dir>.
+-- For each test file:
+--   - runs ./rail_native run <file> with a wall-clock timeout (default 30s)
+--   - captures stdout, stderr, exit code
+--   - PASS iff exit_code == 0 AND last non-empty line of stdout == "PASS"
+--     (both required — rail_native had a silent exit-0 bug once;
+--      we rely on the textual sentinel as a second signal.)
+--
+-- Final line: "N passed, M failed (T seconds)"
+-- Exit code 0 iff all tests passed.
+
+import "stdlib/list.rail"
+import "stdlib/string.rail"
+
+-- ---------- local helpers ----------
+-- `trim` and `str_to_int` are not exposed as compiler builtins (compile.rail
+-- defines its own private versions). We need our own here.
+
+is_ws c = c == " " || c == "\t" || c == "\n" || c == "\r"
+
+trim s =
+  let cs = chars s
+  let cs1 = drop_ws_left cs
+  let cs2 = reverse (drop_ws_left (reverse cs1))
+  from_chars cs2
+
+drop_ws_left cs =
+  if length cs == 0 then cs
+  else if is_ws (head cs) then drop_ws_left (tail cs)
+  else cs
+
+char_to_digit c =
+  if c == "0" then 0
+  else if c == "1" then 1
+  else if c == "2" then 2
+  else if c == "3" then 3
+  else if c == "4" then 4
+  else if c == "5" then 5
+  else if c == "6" then 6
+  else if c == "7" then 7
+  else if c == "8" then 8
+  else if c == "9" then 9
+  else 0
+
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else parse_int_acc (tail cs) (acc * 10 + char_to_digit (head cs))
+
+parse_int s =
+  let cs = chars (trim s)
+  if length cs == 0 then 0
+  else if head cs == "-" then 0 - parse_int_acc (tail cs) 0
+  else parse_int_acc cs 0
+
+-- ---------- argv parsing ----------
+-- argv[0] is the rail_out binary; argv[1] is the dir; subsequent are flags.
+
+dir_arg argv =
+  let rest = tail argv
+  if length rest == 0 then "."
+  else
+    -- First non-flag positional
+    pick_dir rest
+
+pick_dir xs =
+  if length xs == 0 then "."
+  else
+    let h = head xs
+    if starts_with "--" h then pick_dir (tail xs)
+    else h
+
+timeout_arg argv = timeout_arg_acc (tail argv)
+
+timeout_arg_acc xs =
+  if length xs == 0 then 30
+  else
+    let h = head xs
+    if starts_with "--timeout=" h then
+      let n = str_sub h 10 (length h - 10)
+      parse_int n
+    else timeout_arg_acc (tail xs)
+
+-- ---------- file discovery ----------
+-- Use `find` to recursively list test_*.rail. Strip blank lines.
+
+discover_tests dir =
+  let cmd = cat ["find ", dir, " -type f -name 'test_*.rail' 2>/dev/null | sort"]
+  let out = shell cmd
+  filter_nonempty (split "\n" out)
+
+filter_nonempty xs =
+  if length xs == 0 then []
+  else
+    let h = head xs
+    if length (trim h) == 0 then filter_nonempty (tail xs)
+    else cons h (filter_nonempty (tail xs))
+
+-- ---------- single-test execution ----------
+-- Two-step so we get a REAL exit code (./rail_native run swallows it):
+--   1. Compile to a per-test binary path so parallel calls don't trample
+--      /tmp/rail_out.  Compile errors are caught here as ec != 0.
+--   2. Run the binary under a perl-based timeout (BSD has no `timeout`).
+-- Captures: stdout -> /tmp/rail_test_out.txt, stderr -> /tmp/rail_test_err.txt,
+-- exit code -> stdout of the wrapper.
+
+run_one file timeout_s =
+  let stdout_path = "/tmp/rail_test_out.txt"
+  let stderr_path = "/tmp/rail_test_err.txt"
+  let bin_path = "/tmp/rail_test_bin"
+  let compile_log = "/tmp/rail_test_compile.log"
+  let _ = shell (cat ["rm -f ", stdout_path, " ", stderr_path, " ", bin_path, " ", compile_log])
+  -- Step 1: compile (./rail_native produces /tmp/rail_out, no flag to redirect).
+  let compile_ec_s = trim (shell (cat [
+    "./rail_native ", file, " > ", compile_log, " 2>&1; echo $?"]))
+  let compile_ec = parse_int compile_ec_s
+  if compile_ec != 0 then (compile_ec, cat ["[COMPILE FAILED]\n", shell (cat ["cat ", compile_log])])
+  else
+    let _ = shell (cat ["cp /tmp/rail_out ", bin_path])
+    -- Step 2: run with perl-based wall-clock timeout.
+    let perl_prog = cat [
+      "perl -e '",
+      "my $pid = fork(); if ($pid == 0) { exec(@ARGV) or exit 127; } ",
+      "$SIG{ALRM} = sub { kill 9, $pid; waitpid($pid, 0); exit 124; }; ",
+      "alarm(", show timeout_s, "); waitpid($pid, 0); exit($? >> 8);' ",
+      bin_path,
+      " > ", stdout_path, " 2> ", stderr_path,
+      "; echo $?"
+    ]
+    let ec_str = trim (shell perl_prog)
+    let ec = parse_int ec_str
+    let so = shell (cat ["cat ", stdout_path])
+    (ec, so)
+
+-- ---------- pass/fail decision ----------
+-- PASS iff exit_code == 0 AND last non-empty line of stdout is "PASS".
+
+last_nonempty_line s =
+  let lines = split "\n" s
+  last_nonempty_acc lines ""
+
+last_nonempty_acc xs cur =
+  if length xs == 0 then cur
+  else
+    let h = trim (head xs)
+    if length h == 0 then last_nonempty_acc (tail xs) cur
+    else last_nonempty_acc (tail xs) h
+
+decide ec stdout_text =
+  if ec == 124 then ("TIMEOUT", false)
+  else if ec != 0 then (cat ["FAIL exit=", show ec], false)
+  else
+    let last = last_nonempty_line stdout_text
+    if last == "PASS" then ("PASS", true)
+    else (cat ["FAIL no-PASS-line (last='", last, "')"], false)
+
+-- ---------- per-file driver ----------
+
+run_files files timeout_s passed failed =
+  if length files == 0 then (passed, failed)
+  else
+    let f = head files
+    let (ec, so) = run_one f timeout_s
+    let (label, ok) = decide ec so
+    let _ = print (cat ["  ", label, "  ", f])
+    if ok then run_files (tail files) timeout_s (passed + 1) failed
+    else run_files (tail files) timeout_s passed (failed + 1)
+
+-- ---------- main ----------
+
+main =
+  let dir = dir_arg args
+  let timeout_s = timeout_arg args
+  let _ = print (cat ["rail_test v0  dir=", dir, "  timeout=", show timeout_s, "s"])
+
+  let t0 = shell "date +%s"
+  let t0i = parse_int (trim t0)
+
+  let files = discover_tests dir
+  let _ = print (cat ["discovered ", show (length files), " test files"])
+
+  let (passed, failed) = run_files files timeout_s 0 0
+
+  let t1 = shell "date +%s"
+  let t1i = parse_int (trim t1)
+  let dt = t1i - t0i
+
+  let _ = print (cat [show passed, " passed, ", show failed, " failed (", show dt, " seconds)"])
+  if failed == 0 then 0 else 1
