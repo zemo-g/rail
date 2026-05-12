@@ -28,3 +28,7 @@ Per the "honest backlog" discipline, here is what didn't make v0 and why.
 - That every stdlib function listed in `stdlib.md` is robust or documented well. Many have empty docstrings — that's the actual source state, not a generator bug.
 - That every example is the "best" version of its concept. They are the existing programs under `examples/` that compile and run. Some teach Rail well; others are smoke tests that happen to live there.
 - That the doc site is deployed anywhere. v0 explicitly builds local files only; deploy is a separate task gated on review of these files.
+
+## v0+1: auto-deploy shipped 2026-05-12
+
+The site at https://ledatic.org/rail/docs/ is now auto-deployed by a post-receive hook on Mini's bare rail repo: changes under `docs/site/` pushed to the `next` branch rebuild HTML and upload to Cloudflare KV without manual intervention. See `notes/auto_deploy_hook.md` for the topology, allowlist, and rollback path.
