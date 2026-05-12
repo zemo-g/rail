@@ -291,12 +291,21 @@ done
 
 # Phase 2: single docker invocation to assemble+link+run everything
 # We mount $STAGE so the container can see asm/ and write out/.
+# The tensor.rail stdlib declares ~33 `foreign tgl_*` symbols backed by the
+# Mac-only libtensor_gpu.dylib. On Linux we ship a no-op CPU-fallback stub
+# (tools/metal/libtensor_gpu_linux_stub.c) so the link resolves; the runtime
+# never enters the GPU path because `gpu_available` shells out to a Mac path.
+cp tools/metal/libtensor_gpu_linux_stub.c "$STAGE/libtensor_gpu_linux_stub.c"
 cat > "$STAGE/runner.sh" <<'EOF'
 #!/bin/sh
 cd /stage
+# Build the tensor-GPU stub once; link every test against it.
+gcc -shared -fPIC -O0 -o libtensor_gpu.so libtensor_gpu_linux_stub.c \
+    2> out/_stub.build.log || { echo "STUB-BUILD-FAIL"; cat out/_stub.build.log; exit 2; }
 for s in asm/*.s; do
   name=$(basename "$s" .s)
-  if gcc -no-pie -o "/tmp/$name.bin" "$s" 2> "out/$name.link.log"; then
+  if gcc -no-pie -o "/tmp/$name.bin" "$s" \
+         -L/stage -ltensor_gpu -Wl,-rpath,/stage -lm 2> "out/$name.link.log"; then
     actual=$(/tmp/$name.bin 2>&1)
     ec=$?
     printf "%s\n--EXIT--\n%s\n" "$actual" "$ec" > "out/$name.run.log"
