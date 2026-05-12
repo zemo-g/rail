@@ -1353,3 +1353,124 @@ _rail_str_split:
     call _rail_reverse
     leave
     ret
+
+# === Bit ops (Agent A - feat/a-bitop-runtime-v0) ============================
+#
+# Symbols expected by the x86 codegen fall-through path
+# (compile.rail:x86_cg_bi3 default branch emits `call _<fname>`):
+#   _bit_and  _bit_or  _bit_xor  _shl  _shr  _rotl
+#
+# ABI: System V AMD64 — args in rdi (a), rsi (b), return in rax.
+# All operands are tagged ints: low bit = 1, value = (raw << 1) | 1.
+# Re-tag via `lea rax, [rax*2+1]` after the bare op on raw bits.
+#
+# Mirrors compile.rail's ARM64 inline emit (`asr x0, x0, #1` strip-tag ->
+# native op -> `lsl x0, x0, #1; orr x0, x0, #1` re-tag).
+#
+# Crypto callers (stdlib/sha256.rail and friends) define `and32 a b =
+# bit_and (bit_and a b) 4294967295` patterns, so 32-bit semantics emerge
+# from the caller; these runtime helpers operate on the full 63-bit
+# Rail int width.
+
+.global _bit_and
+_bit_and:
+    sar rdi, 1
+    sar rsi, 1
+    and rdi, rsi
+    lea rax, [rdi*2+1]
+    ret
+
+.global _bit_or
+_bit_or:
+    sar rdi, 1
+    sar rsi, 1
+    or rdi, rsi
+    lea rax, [rdi*2+1]
+    ret
+
+.global _bit_xor
+_bit_xor:
+    sar rdi, 1
+    sar rsi, 1
+    xor rdi, rsi
+    lea rax, [rdi*2+1]
+    ret
+
+# shl x n : x << n. x86 `shl` requires count in cl when count is a
+# register. Mirror ARM64 inline (undefined for n>=64; crypto callers
+# know n statically and stay in-range).
+.global _shl
+_shl:
+    sar rdi, 1
+    sar rsi, 1
+    mov rcx, rsi
+    shl rdi, cl
+    lea rax, [rdi*2+1]
+    ret
+
+# shr x n : logical right shift. Sign-extend would change SHA-256 etc.;
+# match ARM64 semantics which use `lsr` (zero-fill).
+.global _shr
+_shr:
+    sar rdi, 1
+    sar rsi, 1
+    mov rcx, rsi
+    shr rdi, cl
+    lea rax, [rdi*2+1]
+    ret
+
+# rotl x n : rotate left by n bits, 64-bit width. x86 `rol` takes count
+# in cl. Note this rotates the full 63-bit value; 32-bit ChaCha20-style
+# rotates require the caller to mask with 0xFFFFFFFF afterwards, same
+# as on ARM64.
+.global _rotl
+_rotl:
+    sar rdi, 1
+    sar rsi, 1
+    mov rcx, rsi
+    rol rdi, cl
+    lea rax, [rdi*2+1]
+    ret
+
+# char_from_int(c_tagged) -> raw C string of 2 bytes [c, NUL]. Inverse of
+# char_to_int. ARM64 wraps with `_rail_wrap_str` (header [9,len,bytes]); x86
+# strings are raw C strings (see compile.rail:5564), so we just malloc 2,
+# write the char + null terminator, return the pointer. Untagged return
+# matches the rest of x86's string ABI.
+#
+# Required by stdlib/sha256.rail's `hex_char_of` helper, which gates the
+# entire sha256/hmac/hkdf/chacha20/poly1305/aead/x25519 cascade.
+.global _char_from_int
+_char_from_int:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1               # untag char value
+    mov [rbp-8], rdi         # save char byte
+    mov rdi, 2
+    call malloc@PLT
+    mov rcx, [rbp-8]
+    mov byte ptr [rax], cl   # byte 0 = char
+    mov byte ptr [rax+1], 0  # byte 1 = NUL
+    leave
+    ret
+
+# byte_at(str_ptr, i_tagged) -> tagged int byte value. Raw C string indexed.
+# Mirrors ARM64 compile.rail:1128 inline. Needed by stdlib byte-buffer code
+# (HMAC key/message expansion, AEAD nonce construction).
+.global _byte_at
+_byte_at:
+    sar rsi, 1               # untag index
+    movzx rax, byte ptr [rdi+rsi]
+    lea rax, [rax*2+1]       # tag the byte value
+    ret
+
+# byte_set(str_ptr, i_tagged, v_tagged) -> ignored (returns tagged 1).
+# ARM64 returns x0=#3 (boolean true) at compile.rail:1133. Mirror that.
+.global _byte_set
+_byte_set:
+    sar rsi, 1               # untag index
+    sar rdx, 1               # untag value
+    mov byte ptr [rdi+rsi], dl
+    mov rax, 3               # tagged true
+    ret
