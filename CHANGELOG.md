@@ -2,6 +2,38 @@
 
 All notable changes to Rail are documented here.
 
+## Unreleased — post-renovate (2026-05-12 → 2026-05-13)
+
+Tightening pass after v3.7.0. Six parallel agents shipped backend, harness,
+and ops work; the test floor moved up.
+
+- **ARM64 test floor: 137 → 140.** Added `t132` (3-movk integer literal),
+  `t133` (4-movk literal), `t134` (4-movk negative variant) to lock down
+  the wide-integer literal codegen rewrite of `emit_load_int` at
+  `compile.rail:829`. The fix emits `movz` + up to 3 `movk` chunks (bits
+  0-15, 16-31, 32-47, 48-63) with zero chunks at ≥#32 skipped, plus a
+  symmetric `movn` + `movk` path for negatives. `k16`/`k32`/`k48`
+  computed via `shl 1 N` so constant-folding doesn't bake 64-bit
+  literals the seed can't emit. Branch `feat/c-3-movk-literals`,
+  commit `872424b`. 140/140 with byte-identical 2-cycle bootstrap.
+- **x86_64 conformance: 55/60 → 71/79.** Harness extended from 60 to 79
+  representative tests; gaps classified. 8 remaining failures are 3
+  ELF-prefix `_<name>` ffi-libc tests and 5 missing str-runtime
+  symbols. See `tools/test/x86_conformance.sh` and memory entry
+  `x86_backend_status` for the full taxonomy.
+- **Docs auto-deploy.** Mini's bare `~/git/rail.git` repo got a
+  post-receive hook that diff-gates on `docs/site/` and rebuilds +
+  uploads `rail/docs/*.html` to Cloudflare KV. Pushes to the
+  allowlisted `next` branch land at https://ledatic.org/rail/docs/
+  without manual intervention. See `notes/auto_deploy_hook.md` for
+  the topology, allowlist, and rollback path.
+- **Bootstrap convergence audit.** The claim "bootstrap doesn't
+  converge" was falsified: the bootstrap is a 2-cycle limit cycle.
+  gen0's shipped runtime asm doesn't necessarily match what gen0's
+  source emits, so cycle 1 typically differs. gen2 always lands the
+  byte-identical fixed point (gen2 == gen3 == gen4 verified). See
+  `notes/bootstrap_convergence_audit_2026-05-13.md`.
+
 ## v3.7.0 — 2026-04-30 — Float-TCO root fix, mixed-precision inference, parallel rerank
 
 Substantial substrate work. Seven commits, three real bugs (one fixed at
