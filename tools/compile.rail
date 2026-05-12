@@ -5423,11 +5423,21 @@ x86_get_opc_inline op lc =
   else if op == "||" then "    or rax, rcx\n"
   else "    ; unknown op\n"
 
-x86_save_params params idx =
+-- Args 0-5 arrive in rdi/rsi/rdx/rcx/r8/r9 (System V AMD64). Args 6+ are
+-- passed on the caller's stack at [rbp+frame_size+16 + (idx-6)*8] (above the
+-- saved rbp + saved RIP). Without this load, args 7+ silently take whatever
+-- rax happened to hold at function entry — surfaced 2026-05-15 by the hkdf
+-- and x25519 SIGSEGV bisect (hkdf_expand_loop has 9 args).
+x86_save_params params idx fs =
   if length params == 0 then ""
   else
     let off = 16 + idx * 8
-    cat ["    mov [rbp+", show off, "], ", x86_arg_reg idx, "\n", x86_save_params (tail params) (idx + 1)]
+    let stmt = if idx >= 6 then
+      let src = fs + 16 + (idx - 6) * 16
+      cat ["    mov rax, [rbp+", show src, "]\n    mov [rbp+", show off, "], rax\n"]
+    else
+      cat ["    mov [rbp+", show off, "], ", x86_arg_reg idx, "\n"]
+    cat [stmt, x86_save_params (tail params) (idx + 1) fs]
 
 x86_save_params_reg params idx =
   if length params == 0 then ""
@@ -5446,6 +5456,36 @@ x86_cg_push_args args env ar lc sl fs =
 x86_cg_pop_regs n i =
   if i >= n then ""
   else cat ["    mov ", x86_arg_reg (n - 1 - i), ", [rsp]\n    add rsp, 16\n", x86_cg_pop_regs n (i + 1)]
+
+-- Load args 0..min(n-1,5) from their push-slots into x86 SysV arg registers
+-- via direct addressing. Push-slot for arg i is at [rsp + 16*(n-1-i)] (last
+-- push is at top of stack).
+x86_load_arg_regs n i =
+  let nreg = if n < 6 then n else 6
+  if i >= nreg then ""
+  else
+    let off = (n - 1 - i) * 16
+    cat ["    mov ", x86_arg_reg i, ", [rsp+", show off, "]\n", x86_load_arg_regs n (i + 1)]
+
+-- For args 6..n-1 (the SysV stack args), move from push-slot to upper slots
+-- so that after `add rsp, 96` they land at [rsp+0..(n-7)*16] in correct order.
+x86_move_stack_args_up n i =
+  if i >= n then ""
+  else
+    let src = (n - 1 - i) * 16
+    let dst = 96 + (i - 6) * 16
+    cat ["    mov rax, [rsp+", show src, "]\n    mov [rsp+", show dst, "], rax\n", x86_move_stack_args_up n (i + 1)]
+
+-- For TCO with >6 args (self-recursion): write new args 7+ to the CALLER's
+-- own stack-arg slots so they survive `add rsp, fs; pop rbp; jmp`. The new
+-- callee will then read them at the same relative offset from its rbp.
+-- `fs` is the string-form frame_size (the assembler computes fs+local at link).
+x86_move_stack_args_tco n i fs =
+  if i >= n then ""
+  else
+    let src = (n - 1 - i) * 16
+    let dst_local = 16 + (i - 6) * 16
+    cat ["    mov rax, [rsp+", show src, "]\n    mov [rbp+", fs, "+", show dst_local, "], rax\n", x86_move_stack_args_tco n (i + 1) fs]
 
 -- Conditional-untag args in System V int-arg registers before a foreign call.
 -- ARM64 mirror is `untag_args` (compile.rail:1711). Tag bit (LSB=1) marks an
@@ -5721,7 +5761,17 @@ x86_cg_bi3 fname args env ar lc sl tp fs =
     else
       let (pa, lc1, sl1) = x86_cg_push_args args env ar lc sl fs
       let rr = x86_reg_restore env
-      let call = if tp then cat [rr, x86_cg_pop_regs (length args) 0, "    add rsp, ", fs, "\n    pop rbp\n    jmp _", fname, "\n"] else cat [x86_cg_pop_regs (length args) 0, "    call _", fname, "\n"]
+      let nargs = length args
+      let load = x86_load_arg_regs nargs 0
+      let has_stack = nargs > 6
+      let release_amt = if has_stack then "96" else show (nargs * 16)
+      let move_up = if has_stack then x86_move_stack_args_up nargs 6 else ""
+      let cleanup = if has_stack then cat ["    add rsp, ", show ((nargs - 6) * 16), "\n"] else ""
+      let tco_writeback = if has_stack then x86_move_stack_args_tco nargs 6 fs else ""
+      let call = if tp then
+        cat [rr, load, tco_writeback, "    add rsp, ", show (nargs * 16), "\n    add rsp, ", fs, "\n    pop rbp\n    jmp _", fname, "\n"]
+      else
+        cat [load, move_up, "    add rsp, ", release_amt, "\n    call _", fname, "\n", cleanup]
       (cat [pa, call], lc1, sl1)
 
 -- x86_64 MAIN CODEGEN
@@ -5899,7 +5949,7 @@ x86_cg2 node env ar lc sl tg tp fs =
     let lam_frame_size = ((lam_raw_fs + 15) / 16) * 16
     let lam_fs = show lam_frame_size
     let (basm, lc1, _) = x86_cg inner_body lam_env ar (lc + 1) lam_first_sl true lam_fs
-    let fasm = cat ["    jmp ", albl, "\n", flbl, ":\n    push rbp\n    sub rsp, ", lam_fs, "\n    mov rbp, rsp\n", x86_save_params all_ps 0, basm, "    add rsp, ", lam_fs, "\n    pop rbp\n    ret\n", albl, ":\n"]
+    let fasm = cat ["    jmp ", albl, "\n", flbl, ":\n    push rbp\n    sub rsp, ", lam_fs, "\n    mov rbp, rsp\n", x86_save_params all_ps 0 lam_frame_size, basm, "    add rsp, ", lam_fs, "\n    pop rbp\n    ret\n", albl, ":\n"]
     let pcaps = x86_push_captured caps env
     let casm = cat [pcaps, "    mov rdi, ", show (24 + ncap * 8), "\n    call _rail_alloc\n    mov qword ptr [rax], 4\n    lea rcx, [rip+", flbl, "]\n    mov [rax+8], rcx\n    mov qword ptr [rax+16], ", show ncap, "\n", x86_pop_to_closure ncap 0]
     (cat [fasm, casm], lc1, sl)
@@ -5963,7 +6013,6 @@ x86_compile_func d ar lc =
   let save_args = if nm == "main" then cat ["    lea r10, [rip+_rail_argc]\n    lea rax, [rdi*2+1]\n    mov [r10], rax\n    lea r10, [rip+_rail_argv]\n    mov [r10], rsi\n"] else ""
   let use_regs = nm != "main" && length ps >= 1 && length ps <= 3 && all_params_int ps bd
   let nregs = if use_regs then length ps else 0
-  let sv = if use_regs then x86_save_params_reg ps 0 else x86_save_params ps 0
   let env = if use_regs then mk_env_reg ps 16 0 else mk_env ps 16
   let env = if length ps <= 3 then mark_int_params ps bd env else env
   let env = cons ("__nregs", nregs) env
@@ -5973,6 +6022,7 @@ x86_compile_func d ar lc =
   let raw_fs = if final_sl < 48 then 48 else final_sl
   let frame_size = ((raw_fs + 15) / 16) * 16
   let fs = show frame_size
+  let sv = if use_regs then x86_save_params_reg ps 0 else x86_save_params ps 0 frame_size
   let base_int = if head bd == "?" then is_int (head (tail (tail bd))) env else false
   let env = if base_int then cons (cat ["__rt_", nm], 1) env else env
   let (body_asm, lc1, _) = x86_cg bd env ar lc first_sl is_tp fs
