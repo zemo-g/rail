@@ -1322,6 +1322,44 @@ import "stdlib/<name>.rail"
 
 
 
+## `stdlib/concurrent.rail`
+
+### `rc_chan_make capacity`
+
+> Create a bounded blocking channel with `capacity` slots.
+
+### `rc_chan_send ch value`
+
+> Send a value; blocks if the channel is full. Returns 1 ok / 0 closed.
+
+### `rc_chan_recv ch`
+
+> Receive a value; blocks if the channel is empty.
+
+### `rc_chan_close ch`
+
+> Close a channel; wakes all blocked threads.
+
+### `rc_chan_count ch`
+
+> Current buffered count.
+
+### `rc_spawn_producer ch n`
+
+> Spawn a demo producer that sends 1..n then closes the channel. Returns
+> a task handle for rc_join.
+
+### `rc_spawn_consumer ch`
+
+> Spawn a demo consumer that drains the channel, summing recvd values.
+> The sum is returned by rc_join.
+
+### `rc_join task_id`
+
+> Join a task handle; blocks until the thread exits. Returns the int64
+> result the worker stored on exit.
+
+
 ## `stdlib/cortexm_runtime.rail`
 
 ### `cm_emit_halt s halt_label`
