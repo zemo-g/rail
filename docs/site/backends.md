@@ -6,7 +6,7 @@ One Rail compiler, six targets. All driven from the same `rail_native` binary.
 |---|---|---|---|---|
 | macOS ARM64 (Mach-O) | _(default)_ / `run` | `/tmp/rail_out` | none (host `as`+`ld`) | runs end-to-end |
 | Linux ARM64 (ELF) | `linux` | `/tmp/rail_linux` | `aarch64-elf-as`, `aarch64-elf-ld` | needs cross-binutils |
-| Linux x86_64 (ELF, source-only) | `x86` | `/tmp/rail_x86.s` | remote `gcc` | emits `.s`, build on target |
+| Linux x86_64 (ELF, source-only) | `x86` | `/tmp/rail_x86.s` | remote `gcc` (or Docker `linux/amd64`) | emits `.s`, 71/79 conformance via Docker harness |
 | WebAssembly | `wasm` | `/tmp/rail_out.wasm` | `wat2wasm` (wabt) | compiles end-to-end |
 | Cortex-M4 (Thumb-2 ELF) | `cortexm` | `/tmp/rail_m4.elf` | `clang --target=thumbv7em-none-eabi` | compiles end-to-end |
 | RISC-V rv32imc (ELF) | `riscv32` | `/tmp/rail_rv32.elf` | `clang --target=riscv32-unknown-none-elf` | compiles end-to-end |
@@ -69,7 +69,9 @@ Compiling examples/hello.rail (244 chars)...
   Try: scp /tmp/rail_x86.s <user>@<host>:~ && ssh <user>@<host> 'gcc -o rail_x86 rail_x86.s && ./rail_x86'
 ```
 
-Rail emits the GAS assembly directly; assemble on the target with `gcc -o prog /tmp/rail_x86.s`. This is intentional — the x86_64 backend was bootstrapped for the Razer WSL test fleet rather than for cross-tools-on-mac.
+Rail emits the GAS assembly directly; assemble on the target with `gcc -o prog /tmp/rail_x86.s`. This is intentional — the x86_64 backend was bootstrapped for the Razer WSL test fleet rather than for cross-tools-on-mac. The x86 runtime asm lives at `tools/x86_rt.s`.
+
+**Conformance:** `bash tools/test/x86_conformance.sh` (requires Docker + `linux/amd64` image, e.g., Colima/Rosetta) currently passes **71/79** representative tests covering ints, strings, lists, ADTs, closures, floats, FFI, TCO, and arena ops. The 8 remaining failures are 3 ELF-prefix ffi-libc tests and 5 missing str-runtime symbols, all classified in `~/.claude/projects/-Users-user/memory/x86_backend_status.md`.
 
 ## WebAssembly
 

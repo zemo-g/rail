@@ -8,11 +8,14 @@ Rail is a real project with a narrow but honest feature set. Contributions are w
 git clone https://github.com/zemo-g/rail
 cd rail
 
-./rail_native test       # 116/116 core tests
+./rail_native test       # 140/140 core tests
 ./rail_native self       # self-compile → /tmp/rail_self
-cmp rail_native /tmp/rail_self
-# ↑ should be silent; the output is byte-identical to the binary
-#   that produced it. This is the "fixed-point" property.
+./rail_native self && cmp rail_native /tmp/rail_self
+# ↑ may print a one-byte-or-more difference on a clean tree; that is
+#   expected — the shipped seed differs from its own emit by one
+#   bootstrap cycle. Run `cp /tmp/rail_self rail_native` once and
+#   repeat, and the second cmp will be silent (fixed point at gen2).
+#   See notes/bootstrap_convergence_audit_2026-05-13.md.
 ```
 
 If any of those three fails on `master`, that's a bug — please open an issue.
@@ -27,7 +30,7 @@ Linux ARM64 and Linux x86_64 work as cross-compile targets; WASM too. See `./rai
 
 ## The bar for a compiler patch
 
-The compiler is `tools/compile.rail` (~4,687 lines of Rail). It compiles itself. Every change goes through this loop:
+The compiler is `tools/compile.rail` (~6,719 lines of Rail). It compiles itself. Every change goes through this loop:
 
 ```bash
 # 1. Edit tools/compile.rail.
@@ -39,14 +42,15 @@ The compiler is `tools/compile.rail` (~4,687 lines of Rail). It compiles itself.
 cp /tmp/rail_self ./rail_native
 
 # 4. Verify the test suite still passes.
-./rail_native test                        # must be 116/116
+./rail_native test                        # must be 140/140
 
-# 5. Verify the fixed-point property.
+# 5. Verify the fixed-point property (≥2 cycles).
+./rail_native self && cp /tmp/rail_self ./rail_native
 ./rail_native self
 cmp rail_native /tmp/rail_self            # must be silent
 ```
 
-Step 5 is the hard part. If the new binary doesn't produce byte-identical output on the second pass, iterate (`cp /tmp/rail_self rail_native && ./rail_native self`) until it does. One or two extra passes is normal; three or more means something in the codegen is non-deterministic and wants investigation.
+Step 5 is the hard part. The bootstrap is a 2-cycle limit cycle: gen0's shipped runtime asm does not necessarily match what gen0's source emits, so cycle 1 typically produces a different binary. Cycle 2 always lands the byte-identical fixed point (gen2 == gen3 == gen4). If `cmp` is silent after running `self` twice in a row from an already-installed binary, you have converged. If cycle 3 still differs from cycle 2, something in your codegen is non-deterministic and wants investigation. See [`notes/bootstrap_convergence_audit_2026-05-13.md`](notes/bootstrap_convergence_audit_2026-05-13.md) for the falsification of the "doesn't converge" claim.
 
 If you change the runtime — `rt_core`, `rt_list`, `rt_string`, the GC embedded in `compile.rail` — the old binary generates the old runtime. You have to bootstrap twice: compile, install, compile again with the new binary.
 
