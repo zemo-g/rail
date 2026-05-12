@@ -69,10 +69,10 @@ Ten lines including the comment. Functions are `name args = body`. `main` is the
 
 ```
 ... (long test log) ...
-133/137 tests passed
+140/140 tests passed
 ```
 
-The test suite covers parser, codegen, type inference, the runtime allocator, and the standard library. The count fluctuates a little if concurrent sessions race on `/tmp/rail_out`. 137 is the canonical green count — re-run if you see a lower number.
+The test suite covers parser, codegen, type inference, the runtime allocator, and the standard library. The count fluctuates a little if concurrent sessions race on `/tmp/rail_out`. 140 is the canonical green count — re-run if you see a lower number.
 
 ## 5. Self-compile
 
@@ -80,9 +80,11 @@ The test suite covers parser, codegen, type inference, the runtime allocator, an
 ./rail_native self
 ```
 
-The compiler compiles itself to `/tmp/rail_self`. Verify it's byte-identical to the seed:
+The compiler compiles itself to `/tmp/rail_self`. On a clean checkout the first cycle may differ — the seed's shipped runtime asm doesn't always match what its own source emits. Install gen1 and re-run to confirm convergence at gen2:
 
 ```bash
+cp /tmp/rail_self ./rail_native
+./rail_native self
 cmp rail_native /tmp/rail_self && echo "byte-identical"
 ```
 
@@ -90,7 +92,7 @@ cmp rail_native /tmp/rail_self && echo "byte-identical"
 byte-identical
 ```
 
-This is the fixed-point property: the compiler's output is its own input. If you change `tools/compile.rail`, two cycles of self-compile suffice to reach a new fixed point.
+This is the fixed-point property: the compiler's output is its own input. The bootstrap is a 2-cycle limit cycle — gen2 == gen3 == gen4 byte-identically. If `cmp` still differs after 3 cycles, codegen is non-deterministic and wants investigation. See `notes/bootstrap_convergence_audit_2026-05-13.md`.
 
 ## 6. Compile a real example
 
@@ -172,7 +174,7 @@ For a local-only smoke equivalent: the LSP server at `tools/lsp_server.rail` and
 ```
 
 ```
-137/137 tests passed
+140/140 tests passed
 ```
 
 is the local equivalent of a signed bench: the test suite is reproducible, deterministic, and the seed binary's SHA-256 is checked into `rail_safe.sha256` for tamper detection.
