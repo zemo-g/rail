@@ -1,10 +1,10 @@
--- tools/fuzz/diff_fuzz.rail — Differential compiler fuzzer (v0).
+-- tools/fuzz/diff_fuzz.rail — Differential compiler fuzzer (v1).
 --
--- Generates N small random Rail programs from a tiny grammar, then for each:
---   1. Pretty-prints to /tmp/rail_fuzz_NNN.rail
+-- Generates N small random Rail programs from a small grammar, then for each:
+--   1. Pretty-prints to /tmp/diff_fuzz_NNN.rail (plus repros under tools/fuzz/repros/)
 --   2. Compiles with ./rail_native and runs the binary
 --   3. Independently interprets the same AST in a Rail-side evaluator
---   4. Diffs the two integer results
+--   4. Diffs the two stringified results
 --
 -- The point: two independent evaluators of the same AST should agree.
 -- A disagreement is silent miscompilation — exactly the class of bug the
@@ -14,10 +14,14 @@
 -- Usage:
 --   ./rail_native run tools/fuzz/diff_fuzz.rail [--seed=N] [--n=N]
 --
--- Grammar:
---   E ::= int_literal | x | (let x = E in E) | E + E | E - E | E * E
---       | if E < E then E else E
--- Depth caps: bind depth <= 3, expression depth <= 4.
+-- Grammar v1 — picks one of four families per program:
+--   Int (v0):    E ::= int_literal | x | (let x = E in E) | E +-* E
+--                    | if E < E then E else E
+--   Float (v1):  F ::= float_literal | F +-*/ F | if F < F then F else F
+--   Stdlib (v1): C ::= (length [..]) | (head [..]) | (fold add0 0 [..])
+--   UserCall (v1): generate 1-2 user-fns "fnN x [y] = <int-body>",
+--                  call one with int-literal args.
+-- Depth caps: bind depth <= 3, expression depth <= 4, float depth <= 4.
 
 import "stdlib/list.rail"
 import "stdlib/string.rail"
@@ -68,11 +72,19 @@ rand_in s lo hi =
   (s1, lo + vv)
 
 -- ---------- AST as ADT ----------
--- Lit n
--- Var name
--- Add l r, Sub l r, Mul l r
--- Let name bound body
--- If lt_l lt_r then_e else_e
+-- Int family (v0):
+--   Lit n, Var nm, Add/Sub/Mul l r, Let nm bound body, IfLt ll lr te ee
+-- Float family (v1, added 2026-05-12):
+--   FLit f, FAdd/FSub/FMul/FDiv l r, FIfLt ll lr te ee
+-- Call family (v1, added 2026-05-12):
+--   UCall name args  — call into a user-declared int->int function
+--   StdLen lst       — stdlib length on a literal int-list
+--   StdHead lst      — stdlib head on a literal int-list (returns 0 if empty)
+--   StdSumFold lst   — fold (+) 0 lst — exercises higher-order builtin
+--
+-- The float family produces a value typed as a float (Rail unboxed f64).
+-- We carry a tag (int vs float) up to the harness so the pretty-printer
+-- can choose between `show` (int) and `show_float` (float).
 
 type Expr =
   | Lit n
@@ -82,6 +94,18 @@ type Expr =
   | Mul l r
   | Let nm bound body
   | IfLt ll lr te ee
+  | FLit f
+  | FAdd l r
+  | FSub l r
+  | FMul l r
+  | FDiv l r
+  | FIfLt ll lr te ee
+  | UCall fnm args
+  | StdLen xs
+  | StdHead xs
+  | StdSumFold xs
+  | StdTailLen xs
+  | StdMapLen xs
 
 -- ---------- generator ----------
 -- gen_expr seed bind_depth expr_depth vars -> (seed', Expr)
@@ -156,22 +180,198 @@ gen_let s bd ed vars =
   let (s3, body) = gen_expr s2 (bd - 1) (ed - 1) new_vars
   (s3, Let nm bound body)
 
+-- ---------- float-family generator ----------
+-- gen_fexpr returns (seed', float-typed Expr).
+-- Float vars are not generated (no float `let` in v1); leaves are FLit or
+-- a promotion of an int-Lit. Bias to FLit at depth 0.
+
+gen_fleaf s =
+  -- whole in [-9, 9], frac in [0, 99]
+  let (s1, w) = rand_in s (0 - 9) 9
+  let (s2, f) = rand_in s1 0 99
+  (s2, FLit (w, f))
+
+gen_fexpr s ed =
+  if ed <= 0 then gen_fleaf s
+  else
+    -- 5 buckets: flit, fadd, fsub, fmul, fdiv. fif gets its own bucket at 5.
+    let (s1, k) = rand_in s 0 5
+    if k == 0 then gen_fleaf s1
+    else if k == 1 then gen_fbinop s1 ed "FAdd"
+    else if k == 2 then gen_fbinop s1 ed "FSub"
+    else if k == 3 then gen_fbinop s1 ed "FMul"
+    else if k == 4 then gen_fbinop s1 ed "FDiv"
+    else gen_fif s1 ed
+
+gen_fbinop s ed op =
+  let (s1, l) = gen_fexpr s (ed - 1)
+  let (s2, r) = gen_fexpr s1 (ed - 1)
+  if op == "FAdd" then (s2, FAdd l r)
+  else if op == "FSub" then (s2, FSub l r)
+  else if op == "FMul" then (s2, FMul l r)
+  else (s2, FDiv l r)
+
+gen_fif s ed =
+  let (s1, a) = gen_fexpr s (ed - 1)
+  let (s2, b) = gen_fexpr s1 (ed - 1)
+  let (s3, t) = gen_fexpr s2 (ed - 1)
+  let (s4, e) = gen_fexpr s3 (ed - 1)
+  (s4, FIfLt a b t e)
+
+-- ---------- call-family generator ----------
+-- Picks a stdlib intrinsic OR an invocation of a generated user-fn.
+-- For user-fns we declare 1-2 of them in a ftab and generate UCall nodes
+-- pointing at them.
+
+-- Generate a fixed pool of int-list literals for stdlib calls.
+gen_intlist s =
+  let (s1, len) = rand_in s 0 5
+  gen_intlist_acc s1 len []
+
+gen_intlist_acc s n acc =
+  if n <= 0 then (s, reverse acc)
+  else
+    let (s1, v) = rand_in s (0 - 10) 10
+    gen_intlist_acc s1 (n - 1) (cons v acc)
+
+gen_stdlib_call s =
+  let (s1, k) = rand_in s 0 4
+  let (s2, xs) = gen_intlist s1
+  if k == 0 then (s2, StdLen xs)
+  else if k == 1 then (s2, StdHead xs)
+  else if k == 2 then (s2, StdSumFold xs)
+  else if k == 3 then (s2, StdTailLen xs)
+  else (s2, StdMapLen xs)
+
+-- Generate a user-fn declaration: a 1- or 2-arg int-returning function
+-- whose body is a small int-typed gen_expr.
+gen_user_fn s fname =
+  let (s1, nparams) = rand_in s 1 2
+  let params = if nparams == 1 then ["x"] else ["x", "y"]
+  let (s2, body) = gen_expr s1 1 3 params
+  (s2, (fname, params, body))
+
+-- Build a function table with N user-fns. Names are fn0, fn1, ...
+gen_fntab s n =
+  gen_fntab_acc s n 0 []
+
+gen_fntab_acc s n i acc =
+  if i >= n then (s, reverse acc)
+  else
+    let fname = cat ["fn", show i]
+    let (s1, fn) = gen_user_fn s fname
+    gen_fntab_acc s1 n (i + 1) (cons fn acc)
+
+-- Generate a UCall to one of the functions in ftab.
+gen_ucall s ftab =
+  let nfns = length ftab
+  let (s1, fi) = rand_in s 0 (nfns - 1)
+  let (fname, params, body) = ix ftab fi
+  let nargs = length params
+  gen_ucall_args s1 fname nargs []
+
+gen_ucall_args s fname remaining acc =
+  if remaining <= 0 then (s, UCall fname (reverse acc))
+  else
+    let (s1, n) = rand_in s (0 - 15) 15
+    gen_ucall_args s1 fname (remaining - 1) (cons (Lit n) acc)
+
+-- ---------- top-level program generator ----------
+-- Picks family by weight and returns (seed', expr, ftab, tag).
+-- tag in {"int", "float"} drives show vs show_float.
+-- ftab is a list of (name, params, body) for user-fns referenced by the expr.
+
+gen_program s =
+  -- 4 family buckets: 0=int, 1=float, 2=stdlib-call, 3=user-call
+  let (s1, fam) = rand_in s 0 3
+  if fam == 0 then
+    let (s2, e) = gen_expr s1 3 4 []
+    (s2, e, [], "int")
+  else if fam == 1 then
+    let (s2, e) = gen_fexpr s1 4
+    (s2, e, [], "float")
+  else if fam == 2 then
+    let (s2, e) = gen_stdlib_call s1
+    (s2, e, [], "int")
+  else
+    let (s2, nfns) = rand_in s1 1 2
+    let (s3, ftab) = gen_fntab s2 nfns
+    let (s4, e) = gen_ucall s3 ftab
+    (s4, e, ftab, "int")
+
 -- ---------- pretty-printer ----------
 -- We always parenthesize binary ops to avoid relying on operator-precedence
 -- decisions in both evaluators.
 
+-- Pretty-print an int list literal as Rail source: [a, b, c].
+-- We unroll the map(show) step into a manual recursive walk because
+-- builtins like `show` aren't first-class values in Rail today.
+pp_intlist xs =
+  if length xs == 0 then "[]"
+  else cat ["[", pp_intlist_inner xs, "]"]
+
+pp_intlist_inner xs =
+  if length xs == 0 then ""
+  else if length xs == 1 then show (head xs)
+  else cat [show (head xs), ", ", pp_intlist_inner (tail xs)]
+
+-- Pretty-print an arg-list for a user-defined function call.
+-- Manual walk for the same reason as pp_intlist_inner.
+pp_args xs =
+  if length xs == 0 then ""
+  else if length xs == 1 then pp_paren (head xs)
+  else cat [pp_paren (head xs), " ", pp_args (tail xs)]
+
+pp_paren e = cat ["(", pp e, ")"]
+
+-- pp_flit takes a (whole, frac) tuple of ints and stringifies it as e.g. "3.14".
+-- Negative whole numbers are wrapped in parens to avoid the unary-minus
+-- getting parsed as binary subtraction at the call site.
+pp_flit pair =
+  let (whole, frac) = pair
+  let wabs = if whole < 0 then 0 - whole else whole
+  -- Ensure frac is 0..99 so we always emit a 2-digit fractional component.
+  let f = if frac < 0 then 0 - frac else frac
+  let f2 = f % 100
+  let pad = if f2 < 10 then "0" else ""
+  let body = cat [show wabs, ".", pad, show f2]
+  if whole < 0 then cat ["(-", body, ")"]
+  else body
+
+-- Pretty-print an int literal — negative numbers get parens to avoid
+-- gluing the minus into a binary subtraction in the surrounding context.
+pp_lit n =
+  if n < 0 then cat ["(", show n, ")"]
+  else show n
+
 pp e = match e
-  | Lit n -> show n
+  | Lit n -> pp_lit n
   | Var nm -> nm
   | Add l r -> cat ["(", pp l, " + ", pp r, ")"]
   | Sub l r -> cat ["(", pp l, " - ", pp r, ")"]
   | Mul l r -> cat ["(", pp l, " * ", pp r, ")"]
   | Let nm bound body -> cat ["(let ", nm, " = ", pp bound, " in ", pp body, ")"]
   | IfLt a b t e -> cat ["(if ", pp a, " < ", pp b, " then ", pp t, " else ", pp e, ")"]
+  | FLit f -> pp_flit f
+  | FAdd l r -> cat ["(", pp l, " + ", pp r, ")"]
+  | FSub l r -> cat ["(", pp l, " - ", pp r, ")"]
+  | FMul l r -> cat ["(", pp l, " * ", pp r, ")"]
+  | FDiv l r -> cat ["(", pp l, " / ", pp r, ")"]
+  | FIfLt a b t e -> cat ["(if ", pp a, " < ", pp b, " then ", pp t, " else ", pp e, ")"]
+  | UCall fnm args -> cat ["(", fnm, " ", pp_args args, ")"]
+  | StdLen xs -> cat ["(length ", pp_intlist xs, ")"]
+  | StdHead xs -> cat ["(head ", pp_intlist xs, ")"]
+  | StdSumFold xs -> cat ["(fold add0 0 ", pp_intlist xs, ")"]
+  | StdTailLen xs -> cat ["(length (tail ", pp_intlist xs, "))"]
+  | StdMapLen xs -> cat ["(length (map inc1 ", pp_intlist xs, "))"]
 
 -- ---------- side interpreter ----------
 -- env = list of (name, value) tuples.
 -- Pattern: linear scan; latest binding wins.
+--
+-- The interpreter for the int family returns a raw int. The float family
+-- is handled by `evalf` (returns a raw float). Function calls and stdlib
+-- intrinsics live alongside `eval` (int-typed).
 
 env_lookup env nm =
   if length env == 0 then 0
@@ -180,37 +380,142 @@ env_lookup env nm =
     if k == nm then v
     else env_lookup (tail env) nm
 
-eval e env = match e
+-- User-function table: list of (name, param_names, body_expr).
+-- Lookup returns (params, body) or ("", Lit 0) on miss.
+fn_lookup ftab nm =
+  if length ftab == 0 then ([], Lit 0)
+  else
+    let (k, params, body) = head ftab
+    if k == nm then (params, body)
+    else fn_lookup (tail ftab) nm
+
+-- Bind a parallel list of param names to evaluated arg values.
+bind_params params vals env =
+  if length params == 0 then env
+  else bind_params (tail params) (tail vals) (cons (head params, head vals) env)
+
+eval e env ftab = match e
   | Lit n -> n
   | Var nm -> env_lookup env nm
-  | Add l r -> eval l env + eval r env
-  | Sub l r -> eval l env - eval r env
-  | Mul l r -> eval l env * eval r env
+  | Add l r -> eval l env ftab + eval r env ftab
+  | Sub l r -> eval l env ftab - eval r env ftab
+  | Mul l r -> eval l env ftab * eval r env ftab
   | Let nm bound body ->
-      let v = eval bound env
-      eval body (cons (nm, v) env)
+      let v = eval bound env ftab
+      eval body (cons (nm, v) env) ftab
   | IfLt a b t e ->
-      if eval a env < eval b env then eval t env
-      else eval e env
+      if eval a env ftab < eval b env ftab then eval t env ftab
+      else eval e env ftab
+  | FLit f -> 0
+  | FAdd l r -> 0
+  | FSub l r -> 0
+  | FMul l r -> 0
+  | FDiv l r -> 0
+  | FIfLt a b t e -> 0
+  | UCall fnm args ->
+      let (params, body) = fn_lookup ftab fnm
+      let vals = map_eval args env ftab
+      eval body (bind_params params vals []) ftab
+  | StdLen xs -> length xs
+  | StdHead xs -> if length xs == 0 then 0 else head xs
+  | StdSumFold xs -> sum_list xs
+  | StdTailLen xs -> if length xs == 0 then 0 else length (tail xs)
+  | StdMapLen xs -> length xs
+
+-- Evaluate every expression in args to a list of int values.
+map_eval args env ftab =
+  if length args == 0 then []
+  else cons (eval (head args) env ftab) (map_eval (tail args) env ftab)
+
+sum_list xs =
+  if length xs == 0 then 0
+  else head xs + sum_list (tail xs)
+
+-- Float-family evaluator. Returns a raw float.
+-- Float vars are unsupported in v1 (no let-bound floats yet); evalf treats
+-- Var as int-from-env and promotes via int_to_float.
+--
+-- IMPORTANT: every cross-function float return is wrapped with `0.0 +` to
+-- defeat the float-promotion quirk documented in CLAUDE.md (Rail quirks
+-- memory entry). Without this wrap, recursive float-returning calls inside
+-- an ADT walker mis-type as int and produce garbage (or segfault when the
+-- bit-pattern is dereferenced). This bug class is filed as a repro.
+evalf e env ftab = match e
+  | FLit pair ->
+      let (whole, frac) = pair
+      let wabs = if whole < 0 then 0 - whole else whole
+      let f = if frac < 0 then 0 - frac else frac
+      let f2 = f % 100
+      let whole_f = int_to_float wabs
+      let frac_f = int_to_float f2
+      let hundred = int_to_float 100
+      let mag = whole_f + frac_f / hundred
+      if whole < 0 then 0.0 - mag else 0.0 + mag
+  | FAdd l r -> 0.0 + (evalf l env ftab) + (evalf r env ftab)
+  | FSub l r -> 0.0 + (evalf l env ftab) - (evalf r env ftab)
+  | FMul l r -> 0.0 + (evalf l env ftab) * (evalf r env ftab)
+  | FDiv l r ->
+      -- IEEE semantics: divide by zero yields inf or nan. We deliberately do
+      -- NOT guard the interpreter, so its inf/nan output matches the native
+      -- code path.
+      0.0 + (evalf l env ftab) / (0.0 + (evalf r env ftab))
+  | FIfLt a b t e ->
+      let av = 0.0 + (evalf a env ftab)
+      let bv = 0.0 + (evalf b env ftab)
+      if av < bv then 0.0 + (evalf t env ftab)
+      else 0.0 + (evalf e env ftab)
+  | Lit n -> 0.0 + int_to_float n
+  | Var nm -> 0.0 + int_to_float (env_lookup env nm)
+  | Add l r -> 0.0 + (evalf l env ftab) + (evalf r env ftab)
+  | Sub l r -> 0.0 + (evalf l env ftab) - (evalf r env ftab)
+  | Mul l r -> 0.0 + (evalf l env ftab) * (evalf r env ftab)
+  | Let nm bound body -> 0.0
+  | IfLt a b t e -> 0.0
+  | UCall fnm args -> 0.0
+  | StdLen xs -> 0.0
+  | StdHead xs -> 0.0
+  | StdSumFold xs -> 0.0
+  | StdTailLen xs -> 0.0
+  | StdMapLen xs -> 0.0
 
 -- ---------- compile-and-run ----------
--- Emit `main = <pp e>` to a file; compile; run; capture exit code AND the
--- printed value (we print it from the generated program so we can read it).
+-- Emit a small Rail program to disk, compile + run, return printed stdout.
 --
--- Convention: generated program is
+-- Generated program shape:
+--   add0 a b = a + b              -- prelude helper for fold
+--   <user_fn_decls...>            -- optional, when grammar generated UCalls
 --   main =
---     let v = <expr>
---     let _ = print (show v)
+--     let _ = print (<show-call> <expr>)
 --     0
--- exit code 0, and stdout = "<value>\n"
+--
+-- For int-typed expressions, <show-call> is `show`.
+-- For float-typed expressions, <show-call> is `show_float`.
 
-emit_program e path =
+-- Render one user-function declaration: "name p0 p1 = <body>\n"
+emit_fn_decl fn =
+  let (nm, params, body) = fn
+  let phead = if length params == 0 then nm else cat [nm, " ", join " " params]
+  cat [phead, " = ", pp body, "\n"]
+
+emit_fn_decls ftab =
+  if length ftab == 0 then ""
+  else cat [emit_fn_decl (head ftab), emit_fn_decls (tail ftab)]
+
+-- Tag drives which `show` builtin we call on the final value.
+-- "int" -> show, "float" -> show_float.
+show_for tag = if tag == "float" then "show_float" else "show"
+
+emit_program e ftab tag path =
   let body = pp e
+  let decls = emit_fn_decls ftab
+  let sc = show_for tag
   let src = cat [
     "-- diff_fuzz auto-generated\n",
+    "add0 a b = a + b\n",
+    "inc1 x = x + 1\n",
+    decls,
     "main =\n",
-    "  let v = ", body, "\n",
-    "  let _ = print (show v)\n",
+    "  let _ = print (", sc, " ", body, ")\n",
     "  0\n"]
   write_file path src
 
@@ -219,31 +524,72 @@ run_compiled path =
   let out = "/tmp/diff_fuzz_run.out"
   let _ = shell (cat ["rm -f ", log, " ", out])
   let compile_ec = trim (shell (cat ["./rail_native ", path, " > ", log, " 2>&1; echo $?"]))
-  if parse_int compile_ec != 0 then ("COMPILE_ERR", 0)
+  if parse_int compile_ec != 0 then ("COMPILE_ERR", "")
   else
     let _ = shell (cat ["cp /tmp/rail_out /tmp/diff_fuzz_bin"])
     let run_ec = trim (shell (cat ["/tmp/diff_fuzz_bin > ", out, " 2>&1; echo $?"]))
-    if parse_int run_ec != 0 then (cat ["RUN_ERR=", run_ec], 0)
+    if parse_int run_ec != 0 then (cat ["RUN_ERR=", run_ec], "")
     else
       let raw = shell (cat ["cat ", out])
-      let txt = trim raw
-      ("OK", parse_int txt)
+      ("OK", trim raw)
 
 -- ---------- per-program comparison ----------
+-- Returns (msg, agreed, compiled, divergence_kind).
+-- divergence_kind in {"none", "int", "float", "call"} — used by the harness
+-- to bucket repros into folders.
 
-cmp_one e idx =
-  let path = cat ["/tmp/diff_fuzz_", show idx, ".rail"]
-  let _ = emit_program e path
-  let (status, native_val) = run_compiled path
-  let interp_val = eval e []
-  if status != "OK" then
-    -- Compile/run failed; this isn't a *miscompilation* divergence but is
-    -- worth surfacing.
-    (cat ["[", show idx, "] ", status, "  interp=", show interp_val, "  src=", pp e], false, false)
-  else if native_val == interp_val then
-    (cat ["[", show idx, "] OK  v=", show native_val], true, true)
+-- Truncate a float-shaped string to at most N significant digits so that
+-- last-digit IEEE-rounding noise from the side-interpreter's extra `0.0 +`
+-- wraps (used to defeat the cross-function float-return quirk) doesn't
+-- masquerade as a codegen divergence.
+truncate_sig s n =
+  if str_contains "." s == false then s
+  else if str_contains "inf" s then s
+  else if str_contains "nan" s then s
+  else trunc_sig_walk (chars s) n false 0 []
+
+is_digit_char c =
+  if c == "0" then true
+  else if c == "1" then true
+  else if c == "2" then true
+  else if c == "3" then true
+  else if c == "4" then true
+  else if c == "5" then true
+  else if c == "6" then true
+  else if c == "7" then true
+  else if c == "8" then true
+  else if c == "9" then true
+  else false
+
+trunc_sig_walk cs n started kept acc =
+  if length cs == 0 then from_chars (reverse acc)
+  else if kept >= n then from_chars (reverse acc)
   else
-    (cat ["[", show idx, "] DIVERGE  native=", show native_val, "  interp=", show interp_val, "\n     src: ", pp e], false, true)
+    let c = head cs
+    let isd = is_digit_char c
+    let is_nz = isd && c != "0"
+    let new_started = started || is_nz
+    let new_kept = if new_started && isd then kept + 1 else kept
+    trunc_sig_walk (tail cs) n new_started new_kept (cons c acc)
+
+-- Compare strings after truncating both to 12 sig figs if they look like floats.
+strings_agree native interp tag =
+  if tag != "float" then native == interp
+  else (truncate_sig native 12) == (truncate_sig interp 12)
+
+cmp_one e ftab tag kind idx seed =
+  let path = cat ["/tmp/diff_fuzz_", show idx, ".rail"]
+  let _ = emit_program e ftab tag path
+  let (status, native_str) = run_compiled path
+  let interp_str =
+    if tag == "float" then show_float (evalf e [] ftab)
+    else show (eval e [] ftab)
+  if status != "OK" then
+    (cat ["[", show idx, "] ", status, "  interp=", interp_str, "  src=", pp e], false, false, kind)
+  else if strings_agree native_str interp_str tag then
+    (cat ["[", show idx, "] OK  v=", native_str], true, true, "none")
+  else
+    (cat ["[", show idx, "] DIVERGE(", kind, ")  native=", native_str, "  interp=", interp_str, "\n     src: ", pp e], false, true, kind)
 
 -- ---------- main driver ----------
 
@@ -257,28 +603,59 @@ get_int_opt argv key def =
       parse_int v
     else get_int_opt (tail argv) key def
 
-run_loop n bd ed s idx ok diverge compile_err =
-  if idx >= n then (ok, diverge, compile_err)
+-- Persist the .rail source of a divergent program to tools/fuzz/repros/
+-- so it can be inspected and minimized later. Filename encodes the seed
+-- and the iteration index so the run is fully reproducible from its name.
+save_repro e ftab tag kind seed idx repros_saved =
+  let dir = "tools/fuzz/repros"
+  let _ = shell (cat ["mkdir -p ", dir])
+  let fname = cat [dir, "/", kind, "_seed", show seed, "_idx", show idx, ".rail"]
+  let body = pp e
+  let decls = emit_fn_decls ftab
+  let sc = show_for tag
+  let header = cat [
+    "-- diff_fuzz repro: seed=", show seed, " idx=", show idx, " family=", kind, "\n",
+    "-- Native and side-interpreter outputs diverged on this program.\n",
+    "-- Bug class: ", kind, "-family divergence (codegen vs reference eval).\n"]
+  let src = cat [
+    header,
+    "add0 a b = a + b\n",
+    "inc1 x = x + 1\n",
+    decls,
+    "main =\n",
+    "  let _ = print (", sc, " ", body, ")\n",
+    "  0\n"]
+  let _ = write_file fname src
+  let _ = print (cat ["  -> saved repro: ", fname])
+  repros_saved + 1
+
+run_loop n s idx ok diverge compile_err repros_saved =
+  if idx >= n then (ok, diverge, compile_err, repros_saved)
   else
-    let (s1, e) = gen_expr s bd ed []
-    let (msg, agreed, compiled) = cmp_one e idx
+    let (s1, e, ftab, tag) = gen_program s
+    let kind = tag
+    let (msg, agreed, compiled, dkind) = cmp_one e ftab tag kind idx s
     let _ = print msg
     let nok = if agreed then ok + 1 else ok
-    let nd = if compiled && (agreed == false) then diverge + 1 else diverge
+    let div_hit = compiled && (agreed == false)
+    let nd = if div_hit then diverge + 1 else diverge
     let nc = if compiled == false then compile_err + 1 else compile_err
-    run_loop n bd ed s1 (idx + 1) nok nd nc
+    let nrepros = if div_hit then save_repro e ftab tag dkind s idx repros_saved
+                  else repros_saved
+    run_loop n s1 (idx + 1) nok nd nc nrepros
 
 main =
   let seed = get_int_opt (tail args) "seed" 1
   let n = get_int_opt (tail args) "n" 50
-  let _ = print (cat ["diff_fuzz v0  seed=", show seed, "  n=", show n])
+  let _ = print (cat ["diff_fuzz v1  seed=", show seed, "  n=", show n])
 
-  let (ok, diverge, compile_err) = run_loop n 3 4 seed 0 0 0 0
+  let (ok, diverge, compile_err, repros) = run_loop n seed 0 0 0 0 0
 
   let _ = print ""
   let _ = print (cat [
     "results: ", show ok, " agree  /  ",
     show diverge, " DIVERGENCE  /  ",
     show compile_err, " compile-or-run-error  /  ",
-    show n, " total"])
+    show n, " total  /  ",
+    show repros, " repros saved"])
   if diverge == 0 then 0 else 2
