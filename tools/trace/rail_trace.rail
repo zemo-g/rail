@@ -1,0 +1,220 @@
+-- tools/trace/rail_trace.rail
+--
+-- v0 sampling diagnostic. Wraps `./rail_native run <prog> <args...>` with
+-- RAIL_TRACE=1 exported, captures macOS `/usr/bin/time -l` output, and emits
+-- both a human-readable report and a JSON sidecar at <prog>.trace.json.
+--
+-- Honest about scope:
+--   - RAIL_TRACE=1 is exported into the child env. `rail_native` does not
+--     currently consume it; the wrapper still produces a useful report from
+--     `time -l`. We export the var anyway so future runtimes that look for
+--     it can flip a switch without changing this wrapper.
+--   - This is NOT a debugger and NOT source-mapped. v0 is wall-clock + RSS +
+--     page faults + ctx switches + peak memory footprint + exit code.
+--   - alloc_stats_snapshot integration is deferred to v1. rail_native has no
+--     one-shot dump mode today; threading our own probe in would require
+--     editing tools/compile.rail which is out of scope for v0.
+--
+-- Usage:
+--   ./rail_native run tools/trace/rail_trace.rail <prog.rail> [args...]
+--
+-- Outputs:
+--   stdout       — human-readable report
+--   <prog>.trace.json — structured sidecar (overwritten each run)
+
+-- ---- argv parsing ---------------------------------------------------------
+
+-- args returns [script_path, prog, prog_args...]. We need everything after
+-- the script path. argv[0] = "tools/trace/rail_trace.rail", argv[1] = prog.
+
+usage dummy =
+  let _ = print "Usage: ./rail_native run tools/trace/rail_trace.rail <prog.rail> [args...]"
+  let _ = print "  Emits human report on stdout and <prog>.trace.json sidecar."
+  1
+
+-- ---- JSON escaping --------------------------------------------------------
+
+q = "\""
+
+json_esc_bs s = join "\\\\" (split "\\" s)
+json_esc_q s = join "\\\"" (split "\"" s)
+json_esc_nl s = join "\\n" (split "\n" s)
+json_esc_tab s = join "\\t" (split "\t" s)
+json_esc s = json_esc_tab (json_esc_nl (json_esc_q (json_esc_bs s)))
+
+-- ---- list helpers ---------------------------------------------------------
+
+last_nonempty xs =
+  if length xs == 0 then ""
+  else if length xs == 1 then head xs
+  else
+    let l = last_nonempty (tail xs)
+    if l == "" then head xs else l
+
+drop_first xs =
+  if length xs == 0 then xs else tail xs
+
+join_with_space xs =
+  if length xs == 0 then ""
+  else if length xs == 1 then head xs
+  else cat [head xs, " ", join_with_space (tail xs)]
+
+-- ---- line parsing ---------------------------------------------------------
+
+-- `time -l` lines look like:
+--      "        6.53 real         6.44 user         0.12 sys"
+--      "          664847248  peak memory footprint"
+--      "                  24  voluntary context switches"
+-- We strip leading whitespace, split on space, the first non-empty token is
+-- the number we want.
+
+trim_left s =
+  let cs = chars s
+  trim_left_acc cs
+
+trim_left_acc cs =
+  if length cs == 0 then ""
+  else if head cs == " " || head cs == "\t" then trim_left_acc (tail cs)
+  else from_chars cs
+
+from_chars cs =
+  if length cs == 0 then ""
+  else cat [head cs, from_chars (tail cs)]
+
+-- First whitespace-separated token of a line.
+first_token line =
+  let trimmed = trim_left line
+  let parts = split " " trimmed
+  -- split on a single char keeps empties; first non-empty wins
+  first_nonempty parts
+
+first_nonempty xs =
+  if length xs == 0 then ""
+  else if head xs == "" then first_nonempty (tail xs)
+  else head xs
+
+-- Compact a token list by dropping empties (split " " keeps empties).
+compact xs =
+  if length xs == 0 then []
+  else if head xs == "" then compact (tail xs)
+  else cons (head xs) (compact (tail xs))
+
+-- Does line contain substring needle?
+has_sub needle line = str_find needle line >= 0
+
+-- Find first line containing needle, return first_token of it, or default.
+find_field lines needle default =
+  if length lines == 0 then default
+  else if has_sub needle (head lines) then first_token (head lines)
+  else find_field (tail lines) needle default
+
+-- Find first line containing needle, then return the token IMMEDIATELY
+-- BEFORE the first token matching needle. macOS `time -l` packs the
+-- real/user/sys triplet on one line: "  0.30 real  0.09 user  0.09 sys",
+-- so we need positional parsing, not "first token of line".
+find_paired lines needle default =
+  if length lines == 0 then default
+  else if has_sub needle (head lines) then
+    let toks = compact (split " " (head lines))
+    token_before toks needle default
+  else find_paired (tail lines) needle default
+
+token_before toks needle default =
+  if length toks < 2 then default
+  else if head (tail toks) == needle then head toks
+  else token_before (tail toks) needle default
+
+-- ---- main -----------------------------------------------------------------
+
+build_cmd prog rest_args time_out exit_out stdout_out =
+  -- We export RAIL_TRACE=1 explicitly. macOS /usr/bin/time -l writes the
+  -- resource block to stderr; we redirect it to time_out. Program stdout
+  -- goes to stdout_out so it doesn't pollute the report. Exit code lands
+  -- in exit_out.
+  let argstr = if length rest_args == 0 then "" else cat [" ", join_with_space rest_args]
+  cat [
+    "RAIL_TRACE=1 /usr/bin/time -l ./rail_native run ", prog, argstr,
+    " > ", stdout_out, " 2> ", time_out,
+    "; echo $? > ", exit_out
+  ]
+
+main =
+  let a = args
+  -- args[0] is the script path; args[1] is the prog under trace.
+  if length a < 2 then usage 0
+  else
+    let prog = head (tail a)
+    let rest = drop_first (tail a)
+    let time_out = "/tmp/rail_trace_time.txt"
+    let exit_out = "/tmp/rail_trace_exit.txt"
+    let stdout_out = "/tmp/rail_trace_stdout.txt"
+    let cmd = build_cmd prog rest time_out exit_out stdout_out
+    let _ = print (cat ["rail trace -- running: ", prog])
+    let _ = shell cmd
+    let time_raw = read_file time_out
+    let exit_raw = read_file exit_out
+    let stdout_raw = read_file stdout_out
+    let lines = split "\n" time_raw
+    -- pull the fields we care about
+    let real_s = find_paired lines "real" "?"
+    let user_s = find_paired lines "user" "?"
+    let sys_s = find_paired lines "sys" "?"
+    let peak_rss = find_field lines "maximum resident set size" "?"
+    let peak_foot = find_field lines "peak memory footprint" "?"
+    let page_faults = find_field lines "page faults" "?"
+    let page_reclaims = find_field lines "page reclaims" "?"
+    let vol_ctx = find_field lines "voluntary context switches" "?"
+    let invol_ctx = find_field lines "involuntary context switches" "?"
+    let instr_retired = find_field lines "instructions retired" "?"
+    let cycles = find_field lines "cycles elapsed" "?"
+    let exit_code = trim_left (last_nonempty (split "\n" exit_raw))
+    let stdout_bytes = length stdout_raw
+    -- Human report
+    let _ = print "rail trace report"
+    let _ = print "-----------------------------------"
+    let _ = print (cat ["Program:        ", prog])
+    let _ = print (cat ["Args:           ", if length rest == 0 then "(none)" else join_with_space rest])
+    let _ = print (cat ["Wall clock:     ", real_s, " s"])
+    let _ = print (cat ["User CPU:       ", user_s, " s"])
+    let _ = print (cat ["Sys CPU:        ", sys_s, " s"])
+    let _ = print (cat ["Peak RSS:       ", peak_rss, " bytes"])
+    let _ = print (cat ["Peak footprint: ", peak_foot, " bytes"])
+    let _ = print (cat ["Page reclaims:  ", page_reclaims])
+    let _ = print (cat ["Page faults:    ", page_faults])
+    let _ = print (cat ["Ctx switches:   vol=", vol_ctx, " inv=", invol_ctx])
+    let _ = print (cat ["Instr retired:  ", instr_retired])
+    let _ = print (cat ["Cycles elapsed: ", cycles])
+    let _ = print (cat ["Exit code:      ", exit_code])
+    let _ = print (cat ["Captured stdout: ", show stdout_bytes, " bytes -> ", stdout_out])
+    let _ = print "-----------------------------------"
+    let _ = print "note: RAIL_TRACE=1 is exported into the child env;"
+    let _ = print "      rail_native does not consume it today (v0 wrapper)."
+    -- JSON sidecar
+    let sidecar = cat [prog, ".trace.json"]
+    let json = cat [
+      "{",
+      q, "schema", q, ":", q, "rail_trace_v0", q, ",",
+      q, "program", q, ":", q, json_esc prog, q, ",",
+      q, "args", q, ":", q, json_esc (join_with_space rest), q, ",",
+      q, "rail_trace_env", q, ":", q, "1", q, ",",
+      q, "rail_trace_consumed_by_runtime", q, ":false,",
+      q, "wall_clock_s", q, ":", q, real_s, q, ",",
+      q, "user_cpu_s", q, ":", q, user_s, q, ",",
+      q, "sys_cpu_s", q, ":", q, sys_s, q, ",",
+      q, "peak_rss_bytes", q, ":", q, peak_rss, q, ",",
+      q, "peak_footprint_bytes", q, ":", q, peak_foot, q, ",",
+      q, "page_reclaims", q, ":", q, page_reclaims, q, ",",
+      q, "page_faults", q, ":", q, page_faults, q, ",",
+      q, "vol_ctx_switches", q, ":", q, vol_ctx, q, ",",
+      q, "invol_ctx_switches", q, ":", q, invol_ctx, q, ",",
+      q, "instructions_retired", q, ":", q, instr_retired, q, ",",
+      q, "cycles_elapsed", q, ":", q, cycles, q, ",",
+      q, "exit_code", q, ":", q, exit_code, q, ",",
+      q, "stdout_bytes", q, ":", show stdout_bytes, ",",
+      q, "stdout_capture_path", q, ":", q, json_esc stdout_out, q, ",",
+      q, "time_capture_path", q, ":", q, json_esc time_out, q,
+      "}\n"
+    ]
+    let _ = write_file sidecar json
+    let _ = print (cat ["JSON sidecar:   ", sidecar])
+    0
