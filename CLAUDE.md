@@ -192,7 +192,7 @@ Public docs: **https://ledatic.org/rail/docs/** — md→html build + deploy rec
 
 - **Phantom builtins** in `compile.rail:~2233` `str_returning_builtin` list: `trim`, `str_to_int`. Declared but no codegen → `ld` undefined symbol at link. Inline a helper or extend emit.
 - **`to_int "42"` silently returns 0** — `to_int` is float→int only. There is no string-to-int builtin. Write a digit-walking helper inline.
-- **3-movk codegen** for >32-bit integer literals errors at `as:` with "immediate must be integer in range [0, 65535]". Keep literals ≤32 bits or compose via shift/or at runtime. Surfaced by `diff_fuzz` LCG seed.
+- **3-movk codegen** (FIXED 2026-05-12, `feat/c-3-movk-literals`): `emit_load_int` at `compile.rail:829` now emits movz + up to 3 movk chunks (bits 0-15, 16-31, 32-47, 48-63), with zero chunks at >=#32 skipped. Both positive (`movz`+`movk`) and negative (`movn`+`movk` with inverted bits) paths handle the full 64-bit range. Regression tests: t132 (3-movk), t133 (4-movk), t134 (4-movk negative). Note: `k16/k32/k48` constants computed via `shl 1 N` so `opt` constant-folding doesn't bake them as 64-bit literals the seed can't emit.
 
 ## Related repos
 
