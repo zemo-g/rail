@@ -36,7 +36,7 @@ Before declaring a hypothesis confirmed, run the falsification test (e.g., for f
 
 Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64, x86_64, and Linux ARM64.
 
-- **Compiler source**: `tools/compile.rail` (~4,690 lines, 335 functions)
+- **Compiler source**: `tools/compile.rail` (~6,719 lines, 335 functions)
 - **Seed binary**: `rail_native` (729K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
 - **Native floats (v2.0)**: unboxed IEEE 754 doubles in ARM64 d-registers. No heap allocation. `fadd`/`fmul`/`fdiv`/`fcmp` directly. Float arrays, foreign float calls (`sin`/`cos`/`tanh`/`sqrt`), auto int→float promotion.
 - **REPL**: `./rail_native run tools/repl.rail` — interactive, persistent definitions
@@ -48,7 +48,7 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 - **Effect handlers**: `try body handler` — setjmp/longjmp non-local error recovery. Deep unwinding, nested handlers.
 - **Type checker**: Forward inference pass emits warnings (not errors) for: head/tail on non-list, arithmetic on non-numeric, wrong arity, calling non-functions.
 - **Package manager**: `import math` (bare imports), `rail get github.com/...`, `rail pkg` reads `rail.toml`.
-- **Tests**: `./rail_native test` — 137 tests, should be 137/137. Count fluctuates only when concurrent sessions collide on `/tmp/rail_out` — rerun to confirm.
+- **Tests**: `./rail_native test` — 140 tests, should be 140/140. Count fluctuates only when concurrent sessions collide on `/tmp/rail_out` — rerun to confirm. (Was 137 prior to 2026-05-12; t132/t133/t134 cover 3-/4-movk integer literal codegen.)
 - **Checkpoints**: `stdlib/checkpoint.rail` — `save_checkpoint prefix weights adams step best_val` + `load_checkpoint` / in-place `load_model_into` / `load_adam_states_into`. Atomic via `<prefix>.committed` sentinel. `corpus_split text val_pct` for eval splits. `tools/train/lm_transformer.rail:run_segments` wires resume + periodic checkpoint into the training loop.
 - **Performance**: Tail-recursive loops match C -O2 (5 instructions/iteration). Self-loop optimization, untagged register params, bottom-test with `subs`.
 - **Targets**: macOS ARM64 (native), Linux ARM64 (Pi Zero), Linux x86_64 (Razer WSL)
@@ -56,7 +56,7 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 ### Key Commands
 
 ```bash
-./rail_native test                    # run 137-test suite
+./rail_native test                    # run 140-test suite
 ./rail_native self                    # self-compile → /tmp/rail_self (must be byte-identical)
 ./rail_native run file.rail           # compile + execute
 ./rail_native file.rail               # compile only → /tmp/rail_out
@@ -142,8 +142,8 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 After editing `tools/compile.rail`:
 1. `./rail_native self` — self-compile
 2. `cp /tmp/rail_self rail_native` — install new binary
-3. `./rail_native test` — verify 137/137
-4. `./rail_native self && cmp rail_native /tmp/rail_self` — verify fixed point (may need 2-3 rounds)
+3. `./rail_native test` — verify 140/140
+4. `./rail_native self && cmp rail_native /tmp/rail_self` — verify fixed point. **Needs ≥2 cycles**: gen0's shipped runtime asm doesn't necessarily match what gen0's source emits, so cycle 1 typically differs. Cycle 2 always lands the byte-identical fixed point (gen2 == gen3 == gen4). See `notes/bootstrap_convergence_audit_2026-05-13.md` for the empirical proof. Verify by running self twice after installing and `cmp`-ing the two outputs.
 
 **NOTE**: Self-compile works cleanly since the 256MB stack fix. No gen2_head bootstrap needed.
 

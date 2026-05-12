@@ -1,6 +1,6 @@
 # Rail
 
-Rail is a self-hosted ARM64 language with five backends (macOS ARM64, Linux ARM64, Linux x86_64, WebAssembly, Cortex-M4, RISC-V rv32imc), an LLM training substrate, and a verifiable provenance layer. The compiler is 6,679 lines of Rail compiling itself byte-identically; the runtime is ARM64 assembly embedded in the compiler. Zero C dependencies. One binary.
+Rail is a self-hosted ARM64 language with six backends (macOS ARM64, Linux ARM64, Linux x86_64, WebAssembly, Cortex-M4, RISC-V rv32imc), an LLM training substrate, and a verifiable provenance layer. The compiler is ~6,719 lines of Rail compiling itself byte-identically at gen2; the runtime is ARM64 assembly embedded in the compiler. Zero C dependencies. One binary.
 
 ## Quickstart
 
@@ -21,7 +21,7 @@ hello, rail
 42
 ```
 
-The seed binary (`rail_native`, ~1 MB ARM64) is checked into the repo and self-compiles byte-identically. No build step before "hello, world".
+The seed binary (`rail_native`, ~1.0 MB ARM64) is checked into the repo and self-compiles to a byte-identical fixed point at gen2 (the first cycle may differ; gen2 == gen3 always). No build step before "hello, world".
 
 For Apple Silicon you're done. Other targets need cross-toolchains — see [backends.md](backends.md).
 
@@ -53,7 +53,7 @@ main =
 
 Functions are `name args = body`. `main` is the entry point and returns an int. ADTs use `type T = | Ctor args | ...`. Pattern matching uses `match` (no `with`). Tail calls are compiled to loops with no stack growth.
 
-## Five backends, one compiler
+## Six backends, one compiler
 
 ```bash
 ./rail_native run file.rail        # macOS ARM64 (native execute)
