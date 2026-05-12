@@ -172,6 +172,28 @@ If steps 1–3 pass but 4 fails, you probably need another cycle. If step 2 fail
 
 **ASCII-only inside string literals emitted to asm**: avoid em-dashes (—), curly quotes, etc. inside any string that flows into `.asciz` output. The lexer handles UTF-8 in literals but the assembler can be unhappy with multi-byte content in some contexts. Use `-` (hyphen-minus) and `'` (apostrophe). Comments (outside string literals) can use anything Unicode you want.
 
+## Substrate beyond compile.rail (shipped 2026-05-11)
+
+Seven foundation tools landed via parallel-v0 workflow. **Use them. Don't redo them.**
+
+| Tool | Path | When |
+|---|---|---|
+| Test runner | `./rail_native run tools/test/rail_test.rail <dir>` | New tests. Convention: exit 0 AND last-line `PASS`. Exit-code-honest (relies on the 2026-05-02 fix) |
+| Diff fuzzer | `./rail_native run tools/fuzz/diff_fuzz.rail --seed=42 --n=20` | Before any compile.rail change. Catches silent miscompilation via two-path differential eval. Int-only grammar today |
+| Type-quirk lint | `./rail_native run tools/lint/check_quirks.rail <file>.rail` | Before merging .rail. Codes: Q001 het-list, Q002 high-arity, Q003 unwrapped float-return. For compile.rail use `RAIL_ARENA_MB=4096` (else 10min GC thrash) |
+| Perf trace | `./rail_native run tools/trace/rail_trace.rail <prog>.rail [args...]` | Any perf claim. Wall/CPU/RSS/page-faults/ctxsw + JSON sidecar. v0 has no per-fn sampling |
+| Channels/spawn | `bash tools/runtime/build_concurrent.sh` then `import "stdlib/concurrent.rail"` — `rc_chan_make / rc_chan_send / rc_chan_recv / rc_spawn` | Producer/consumer, parallel work. int64-only values today. Symbols `rc_*` (Rail) / `rcon_*` (C) to avoid colliding with compiler-internal `_rail_spawn` |
+| Pkg manifest | `tools/pkg/` — `pkg_resolve.rail`, `pkg_link.rail`, INI manifest `rail.toml` | Multi-package projects. Local-path deps only in v0. Spec in `tools/pkg/SPEC.md` |
+| Stdlib docs | `./rail_native run tools/docs/gen_stdlib_ref.rail` | After any stdlib edit, regen `docs/site/stdlib.md` |
+
+Public docs: **https://ledatic.org/rail/docs/** — md→html build + deploy recipe in memory entry `docs_deploy_rail.md`.
+
+### Recent emit-class gotchas surfaced by foundations work
+
+- **Phantom builtins** in `compile.rail:~2233` `str_returning_builtin` list: `trim`, `str_to_int`. Declared but no codegen → `ld` undefined symbol at link. Inline a helper or extend emit.
+- **`to_int "42"` silently returns 0** — `to_int` is float→int only. There is no string-to-int builtin. Write a digit-walking helper inline.
+- **3-movk codegen** for >32-bit integer literals errors at `as:` with "immediate must be integer in range [0, 65535]". Keep literals ≤32 bits or compose via shift/or at runtime. Surfaced by `diff_fuzz` LCG seed.
+
 ## Related repos
 
 Rail is the compiler + stdlib. A few things that used to live here moved out on 2026-04-20:
