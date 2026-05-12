@@ -1,0 +1,284 @@
+-- tools/fuzz/diff_fuzz.rail — Differential compiler fuzzer (v0).
+--
+-- Generates N small random Rail programs from a tiny grammar, then for each:
+--   1. Pretty-prints to /tmp/rail_fuzz_NNN.rail
+--   2. Compiles with ./rail_native and runs the binary
+--   3. Independently interprets the same AST in a Rail-side evaluator
+--   4. Diffs the two integer results
+--
+-- The point: two independent evaluators of the same AST should agree.
+-- A disagreement is silent miscompilation — exactly the class of bug the
+-- float-TCO regression (2026-04-13 → 2026-04-30) and the nullary-LHS
+-- binary-op regression slipped past tests for.
+--
+-- Usage:
+--   ./rail_native run tools/fuzz/diff_fuzz.rail [--seed=N] [--n=N]
+--
+-- Grammar:
+--   E ::= int_literal | x | (let x = E in E) | E + E | E - E | E * E
+--       | if E < E then E else E
+-- Depth caps: bind depth <= 3, expression depth <= 4.
+
+import "stdlib/list.rail"
+import "stdlib/string.rail"
+
+-- ---------- local helpers ----------
+
+is_ws c = c == " " || c == "\t" || c == "\n" || c == "\r"
+
+trim s =
+  let cs = chars s
+  let cs1 = drop_ws_left cs
+  let cs2 = reverse (drop_ws_left (reverse cs1))
+  from_chars cs2
+
+drop_ws_left cs =
+  if length cs == 0 then cs
+  else if is_ws (head cs) then drop_ws_left (tail cs)
+  else cs
+
+char_to_digit c =
+  if c == "0" then 0 else if c == "1" then 1 else if c == "2" then 2
+  else if c == "3" then 3 else if c == "4" then 4 else if c == "5" then 5
+  else if c == "6" then 6 else if c == "7" then 7 else if c == "8" then 8
+  else if c == "9" then 9 else 0
+
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else parse_int_acc (tail cs) (acc * 10 + char_to_digit (head cs))
+
+parse_int s =
+  let t = trim s
+  let cs = chars t
+  if length cs == 0 then 0
+  else if head cs == "-" then 0 - parse_int_acc (tail cs) 0
+  else parse_int_acc cs 0
+
+-- ---------- RNG: 32-bit LCG (Numerical Recipes) ----------
+-- We thread the state explicitly because Rail has no mutable refs.
+-- Constants fit in 32-bit literals (compiler movk handles up to 32 bits).
+
+rng_next s = (s * 1103515245 + 12345) % 2147483647
+
+rand_in s lo hi =
+  let s1 = rng_next s
+  let span = hi - lo + 1
+  let v = s1 % span
+  let vv = if v < 0 then v + span else v
+  (s1, lo + vv)
+
+-- ---------- AST as ADT ----------
+-- Lit n
+-- Var name
+-- Add l r, Sub l r, Mul l r
+-- Let name bound body
+-- If lt_l lt_r then_e else_e
+
+type Expr =
+  | Lit n
+  | Var nm
+  | Add l r
+  | Sub l r
+  | Mul l r
+  | Let nm bound body
+  | IfLt ll lr te ee
+
+-- ---------- generator ----------
+-- gen_expr seed bind_depth expr_depth vars -> (seed', Expr)
+-- vars: list of strings currently in scope.
+
+pick_name s used =
+  let pool = ["a", "b", "c", "d", "e"]
+  let (s1, idx) = rand_in s 0 4
+  let nm = ix pool idx
+  if member_str nm used then pick_name s1 used
+  else (s1, nm)
+
+ix xs i =
+  if i == 0 then head xs
+  else ix (tail xs) (i - 1)
+
+member_str s xs =
+  if length xs == 0 then false
+  else if head xs == s then true
+  else member_str s (tail xs)
+
+-- We bias expression generation by depth: at depth 0 only leaves.
+gen_expr s bd ed vars =
+  if ed <= 0 then gen_leaf s vars
+  else
+    -- 6 buckets: lit, var, add, sub, mul, if/let
+    let max_bucket = if bd > 0 && length vars < 5 then 6 else 5
+    let var_bucket = if length vars == 0 then 1 else 2
+    let (s1, k) = rand_in s 0 max_bucket
+    if k == 0 then gen_leaf s1 vars
+    else if k == 1 && length vars > 0 then gen_var s1 vars
+    else if k == 2 then gen_binop s1 bd ed vars "Add"
+    else if k == 3 then gen_binop s1 bd ed vars "Sub"
+    else if k == 4 then gen_binop s1 bd ed vars "Mul"
+    else if k == 5 then gen_if s1 bd ed vars
+    else gen_let s1 bd ed vars
+
+gen_leaf s vars =
+  -- 50/50 lit vs var if any var is in scope, else lit
+  if length vars == 0 then
+    let (s1, n) = rand_in s (0 - 20) 20
+    (s1, Lit n)
+  else
+    let (s1, k) = rand_in s 0 1
+    if k == 0 then
+      let (s2, n) = rand_in s1 (0 - 20) 20
+      (s2, Lit n)
+    else gen_var s1 vars
+
+gen_var s vars =
+  let (s1, i) = rand_in s 0 (length vars - 1)
+  (s1, Var (ix vars i))
+
+gen_binop s bd ed vars op =
+  let (s1, l) = gen_expr s bd (ed - 1) vars
+  let (s2, r) = gen_expr s1 bd (ed - 1) vars
+  if op == "Add" then (s2, Add l r)
+  else if op == "Sub" then (s2, Sub l r)
+  else (s2, Mul l r)
+
+gen_if s bd ed vars =
+  let (s1, a) = gen_expr s bd (ed - 1) vars
+  let (s2, b) = gen_expr s1 bd (ed - 1) vars
+  let (s3, t) = gen_expr s2 bd (ed - 1) vars
+  let (s4, e) = gen_expr s3 bd (ed - 1) vars
+  (s4, IfLt a b t e)
+
+gen_let s bd ed vars =
+  let (s1, nm) = pick_name s vars
+  let (s2, bound) = gen_expr s1 (bd - 1) (ed - 1) vars
+  let new_vars = cons nm vars
+  let (s3, body) = gen_expr s2 (bd - 1) (ed - 1) new_vars
+  (s3, Let nm bound body)
+
+-- ---------- pretty-printer ----------
+-- We always parenthesize binary ops to avoid relying on operator-precedence
+-- decisions in both evaluators.
+
+pp e = match e
+  | Lit n -> show n
+  | Var nm -> nm
+  | Add l r -> cat ["(", pp l, " + ", pp r, ")"]
+  | Sub l r -> cat ["(", pp l, " - ", pp r, ")"]
+  | Mul l r -> cat ["(", pp l, " * ", pp r, ")"]
+  | Let nm bound body -> cat ["(let ", nm, " = ", pp bound, " in ", pp body, ")"]
+  | IfLt a b t e -> cat ["(if ", pp a, " < ", pp b, " then ", pp t, " else ", pp e, ")"]
+
+-- ---------- side interpreter ----------
+-- env = list of (name, value) tuples.
+-- Pattern: linear scan; latest binding wins.
+
+env_lookup env nm =
+  if length env == 0 then 0
+  else
+    let (k, v) = head env
+    if k == nm then v
+    else env_lookup (tail env) nm
+
+eval e env = match e
+  | Lit n -> n
+  | Var nm -> env_lookup env nm
+  | Add l r -> eval l env + eval r env
+  | Sub l r -> eval l env - eval r env
+  | Mul l r -> eval l env * eval r env
+  | Let nm bound body ->
+      let v = eval bound env
+      eval body (cons (nm, v) env)
+  | IfLt a b t e ->
+      if eval a env < eval b env then eval t env
+      else eval e env
+
+-- ---------- compile-and-run ----------
+-- Emit `main = <pp e>` to a file; compile; run; capture exit code AND the
+-- printed value (we print it from the generated program so we can read it).
+--
+-- Convention: generated program is
+--   main =
+--     let v = <expr>
+--     let _ = print (show v)
+--     0
+-- exit code 0, and stdout = "<value>\n"
+
+emit_program e path =
+  let body = pp e
+  let src = cat [
+    "-- diff_fuzz auto-generated\n",
+    "main =\n",
+    "  let v = ", body, "\n",
+    "  let _ = print (show v)\n",
+    "  0\n"]
+  write_file path src
+
+run_compiled path =
+  let log = "/tmp/diff_fuzz_compile.log"
+  let out = "/tmp/diff_fuzz_run.out"
+  let _ = shell (cat ["rm -f ", log, " ", out])
+  let compile_ec = trim (shell (cat ["./rail_native ", path, " > ", log, " 2>&1; echo $?"]))
+  if parse_int compile_ec != 0 then ("COMPILE_ERR", 0)
+  else
+    let _ = shell (cat ["cp /tmp/rail_out /tmp/diff_fuzz_bin"])
+    let run_ec = trim (shell (cat ["/tmp/diff_fuzz_bin > ", out, " 2>&1; echo $?"]))
+    if parse_int run_ec != 0 then (cat ["RUN_ERR=", run_ec], 0)
+    else
+      let raw = shell (cat ["cat ", out])
+      let txt = trim raw
+      ("OK", parse_int txt)
+
+-- ---------- per-program comparison ----------
+
+cmp_one e idx =
+  let path = cat ["/tmp/diff_fuzz_", show idx, ".rail"]
+  let _ = emit_program e path
+  let (status, native_val) = run_compiled path
+  let interp_val = eval e []
+  if status != "OK" then
+    -- Compile/run failed; this isn't a *miscompilation* divergence but is
+    -- worth surfacing.
+    (cat ["[", show idx, "] ", status, "  interp=", show interp_val, "  src=", pp e], false, false)
+  else if native_val == interp_val then
+    (cat ["[", show idx, "] OK  v=", show native_val], true, true)
+  else
+    (cat ["[", show idx, "] DIVERGE  native=", show native_val, "  interp=", show interp_val, "\n     src: ", pp e], false, true)
+
+-- ---------- main driver ----------
+
+get_int_opt argv key def =
+  if length argv == 0 then def
+  else
+    let h = head argv
+    let prefix = cat ["--", key, "="]
+    if starts_with prefix h then
+      let v = str_sub h (length prefix) (length h - length prefix)
+      parse_int v
+    else get_int_opt (tail argv) key def
+
+run_loop n bd ed s idx ok diverge compile_err =
+  if idx >= n then (ok, diverge, compile_err)
+  else
+    let (s1, e) = gen_expr s bd ed []
+    let (msg, agreed, compiled) = cmp_one e idx
+    let _ = print msg
+    let nok = if agreed then ok + 1 else ok
+    let nd = if compiled && (agreed == false) then diverge + 1 else diverge
+    let nc = if compiled == false then compile_err + 1 else compile_err
+    run_loop n bd ed s1 (idx + 1) nok nd nc
+
+main =
+  let seed = get_int_opt (tail args) "seed" 1
+  let n = get_int_opt (tail args) "n" 50
+  let _ = print (cat ["diff_fuzz v0  seed=", show seed, "  n=", show n])
+
+  let (ok, diverge, compile_err) = run_loop n 3 4 seed 0 0 0 0
+
+  let _ = print ""
+  let _ = print (cat [
+    "results: ", show ok, " agree  /  ",
+    show diverge, " DIVERGENCE  /  ",
+    show compile_err, " compile-or-run-error  /  ",
+    show n, " total"])
+  if diverge == 0 then 0 else 2
