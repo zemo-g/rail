@@ -234,9 +234,15 @@ _rail_add:
     lea rax, [rdi-1]
     ret
 .Ladd_heap:
-    # Heap: check for string concat or float add
+    # Heap: check for string concat, float+float add, or float+int mixed add.
+    # rdi is known heap (low bit 0); rsi may be heap or tagged-int.
     push rbp
     mov rbp, rsp
+    # If rsi is tagged-int (low bit 1), this is mixed float+int (e.g., 0.0 + i).
+    # Promote rsi to a double and use the float path. (Agent B 2026-05-14:
+    # closes t106 mixed_float_int_op cascade on x86 once float_arr_set lands.)
+    test rsi, 1
+    jnz .Ladd_mixed_fi
     mov rax, [rsi]
     cmp rax, 6
     je .Ladd_float
@@ -248,6 +254,20 @@ _rail_add:
     sub rsp, 16
     movsd xmm0, [rsi+8]
     movsd xmm1, [rdi+8]
+    addsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Ladd_mixed_fi:
+    # rdi = boxed float, rsi = tagged int
+    sub rsp, 16
+    movsd xmm0, [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
     addsd xmm0, xmm1
     mov rdi, 16
     call _rail_alloc
@@ -1351,5 +1371,359 @@ _rail_str_split:
     # Reverse
     mov rdi, rax
     call _rail_reverse
+    leave
+    ret
+
+# === Float-arr + numeric parse (Agent B, 2026-05-14) =========================
+# Mirrors ARM64 contracts from compile.rail (rfarrnew/get/set/tof32/fromf32).
+# Unblocks: parse_float / sci_int_exp / sci_frac / f32_io_roundtrip /
+# mixed_float_int_op / tensor_prims / tensor_rank / tensor_slice /
+# tensor_layer_norm.
+#
+# Float ABI on x86 (different from ARM64): floats are HEAP-BOXED as a 16-byte
+# object `[qword tag=6, qword double-bits]`. Pointers move in GP regs (rax,
+# rdi, …); the unboxed double lives at offset +8. Ints are tagged
+# `(val<<1)|1`. Where ARM64 returns raw double bits in x0 after `fmov x0, d0`,
+# x86 returns a pointer to a fresh `[6, double]` box.
+#
+# Float-array layout matches the existing `arr_new` shape so `arr_len` works
+# uniformly: `[qword tag=7, qword length, double e0, double e1, …]`. Elements
+# are raw doubles inline; get allocates a fresh `[6, double]` box, set unboxes
+# from a boxed argument. Equivalent to the ARM64 packed-doubles layout once
+# the length-header word is accounted for.
+
+# ── _to_int / _float_to_int : boxed float → tagged int (truncate) ────────────
+# rdi = boxed float pointer ([6, double] @ +8)
+# rax = ((trunc xmm0) << 1) | 1
+.global _to_int
+_to_int:
+    movsd xmm0, qword ptr [rdi+8]
+    cvttsd2si rax, xmm0
+    lea rax, [rax*2+1]
+    ret
+
+.global _float_to_int
+_float_to_int:
+    movsd xmm0, qword ptr [rdi+8]
+    cvttsd2si rax, xmm0
+    lea rax, [rax*2+1]
+    ret
+
+# ── _to_float / _int_to_float : tagged int → boxed float ─────────────────────
+# rdi = tagged int. rax = pointer to fresh [6, double] box.
+.global _to_float
+_to_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+.global _int_to_float
+_int_to_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+# ── _parse_float : C-string → boxed float ────────────────────────────────────
+# rdi = char* (already a raw C-string on x86; no _str_unwrap needed unlike
+# ARM64). rax = pointer to fresh [6, double] box. Uses libc strtod for IEEE
+# parse (handles "1e6", "5.0e2", "-3.25", etc.). NULL endptr — accepts the
+# whole string; non-numeric tails silently truncate.
+.global _parse_float
+_parse_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    xor rsi, rsi
+    call strtod@PLT
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+# ── _show_float : boxed float → C-string ─────────────────────────────────────
+# rdi = boxed float pointer. _rail_show already dispatches on the tag-6
+# header, so we just forward. (User code that calls show_float gets the
+# same %.15g output _rail_show would produce.)
+.global _show_float
+_show_float:
+    jmp _rail_show
+
+# ── _fneg / _fsqrt / _fabs : boxed float → boxed float ───────────────────────
+# Allocate a fresh box each call (functional, no in-place mutation).
+.global _fneg
+_fneg:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    movsd xmm0, qword ptr [rdi+8]
+    pxor xmm1, xmm1
+    subsd xmm1, xmm0
+    movsd [rbp-16], xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+.global _fsqrt
+_fsqrt:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    movsd xmm0, qword ptr [rdi+8]
+    sqrtsd xmm0, xmm0
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+.global _fabs
+_fabs:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    movsd xmm0, qword ptr [rdi+8]
+    # Clear the sign bit by AND with 0x7FFFFFFFFFFFFFFF
+    mov rax, 0x7FFFFFFFFFFFFFFF
+    movq xmm1, rax
+    andpd xmm0, xmm1
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+# ── _float_arr_new : size_tagged, init_boxed → boxed float-array ─────────────
+# rdi = size (tagged int), rsi = init (boxed float pointer)
+# Layout: [tag=7, length, d0, d1, …] — same header as _rail_arr_new so
+# `arr_len` works uniformly.
+.global _float_arr_new
+_float_arr_new:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    sar rdi, 1                # untag size
+    mov [rbp-8], rdi          # save size (untagged)
+    movsd xmm0, qword ptr [rsi+8]
+    movsd [rbp-24], xmm0      # save init double
+    lea rdi, [rdi*8+16]       # size*8 + 16-byte header
+    call _rail_alloc
+    mov [rbp-16], rax         # save buffer
+    mov qword ptr [rax], 7
+    mov rcx, [rbp-8]
+    mov [rax+8], rcx          # length (untagged)
+    movsd xmm0, qword ptr [rbp-24]
+    xor rcx, rcx              # i = 0
+.Lfan_loop:
+    cmp rcx, [rbp-8]
+    jae .Lfan_done
+    lea rdx, [rcx+2]          # element offset = (i+2)*8
+    movsd qword ptr [rax+rdx*8], xmm0
+    inc rcx
+    jmp .Lfan_loop
+.Lfan_done:
+    mov rax, [rbp-16]
+    leave
+    ret
+
+# ── _float_arr_get : arr, idx_tagged → boxed float ───────────────────────────
+# rdi = arr pointer, rsi = idx (tagged int)
+# Loads raw double from inline slot, allocates a fresh [6, double] box.
+.global _float_arr_get
+_float_arr_get:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rsi, 1                # untag idx
+    add rsi, 2                # account for [tag, length] header
+    movsd xmm0, qword ptr [rdi+rsi*8]
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+# ── _float_arr_set : arr, idx_tagged, val_boxed → tagged 1 ───────────────────
+# rdi = arr, rsi = idx (tagged), rdx = boxed float pointer.
+# Unbox rdx, store raw double at slot, return tagged 1 (=3).
+.global _float_arr_set
+_float_arr_set:
+    movsd xmm0, qword ptr [rdx+8]
+    sar rsi, 1
+    add rsi, 2
+    movsd qword ptr [rdi+rsi*8], xmm0
+    mov rax, 3
+    ret
+
+# ── _float_arr_len : arr → tagged length ─────────────────────────────────────
+# Same as _rail_arr_len, just exposed under the float name (stdlib/tensor.rail
+# calls `float_arr_len` explicitly and it falls through to user-symbol emit).
+.global _float_arr_len
+_float_arr_len:
+    mov rax, [rdi+8]
+    lea rax, [rax*2+1]
+    ret
+
+# ── _float_arr_to_f32_file : path, arr, n_tagged → tagged 1 (or tagged 0 on err)
+# rdi = path (C string), rsi = arr, rdx = n (tagged).
+# Down-converts each double to float32 via cvtsd2ss, writes a contiguous
+# little-endian f32 blob via fwrite. Returns tagged 1 on success, tagged 0
+# (=1) on error. Mirrors the ARM64 syscall-based implementation without the
+# direct write(2) syscall (uses libc fopen/fwrite/fclose instead).
+.global _float_arr_to_f32_file
+_float_arr_to_f32_file:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi          # path
+    mov [rbp-16], rsi         # arr
+    sar rdx, 1                # untag n
+    mov [rbp-24], rdx         # n (untagged)
+    # fopen(path, "w")
+    mov rdi, [rbp-8]
+    lea rsi, [rip+_mode_w]
+    call fopen@PLT
+    test rax, rax
+    jz .Lf32w_err
+    mov [rbp-32], rax         # FILE*
+    # Allocate scratch buffer of n*4 bytes (one f32 per element)
+    mov rdi, [rbp-24]
+    shl rdi, 2
+    test rdi, rdi
+    jz .Lf32w_close_ok        # n==0 → success, nothing to write
+    call malloc@PLT
+    test rax, rax
+    jz .Lf32w_close_err
+    mov [rbp-40], rax         # buf
+    # Fill buf: i = 0; while i < n: buf[i] = (float)arr[i]
+    xor rcx, rcx
+.Lf32w_fill:
+    cmp rcx, [rbp-24]
+    jae .Lf32w_write
+    mov rax, [rbp-16]
+    lea rdx, [rcx+2]
+    movsd xmm0, qword ptr [rax+rdx*8]
+    cvtsd2ss xmm0, xmm0
+    mov rax, [rbp-40]
+    movss dword ptr [rax+rcx*4], xmm0
+    inc rcx
+    jmp .Lf32w_fill
+.Lf32w_write:
+    mov rdi, [rbp-40]         # buf
+    mov rsi, 4                # element size
+    mov rdx, [rbp-24]         # nmemb
+    mov rcx, [rbp-32]         # FILE*
+    call fwrite@PLT
+    mov rdi, [rbp-40]
+    call free@PLT
+.Lf32w_close_ok:
+    mov rdi, [rbp-32]
+    call fclose@PLT
+    mov rax, 3                # tagged 1
+    leave
+    ret
+.Lf32w_close_err:
+    mov rdi, [rbp-32]
+    call fclose@PLT
+.Lf32w_err:
+    mov rax, 1                # tagged 0
+    leave
+    ret
+
+# ── _float_arr_from_f32_file : path, arr, n_tagged → tagged 1 (or 0 on err) ──
+# rdi = path, rsi = arr, rdx = n (tagged).
+# Reads n*4 bytes of f32 via fread, expands each to f64 via cvtss2sd, stores
+# into the float-array slots. Inverse of _float_arr_to_f32_file.
+.global _float_arr_from_f32_file
+_float_arr_from_f32_file:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi
+    mov [rbp-16], rsi
+    sar rdx, 1
+    mov [rbp-24], rdx
+    mov rdi, [rbp-8]
+    lea rsi, [rip+_mode_r]
+    call fopen@PLT
+    test rax, rax
+    jz .Lf32r_err
+    mov [rbp-32], rax
+    mov rdi, [rbp-24]
+    shl rdi, 2
+    test rdi, rdi
+    jz .Lf32r_close_ok
+    call malloc@PLT
+    test rax, rax
+    jz .Lf32r_close_err
+    mov [rbp-40], rax         # buf
+    mov rdi, [rbp-40]
+    mov rsi, 4
+    mov rdx, [rbp-24]
+    mov rcx, [rbp-32]
+    call fread@PLT
+    # Expand f32 → f64 into arr
+    xor rcx, rcx
+.Lf32r_load:
+    cmp rcx, [rbp-24]
+    jae .Lf32r_done
+    mov rax, [rbp-40]
+    movss xmm0, dword ptr [rax+rcx*4]
+    cvtss2sd xmm0, xmm0
+    mov rax, [rbp-16]
+    lea rdx, [rcx+2]
+    movsd qword ptr [rax+rdx*8], xmm0
+    inc rcx
+    jmp .Lf32r_load
+.Lf32r_done:
+    mov rdi, [rbp-40]
+    call free@PLT
+.Lf32r_close_ok:
+    mov rdi, [rbp-32]
+    call fclose@PLT
+    mov rax, 3
+    leave
+    ret
+.Lf32r_close_err:
+    mov rdi, [rbp-32]
+    call fclose@PLT
+.Lf32r_err:
+    mov rax, 1
     leave
     ret
