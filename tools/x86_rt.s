@@ -196,6 +196,10 @@ _rail_show:
     ret
 
 # ── String append ────────────────────────────────────────────────────────────
+# O(n+m) via strlen + memcpy. The previous strcpy+strcat sequence walked
+# the destination twice (once on strcpy's implicit length, again on strcat's
+# strlen scan), so chained `s = s + chunk` accumulators were O(n^2). See
+# rail_join_O_n2_fixed memory entry for the ARM64-side history.
 .global _rail_str_append
 _rail_str_append:
     push rbp
@@ -207,18 +211,29 @@ _rail_str_append:
     mov [rbp-24], rax       # len1
     mov rdi, [rbp-16]
     call strlen@PLT
+    mov [rbp-32], rax       # len2
     add rax, [rbp-24]
-    add rax, 1
+    add rax, 1              # len1 + len2 + 1 (for NUL)
     mov rdi, rax
     call malloc@PLT
-    mov [rbp-32], rax       # result buffer
+    mov [rbp-40], rax       # result buffer
+    # memcpy(buf, s1, len1)
     mov rdi, rax
     mov rsi, [rbp-8]
-    call strcpy@PLT
-    mov rdi, [rbp-32]
+    mov rdx, [rbp-24]
+    call memcpy@PLT
+    # memcpy(buf + len1, s2, len2)
+    mov rdi, [rbp-40]
+    add rdi, [rbp-24]
     mov rsi, [rbp-16]
-    call strcat@PLT
-    mov rax, [rbp-32]
+    mov rdx, [rbp-32]
+    call memcpy@PLT
+    # write trailing NUL at buf[len1 + len2]
+    mov rax, [rbp-40]
+    mov rcx, [rbp-24]
+    add rcx, [rbp-32]
+    mov byte ptr [rax+rcx], 0
+    mov rax, [rbp-40]
     leave
     ret
 
