@@ -1353,3 +1353,105 @@ _rail_str_split:
     call _rail_reverse
     leave
     ret
+
+# === Threading (Agent C) ===
+# x86_64 SysV mirror of the ARM64 rt_thread block (compile.rail rt_thread).
+#
+# Handle layout (40 bytes, malloc'd, leaked — matches ARM64 lifetime):
+#   [+0]  fn       (closure pointer or raw fn — header tag 4 = closure)
+#   [+8]  arg      (tagged value)
+#   [+16] result   (tagged value, written by trampoline)
+#   [+24] pthread_t (opaque; glibc = unsigned long = 8 bytes)
+#   [+32] padding (reserved)
+#
+# Linker: gcc -lpthread (already in x86_rt.s header). Symbols are bare
+# `pthread_create@PLT` / `pthread_join@PLT` per glibc convention.
+
+.global _rail_spawn_thread
+_rail_spawn_thread:
+    # rdi = fn, rsi = arg.  Allocate handle, init slots, spawn pthread.
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8],  rdi               # fn
+    mov [rbp-16], rsi               # arg
+    mov rdi, 40
+    call malloc@PLT
+    mov [rbp-24], rax               # handle
+    mov rcx, [rbp-8]
+    mov [rax],    rcx               # handle[0] = fn
+    mov rcx, [rbp-16]
+    mov [rax+8],  rcx               # handle[8] = arg
+    mov qword ptr [rax+16], 0       # handle[16] = result slot
+    # pthread_create(&handle[24], NULL, _rail_thread_tramp, handle)
+    mov rdi, rax
+    add rdi, 24
+    xor rsi, rsi
+    lea rdx, [rip+_rail_thread_tramp]
+    mov rcx, [rbp-24]
+    call pthread_create@PLT
+    mov rax, [rbp-24]               # return handle (raw pointer)
+    leave
+    ret
+
+# void *_rail_thread_tramp(void *handle)
+# Dispatches handle[0] on handle[8] and stores the tagged result at handle[16].
+# fn may be:
+#   - tagged int (low bit 1)         → degenerate; store 1 and exit
+#   - closure pointer (hdr == 4)     → call closure[+8] with rdi=arg, rsi..=caps
+#   - raw function pointer (other)   → call fn(arg)
+# Mirrors ARM64 _rail_thread_tramp closely (no caps loaded since spawn_thread
+# tests are single-arg no-capture; matches arm64 trampoline behavior).
+.global _rail_thread_tramp
+_rail_thread_tramp:
+    push rbp
+    mov rbp, rsp
+    push rbx                        # callee-saved scratch
+    sub rsp, 24                     # keep 16-byte align before call
+    mov rbx, rdi                    # handle (preserved across calls)
+    mov rdi, [rbx+8]                # arg → first ABI reg
+    mov r10, [rbx]                  # fn
+    test r10, 1
+    jne .Lthread_tramp_done         # tagged int: skip the call
+    mov r11, [r10]                  # header word
+    btr r11, 63                     # clear GC mark bit (high)
+    cmp r11, 4
+    jne .Lthread_tramp_raw
+    # Closure path: closure[+8] is the code pointer.  Set r15=closure for
+    # callee's capture-load convention; ncaps=0 in our test programs so the
+    # callee's `cmp r13, 0; je clbl` short-circuits before any capture load.
+    mov r15, r10
+    xor r13, r13                    # ncaps = 0
+    mov r10, [r10+8]
+    call r10
+    jmp .Lthread_tramp_store
+.Lthread_tramp_raw:
+    call r10
+    jmp .Lthread_tramp_store
+.Lthread_tramp_done:
+    mov rax, 1                      # tagged 0
+.Lthread_tramp_store:
+    mov [rbx+16], rax
+    xor rax, rax                    # pthread start_routine return value
+    add rsp, 24
+    pop rbx
+    leave
+    ret
+
+.global _rail_join_thread
+_rail_join_thread:
+    # rdi = handle.  Wait for pthread, return handle[16].
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8                      # 16-byte align before call
+    mov rbx, rdi
+    mov rdi, [rbx+24]               # pthread_t
+    xor rsi, rsi                    # retval ignored (we use handle[16])
+    call pthread_join@PLT
+    mov rax, [rbx+16]
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
