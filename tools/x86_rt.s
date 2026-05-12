@@ -1115,3 +1115,241 @@ _rail_rc_alloc:
 .global _rail_rc_release
 _rail_rc_release:
     ret
+
+# ── String runtime: find/contains/sub/replace/split ─────────────────────────
+# ARM64 oracle: compile.rail rt_string (sfind/scont/ssub/srepl/ssplit).
+# x86 strings are raw char* (no heap wrapper), so no str_unwrap/wrap_str
+# needed; we call glibc strstr/strlen/strcpy/memcpy/malloc directly.
+#
+# Arg passing (SysV ABI):
+#   _rail_str_find(rdi=needle, rsi=haystack)
+#   _rail_str_contains(rdi=needle, rsi=haystack)
+#   _rail_str_sub(rdi=str, rsi=start_tagged, rdx=len_tagged)
+#   _rail_str_replace(rdi=find, rsi=replace, rdx=str)
+#   _rail_str_split(rdi=delim, rsi=str)
+
+# _rail_str_find(needle, haystack) -> tagged int offset, or tagged -1
+.global _rail_str_find
+_rail_str_find:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    mov [rbp-8], rsi         # save haystack
+    # strstr(haystack, needle) — glibc: rdi=haystack, rsi=needle
+    mov rax, rdi             # swap: rax = needle
+    mov rdi, rsi             # rdi = haystack
+    mov rsi, rax             # rsi = needle
+    call strstr@PLT
+    test rax, rax
+    jz .Lsf_notfound
+    sub rax, [rbp-8]         # offset = match - haystack
+    lea rax, [rax*2+1]       # tag
+    leave
+    ret
+.Lsf_notfound:
+    mov rax, -1
+    lea rax, [rax*2+1]       # tag -1 -> -1 (0xFFFFFFFFFFFFFFFF)
+    leave
+    ret
+
+# _rail_str_contains(needle, haystack) -> tagged bool (3=true, 1=false)
+.global _rail_str_contains
+_rail_str_contains:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    # strstr(haystack, needle)
+    mov rax, rdi             # rax = needle
+    mov rdi, rsi             # rdi = haystack
+    mov rsi, rax             # rsi = needle
+    call strstr@PLT
+    test rax, rax
+    setne al
+    movzx rax, al
+    lea rax, [rax*2+1]       # 0 -> 1 (false), 1 -> 3 (true)
+    leave
+    ret
+
+# _rail_str_sub(str, start_tagged, len_tagged) -> new string (untagged char*)
+.global _rail_str_sub
+_rail_str_sub:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    sar rsi, 1               # untag start
+    sar rdx, 1               # untag len
+    mov [rbp-8], rdi         # save str
+    mov [rbp-16], rsi        # save start
+    mov [rbp-24], rdx        # save len
+    # malloc(len + 1)
+    mov rdi, rdx
+    inc rdi
+    call malloc@PLT
+    mov [rbp-32], rax        # save dest buffer
+    # memcpy(dest, str+start, len)
+    mov rdi, rax             # dest
+    mov rsi, [rbp-8]
+    add rsi, [rbp-16]        # src = str + start
+    mov rdx, [rbp-24]        # n = len
+    call memcpy@PLT
+    # null-terminate at dest[len]
+    mov rax, [rbp-32]
+    mov rcx, [rbp-24]
+    mov byte ptr [rax+rcx], 0
+    mov rax, [rbp-32]
+    leave
+    ret
+
+# _rail_str_replace(find, replace, str) -> new string (replaces all occurrences)
+# Allocate generous buffer: 4 * len(str) + 64 (matches ARM64 heuristic).
+# This works for replace strings up to ~4x the find string; long replacements
+# could in theory overflow but the ARM64 oracle has the same limit.
+.global _rail_str_replace
+_rail_str_replace:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 96
+    mov [rbp-8], rdi         # find
+    mov [rbp-16], rsi        # replace
+    mov [rbp-24], rdx        # str (cursor advances)
+    # str_len = strlen(str)
+    mov rdi, rdx
+    call strlen@PLT
+    mov [rbp-32], rax        # str_len
+    # find_len = strlen(find)
+    mov rdi, [rbp-8]
+    call strlen@PLT
+    mov [rbp-40], rax        # find_len
+    # replace_len = strlen(replace)
+    mov rdi, [rbp-16]
+    call strlen@PLT
+    mov [rbp-48], rax        # replace_len
+    # alloc buf = malloc(4*str_len + 64)
+    mov rdi, [rbp-32]
+    shl rdi, 2
+    add rdi, 64
+    call malloc@PLT
+    mov [rbp-56], rax        # buf
+    mov qword ptr [rbp-64], 0  # buf_off
+    mov rax, [rbp-24]
+    mov [rbp-72], rax        # cursor = str
+.Lsr_loop:
+    # strstr(cursor, find)
+    mov rdi, [rbp-72]
+    mov rsi, [rbp-8]
+    call strstr@PLT
+    test rax, rax
+    jz .Lsr_rest
+    mov [rbp-80], rax        # match_ptr
+    # Copy cursor..match_ptr to buf+buf_off
+    mov rsi, [rbp-72]
+    mov rdx, rax
+    sub rdx, rsi             # gap_len = match - cursor
+    mov rdi, [rbp-56]
+    add rdi, [rbp-64]        # dest = buf + buf_off
+    mov [rbp-88], rdx        # save gap_len
+    call memcpy@PLT
+    # buf_off += gap_len
+    mov rax, [rbp-88]
+    add [rbp-64], rax
+    # Copy replace to buf+buf_off
+    mov rdi, [rbp-56]
+    add rdi, [rbp-64]
+    mov rsi, [rbp-16]
+    mov rdx, [rbp-48]
+    call memcpy@PLT
+    # buf_off += replace_len
+    mov rax, [rbp-48]
+    add [rbp-64], rax
+    # cursor = match_ptr + find_len
+    mov rax, [rbp-80]
+    add rax, [rbp-40]
+    mov [rbp-72], rax
+    jmp .Lsr_loop
+.Lsr_rest:
+    # Copy remainder of cursor (including null terminator) to buf+buf_off
+    mov rdi, [rbp-56]
+    add rdi, [rbp-64]
+    mov rsi, [rbp-72]
+.Lsr_cp3:
+    movzx eax, byte ptr [rsi]
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    test al, al
+    jnz .Lsr_cp3
+    mov rax, [rbp-56]
+    leave
+    ret
+
+# _rail_str_split(delim, str) -> Rail list of strings (multi-char delimiter)
+# Iterate strstr(cursor, delim); for each hit, cons substring onto acc.
+# After loop, cons remainder, then reverse.
+.global _rail_str_split
+_rail_str_split:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 64
+    mov [rbp-8], rdi         # delim
+    mov [rbp-16], rsi        # str (also initial cursor)
+    # delim_len
+    call strlen@PLT
+    mov [rbp-24], rax        # delim_len
+    lea rax, [rip+_rail_nil]
+    mov [rbp-32], rax        # acc = nil
+    mov rax, [rbp-16]
+    mov [rbp-40], rax        # cursor = str
+.Lssp_loop:
+    mov rdi, [rbp-40]
+    mov rsi, [rbp-8]
+    call strstr@PLT
+    test rax, rax
+    jz .Lssp_last
+    mov [rbp-48], rax        # match_ptr
+    # seg_len = match_ptr - cursor
+    mov rcx, rax
+    sub rcx, [rbp-40]
+    mov [rbp-56], rcx        # seg_len
+    # alloc seg_len+1
+    lea rdi, [rcx+1]
+    call malloc@PLT
+    mov [rbp-64], rax        # seg_buf
+    # memcpy(seg_buf, cursor, seg_len)
+    mov rdi, rax
+    mov rsi, [rbp-40]
+    mov rdx, [rbp-56]
+    call memcpy@PLT
+    # null-terminate
+    mov rax, [rbp-64]
+    mov rcx, [rbp-56]
+    mov byte ptr [rax+rcx], 0
+    # cons(seg_buf, acc)
+    mov rdi, [rbp-64]
+    mov rsi, [rbp-32]
+    call _rail_cons
+    mov [rbp-32], rax
+    # cursor = match_ptr + delim_len
+    mov rax, [rbp-48]
+    add rax, [rbp-24]
+    mov [rbp-40], rax
+    jmp .Lssp_loop
+.Lssp_last:
+    # Cons remainder (everything from cursor)
+    mov rdi, [rbp-40]
+    call strlen@PLT
+    lea rdi, [rax+1]
+    mov [rbp-56], rax        # rem_len (without null)
+    call malloc@PLT
+    mov [rbp-64], rax
+    mov rdi, rax
+    mov rsi, [rbp-40]
+    call strcpy@PLT
+    mov rdi, [rbp-64]
+    mov rsi, [rbp-32]
+    call _rail_cons
+    mov [rbp-32], rax
+    # Reverse
+    mov rdi, rax
+    call _rail_reverse
+    leave
+    ret
