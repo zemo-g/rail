@@ -1,0 +1,292 @@
+-- stdlib/thumb2.rail - Minimal ARM Cortex-M Thumb-2 disassembler in Rail.
+--
+-- Scope: control-flow + function-boundary instructions. Enough to walk
+-- a call graph from a known entry point (e.g. Reset_Handler), identify
+-- function prologues / epilogues, and follow BL targets.
+--
+-- Decoded forms:
+--   16-bit:  B (uncond), Bcond, BX, BLX(reg), POP{..,PC}, PUSH{..,LR},
+--            CBZ/CBNZ, NOP, BKPT, UDF, SVC
+--   32-bit:  BL (long branch), B.W (uncond), Bcond.W, NOP.W, UDF.W
+--
+-- Anything not in those classes is emitted as "?? raw=<hex>" so a walker
+-- can keep going without losing alignment.
+--
+-- Public API:
+--   t2_inst_len buf off               -> 2 or 4 (instruction byte length)
+--   t2_decode buf off                 -> [kind, target, length, op_hi, op_lo]
+--   t2_decode_str buf off             -> human-readable line
+--   t2_disasm buf base limit max      -> prints up to `max` instructions
+--
+-- kind codes (in t2_decode result[0]):
+--   0  unhandled       no target (-1), no link
+--   1  B uncond        target = absolute address
+--   2  Bcond           target = absolute address, link=cond code in op_lo
+--   3  BL              target = absolute address (function call)
+--   4  B.W             target = absolute address
+--   5  Bcond.W         target = absolute address
+--   6  BX/BLX (reg)    target = -1 (register-indirect)
+--   7  POP {..,PC}     target = -1 (return via popped PC)
+--   8  PUSH {..,LR}    target = -1 (function entry candidate)
+--   9  CBZ/CBNZ        target = absolute address (forward only)
+--  10  NOP / NOP.W
+--  11  SVC / BKPT
+--  12  UDF / UDF.W
+--
+-- Uses only Rail builtins (bit_and/bit_or/bit_xor/shl/shr, arr_new/get/set,
+-- char_from_int, cat, print). No imports - keeps the module composable
+-- with anything else that already pulls in stdlib/bytes.rail.
+
+-- ---- Halfword reader ---------------------------------------------------
+
+t2_hw buf off =
+  let b0 = arr_get buf off
+  let b1 = arr_get buf (off + 1)
+  bit_or b0 (shl b1 8)
+
+-- ---- 32-bit-instruction predicate (ARMv7-M ARM A6.3) -------------------
+-- Bits [15:11] of the first halfword in {11101, 11110, 11111} -> 32-bit.
+
+t2_is_32bit_hw hw =
+  let b = bit_and (shr hw 11) 31
+  (b == 29) || (b == 30) || (b == 31)
+
+t2_inst_len buf off =
+  if t2_is_32bit_hw (t2_hw buf off) then 4 else 2
+
+-- ---- Sign-extend helpers ------------------------------------------------
+
+t2_sext_n v nbits =
+  let half = shl 1 (nbits - 1)
+  let mask = (shl 1 nbits) - 1
+  let m = bit_and v mask
+  if m >= half then m - (shl 1 nbits) else m
+
+-- ---- Decoder ------------------------------------------------------------
+-- Returns 5-element arr [kind, target, length, op_hi, op_lo].
+-- Caller can also recover the raw bytes from buf+off for printing.
+
+t2_make_result kind target length op_hi op_lo =
+  let r = arr_new 5 0
+  let _ = arr_set r 0 kind
+  let _ = arr_set r 1 target
+  let _ = arr_set r 2 length
+  let _ = arr_set r 3 op_hi
+  let _ = arr_set r 4 op_lo
+  r
+
+-- 32-bit BL/B.W/Bcond.W decoder.
+-- First halfword: 11110 S imm10
+--   bits 15..11 = 11110, bit 10 = S, bits 9..0 = imm10
+-- Second halfword: 1 X J1 X J2 imm11
+--   bits 15..14 = 10/11 + bit 12 distinguishes:
+--     11x1 -> BL  (bit 12 = 1, bit 14 = 1)
+--     10x1 -> B.W (bit 12 = 1, bit 14 = 0)
+--     10x0 -> Bcond.W (bit 12 = 0, bit 14 = 0)
+-- I1 = NOT(J1 XOR S);  I2 = NOT(J2 XOR S)
+-- offset = sext24((S<<24) | (I1<<23) | (I2<<22) | (imm10<<12) | (imm11<<1)) for BL/B.W
+--      or sext20((S<<20) | (J1<<19) | (J2<<18) | (imm6<<12) | (imm11<<1)) for Bcond.W
+
+t2_branch32 hi lo addr =
+  let s = bit_and (shr hi 10) 1
+  let imm10 = bit_and hi 1023
+  let bit15_lo = bit_and (shr lo 15) 1
+  let bit14 = bit_and (shr lo 14) 1
+  let bit12 = bit_and (shr lo 12) 1
+  let j1 = bit_and (shr lo 13) 1
+  let j2 = bit_and (shr lo 11) 1
+  let imm11 = bit_and lo 2047
+  -- ARMv7-M ARM A6.3: bit 15 of the low halfword separates branches/misc
+  -- (bit15=1) from data-processing (bit15=0). We only handle branches.
+  if bit15_lo == 0 then t2_make_result 0 (0 - 1) 4 hi lo
+  else if (bit14 == 0) && (bit12 == 0) then
+    -- Bcond.W (encoding T3): cond in hi[9:6], imm6 in hi[5:0].
+    --   imm32 = SignExtend(S:J2:J1:imm6:imm11:0, 21)  (note J2 before J1)
+    -- Cond 14 (AL) and 15 (predefined) are NOT Bcond.W - they overlap with
+    -- the branches/misc-control encoding for MSR/MRS/HINTs/etc. Treat as
+    -- unhandled so the caller doesn't follow a phantom branch.
+    let cond = bit_and (shr hi 6) 15
+    if (cond == 14) || (cond == 15) then t2_make_result 0 (0 - 1) 4 hi lo
+    else
+      let imm6 = bit_and hi 63
+      let raw = bit_or (bit_or (bit_or (shl s 20) (shl j2 19)) (bit_or (shl j1 18) (shl imm6 12))) (shl imm11 1)
+      let off_signed = t2_sext_n raw 21
+      let target = addr + 4 + off_signed
+      t2_make_result 5 target 4 hi lo
+  else
+    -- BL (T1, lo[14]=1) or B.W (T4, lo[14]=0). Both: I1=NOT(J1^S), I2=NOT(J2^S).
+    --   imm32 = SignExtend(S:I1:I2:imm10:imm11:0, 25)
+    let i1 = bit_xor (bit_xor j1 s) 1
+    let i2 = bit_xor (bit_xor j2 s) 1
+    let raw = bit_or (bit_or (bit_or (shl s 24) (shl i1 23)) (bit_or (shl i2 22) (shl imm10 12))) (shl imm11 1)
+    let off_signed = t2_sext_n raw 25
+    let target = addr + 4 + off_signed
+    if bit14 == 1 then t2_make_result 3 target 4 hi lo
+    else t2_make_result 4 target 4 hi lo
+
+-- 16-bit B unconditional: bits 15..11 = 11100, imm11 in bits 10..0
+t2_b16 hw addr =
+  let imm11 = bit_and hw 2047
+  let off_signed = t2_sext_n (shl imm11 1) 12
+  let target = addr + 4 + off_signed
+  t2_make_result 1 target 2 hw 0
+
+-- 16-bit Bcond: bits 15..12 = 1101, bits 11..8 = cond (0..13), imm8 in bits 7..0.
+-- cond = 14 means uncond (always); cond = 15 means SVC (handled separately).
+t2_bcond16 hw addr =
+  let cond = bit_and (shr hw 8) 15
+  if cond == 15 then
+    t2_make_result 11 (0 - 1) 2 hw 0          -- SVC
+  else
+    let imm8 = bit_and hw 255
+    let off_signed = t2_sext_n (shl imm8 1) 9
+    let target = addr + 4 + off_signed
+    t2_make_result 2 target 2 hw cond
+
+-- 16-bit BX/BLX register: 010001 11 L Rm (Rm 4 bits including high)
+-- Encoding: 0100 0111 0LMM Mmmm  where L=0 -> BX, L=1 -> BLX
+t2_bxblx hw =
+  let prefix = bit_and (shr hw 7) 511
+  if prefix == 142 then     -- 0b010001110 = 0x8E
+    t2_make_result 6 (0 - 1) 2 hw 0           -- BX
+  else if prefix == 143 then -- 0b010001111 = 0x8F
+    t2_make_result 6 (0 - 1) 2 hw 1           -- BLX (reg)
+  else
+    t2_make_result 0 (0 - 1) 2 hw 0
+
+-- 16-bit POP: 1011 110P reglist8.  P=1 means PC included -> return.
+t2_pop16 hw =
+  let pcbit = bit_and (shr hw 8) 1
+  if pcbit == 1 then t2_make_result 7 (0 - 1) 2 hw 0
+  else t2_make_result 0 (0 - 1) 2 hw 0
+
+-- 16-bit PUSH: 1011 010M reglist8.  M=1 means LR included -> prologue.
+t2_push16 hw =
+  let lrbit = bit_and (shr hw 8) 1
+  if lrbit == 1 then t2_make_result 8 (0 - 1) 2 hw 0
+  else t2_make_result 0 (0 - 1) 2 hw 0
+
+-- 16-bit CBZ/CBNZ encoding: 1011 op 0 1 i imm5[4:0] Rn[2:0]
+--   bits 15..12 = 1011, bit 11 = op (0 CBZ, 1 CBNZ), bits 10..9 = "01",
+--   bit 8 = i (high bit of immediate), bits 7..3 = imm5, bits 2..0 = Rn.
+-- target = PC + (i:imm5:0 << 1). Forward only.
+t2_cb16 hw addr =
+  let i = bit_and (shr hw 8) 1
+  let imm5 = bit_and (shr hw 3) 31
+  let off = (shl i 6) + (shl imm5 1)
+  let target = addr + 4 + off
+  t2_make_result 9 target 2 hw 0
+
+-- Top-level decoder.
+t2_decode buf off =
+  let hi = t2_hw buf off
+  if t2_is_32bit_hw hi then
+    let lo = t2_hw buf (off + 2)
+    -- 32-bit class: only branches matter for now. Bits 15..11 = 11110.
+    if bit_and (shr hi 11) 31 == 30 then t2_branch32 hi lo off
+    else t2_make_result 0 (0 - 1) 4 hi lo
+  else
+    let top4 = bit_and (shr hi 12) 15
+    let top5 = bit_and (shr hi 11) 31
+    let top7 = bit_and (shr hi 9) 127
+    let top9 = bit_and (shr hi 7) 511
+    if top5 == 28 then t2_b16 hi off              -- 11100xxxxxxxxxxx
+    else if top4 == 13 then t2_bcond16 hi off      -- 1101xxxxxxxxxxxx (incl SVC)
+    else if (top9 == 142) || (top9 == 143) then t2_bxblx hi
+    else if top7 == 89 then t2_cb16 hi off         -- 1011001 = CBZ
+    else if top7 == 93 then t2_cb16 hi off         -- 1011101 = CBNZ
+    else if top7 == 94 then t2_pop16 hi            -- 1011110x POP
+    else if top7 == 90 then t2_push16 hi           -- 1011010x PUSH
+    else if hi == 48896 then t2_make_result 10 (0 - 1) 2 hi 0   -- 0xBF00 NOP
+    else if (bit_and hi 65280) == 48896 then       -- BF00..BFFF: NOP/IT/HINT
+      t2_make_result 10 (0 - 1) 2 hi 0
+    else if (bit_and hi 65280) == 47616 then       -- BE00..BEFF: BKPT
+      t2_make_result 11 (0 - 1) 2 hi 0
+    else if (bit_and hi 65280) == 56832 then       -- DE00..DEFF: UDF
+      t2_make_result 12 (0 - 1) 2 hi 0
+    else t2_make_result 0 (0 - 1) 2 hi 0
+
+-- ---- Pretty-print -------------------------------------------------------
+
+t2_kind_name k =
+  if k == 0 then "?? "
+  else if k == 1 then "b   "
+  else if k == 2 then "b.  "
+  else if k == 3 then "bl  "
+  else if k == 4 then "b.w "
+  else if k == 5 then "b.w "
+  else if k == 6 then "bx  "
+  else if k == 7 then "pop "
+  else if k == 8 then "push"
+  else if k == 9 then "cbz "
+  else if k == 10 then "nop "
+  else if k == 11 then "svc "
+  else if k == 12 then "udf "
+  else "?   "
+
+t2_cond_name c =
+  if c == 0 then "eq" else if c == 1 then "ne"
+  else if c == 2 then "cs" else if c == 3 then "cc"
+  else if c == 4 then "mi" else if c == 5 then "pl"
+  else if c == 6 then "vs" else if c == 7 then "vc"
+  else if c == 8 then "hi" else if c == 9 then "ls"
+  else if c == 10 then "ge" else if c == 11 then "lt"
+  else if c == 12 then "gt" else if c == 13 then "le"
+  else if c == 14 then "al" else "??"
+
+t2_hex8_acc n i acc =
+  if i >= 8 then acc
+  else
+    let nib = bit_and (shr n ((7 - i) * 4)) 15
+    let c = if nib < 10 then char_from_int (48 + nib) else char_from_int (87 + nib)
+    t2_hex8_acc n (i + 1) (cat [acc, c])
+
+t2_hex8 n = t2_hex8_acc n 0 ""
+
+t2_hex4_acc n i acc =
+  if i >= 4 then acc
+  else
+    let nib = bit_and (shr n ((3 - i) * 4)) 15
+    let c = if nib < 10 then char_from_int (48 + nib) else char_from_int (87 + nib)
+    t2_hex4_acc n (i + 1) (cat [acc, c])
+
+t2_hex4 n = t2_hex4_acc n 0 ""
+
+t2_hex2 n =
+  let hi = bit_and (shr n 4) 15
+  let lo = bit_and n 15
+  let ch = if hi < 10 then char_from_int (48 + hi) else char_from_int (87 + hi)
+  let cl = if lo < 10 then char_from_int (48 + lo) else char_from_int (87 + lo)
+  cat [ch, cl]
+
+t2_decode_str buf off =
+  let r = t2_decode buf off
+  let kind = arr_get r 0
+  let target = arr_get r 1
+  let length = arr_get r 2
+  let op_hi = arr_get r 3
+  let op_lo = arr_get r 4
+  let bytes_str = if length == 2 then t2_hex4 op_hi
+                  else cat [t2_hex4 op_hi, " ", t2_hex4 op_lo]
+  let mnem = if kind == 2 then cat ["b.", t2_cond_name op_lo, "  "]
+             else if kind == 5 then cat ["b.", t2_cond_name (bit_and (shr op_hi 6) 15), ".w"]
+             else t2_kind_name kind
+  let operand = if target >= 0 then cat ["0x", t2_hex8 target]
+                else if kind == 6 then cat ["r", show (bit_and (shr op_hi 3) 15)]
+                else if kind == 7 || kind == 8 then "{...}"
+                else ""
+  cat ["0x", t2_hex8 off, "  ", bytes_str, "  ", mnem, " ", operand]
+
+-- Print up to `max` instructions starting at byte offset `base`.
+-- `limit` is the buffer end; we stop early if we'd run off the end.
+t2_disasm_loop buf base limit max i =
+  if i >= max then 0
+  else if base >= limit then 0
+  else
+    let r = t2_decode buf base
+    let length = arr_get r 2
+    let _ = print (t2_decode_str buf base)
+    if base + length > limit then 0
+    else t2_disasm_loop buf (base + length) limit max (i + 1)
+
+t2_disasm buf base limit max = t2_disasm_loop buf base limit max 0

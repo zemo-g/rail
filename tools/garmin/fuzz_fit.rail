@@ -1,0 +1,179 @@
+-- tools/garmin/fuzz_fit.rail - FIT-format mutator for parser-fuzz testing.
+--
+-- For each named mutation strategy, builds a single semi-valid FIT file
+-- with one targeted corruption. The harness ships these files one at a
+-- time onto the watch's NewFiles/ folder; ejecting causes the watch to
+-- parse them, and we read /Garmin/Debug/err_log.txt for crash signals.
+--
+-- Strategy taxonomy (per docs/plans/PHASE_2_TRACK_B.md):
+--   F-BASELINE     valid 1-record activity FIT - control case
+--   F-HDR-0        header data_size much LARGER than file actually carries
+--   F-HDR-1        header data_size much smaller than actual data
+--   F-DEF-0        definition message claims total_size = 0xFFFF
+--   F-DEF-1        definition message claims more fields than data fits
+--   F-MSG-1        data record references a never-defined local_id
+--   F-FLD-1        string field with no NUL terminator running off the end
+--   F-CRC-0        trailing CRC clearly wrong (and large enough to wrap)
+--
+-- Output: ~/garmin_recon/fuzz/fit_corpus/<strategy>.fit
+
+import "stdlib/fit_emit.rail"
+
+-- Common file_id record fields for our baseline. file_id = global msg 0:
+--   field 3 (uint32z): serial_number
+--   field 4 (uint32):  time_created
+--   field 1 (uint16):  manufacturer
+--   field 2 (uint16):  product
+--   field 0 (enum):    type
+-- Total body = 4 + 4 + 2 + 2 + 1 = 13 bytes.
+
+baseline_file_id_fields _ =
+  let f5 = cons (fe_field 0 1 0) []         -- field 0, size 1, enum
+  let f4 = cons (fe_field 2 2 132) f5       -- field 2, size 2, uint16
+  let f3 = cons (fe_field 1 2 132) f4       -- field 1, size 2, uint16
+  let f2 = cons (fe_field 4 4 134) f3       -- field 4, size 4, uint32
+  cons (fe_field 3 4 140) f2                -- field 3, size 4, uint32z
+
+-- file_id payload:
+emit_file_id_payload s =
+  let _ = fe_write_u32_le s 3422906732   -- serial = our test unit
+  let _ = fe_write_u32_le s 1145836800   -- time_created (a 2026 unix epoch FIT-ish)
+  let _ = fe_write_u16_le s 1            -- manufacturer = Garmin
+  let _ = fe_write_u16_le s 3126         -- product = Instinct
+  let _ = fe_write_u8 s 4                -- type = activity
+  0
+
+-- ---- Strategy: BASELINE valid file ---------------------------------
+
+mut_baseline path =
+  let s = fe_new 256
+  let _ = fe_emit_header s 0             -- placeholder; finalized later
+  let _ = fe_emit_def s 0 0 0 (baseline_file_id_fields 0)
+  -- Emit data record header + payload:
+  let _ = fe_write_u8 s 0                -- record header (data, local_id 0)
+  let _ = emit_file_id_payload s
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+-- ---- Strategy: F-HDR-0 oversized data_size --------------------------
+-- After finalize, overwrite the header's data_size with 0xFFFFFFFF.
+-- A naive parser may walk past the end of buffer.
+
+mut_hdr_oversized path =
+  let s = fe_new 256
+  let _ = fe_emit_header s 0
+  let _ = fe_emit_def s 0 0 0 (baseline_file_id_fields 0)
+  let _ = fe_write_u8 s 0
+  let _ = emit_file_id_payload s
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  let _ = fe_patch_data_size s 4294967295
+  fe_save s path
+
+-- ---- Strategy: F-HDR-1 undersized data_size -------------------------
+
+mut_hdr_undersized path =
+  let s = fe_new 256
+  let _ = fe_emit_header s 0
+  let _ = fe_emit_def s 0 0 0 (baseline_file_id_fields 0)
+  let _ = fe_write_u8 s 0
+  let _ = emit_file_id_payload s
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  let _ = fe_patch_data_size s 1            -- claims only 1 byte of data
+  fe_save s path
+
+-- ---- Strategy: F-DEF-1 too many fields claimed ----------------------
+-- num_fields = 50 but only 5 follow.
+
+big_def_fields _ = baseline_file_id_fields 0   -- still 5 fields physically
+
+mut_def_too_many path =
+  let s = fe_new 256
+  let _ = fe_emit_header s 0
+  -- Emit definition with HEADER claiming 50 fields, but body only has 5.
+  let _ = fe_write_u8 s (bit_or 64 0)        -- def msg, local_id 0
+  let _ = fe_write_u8 s 0                    -- reserved
+  let _ = fe_write_u8 s 0                    -- arch LE
+  let _ = fe_write_u16_le s 0                -- global_msg = file_id
+  let _ = fe_write_u8 s 50                   -- LIES: 50 fields
+  -- Only emit 5 fields of body
+  let _ = fe_emit_def_field_loop s (baseline_file_id_fields 0)
+  let _ = fe_finalize s
+  fe_save s path
+
+-- ---- Strategy: F-MSG-1 data ref to undefined local_id --------------
+-- Define local_id 0 but data record uses local_id 7.
+
+mut_undef_local_id path =
+  let s = fe_new 256
+  let _ = fe_emit_header s 0
+  let _ = fe_emit_def s 0 0 0 (baseline_file_id_fields 0)
+  -- Data record with local_id 7 (never defined)
+  let _ = fe_write_u8 s 7
+  let _ = emit_file_id_payload s
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+-- ---- Strategy: F-FLD-1 string-no-nul ---------------------------------
+-- Definition includes a 16-byte string field (base_type 7); payload writes
+-- 16 non-NUL bytes. A naive C-string-style parser may read past the field
+-- looking for the terminator.
+
+string_field_def _ =
+  cons (fe_field 0 16 7) []    -- field 0, size 16, base_type 0x07 (string)
+
+mut_string_no_nul path =
+  let s = fe_new 256
+  let _ = fe_emit_header s 0
+  let _ = fe_emit_def s 0 0 0 (string_field_def 0)
+  let _ = fe_write_u8 s 0                    -- data record, local_id 0
+  -- 16 bytes, no NUL anywhere
+  let _ = mut_string_loop s 65 0
+  let _ = fe_emit_trailing_crc s 0
+  let _ = fe_finalize s
+  fe_save s path
+
+mut_string_loop s b i =
+  if i >= 16 then 0
+  else
+    let _ = fe_write_u8 s b
+    mut_string_loop s b (i + 1)
+
+-- ---- Strategy: F-CRC-0 garbage CRC ----------------------------------
+
+mut_bad_crc path =
+  let s = fe_new 256
+  let _ = fe_emit_header s 0
+  let _ = fe_emit_def s 0 0 0 (baseline_file_id_fields 0)
+  let _ = fe_write_u8 s 0
+  let _ = emit_file_id_payload s
+  let _ = fe_emit_trailing_crc s 65535        -- max 16-bit value, almost certainly wrong
+  let _ = fe_finalize s
+  fe_save s path
+
+-- ---- Driver --------------------------------------------------------
+
+main =
+  let argv = args
+  let out_dir = if length argv >= 2 then head (tail argv)
+                else "~/garmin_recon/fuzz/fit_corpus"
+  let _ = shell (cat ["mkdir -p '", out_dir, "'"])
+  let _ = print (cat ["writing FIT corpus to ", out_dir])
+  let _ = mut_baseline (cat [out_dir, "/baseline.fit"])
+  let _ = print "  baseline.fit"
+  let _ = mut_hdr_oversized (cat [out_dir, "/hdr_oversized.fit"])
+  let _ = print "  hdr_oversized.fit"
+  let _ = mut_hdr_undersized (cat [out_dir, "/hdr_undersized.fit"])
+  let _ = print "  hdr_undersized.fit"
+  let _ = mut_def_too_many (cat [out_dir, "/def_too_many_fields.fit"])
+  let _ = print "  def_too_many_fields.fit"
+  let _ = mut_undef_local_id (cat [out_dir, "/undef_local_id.fit"])
+  let _ = print "  undef_local_id.fit"
+  let _ = mut_string_no_nul (cat [out_dir, "/string_no_nul.fit"])
+  let _ = print "  string_no_nul.fit"
+  let _ = mut_bad_crc (cat [out_dir, "/bad_crc.fit"])
+  let _ = print "  bad_crc.fit"
+  0

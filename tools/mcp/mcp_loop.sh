@@ -7,7 +7,7 @@
 #   {
 #     "mcpServers": {
 #       "rail": {
-#         "command": "$HOME/projects/rail-https/tools/mcp/mcp_loop.sh"
+#         "command": "~/projects/rail/tools/mcp/mcp_loop.sh"
 #       }
 #     }
 #   }

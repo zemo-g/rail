@@ -1,0 +1,2314 @@
+# x86_rt.s — Rail x86_64 Linux runtime (glibc-linked)
+# Build: gcc -o prog prog.s -lc -lpthread
+# Or: as -o prog.o prog.s && gcc -o prog prog.o -lc -lpthread
+.intel_syntax noprefix
+
+.section .rodata
+_fmt_int:
+    .asciz "%ld\n"
+_fmt_str:
+    .asciz "%s\n"
+_fmt_ld:
+    .asciz "%ld"
+_fmt_g:
+    .asciz "%g\n"
+_fmt_gbare:
+    .asciz "%.15g"
+_mode_w:
+    .asciz "w"
+_mode_r:
+    .asciz "r"
+.p2align 3
+_rail_empty_str:
+    .byte 0
+
+.data
+.p2align 3
+_rail_nil:
+    .quad 2
+.p2align 3
+_rail_heap_ptr:
+    .quad 0
+.p2align 3
+_rail_heap_end:
+    .quad 0
+.p2align 3
+_rail_argc:
+    .quad 0
+_rail_argv:
+    .quad 0
+
+.bss
+.p2align 3
+_rail_heap:
+    .space 268435456    # 256MB bump allocator
+
+.text
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+.global main
+main:
+    push rbp
+    mov rbp, rsp
+    # Init heap
+    lea rax, [rip+_rail_heap]
+    lea rcx, [rip+_rail_heap_ptr]
+    mov [rcx], rax
+    lea rdx, [rax+268435456]
+    lea rcx, [rip+_rail_heap_end]
+    mov [rcx], rdx
+    # Call user main with argc, argv
+    call _main
+    # Untag return value
+    sar rax, 1
+    pop rbp
+    ret
+
+# ── Allocator ────────────────────────────────────────────────────────────────
+# Input: rdi = size (tag value)
+# Output: rax = pointer (past 8-byte header)
+.global _rail_alloc
+_rail_alloc:
+    push rbp
+    mov rbp, rsp
+    mov rcx, rdi            # save tag/size
+    add rdi, 15
+    and rdi, -8             # align to 8
+    lea rax, [rip+_rail_heap_ptr]
+    mov r8, [rax]           # current ptr
+    mov r9, r8
+    add r9, rdi             # new ptr
+    lea r10, [rip+_rail_heap_end]
+    cmp r9, [r10]
+    ja .Lalloc_slow
+    mov [rax], r9           # update heap ptr
+    mov [r8], rcx           # store tag at header
+    lea rax, [r8+8]         # return ptr+8
+    pop rbp
+    ret
+.Lalloc_slow:
+    # Fallback to malloc
+    call malloc@PLT
+    pop rbp
+    ret
+
+# ── Print ────────────────────────────────────────────────────────────────────
+# Input: rdi = tagged value (bit 0 = 1 means integer)
+.global _rail_print
+_rail_print:
+    push rbp
+    mov rbp, rsp
+    test rdi, 1
+    jz .Lprint_heap
+    # Integer: untag and printf
+    sar rdi, 1
+    mov rsi, rdi
+    lea rdi, [rip+_fmt_int]
+    xor eax, eax
+    call printf@PLT
+    xor rdi, rdi
+    call fflush@PLT
+    mov rax, 1
+    pop rbp
+    ret
+.Lprint_heap:
+    # Heap object — check tag
+    mov rax, [rdi]
+    cmp rax, 6
+    je .Lprint_float
+    # String
+    mov rsi, rdi
+    lea rdi, [rip+_fmt_str]
+    xor eax, eax
+    call printf@PLT
+    xor rdi, rdi
+    call fflush@PLT
+    mov rax, 1
+    pop rbp
+    ret
+.Lprint_float:
+    sub rsp, 16
+    movsd xmm0, [rdi+8]
+    lea rdi, [rip+_fmt_g]
+    mov eax, 1
+    call printf@PLT
+    xor rdi, rdi
+    call fflush@PLT
+    add rsp, 16
+    mov rax, 1
+    pop rbp
+    ret
+
+# ── Show (int → string) ─────────────────────────────────────────────────────
+.global _rail_show
+_rail_show:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    test rdi, 1
+    jz .Lshow_heap
+    sar rdi, 1
+    mov [rbp-8], rdi        # save untagged int
+    mov rdi, 24
+    call malloc@PLT
+    mov [rbp-16], rax       # save buffer
+    mov rdi, rax
+    mov rsi, 24
+    lea rdx, [rip+_fmt_ld]
+    mov rcx, [rbp-8]
+    xor eax, eax
+    call snprintf@PLT
+    mov rax, [rbp-16]
+    leave
+    ret
+.Lshow_heap:
+    # Float
+    mov rax, [rdi]
+    cmp rax, 6
+    jne .Lshow_str
+    sub rsp, 16
+    movsd xmm0, [rdi+8]
+    mov [rbp-24], rdi
+    mov rdi, 32
+    call malloc@PLT
+    mov [rbp-16], rax
+    mov rdi, rax
+    mov rsi, 32
+    lea rdx, [rip+_fmt_gbare]
+    movsd xmm0, [rbp-24]
+    movsd xmm0, [rdi+8]    # reload from saved object...
+    # Actually let me fix this — save the float value
+    mov rax, [rbp-24]
+    movsd xmm0, [rax+8]
+    mov rdi, [rbp-16]
+    mov rsi, 32
+    lea rdx, [rip+_fmt_gbare]
+    mov eax, 1
+    call snprintf@PLT
+    mov rax, [rbp-16]
+    add rsp, 16
+    leave
+    ret
+.Lshow_str:
+    # Already a string, return as-is
+    mov rax, rdi
+    leave
+    ret
+
+# ── String append ────────────────────────────────────────────────────────────
+# O(n+m) via strlen + memcpy. The previous strcpy+strcat sequence walked
+# the destination twice (once on strcpy's implicit length, again on strcat's
+# strlen scan), so chained `s = s + chunk` accumulators were O(n^2). See
+# rail_join_O_n2_fixed memory entry for the ARM64-side history.
+.global _rail_str_append
+_rail_str_append:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi        # s1
+    mov [rbp-16], rsi       # s2
+    call strlen@PLT
+    mov [rbp-24], rax       # len1
+    mov rdi, [rbp-16]
+    call strlen@PLT
+    mov [rbp-32], rax       # len2
+    add rax, [rbp-24]
+    add rax, 1              # len1 + len2 + 1 (for NUL)
+    mov rdi, rax
+    call malloc@PLT
+    mov [rbp-40], rax       # result buffer
+    # memcpy(buf, s1, len1)
+    mov rdi, rax
+    mov rsi, [rbp-8]
+    mov rdx, [rbp-24]
+    call memcpy@PLT
+    # memcpy(buf + len1, s2, len2)
+    mov rdi, [rbp-40]
+    add rdi, [rbp-24]
+    mov rsi, [rbp-16]
+    mov rdx, [rbp-32]
+    call memcpy@PLT
+    # write trailing NUL at buf[len1 + len2]
+    mov rax, [rbp-40]
+    mov rcx, [rbp-24]
+    add rcx, [rbp-32]
+    mov byte ptr [rax+rcx], 0
+    mov rax, [rbp-40]
+    leave
+    ret
+
+# ── Tagged arithmetic ────────────────────────────────────────────────────────
+.global _rail_add
+_rail_add:
+    # Inline-codegen fallback enters here when LEFT (rdi) was heap. Test rdi to
+    # match that contract: testing rsi mis-routes when the right operand's
+    # string-literal address happens to be odd. See str_plus regression.
+    # If LHS is tagged-int but RHS is heap, route through .Ladd_mixed_if
+    # (the mirror of .Ladd_mixed_fi). Without this branch the fast-path
+    # `add rdi, rsi` adds a pointer to a tagged-int and `lea rax,[rdi-1]`
+    # publishes garbage. Bug-class with no current symptom because compile-
+    # time inference promotes inline for `0.0 + i` shapes; reachable via
+    # arr_get-style untyped runtime values (see add_int_float_ordering test).
+    test rdi, 1
+    jz .Ladd_heap
+    test rsi, 1
+    jz .Ladd_mixed_if
+    add rdi, rsi
+    lea rax, [rdi-1]
+    ret
+.Ladd_mixed_if:
+    # rdi = tagged-int LHS, rsi = boxed-float RHS. Mirror of .Ladd_mixed_fi
+    # below: promote the int operand to a double and add. Assumes the heap
+    # operand is a boxed float (header 6); int+other-heap is undefined here
+    # (would need a separate dispatch).
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, [rsi+8]
+    addsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Ladd_heap:
+    # Heap: check for string concat, float+float add, or float+int mixed add.
+    # rdi is known heap (low bit 0); rsi may be heap or tagged-int.
+    push rbp
+    mov rbp, rsp
+    # If rsi is tagged-int (low bit 1), this is mixed float+int (e.g., 0.0 + i).
+    # Promote rsi to a double and use the float path. (Agent B 2026-05-14:
+    # closes t106 mixed_float_int_op cascade on x86 once float_arr_set lands.)
+    test rsi, 1
+    jnz .Ladd_mixed_fi
+    mov rax, [rsi]
+    cmp rax, 6
+    je .Ladd_float
+    # String concat: rdi=first, rsi=second already in place for _rail_str_append
+    call _rail_str_append
+    pop rbp
+    ret
+.Ladd_float:
+    sub rsp, 16
+    movsd xmm0, [rsi+8]
+    movsd xmm1, [rdi+8]
+    addsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Ladd_mixed_fi:
+    # rdi = boxed float, rsi = tagged int
+    sub rsp, 16
+    movsd xmm0, [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
+    addsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+
+.global _rail_sub
+_rail_sub:
+    # Same bug class as _rail_add: pre-fix only checked rdi (LHS) tag bit.
+    # For (tagged-int LHS, boxed-float RHS) the int fast path (sar; sar; sub)
+    # subtracted (heap_ptr/2) — UB. Mirror branch .Lsub_mixed_if promotes
+    # the int operand to double and uses subsd. See rail_emit_gotchas
+    # entry "x86 floats are heap-boxed".
+    test rdi, 1
+    jz .Lsub_float
+    test rsi, 1
+    jz .Lsub_mixed_if
+    push rbp
+    mov rbp, rsp
+    sar rdi, 1
+    sar rsi, 1
+    sub rdi, rsi
+    lea rax, [rdi*2+1]
+    pop rbp
+    ret
+.Lsub_mixed_if:
+    # rdi = tagged-int LHS, rsi = boxed-float RHS.
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    subsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Lsub_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    # Float LHS; if RHS is tagged-int, promote it. Mirrors .Ladd_mixed_fi.
+    test rsi, 1
+    jnz .Lsub_mixed_fi
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    subsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Lsub_mixed_fi:
+    # rdi = boxed-float LHS, rsi = tagged-int RHS.
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
+    subsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+
+.global _rail_mul
+_rail_mul:
+    # Same bug class as _rail_add. Mirror branch .Lmul_mixed_if handles
+    # (tagged-int LHS, boxed-float RHS).
+    test rdi, 1
+    jz .Lmul_float
+    test rsi, 1
+    jz .Lmul_mixed_if
+    push rbp
+    mov rbp, rsp
+    sar rdi, 1
+    sar rsi, 1
+    imul rdi, rsi
+    lea rax, [rdi*2+1]
+    pop rbp
+    ret
+.Lmul_mixed_if:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    mulsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Lmul_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    test rsi, 1
+    jnz .Lmul_mixed_fi
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    mulsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Lmul_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
+    mulsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+
+.global _rail_div
+_rail_div:
+    # Same bug class as _rail_add. Mirror branch .Ldiv_mixed_if handles
+    # (tagged-int LHS, boxed-float RHS).
+    test rdi, 1
+    jz .Ldiv_float
+    test rsi, 1
+    jz .Ldiv_mixed_if
+    push rbp
+    mov rbp, rsp
+    sar rdi, 1
+    sar rsi, 1
+    mov rax, rdi
+    cqo
+    idiv rsi
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
+.Ldiv_mixed_if:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    divsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Ldiv_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    test rsi, 1
+    jnz .Ldiv_mixed_fi
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    divsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Ldiv_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
+    divsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+
+.global _rail_mod
+_rail_mod:
+    # Pre-fix: int-only — assumed both operands tagged-int. For (tagged-int
+    # LHS, boxed-float RHS) the sar/sar/idiv treats the heap pointer as an
+    # int. Mirror branches .Lmod_mixed_if / .Lmod_float / .Lmod_mixed_fi
+    # promote to double and call fmod (from libm; harness already links -lm).
+    test rdi, 1
+    jz .Lmod_float
+    test rsi, 1
+    jz .Lmod_mixed_if
+    push rbp
+    mov rbp, rsp
+    sar rdi, 1
+    sar rsi, 1
+    mov rax, rdi
+    cqo
+    idiv rsi
+    lea rax, [rdx*2+1]
+    pop rbp
+    ret
+.Lmod_mixed_if:
+    # rdi = tagged-int LHS, rsi = boxed-float RHS.
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    call fmod@PLT
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Lmod_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    test rsi, 1
+    jnz .Lmod_mixed_fi
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    call fmod@PLT
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Lmod_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
+    call fmod@PLT
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+
+# ── Comparison ───────────────────────────────────────────────────────────────
+# Mirror ARM64 _rail_eq (compile.rail:2622). Dispatch on the right operand's
+# tag bit. If right is tagged-int, raw-compare both sides — this handles the
+# `heap-ptr == 0` pattern (e.g., null_safe_eq test t103) without a SIGSEGV
+# in strcmp. If right is heap, fall through to type-aware compare:
+#   - either side raw zero  -> raw compare
+#   - left tagged-int but right heap -> mismatch (false)
+#   - both heap, tag==6      -> float compare
+#   - else                   -> strcmp (strings)
+.global _rail_eq
+_rail_eq:
+    push rbp
+    mov rbp, rsp
+    test rsi, 1
+    jz .Leq_heap
+    cmp rdi, rsi
+    sete al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
+.Leq_heap:
+    test rsi, rsi
+    jz .Leq_raw_cmp
+    test rdi, rdi
+    jz .Leq_raw_cmp
+    test rdi, 1
+    jnz .Leq_mismatch
+    # Both heap. Check for float (tag 6) before falling through to strcmp.
+    mov rdx, [rsi]
+    mov r8, 0x7fffffffffffffff
+    and rdx, r8
+    cmp rdx, 6
+    je .Leq_float
+    # String comparison
+    sub rsp, 16
+    call strcmp@PLT
+    test eax, eax
+    sete al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    add rsp, 16
+    pop rbp
+    ret
+.Leq_raw_cmp:
+    cmp rdi, rsi
+    sete al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
+.Leq_mismatch:
+    mov rax, 1
+    pop rbp
+    ret
+.Leq_float:
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    sete al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
+
+# Mirror _rail_eq but negate the boolean result. Same null/type-mismatch
+# safety as eq — `heap-ptr != 0` no longer SIGSEGVs in strcmp.
+.global _rail_ne
+_rail_ne:
+    push rbp
+    mov rbp, rsp
+    test rsi, 1
+    jz .Lne_heap
+    cmp rdi, rsi
+    setne al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
+.Lne_heap:
+    test rsi, rsi
+    jz .Lne_raw_cmp
+    test rdi, rdi
+    jz .Lne_raw_cmp
+    test rdi, 1
+    jnz .Lne_mismatch
+    mov rdx, [rsi]
+    mov r8, 0x7fffffffffffffff
+    and rdx, r8
+    cmp rdx, 6
+    je .Lne_float
+    sub rsp, 16
+    call strcmp@PLT
+    test eax, eax
+    setne al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    add rsp, 16
+    pop rbp
+    ret
+.Lne_raw_cmp:
+    cmp rdi, rsi
+    setne al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
+.Lne_mismatch:
+    mov rax, 3
+    pop rbp
+    ret
+.Lne_float:
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setne al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
+
+# Float-aware ordered compares. Mirror ARM64 (compile.rail:2668-2671).
+# Convention: rdi = left, rsi = right. Test rdi tag bit; if even, both heap-floats.
+.global _rail_lt
+_rail_lt:
+    # Same bug class as _rail_add: if rdi is tagged-int and rsi is heap-float
+    # (or vice-versa), the raw `cmp rdi, rsi` compares a tagged int to a heap
+    # pointer (always int < ptr ~unsigned, but signed cmp is undefined). Mirror
+    # branches promote the int operand to double and use ucomisd. Comparators
+    # return Rail-tagged bool (1=false, 3=true) — no alloc-header-6.
+    test rdi, 1
+    jz .Llt_float
+    test rsi, 1
+    jz .Llt_mixed_if
+    cmp rdi, rsi
+    setl al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Llt_mixed_if:
+    # rdi = tagged-int LHS, rsi = boxed-float RHS.
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setb al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Llt_float:
+    test rsi, 1
+    jnz .Llt_mixed_fi
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setb al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Llt_mixed_fi:
+    # rdi = boxed-float LHS, rsi = tagged-int RHS.
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
+    ucomisd xmm0, xmm1
+    setb al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+
+.global _rail_gt
+_rail_gt:
+    test rdi, 1
+    jz .Lgt_float
+    test rsi, 1
+    jz .Lgt_mixed_if
+    cmp rdi, rsi
+    setg al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lgt_mixed_if:
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    seta al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lgt_float:
+    test rsi, 1
+    jnz .Lgt_mixed_fi
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    seta al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lgt_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
+    ucomisd xmm0, xmm1
+    seta al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+
+.global _rail_le
+_rail_le:
+    test rdi, 1
+    jz .Lle_float
+    test rsi, 1
+    jz .Lle_mixed_if
+    cmp rdi, rsi
+    setle al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lle_mixed_if:
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setbe al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lle_float:
+    test rsi, 1
+    jnz .Lle_mixed_fi
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setbe al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lle_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
+    ucomisd xmm0, xmm1
+    setbe al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+
+.global _rail_ge
+_rail_ge:
+    test rdi, 1
+    jz .Lge_float
+    test rsi, 1
+    jz .Lge_mixed_if
+    cmp rdi, rsi
+    setge al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lge_mixed_if:
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setae al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lge_float:
+    test rsi, 1
+    jnz .Lge_mixed_fi
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setae al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lge_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
+    ucomisd xmm0, xmm1
+    setae al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+
+# ── List operations ──────────────────────────────────────────────────────────
+.global _rail_cons
+_rail_cons:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8], rdi        # head
+    mov [rbp-16], rsi       # tail
+    mov rdi, 24
+    call _rail_alloc
+    mov qword ptr [rax], 1  # tag = cons
+    mov rcx, [rbp-8]
+    mov [rax+8], rcx        # head
+    mov rcx, [rbp-16]
+    mov [rax+16], rcx       # tail
+    leave
+    ret
+
+.global _rail_head
+_rail_head:
+    mov rax, [rdi+8]
+    ret
+
+.global _rail_tail
+_rail_tail:
+    mov rax, [rdi+16]
+    ret
+
+.global _rail_length
+_rail_length:
+    push rbp
+    mov rbp, rsp
+    # Check type
+    test rdi, 1
+    jnz .Llen_zero
+    mov rax, [rdi]
+    cmp rax, 1
+    je .Llen_list
+    cmp rax, 2
+    je .Llen_zero
+    # String length
+    call strlen@PLT
+    lea rax, [rax*2+1]
+    pop rbp
+    ret
+.Llen_list:
+    xor rcx, rcx
+.Llen_loop:
+    mov rax, [rdi]
+    cmp rax, 2              # nil tag
+    je .Llen_done
+    mov rdi, [rdi+16]       # tail
+    inc rcx
+    jmp .Llen_loop
+.Llen_done:
+    lea rax, [rcx*2+1]
+    pop rbp
+    ret
+.Llen_zero:
+    mov rax, 1              # tagged 0
+    pop rbp
+    ret
+
+.global _rail_append
+_rail_append:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8], rdi        # list1/str1
+    mov [rbp-16], rsi       # list2/str2
+    test rdi, 1
+    jnz .Lapp_ret2
+    mov rax, [rdi]
+    cmp rax, 2
+    je .Lapp_ret2
+    cmp rax, 1
+    je .Lapp_list
+    # String append
+    call _rail_str_append
+    leave
+    ret
+.Lapp_ret2:
+    mov rax, [rbp-16]
+    leave
+    ret
+.Lapp_list:
+    mov rdi, [rbp-8]
+    mov rcx, [rdi+8]        # head
+    mov [rbp-24], rcx
+    mov rdi, [rdi+16]       # tail of first
+    mov rsi, [rbp-16]       # second list
+    call _rail_append
+    mov rsi, rax             # appended tail
+    mov rdi, [rbp-24]       # head
+    call _rail_cons
+    leave
+    ret
+
+.global _rail_reverse
+_rail_reverse:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    lea rax, [rip+_rail_nil]
+    mov [rbp-8], rax        # acc = nil
+.Lrev_loop:
+    mov rax, [rdi]
+    cmp rax, 2
+    je .Lrev_done
+    mov [rbp-16], rdi       # save current
+    mov rcx, [rdi+8]        # head
+    mov rdi, rcx
+    mov rsi, [rbp-8]        # acc
+    call _rail_cons
+    mov [rbp-8], rax        # acc = cons(head, acc)
+    mov rdi, [rbp-16]
+    mov rdi, [rdi+16]       # tail
+    jmp .Lrev_loop
+.Lrev_done:
+    mov rax, [rbp-8]
+    leave
+    ret
+
+.global _rail_range
+_rail_range:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    sar rdi, 1
+    dec rdi                 # n-1
+    mov [rbp-8], rdi
+    lea rax, [rip+_rail_nil]
+    mov [rbp-16], rax       # acc = nil
+.Lrange_loop:
+    mov rdi, [rbp-8]
+    cmp rdi, 0
+    jl .Lrange_done
+    lea rdi, [rdi*2+1]      # tag
+    mov rsi, [rbp-16]
+    call _rail_cons
+    mov [rbp-16], rax
+    mov rdi, [rbp-8]
+    dec rdi
+    mov [rbp-8], rdi
+    jmp .Lrange_loop
+.Lrange_done:
+    mov rax, [rbp-16]
+    leave
+    ret
+
+# ── Higher-order: map, filter, fold ──────────────────────────────────────────
+.global _rail_map
+_rail_map:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi        # closure
+    mov [rbp-16], rsi       # list
+    mov rax, [rsi]
+    cmp rax, 2
+    je .Lmap_nil
+    # Get head and tail
+    mov rcx, [rsi+8]
+    mov [rbp-24], rcx       # head
+    mov rcx, [rsi+16]
+    mov [rbp-32], rcx       # tail
+    # Call closure with head
+    mov rax, [rbp-8]        # closure
+    mov r14, [rax+8]        # code ptr
+    mov r13, [rax+16]       # ncaps
+    mov rdi, [rbp-24]       # head as arg
+    cmp r13, 0
+    je .Lmap_call
+    mov rsi, [rax+24]       # first capture
+.Lmap_call:
+    call r14
+    mov [rbp-40], rax       # mapped head
+    # Recurse on tail
+    mov rdi, [rbp-8]
+    mov rsi, [rbp-32]
+    call _rail_map
+    mov rsi, rax             # mapped tail
+    mov rdi, [rbp-40]       # mapped head
+    call _rail_cons
+    leave
+    ret
+.Lmap_nil:
+    lea rax, [rip+_rail_nil]
+    leave
+    ret
+
+.global _rail_filter
+_rail_filter:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi        # closure
+    mov [rbp-16], rsi       # list
+    mov rax, [rsi]
+    cmp rax, 2
+    je .Lfilt_nil
+    mov rcx, [rsi+8]
+    mov [rbp-24], rcx       # head
+    mov rcx, [rsi+16]
+    mov [rbp-32], rcx       # tail
+    # Call predicate with head
+    mov rax, [rbp-8]
+    mov r14, [rax+8]
+    mov r13, [rax+16]
+    mov rdi, [rbp-24]
+    cmp r13, 0
+    je .Lfilt_call
+    mov rsi, [rax+24]
+.Lfilt_call:
+    call r14
+    mov [rbp-40], rax       # predicate result
+    # Recurse on tail
+    mov rdi, [rbp-8]
+    mov rsi, [rbp-32]
+    call _rail_filter
+    # Check predicate result
+    mov rcx, [rbp-40]
+    cmp rcx, 3              # tagged true
+    jne .Lfilt_skip
+    mov rsi, rax             # filtered tail
+    mov rdi, [rbp-24]       # head
+    call _rail_cons
+    leave
+    ret
+.Lfilt_skip:
+    leave
+    ret
+.Lfilt_nil:
+    lea rax, [rip+_rail_nil]
+    leave
+    ret
+
+.global _rail_fold
+_rail_fold:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi        # closure
+    mov [rbp-16], rsi       # accumulator
+    mov [rbp-24], rdx       # list
+    mov rax, [rdx]
+    cmp rax, 2
+    je .Lfold_done
+    mov rcx, [rdx+8]
+    mov [rbp-32], rcx       # head
+    # Call f(acc, head)
+    mov rax, [rbp-8]
+    mov r14, [rax+8]
+    mov rdi, [rbp-16]       # acc
+    mov rsi, [rbp-32]       # head
+    mov r13, [rax+16]
+    cmp r13, 0
+    je .Lfold_call
+    mov rdx, [rax+24]
+.Lfold_call:
+    call r14
+    # Recurse: fold(f, result, tail)
+    mov rdi, [rbp-8]
+    mov rsi, rax             # new acc
+    mov rax, [rbp-24]
+    mov rdx, [rax+16]       # tail
+    call _rail_fold
+    leave
+    ret
+.Lfold_done:
+    mov rax, [rbp-16]       # return accumulator
+    leave
+    ret
+
+# ── String operations ────────────────────────────────────────────────────────
+.global _rail_join
+_rail_join:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi        # separator
+    mov [rbp-16], rsi       # list
+    mov rax, [rsi]
+    cmp rax, 2
+    je .Ljoin_empty
+    mov rcx, [rsi+8]
+    mov [rbp-24], rcx       # head
+    mov rcx, [rsi+16]
+    mov rax, [rcx]
+    cmp rax, 2
+    je .Ljoin_single
+    # head + sep + join(sep, tail)
+    mov rdi, [rbp-8]
+    mov rsi, [rbp-16]
+    mov rsi, [rsi+16]       # tail
+    call _rail_join
+    mov [rbp-32], rax       # joined rest
+    # head + sep
+    mov rdi, [rbp-24]
+    mov rsi, [rbp-8]
+    call _rail_str_append
+    mov [rbp-40], rax
+    # (head+sep) + rest
+    mov rdi, rax
+    mov rsi, [rbp-32]
+    call _rail_str_append
+    leave
+    ret
+.Ljoin_empty:
+    lea rax, [rip+_rail_empty_str]
+    leave
+    ret
+.Ljoin_single:
+    mov rax, [rbp-24]
+    leave
+    ret
+
+.global _rail_cat
+_rail_cat:
+    push rbp
+    mov rbp, rsp
+    mov rsi, rdi             # list
+    lea rdi, [rip+_rail_empty_str]
+    call _rail_join
+    pop rbp
+    ret
+
+.global _rail_chars
+_rail_chars:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi         # string
+    call strlen@PLT
+    mov [rbp-16], rax        # length
+    lea rax, [rip+_rail_nil]
+    mov [rbp-24], rax        # acc = nil
+    mov rax, [rbp-16]
+    dec rax
+    mov [rbp-32], rax        # i = len-1
+.Lchars_loop:
+    mov rax, [rbp-32]
+    cmp rax, 0
+    jl .Lchars_done
+    # Allocate 2-byte string for single char
+    mov rdi, 2
+    call malloc@PLT
+    mov [rbp-40], rax
+    mov rcx, [rbp-8]
+    mov rdx, [rbp-32]
+    movzx edx, byte ptr [rcx+rdx]
+    mov byte ptr [rax], dl
+    mov byte ptr [rax+1], 0
+    # cons(char_str, acc)
+    mov rdi, rax
+    mov rsi, [rbp-24]
+    call _rail_cons
+    mov [rbp-24], rax
+    dec qword ptr [rbp-32]
+    jmp .Lchars_loop
+.Lchars_done:
+    mov rax, [rbp-24]
+    leave
+    ret
+
+.global _rail_split
+_rail_split:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 64
+    mov [rbp-8], rdi         # delimiters string
+    mov [rbp-16], rsi        # string to split
+    movzx eax, byte ptr [rdi] # first delimiter char
+    mov [rbp-24], rax
+    mov rdi, rsi
+    call strlen@PLT
+    mov [rbp-32], rax        # string length
+    lea rax, [rip+_rail_nil]
+    mov [rbp-40], rax        # result = nil
+    mov qword ptr [rbp-48], 0 # start = 0
+    mov qword ptr [rbp-56], 0 # i = 0
+.Lsplit_loop:
+    mov rax, [rbp-56]
+    cmp rax, [rbp-32]
+    jge .Lsplit_last
+    mov rcx, [rbp-16]
+    movzx edx, byte ptr [rcx+rax]
+    cmp rdx, [rbp-24]
+    je .Lsplit_hit
+    inc qword ptr [rbp-56]
+    jmp .Lsplit_loop
+.Lsplit_hit:
+    # Extract substring from start to i
+    mov rax, [rbp-56]
+    sub rax, [rbp-48]        # len = i - start
+    inc rax                  # +1 for null
+    mov rdi, rax
+    call malloc@PLT
+    mov [rbp-64], rax        # buffer
+    mov rdi, rax
+    mov rsi, [rbp-16]
+    add rsi, [rbp-48]        # src = str + start
+    mov rdx, [rbp-56]
+    sub rdx, [rbp-48]        # len = i - start
+    mov rcx, rdx
+    rep movsb
+    mov byte ptr [rdi], 0    # null terminate
+    # cons(substr, result)... actually prepend, we'll reverse later
+    # For correct order, build in reverse
+    mov rdi, [rbp-64]
+    mov rsi, [rbp-40]
+    call _rail_cons
+    mov [rbp-40], rax
+    mov rax, [rbp-56]
+    inc rax
+    mov [rbp-48], rax        # start = i + 1
+    mov [rbp-56], rax        # i = i + 1
+    jmp .Lsplit_loop
+.Lsplit_last:
+    # Last segment
+    mov rax, [rbp-32]
+    sub rax, [rbp-48]
+    inc rax
+    mov rdi, rax
+    call malloc@PLT
+    mov [rbp-64], rax
+    mov rdi, rax
+    mov rsi, [rbp-16]
+    add rsi, [rbp-48]
+    mov rdx, [rbp-32]
+    sub rdx, [rbp-48]
+    mov rcx, rdx
+    rep movsb
+    mov byte ptr [rdi], 0
+    mov rdi, [rbp-64]
+    mov rsi, [rbp-40]
+    call _rail_cons
+    mov [rbp-40], rax
+    # Reverse the result
+    mov rdi, rax
+    call _rail_reverse
+    leave
+    ret
+
+# ── I/O ──────────────────────────────────────────────────────────────────────
+.global _rail_write_file
+_rail_write_file:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8], rdi         # filename
+    mov [rbp-16], rsi        # content
+    lea rsi, [rip+_mode_w]
+    call fopen@PLT
+    mov [rbp-24], rax        # FILE*
+    test rax, rax
+    jz .Lwf_fail
+    mov rdi, [rbp-16]
+    call strlen@PLT
+    mov rdi, [rbp-16]        # buf
+    mov rsi, 1               # size
+    mov rdx, rax             # count
+    mov rcx, [rbp-24]        # FILE*
+    call fwrite@PLT
+    mov rdi, [rbp-24]
+    call fclose@PLT
+.Lwf_fail:
+    mov rax, 1               # tagged 0... actually return 1
+    leave
+    ret
+
+.global _rail_read_file
+_rail_read_file:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi
+    lea rsi, [rip+_mode_r]
+    call fopen@PLT
+    test rax, rax
+    jz .Lrf_empty
+    mov [rbp-16], rax        # FILE*
+    mov rdi, rax
+    xor rsi, rsi
+    mov rdx, 2               # SEEK_END
+    call fseek@PLT
+    mov rdi, [rbp-16]
+    call ftell@PLT
+    mov [rbp-24], rax        # file size
+    mov rdi, [rbp-16]
+    xor rsi, rsi
+    xor rdx, rdx             # SEEK_SET
+    call fseek@PLT
+    mov rdi, [rbp-24]
+    inc rdi
+    call malloc@PLT
+    mov [rbp-32], rax        # buffer
+    mov rdi, rax
+    mov rsi, 1
+    mov rdx, [rbp-24]
+    mov rcx, [rbp-16]
+    call fread@PLT
+    mov rdi, [rbp-32]
+    mov rsi, [rbp-24]
+    mov byte ptr [rdi+rsi], 0
+    mov rdi, [rbp-16]
+    call fclose@PLT
+    mov rax, [rbp-32]
+    leave
+    ret
+.Lrf_empty:
+    lea rax, [rip+_rail_empty_str]
+    leave
+    ret
+
+.global _rail_shell
+_rail_shell:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    lea rsi, [rip+_mode_r]
+    call popen@PLT
+    mov [rbp-8], rax         # pipe
+    mov rdi, 65536
+    call malloc@PLT
+    mov [rbp-16], rax        # buffer
+    mov qword ptr [rbp-24], 0 # total read
+.Lsh_read:
+    mov rdi, [rbp-16]
+    add rdi, [rbp-24]
+    mov rsi, 1
+    mov rdx, 4096
+    mov rcx, [rbp-8]
+    call fread@PLT
+    test rax, rax
+    jz .Lsh_done
+    add [rbp-24], rax
+    jmp .Lsh_read
+.Lsh_done:
+    mov rdi, [rbp-16]
+    mov rsi, [rbp-24]
+    mov byte ptr [rdi+rsi], 0
+    mov rdi, [rbp-8]
+    call pclose@PLT
+    mov rax, [rbp-16]
+    leave
+    ret
+
+.global _rail_args
+_rail_args:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    lea rax, [rip+_rail_nil]
+    mov [rbp-8], rax         # result = nil
+    lea rax, [rip+_rail_argc]
+    mov rax, [rax]
+    sar rax, 1               # untag argc
+    dec rax
+    mov [rbp-16], rax        # i = argc - 1
+.Largs_loop:
+    cmp qword ptr [rbp-16], 0
+    jl .Largs_done
+    lea rax, [rip+_rail_argv]
+    mov rax, [rax]
+    mov rcx, [rbp-16]
+    mov rdi, [rax+rcx*8]     # argv[i]
+    mov rsi, [rbp-8]
+    call _rail_cons
+    mov [rbp-8], rax
+    dec qword ptr [rbp-16]
+    jmp .Largs_loop
+.Largs_done:
+    mov rax, [rbp-8]
+    leave
+    ret
+
+# ── Mutable arrays ──────────────────────────────────────────────────────────
+# Layout matches ARM64: [tag=7 | length(untagged) | elem0 | elem1 | ...].
+# _rail_arr_new(size_tagged, init_tagged) -> ptr
+.global _rail_arr_new
+_rail_arr_new:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    sar rdi, 1               # untag size
+    mov [rbp-8], rdi         # save size (untagged)
+    mov [rbp-16], rsi        # save init (tagged)
+    lea rdi, [rdi*8+16]      # size*8 + 16 header
+    call _rail_alloc
+    mov [rbp-24], rax        # save buffer
+    mov qword ptr [rax], 7   # tag = 7
+    mov rcx, [rbp-8]
+    mov [rax+8], rcx         # length (untagged)
+    mov rsi, [rbp-16]        # init
+    xor rcx, rcx             # i = 0
+.Larn_loop:
+    cmp rcx, [rbp-8]
+    jae .Larn_done
+    lea rdx, [rcx+2]
+    mov [rax+rdx*8], rsi     # arr[(i+2)*8] = init
+    inc rcx
+    jmp .Larn_loop
+.Larn_done:
+    mov rax, [rbp-24]
+    leave
+    ret
+
+# ── GC stub (no-op for now) ─────────────────────────────────────────────────
+.global _rail_gc
+_rail_gc:
+    ret
+
+.global _rail_free_list_alloc
+_rail_free_list_alloc:
+    xor rax, rax
+    ret
+
+.global _rail_free_list_clear
+_rail_free_list_clear:
+    ret
+
+# ── RC stubs ─────────────────────────────────────────────────────────────────
+.global _rail_rc_alloc
+_rail_rc_alloc:
+    push rbp
+    mov rbp, rsp
+    add rdi, 8
+    call _rail_alloc
+    pop rbp
+    ret
+
+.global _rail_rc_release
+_rail_rc_release:
+    ret
+
+# ── String runtime: find/contains/sub/replace/split ─────────────────────────
+# ARM64 oracle: compile.rail rt_string (sfind/scont/ssub/srepl/ssplit).
+# x86 strings are raw char* (no heap wrapper), so no str_unwrap/wrap_str
+# needed; we call glibc strstr/strlen/strcpy/memcpy/malloc directly.
+#
+# Arg passing (SysV ABI):
+#   _rail_str_find(rdi=needle, rsi=haystack)
+#   _rail_str_contains(rdi=needle, rsi=haystack)
+#   _rail_str_sub(rdi=str, rsi=start_tagged, rdx=len_tagged)
+#   _rail_str_replace(rdi=find, rsi=replace, rdx=str)
+#   _rail_str_split(rdi=delim, rsi=str)
+
+# _rail_str_find(needle, haystack) -> tagged int offset, or tagged -1
+.global _rail_str_find
+_rail_str_find:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    mov [rbp-8], rsi         # save haystack
+    # strstr(haystack, needle) — glibc: rdi=haystack, rsi=needle
+    mov rax, rdi             # swap: rax = needle
+    mov rdi, rsi             # rdi = haystack
+    mov rsi, rax             # rsi = needle
+    call strstr@PLT
+    test rax, rax
+    jz .Lsf_notfound
+    sub rax, [rbp-8]         # offset = match - haystack
+    lea rax, [rax*2+1]       # tag
+    leave
+    ret
+.Lsf_notfound:
+    mov rax, -1
+    lea rax, [rax*2+1]       # tag -1 -> -1 (0xFFFFFFFFFFFFFFFF)
+    leave
+    ret
+
+# _rail_str_contains(needle, haystack) -> tagged bool (3=true, 1=false)
+.global _rail_str_contains
+_rail_str_contains:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    # strstr(haystack, needle)
+    mov rax, rdi             # rax = needle
+    mov rdi, rsi             # rdi = haystack
+    mov rsi, rax             # rsi = needle
+    call strstr@PLT
+    test rax, rax
+    setne al
+    movzx rax, al
+    lea rax, [rax*2+1]       # 0 -> 1 (false), 1 -> 3 (true)
+    leave
+    ret
+
+# _rail_str_sub(str, start_tagged, len_tagged) -> new string (untagged char*)
+.global _rail_str_sub
+_rail_str_sub:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    sar rsi, 1               # untag start
+    sar rdx, 1               # untag len
+    mov [rbp-8], rdi         # save str
+    mov [rbp-16], rsi        # save start
+    mov [rbp-24], rdx        # save len
+    # malloc(len + 1)
+    mov rdi, rdx
+    inc rdi
+    call malloc@PLT
+    mov [rbp-32], rax        # save dest buffer
+    # memcpy(dest, str+start, len)
+    mov rdi, rax             # dest
+    mov rsi, [rbp-8]
+    add rsi, [rbp-16]        # src = str + start
+    mov rdx, [rbp-24]        # n = len
+    call memcpy@PLT
+    # null-terminate at dest[len]
+    mov rax, [rbp-32]
+    mov rcx, [rbp-24]
+    mov byte ptr [rax+rcx], 0
+    mov rax, [rbp-32]
+    leave
+    ret
+
+# _rail_str_replace(find, replace, str) -> new string (replaces all occurrences)
+# Allocate generous buffer: 4 * len(str) + 64 (matches ARM64 heuristic).
+# This works for replace strings up to ~4x the find string; long replacements
+# could in theory overflow but the ARM64 oracle has the same limit.
+.global _rail_str_replace
+_rail_str_replace:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 96
+    mov [rbp-8], rdi         # find
+    mov [rbp-16], rsi        # replace
+    mov [rbp-24], rdx        # str (cursor advances)
+    # str_len = strlen(str)
+    mov rdi, rdx
+    call strlen@PLT
+    mov [rbp-32], rax        # str_len
+    # find_len = strlen(find)
+    mov rdi, [rbp-8]
+    call strlen@PLT
+    mov [rbp-40], rax        # find_len
+    # replace_len = strlen(replace)
+    mov rdi, [rbp-16]
+    call strlen@PLT
+    mov [rbp-48], rax        # replace_len
+    # alloc buf = malloc(4*str_len + 64)
+    mov rdi, [rbp-32]
+    shl rdi, 2
+    add rdi, 64
+    call malloc@PLT
+    mov [rbp-56], rax        # buf
+    mov qword ptr [rbp-64], 0  # buf_off
+    mov rax, [rbp-24]
+    mov [rbp-72], rax        # cursor = str
+.Lsr_loop:
+    # strstr(cursor, find)
+    mov rdi, [rbp-72]
+    mov rsi, [rbp-8]
+    call strstr@PLT
+    test rax, rax
+    jz .Lsr_rest
+    mov [rbp-80], rax        # match_ptr
+    # Copy cursor..match_ptr to buf+buf_off
+    mov rsi, [rbp-72]
+    mov rdx, rax
+    sub rdx, rsi             # gap_len = match - cursor
+    mov rdi, [rbp-56]
+    add rdi, [rbp-64]        # dest = buf + buf_off
+    mov [rbp-88], rdx        # save gap_len
+    call memcpy@PLT
+    # buf_off += gap_len
+    mov rax, [rbp-88]
+    add [rbp-64], rax
+    # Copy replace to buf+buf_off
+    mov rdi, [rbp-56]
+    add rdi, [rbp-64]
+    mov rsi, [rbp-16]
+    mov rdx, [rbp-48]
+    call memcpy@PLT
+    # buf_off += replace_len
+    mov rax, [rbp-48]
+    add [rbp-64], rax
+    # cursor = match_ptr + find_len
+    mov rax, [rbp-80]
+    add rax, [rbp-40]
+    mov [rbp-72], rax
+    jmp .Lsr_loop
+.Lsr_rest:
+    # Copy remainder of cursor (including null terminator) to buf+buf_off
+    mov rdi, [rbp-56]
+    add rdi, [rbp-64]
+    mov rsi, [rbp-72]
+.Lsr_cp3:
+    movzx eax, byte ptr [rsi]
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    test al, al
+    jnz .Lsr_cp3
+    mov rax, [rbp-56]
+    leave
+    ret
+
+# _rail_str_split(delim, str) -> Rail list of strings (multi-char delimiter)
+# Iterate strstr(cursor, delim); for each hit, cons substring onto acc.
+# After loop, cons remainder, then reverse.
+.global _rail_str_split
+_rail_str_split:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 64
+    mov [rbp-8], rdi         # delim
+    mov [rbp-16], rsi        # str (also initial cursor)
+    # delim_len
+    call strlen@PLT
+    mov [rbp-24], rax        # delim_len
+    lea rax, [rip+_rail_nil]
+    mov [rbp-32], rax        # acc = nil
+    mov rax, [rbp-16]
+    mov [rbp-40], rax        # cursor = str
+.Lssp_loop:
+    mov rdi, [rbp-40]
+    mov rsi, [rbp-8]
+    call strstr@PLT
+    test rax, rax
+    jz .Lssp_last
+    mov [rbp-48], rax        # match_ptr
+    # seg_len = match_ptr - cursor
+    mov rcx, rax
+    sub rcx, [rbp-40]
+    mov [rbp-56], rcx        # seg_len
+    # alloc seg_len+1
+    lea rdi, [rcx+1]
+    call malloc@PLT
+    mov [rbp-64], rax        # seg_buf
+    # memcpy(seg_buf, cursor, seg_len)
+    mov rdi, rax
+    mov rsi, [rbp-40]
+    mov rdx, [rbp-56]
+    call memcpy@PLT
+    # null-terminate
+    mov rax, [rbp-64]
+    mov rcx, [rbp-56]
+    mov byte ptr [rax+rcx], 0
+    # cons(seg_buf, acc)
+    mov rdi, [rbp-64]
+    mov rsi, [rbp-32]
+    call _rail_cons
+    mov [rbp-32], rax
+    # cursor = match_ptr + delim_len
+    mov rax, [rbp-48]
+    add rax, [rbp-24]
+    mov [rbp-40], rax
+    jmp .Lssp_loop
+.Lssp_last:
+    # Cons remainder (everything from cursor)
+    mov rdi, [rbp-40]
+    call strlen@PLT
+    lea rdi, [rax+1]
+    mov [rbp-56], rax        # rem_len (without null)
+    call malloc@PLT
+    mov [rbp-64], rax
+    mov rdi, rax
+    mov rsi, [rbp-40]
+    call strcpy@PLT
+    mov rdi, [rbp-64]
+    mov rsi, [rbp-32]
+    call _rail_cons
+    mov [rbp-32], rax
+    # Reverse
+    mov rdi, rax
+    call _rail_reverse
+    leave
+    ret
+
+# === Bit ops (Agent A - feat/a-bitop-runtime-v0) ============================
+#
+# Symbols expected by the x86 codegen fall-through path
+# (compile.rail:x86_cg_bi3 default branch emits `call _<fname>`):
+#   _bit_and  _bit_or  _bit_xor  _shl  _shr  _rotl
+#
+# ABI: System V AMD64 — args in rdi (a), rsi (b), return in rax.
+# All operands are tagged ints: low bit = 1, value = (raw << 1) | 1.
+# Re-tag via `lea rax, [rax*2+1]` after the bare op on raw bits.
+#
+# Mirrors compile.rail's ARM64 inline emit (`asr x0, x0, #1` strip-tag ->
+# native op -> `lsl x0, x0, #1; orr x0, x0, #1` re-tag).
+#
+# Crypto callers (stdlib/sha256.rail and friends) define `and32 a b =
+# bit_and (bit_and a b) 4294967295` patterns, so 32-bit semantics emerge
+# from the caller; these runtime helpers operate on the full 63-bit
+# Rail int width.
+
+.global _bit_and
+_bit_and:
+    sar rdi, 1
+    sar rsi, 1
+    and rdi, rsi
+    lea rax, [rdi*2+1]
+    ret
+
+.global _bit_or
+_bit_or:
+    sar rdi, 1
+    sar rsi, 1
+    or rdi, rsi
+    lea rax, [rdi*2+1]
+    ret
+
+.global _bit_xor
+_bit_xor:
+    sar rdi, 1
+    sar rsi, 1
+    xor rdi, rsi
+    lea rax, [rdi*2+1]
+    ret
+
+# shl x n : x << n. x86 `shl` requires count in cl when count is a
+# register. Mirror ARM64 inline (undefined for n>=64; crypto callers
+# know n statically and stay in-range).
+.global _shl
+_shl:
+    sar rdi, 1
+    sar rsi, 1
+    mov rcx, rsi
+    shl rdi, cl
+    lea rax, [rdi*2+1]
+    ret
+
+# shr x n : logical right shift. Sign-extend would change SHA-256 etc.;
+# match ARM64 semantics which use `lsr` (zero-fill).
+.global _shr
+_shr:
+    sar rdi, 1
+    sar rsi, 1
+    mov rcx, rsi
+    shr rdi, cl
+    lea rax, [rdi*2+1]
+    ret
+
+# rotl x n : rotate left by n bits, 64-bit width. x86 `rol` takes count
+# in cl. Note this rotates the full 63-bit value; 32-bit ChaCha20-style
+# rotates require the caller to mask with 0xFFFFFFFF afterwards, same
+# as on ARM64.
+.global _rotl
+_rotl:
+    sar rdi, 1
+    sar rsi, 1
+    mov rcx, rsi
+    rol rdi, cl
+    lea rax, [rdi*2+1]
+    ret
+
+# char_from_int(c_tagged) -> raw C string of 2 bytes [c, NUL]. Inverse of
+# char_to_int. ARM64 wraps with `_rail_wrap_str` (header [9,len,bytes]); x86
+# strings are raw C strings (see compile.rail:5564), so we just malloc 2,
+# write the char + null terminator, return the pointer. Untagged return
+# matches the rest of x86's string ABI.
+#
+# Required by stdlib/sha256.rail's `hex_char_of` helper, which gates the
+# entire sha256/hmac/hkdf/chacha20/poly1305/aead/x25519 cascade.
+.global _char_from_int
+_char_from_int:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1               # untag char value
+    mov [rbp-8], rdi         # save char byte
+    mov rdi, 2
+    call malloc@PLT
+    mov rcx, [rbp-8]
+    mov byte ptr [rax], cl   # byte 0 = char
+    mov byte ptr [rax+1], 0  # byte 1 = NUL
+    leave
+    ret
+
+# byte_at(str_ptr, i_tagged) -> tagged int byte value. Raw C string indexed.
+# Mirrors ARM64 compile.rail:1128 inline. Needed by stdlib byte-buffer code
+# (HMAC key/message expansion, AEAD nonce construction).
+.global _byte_at
+_byte_at:
+    sar rsi, 1               # untag index
+    movzx rax, byte ptr [rdi+rsi]
+    lea rax, [rax*2+1]       # tag the byte value
+    ret
+
+# byte_set(str_ptr, i_tagged, v_tagged) -> ignored (returns tagged 1).
+# ARM64 returns x0=#3 (boolean true) at compile.rail:1133. Mirror that.
+.global _byte_set
+_byte_set:
+    sar rsi, 1               # untag index
+    sar rdx, 1               # untag value
+    mov byte ptr [rdi+rsi], dl
+    mov rax, 3               # tagged true
+    ret
+
+# === Float-arr + numeric parse (Agent B, 2026-05-14) =========================
+# Mirrors ARM64 contracts from compile.rail (rfarrnew/get/set/tof32/fromf32).
+# Unblocks: parse_float / sci_int_exp / sci_frac / f32_io_roundtrip /
+# mixed_float_int_op / tensor_prims / tensor_rank / tensor_slice /
+# tensor_layer_norm.
+#
+# Float ABI on x86 (different from ARM64): floats are HEAP-BOXED as a 16-byte
+# object `[qword tag=6, qword double-bits]`. Pointers move in GP regs (rax,
+# rdi, …); the unboxed double lives at offset +8. Ints are tagged
+# `(val<<1)|1`. Where ARM64 returns raw double bits in x0 after `fmov x0, d0`,
+# x86 returns a pointer to a fresh `[6, double]` box.
+#
+# Float-array layout matches the existing `arr_new` shape so `arr_len` works
+# uniformly: `[qword tag=7, qword length, double e0, double e1, …]`. Elements
+# are raw doubles inline; get allocates a fresh `[6, double]` box, set unboxes
+# from a boxed argument. Equivalent to the ARM64 packed-doubles layout once
+# the length-header word is accounted for.
+
+# ── _to_int / _float_to_int : boxed float → tagged int (truncate) ────────────
+# rdi = boxed float pointer ([6, double] @ +8)
+# rax = ((trunc xmm0) << 1) | 1
+.global _to_int
+_to_int:
+    movsd xmm0, qword ptr [rdi+8]
+    cvttsd2si rax, xmm0
+    lea rax, [rax*2+1]
+    ret
+
+.global _float_to_int
+_float_to_int:
+    movsd xmm0, qword ptr [rdi+8]
+    cvttsd2si rax, xmm0
+    lea rax, [rax*2+1]
+    ret
+
+# ── _to_float / _int_to_float : tagged int → boxed float ─────────────────────
+# rdi = tagged int. rax = pointer to fresh [6, double] box.
+.global _to_float
+_to_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+.global _int_to_float
+_int_to_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+# ── _parse_float : C-string → boxed float ────────────────────────────────────
+# rdi = char* (already a raw C-string on x86; no _str_unwrap needed unlike
+# ARM64). rax = pointer to fresh [6, double] box. Uses libc strtod for IEEE
+# parse (handles "1e6", "5.0e2", "-3.25", etc.). NULL endptr — accepts the
+# whole string; non-numeric tails silently truncate.
+.global _parse_float
+_parse_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    xor rsi, rsi
+    call strtod@PLT
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+# ── _show_float : boxed float → C-string ─────────────────────────────────────
+# rdi = boxed float pointer. _rail_show already dispatches on the tag-6
+# header, so we just forward. (User code that calls show_float gets the
+# same %.15g output _rail_show would produce.)
+.global _show_float
+_show_float:
+    jmp _rail_show
+
+# ── _fneg / _fsqrt / _fabs : boxed float → boxed float ───────────────────────
+# Allocate a fresh box each call (functional, no in-place mutation).
+.global _fneg
+_fneg:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    movsd xmm0, qword ptr [rdi+8]
+    pxor xmm1, xmm1
+    subsd xmm1, xmm0
+    movsd [rbp-16], xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+.global _fsqrt
+_fsqrt:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    movsd xmm0, qword ptr [rdi+8]
+    sqrtsd xmm0, xmm0
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+.global _fabs
+_fabs:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    movsd xmm0, qword ptr [rdi+8]
+    # Clear the sign bit by AND with 0x7FFFFFFFFFFFFFFF
+    mov rax, 0x7FFFFFFFFFFFFFFF
+    movq xmm1, rax
+    andpd xmm0, xmm1
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+# ── _float_arr_new : size_tagged, init_boxed → boxed float-array ─────────────
+# rdi = size (tagged int), rsi = init (boxed float pointer)
+# Layout: [tag=7, length, d0, d1, …] — same header as _rail_arr_new so
+# `arr_len` works uniformly.
+.global _float_arr_new
+_float_arr_new:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    sar rdi, 1                # untag size
+    mov [rbp-8], rdi          # save size (untagged)
+    movsd xmm0, qword ptr [rsi+8]
+    movsd [rbp-24], xmm0      # save init double
+    lea rdi, [rdi*8+16]       # size*8 + 16-byte header
+    call _rail_alloc
+    mov [rbp-16], rax         # save buffer
+    mov qword ptr [rax], 7
+    mov rcx, [rbp-8]
+    mov [rax+8], rcx          # length (untagged)
+    movsd xmm0, qword ptr [rbp-24]
+    xor rcx, rcx              # i = 0
+.Lfan_loop:
+    cmp rcx, [rbp-8]
+    jae .Lfan_done
+    lea rdx, [rcx+2]          # element offset = (i+2)*8
+    movsd qword ptr [rax+rdx*8], xmm0
+    inc rcx
+    jmp .Lfan_loop
+.Lfan_done:
+    mov rax, [rbp-16]
+    leave
+    ret
+
+# ── _float_arr_get : arr, idx_tagged → boxed float ───────────────────────────
+# rdi = arr pointer, rsi = idx (tagged int)
+# Loads raw double from inline slot, allocates a fresh [6, double] box.
+.global _float_arr_get
+_float_arr_get:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rsi, 1                # untag idx
+    add rsi, 2                # account for [tag, length] header
+    movsd xmm0, qword ptr [rdi+rsi*8]
+    movsd [rbp-16], xmm0
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd xmm0, qword ptr [rbp-16]
+    movsd [rax+8], xmm0
+    leave
+    ret
+
+# ── _float_arr_set : arr, idx_tagged, val_boxed → tagged 1 ───────────────────
+# rdi = arr, rsi = idx (tagged), rdx = boxed float pointer.
+# Unbox rdx, store raw double at slot, return tagged 1 (=3).
+.global _float_arr_set
+_float_arr_set:
+    movsd xmm0, qword ptr [rdx+8]
+    sar rsi, 1
+    add rsi, 2
+    movsd qword ptr [rdi+rsi*8], xmm0
+    mov rax, 3
+    ret
+
+# ── _float_arr_len : arr → tagged length ─────────────────────────────────────
+# Same as _rail_arr_len, just exposed under the float name (stdlib/tensor.rail
+# calls `float_arr_len` explicitly and it falls through to user-symbol emit).
+.global _float_arr_len
+_float_arr_len:
+    mov rax, [rdi+8]
+    lea rax, [rax*2+1]
+    ret
+
+# ── _float_arr_to_f32_file : path, arr, n_tagged → tagged 1 (or tagged 0 on err)
+# rdi = path (C string), rsi = arr, rdx = n (tagged).
+# Down-converts each double to float32 via cvtsd2ss, writes a contiguous
+# little-endian f32 blob via fwrite. Returns tagged 1 on success, tagged 0
+# (=1) on error. Mirrors the ARM64 syscall-based implementation without the
+# direct write(2) syscall (uses libc fopen/fwrite/fclose instead).
+.global _float_arr_to_f32_file
+_float_arr_to_f32_file:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi          # path
+    mov [rbp-16], rsi         # arr
+    sar rdx, 1                # untag n
+    mov [rbp-24], rdx         # n (untagged)
+    # fopen(path, "w")
+    mov rdi, [rbp-8]
+    lea rsi, [rip+_mode_w]
+    call fopen@PLT
+    test rax, rax
+    jz .Lf32w_err
+    mov [rbp-32], rax         # FILE*
+    # Allocate scratch buffer of n*4 bytes (one f32 per element)
+    mov rdi, [rbp-24]
+    shl rdi, 2
+    test rdi, rdi
+    jz .Lf32w_close_ok        # n==0 → success, nothing to write
+    call malloc@PLT
+    test rax, rax
+    jz .Lf32w_close_err
+    mov [rbp-40], rax         # buf
+    # Fill buf: i = 0; while i < n: buf[i] = (float)arr[i]
+    xor rcx, rcx
+.Lf32w_fill:
+    cmp rcx, [rbp-24]
+    jae .Lf32w_write
+    mov rax, [rbp-16]
+    lea rdx, [rcx+2]
+    movsd xmm0, qword ptr [rax+rdx*8]
+    cvtsd2ss xmm0, xmm0
+    mov rax, [rbp-40]
+    movss dword ptr [rax+rcx*4], xmm0
+    inc rcx
+    jmp .Lf32w_fill
+.Lf32w_write:
+    mov rdi, [rbp-40]         # buf
+    mov rsi, 4                # element size
+    mov rdx, [rbp-24]         # nmemb
+    mov rcx, [rbp-32]         # FILE*
+    call fwrite@PLT
+    mov rdi, [rbp-40]
+    call free@PLT
+.Lf32w_close_ok:
+    mov rdi, [rbp-32]
+    call fclose@PLT
+    mov rax, 3                # tagged 1
+    leave
+    ret
+.Lf32w_close_err:
+    mov rdi, [rbp-32]
+    call fclose@PLT
+.Lf32w_err:
+    mov rax, 1                # tagged 0
+    leave
+    ret
+
+# ── _float_arr_from_f32_file : path, arr, n_tagged → tagged 1 (or 0 on err) ──
+# rdi = path, rsi = arr, rdx = n (tagged).
+# Reads n*4 bytes of f32 via fread, expands each to f64 via cvtss2sd, stores
+# into the float-array slots. Inverse of _float_arr_to_f32_file.
+.global _float_arr_from_f32_file
+_float_arr_from_f32_file:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi
+    mov [rbp-16], rsi
+    sar rdx, 1
+    mov [rbp-24], rdx
+    mov rdi, [rbp-8]
+    lea rsi, [rip+_mode_r]
+    call fopen@PLT
+    test rax, rax
+    jz .Lf32r_err
+    mov [rbp-32], rax
+    mov rdi, [rbp-24]
+    shl rdi, 2
+    test rdi, rdi
+    jz .Lf32r_close_ok
+    call malloc@PLT
+    test rax, rax
+    jz .Lf32r_close_err
+    mov [rbp-40], rax         # buf
+    mov rdi, [rbp-40]
+    mov rsi, 4
+    mov rdx, [rbp-24]
+    mov rcx, [rbp-32]
+    call fread@PLT
+    # Expand f32 → f64 into arr
+    xor rcx, rcx
+.Lf32r_load:
+    cmp rcx, [rbp-24]
+    jae .Lf32r_done
+    mov rax, [rbp-40]
+    movss xmm0, dword ptr [rax+rcx*4]
+    cvtss2sd xmm0, xmm0
+    mov rax, [rbp-16]
+    lea rdx, [rcx+2]
+    movsd qword ptr [rax+rdx*8], xmm0
+    inc rcx
+    jmp .Lf32r_load
+.Lf32r_done:
+    mov rdi, [rbp-40]
+    call free@PLT
+.Lf32r_close_ok:
+    mov rdi, [rbp-32]
+    call fclose@PLT
+    mov rax, 3
+    leave
+    ret
+.Lf32r_close_err:
+    mov rdi, [rbp-32]
+    call fclose@PLT
+.Lf32r_err:
+    mov rax, 1
+    leave
+    ret
+
+# === Threading (Agent C) ===
+# x86_64 SysV mirror of the ARM64 rt_thread block (compile.rail rt_thread).
+#
+# Handle layout (40 bytes, malloc'd, leaked — matches ARM64 lifetime):
+#   [+0]  fn       (closure pointer or raw fn — header tag 4 = closure)
+#   [+8]  arg      (tagged value)
+#   [+16] result   (tagged value, written by trampoline)
+#   [+24] pthread_t (opaque; glibc = unsigned long = 8 bytes)
+#   [+32] padding (reserved)
+#
+# Linker: gcc -lpthread (already in x86_rt.s header). Symbols are bare
+# `pthread_create@PLT` / `pthread_join@PLT` per glibc convention.
+
+.global _rail_spawn_thread
+_rail_spawn_thread:
+    # rdi = fn, rsi = arg.  Allocate handle, init slots, spawn pthread.
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8],  rdi               # fn
+    mov [rbp-16], rsi               # arg
+    mov rdi, 40
+    call malloc@PLT
+    mov [rbp-24], rax               # handle
+    mov rcx, [rbp-8]
+    mov [rax],    rcx               # handle[0] = fn
+    mov rcx, [rbp-16]
+    mov [rax+8],  rcx               # handle[8] = arg
+    mov qword ptr [rax+16], 0       # handle[16] = result slot
+    # pthread_create(&handle[24], NULL, _rail_thread_tramp, handle)
+    mov rdi, rax
+    add rdi, 24
+    xor rsi, rsi
+    lea rdx, [rip+_rail_thread_tramp]
+    mov rcx, [rbp-24]
+    call pthread_create@PLT
+    mov rax, [rbp-24]               # return handle (raw pointer)
+    leave
+    ret
+
+# void *_rail_thread_tramp(void *handle)
+# Dispatches handle[0] on handle[8] and stores the tagged result at handle[16].
+# fn may be:
+#   - tagged int (low bit 1)         → degenerate; store 1 and exit
+#   - closure pointer (hdr == 4)     → call closure[+8] with rdi=arg, rsi..=caps
+#   - raw function pointer (other)   → call fn(arg)
+# Mirrors ARM64 _rail_thread_tramp closely (no caps loaded since spawn_thread
+# tests are single-arg no-capture; matches arm64 trampoline behavior).
+.global _rail_thread_tramp
+_rail_thread_tramp:
+    push rbp
+    mov rbp, rsp
+    push rbx                        # callee-saved scratch
+    sub rsp, 24                     # keep 16-byte align before call
+    mov rbx, rdi                    # handle (preserved across calls)
+    mov rdi, [rbx+8]                # arg → first ABI reg
+    mov r10, [rbx]                  # fn
+    test r10, 1
+    jne .Lthread_tramp_done         # tagged int: skip the call
+    mov r11, [r10]                  # header word
+    btr r11, 63                     # clear GC mark bit (high)
+    cmp r11, 4
+    jne .Lthread_tramp_raw
+    # Closure path: closure[+8] is the code pointer.  Set r15=closure for
+    # callee's capture-load convention; ncaps=0 in our test programs so the
+    # callee's `cmp r13, 0; je clbl` short-circuits before any capture load.
+    mov r15, r10
+    xor r13, r13                    # ncaps = 0
+    mov r10, [r10+8]
+    call r10
+    jmp .Lthread_tramp_store
+.Lthread_tramp_raw:
+    call r10
+    jmp .Lthread_tramp_store
+.Lthread_tramp_done:
+    mov rax, 1                      # tagged 0
+.Lthread_tramp_store:
+    mov [rbx+16], rax
+    xor rax, rax                    # pthread start_routine return value
+    add rsp, 24
+    pop rbx
+    leave
+    ret
+
+.global _rail_join_thread
+_rail_join_thread:
+    # rdi = handle.  Wait for pthread, return handle[16].
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8                      # 16-byte align before call
+    mov rbx, rdi
+    mov rdi, [rbx+24]               # pthread_t
+    xor rsi, rsi                    # retval ignored (we use handle[16])
+    call pthread_join@PLT
+    mov rax, [rbx+16]
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+

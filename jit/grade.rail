@@ -1,0 +1,127 @@
+-- jit/grade.rail — training-session integration helper.
+--
+-- Single Rail function `try_jit_grade src`. The training session calls
+-- this in its rollout loop. Returns:
+--   ["jit_ok", int_return]  -- JIT lowered + ran cleanly; here's main's int
+--   ["err", reason_string]  -- couldn't lower (use shell-grade fallback)
+--
+-- For programs that print via op_print_int / op_print_str, see
+-- `try_jit_grade_str src expected` below — output capture (P0 from
+-- CONTINUATION.md) is now wired up via the heap output buffer.
+--
+-- Typical use:
+--
+--   import "jit/heap.rail"
+--   import "jit/emit.rail"
+--   import "jit/loader.rail"
+--   import "jit/lower.rail"
+--   import "jit/grade.rail"
+--
+--   let r = try_jit_grade candidate_src
+--   if (head r) == "jit_ok" then
+--     -- compare (head (tail r)) to expected_int; full grade
+--     ...
+--   else
+--     -- fall back to shell-grade
+--     ...
+--
+-- Cost: ~ms when JIT path runs (lower + emit + pthread + read). Compare
+-- to ~100 ms for `./rail_native run`, the canonical fallback grader.
+
+-- ============================================================================
+-- Public API
+-- ============================================================================
+
+try_jit_grade src =
+  let r = lower_source src
+  if (head r) == "err" then
+    cons "err" (cons (cat ["lower: ", head (tail r)]) [])
+  else jit_grade_run (head (tail r)) (head (tail (tail r)))
+
+jit_grade_run fns pool =
+  let heap = heap_alloc 0
+  let res = emit_program fns pool heap
+  let buf = emitted_buf res
+  let n = emitted_size res
+  let page = make_executable buf n
+  -- P6: direct call via libjit_call.dylib (~10× faster than pthread_create).
+  let got = call_jit_direct page heap
+  let _ = free_jit page
+  let _ = heap_free heap
+  cons "jit_ok" (cons got [])
+
+-- ============================================================================
+-- Convenience: verify against an expected int. Returns 1 (pass) or 0 (fail).
+-- For "errored" lowerings, returns 0 (so the harness drops to shell grade).
+-- ============================================================================
+
+jit_grade_int src expected =
+  let r = try_jit_grade src
+  if (head r) == "err" then 0
+  else if (head (tail r)) == expected then 1
+  else 0
+
+-- ============================================================================
+-- Convenience: just check if a program lowers (cheap canary, no execution).
+-- Returns 1 if lowerable, 0 if not. Useful for distill-time partitioning
+-- before deciding whether to JIT or shell-grade.
+-- ============================================================================
+
+-- Builtins recognised by the JIT lowerer but NOT by rail_native's regular
+-- pipeline (rail_native uses `==`, `length`, `str_sub`, ADT match instead).
+-- If a candidate source mentions one of these, `jit_can_lower=1` would be
+-- unsound — naive fast-path users would mark a program as JIT_PASS when
+-- rail_native actually rejects it. Refuse the fast path here, at the
+-- source. Keep this list in sync with tools/bench/jit_grade_batch.rail
+-- (which keeps the same check as defense-in-depth).
+contains_rail_native_incompatible_builtin src =
+  if str_contains "str_eq" src then 1
+  else if str_contains "str_len" src then 1
+  else if str_contains "str_at" src then 1
+  else if str_contains "is_nil" src then 1
+  else 0
+
+jit_can_lower src =
+  if (contains_rail_native_incompatible_builtin src) == 1 then 0
+  else
+    let r = lower_source src
+    if (head r) == "err" then 0 else 1
+
+-- ============================================================================
+-- Stdout grading (P0/P1): JIT the source, run it, read the captured output
+-- buffer back, compare to `expected`. The training session calls this in
+-- its rollout loop for programs whose grade is determined by stdout.
+--
+-- Returns:
+--   ["jit_pass"]                  -- captured == expected (byte-exact)
+--   ["jit_fail", actual_string]   -- ran cleanly but stdout mismatched
+--   ["err", reason_string]        -- couldn't lower (use shell-grade fallback)
+--
+-- Cost: ~ms per call once the lowering pipeline is warm. Compare to
+-- ~100 ms for `./rail_native run` + read /tmp/rail_out + strcmp.
+-- ============================================================================
+
+try_jit_grade_str src expected =
+  let r = lower_source src
+  if (head r) == "err" then
+    cons "err" (cons (cat ["lower: ", head (tail r)]) [])
+  else
+    let fns  = head (tail r)
+    let pool = head (tail (tail r))
+    let heap = heap_alloc 0
+    let res  = emit_program fns pool heap
+    let buf  = emitted_buf res
+    let nbytes = emitted_size res
+    let page = make_executable buf nbytes
+    -- P6: direct call via libjit_call.dylib (~10× faster than pthread_create).
+    let _    = call_jit_direct page heap
+    let actual = read_jit_output heap
+    let _ = free_jit page
+    let _ = heap_free heap
+    if actual == expected then ["jit_pass"]
+    else cons "jit_fail" (cons actual [])
+
+-- 1/0 convenience (mirrors jit_grade_int).
+jit_grade_str src expected =
+  let r = try_jit_grade_str src expected
+  if (head r) == "jit_pass" then 1 else 0

@@ -24,7 +24,7 @@ FLEET_TOKEN_FILE=${FLEET_TOKEN_FILE:-$HOME/.fleet/token}
 BEACON_TOKEN_FILE=${BEACON_TOKEN_FILE:-$HOME/.ledatic/entropy/beacon_token}
 WITNESS_HOST_FILE=${WITNESS_HOST_FILE:-$HOME/.ledatic/witness/host}
 WITNESS_HOST=${WITNESS_HOST:-$(cat "$WITNESS_HOST_FILE" 2>/dev/null || echo "")}
-SIGNER=${SIGNER:-/home/zemog/.ledatic/witness/sign_fleet_bundle.sh}
+SIGNER=${SIGNER:-<HOME>/.ledatic/witness/sign_fleet_bundle.sh}
 SITE=${SITE:-https://ledatic.org}
 BEACON_URL=${BEACON_URL:-https://ledatic.org/entropy/pulse}
 NODES_FILE=${NODES_FILE:-$HOME/.ledatic/fleet/nodes}
@@ -98,7 +98,7 @@ PY
 digest=$(printf '%s' "$canonical" | shasum -a 256 | awk '{print $1}')
 
 inner=$(ssh -o ConnectTimeout=4 -o BatchMode=yes "$WITNESS_HOST" \
-  "/home/zemog/.ledatic/witness/sign_attestation.sh $digest $pulse_id $value_hex" 2>/dev/null || true)
+  "<HOME>/.ledatic/witness/sign_attestation.sh $digest $pulse_id $value_hex" 2>/dev/null || true)
 if [ -z "$inner" ]; then
   echo "witness signer unreachable; publishing unsigned" >&2
   inner='{"kind":"attestation","version":1,"sig":null,"pk_fp":null,"witness":"none"}'

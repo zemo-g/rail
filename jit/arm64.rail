@@ -1,0 +1,210 @@
+-- jit/arm64.rail — ARM64 instruction encoder.
+-- Each function returns a 32-bit ARM64 instruction word as a Rail int.
+-- Encodings verified against `as` + `objdump -d` (see test_codegen.rail).
+
+-- mov xD, xS   (alias of orr xD, xzr, xS)
+-- Base: 0xAA0003E0 | (S << 16) | D
+enc_mov_reg dst src =
+  bit_or 2852127712 (bit_or (shl src 16) dst)
+
+-- movz xD, #imm16            (mov xD, #imm)
+-- Base: 0xD2800000 | (imm << 5) | D
+enc_mov_imm16 dst imm =
+  bit_or 3531603968 (bit_or (shl (bit_and imm 65535) 5) dst)
+
+-- movk xD, #imm16, lsl #(N*16)   N in {0,1,2,3}
+-- Base: 0xF2800000 | (N << 21) | (imm << 5) | D
+enc_movk dst imm shift_n =
+  bit_or 4068474880 (bit_or (shl shift_n 21) (bit_or (shl (bit_and imm 65535) 5) dst))
+
+-- add xD, xA, xB    Base: 0x8B000000 | (B << 16) | (A << 5) | D
+enc_add dst a b =
+  bit_or 2332033024 (bit_or (shl b 16) (bit_or (shl a 5) dst))
+
+-- sub xD, xA, xB    Base: 0xCB000000 | (B << 16) | (A << 5) | D
+enc_sub dst a b =
+  bit_or 3405774848 (bit_or (shl b 16) (bit_or (shl a 5) dst))
+
+-- mul xD, xA, xB    (madd xD, xA, xB, xzr)
+-- Base: 0x9B007C00 | (B << 16) | (A << 5) | D
+enc_mul dst a b =
+  bit_or 2600500224 (bit_or (shl b 16) (bit_or (shl a 5) dst))
+
+-- cmp xA, xB        (subs xzr, xA, xB)
+-- Base: 0xEB00001F | (B << 16) | (A << 5)
+enc_cmp a b =
+  bit_or 3942645791 (bit_or (shl b 16) (shl a 5))
+
+-- cset xD, lt       Base: 0x9A9FA7E0 | D
+enc_cset_lt dst =
+  bit_or 2594154464 dst
+
+-- cset xD, eq       Base: 0x9A9F17E0 | D  (csinc with cond=ne to invert)
+enc_cset_eq dst = bit_or 2594117600 dst
+-- cset xD, gt       Base: 0x9A9FD7E0 | D  (cond=le)
+enc_cset_gt dst = bit_or 2594166752 dst
+-- cset xD, le       Base: 0x9A9FC7E0 | D  (cond=gt)
+enc_cset_le dst = bit_or 2594162656 dst
+-- cset xD, ge       Base: 0x9A9FB7E0 | D  (cond=lt)
+enc_cset_ge dst = bit_or 2594158560 dst
+
+-- udiv xD, xA, xB    Base: 0x9AC00800 | (B<<16) | (A<<5) | D
+enc_udiv dst a b = bit_or (bit_or (bit_or 2596276224 (shl b 16)) (shl a 5)) dst
+
+-- msub xD, xN, xM, xA  Base: 0x9B008000 | (M<<16) | (A<<10) | (N<<5) | D
+enc_msub dst n m a =
+  bit_or (bit_or (bit_or (bit_or 2600501248 (shl m 16)) (shl a 10)) (shl n 5)) dst
+
+-- cbz xR, #offset_in_instructions     (offset shifted left 2 to bytes by HW)
+-- We accept the byte offset, divide by 4 inside.
+-- Base: 0xB4000000 | ((off19 & 0x7FFFF) << 5) | R
+-- off19 is the instruction offset (signed 19 bits).
+enc_cbz_byte_off reg byte_off =
+  let inst_off = byte_off / 4
+  let masked = bit_and inst_off 524287
+  bit_or 3019898880 (bit_or (shl masked 5) reg)
+
+-- b #offset (byte_off must be multiple of 4)
+-- Base: 0x14000000 | (off26 & 0x3FFFFFF)
+enc_b_byte_off byte_off =
+  let inst_off = byte_off / 4
+  let masked = bit_and inst_off 67108863
+  bit_or 335544320 masked
+
+-- ret    Base: 0xD65F03C0
+enc_ret = 3596551104
+
+-- bl #offset    (offset must be multiple of 4; signed 26-bit instr offset)
+-- Base: 0x94000000 | ((byte_off >> 2) & 0x3FFFFFF)
+-- Same field layout as `b` but with bit 31 set (link).
+enc_bl_byte_off byte_off =
+  let inst_off = byte_off / 4
+  let masked = bit_and inst_off 67108863
+  bit_or 2483027968 masked
+
+-- adr xD, #byte_off    PC-relative byte address into xD (signed 21-bit range).
+-- Encoding: 0x10000000 | (immlo<<29) | (immhi<<5) | Rd
+--   immlo = byte_off & 3        (low 2 bits)
+--   immhi = (byte_off >> 2) & 0x7FFFF   (high 19 bits)
+enc_adr dst byte_off =
+  let imm21 = bit_and byte_off 2097151
+  let immlo = bit_and imm21 3
+  let immhi = bit_and (shr imm21 2) 524287
+  bit_or 268435456 (bit_or (shl immlo 29) (bit_or (shl immhi 5) dst))
+
+-- cmp xN, #imm12   (alias of `subs xzr, xN, #imm`, 64-bit, no shift)
+-- Base: 0xF100001F | (imm12 << 10) | (N << 5)
+-- NOTE: prior base 4043309343 (0xF100011F) had stray bit 8 set, corrupting
+-- Rn whenever bit 3 of reg was 0 (regs 0..7, 16..23). Manifested as
+-- chained-op_apply-over-let-bound-fn-ref returning 0 (cmp x19 → cmp x27).
+enc_cmp_imm reg imm12 =
+  bit_or 4043309087 (bit_or (shl (bit_and imm12 4095) 10) (shl reg 5))
+
+-- b.ne #(byte_off)    Conditional branch (NE = cond 0x1).
+-- Base: 0x54000001 | (imm19 << 5)  where imm19 = byte_off / 4 (signed 19-bit).
+enc_bne_byte_off byte_off =
+  let inst_off = byte_off / 4
+  let masked = bit_and inst_off 524287
+  bit_or 1409286145 (shl masked 5)
+
+-- ============================================================================
+-- Float (d-register) encoders. Verified via /tmp/asmfloat.s + as + otool.
+-- All take 0..15 d-reg numbers in v1.
+-- ============================================================================
+
+-- fadd d_dst, d_lhs, d_rhs   Base: 0x1E602800 | dst | (lhs<<5) | (rhs<<16)
+enc_fadd dst lhs rhs =
+  bit_or 509618176 (bit_or dst (bit_or (shl lhs 5) (shl rhs 16)))
+
+-- fsub d_dst, d_lhs, d_rhs   Base: 0x1E603800
+enc_fsub dst lhs rhs =
+  bit_or 509622272 (bit_or dst (bit_or (shl lhs 5) (shl rhs 16)))
+
+-- fmul d_dst, d_lhs, d_rhs   Base: 0x1E600800
+enc_fmul dst lhs rhs =
+  bit_or 509609984 (bit_or dst (bit_or (shl lhs 5) (shl rhs 16)))
+
+-- fdiv d_dst, d_lhs, d_rhs   Base: 0x1E601800
+enc_fdiv dst lhs rhs =
+  bit_or 509614080 (bit_or dst (bit_or (shl lhs 5) (shl rhs 16)))
+
+-- fcmp d_lhs, d_rhs   Base: 0x1E602000 | (lhs<<5) | (rhs<<16)
+enc_fcmp lhs rhs =
+  bit_or 509616128 (bit_or (shl lhs 5) (shl rhs 16))
+
+-- scvtf d_dst, x_src    (signed-int -> double)   Base: 0x9E620000 | dst | (src<<5)
+enc_scvtf dst src =
+  bit_or 2657222656 (bit_or dst (shl src 5))
+
+-- fcvtzs x_dst, d_src   (double -> signed-int truncated)   Base: 0x9E780000
+enc_fcvtzs dst src =
+  bit_or 2658664448 (bit_or dst (shl src 5))
+
+-- fmov d_dst, x_src     (bit-cast int -> double)   Base: 0x9E670000
+enc_fmov_d_x dst src =
+  bit_or 2657550336 (bit_or dst (shl src 5))
+
+-- fmov d_dst, d_src     (double-to-double copy)   Base: 0x1E604000
+enc_fmov_d_d dst src =
+  bit_or 509624320 (bit_or dst (shl src 5))
+
+-- cset x_dst, mi   (after fcmp: 1 if lhs<rhs ordered, NaN-safe)   Base: 0x9A9F57E0
+enc_cset_mi dst = bit_or 2594133984 dst
+
+-- cset x_dst, ls   (after fcmp: 1 if lhs<=rhs ordered, NaN-safe)  Base: 0x9A9F87E0
+-- Used for op_fle. (`le` would also fire on unordered, so use `ls` instead.)
+enc_cset_ls dst = bit_or 2594146272 dst
+
+-- ldr xD, [x27, #imm]   imm must be 8-byte multiple in [0, 32760].
+-- Base: 0xF9400360 | ((imm/8)<<10) | dst    (the 0x360 bakes Rn=27 into bits 5..9)
+enc_ldr_x27 dst imm =
+  bit_or 4181721952 (bit_or dst (shl (imm / 8) 10))
+
+-- str xD, [x27, #imm]   imm must be 8-byte multiple.
+-- Base: 0xF9000360 | ((imm/8)<<10) | dst
+enc_str_x27 dst imm =
+  bit_or 4177527648 (bit_or dst (shl (imm / 8) 10))
+
+-- blr xR     Base: 0xD63F0000 | (R<<5)
+enc_blr reg =
+  bit_or 3594452992 (shl reg 5)
+
+-- Function-frame fixed instructions (FP=x29, LR=x30, SP=x31).
+-- 64-byte frame (post-P4-extension): 16 FP/LR, 16 x19/x20, 16 x27+pad,
+--                                    16 d8/d9 (float callee-save).
+-- (x27 is the heap_addr under ABI v2; saved/restored to preserve it across calls.
+--  d8/d9 added in P4-extension to support cross-call float preservation.)
+-- stp x29, x30, [sp, #-64]!     : 0xA9BC7BFD
+-- mov x29, sp  (add x29, sp, #0): 0x910003FD
+-- stp x19, x20, [sp, #16]       : 0xA90153F3
+-- str x27, [sp, #32]            : 0xF90013FB   -- save caller's x27 (= heap chain)
+-- stp d8, d9, [sp, #48]         : 0x6D0327E8   -- save callee-save floats (P4-ext)
+-- ldp d8, d9, [sp, #48]         : 0x6D4327E8   -- restore on exit
+-- ldr x27, [sp, #32]            : 0xF94013FB   -- restore on exit
+-- ldp x19, x20, [sp, #16]       : 0xA94153F3
+-- nop                           : 0xD503201F   -- placeholder where main does mov x27, x0
+-- v2-B (112-byte frame): adds d10..d15 callee-save slots at [sp,#64..#111].
+-- stp x29, x30, [sp, #-112]!    : 0xA9B97BFD
+-- ldp x29, x30, [sp], #112      : 0xA8C77BFD
+-- stp d10, d11, [sp, #64]       : 0x6D042FEA
+-- ldp d10, d11, [sp, #64]       : 0x6D442FEA
+-- stp d12, d13, [sp, #80]       : 0x6D0537EC
+-- ldp d12, d13, [sp, #80]       : 0x6D4537EC
+-- stp d14, d15, [sp, #96]       : 0x6D063FEE
+-- ldp d14, d15, [sp, #96]       : 0x6D463FEE
+inst_stp_fp_lr_pre   = 2847505405
+inst_mov_x29_sp      = 2432697341
+inst_stp_x19_x20_16  = 2835436531
+inst_str_x27_32      = 4177531899
+inst_stp_d8_d9_48    = 1828923368
+inst_stp_d10_d11_64  = 1828990954
+inst_stp_d12_d13_80  = 1829058540
+inst_stp_d14_d15_96  = 1829126126
+inst_ldp_d8_d9_48    = 1833117672
+inst_ldp_d10_d11_64  = 1833185258
+inst_ldp_d12_d13_80  = 1833252844
+inst_ldp_d14_d15_96  = 1833320430
+inst_ldr_x27_32      = 4181726203
+inst_ldp_x19_x20_16  = 2839630835
+inst_ldp_fp_lr_post  = 2831645693
+inst_nop             = 3573751839

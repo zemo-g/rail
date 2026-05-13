@@ -1,0 +1,2020 @@
+-- jit/lower.rail — Rail subset AST → JIT IR (FnList for emit_program).
+--
+-- Public entry point:
+--   lower_source src -> [tag, payload]
+--     tag = "ok"  : payload = list of FnStruct ready for emit_program
+--     tag = "err" : payload = error message string
+--
+-- Subset support (current, post-P4-ext):
+--   * User functions with 1..4 args (>4 args → err).
+--   * Integer arithmetic (+ - * / mod), comparison (< == > <= >=), bool
+--     (&& || not, parse-time desugar).
+--   * `if c then a else b` with both int- and float-typed branches.
+--   * `let x = e in body`; let-bound lambdas inline-substitute at call site.
+--   * Function calls (1..4 args, recursion supported); HOF dispatch via
+--     op_apply when callee is a let-bound named-fn alias.
+--   * String literals, length-prefixed pool, str_eq / str_len / str_at.
+--   * List literals [a,b,c], cons / head / tail / is_nil, match (nil|cons).
+--   * `print (show e)` for ints AND floats; `print str_lit`; `print str_var`.
+--   * `read_file path` builtin (open + lseek + read + close).
+--   * Floats (P4): literals + arithmetic + comparison + int↔float convert.
+--   * Float-returning user fns (P4-ext): registry tracks ret_type, op_call_
+--     fret captures via fmov, op_ret_float returns via fmov.
+--   * Cross-call float preservation (P4-ext): d8/d9 callee-save (2 slots).
+--
+-- Int cross-call preservation: caller-save (v0..v9) values that must survive
+-- a function call are moved to callee-save (v10/v11) before the call.
+-- Caps at 2 int cross-call slots (v10, v11) and 2 float cross-call slots
+-- (f8, f9). If lowering needs more, fails with a clear error.
+--
+-- Notable v1 limits NOT yet lifted (see CONTINUATION.md / SESSION_PROMPT.md):
+--   * Float-typed user fn args (per-arg inference is circular for binary
+--     ops; workaround: take int args, int_to_float internally).
+--   * Closures with capture-by-value (lambdas inline-substitute today).
+--   * 0-arg user fn calls (`pi = 3.14` defines but `pi` lowers as a
+--     fn_idx materialization, not a call).
+
+-- NOTE: this file deliberately does NOT `import "jit/ir.rail"`. Rail imports
+-- aren't deduped, so each direct importer must include ir.rail exactly once.
+-- Canonical use: caller imports emit.rail (which brings ir.rail), then this
+-- file. See jit/test_lower.rail for the order.
+import "jit/lex.rail"
+import "jit/syntax.rail"
+
+-- ============================================================================
+-- State record (mutable cells via 1-element int_arrs).
+-- Layout: cons ir (cons ctr (cons blocks (cons err_msg (cons registry (cons pool [])))))
+--
+--   ir       : int_arr of size 4*MAX_INSTR (instructions written here)
+--   ctr      : int_arr of size 10:
+--                [0] (unused; caller-save now via live mask in slot [6])
+--                [1] next_callee_vreg (int callee-save: 10..11)
+--                [2] instr_idx
+--                [3] n_blocks reserved
+--                [4] max_vreg_seen
+--                [5] err_flag (0=ok, 1=err)
+--                [6] live caller-save bitmask (bit i = v(i) live)
+--                [7] n_args (set by lower_fn_def)
+--                [8] next caller-save float vreg (0..7 = d0..d7)
+--                [9] next callee-save float slot (0..1 → f8/f9 = d8/d9; P4-ext)
+--   blocks   : int_arr of size MAX_BLOCKS (block start instr indices)
+--   err_msg  : 1-element Rail-list cell holding the error-message string
+--   registry : list of [name, fn_idx, ret_ty] entries (P4-ext)
+--   pool     : [pool_buf, pool_size_cell] for the program string pool
+-- ============================================================================
+
+max_instr_per_fn = 256
+max_blocks_per_fn = 32
+
+mk_state _ =
+  let ir = arr_new (4 * max_instr_per_fn) 0
+  let ctr = arr_new 12 0
+  let _ = arr_set ctr 0 0     -- (unused; caller-save now via live mask)
+  let _ = arr_set ctr 1 10    -- next_callee starts at v10
+  let _ = arr_set ctr 2 0     -- instr_idx
+  let _ = arr_set ctr 3 0     -- n_blocks
+  let _ = arr_set ctr 4 0     -- max_vreg_seen
+  let _ = arr_set ctr 5 0     -- err_flag
+  let _ = arr_set ctr 6 0     -- live caller-save bitmask (bit i = v(i) live)
+  let _ = arr_set ctr 7 1     -- n_args (default 1; lower_fn_def overrides)
+  let _ = arr_set ctr 8 0     -- next caller-save float vreg (high-water bump)
+  let _ = arr_set ctr 9 0     -- next callee-save float slot (0..7 → f8..f15, v2-B)
+  let _ = arr_set ctr 10 0    -- float caller-save free-bitmap (bits 0..7 = f0..f7 reusable)
+  let _ = arr_set ctr 11 0    -- float caller-save lock-mask (bit i = f_i is env-bound, never freed)
+  let blocks = arr_new max_blocks_per_fn 0
+  -- 1-element mutable cell holding the first error message string. Storing
+  -- strings in arr cells is the same pattern stdlib/https_session.rail uses
+  -- to thread strings through state. Initial sentinel "" means "no err yet".
+  let err_msg = arr_new 1 0
+  let _ = arr_set err_msg 0 ""
+  cons ir (cons ctr (cons blocks (cons err_msg [])))
+
+st_ir       s = head s
+st_ctr      s = head (tail s)
+st_blocks   s = head (tail (tail s))
+st_err_msg  s = head (tail (tail (tail s)))
+
+st_get_caller s   = arr_get (st_ctr s) 0
+st_get_callee s   = arr_get (st_ctr s) 1
+st_get_instr s    = arr_get (st_ctr s) 2
+st_get_nblocks s  = arr_get (st_ctr s) 3
+st_get_maxreg s   = arr_get (st_ctr s) 4
+st_get_err s      = arr_get (st_ctr s) 5
+
+st_track_reg s v =
+  let mx = arr_get (st_ctr s) 4
+  if v > mx then arr_set (st_ctr s) 4 v
+  else 0
+
+-- Fail with a message; sets err_flag and stores the message.
+-- Stores only the FIRST error (later failures on the same lowering get
+-- the boilerplate "lower failed" message; we want the root cause). Silent
+-- by design: callers retrieve the message via st_get_err_msg or via the
+-- ["err", msg] tuple that lower_source returns. Previous versions printed
+-- "LOWER ERR: ..." to stdout, which polluted programmatic callers (the
+-- bench-grade harness had to filter it out).
+st_fail s msg =
+  let _ = arr_set (st_ctr s) 5 1
+  let cell = st_err_msg s
+  let prev = arr_get cell 0
+  let _ = if prev == "" then arr_set cell 0 msg else 0
+  0 - 1     -- sentinel return
+
+-- Read the stored error message ("" if none).
+st_get_err_msg s = arr_get (st_err_msg s) 0
+
+-- Caller-save allocator: scans live mask for the lowest free bit in v1..v9.
+-- v0 is reserved for the input arg. Returns -1 (via st_fail) on overflow.
+st_alloc_caller s =
+  let live = arr_get (st_ctr s) 6
+  let v = find_free_caller_bit live 1
+  if v > 9 then st_fail s "caller-save vreg overflow (>9 simultaneously live)"
+  else lock_caller s v
+
+find_free_caller_bit live i =
+  if i > 9 then 10
+  else if (bit_and live (shl 1 i)) == 0 then i
+  else find_free_caller_bit live (i + 1)
+
+lock_caller s v =
+  let live = arr_get (st_ctr s) 6
+  let _ = arr_set (st_ctr s) 6 (bit_or live (shl 1 v))
+  let _ = st_track_reg s v
+  v
+
+-- Live-mask snapshot/restore at lower_expr boundaries. After dispatch we
+-- want only the saved live + the result vreg's bit (if it's a fresh
+-- caller-save vreg) to remain set. Everything else allocated within the
+-- expression is scratch and gets dropped.
+st_get_live s = arr_get (st_ctr s) 6
+
+st_restore_live s saved result_v =
+  let new = if result_v >= 10 then saved
+            else if result_v == 0 then saved
+            else if result_v < 0 then saved
+            else bit_or saved (shl 1 result_v)
+  arr_set (st_ctr s) 6 new
+
+st_alloc_callee s =
+  let v = arr_get (st_ctr s) 1
+  let _ = arr_set (st_ctr s) 1 (v + 1)
+  let _ = st_track_reg s v
+  if v >= 12 then st_fail s "callee-save vreg overflow (>= v12); v1 only saves x19/x20"
+  else v
+
+-- Float vreg allocator. Float vregs map directly to d-regs.
+--   f0..f7  = d0..d7  caller-save (clobbered by op_call).
+--   f8..f15 = d8..d15 callee-save (saved/restored by every prologue/epilogue
+--                     in v2-B's 112-byte frame; allocated via st_alloc_float_callee).
+-- Allocator strategy (v2-B): prefer the free-bitmap (ctr[10]) — slots that
+-- previous ops have explicitly freed. Otherwise bump ctr[8] (the high-water
+-- pointer). This lets `(call) + a + b + c + d` reuse the call-result slot
+-- across the chain instead of allocating a fresh slot per add.
+st_alloc_float s =
+  let free_mask = arr_get (st_ctr s) 10
+  if free_mask != 0 then
+    let f = lowest_bit_set free_mask 0
+    let _ = arr_set (st_ctr s) 10 (bit_and free_mask (bit_not_8 (shl 1 f)))
+    f
+  else
+    let f = arr_get (st_ctr s) 8
+    let _ = arr_set (st_ctr s) 8 (f + 1)
+    if f > 7 then st_fail s "float caller-save vreg overflow (>=f8); v1 caps at d0..d7"
+    else f
+
+-- Find the lowest set bit position (0..7) in mask. Caller guarantees mask != 0.
+lowest_bit_set mask i =
+  if (bit_and mask (shl 1 i)) != 0 then i
+  else if i >= 7 then 7
+  else lowest_bit_set mask (i + 1)
+
+-- 8-bit bitwise NOT (Rail has bit_and / bit_or / shl but not bit_not).
+bit_not_8 x = bit_xor x 255
+
+-- Free a caller-save float slot so future allocations can reuse it. Only
+-- frees if the slot is NOT locked (locked slots are env-bound, e.g., params
+-- in d0..d7 or let-bindings — overwriting them would corrupt the binding).
+st_free_float_caller s f =
+  if f >= 8 then 0
+  else
+    let lock_mask = arr_get (st_ctr s) 11
+    if (bit_and lock_mask (shl 1 f)) != 0 then 0
+    else
+      let free_mask = arr_get (st_ctr s) 10
+      arr_set (st_ctr s) 10 (bit_or free_mask (shl 1 f))
+
+-- Mark a caller-save slot as env-bound (param or let-binding). Locked slots
+-- are not returned by alloc and are not freed by st_free_float_caller.
+st_lock_float_caller s f =
+  if f >= 8 then 0
+  else
+    let lock_mask = arr_get (st_ctr s) 11
+    arr_set (st_ctr s) 11 (bit_or lock_mask (shl 1 f))
+
+-- Allocate one of f8..f15 (callee-save). Slot 9 of ctr counts how many we've
+-- handed out (0..7). Returns the f-vreg (8..15), which maps to d8..d15.
+-- v2-B lifted the cap from 2 → 8; the prologue saves all 8 unconditionally.
+st_alloc_float_callee s =
+  let n = arr_get (st_ctr s) 9
+  let _ = arr_set (st_ctr s) 9 (n + 1)
+  if n >= 8 then st_fail s "float callee-save overflow (>=f16); v2-B saves d8..d15 (8 slots)"
+  else (n + 8)
+
+-- Preserve a float vreg into callee-save (d8/d9) so it survives a function
+-- call. Returns the new (callee-save) f-vreg. No-op if input is already
+-- callee-save.
+preserve_callee_float s f_v =
+  if f_v >= 8 then f_v
+  else
+    let f_safe = st_alloc_float_callee s
+    if (st_get_err s) == 1 then f_safe
+    else
+      let _ = st_emit s op_fmov f_safe f_v 0
+      f_safe
+
+-- Reserve a new block; returns its index. Caller will set its start later.
+st_reserve_block s =
+  let idx = arr_get (st_ctr s) 3
+  let _ = arr_set (st_ctr s) 3 (idx + 1)
+  if idx >= max_blocks_per_fn then st_fail s "block overflow"
+  else idx
+
+st_set_block_start s blk_idx =
+  let cur = arr_get (st_ctr s) 2
+  arr_set (st_blocks s) blk_idx cur
+
+-- Emit one IR instruction; returns 0.
+st_emit s op a b c =
+  let i = arr_get (st_ctr s) 2
+  if i >= max_instr_per_fn then st_fail s "instruction overflow"
+  else
+    let _ = ir_emit (st_ir s) i op a b c
+    let _ = arr_set (st_ctr s) 2 (i + 1)
+    0
+
+-- ============================================================================
+-- Environment: list of (name, vreg) pairs. Most-recent binding shadows.
+-- ============================================================================
+
+-- env entries are 4-element lists: [name, vreg, type, payload]
+-- where type is "int"|"str"|"fn"|"lambda" and payload is opaque (used for
+-- carrying lambda AST when type=="lambda"; 0 otherwise).
+env_empty _ = []
+env_extend env name vreg = env_extend_typed env name vreg "int"
+env_extend_typed env name vreg ty = env_extend_full env name vreg ty 0
+env_extend_full env name vreg ty payload =
+  cons (cons name (cons vreg (cons ty (cons payload [])))) env
+
+env_lookup env name =
+  if env == [] then 0 - 1
+  else
+    let pair = head env
+    if (head pair) == name then head (tail pair)
+    else env_lookup (tail env) name
+
+env_lookup_type env name =
+  if env == [] then "int"
+  else
+    let pair = head env
+    if (head pair) == name then head (tail (tail pair))
+    else env_lookup_type (tail env) name
+
+env_lookup_payload env name =
+  if env == [] then 0
+  else
+    let pair = head env
+    if (head pair) == name then head (tail (tail (tail pair)))
+    else env_lookup_payload (tail env) name
+
+env_has env name =
+  if env == [] then 0
+  else
+    let pair = head env
+    if (head pair) == name then 1
+    else env_has (tail env) name
+
+-- Conservative AST-level type inference. Returns "int", "str", or "float".
+-- Assumes user-fn calls return int (no str-returning user fns in v1).
+infer_type env ast =
+  let tag = ast_tag ast
+  if tag == "int" then "int"
+  else if tag == "float" then "float"
+  else if tag == "str" then "str"
+  else if tag == "var" then infer_type_var env (head (tail ast))
+  else if tag == "op" then infer_type_op env ast
+  else if tag == "if" then infer_type_if env ast
+  else if tag == "let" then infer_type_let env ast
+  else if tag == "app" then infer_type_app env ast
+  else "int"
+
+-- A bare var ref. If it's bound locally, use the local type. Otherwise, if it
+-- names a 0-arg user fn (registered as `__USERFN_<name>`), the var ref will
+-- lower as a 0-arg call; its type is the fn's ret_ty (v2-A).
+infer_type_var env name =
+  if (env_has env name) == 1 then env_lookup_type env name
+  else if (env_has env (cat ["__USERFN_", name])) == 1 then env_lookup_type env (cat ["__USERFN_", name])
+  else "int"
+
+-- A binary op produces "float" if either operand is float (auto-promotion).
+-- Comparison ops (`<`, `==`, etc.) always produce "int" (the 0/1 result),
+-- regardless of operand type.
+infer_type_op env ast =
+  let op_str = head (tail ast)
+  if (is_compare_op op_str) == 1 then "int"
+  else
+    let lhs = head (tail (tail ast))
+    let rhs = head (tail (tail (tail ast)))
+    if (infer_type env lhs) == "float" then "float"
+    else if (infer_type env rhs) == "float" then "float"
+    else "int"
+
+is_compare_op s =
+  if s == "<" then 1
+  else if s == ">" then 1
+  else if s == "==" then 1
+  else if s == "<=" then 1
+  else if s == ">=" then 1
+  else 0
+
+-- An if expression's type is the (then-branch ∪ else-branch) join.
+-- For v1: if either branch is float, the if is float; otherwise int.
+infer_type_if env ast =
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  if (infer_type env t) == "float" then "float"
+  else if (infer_type env e) == "float" then "float"
+  else infer_type env t
+
+-- Recognize str-returning and float-returning builtins / user fns via
+-- innermost-head fname. User fn ret_types are seeded into env as
+-- "__USERFN_<name>" entries by lower_fn_body / build_registry.
+infer_type_app env ast =
+  let f = innermost_app_f_pre ast
+  if (ast_tag f) == "var" then
+    let nm = head (tail f)
+    if nm == "read_file" then "str"
+    else if nm == "int_to_float" then "float"
+    else if (env_has env (cat ["__USERFN_", nm])) == 1 then env_lookup_type env (cat ["__USERFN_", nm])
+    else "int"
+  else "int"
+
+-- Local copy of innermost_app_f to avoid forward reference.
+innermost_app_f_pre ast =
+  if (ast_tag ast) == "app" then innermost_app_f_pre (head (tail ast))
+  else ast
+
+infer_type_let env ast =
+  let name = head (tail ast)
+  let val = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  let val_ty = infer_type env val
+  infer_type (env_extend_typed env name 0 val_ty) body
+
+-- ============================================================================
+-- Function-name registry: list of [name, fn_idx, meta_arr] triples.
+-- meta_arr is an int_arr of size (n_args + 1), MUTABLE:
+--   meta[0]      = ret_ty bit (0=int, 1=float)
+--   meta[1..n]   = per-arg type bits (0=int, 1=float)
+--
+-- Mutability lets the fixed-point inference loop refine arg/ret types in
+-- place without rebuilding the registry list. Built in two phases:
+--   1. build_registry_initial: walks defs in order, seeds ret_ty via
+--      infer_type with all-int param assumption, all arg types 0.
+--   2. fixed_point_arg_types: refines arg types from call-site usage AND
+--      ret types from updated body inference. Caps at 4 iterations.
+-- ============================================================================
+
+reg_empty _ = []
+
+reg_add_meta r name idx n_args =
+  let meta = arr_new (n_args + 1) 0
+  cons (cons name (cons idx (cons meta []))) r
+
+reg_lookup r name =
+  if r == [] then 0 - 1
+  else
+    let pair = head r
+    if (head pair) == name then head (tail pair)
+    else reg_lookup (tail r) name
+
+reg_lookup_meta r name =
+  if r == [] then arr_new 0 0
+  else
+    let pair = head r
+    if (head pair) == name then head (tail (tail pair))
+    else reg_lookup_meta (tail r) name
+
+reg_lookup_ret_ty r name =
+  let meta = reg_lookup_meta r name
+  if (arr_len meta) == 0 then "int"
+  else if (arr_get meta 0) == 1 then "float" else "int"
+
+reg_lookup_arg_ty r name i =
+  let meta = reg_lookup_meta r name
+  if (arr_len meta) <= (i + 1) then "int"
+  else if (arr_get meta (i + 1)) == 1 then "float" else "int"
+
+-- Returns the arity (n_args) of a registered fn, or -1 if not found.
+-- Meta length = 1 + n_args (slot 0 = ret_ty, slots 1..n = arg types).
+reg_lookup_arity r name =
+  let meta = reg_lookup_meta r name
+  if (arr_len meta) == 0 then 0 - 1
+  else (arr_len meta) - 1
+
+reg_set_ret_ty r name ty_str =
+  let meta = reg_lookup_meta r name
+  if (arr_len meta) == 0 then 0
+  else
+    let bit = if ty_str == "float" then 1 else 0
+    arr_set meta 0 bit
+
+reg_set_arg_ty_bit r name i v =
+  let meta = reg_lookup_meta r name
+  if (arr_len meta) <= (i + 1) then 0
+  else arr_set meta (i + 1) v
+
+-- Seed an env with __USERFN_<name>:ret_ty entries for every entry in the
+-- registry. infer_type_app reads these to resolve user fn return types.
+seed_env_from_registry registry env =
+  if registry == [] then env
+  else
+    let entry = head registry
+    let nm = head entry
+    let meta = head (tail (tail entry))
+    let ret_ty = if (arr_len meta) == 0 then "int"
+                 else if (arr_get meta 0) == 1 then "float" else "int"
+    let env2 = env_extend_typed env (cat ["__USERFN_", nm]) 0 ret_ty
+    seed_env_from_registry (tail registry) env2
+
+-- Build registry: initial pass + fixed-point arg/ret-type refinement.
+build_registry defs =
+  let initial = build_registry_initial defs 0 []
+  fixed_point_arg_types initial defs 4
+
+build_registry_initial defs idx acc =
+  if defs == [] then reverse acc
+  else
+    let fn = head defs
+    let name = head (tail fn)
+    let args = head (tail (tail fn))
+    let body = head (tail (tail (tail fn)))
+    let n_args = list_len_local args
+    let registry_so_far = reverse acc
+    let env_with_reg = seed_env_from_registry registry_so_far (env_empty 0)
+    -- Initial ret_ty inferred with all-int param assumption.
+    let ret_ty = infer_type env_with_reg body
+    let meta = arr_new (n_args + 1) 0
+    let _ = if ret_ty == "float" then arr_set meta 0 1 else 0
+    let entry = cons name (cons idx (cons meta []))
+    build_registry_initial (tail defs) (idx + 1) (cons entry acc)
+
+-- One pass over all defs: refines arg types from call-site usage AND
+-- re-infers ret type from updated body. Returns 1 iff any change made.
+-- Cap at `cap` iterations to avoid infinite loops on pathological input.
+fixed_point_arg_types registry defs cap =
+  if cap <= 0 then registry
+  else
+    let changed = update_pass defs registry 0
+    if changed == 0 then registry
+    else fixed_point_arg_types registry defs (cap - 1)
+
+update_pass defs registry changed_acc =
+  if defs == [] then changed_acc
+  else
+    let fn = head defs
+    let new_acc = update_one_fn registry fn changed_acc
+    update_pass (tail defs) registry new_acc
+
+update_one_fn registry fn changed_acc =
+  let name = head (tail fn)
+  let args = head (tail (tail fn))
+  let body = head (tail (tail (tail fn)))
+  let env = seed_env_from_registry registry (env_empty 0)
+  let env_p = build_param_env_typed args registry name 0 env
+  -- Refine ret_ty from updated body type.
+  let new_ret_ty = infer_type env_p body
+  let cur_ret_ty = reg_lookup_ret_ty registry name
+  let changed_ret = if new_ret_ty == cur_ret_ty then 0
+                    else
+                      let _ = reg_set_ret_ty registry name new_ret_ty
+                      1
+  -- Refine arg types from call-site arg-expression types.
+  let changed_args = walk_calls_for_arg_types env_p body registry 0
+  bit_or (bit_or changed_acc changed_ret) changed_args
+
+build_param_env_typed args registry self_name i env =
+  if args == [] then env
+  else
+    let param_name = head args
+    let ty = reg_lookup_arg_ty registry self_name i
+    let env2 = env_extend_typed env param_name 0 ty
+    build_param_env_typed (tail args) registry self_name (i + 1) env2
+
+walk_calls_for_arg_types env ast registry acc =
+  let tag = ast_tag ast
+  if tag == "int" then acc
+  else if tag == "float" then acc
+  else if tag == "str" then acc
+  else if tag == "var" then acc
+  else if tag == "op" then walk_calls_op_argtype env ast registry acc
+  else if tag == "if" then walk_calls_if_argtype env ast registry acc
+  else if tag == "let" then walk_calls_let_argtype env ast registry acc
+  else if tag == "app" then walk_calls_app_argtype env ast registry acc
+  else acc
+
+walk_calls_op_argtype env ast registry acc =
+  let lhs = head (tail (tail ast))
+  let rhs = head (tail (tail (tail ast)))
+  let acc1 = walk_calls_for_arg_types env lhs registry acc
+  walk_calls_for_arg_types env rhs registry acc1
+
+walk_calls_if_argtype env ast registry acc =
+  let c = head (tail ast)
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  let a1 = walk_calls_for_arg_types env c registry acc
+  let a2 = walk_calls_for_arg_types env t registry a1
+  walk_calls_for_arg_types env e registry a2
+
+walk_calls_let_argtype env ast registry acc =
+  let nm = head (tail ast)
+  let val = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  let acc1 = walk_calls_for_arg_types env val registry acc
+  let val_ty = infer_type env val
+  let env2 = env_extend_typed env nm 0 val_ty
+  walk_calls_for_arg_types env2 body registry acc1
+
+walk_calls_app_argtype env ast registry acc =
+  let acc1 = walk_app_arg_exprs env ast registry acc
+  let f = innermost_app_f_pre ast
+  if (ast_tag f) != "var" then acc1
+  else
+    let fname = head (tail f)
+    if (reg_lookup registry fname) < 0 then acc1
+    else
+      let args_list = collect_app_args ast []
+      propagate_arg_types_to_callee env fname args_list registry 0 acc1
+
+walk_app_arg_exprs env ast registry acc =
+  if (ast_tag ast) != "app" then acc
+  else
+    let f = head (tail ast)
+    let arg = head (tail (tail ast))
+    let acc1 = walk_calls_for_arg_types env arg registry acc
+    walk_app_arg_exprs env f registry acc1
+
+propagate_arg_types_to_callee env fname args registry i acc =
+  if args == [] then acc
+  else
+    let arg = head args
+    let inferred = infer_type env arg
+    let new_acc = if inferred == "float" then
+                    if (reg_lookup_arg_ty registry fname i) == "int" then
+                      let _ = reg_set_arg_ty_bit registry fname i 1
+                      1
+                    else acc
+                  else acc
+    propagate_arg_types_to_callee env fname (tail args) registry (i + 1) new_acc
+
+-- ============================================================================
+-- contains_call: does an expression contain a function call (or print_show)?
+-- Used to decide whether to preserve LHS values across RHS evaluation.
+-- ============================================================================
+
+-- contains_call: does this expression need cross-call preservation of
+-- caller-save vregs? Returns 1 only for ops that clobber x9..x18:
+--   - User function calls (op_call)
+--   - print / show (which lower to op_print_int / op_print_str using
+--     caller-save scratch)
+-- Safe builtins (cons/head/tail/is_nil/str_*) emit ops that touch only
+-- x21..x27 scratch and the explicit dst preg; they do NOT clobber other
+-- caller-save vregs, so we return 0 — but we recursively check their args.
+-- v2-A: contains_call is registry-aware. A bare var ref to a 0-arg user fn
+-- (`pi` where `pi = 3.14` is registered) IS a call — lower_var emits op_call
+-- for it. registry is a list (or [] when called from contexts without state).
+contains_call_r ast registry =
+  let tag = ast_tag ast
+  if tag == "int" then 0
+  else if tag == "float" then 0
+  else if tag == "str" then 0
+  else if tag == "var" then
+    let nm = head (tail ast)
+    if registry == [] then 0
+    else if (reg_lookup_arity registry nm) == 0 then 1
+    else 0
+  else if tag == "op" then contains_call_op_r ast registry
+  else if tag == "if" then contains_call_if_r ast registry
+  else if tag == "let" then contains_call_let_r ast registry
+  else if tag == "app" then contains_call_app_r ast registry
+  else 0
+
+-- Pure ast variant: kept for back-compat at callsites without state. Treats
+-- bare var refs as non-calls; correct for everything except 0-arg fn refs.
+contains_call ast = contains_call_r ast []
+
+contains_call_app_r ast registry =
+  let f = innermost_app_f ast
+  if (ast_tag f) != "var" then 1
+  else contains_call_named_r (head (tail f)) ast registry
+
+contains_call_app ast = contains_call_app_r ast []
+
+contains_call_named_r name ast registry =
+  if (is_safe_builtin name) == 1 then contains_call_app_args_r ast registry
+  else 1
+
+is_safe_builtin name =
+  if name == "cons" then 1
+  else if name == "head" then 1
+  else if name == "tail" then 1
+  else if name == "is_nil" then 1
+  else if name == "str_eq" then 1
+  else if name == "str_len" then 1
+  else if name == "str_at" then 1
+  else if name == "mod" then 1
+  else if name == "not" then 1
+  else 0
+
+contains_call_app_args_r ast registry =
+  if (ast_tag ast) != "app" then 0
+  else
+    let f = head (tail ast)
+    let arg = head (tail (tail ast))
+    if (contains_call_r arg registry) == 1 then 1
+    else contains_call_app_args_r f registry
+
+contains_call_op_r ast registry =
+  let lhs = head (tail (tail ast))
+  let rhs = head (tail (tail (tail ast)))
+  if (contains_call_r lhs registry) == 1 then 1
+  else contains_call_r rhs registry
+
+contains_call_if_r ast registry =
+  let c = head (tail ast)
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  if (contains_call_r c registry) == 1 then 1
+  else if (contains_call_r t registry) == 1 then 1
+  else contains_call_r e registry
+
+contains_call_let_r ast registry =
+  let v = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  if (contains_call_r v registry) == 1 then 1
+  else contains_call_r body registry
+
+-- ============================================================================
+-- Lowering
+-- ============================================================================
+
+-- Preserve a vreg into callee-save by allocating a fresh callee slot and
+-- emitting op_mov. Returns the new (callee-save) vreg. Skips if v is
+-- already in callee-save (>= 10) — re-preserving wastes a slot.
+preserve_callee s v =
+  if v >= 10 then v
+  else preserve_callee_force s v
+
+preserve_callee_force s v =
+  let v_safe = st_alloc_callee s
+  if (st_get_err s) == 1 then v_safe
+  else
+    let _ = st_emit s op_mov v_safe v 0
+    v_safe
+
+lower_expr s env ast =
+  if (st_get_err s) == 1 then 0 - 1
+  else lower_expr_scoped s env ast
+
+lower_expr_scoped s env ast =
+  let saved_live = st_get_live s
+  let saved_fctr = arr_get (st_ctr s) 8
+  let ty = infer_type env ast
+  let v = lower_expr_dispatch s env ast
+  if (st_get_err s) == 1 then v
+  else
+    -- Int side: live mask snapshot/restore — see st_restore_live comment.
+    let _ = st_restore_live s saved_live v
+    -- Float side: caller-save d0..d7 are scoped scratch. After dispatch,
+    -- reset ctr[8] to high-water-mark = max(saved, result+1) for float
+    -- results in caller-save range, else just restore saved. This frees
+    -- intermediate caller-save floats for reuse, matching the int pattern.
+    -- Callee-save f8/f9 are preserved across calls explicitly via
+    -- preserve_callee_float; their counter (ctr[9]) is not reset here.
+    let _ = st_restore_float_ctr s saved_fctr v ty
+    v
+
+st_restore_float_ctr s saved_fctr v_result ty =
+  if ty != "float" then
+    arr_set (st_ctr s) 8 saved_fctr
+  else if v_result >= 8 then
+    arr_set (st_ctr s) 8 saved_fctr
+  else
+    let need = v_result + 1
+    let new = if saved_fctr > need then saved_fctr else need
+    arr_set (st_ctr s) 8 new
+
+lower_expr_dispatch s env ast =
+  let tag = ast_tag ast
+  if tag == "int" then lower_int s ast
+  else if tag == "float" then lower_float s ast
+  else if tag == "str" then lower_str s ast
+  else if tag == "var" then lower_var s env ast
+  else if tag == "op" then lower_op s env ast
+  else if tag == "if" then lower_if s env ast
+  else if tag == "let" then lower_let s env ast
+  else if tag == "app" then lower_app s env ast
+  else st_fail s (cat ["lower: unknown ast tag ", tag])
+
+lower_str s ast =
+  let str_val = head (tail ast)
+  let off = pool_append s str_val
+  if (st_get_err s) == 1 then 0 - 1
+  else
+    let v = st_alloc_caller s
+    if (st_get_err s) == 1 then v
+    else
+      let _ = st_emit s op_str_lit v off 0
+      v
+
+lower_int s ast =
+  let n = head (tail ast)
+  let v = st_alloc_caller s
+  if (st_get_err s) == 1 then v
+  else
+    let _ = st_emit s op_const v n 0
+    v
+
+-- Float literal: parse the literal string to a Rail double, split the bit
+-- pattern into 32-bit halves via the libjit_call.dylib helpers, emit op_fconst.
+lower_float s ast =
+  let lit = head (tail ast)
+  let f = parse_float lit
+  let lo = jit_float_bits_lo f
+  let hi = jit_float_bits_hi f
+  let f_dst = st_alloc_float s
+  if (st_get_err s) == 1 then f_dst
+  else
+    let _ = st_emit s op_fconst f_dst lo hi
+    f_dst
+
+-- Lower an expression so its result lands in a FLOAT vreg. If the expression
+-- is naturally float-typed, returns its float vreg directly. If int-typed,
+-- emits op_int_to_float for the promotion. Used by float ops (lower_op_float),
+-- print(show f), and explicit int_to_float builtin.
+lower_expr_float s env ast =
+  let ty = infer_type env ast
+  if ty == "float" then lower_expr s env ast
+  else if ty == "int" then lower_expr_promote s env ast
+  else
+    let _ = st_fail s (cat ["lower: cannot use ", ty, "-typed expression in float context"])
+    0 - 1
+
+lower_expr_promote s env ast =
+  let v_int = lower_expr s env ast
+  if (st_get_err s) == 1 then v_int
+  else
+    let f_dst = st_alloc_float s
+    if (st_get_err s) == 1 then f_dst
+    else
+      let _ = st_emit s op_int_to_float f_dst v_int 0
+      f_dst
+
+lower_var s env ast =
+  let name = head (tail ast)
+  if name == "nil" then lower_nil_lit s
+  else
+    let v = env_lookup env name
+    if v >= 0 then v
+    else
+      -- Not in local env; maybe a top-level fn name being used as a value.
+      -- v2-A: if the registered fn has arity 0 (e.g., `pi = 3.14`), emit a
+      -- 0-arg call so `pi` evaluates to its body. Otherwise materialize the
+      -- fn_idx as a constant (HOF / alias-bind use; P3-variant).
+      let fn_idx = st_registry_lookup s name
+      if fn_idx < 0 then st_fail s (cat ["lower: unbound variable ", name])
+      else
+        let arity = reg_lookup_arity (st_registry s) name
+        if arity == 0 then lower_call_with_args s env fn_idx []
+        else
+          let v_new = st_alloc_caller s
+          if (st_get_err s) == 1 then v_new
+          else
+            let _ = st_emit s op_const v_new fn_idx 0
+            v_new
+
+lower_nil_lit s =
+  let v = st_alloc_caller s
+  if (st_get_err s) == 1 then v
+  else
+    let _ = st_emit s op_nil v 0 0
+    v
+
+lower_op s env ast =
+  let op_str = head (tail ast)
+  let lhs = head (tail (tail ast))
+  let rhs = head (tail (tail (tail ast)))
+  let lhs_ty = infer_type env lhs
+  let rhs_ty = infer_type env rhs
+  if lhs_ty == "float" then lower_op_float s env op_str lhs rhs
+  else if rhs_ty == "float" then lower_op_float s env op_str lhs rhs
+  else
+    let v_lhs = lower_expr s env lhs
+    if (st_get_err s) == 1 then v_lhs
+    else lower_op_after_lhs s env op_str rhs v_lhs
+
+-- Float binary op: both operands lowered as float (with int→float promotion
+-- where needed). Result is float for arithmetic, int for comparison.
+-- Cross-call preservation: if rhs contains a call, the lhs's d-reg would be
+-- clobbered (caller-save d0..d7). Move it to a callee-save slot (d8/d9 — only
+-- 2 slots; overflow fails clean).
+lower_op_float s env op_str lhs rhs =
+  let f_lhs = lower_expr_float s env lhs
+  if (st_get_err s) == 1 then f_lhs
+  else
+    let f_lhs2 = if (contains_call_r rhs (st_registry s)) == 1 then preserve_callee_float s f_lhs else f_lhs
+    if (st_get_err s) == 1 then f_lhs2
+    else
+      let f_rhs = lower_expr_float s env rhs
+      if (st_get_err s) == 1 then f_rhs
+      else lower_op_float_emit s op_str f_lhs2 f_rhs
+
+lower_op_float_emit s op_str f_lhs f_rhs =
+  if (is_compare_op op_str) == 1 then lower_op_float_cmp s op_str f_lhs f_rhs
+  else lower_op_float_arith s op_str f_lhs f_rhs
+
+lower_op_float_arith s op_str f_lhs f_rhs =
+  let f_dst = st_alloc_float s
+  if (st_get_err s) == 1 then f_dst
+  else
+    let opcode = float_arith_op_for_str op_str
+    if opcode < 0 then st_fail s (cat ["lower: unknown float arith op ", op_str])
+    else
+      let _ = st_emit s opcode f_dst f_lhs f_rhs
+      -- v2-B: f_lhs and f_rhs are dead after this op. Free their caller-save
+      -- slots so future allocations recycle them. Locked slots (env-bound
+      -- params/let-bindings) are skipped by st_free_float_caller.
+      let _ = st_free_float_caller s f_lhs
+      let _ = st_free_float_caller s f_rhs
+      f_dst
+
+float_arith_op_for_str s =
+  if s == "+" then op_fadd
+  else if s == "-" then op_fsub
+  else if s == "*" then op_fmul
+  else if s == "/" then op_fdiv
+  else 0 - 1
+
+lower_op_float_cmp s op_str f_lhs f_rhs =
+  let v_dst = st_alloc_caller s
+  if (st_get_err s) == 1 then v_dst
+  else
+    let opcode = float_cmp_op_for_str op_str
+    if opcode < 0 then st_fail s (cat ["lower: unsupported float compare ", op_str, " (v1: < == > >=)"])
+    else
+      let _ = st_emit s opcode v_dst f_lhs f_rhs
+      -- v2-B: free caller-save float operands post-emit (cmp result is int).
+      let _ = st_free_float_caller s f_lhs
+      let _ = st_free_float_caller s f_rhs
+      v_dst
+
+float_cmp_op_for_str s =
+  if s == "<" then op_flt
+  else if s == "==" then op_feq
+  else if s == ">" then op_fgt
+  else if s == ">=" then op_fge
+  else if s == "<=" then op_fle
+  else 0 - 1
+
+lower_op_after_lhs s env op_str rhs v_lhs =
+  let v_lhs2 = if (contains_call_r rhs (st_registry s)) == 1 then preserve_callee s v_lhs else v_lhs
+  if (st_get_err s) == 1 then v_lhs2
+  else
+    let v_rhs = lower_expr s env rhs
+    if (st_get_err s) == 1 then v_rhs
+    else lower_op_emit s op_str v_lhs2 v_rhs
+
+lower_op_emit s op_str v_lhs v_rhs =
+  let v_dst = st_alloc_caller s
+  if (st_get_err s) == 1 then v_dst
+  else
+    let opcode = ir_op_for_str op_str
+    if opcode < 0 then st_fail s (cat ["lower: unknown binary op ", op_str])
+    else
+      let _ = st_emit s opcode v_dst v_lhs v_rhs
+      v_dst
+
+ir_op_for_str s =
+  if s == "+" then op_add
+  else if s == "-" then op_sub
+  else if s == "*" then op_mul
+  else if s == "/" then op_div
+  else if s == "<" then op_lt
+  else if s == ">" then op_gt
+  else if s == "==" then op_eq
+  else if s == "<=" then op_le
+  else if s == ">=" then op_ge
+  else 0 - 1
+
+lower_if s env ast =
+  let c = head (tail ast)
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  let v_c = lower_expr s env c
+  if (st_get_err s) == 1 then v_c
+  else
+    let t_ty = infer_type env t
+    let e_ty = infer_type env e
+    if t_ty == "float" then lower_if_float s env v_c t e
+    else if e_ty == "float" then lower_if_float s env v_c t e
+    else lower_if_after_cond s env v_c t e
+
+-- Float-merge if: result lands in a float vreg via op_fmov from each branch.
+lower_if_float s env v_c t e =
+  let f_result = st_alloc_float s
+  if (st_get_err s) == 1 then f_result
+  else
+    let else_blk = st_reserve_block s
+    let after_blk = st_reserve_block s
+    let _ = st_emit s op_jz v_c else_blk 0
+    let f_t = lower_expr_float s env t
+    if (st_get_err s) == 1 then f_t
+    else lower_if_float_after_then s env f_result f_t else_blk after_blk e
+
+lower_if_float_after_then s env f_result f_t else_blk after_blk e =
+  let _ = st_emit s op_fmov f_result f_t 0
+  let _ = st_emit s op_jmp after_blk 0 0
+  let _ = st_set_block_start s else_blk
+  let f_e = lower_expr_float s env e
+  if (st_get_err s) == 1 then f_e
+  else
+    let _ = st_emit s op_fmov f_result f_e 0
+    let _ = st_set_block_start s after_blk
+    f_result
+
+lower_if_after_cond s env v_c t e =
+  -- v_result is caller-save: at the merge point (the after_block), no calls
+  -- happen between mov-into-result and the next outer use. If the outer
+  -- context is a let whose body has calls, lower_let will preserve it.
+  let v_result = st_alloc_caller s
+  if (st_get_err s) == 1 then v_result
+  else
+    let else_blk = st_reserve_block s
+    let after_blk = st_reserve_block s
+    let _ = st_emit s op_jz v_c else_blk 0
+    let v_t = lower_expr s env t
+    if (st_get_err s) == 1 then v_t
+    else lower_if_after_then s env v_result v_t else_blk after_blk e
+
+lower_if_after_then s env v_result v_t else_blk after_blk e =
+  let _ = st_emit s op_mov v_result v_t 0
+  let _ = st_emit s op_jmp after_blk 0 0
+  let _ = st_set_block_start s else_blk
+  let v_e = lower_expr s env e
+  if (st_get_err s) == 1 then v_e
+  else
+    let _ = st_emit s op_mov v_result v_e 0
+    let _ = st_set_block_start s after_blk
+    v_result
+
+lower_let s env ast =
+  let name = head (tail ast)
+  let val = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  -- P3-full: `let f = \x -> body in body2`. Bind f as a "lambda" with the
+  -- AST as payload; each call site to f inlines the body (substituting the
+  -- lambda's param). Captures work for free since the inlined body sees
+  -- f's enclosing scope.
+  if (ast_tag val) == "lambda" then
+    let env2 = env_extend_full env name (0 - 1) "lambda" val
+    lower_expr s env2 body
+  else
+    -- Type inference: `let X = var(known_top_level_fn)` gets type "fn" so
+    -- that subsequent `X arg` calls dispatch via op_apply (P3-variant).
+    let val_ty = infer_let_val_ty s env val
+    let v_val = lower_expr s env val
+    if (st_get_err s) == 1 then v_val
+    else
+      -- Preserve to callee-save if `name` is used AFTER a call in the body.
+      -- v2-B extends preservation to floats: prior versions could not survive
+      -- a let-binding across a call. Now both int and float lets preserve.
+      let needs_preserve = if val_ty == "float" then
+                             if v_val >= 8 then 0
+                             else used_after_call_r name body 0 (st_registry s)
+                           else if v_val >= 10 then 0
+                           else used_after_call_r name body 0 (st_registry s)
+      let v_safe = if needs_preserve == 1 then
+                     if val_ty == "float" then preserve_callee_float s v_val
+                     else preserve_callee s v_val
+                   else v_val
+      if (st_get_err s) == 1 then v_safe
+      else
+        -- Lock the slot if it's a caller-save float — env binding outlives
+        -- the lower_op_float that produced v_val, so a later op must not free
+        -- this slot. (preserve_callee_float already moves to callee-save,
+        -- which is never freed, so we only lock if the binding stayed in d0..d7.)
+        let _ = if val_ty == "float" then
+                  if v_safe < 8 then st_lock_float_caller s v_safe else 0
+                else 0
+        let env2 = env_extend_typed env name v_safe val_ty
+        lower_expr s env2 body
+
+infer_let_val_ty s env val =
+  if (ast_tag val) == "var" then
+    let nm = head (tail val)
+    if (env_lookup env nm) >= 0 then env_lookup_type env nm
+    else if (st_registry_lookup s nm) >= 0 then
+      -- v2-A: 0-arg user fn ref evaluates by calling, so let val_ty = ret_ty.
+      let arity = reg_lookup_arity (st_registry s) nm
+      if arity == 0 then reg_lookup_ret_ty (st_registry s) nm
+      else "fn"
+    else "int"
+  else infer_type env val
+
+-- Registry-aware used_after_call. A var ref to a 0-arg user fn counts as a
+-- call (so subsequent uses of `name` are "after-call"). registry is a list
+-- (or [] when called from contexts without state).
+used_after_call_r name ast seen_call registry =
+  let tag = ast_tag ast
+  if tag == "var" then
+    if (head (tail ast)) == name then seen_call else 0
+  else if tag == "int" then 0
+  else if tag == "float" then 0
+  else if tag == "str" then 0
+  else if tag == "op" then used_after_call_op_r name ast seen_call registry
+  else if tag == "if" then used_after_call_if_r name ast seen_call registry
+  else if tag == "let" then used_after_call_let_r name ast seen_call registry
+  else if tag == "app" then used_after_call_app_r name ast seen_call registry
+  else 0
+
+-- Pure ast variant kept for callers without state.
+used_after_call name ast seen_call = used_after_call_r name ast seen_call []
+
+used_after_call_op_r name ast seen_call registry =
+  let lhs = head (tail (tail ast))
+  let rhs = head (tail (tail (tail ast)))
+  let after_lhs = used_after_call_r name lhs seen_call registry
+  if after_lhs == 1 then 1
+  else
+    let new_seen = if (contains_call_r lhs registry) == 1 then 1 else seen_call
+    used_after_call_r name rhs new_seen registry
+
+used_after_call_if_r name ast seen_call registry =
+  let c = head (tail ast)
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  let after_c = used_after_call_r name c seen_call registry
+  if after_c == 1 then 1
+  else
+    let new_seen = if (contains_call_r c registry) == 1 then 1 else seen_call
+    let after_t = used_after_call_r name t new_seen registry
+    if after_t == 1 then 1
+    else used_after_call_r name e new_seen registry
+
+used_after_call_let_r name ast seen_call registry =
+  let inner_name = head (tail ast)
+  let v = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  let after_v = used_after_call_r name v seen_call registry
+  if after_v == 1 then 1
+  else if inner_name == name then 0   -- shadowed, no further uses count
+  else
+    let new_seen = if (contains_call_r v registry) == 1 then 1 else seen_call
+    used_after_call_r name body new_seen registry
+
+used_after_call_app_r name ast seen_call registry =
+  -- Walk the app tree's args left-to-right; a call (the app itself) makes
+  -- subsequent uses "after-call".
+  let f = head (tail ast)
+  let arg = head (tail (tail ast))
+  let after_f = used_after_call_r name f seen_call registry
+  if after_f == 1 then 1
+  else used_after_call_r name arg seen_call registry
+
+-- App: function call OR `print (show e)` / `print e` pattern.
+-- Inside the JIT's int-only world, `print e` for any lowerable e maps
+-- to op_print_int — the inner expression is necessarily int-typed
+-- because nothing else lowers.
+lower_app s env ast =
+  if (is_print_show ast) == 1 then lower_print_show s env ast
+  else if (is_print_bare ast) == 1 then lower_print_bare s env ast
+  else lower_call s env ast
+
+is_print_show ast =
+  -- ast = app f arg, where f = var "print" and arg = app(var "show", e)
+  let f = head (tail ast)
+  let arg = head (tail (tail ast))
+  if (is_var_named f "print") == 0 then 0
+  else if (ast_tag arg) == "app" then is_var_named (head (tail arg)) "show"
+  else 0
+
+is_print_bare ast =
+  -- ast = app f arg, where f = var "print" and arg is anything that's
+  -- NOT the show-wrapped form (which is_print_show already covers).
+  let f = head (tail ast)
+  if (is_var_named f "print") == 0 then 0
+  else if (is_print_show ast) == 1 then 0
+  else 1
+
+is_var_named ast name =
+  if (ast_tag ast) == "var" then
+    if (head (tail ast)) == name then 1 else 0
+  else 0
+
+lower_print_show s env ast =
+  -- Extract the inner expression e from app(var print, app(var show, e)).
+  let inner_app = head (tail (tail ast))
+  let e = head (tail (tail inner_app))
+  if (infer_type env e) == "float" then lower_print_show_float s env e
+  else
+    let v_e = lower_expr s env e
+    if (st_get_err s) == 1 then v_e
+    else lower_print_show_emit s v_e
+
+lower_print_show_float s env e =
+  let f_e = lower_expr_float s env e
+  if (st_get_err s) == 1 then f_e
+  else
+    let _ = st_emit s op_print_float f_e 0 0
+    let v_zero = st_alloc_caller s
+    if (st_get_err s) == 1 then v_zero
+    else
+      let _ = st_emit s op_const v_zero 0 0
+      v_zero
+
+lower_print_bare s env ast =
+  -- ast = app f arg; print arg. Dispatch via type inference:
+  --   str-typed arg -> op_print_str (length-prefixed pointer)
+  --   int-typed arg -> op_print_int (decimal stdout)
+  let arg = head (tail (tail ast))
+  if (infer_type env arg) == "str" then lower_print_bare_str s env arg
+  else lower_print_bare_int s env arg
+
+lower_print_bare_int s env arg =
+  let v_e = lower_expr s env arg
+  if (st_get_err s) == 1 then v_e
+  else lower_print_show_emit s v_e
+
+lower_print_bare_str s env arg =
+  let v_ptr = lower_expr s env arg
+  if (st_get_err s) == 1 then v_ptr
+  else lower_print_str_emit s v_ptr
+
+lower_print_str_emit s v_ptr =
+  let _ = st_emit s op_print_str v_ptr 0 0
+  let v_zero = st_alloc_caller s
+  if (st_get_err s) == 1 then v_zero
+  else
+    let _ = st_emit s op_const v_zero 0 0
+    v_zero
+
+lower_print_show_emit s v_e =
+  let _ = st_emit s op_print_int v_e 0 0
+  -- print returns 0 (the integer)
+  let v_zero = st_alloc_caller s
+  if (st_get_err s) == 1 then v_zero
+  else
+    let _ = st_emit s op_const v_zero 0 0
+    v_zero
+
+-- A call: walks nested apps to collect args (left-to-right). The
+-- innermost `head` must be a `var` naming a known function.
+lower_call s env ast =
+  let args = collect_app_args ast []
+  let f = innermost_app_f ast
+  if (ast_tag f) != "var" then st_fail s "lower: HOF / non-variable head in call"
+  else lower_call_resolved s env (head (tail f)) args
+
+collect_app_args ast acc =
+  if (ast_tag ast) == "app" then
+    let f = head (tail ast)
+    let arg = head (tail (tail ast))
+    collect_app_args f (cons arg acc)
+  else acc
+
+innermost_app_f ast =
+  if (ast_tag ast) == "app" then innermost_app_f (head (tail ast))
+  else ast
+
+lower_call_resolved s env fname args =
+  if (is_builtin fname) == 1 then lower_builtin s env fname args
+  else
+    let fn_idx = st_registry_lookup s fname
+    if fn_idx >= 0 then lower_call_with_args s env fn_idx args
+    else if (env_has env fname) == 1 then
+      let ty = env_lookup_type env fname
+      if ty == "fn" then
+        lower_apply s env (env_lookup env fname) args
+      else if ty == "lambda" then
+        lower_lambda_call s env fname args
+      else st_fail s (cat ["lower: ", fname, " is not callable (env type ", ty, ")"])
+    else st_fail s (cat ["lower: unknown function ", fname])
+
+-- Inline a lambda call: `f arg` where f is bound to `\param -> body`.
+-- The body is lowered with param substituted to arg's vreg in env. Captures
+-- (free vars in body) are picked up from env naturally.
+lower_lambda_call s env fname args =
+  let n = list_len_local args
+  if n != 1 then st_fail s "lower: lambda call must have exactly 1 arg in v1"
+  else
+    let lam_ast = env_lookup_payload env fname
+    let param = head (tail lam_ast)
+    let body = head (tail (tail lam_ast))
+    let v_arg = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_arg
+    else
+      -- Bind param → v_arg in a child env, then lower body. Result vreg is
+      -- the body's last expression value.
+      let env2 = env_extend_typed env param v_arg "int"
+      lower_expr s env2 body
+
+-- HOF dispatch: `f arg` where f holds a runtime fn_idx.
+-- v1 supports 1-arg apply only.
+lower_apply s env v_fn args =
+  let n = list_len_local args
+  if n != 1 then st_fail s "lower: op_apply only supports 1-arg HOF in v1"
+  else
+    let v_arg = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_arg
+    else
+      let v_dst = st_alloc_caller s
+      if (st_get_err s) == 1 then v_dst
+      else
+        let _ = st_emit s op_apply v_dst v_fn v_arg
+        v_dst
+
+is_builtin name =
+  if name == "str_eq" then 1
+  else if name == "str_len" then 1
+  else if name == "str_at" then 1
+  else if name == "cons" then 1
+  else if name == "head" then 1
+  else if name == "tail" then 1
+  else if name == "is_nil" then 1
+  else if name == "mod" then 1
+  else if name == "not" then 1
+  else if name == "read_file" then 1
+  else if name == "int_to_float" then 1
+  else if name == "float_to_int" then 1
+  else 0
+
+lower_builtin s env fname args =
+  let n = list_len_local args
+  if fname == "str_len" then lower_builtin_str_len s env args n
+  else if fname == "str_eq" then lower_builtin_str_eq s env args n
+  else if fname == "str_at" then lower_builtin_str_at s env args n
+  else if fname == "cons" then lower_builtin_cons s env args n
+  else if fname == "head" then lower_builtin_head s env args n
+  else if fname == "tail" then lower_builtin_tail s env args n
+  else if fname == "is_nil" then lower_builtin_is_nil s env args n
+  else if fname == "mod" then lower_builtin_mod s env args n
+  else if fname == "not" then lower_builtin_not s env args n
+  else if fname == "read_file" then lower_builtin_read_file s env args n
+  else if fname == "int_to_float" then lower_builtin_int_to_float s env args n
+  else if fname == "float_to_int" then lower_builtin_float_to_int s env args n
+  else st_fail s (cat ["lower: unimplemented builtin ", fname])
+
+lower_builtin_int_to_float s env args n =
+  if n != 1 then st_fail s "int_to_float: 1 arg required"
+  else
+    let v_int = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_int
+    else
+      let f_dst = st_alloc_float s
+      if (st_get_err s) == 1 then f_dst
+      else
+        let _ = st_emit s op_int_to_float f_dst v_int 0
+        f_dst
+
+lower_builtin_float_to_int s env args n =
+  if n != 1 then st_fail s "float_to_int: 1 arg required"
+  else
+    let f_src = lower_expr_float s env (head args)
+    if (st_get_err s) == 1 then f_src
+    else
+      let v_dst = st_alloc_caller s
+      if (st_get_err s) == 1 then v_dst
+      else
+        let _ = st_emit s op_float_to_int v_dst f_src 0
+        v_dst
+
+lower_builtin_read_file s env args n =
+  if n != 1 then st_fail s "read_file: 1 arg (path string) required"
+  else
+    let v_path = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_path
+    else
+      let v_dst = st_alloc_caller s
+      if (st_get_err s) == 1 then v_dst
+      else
+        let _ = st_emit s op_read_file v_dst v_path 0
+        v_dst
+
+lower_builtin_not s env args n =
+  if n != 1 then st_fail s "not: 1 arg required"
+  else
+    let v_arg = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_arg
+    else
+      let v_zero = st_alloc_caller s
+      if (st_get_err s) == 1 then v_zero
+      else
+        let _ = st_emit s op_const v_zero 0 0
+        let v_dst = st_alloc_caller s
+        if (st_get_err s) == 1 then v_dst
+        else
+          let _ = st_emit s op_eq v_dst v_arg v_zero
+          v_dst
+
+lower_builtin_mod s env args n =
+  if n != 2 then st_fail s "mod: 2 args required"
+  else
+    let v_a = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_a
+    else
+      let v_a2 = if (contains_call_r (head (tail args)) (st_registry s)) == 1 then preserve_callee s v_a else v_a
+      if (st_get_err s) == 1 then v_a2
+      else
+        let v_b = lower_expr s env (head (tail args))
+        if (st_get_err s) == 1 then v_b
+        else
+          let v_dst = st_alloc_caller s
+          if (st_get_err s) == 1 then v_dst
+          else
+            let _ = st_emit s op_mod v_dst v_a2 v_b
+            v_dst
+
+lower_builtin_cons s env args n =
+  if n != 2 then st_fail s "cons: 2 args required (head, tail)"
+  else
+    let v_head = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_head
+    else
+      let v_head2 = if (contains_call_r (head (tail args)) (st_registry s)) == 1 then preserve_callee s v_head else v_head
+      if (st_get_err s) == 1 then v_head2
+      else
+        let v_tail = lower_expr s env (head (tail args))
+        if (st_get_err s) == 1 then v_tail
+        else
+          let v_dst = st_alloc_caller s
+          if (st_get_err s) == 1 then v_dst
+          else
+            let _ = st_emit s op_cons v_dst v_head2 v_tail
+            v_dst
+
+lower_builtin_head s env args n =
+  if n != 1 then st_fail s "head: 1 arg required"
+  else lower_one_arg_op s env args op_head
+
+lower_builtin_tail s env args n =
+  if n != 1 then st_fail s "tail: 1 arg required"
+  else lower_one_arg_op s env args op_tail
+
+lower_builtin_is_nil s env args n =
+  if n != 1 then st_fail s "is_nil: 1 arg required"
+  else lower_one_arg_op s env args op_is_nil
+
+lower_one_arg_op s env args op =
+  let v_src = lower_expr s env (head args)
+  if (st_get_err s) == 1 then v_src
+  else
+    let v_dst = st_alloc_caller s
+    if (st_get_err s) == 1 then v_dst
+    else
+      let _ = st_emit s op v_dst v_src 0
+      v_dst
+
+lower_builtin_str_at s env args n =
+  if n != 2 then st_fail s "str_at: 2 args required"
+  else
+    let v_ptr = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_ptr
+    else
+      let v_ptr2 = if (contains_call_r (head (tail args)) (st_registry s)) == 1 then preserve_callee s v_ptr else v_ptr
+      if (st_get_err s) == 1 then v_ptr2
+      else
+        let v_idx = lower_expr s env (head (tail args))
+        if (st_get_err s) == 1 then v_idx
+        else
+          let v_dst = st_alloc_caller s
+          if (st_get_err s) == 1 then v_dst
+          else
+            let _ = st_emit s op_str_at v_dst v_ptr2 v_idx
+            v_dst
+
+lower_builtin_str_len s env args n =
+  if n != 1 then st_fail s "str_len: 1 arg required"
+  else
+    let v_ptr = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_ptr
+    else
+      let v_dst = st_alloc_caller s
+      if (st_get_err s) == 1 then v_dst
+      else
+        let _ = st_emit s op_str_len v_dst v_ptr 0
+        v_dst
+
+lower_builtin_str_eq s env args n =
+  if n != 2 then st_fail s "str_eq: 2 args required"
+  else
+    let v_a = lower_expr s env (head args)
+    if (st_get_err s) == 1 then v_a
+    else
+      let v_a2 = if (contains_call_r (head (tail args)) (st_registry s)) == 1 then preserve_callee s v_a else v_a
+      if (st_get_err s) == 1 then v_a2
+      else
+        let v_b = lower_expr s env (head (tail args))
+        if (st_get_err s) == 1 then v_b
+        else
+          let v_dst = st_alloc_caller s
+          if (st_get_err s) == 1 then v_dst
+          else
+            let _ = st_emit s op_str_eq v_dst v_a2 v_b
+            v_dst
+
+lower_call_with_args s env fn_idx args =
+  let n = list_len_local args
+  if n > 4 then st_fail s "lower: >4 arg call not supported in v1"
+  else lower_call_n s env fn_idx args n
+
+-- Lower each arg into a vreg per the callee's per-arg types from the registry,
+-- preserving across calls as needed, then emit op_call with packed
+-- arg vregs + arg type bits + ret type bit.
+lower_call_n s env fn_idx args n =
+  let callee_name = reg_idx_to_name (st_registry s) fn_idx
+  let arg_types = collect_arg_types (st_registry s) callee_name n 0 []
+  let arg_vregs = lower_args_with_preserve_typed s env args arg_types
+  if (st_get_err s) == 1 then 0 - 1
+  else lower_call_emit s fn_idx arg_vregs arg_types n
+
+collect_arg_types registry callee_name n i acc =
+  if i >= n then reverse acc
+  else
+    let ty = reg_lookup_arg_ty registry callee_name i
+    collect_arg_types registry callee_name n (i + 1) (cons ty acc)
+
+-- Lower args left-to-right per arg_types (int args via lower_expr, float args
+-- via lower_expr_float with int->float promotion). Before each subsequent
+-- arg's lowering, preserve previously-lowered caller-save vregs to callee-save
+-- if the remaining args contain a call. Float vregs go through
+-- preserve_callee_float (caps at 2 callee-save d-slots).
+lower_args_with_preserve_typed s env args arg_types =
+  lower_args_loop_typed s env args arg_types [] []
+
+lower_args_loop_typed s env remaining arg_types done_vregs done_safe =
+  if remaining == [] then reverse done_safe
+  else
+    let arg = head remaining
+    let arg_ty = head arg_types
+    let rest = tail remaining
+    let rest_types = tail arg_types
+    let v = if arg_ty == "float" then lower_expr_float s env arg else lower_expr s env arg
+    if (st_get_err s) == 1 then []
+    else
+      let v_safe = if (any_contains_call_r rest (st_registry s)) == 1 then
+                     if arg_ty == "float" then preserve_callee_float s v
+                     else preserve_callee s v
+                   else v
+      lower_args_loop_typed s env rest rest_types (cons v done_vregs) (cons v_safe done_safe)
+
+any_contains_call args = any_contains_call_r args []
+
+any_contains_call_r args registry =
+  if args == [] then 0
+  else if (contains_call_r (head args) registry) == 1 then 1
+  else any_contains_call_r (tail args) registry
+
+-- Emit a folded op_call (op_call_fret merged via bit 28). The c slot encodes
+-- arg vregs + per-arg type bits + ret type bit; emit_op_call decodes and
+-- dispatches per-arg int/float moves and int/float return capture.
+lower_call_emit s fn_idx arg_vregs arg_types n =
+  let callee_name = reg_idx_to_name (st_registry s) fn_idx
+  let ret_ty = reg_lookup_ret_ty (st_registry s) callee_name
+  let packed = pack_call_args_typed arg_vregs arg_types n ret_ty
+  if ret_ty == "float" then
+    let f_dst = st_alloc_float s
+    if (st_get_err s) == 1 then f_dst
+    else
+      let _ = st_emit s op_call f_dst fn_idx packed
+      f_dst
+  else
+    let v_dst = st_alloc_caller s
+    if (st_get_err s) == 1 then v_dst
+    else
+      let _ = st_emit s op_call v_dst fn_idx packed
+      v_dst
+
+reg_idx_to_name registry idx =
+  if registry == [] then ""
+  else
+    let entry = head registry
+    if (head (tail entry)) == idx then head entry
+    else reg_idx_to_name (tail registry) idx
+
+pack_call_args_typed vregs arg_types n ret_ty =
+  let v0 = if n >= 1 then nth_local 0 vregs else 0
+  let v1 = if n >= 2 then nth_local 1 vregs else 0
+  let v2 = if n >= 3 then nth_local 2 vregs else 0
+  let v3 = if n >= 4 then nth_local 3 vregs else 0
+  let t0 = if n >= 1 then ty_bit (nth_local 0 arg_types) else 0
+  let t1 = if n >= 2 then ty_bit (nth_local 1 arg_types) else 0
+  let t2 = if n >= 3 then ty_bit (nth_local 2 arg_types) else 0
+  let t3 = if n >= 4 then ty_bit (nth_local 3 arg_types) else 0
+  let r = if ret_ty == "float" then 1 else 0
+  call_pack_typed n v0 v1 v2 v3 t0 t1 t2 t3 r
+
+ty_bit s = if s == "float" then 1 else 0
+
+nth_local i xs =
+  if i == 0 then head xs
+  else nth_local (i - 1) (tail xs)
+
+-- Registry + pool helpers on state. State layout:
+--   [ir, ctr, blocks, err_msg, registry, pool]
+-- pool = [pool_buf (int_arr of bytes), pool_size_cell (int_arr size 1)]
+-- The pool is shared across all functions in a program; the registry is
+-- read-only per program.
+mk_state_with_registry registry pool =
+  let s = mk_state 0
+  cons (st_ir s) (cons (st_ctr s) (cons (st_blocks s) (cons (st_err_msg s) (cons registry (cons pool [])))))
+
+st_registry s = head (tail (tail (tail (tail s))))
+st_registry_lookup s name = reg_lookup (st_registry s) name
+
+st_pool s          = head (tail (tail (tail (tail (tail s)))))
+st_pool_buf s      = head (st_pool s)
+st_pool_size_cell s = head (tail (st_pool s))
+st_pool_size s     = arr_get (st_pool_size_cell s) 0
+st_pool_bump s n   = arr_set (st_pool_size_cell s) 0 ((st_pool_size s) + n)
+
+max_pool_bytes = 16384
+
+mk_empty_pool _ =
+  let buf = arr_new max_pool_bytes 0
+  let sz = arr_new 1 0
+  cons buf (cons sz [])
+
+-- Append a length-prefixed string to the pool. Returns the offset of the
+-- length prefix within the pool. Length is stored as 8-byte little-endian.
+-- A trailing null byte is written after the data so the data pointer
+-- (off+8) is a valid C-string for syscalls like open(path, ...).
+pool_append s str =
+  let off = st_pool_size s
+  let buf = st_pool_buf s
+  let n = length str
+  if (off + 9 + n) > max_pool_bytes then
+    let _ = st_fail s "pool overflow (>16KB strings); raise max_pool_bytes"
+    0
+  else
+    let _ = write_le_u64 buf off n
+    let _ = write_str_bytes buf (off + 8) str 0 n
+    let _ = arr_set buf (off + 8 + n) 0    -- null terminator
+    let _ = st_pool_bump s (8 + n + 1)
+    off
+
+write_le_u64 buf off v =
+  let _ = arr_set buf       off       (bit_and v 255)
+  let _ = arr_set buf (off + 1) (bit_and (shr v 8)  255)
+  let _ = arr_set buf (off + 2) (bit_and (shr v 16) 255)
+  let _ = arr_set buf (off + 3) (bit_and (shr v 24) 255)
+  let _ = arr_set buf (off + 4) (bit_and (shr v 32) 255)
+  let _ = arr_set buf (off + 5) (bit_and (shr v 40) 255)
+  let _ = arr_set buf (off + 6) (bit_and (shr v 48) 255)
+  let _ = arr_set buf (off + 7) (bit_and (shr v 56) 255)
+  0
+
+write_str_bytes buf off str i n =
+  if i >= n then 0
+  else
+    let c = str_sub str i 1
+    let b = byte_at_str c
+    let _ = arr_set buf (off + i) b
+    write_str_bytes buf off str (i + 1) n
+
+-- One-character string -> byte value (ASCII printable + tab/newline only).
+-- For non-ASCII, returns 0. v1 corpus is ASCII-only so this suffices.
+byte_at_str c =
+  if c == "\n" then 10
+  else if c == "\t" then 9
+  else byte_printable c
+
+printable_set = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+byte_printable c =
+  if c == " " then 32
+  else
+    let i = str_find c printable_set
+    if i < 0 then 0
+    else 33 + i
+
+-- ============================================================================
+-- Function lowering
+-- ============================================================================
+
+-- Lower one function definition; returns FnStruct or sets err.
+lower_fn_def fn_def registry pool =
+  let name = head (tail fn_def)
+  let args = head (tail (tail fn_def))
+  let body = head (tail (tail (tail fn_def)))
+  let n_args = list_len_local args
+  if n_args > 4 then mk_err_fn (cat ["fn '", name, "': >4 args not supported (v1 ABI cap)"])
+  else lower_fn_body name args body registry pool n_args
+
+mk_err_fn msg =
+  -- A sentinel "error" function struct (caller checks). Silent — the message
+  -- propagates through the return tuple. lower_source surfaces it via the
+  -- ["err", msg] return value.
+  cons "ERR" (cons msg [])
+
+-- State-aware variant: prefer the first message captured into st_err_msg
+-- (typically the deepest st_fail call), falling back to the boilerplate
+-- `fallback` if state didn't record anything (rare; defensive).
+mk_err_fn_from_state s fallback =
+  let stored = st_get_err_msg s
+  if stored == "" then mk_err_fn fallback
+  else mk_err_fn stored
+
+lower_fn_body name args body registry pool n_args =
+  let s = mk_state_with_registry registry pool
+  -- record n_args in state so finalize can pass it to make_fn_n
+  let _ = arr_set (st_ctr s) 7 n_args
+  -- block 0 starts at instruction 0
+  let _ = st_set_block_start s (st_reserve_block s)
+  let env = build_arg_env s args body name
+  if (st_get_err s) == 1 then mk_err_fn_from_state s "lower failed during arg setup"
+  else lower_fn_after_args s env body name
+
+-- Bind args. Each positional arg has a type from the registry's per-fn
+-- arg_types meta (set by build_registry's fixed-point inference). For each
+-- arg in declaration order, increment EITHER int_slot (for int args) OR
+-- float_slot (for float args). int_slot tracks AAPCS64 x0..x7 consumption,
+-- float_slot tracks d0..d7. They index INDEPENDENTLY per AAPCS64.
+--
+-- Int args bind name to caller-save vreg `int_slot` (preg = x_int_slot+9);
+-- float args bind name to f-vreg `float_slot` (= d_float_slot).
+-- Args used after a call get preserved into callee-save slots (v10/v11 for
+-- ints; f8/f9 for floats; each capped at 2).
+build_arg_env s args body self_name =
+  let registry = st_registry s
+  let seed_env = seed_env_from_registry registry (env_empty 0)
+  build_arg_env_loop s args body 0 seed_env (contains_call_r body registry) self_name 0 0
+
+build_arg_env_loop s args body i env body_has_call self_name int_slot float_slot =
+  if args == [] then env
+  else
+    let arg_name = head args
+    let registry = st_registry s
+    let arg_ty = reg_lookup_arg_ty registry self_name i
+    if arg_ty == "float" then build_arg_env_float_param s args body i env body_has_call self_name int_slot float_slot
+    else
+      let _ = st_track_reg s int_slot
+      if (used_after_call_r arg_name body 0 registry) == 1 then build_arg_env_int_preserved s args body i env body_has_call self_name int_slot float_slot
+      else build_arg_env_int_no_preserve s args body i env body_has_call self_name int_slot float_slot
+
+build_arg_env_float_param s args body i env body_has_call self_name int_slot float_slot =
+  let arg_name = head args
+  -- For float params used after a call, preserve into a callee-save slot
+  -- (f8..f15 with v2-B's expanded frame). Bind name to the safe slot. Bump
+  -- ctr[8] past the original arg slot so subsequent st_alloc_float skips it.
+  if (used_after_call_r arg_name body 0 (st_registry s)) == 1 then
+    let f_safe = st_alloc_float_callee s
+    if (st_get_err s) == 1 then env
+    else
+      let _ = st_emit s op_fmov f_safe float_slot 0
+      let env2 = env_extend_typed env arg_name f_safe "float"
+      let _ = arr_set (st_ctr s) 8 (float_slot + 1)
+      build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call self_name int_slot (float_slot + 1)
+  else
+    -- Caller-save param. Lock the slot so st_free_float_caller leaves it
+    -- alone — env binding `arg_name → float_slot` outlives any single op.
+    let _ = st_lock_float_caller s float_slot
+    let env2 = env_extend_typed env arg_name float_slot "float"
+    let _ = arr_set (st_ctr s) 8 (float_slot + 1)
+    build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call self_name int_slot (float_slot + 1)
+
+build_arg_env_int_preserved s args body i env body_has_call self_name int_slot float_slot =
+  let arg_name = head args
+  let v_safe = st_alloc_callee s
+  if (st_get_err s) == 1 then env
+  else
+    let _ = st_emit s op_mov v_safe int_slot 0
+    let env2 = env_extend_typed env arg_name v_safe (infer_arg_type arg_name)
+    build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call self_name (int_slot + 1) float_slot
+
+build_arg_env_int_no_preserve s args body i env body_has_call self_name int_slot float_slot =
+  let arg_name = head args
+  -- Lock int_slot's bit in the live mask so the caller-save allocator doesn't
+  -- clobber the arg-holding register. v0 is reserved and not in the mask.
+  let _ = if int_slot >= 1 then lock_caller s int_slot else 0
+  let env2 = env_extend_typed env arg_name int_slot (infer_arg_type arg_name)
+  build_arg_env_loop s (tail args) body (i + 1) env2 body_has_call self_name (int_slot + 1) float_slot
+
+-- Heuristic: arg names starting with `s` or containing `str` -> "str";
+-- otherwise "int". Imperfect but covers common idioms (`s`, `str`, `s1`, etc.).
+-- Better: explicit type annotations or callsite-driven inference (v2).
+infer_arg_type name =
+  if name == "s" then "str"
+  else if name == "s1" then "str"
+  else if name == "s2" then "str"
+  else if name == "str" then "str"
+  else if name == "name" then "str"
+  -- HOF parameter heuristic (P3-variant): `f`, `g`, `fn`, `func` are fn-typed.
+  -- Imperfect but matches common Rail idioms (`map f xs`, `apply g x`).
+  else if name == "f" then "fn"
+  else if name == "g" then "fn"
+  else if name == "fn" then "fn"
+  else if name == "func" then "fn"
+  else "int"
+
+lower_fn_after_args s env body name =
+  -- Determine the body's static type BEFORE lowering — env now has the
+  -- registry seed + arg bindings, so infer_type can resolve user fn calls
+  -- and float-arg references correctly.
+  let body_ty = infer_type env body
+  let v_result = lower_expr s env body
+  if (st_get_err s) == 1 then mk_err_fn_from_state s "lower failed (see prior LOWER ERR)"
+  else lower_fn_finalize s v_result body_ty name
+
+lower_fn_finalize s v_result body_ty name =
+  let ret_op = if body_ty == "float" then op_ret_float else op_ret
+  let _ = st_emit s ret_op v_result 0 0
+  let n_instr = st_get_instr s
+  let n_regs = (st_get_maxreg s) + 1
+  let n_blocks = st_get_nblocks s
+  let n_args = arr_get (st_ctr s) 7
+  let blocks_compact = arr_new n_blocks 0
+  let _ = copy_blocks (st_blocks s) blocks_compact n_blocks 0
+  let arg_types_arr = build_arg_types_arr (st_registry s) name n_args
+  make_fn_n_typed (st_ir s) n_instr n_regs blocks_compact n_args arg_types_arr
+
+build_arg_types_arr registry name n_args =
+  let arr = arr_new n_args 0
+  let _ = fill_arg_types_arr registry name arr n_args 0
+  arr
+
+fill_arg_types_arr registry name dst n_args i =
+  if i >= n_args then 0
+  else
+    let bit = if (reg_lookup_arg_ty registry name i) == "float" then 1 else 0
+    let _ = arr_set dst i bit
+    fill_arg_types_arr registry name dst n_args (i + 1)
+
+copy_blocks src dst n i =
+  if i >= n then 0
+  else
+    let _ = arr_set dst i (arr_get src i)
+    copy_blocks src dst n (i + 1)
+
+list_len_local xs =
+  if xs == [] then 0
+  else 1 + list_len_local (tail xs)
+
+list_contains_str xs nm =
+  if xs == [] then 0
+  else if (head xs) == nm then 1
+  else list_contains_str (tail xs) nm
+
+append_list a b =
+  if a == [] then b
+  else cons (head a) (append_list (tail a) b)
+
+union_str a b =
+  if a == [] then b
+  else if (list_contains_str b (head a)) == 1 then union_str (tail a) b
+  else cons (head a) (union_str (tail a) b)
+
+-- ============================================================================
+-- v2-C: Lambda hoisting pre-pass
+-- ============================================================================
+-- Walk every fn_def body. For each lambda node with NO free variables (modulo
+-- the lambda's own arg, top-level fn names, and builtins), hoist to a synthetic
+-- top-level fn `__lam_<n>` and rewrite the lambda site to `var __lam_<n>`.
+-- Capturing lambdas remain as-is (inline-substituted by P3-full v1).
+-- Result: lambdas without captures become first-class values that can be
+-- passed to HOFs via the existing P3-variant op_apply dispatch.
+
+-- Free-var analysis. Walks ast collecting names referenced but not in `bound`.
+-- Returns a list of free names (no dedup pressure — caller filters).
+free_vars ast bound =
+  let tag = ast_tag ast
+  if tag == "int" then []
+  else if tag == "float" then []
+  else if tag == "str" then []
+  else if tag == "var" then
+    let nm = head (tail ast)
+    if (list_contains_str bound nm) == 1 then [] else cons nm []
+  else if tag == "op" then
+    let lhs = head (tail (tail ast))
+    let rhs = head (tail (tail (tail ast)))
+    union_str (free_vars lhs bound) (free_vars rhs bound)
+  else if tag == "if" then
+    let c = head (tail ast)
+    let t = head (tail (tail ast))
+    let e = head (tail (tail (tail ast)))
+    union_str (union_str (free_vars c bound) (free_vars t bound)) (free_vars e bound)
+  else if tag == "let" then
+    let nm = head (tail ast)
+    let v = head (tail (tail ast))
+    let body = head (tail (tail (tail ast)))
+    let v_free = free_vars v bound
+    let body_free = free_vars body (cons nm bound)
+    union_str v_free body_free
+  else if tag == "app" then
+    let f = head (tail ast)
+    let arg = head (tail (tail ast))
+    union_str (free_vars f bound) (free_vars arg bound)
+  else if tag == "lambda" then
+    let arg = head (tail ast)
+    let body = head (tail (tail ast))
+    free_vars body (cons arg bound)
+  else []
+
+-- Filter out names that are top-level fns or JIT builtins. The remaining list
+-- is the lambda's TRUE captures.
+lambda_true_captures free_list top_names =
+  if free_list == [] then []
+  else
+    let nm = head free_list
+    if (list_contains_str top_names nm) == 1 then lambda_true_captures (tail free_list) top_names
+    else if (is_builtin nm) == 1 then lambda_true_captures (tail free_list) top_names
+    else cons nm (lambda_true_captures (tail free_list) top_names)
+
+-- Recursively walk an AST, hoisting lambdas. State (counter + accumulated
+-- synthetics) is threaded via an int_arr (counter at slot 0) and a list ref
+-- via the return value. Returns [new_ast, new_synth_list].
+walk_hoist ast outer_bound ctr top_names acc_synth =
+  let tag = ast_tag ast
+  if tag == "int" then cons ast (cons acc_synth [])
+  else if tag == "float" then cons ast (cons acc_synth [])
+  else if tag == "str" then cons ast (cons acc_synth [])
+  else if tag == "var" then cons ast (cons acc_synth [])
+  else if tag == "op" then walk_hoist_op ast outer_bound ctr top_names acc_synth
+  else if tag == "if" then walk_hoist_if ast outer_bound ctr top_names acc_synth
+  else if tag == "let" then walk_hoist_let ast outer_bound ctr top_names acc_synth
+  else if tag == "app" then walk_hoist_app ast outer_bound ctr top_names acc_synth
+  else if tag == "lambda" then walk_hoist_lambda ast outer_bound ctr top_names acc_synth
+  else cons ast (cons acc_synth [])
+
+walk_hoist_op ast outer_bound ctr top_names acc_synth =
+  let op_str = head (tail ast)
+  let lhs = head (tail (tail ast))
+  let rhs = head (tail (tail (tail ast)))
+  let r1 = walk_hoist lhs outer_bound ctr top_names acc_synth
+  let new_lhs = head r1
+  let acc1 = head (tail r1)
+  let r2 = walk_hoist rhs outer_bound ctr top_names acc1
+  let new_rhs = head r2
+  let acc2 = head (tail r2)
+  let new_op = cons "op" (cons op_str (cons new_lhs (cons new_rhs [])))
+  cons new_op (cons acc2 [])
+
+walk_hoist_if ast outer_bound ctr top_names acc_synth =
+  let c = head (tail ast)
+  let t = head (tail (tail ast))
+  let e = head (tail (tail (tail ast)))
+  let r1 = walk_hoist c outer_bound ctr top_names acc_synth
+  let r2 = walk_hoist t outer_bound ctr top_names (head (tail r1))
+  let r3 = walk_hoist e outer_bound ctr top_names (head (tail r2))
+  let new_if = cons "if" (cons (head r1) (cons (head r2) (cons (head r3) [])))
+  cons new_if (cons (head (tail r3)) [])
+
+walk_hoist_let ast outer_bound ctr top_names acc_synth =
+  let nm = head (tail ast)
+  let v = head (tail (tail ast))
+  let body = head (tail (tail (tail ast)))
+  -- v2-C: a lambda that is the DIRECT val of a let is left inline so the
+  -- existing P3-full v1 substitution path handles it (avoids a pre-existing
+  -- bug in chained op_apply over let-bound fn refs). Still walk into the
+  -- lambda's body to hoist any deeper non-capturing lambdas.
+  let r1 = if (ast_tag v) == "lambda" then walk_hoist_let_lam_body v outer_bound ctr top_names acc_synth
+           else walk_hoist v outer_bound ctr top_names acc_synth
+  let body_bound = cons nm outer_bound
+  let r2 = walk_hoist body body_bound ctr top_names (head (tail r1))
+  let new_let = cons "let" (cons nm (cons (head r1) (cons (head r2) [])))
+  cons new_let (cons (head (tail r2)) [])
+
+-- Walk a lambda's body without hoisting the lambda itself. Used for let-bound
+-- lambdas, where inline substitution is preferred.
+walk_hoist_let_lam_body lam outer_bound ctr top_names acc_synth =
+  let lam_arg = head (tail lam)
+  let lam_body = head (tail (tail lam))
+  let inner_bound = cons lam_arg outer_bound
+  let rb = walk_hoist lam_body inner_bound ctr top_names acc_synth
+  let new_body = head rb
+  let acc1 = head (tail rb)
+  let new_lam = cons "lambda" (cons lam_arg (cons new_body []))
+  cons new_lam (cons acc1 [])
+
+walk_hoist_app ast outer_bound ctr top_names acc_synth =
+  let f = head (tail ast)
+  let arg = head (tail (tail ast))
+  let r1 = walk_hoist f outer_bound ctr top_names acc_synth
+  let r2 = walk_hoist arg outer_bound ctr top_names (head (tail r1))
+  let new_app = cons "app" (cons (head r1) (cons (head r2) []))
+  cons new_app (cons (head (tail r2)) [])
+
+walk_hoist_lambda ast outer_bound ctr top_names acc_synth =
+  let lam_arg = head (tail ast)
+  let lam_body = head (tail (tail ast))
+  -- Recurse into body with arg added to bound (handles nested lambdas first).
+  let inner_bound = cons lam_arg outer_bound
+  let rb = walk_hoist lam_body inner_bound ctr top_names acc_synth
+  let new_body = head rb
+  let acc1 = head (tail rb)
+  -- Free-var check: only lam_arg counts as bound for THIS lambda's hoistability.
+  -- Outer-bound names are captures.
+  let body_free = free_vars new_body (cons lam_arg [])
+  let captures = lambda_true_captures body_free top_names
+  if captures == [] then
+    let n = arr_get ctr 0
+    let _ = arr_set ctr 0 (n + 1)
+    let synth_name = cat ["__lam_", show n]
+    let synth_args = cons lam_arg []
+    let synth_def = cons "fn_def" (cons synth_name (cons synth_args (cons new_body [])))
+    let var_ref = cons "var" (cons synth_name [])
+    cons var_ref (cons (cons synth_def acc1) [])
+  else
+    let new_lam = cons "lambda" (cons lam_arg (cons new_body []))
+    cons new_lam (cons acc1 [])
+
+collect_top_names defs acc =
+  if defs == [] then reverse acc
+  else
+    let nm = head (tail (head defs))
+    collect_top_names (tail defs) (cons nm acc)
+
+hoist_each_def defs ctr top_names acc_orig acc_synth =
+  if defs == [] then
+    -- Originals first (preserving user order), synthetics appended at the end.
+    append_list (reverse acc_orig) (reverse acc_synth)
+  else
+    let fn_def = head defs
+    let name = head (tail fn_def)
+    let args = head (tail (tail fn_def))
+    let body = head (tail (tail (tail fn_def)))
+    let r = walk_hoist body args ctr top_names acc_synth
+    let new_body = head r
+    let new_synth = head (tail r)
+    let new_fn = cons "fn_def" (cons name (cons args (cons new_body [])))
+    hoist_each_def (tail defs) ctr top_names (cons new_fn acc_orig) new_synth
+
+hoist_lambdas defs =
+  let ctr = arr_new 1 0
+  let top_names = collect_top_names defs []
+  hoist_each_def defs ctr top_names [] []
+
+-- ============================================================================
+-- Public entry
+-- ============================================================================
+
+lower_source src =
+  let toks = tokenize src
+  let r = parse_program toks
+  if (is_err r) == 1 then cons "err" (cons (head (tail (res_ast r))) [])
+  else lower_program (res_ast r)
+
+lower_program program_ast =
+  let raw_defs = head (tail program_ast)
+  if raw_defs == [] then cons "err" (cons "empty program" [])
+  else
+    -- v2-C: hoist non-capturing lambdas to top-level synthetic fns. After
+    -- this pass, lambda values can be passed to HOFs via fn_idx materialization
+    -- and the existing P3-variant op_apply dispatch.
+    let defs = hoist_lambdas raw_defs
+    let registry = build_registry defs
+    -- The main entry point must be the LAST function (so it sees the registry
+    -- of preceding ones), but for op_call's relative offsets, fn_offsets are
+    -- assigned in list order. The training session expected `main` as fn 0
+    -- (the entry point). Reorder: put `main` first if it exists.
+    let ordered = move_main_first defs
+    let registry2 = build_registry ordered
+    let pool = mk_empty_pool 0
+    lower_each ordered registry2 pool []
+
+lower_each defs registry pool acc =
+  if defs == [] then cons "ok" (cons (reverse acc) (cons pool []))
+  else
+    let fn = lower_fn_def (head defs) registry pool
+    if (head fn) == "ERR" then cons "err" (cons (head (tail fn)) [])
+    else lower_each (tail defs) registry pool (cons fn acc)
+
+move_main_first defs =
+  if has_main defs == 0 then defs
+  else
+    let m = find_main defs
+    cons m (remove_main defs)
+
+has_main defs =
+  if defs == [] then 0
+  else if (head (tail (head defs))) == "main" then 1
+  else has_main (tail defs)
+
+find_main defs =
+  if defs == [] then []
+  else if (head (tail (head defs))) == "main" then head defs
+  else find_main (tail defs)
+
+remove_main defs =
+  if defs == [] then []
+  else if (head (tail (head defs))) == "main" then tail defs
+  else cons (head defs) (remove_main (tail defs))

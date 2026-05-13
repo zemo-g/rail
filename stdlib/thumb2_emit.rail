@@ -1,0 +1,210 @@
+-- stdlib/thumb2_emit.rail - Rail-native ARM Cortex-M Thumb-2 encoder.
+--
+-- The reverse pass of stdlib/thumb2.rail. Same encoding tables, applied
+-- forward: caller hands us a buffer + offset + instruction operands; we
+-- write 2 or 4 bytes and return the new offset.
+--
+-- Scope (matches what we decode, plus enough data-processing for an MMIO
+-- payload to actually do useful work):
+--   16-bit:  MOVS Rd #imm8, ADDS Rd #imm8, SUBS Rd #imm8, CMP Rd #imm8,
+--            LDR Rt [PC #imm8*4], MOV Rd Rm, B uncond, Bcond, BX Rm,
+--            PUSH {regs, lr?}, POP {regs, pc?}, NOP
+--   32-bit:  BL, B.W, Bcond.W, MOVW Rd #imm16, MOVT Rd #imm16,
+--            LDR.W Rt [Rn #imm12], STR.W Rt [Rn #imm12]
+--
+-- Together those let us load arbitrary 32-bit MMIO addresses (MOVW+MOVT),
+-- read or write registers (LDR.W/STR.W), branch and call, and clean up
+-- with PUSH/POP. Enough for a v0 watchface payload.
+--
+-- Public API (all return new offset):
+--   te_b      buf off addr target               16-bit B
+--   te_bcond  buf off addr target cond          16-bit Bcond
+--   te_bx     buf off rm                        16-bit BX
+--   te_bl     buf off addr target               32-bit BL
+--   te_b_w    buf off addr target               32-bit B.W
+--   te_bcond_w buf off addr target cond         32-bit Bcond.W
+--   te_push   buf off reglist8 lr               16-bit PUSH (lr 0/1)
+--   te_pop    buf off reglist8 pc               16-bit POP  (pc 0/1)
+--   te_nop    buf off                           16-bit NOP
+--   te_movs_imm8 buf off rd imm8                16-bit MOVS Rd #imm8
+--   te_adds_imm8 buf off rd imm8                16-bit ADDS Rd #imm8
+--   te_subs_imm8 buf off rd imm8                16-bit SUBS Rd #imm8
+--   te_cmp_imm8  buf off rd imm8                16-bit CMP  Rd #imm8
+--   te_ldr_pc    buf off rt imm8                16-bit LDR  Rt [PC #imm8*4]
+--   te_mov_reg   buf off rd rm                  16-bit MOV  Rd Rm
+--   te_movw      buf off rd imm16               32-bit MOVW Rd #imm16
+--   te_movt      buf off rd imm16               32-bit MOVT Rd #imm16
+--   te_ldr_w     buf off rt rn imm12            32-bit LDR.W Rt [Rn #imm12]
+--   te_str_w     buf off rt rn imm12            32-bit STR.W Rt [Rn #imm12]
+--
+-- Uses only Rail builtins. No imports.
+
+-- ---- Byte-level emit ---------------------------------------------------
+
+te_emit_hw buf off hw =
+  let _ = arr_set buf off       (bit_and hw 255)
+  let _ = arr_set buf (off + 1) (bit_and (shr hw 8) 255)
+  off + 2
+
+te_emit32 buf off hi lo =
+  let o1 = te_emit_hw buf off hi
+  te_emit_hw buf o1 lo
+
+-- ---- 16-bit branches ---------------------------------------------------
+
+te_b buf off addr target =
+  let dlt = target - (addr + 4)
+  let imm11 = bit_and (shr dlt 1) 2047
+  te_emit_hw buf off (bit_or 57344 imm11)
+
+te_bcond buf off addr target cond =
+  let dlt = target - (addr + 4)
+  let imm8 = bit_and (shr dlt 1) 255
+  te_emit_hw buf off (bit_or 53248 (bit_or (shl cond 8) imm8))
+
+-- BX Rm: 0100 0111 0 Rm[3:0] 000.  Encoding: 0x4700 | (Rm << 3)
+te_bx buf off rm =
+  te_emit_hw buf off (bit_or 18176 (shl rm 3))
+
+-- ---- 32-bit branches ---------------------------------------------------
+-- BL  (T1): hi = 11110 S imm10,         lo = 11 J1 1 J2 imm11
+-- B.W (T4): hi = 11110 S imm10,         lo = 10 J1 1 J2 imm11
+-- Bcond.W (T3): hi = 11110 S cond imm6, lo = 10 J1 0 J2 imm11
+--   I1 = NOT(J1 XOR S);  J1 = NOT(I1 XOR S) - reverse direction
+--   I2 = NOT(J2 XOR S);  J2 = NOT(I2 XOR S)
+--   target offset (BL/B.W) = sext25(S:I1:I2:imm10:imm11:0)
+--   target offset (Bcond.W) = sext21(S:J2:J1:imm6:imm11:0)  (note J2 before J1; no NOT)
+
+te_bl buf off addr target =
+  let dlt = target - (addr + 4)
+  let s = bit_and (shr dlt 24) 1
+  let i1 = bit_and (shr dlt 23) 1
+  let i2 = bit_and (shr dlt 22) 1
+  let imm10 = bit_and (shr dlt 12) 1023
+  let imm11 = bit_and (shr dlt 1) 2047
+  let j1 = bit_xor (bit_xor i1 s) 1
+  let j2 = bit_xor (bit_xor i2 s) 1
+  let hi = bit_or 61440 (bit_or (shl s 10) imm10)
+  let lo = bit_or 53248 (bit_or (shl j1 13) (bit_or (shl j2 11) imm11))
+  te_emit32 buf off hi lo
+
+te_b_w buf off addr target =
+  let dlt = target - (addr + 4)
+  let s = bit_and (shr dlt 24) 1
+  let i1 = bit_and (shr dlt 23) 1
+  let i2 = bit_and (shr dlt 22) 1
+  let imm10 = bit_and (shr dlt 12) 1023
+  let imm11 = bit_and (shr dlt 1) 2047
+  let j1 = bit_xor (bit_xor i1 s) 1
+  let j2 = bit_xor (bit_xor i2 s) 1
+  let hi = bit_or 61440 (bit_or (shl s 10) imm10)
+  -- 0x9000 = 1001 0000 0000 0000 (bit15=1, bit14=0, bit12=1)
+  let lo = bit_or 36864 (bit_or (shl j1 13) (bit_or (shl j2 11) imm11))
+  te_emit32 buf off hi lo
+
+te_bcond_w buf off addr target cond =
+  let dlt = target - (addr + 4)
+  let s = bit_and (shr dlt 20) 1
+  let j2 = bit_and (shr dlt 19) 1
+  let j1 = bit_and (shr dlt 18) 1
+  let imm6 = bit_and (shr dlt 12) 63
+  let imm11 = bit_and (shr dlt 1) 2047
+  let hi = bit_or 61440 (bit_or (shl s 10) (bit_or (shl cond 6) imm6))
+  -- 0x8000 = 1000 0000 0000 0000 (bit15=1, bit14=0, bit12=0)
+  let lo = bit_or 32768 (bit_or (shl j1 13) (bit_or (shl j2 11) imm11))
+  te_emit32 buf off hi lo
+
+-- ---- Stack: PUSH / POP -------------------------------------------------
+-- PUSH: 1011 010M reglist[7:0]    M=1 -> include LR.   Base 0xB400.
+-- POP:  1011 110P reglist[7:0]    P=1 -> include PC.   Base 0xBC00.
+
+te_push buf off reglist8 lr =
+  let inst = bit_or 46080 (bit_or (shl lr 8) (bit_and reglist8 255))
+  te_emit_hw buf off inst
+
+te_pop buf off reglist8 pc =
+  let inst = bit_or 48128 (bit_or (shl pc 8) (bit_and reglist8 255))
+  te_emit_hw buf off inst
+
+-- ---- NOP ---------------------------------------------------------------
+
+te_nop buf off = te_emit_hw buf off 48896  -- 0xBF00
+
+-- ---- 16-bit data-processing immediate ---------------------------------
+-- MOVS Rd, #imm8: 001 00 Rd[2:0] imm8  -> 0x2000 | (Rd<<8) | imm8
+-- CMP  Rd, #imm8: 001 01 Rd[2:0] imm8  -> 0x2800 | (Rd<<8) | imm8
+-- ADDS Rd, #imm8: 001 10 Rd[2:0] imm8  -> 0x3000 | (Rd<<8) | imm8
+-- SUBS Rd, #imm8: 001 11 Rd[2:0] imm8  -> 0x3800 | (Rd<<8) | imm8
+
+te_movs_imm8 buf off rd imm8 =
+  te_emit_hw buf off (bit_or 8192 (bit_or (shl rd 8) (bit_and imm8 255)))
+
+te_cmp_imm8 buf off rd imm8 =
+  te_emit_hw buf off (bit_or 10240 (bit_or (shl rd 8) (bit_and imm8 255)))
+
+te_adds_imm8 buf off rd imm8 =
+  te_emit_hw buf off (bit_or 12288 (bit_or (shl rd 8) (bit_and imm8 255)))
+
+te_subs_imm8 buf off rd imm8 =
+  te_emit_hw buf off (bit_or 14336 (bit_or (shl rd 8) (bit_and imm8 255)))
+
+-- LDR Rt, [PC, #imm8*4]: 0100 1 Rt[2:0] imm8  -> 0x4800 | (Rt<<8) | imm8
+te_ldr_pc buf off rt imm8 =
+  te_emit_hw buf off (bit_or 18432 (bit_or (shl rt 8) (bit_and imm8 255)))
+
+-- MOV Rd, Rm (high regs allowed): 0100 0110 D Rm[3:0] Rd[2:0]
+-- For Rd 0..7, Rm 0..15: 0x4600 | (D=Rd[3])<<7 | Rm<<3 | Rd[2:0]
+te_mov_reg buf off rd rm =
+  let d = bit_and (shr rd 3) 1
+  let inst = bit_or 17920 (bit_or (shl d 7) (bit_or (shl rm 3) (bit_and rd 7)))
+  te_emit_hw buf off inst
+
+-- ---- 32-bit MOVW / MOVT -----------------------------------------------
+-- MOVW Rd, #imm16:  hi = 1111 0 i 100100 imm4   lo = 0 imm3 Rd imm8
+--   imm4  = imm16[15:12]
+--   i     = imm16[11]
+--   imm3  = imm16[10:8]
+--   imm8  = imm16[7:0]
+-- MOVT Rd, #imm16:  same shape with op = 101100 instead of 100100 in hi.
+-- Encoding numbers:
+--   MOVW hi: 0xF240 base. Specifically: bits[15:11]=11110, bit10=i,
+--            bits[9:4]=100100, bits[3:0]=imm4.
+--   MOVT hi: 0xF2C0 base. bits[9:4]=101100.
+
+te_movw buf off rd imm16 =
+  let i = bit_and (shr imm16 11) 1
+  let imm4 = bit_and (shr imm16 12) 15
+  let imm3 = bit_and (shr imm16 8) 7
+  let imm8 = bit_and imm16 255
+  let hi = bit_or 62016 (bit_or (shl i 10) imm4)         -- 0xF240 | (i<<10) | imm4
+  let lo_a = shl imm3 12
+  let lo_b = shl rd 8
+  let lo = bit_or lo_a (bit_or lo_b imm8)
+  te_emit32 buf off hi lo
+
+te_movt buf off rd imm16 =
+  let i = bit_and (shr imm16 11) 1
+  let imm4 = bit_and (shr imm16 12) 15
+  let imm3 = bit_and (shr imm16 8) 7
+  let imm8 = bit_and imm16 255
+  let hi = bit_or 62144 (bit_or (shl i 10) imm4)         -- 0xF2C0 | (i<<10) | imm4
+  let lo_a = shl imm3 12
+  let lo_b = shl rd 8
+  let lo = bit_or lo_a (bit_or lo_b imm8)
+  te_emit32 buf off hi lo
+
+-- ---- 32-bit memory access ---------------------------------------------
+-- LDR.W Rt, [Rn, #imm12]: hi = 1111 1000 1 1 0 1 Rn[3:0]  -> 0xF8D0 | Rn
+--                          lo = Rt[3:0] imm12             -> (Rt<<12) | imm12
+-- STR.W Rt, [Rn, #imm12]: hi = 1111 1000 1 1 0 0 Rn[3:0]  -> 0xF8C0 | Rn
+--                          lo = Rt[3:0] imm12             -> (Rt<<12) | imm12
+
+te_ldr_w buf off rt rn imm12 =
+  let hi = bit_or 63696 (bit_and rn 15)   -- 0xF8D0
+  let lo = bit_or (shl rt 12) (bit_and imm12 4095)
+  te_emit32 buf off hi lo
+
+te_str_w buf off rt rn imm12 =
+  let hi = bit_or 63680 (bit_and rn 15)   -- 0xF8C0
+  let lo = bit_or (shl rt 12) (bit_and imm12 4095)
+  te_emit32 buf off hi lo

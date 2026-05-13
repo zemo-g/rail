@@ -1,0 +1,186 @@
+-- harvest_teacher.rail — Phase 5h.3 model-in-the-loop triple harvester.
+--
+-- Walks the existing `training/triples_v2.txt` corpus, extracts each
+-- (broken, diag) pair, prompts Qwen 3.6 35B (teacher on Studio MLX
+-- 10.42.0.2:8081) for a fix, compiles the teacher's response, and
+-- emits a triple if it compiles cleanly. Discards the existing FIXED
+-- block — we want a SECOND, independently-generated fix for the same
+-- failure, broadening the fix-distribution the model gets to imitate.
+--
+-- Reuses stdlib/llm.rail's JSON escaping + perl cleanup pipeline.
+-- Hits an explicit IP:port (mlx_studio is bound to a Mini-network
+-- interface, not localhost), so a small teacher_call wrapper replaces
+-- llm_call's curl block.
+--
+-- Output: appends to training/triples_harvested_v1.txt in the same
+-- <BROKEN>/<DIAG>/<FIXED>/<END> format as triples_v2.txt, so a future
+-- corpus build can simply `cat` them together.
+
+import "stdlib/llm.rail"
+import "jit/ir.rail"
+import "tools/train/diagnose_jit.rail"
+
+teacher_ip = "10.42.0.2"
+teacher_port = "8081"
+teacher_model = "~/models/Qwen3.6-35B-A3B-8bit"
+
+input_path = "training/triples_v2.txt"
+output_path = "training/triples_harvested_v1.txt"
+log_path = "/tmp/harvest_teacher.log"
+
+-- ── Build the system + user prompts for the teacher.
+sys_prompt =
+  "You are a Rail compiler engineer. The user provides a broken Rail program and the compiler's diagnostic. Reply with ONLY a corrected Rail program (no markdown, no explanation, no commentary). The program must compile cleanly with `./rail_native`. Preserve the original program's structure where possible — minimal edit only."
+
+user_prompt_for broken diag =
+  cat ["<BROKEN>\n", broken, "\n<DIAG>\n", diag, "\n<FIXED>\n"]
+
+-- ── JSON body: same shape as llm.rail's llm_mk_body, plus explicit model.
+teacher_body user_prompt =
+  let q = "\""
+  let esc_sys = llm_json_esc sys_prompt
+  let esc_usr = llm_json_esc user_prompt
+  let esc_model = llm_json_esc teacher_model
+  cat ["{", q, "model", q, ":", q, esc_model, q, ",",
+       q, "messages", q, ":[",
+       "{", q, "role", q, ":", q, "system", q, ",", q, "content", q, ":", q, esc_sys, q, "},",
+       "{", q, "role", q, ":", q, "user", q, ",", q, "content", q, ":", q, esc_usr, q, "}],",
+       q, "max_tokens", q, ":2048,",
+       q, "temperature", q, ":0.3,",
+       q, "chat_template_kwargs", q, ":{", q, "enable_thinking", q, ":true}}"]
+
+-- ── Single teacher call: shell out to curl + jq + perl. Returns the
+-- cleaned content (think-tags stripped, code-fences peeled).
+teacher_call user_prompt =
+  let body = teacher_body user_prompt
+  let _ = write_file "/tmp/rail_teacher_req.json" body
+  let cmd = cat [
+    "curl -s -m 120 http://", teacher_ip, ":", teacher_port, "/v1/chat/completions ",
+    "-H 'Content-Type: application/json' ",
+    "-d @/tmp/rail_teacher_req.json 2>/dev/null | ",
+    "jq -r '.choices[0].message.content // empty' 2>/dev/null > /tmp/rail_teacher_resp.txt && ",
+    "perl -0777 -pe '",
+    "s/^\\s+//; s/\\s+$//; ",
+    "s/<think>.*?<\\/think>\\s*//gs; ",
+    "s/^```[^\\n]*\\n(.*?)\\n```.*$/$1/s; ",
+    "s/\\n\\n\\*\\*.*//s; ",
+    "s/\\n\\nExplanation.*//s; ",
+    "s/\\n\\nNote:.*//s",
+    "' /tmp/rail_teacher_resp.txt"]
+  shell cmd
+
+-- ── Triple parser: split corpus on "<END>\n\n" → stanzas; each stanza
+-- carries <BROKEN>\n...\n<DIAG>\n...\n<FIXED>\n...\n. Returns a list of
+-- [broken, diag, fixed_baseline] string-triples.
+parse_triples_loop chunks acc =
+  if length chunks == 0 then reverse acc
+  else
+    let stanza = head chunks
+    let parsed = parse_one_stanza stanza
+    if length parsed == 0 then parse_triples_loop (tail chunks) acc
+    else parse_triples_loop (tail chunks) (cons parsed acc)
+
+parse_one_stanza s =
+  let b_off = str_find "<BROKEN>\n" s
+  if b_off < 0 then []
+  else
+    let d_off = str_find "\n<DIAG>\n" s
+    if d_off < 0 then []
+    else
+      let f_off = str_find "\n<FIXED>\n" s
+      if f_off < 0 then []
+      else
+        let broken_start = b_off + 9  -- length of "<BROKEN>\n"
+        let broken = str_sub s broken_start (d_off - broken_start)
+        let diag_start = d_off + 8  -- length of "\n<DIAG>\n"
+        let diag = str_sub s diag_start (f_off - diag_start)
+        let fixed_start = f_off + 9  -- length of "\n<FIXED>\n"
+        let total = length (chars s)
+        let fixed_baseline = str_sub s fixed_start (total - fixed_start)
+        cons broken (cons diag (cons fixed_baseline []))
+
+parse_triples corpus_text =
+  let chunks = str_split "<END>\n\n" corpus_text
+  parse_triples_loop chunks []
+
+-- ── Append a teacher-validated triple to the output file.
+emit_triple broken diag teacher_fix =
+  let triple = cat ["<BROKEN>\n", broken, "\n<DIAG>\n", diag, "\n<FIXED>\n", teacher_fix, "\n<END>\n\n"]
+  let _ = write_file "/tmp/rail_harvest_part.txt" triple
+  shell (cat ["cat /tmp/rail_harvest_part.txt >> ", output_path])
+
+-- ── Process one (broken, diag, baseline_fix) triple. Returns 1 if a
+-- new teacher triple was emitted, 0 otherwise.
+process_one broken diag baseline =
+  let teacher_fix = teacher_call (user_prompt_for broken diag)
+  let tl = length (chars teacher_fix)
+  if tl == 0 then 0
+  else if teacher_fix == baseline then 0  -- identical to mutation-undo, skip
+  else
+    let pair = diagnose_fast teacher_fix
+    let ok = head pair
+    if ok == 0 then 0  -- teacher's fix doesn't compile
+    else
+      let _ = emit_triple broken diag teacher_fix
+      1
+
+-- ── Outer harvest loop with progress + early-exit on max_count.
+harvest_loop triples idx kept rejected max_count =
+  if length triples == 0 then kept
+  else if idx >= max_count then kept
+  else
+    let triple = head triples
+    let broken = head triple
+    let diag = head (tail triple)
+    let baseline = head (tail (tail triple))
+    let got = process_one broken diag baseline
+    let new_kept = kept + got
+    let new_rejected = if got == 0 then rejected + 1 else rejected
+    let _ = if idx % 5 == 0 then
+              print (cat ["[", show idx, "/", show max_count, "] kept=", show new_kept, " rejected=", show new_rejected])
+            else 0
+    let _ = shell (cat ["echo '[", show idx, "] kept=", show new_kept, " rejected=", show new_rejected, "' >> ", log_path])
+    harvest_loop (tail triples) (idx + 1) new_kept new_rejected max_count
+
+-- The Rail magic identifier for argv is `args` (NOT `cli_args` — that
+-- was the v1 bug that defaulted max_count to 0). The builtin to_int
+-- is float→int, not string→int, so we inline parse_int_str (same
+-- shape as stdlib/socket.rail's parse_int).
+default_max_count = 200
+
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+
+parse_int_str s = parse_int_acc (chars s) 0
+
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if head xs == key then
+    if length (tail xs) > 0 then head (tail xs) else ""
+  else argv_get_loop (tail xs) key
+
+argv_get_default key dflt =
+  let v = argv_get_loop args key
+  if length (chars v) == 0 then dflt else v
+
+main =
+  let max_str = argv_get_default "--max" "200"
+  let parsed = parse_int_str max_str
+  let max_count = if parsed == 0 then default_max_count else parsed
+  let _ = print (cat ["=== harvest_teacher: read ", input_path, ", up to ", show max_count, " triples"])
+  let _ = shell (cat ["rm -f ", output_path, " ", log_path, " && touch ", output_path, " ", log_path])
+  let corpus_text = read_file input_path
+  let triples = parse_triples corpus_text
+  let _ = print (cat ["loaded ", show (length triples), " seed triples"])
+  let _ = print (cat ["teacher: ", teacher_ip, ":", teacher_port, " model=", teacher_model])
+  let kept = harvest_loop triples 0 0 0 max_count
+  let _ = print (cat ["\nharvested ", show kept, " teacher triples → ", output_path])
+  let sz = head (str_split "\n" (shell (cat ["wc -c < ", output_path])))
+  let _ = print (cat ["output size: ", sz, " chars"])
+  0

@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Plasma — live 4K (Ledatic)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="_shared/viewer.css?v=52d35266">
+<style>
+  /* Drawer-internal errlog: scrollable, dim-monospace, only visible when
+     entries exist.  iOS Safari has no devtools so this surface is the
+     only way to see WebGL fallout when something goes wrong on a phone. */
+  #errlog {
+    max-height: 32vh; overflow: auto;
+    background: rgba(40, 0, 0, 0.36);
+    border: 1px solid rgba(255, 100, 100, 0.28);
+    border-radius: var(--radius);
+    color: #ffb3b3;
+    font: 10px/1.5 'IBM Plex Mono', ui-monospace, monospace;
+    padding: 0.45rem 0.6rem;
+    white-space: pre-wrap; word-break: break-word;
+    display: none;
+  }
+  #errlog.has-entries { display: block; }
+</style>
+</head>
+<body>
+
+<div class="viewer-root" data-mode="live4k">
+  <canvas id="plasma"></canvas>
+
+  <div class="viewer-mark">
+    ledatic <span class="slash">/</span> plasma
+    <span class="sub">live · 4K · webgl2</span>
+  </div>
+
+  <div class="viewer-status">
+    <span class="dot"></span>
+    <span>pulse <span id="pulse_id"><span class="placeholder">…</span></span></span>
+  </div>
+
+  <a class="viewer-back" href="https://ledatic.org/">← ledatic.org</a>
+
+  <button class="viewer-details-btn" id="details-btn" title="Details (i)" aria-label="Details">i</button>
+
+  <nav class="viewer-modes" aria-label="Viewer mode">
+    <a href="/mobile.html" data-mode="mobile">mobile</a>
+    <a href="/live4k.html" data-mode="live4k">live4k</a>
+    <a href="/holo.html" data-mode="holo">holo</a>
+  </nav>
+</div>
+
+<div class="viewer-backdrop" id="backdrop"></div>
+<aside class="viewer-drawer" id="drawer" aria-hidden="true">
+  <button class="drawer-close" id="drawer-close">esc ✕</button>
+  <h2 class="drawer-title">ledatic <span class="accent">/</span> plasma</h2>
+
+  <div class="group">
+    <div class="group-head">Status</div>
+    <div class="row"><span class="l">timestamp</span><span class="v" id="ts"><span class="placeholder">…</span></span></div>
+    <div class="row"><span class="l">step</span><span class="v" id="step"><span class="placeholder">…</span></span></div>
+    <div class="row" style="align-items: flex-start;"><span class="l">value_hex</span></div>
+    <div class="hash" id="value_hex"><span class="placeholder">…</span></div>
+    <a class="verify-link" id="verify-link" href="https://ledatic.org/verify">verify →</a>
+  </div>
+
+  <div class="group">
+    <div class="group-head">Solver</div>
+    <p class="solver-blurb">
+      2D ideal magnetohydrodynamics — Orszag-Tang vortex on a
+      <code>128²</code> periodic grid. 6 channels f32. Mass, energy,
+      and <code>∇·B</code> conserved to machine precision.
+    </p>
+  </div>
+
+  <div class="group">
+    <div class="group-head">Renderer</div>
+    <p class="solver-blurb">
+      WebGL2 · single-pass composite fragment shader · LIC over the
+      magnetic field · vorticity hue tint · Catmull-Rom bicubic upsample
+      · ACES-ish tonemap. Render budget capped at 2560×1440 to keep the
+      GPU command queue from saturating at 4K retina.
+    </p>
+  </div>
+
+  <div class="group">
+    <div class="group-head">Diagnostics</div>
+    <div id="errlog"></div>
+  </div>
+</aside>
+
+<script>
+"use strict";
+
+// ── on-screen error log (no devtools on iOS Safari) ────────────────────────
+// Now lives inside the drawer.  Same `__live4k_err` API as before so the
+// rest of the script doesn't have to know.
+(function () {
+  const el = document.getElementById('errlog');
+  function push(prefix, msg) {
+    const line = document.createElement('div');
+    line.textContent = `[${prefix}] ${msg}`;
+    el.appendChild(line);
+    el.classList.add('has-entries');
+  }
+  window.addEventListener('error', e => {
+    push('error', (e.message || 'unknown') + (e.filename ? ` @ ${e.filename}:${e.lineno || '?'}` : ''));
+  });
+  window.addEventListener('unhandledrejection', e => {
+    push('unhandledrejection', String(e.reason && e.reason.message || e.reason || 'unknown'));
+  });
+  // Mirror console.warn/error so non-fatal issues (extension probes, fetch
+  // hiccups) surface without a dev tools tab.
+  ['warn', 'error'].forEach(level => {
+    const orig = console[level].bind(console);
+    console[level] = (...args) => {
+      try { push(level, args.map(a => typeof a === 'string' ? a : (a && a.message) || JSON.stringify(a)).join(' ')); } catch (_) {}
+      orig(...args);
+    };
+  });
+  window.__live4k_err = push;
+})();
+
+// ── beacon plumbing ────────────────────────────────────────────────────────
+//
+// Frame format (matches tools/plasma/mhd_beacon.rail):
+//   header (48 B):
+//     u32 LE  width, height, channels, step
+//     f32 LE  m0, e0, mass, energy, divb, rho_min, dt, sim_time   (8 metrics)
+//   payload: width × height × channels × f32 LE, channel-planar
+//   channels: 0=ρ  1=vx  2=vy  3=p  4=Bx  5=By
+
+const FRAME_URL = 'https://ledatic.org/entropy/frame/current';
+const PULSE_URL = 'https://ledatic.org/entropy/pulse';
+const POLL_MS   = 2000;
+
+const N = 128;
+const CH = 6;
+
+const CH_RHO = 0, CH_VX = 1, CH_VY = 2, CH_P = 3, CH_BX = 4, CH_BY = 5;
+
+// Pulse-pill error helpers — flash the BR pulse pill red on first network
+// failure, clear once a successful pulse comes back.  Complements the
+// drawer-side errlog (which logs every kind of failure once).
+function setPulseError(msg) {
+  const el = document.getElementById('pulse_id');
+  if (el) { el.textContent = msg; el.style.color = '#ff7d6b'; }
+}
+function clearPulseError() {
+  const el = document.getElementById('pulse_id');
+  if (el) el.style.color = '';
+}
+
+// ── canvas + GL setup ──────────────────────────────────────────────────────
+// Fallback to /mobile.html in three cases:
+//   1. ?nofallback=1 NOT set, AND
+//   2. We didn't already come from /mobile (avoid ping-pong), AND
+//   3. Either:
+//        a. WebGL2 context creation failed
+//        b. EXT_color_buffer_float missing
+//        c. The viewport is touch/narrow (iOS Safari WebGL2 silently
+//           produces wrong values from RGBA32F textures even when the
+//           extension reports as available — the rendering is garbage,
+//           so don't even try)
+//        d. The post-first-frame readPixels watchdog finds an all-black
+//           or near-black canvas
+const _params = new URLSearchParams(location.search);
+const _noFallback = _params.get('nofallback') === '1';
+const _cameFromMobile = (document.referrer || '').includes('/mobile');
+function _bailToMobile(why) {
+  if (_noFallback || _cameFromMobile) return false;
+  console.warn(`live4k: ${why}, redirecting to /mobile.html`);
+  location.replace('/mobile.html' + location.search + location.hash);
+  return true;
+}
+// Pre-emptive: touch devices skip live4k regardless of WebGL2 capability.
+const _isTouch = window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 768;
+if (_isTouch && _bailToMobile('touch device — WebGL2 RGBA32F renders garbled on iOS Safari')) {
+  throw new Error('redirect');
+}
+
+const canvas = document.getElementById('plasma');
+const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
+if (!gl) {
+  if (_bailToMobile('webgl2 unavailable')) throw new Error('redirect');
+  document.body.insertAdjacentHTML('beforeend',
+    '<div style="position:fixed;inset:0;display:grid;place-items:center;color:#f88;font:14px/1.6 sans-serif;text-align:center;padding:2rem;">WebGL2 unavailable. Try a current Chrome / Safari / Firefox, or <a href="/mobile.html" style="color:#86c5ff">use the Canvas 2D viewer</a>.</div>');
+  throw new Error('no webgl2');
+}
+const ext_filter = gl.getExtension('OES_texture_float_linear');
+const ext_buffer = gl.getExtension('EXT_color_buffer_float');
+window.__live4k_err && window.__live4k_err('gl', `OES_texture_float_linear: ${!!ext_filter}, EXT_color_buffer_float: ${!!ext_buffer}, vendor: ${gl.getParameter(gl.VENDOR)}, renderer: ${gl.getParameter(gl.RENDERER)}`);
+if (!ext_buffer) {
+  if (_bailToMobile('EXT_color_buffer_float missing')) throw new Error('redirect');
+  window.__live4k_err && window.__live4k_err('gl', 'EXT_color_buffer_float MISSING — float framebuffers unavailable. Frames will not render. <a href="/mobile.html">Try /mobile.html</a>.');
+}
+
+// Hard pixel ceiling on render resolution. The LIC fragment shader does
+// ~150 texture fetches per pixel; uncapped 4K @ retina (8K × 4K internal,
+// 32M px) overdrives the GPU command queue faster than it can drain,
+// which manifests as the OS slowing to a crawl while the browser process
+// balloons. Cap effective resolution to ~3.7M px (2560 × 1440 maximum).
+const MAX_PX     = 2560 * 1440;
+const MAX_DPR    = 1.5;
+function resize() {
+  const dpr0 = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+  let w = Math.floor(window.innerWidth  * dpr0);
+  let h = Math.floor(window.innerHeight * dpr0);
+  const px = w * h;
+  if (px > MAX_PX) {
+    const s = Math.sqrt(MAX_PX / px);
+    w = Math.floor(w * s);
+    h = Math.floor(h * s);
+  }
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+  }
+  gl.viewport(0, 0, w, h);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ── shader compile helpers ─────────────────────────────────────────────────
+function sh(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s)); console.error(src);
+    throw new Error('shader compile');
+  }
+  return s;
+}
+function prog(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(p));
+    throw new Error('program link');
+  }
+  return p;
+}
+
+const VS = `#version 300 es
+precision highp float;
+out vec2 uv;
+void main() {
+  vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0,
+                (gl_VertexID == 2) ? 3.0 : -1.0);
+  uv = p * 0.5 + 0.5;
+  gl_Position = vec4(p, 0.0, 1.0);
+}`;
+
+// Single composite fragment shader: bicubic-ish sampling of state, LIC over
+// the B field, vorticity tint from velocity, soft glow on pressure.
+//
+// state0: RGBA32F  -> (rho, vx, vy, p)
+// state1: RG32F    -> (Bx, By)
+// noise:  R8       -> 256x256 hash noise for LIC
+const FS = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+in vec2 uv;
+out vec4 frag;
+
+uniform sampler2D state0;       // ρ, vx, vy, p   (CURRENT pulse)
+uniform sampler2D state1;       // Bx, By         (CURRENT pulse)
+uniform sampler2D state0_prev;  // ρ, vx, vy, p   (PREVIOUS pulse)
+uniform sampler2D state1_prev;  // Bx, By         (PREVIOUS pulse)
+uniform sampler2D noise;
+uniform float u_time;
+uniform float u_alpha;          // 0..1 interp between prev & current frame
+uniform vec2 u_res;
+uniform float u_lic_len;        // LIC integration length in cells
+
+// Manual periodic bilinear via texelFetch — independent of the
+// OES_texture_float_linear extension (Safari silently nearest-samples
+// float textures even when LINEAR is set).
+ivec2 wrapPx(ivec2 p, ivec2 sz) {
+  return ivec2(mod(vec2(p) + vec2(sz) * 64.0, vec2(sz)));
+}
+vec4 sampleBL(sampler2D t, vec2 uv0) {
+  ivec2 sz = textureSize(t, 0);
+  vec2 px  = uv0 * vec2(sz) - 0.5;
+  ivec2 i  = ivec2(floor(px));
+  vec2  f  = px - vec2(i);
+  vec4 a = texelFetch(t, wrapPx(i,                 sz), 0);
+  vec4 b = texelFetch(t, wrapPx(i + ivec2(1, 0),   sz), 0);
+  vec4 c = texelFetch(t, wrapPx(i + ivec2(0, 1),   sz), 0);
+  vec4 d = texelFetch(t, wrapPx(i + ivec2(1, 1),   sz), 0);
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// Smooth alpha curve so transitions at pulse boundaries don't tick.
+float alphaSmooth(float a) {
+  return a * a * (3.0 - 2.0 * a);  // smoothstep
+}
+
+// Temporally-interpolated state lookups: blend prev pulse → current pulse.
+vec4 stateA(vec2 uvc) {
+  float a = alphaSmooth(clamp(u_alpha, 0.0, 1.0));
+  return mix(sampleBL(state0_prev, uvc), sampleBL(state0, uvc), a);
+}
+vec4 stateB(vec2 uvc) {
+  float a = alphaSmooth(clamp(u_alpha, 0.0, 1.0));
+  return mix(sampleBL(state1_prev, uvc), sampleBL(state1, uvc), a);
+}
+
+// Catmull-Rom bicubic via 16 texelFetches — used for the *final* composite
+// state lookups so the upsample is genuinely crisp at 4K.  LIC and finite
+// differences use sampleBL for speed.
+float crKernel(float x) {
+  x = abs(x);
+  if (x < 1.0) return 1.5*x*x*x - 2.5*x*x + 1.0;
+  if (x < 2.0) return -0.5*x*x*x + 2.5*x*x - 4.0*x + 2.0;
+  return 0.0;
+}
+vec4 sampleCR(sampler2D t, vec2 uv0) {
+  ivec2 sz = textureSize(t, 0);
+  vec2 px  = uv0 * vec2(sz) - 0.5;
+  ivec2 i  = ivec2(floor(px));
+  vec2  f  = px - vec2(i);
+  vec4 acc = vec4(0.0);
+  float wsum = 0.0;
+  for (int dy = -1; dy <= 2; dy++) {
+    float wy = crKernel(float(dy) - f.y);
+    for (int dx = -1; dx <= 2; dx++) {
+      float wx = crKernel(float(dx) - f.x);
+      float w = wx * wy;
+      acc  += texelFetch(t, wrapPx(i + ivec2(dx, dy), sz), 0) * w;
+      wsum += w;
+    }
+  }
+  return acc / max(wsum, 1e-5);
+}
+
+// LIC: integrate along the B field (with velocity fallback when |B| is small),
+// accumulating noise samples. Striated result aligned with the magnetic field.
+float lic(vec2 uv0) {
+  vec2 size = vec2(textureSize(state1, 0));
+  vec2 step = 1.0 / size;
+  float sum = 0.0;
+  float wsum = 0.0;
+  for (int dir = 0; dir < 2; dir++) {
+    vec2 p = uv0;
+    float sgn = (dir == 0) ? 1.0 : -1.0;
+    for (int i = 0; i < 12; i++) {
+      vec2 b = stateB(p).rg;
+      float bm = length(b);
+      // Velocity fallback so quiescent regions still show flow texture.
+      vec2 v = stateA(p).gb;
+      float vm = length(v);
+      vec2 d  = (bm > 0.05) ? (b / bm) : (vm > 1e-4 ? v / vm : vec2(1.0, 0.0));
+      p += sgn * d * step * (u_lic_len / 12.0);
+      p = fract(p);
+      float w = 1.0 - float(i) / 12.0;
+      vec2 np = p * vec2(textureSize(noise, 0)) / 256.0
+              + vec2(u_time * 0.04, -u_time * 0.03) * sgn;
+      sum  += texture(noise, fract(np)).r * w;
+      wsum += w;
+    }
+  }
+  // Re-center and stretch so strands have real contrast.
+  float v = sum / max(wsum, 1.0);
+  return clamp((v - 0.45) * 2.6 + 0.5, 0.0, 1.0);
+}
+
+// Vorticity = ∂vy/∂x - ∂vx/∂y, finite-differenced from the velocity texture.
+float vorticity(vec2 uv0) {
+  vec2 size = vec2(textureSize(state0, 0));
+  vec2 d = 1.0 / size;
+  float vy_xp = stateA(uv0 + vec2(d.x, 0.0)).z;
+  float vy_xm = stateA(uv0 - vec2(d.x, 0.0)).z;
+  float vx_yp = stateA(uv0 + vec2(0.0, d.y)).y;
+  float vx_ym = stateA(uv0 - vec2(0.0, d.y)).y;
+  return 0.5 * ((vy_xp - vy_xm) - (vx_yp - vx_ym));
+}
+
+// |∇ρ| schlieren: emphasizes shocks and contact discontinuities.
+float schlieren(vec2 uv0) {
+  vec2 size = vec2(textureSize(state0, 0));
+  vec2 d = 1.0 / size;
+  float r_xp = stateA(uv0 + vec2(d.x, 0.0)).x;
+  float r_xm = stateA(uv0 - vec2(d.x, 0.0)).x;
+  float r_yp = stateA(uv0 + vec2(0.0, d.y)).x;
+  float r_ym = stateA(uv0 - vec2(0.0, d.y)).x;
+  return length(vec2(r_xp - r_xm, r_yp - r_ym)) * 0.5;
+}
+
+vec3 hsv2rgb(vec3 c) {
+  vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+void main() {
+  // Square the simulation onto the canvas: pick the smaller axis, periodic-tile.
+  vec2 res = u_res;
+  float scale = min(res.x, res.y);
+  vec2 c = (gl_FragCoord.xy - 0.5 * res) / scale;   // -0.5..0.5 on shorter axis
+  vec2 uvc = fract(c + 0.5);                          // periodic tiling
+
+  vec4 s0 = stateA(uvc);
+  vec2 b  = stateB(uvc).rg;
+  float rho = s0.r;
+  float p = s0.a;
+
+  // S-curve density so blacks crush and highs pop.
+  float Lrho = smoothstep(0.15, 1.55, rho);
+  Lrho = pow(Lrho, 0.85);
+
+  // LIC strands — high contrast, slightly biased dark so strands read white.
+  float l = lic(uvc);
+  l = clamp((l - 0.40) * 3.0, 0.0, 1.0);
+  l = pow(l, 1.3);
+
+  // Vorticity → hue: cyan for CCW, magenta/orange for CW.
+  float w = vorticity(uvc);
+  float hue = 0.55 - clamp(w * 14.0, -0.36, 0.36);
+  float sat = 0.92;
+  vec3  tint = hsv2rgb(vec3(hue, sat, 1.0));
+
+  // Schlieren — shock-front edges.
+  float sch = schlieren(uvc);
+  sch = clamp(pow(sch * 32.0, 0.7), 0.0, 1.0);
+
+  // Magnetic-energy glow.
+  float bm = length(b);
+  float bglow = clamp(bm * 0.55, 0.0, 1.2);
+
+  // Pressure → bloom.
+  float bloom = clamp(p * 0.40, 0.0, 1.4);
+
+  // Composite — base is dark, strands are bright, schlieren is sharp.
+  vec3 base   = tint * Lrho * 0.75 + vec3(0.015, 0.020, 0.045);
+  vec3 strand = mix(vec3(1.00, 1.00, 1.10), tint, 0.55) * l * 1.30;
+  vec3 edges  = vec3(1.35, 0.85, 0.40) * sch * 0.75;
+  vec3 mag    = vec3(0.30, 0.65, 1.35) * bglow * 0.55;
+  vec3 glow   = tint * bloom * 0.40;
+  vec3 col = base + strand + edges + mag + glow;
+
+  // Vignette.
+  float r2 = dot(c, c);
+  col *= 1.0 - 0.20 * smoothstep(0.30, 0.85, r2);
+
+  // ACES-ish tone-map with key-light pre-gain.
+  col *= 1.45;
+  col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);
+  col = clamp(col, 0.0, 1.0);
+
+  // Saturation boost in linear-ish space: pull every pixel away from gray.
+  float lum = dot(col, vec3(0.299, 0.587, 0.114));
+  col = mix(vec3(lum), col, 1.45);
+
+  // Mild gamma sharpen so strands have bite.
+  col = pow(max(col, 0.0), vec3(0.88));
+
+  frag = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
+
+const program = prog(VS, FS);
+gl.useProgram(program);
+const u_state0      = gl.getUniformLocation(program, 'state0');
+const u_state1      = gl.getUniformLocation(program, 'state1');
+const u_state0_prev = gl.getUniformLocation(program, 'state0_prev');
+const u_state1_prev = gl.getUniformLocation(program, 'state1_prev');
+const u_noise       = gl.getUniformLocation(program, 'noise');
+const u_time        = gl.getUniformLocation(program, 'u_time');
+const u_alpha       = gl.getUniformLocation(program, 'u_alpha');
+const u_res         = gl.getUniformLocation(program, 'u_res');
+const u_lic         = gl.getUniformLocation(program, 'u_lic_len');
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+// ── textures ───────────────────────────────────────────────────────────────
+function makeTex(internalFmt, fmt, type, w, h, data, filter = gl.LINEAR) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internalFmt, w, h, 0, fmt, type, data);
+  return t;
+}
+
+// Two snapshots per state pack so we can interpolate between pulses.
+let state0_cur  = makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, N, N, null);
+let state1_cur  = makeTex(gl.RG32F,   gl.RG,   gl.FLOAT, N, N, null);
+let state0_prev = makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, N, N, null);
+let state1_prev = makeTex(gl.RG32F,   gl.RG,   gl.FLOAT, N, N, null);
+
+// hash noise for LIC
+const NSZ = 256;
+const noiseData = new Uint8Array(NSZ * NSZ);
+for (let i = 0; i < noiseData.length; i++) {
+  // value-noise-ish: low-frequency variation gives field-line continuity
+  let x = i % NSZ, y = (i / NSZ) | 0;
+  let v = 0;
+  for (let o = 0; o < 3; o++) {
+    const s = 1 << o;
+    const h = Math.sin((x * s) * 12.9898 + (y * s) * 78.233) * 43758.5453;
+    v += (h - Math.floor(h)) / (1 << o);
+  }
+  noiseData[i] = Math.max(0, Math.min(255, (v / 1.75) * 255));
+}
+const noise_tex = makeTex(gl.R8, gl.RED, gl.UNSIGNED_BYTE, NSZ, NSZ, noiseData);
+
+// ── frame parsing & upload ─────────────────────────────────────────────────
+//
+// Beacon writes channel-planar f32. We split into:
+//   state0: interleaved RGBA = (ρ, vx, vy, p)   per pixel
+//   state1: interleaved RG   = (Bx, By)         per pixel
+
+const state0Buf = new Float32Array(N * N * 4);
+const state1Buf = new Float32Array(N * N * 2);
+
+// Counters used by the silent-render watchdog in frame() — set early
+// so the closure in the render loop sees them.
+let _blackCheckDone  = false;
+let _seenFrameCount  = 0;
+
+function uploadFrame(buf) {
+  const dv = new DataView(buf);
+  const w  = dv.getUint32(0, true);
+  const h  = dv.getUint32(4, true);
+  const c  = dv.getUint32(8, true);
+  const step = dv.getUint32(12, true);
+  if (w !== N || h !== N || c !== CH) {
+    console.warn('frame shape mismatch', w, h, c); return null;
+  }
+  const metrics = [];
+  for (let i = 0; i < 8; i++) metrics.push(dv.getFloat32(16 + i * 4, true));
+
+  const planeSz = N * N;
+  const dataOff = 48;           // 16-byte u32 header + 32-byte metrics
+  const f32 = new Float32Array(buf, dataOff, planeSz * c);
+
+  // Reinterleave channel-planar -> per-pixel RGBA + RG.
+  for (let i = 0; i < planeSz; i++) {
+    state0Buf[i * 4 + 0] = f32[CH_RHO * planeSz + i];
+    state0Buf[i * 4 + 1] = f32[CH_VX  * planeSz + i];
+    state0Buf[i * 4 + 2] = f32[CH_VY  * planeSz + i];
+    state0Buf[i * 4 + 3] = f32[CH_P   * planeSz + i];
+    state1Buf[i * 2 + 0] = f32[CH_BX  * planeSz + i];
+    state1Buf[i * 2 + 1] = f32[CH_BY  * planeSz + i];
+  }
+
+  // Rotate: previous current becomes prev; new data goes into current.
+  [state0_prev, state0_cur] = [state0_cur, state0_prev];
+  [state1_prev, state1_cur] = [state1_cur, state1_prev];
+
+  gl.bindTexture(gl.TEXTURE_2D, state0_cur);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, N, N, gl.RGBA, gl.FLOAT, state0Buf);
+  gl.bindTexture(gl.TEXTURE_2D, state1_cur);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, N, N, gl.RG,   gl.FLOAT, state1Buf);
+
+  // First-pulse ghost fix: on the very first frame, prev still holds the
+  // zero-init blank.  Pre-seed prev with the same data so the initial 2-second
+  // fade-in doesn't blend FROM BLACK.
+  if (firstPulse) {
+    gl.bindTexture(gl.TEXTURE_2D, state0_prev);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, N, N, gl.RGBA, gl.FLOAT, state0Buf);
+    gl.bindTexture(gl.TEXTURE_2D, state1_prev);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, N, N, gl.RG,   gl.FLOAT, state1Buf);
+    firstPulse = false;
+  }
+
+  lastPulseT = performance.now();
+  _seenFrameCount++;
+  return { w, h, c, step, metrics };
+}
+
+let firstPulse = true;
+let lastPulseT = performance.now();
+
+// Gate fetches on prior completion so slow networks / paused Mini can't
+// pile up in-flight ArrayBuffers (each ~393KB) and leak memory over time.
+let frameInflight = false;
+let pulseInflight = false;
+let lastSeenPulseId = -1;
+
+// First-failure logger — only reports the FIRST instance of each kind so
+// we don't spam the on-screen log on persistent network failures.
+const _firstSeen = new Set();
+function _logFirst(kind, msg) {
+  if (_firstSeen.has(kind)) return;
+  _firstSeen.add(kind);
+  window.__live4k_err && window.__live4k_err(kind, msg);
+}
+
+async function pollFrame() {
+  if (frameInflight) return;
+  frameInflight = true;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), POLL_MS * 2);
+  try {
+    const r = await fetch(FRAME_URL + '?t=' + Date.now(),
+      { cache: 'no-store', signal: ctrl.signal });
+    if (!r.ok) {
+      _logFirst('frame-http', `frame fetch returned ${r.status}`);
+      return;
+    }
+    const buf = await r.arrayBuffer();
+    if (buf.byteLength < 100) {
+      _logFirst('frame-short', `frame buffer suspiciously short: ${buf.byteLength} B`);
+      return;
+    }
+    const meta = uploadFrame(buf);
+    if (meta) document.getElementById('step').textContent = meta.step;
+    else _logFirst('frame-bad', `uploadFrame returned null (shape mismatch?)`);
+  } catch (e) { _logFirst('frame-throw', e.message || String(e)); }
+  finally { clearTimeout(timer); frameInflight = false; }
+}
+
+async function pollPulseGated() {
+  if (pulseInflight) return;
+  pulseInflight = true;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), POLL_MS * 2);
+  try {
+    const r = await fetch(PULSE_URL + '?t=' + Date.now(),
+      { cache: 'no-store', signal: ctrl.signal });
+    if (!r.ok) {
+      _logFirst('pulse-http', `pulse fetch returned ${r.status}`);
+      setPulseError(`pulse ${r.status}`);
+      return;
+    }
+    const j = await r.json();
+    if (j.pulse_id === lastSeenPulseId) { clearPulseError(); return; }
+    lastSeenPulseId = j.pulse_id;
+    clearPulseError();
+    document.getElementById('pulse_id').textContent  = j.pulse_id;
+    document.getElementById('ts').textContent        = j.timestamp_utc;
+    if (j.value_hex) {
+      document.getElementById('value_hex').textContent = j.value_hex;
+      document.getElementById('verify-link').href = '/verify/' + j.value_hex;
+    }
+  } catch (e) {
+    _logFirst('pulse-throw', e.message || String(e));
+    setPulseError(e.message || String(e));
+  }
+  finally { clearTimeout(timer); pulseInflight = false; }
+}
+
+// Pause polling when tab is hidden — no point burning bandwidth + memory
+// when nothing is being drawn (RAF naturally throttles in background tabs).
+let pulseTimer = null, frameTimer = null;
+function startPolling() {
+  if (!pulseTimer) pulseTimer = setInterval(pollPulseGated, POLL_MS);
+  if (!frameTimer) frameTimer = setInterval(pollFrame,      POLL_MS);
+}
+function stopPolling() {
+  clearInterval(pulseTimer); pulseTimer = null;
+  clearInterval(frameTimer); frameTimer = null;
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopPolling(); else { startPolling(); pollPulseGated(); pollFrame(); }
+});
+startPolling();
+pollPulseGated(); pollFrame();
+
+// ── render loop ────────────────────────────────────────────────────────────
+gl.uniform1i(u_state0,      0);
+gl.uniform1i(u_state1,      1);
+gl.uniform1i(u_state0_prev, 2);
+gl.uniform1i(u_state1_prev, 3);
+gl.uniform1i(u_noise,       4);
+gl.uniform1f(u_lic, 22.0);
+
+const t0 = performance.now();
+const PULSE_PERIOD_MS = 2000;
+// Frame-pacing safeguard: if the last draw took longer than this budget,
+// skip the next RAF tick.  Prevents the browser from queueing GL commands
+// faster than the GPU can drain (which is what locked the machine earlier).
+const FRAME_BUDGET_MS = 24;
+let lastDrawDuration = 0;
+let lastDrawEnd = 0;
+function frame() {
+  const tickStart = performance.now();
+  // If we're still catching up from a slow previous draw, yield this tick.
+  if (tickStart - lastDrawEnd < lastDrawDuration * 0.5 &&
+      lastDrawDuration > FRAME_BUDGET_MS) {
+    requestAnimationFrame(frame);
+    return;
+  }
+  const t = (tickStart - t0) / 1000.0;
+  const alpha = Math.min(1.0, (tickStart - lastPulseT) / PULSE_PERIOD_MS);
+  gl.uniform1f(u_time,  t);
+  gl.uniform1f(u_alpha, alpha);
+  gl.uniform2f(u_res, canvas.width, canvas.height);
+
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, state0_cur);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, state1_cur);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, state0_prev);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, state1_prev);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, noise_tex);
+
+  gl.bindVertexArray(vao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  // Force the GPU to flush + measure roundtrip; if it grows, we know to
+  // slow down next tick.  finish() blocks until the GPU drains.
+  gl.flush();
+  lastDrawEnd = performance.now();
+  lastDrawDuration = lastDrawEnd - tickStart;
+
+  // Silent-rendering detector: iOS Safari WebGL2 sometimes accepts our
+  // RGBA32F state textures + compiles + links the shader, but produces
+  // an all-black canvas because the float texture's filter quietly
+  // returns zero.  After we've seen at least one beacon frame, sample
+  // the canvas and bail to /mobile.html if everything is still black.
+  if (!_blackCheckDone && _seenFrameCount >= 1) {
+    _blackCheckDone = true;
+    try {
+      const px = new Uint8Array(4);
+      gl.readPixels(canvas.width >> 1, canvas.height >> 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      const lum = px[0] + px[1] + px[2];
+      window.__live4k_err && window.__live4k_err('render-check', `center pixel rgba=(${px[0]},${px[1]},${px[2]},${px[3]}) lum=${lum}`);
+      if (lum < 6 && !_noFallback && !_cameFromMobile) {
+        window.__live4k_err && window.__live4k_err('render-check', 'silent black render — bailing to /mobile.html');
+        location.replace('/mobile.html' + location.search + location.hash);
+        return;
+      }
+    } catch (e) {
+      window.__live4k_err && window.__live4k_err('render-check', 'readPixels threw: ' + (e.message || e));
+    }
+  }
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ── drawer toggle ───────────────────────────────────────────────────
+// `i` / `?` opens, `esc` and click-outside close. Skip when typing.
+const drawer   = document.getElementById('drawer');
+const backdrop = document.getElementById('backdrop');
+const detailsBtn = document.getElementById('details-btn');
+const closeBtn = document.getElementById('drawer-close');
+
+function openDrawer() {
+  drawer.classList.add('open');
+  backdrop.classList.add('open');
+  drawer.setAttribute('aria-hidden', 'false');
+}
+function closeDrawer() {
+  drawer.classList.remove('open');
+  backdrop.classList.remove('open');
+  drawer.setAttribute('aria-hidden', 'true');
+}
+function toggleDrawer() {
+  drawer.classList.contains('open') ? closeDrawer() : openDrawer();
+}
+
+detailsBtn.addEventListener('click', toggleDrawer);
+closeBtn.addEventListener('click', closeDrawer);
+backdrop.addEventListener('click', closeDrawer);
+window.addEventListener('keydown', (e) => {
+  if (e.target.matches && e.target.matches('input, textarea')) return;
+  if (e.key === 'Escape') { closeDrawer(); return; }
+  if ((e.key === 'i' || e.key === '?') && !e.metaKey && !e.ctrlKey) {
+    e.preventDefault();
+    toggleDrawer();
+  }
+});
+
+// Highlight the current viewer mode in the bottom navigation pill.
+(function () {
+  const path = location.pathname;
+  let mode = null;
+  if (path.endsWith('/mobile.html')  || path === '/mobile')  mode = 'mobile';
+  else if (path.endsWith('/live4k.html') || path === '/live4k') mode = 'live4k';
+  else if (path.endsWith('/holo.html')   || path === '/holo')   mode = 'holo';
+  if (!mode) return;
+  for (const a of document.querySelectorAll('.viewer-modes a')) {
+    if (a.dataset.mode === mode) a.classList.add('active');
+  }
+})();
+</script>
+</body>
+</html>

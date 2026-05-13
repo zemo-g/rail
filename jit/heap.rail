@@ -1,0 +1,58 @@
+-- jit/heap.rail — bump-pointer heap + output capture buffer.
+--
+-- A separate mmap'd RW page (NOT the JIT code page). Three metadata cells
+-- live at the start of the page; cons cells start past a fixed-size
+-- output region.
+--
+-- Layout (P4-extended; in the 64 KB mmap'd page; real address = R):
+--   R + 0..7      : bump pointer for cons cells (real addr; advances)
+--   R + 8..15     : output cursor for op_print_*  (real addr; advances)
+--   R + 16..23    : reserved (alignment / future)
+--   R + 24..31    : absolute address of jit_print_float (set at heap_alloc)
+--   R + 32..16415 : output buffer (~16 KB; first byte = R+32)
+--   R + 16416..   : cons cell area (~48 KB ≈ 3070 cells)
+--
+-- Initial values written by heap_alloc:
+--   bump   = R + 16416
+--   cursor = R + 32
+--   [R+24] = jit_print_float (absolute, dlsym-equivalent via the trampoline
+--            getter foreign declared in ffi.rail)
+--
+-- ABI v2 prologue captures heap_addr as x27 = R (via pthread_create's
+-- arg slot). op_cons reads/writes [x27, #0]. op_print_int / op_print_str
+-- load/store the output cursor at [x27, #8] and append bytes between
+-- cursor and base. op_print_float reads the function-pointer at [x27, #24]
+-- and `blr`s through it (passing d0=value, x1=cursor; returns new cursor in x0).
+--
+-- Public API:
+--   heap_alloc 0        -> ptr (heap base)
+--   heap_free h         -> 0
+--   read_jit_output h   -> Rail string (in jit/loader.rail)
+--
+-- This file is the CANONICAL importer for stdlib/mmap.rail and jit/ffi.rail.
+-- Other files (jit/loader.rail, jit/emit.rail) DO NOT re-import them; they
+-- rely on the caller importing jit/heap.rail before them.
+
+import "stdlib/mmap.rail"
+import "jit/ffi.rail"
+
+heap_page_size = 65536    -- 64 KB
+output_cap     = 16384    -- 16 KB output region budget (cells - cursor_init)
+cells_offset   = 16416    -- bumped from 16400 in P4 (16-byte metadata extension)
+
+heap_alloc _ =
+  let p = alloc_pages heap_page_size
+  -- KEY INSIGHT: Rail represents pointers from `foreign` returns as raw
+  -- 64-bit values; `shl p 1` produces a Rail tagged-int whose raw bytes
+  -- (when written via write_u64) equal the real address R. The JIT-side
+  -- `ldr x21, [x27, #N]` reads those bytes as a real pointer.
+  let p_real = shl p 1
+  let bump_init   = p_real + 16416    -- cells start past the output buffer
+  let cursor_init = p_real + 32        -- output starts at R+32 (P4)
+  let pf_addr = jit_print_float_addr 0  -- absolute jit_print_float
+  let _ = write_u64 p 0 bump_init
+  let _ = write_u64 p 8 cursor_init
+  let _ = write_u64 p 24 pf_addr
+  p
+
+heap_free p = free_pages p heap_page_size

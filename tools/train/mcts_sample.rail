@@ -1,0 +1,179 @@
+-- tools/train/mcts_sample.rail — Tier-B1 tree-of-rollouts MCTS sampler.
+--
+-- Compile-in-the-loop best-first sampling. At each token step:
+--   1. Get top-k=4 candidate next tokens from the model.
+--   2. For each candidate, append it AND a synthetic eos suffix.
+--   3. Compile the prefix + candidate-token + eos via rail_native.
+--   4. Score: compile-pass = 1.0 · prior, compile-fail = 0.1 · prior.
+--   5. Pick highest-scored candidate; commit token; advance.
+--
+-- Cap depth at max_gen=64. Budget is ~256 compiles per sample (4 branches
+-- × 64 steps), each ~50ms = ~13 sec per sample. At N=20 rerank, that's
+-- ~4 min per prompt — acceptable since the compiler is fast enough.
+--
+-- The "synthetic eos suffix" matters: a partial program won't compile
+-- without a proper ending. We append a stage-aware suffix:
+--   - if cursor is mid-expression, suffix = " 0\n"  (force int)
+--   - if cursor is after let, suffix = " in 0\n"
+--   - if cursor is after match, suffix = " | _ -> 0\n"
+--   - else, suffix = "\n"
+-- Heuristic; suffix-correctness is checked at compile time, branches
+-- where suffix doesn't fix the program also count as compile-fail.
+--
+-- Key advantage at our scale: structurally only feasible because the
+-- Rail compiler is in-process and sub-100ms. AlphaCode-2 territory but
+-- with a 4M-param model and a 30-prompt bench.
+--
+-- Usage (called by trainer harvest pipeline):
+--   ./rail_native run tools/train/mcts_sample.rail \
+--       --prefix <ckpt> --prompt "..." --max 64 --k 4 --seed 1234
+
+import "stdlib/list.rail"
+
+cat parts = join "" parts
+
+top_k_candidates probs V k =
+  -- Walk probs once, keep top-k by reservoir-style scan.
+  let result = float_arr_new (k * 2) 0.0   -- pairs of (idx, prob)
+  let _ = init_topk result k
+  let _ = topk_loop probs result 0 V k
+  result
+
+init_topk result k =
+  init_loop result 0 k
+
+init_loop r i k =
+  if i >= k then 0
+  else
+    let _ = float_arr_set r (i * 2) (-1.0)
+    let _ = float_arr_set r (i * 2 + 1) (-1.0)
+    init_loop r (i + 1) k
+
+topk_loop probs result i V k =
+  if i >= V then 0
+  else
+    let p = float_arr_get probs i
+    let _ = maybe_insert_topk result k (int_to_float i) p
+    topk_loop probs result (i + 1) V k
+
+maybe_insert_topk result k idx p =
+  -- Find slot with smallest prob; if our p > smallest, replace.
+  let min_slot = find_min_slot result k 0 0 1.0e30
+  let cur = float_arr_get result (min_slot * 2 + 1)
+  if p > cur then
+    let _ = float_arr_set result (min_slot * 2) idx
+    let _ = float_arr_set result (min_slot * 2 + 1) p
+    1
+  else 0
+
+find_min_slot result k i best_slot best_val =
+  if i >= k then best_slot
+  else
+    let v = float_arr_get result (i * 2 + 1)
+    if v < best_val then find_min_slot result k (i + 1) i v
+    else find_min_slot result k (i + 1) best_slot best_val
+
+-- ── Synthesize a program completion from partial text + token suffix.
+-- Used to test compile-viability of each branch.
+synth_completion partial new_tok =
+  let candidate = cat [partial, new_tok]
+  let suffix = guess_suffix partial
+  cat [candidate, suffix]
+
+guess_suffix partial =
+  let trimmed = trim_right_str partial
+  let last_few = if length (chars trimmed) >= 3
+                 then str_sub trimmed (length (chars trimmed) - 3) 3
+                 else trimmed
+  if str_ends_with " in" trimmed then " 0\n"
+  else if str_ends_with " =" trimmed then " 0\n"
+  else if str_ends_with "let" trimmed then " _ = 0 in 0\n"
+  else if str_ends_with "match" trimmed then " 0 | _ -> 0\n"
+  else if str_ends_with "->" trimmed then " 0\n"
+  else "\n"
+
+trim_right_str s =
+  let cs = chars s
+  let r = trim_right_loop_local (reverse cs) []
+  join "" r
+
+trim_right_loop_local cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    if c == " " || c == "\n" || c == "\t" then trim_right_loop_local (tail cs) acc
+    else cons c (append (tail cs) acc)
+
+str_ends_with suffix s =
+  let sufx_cs = chars suffix
+  let s_cs = chars s
+  let lsx = length sufx_cs
+  let ls = length s_cs
+  if lsx > ls then false
+  else
+    let s_tail = drop_n s_cs (ls - lsx)
+    eq_chars sufx_cs s_tail
+
+drop_n xs n =
+  if n <= 0 then xs
+  else if length xs == 0 then xs
+  else drop_n (tail xs) (n - 1)
+
+eq_chars a b =
+  if length a == 0 && length b == 0 then true
+  else if length a == 0 || length b == 0 then false
+  else if head a == head b then eq_chars (tail a) (tail b)
+  else false
+
+-- ── Compile a synthesized completion; return 1 if pass, 0 if fail.
+test_compile candidate =
+  let _ = write_file "/tmp/mcts_probe.rail" candidate
+  let cmd = "./rail_native /tmp/mcts_probe.rail >/dev/null 2>&1 && echo OK || echo FAIL"
+  let result = trim (shell cmd)
+  if result == "OK" then 1 else 0
+
+trim s =
+  let cs = chars s
+  trim_simple cs []
+
+trim_simple cs acc =
+  if length cs == 0 then join "" (reverse acc)
+  else
+    let c = head cs
+    if c == " " || c == "\n" || c == "\t" || c == "\r" then trim_simple (tail cs) acc
+    else trim_simple (tail cs) (cons c acc)
+
+-- ── Score a candidate: prior × (compile_factor).
+score_candidate prior compile_pass =
+  if compile_pass == 1 then prior * 1.0
+  else prior * 0.1
+
+-- ── Select branch with highest score. NOTE: full implementation requires
+-- per-token model invocation hooks. This file is the SCAFFOLD; the actual
+-- step-wise integration goes into a forked lm_infer_cpu_mcts.rail trainer
+-- that invokes these helpers per token. Documenting interface here.
+--
+-- The forked inference would do:
+--   for each step t in 1..max_gen:
+--     probs = model_step(state, partial)
+--     candidates = top_k_candidates(probs, V, k)
+--     scores = float_arr[k]
+--     for j in 0..k:
+--       tok_idx = candidates[j*2]
+--       prior = candidates[j*2 + 1]
+--       new_tok = vocab[tok_idx]
+--       candidate_completion = synth_completion(partial, new_tok)
+--       compile_ok = test_compile(candidate_completion)
+--       scores[j] = score_candidate(prior, compile_ok)
+--     pick j with max score; commit tok_idx; partial += new_tok
+--   return partial
+--
+-- Wall-budget at max=64, k=4: 256 compile probes per sample. At ~50ms
+-- each, ~13 sec per sample. N=20 rerank ⇒ ~4 min per prompt; 30 prompts
+-- ⇒ ~2 hr per bench. Slow but tractable.
+
+main =
+  let _ = print "mcts_sample module — interface scaffold."
+  let _ = print "Integration: fork lm_infer_cpu.rail → lm_infer_cpu_mcts.rail,"
+  let _ = print "import this module, replace per-step argmax with mcts pick."
+  0

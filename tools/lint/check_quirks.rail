@@ -1,0 +1,471 @@
+-- tools/lint/check_quirks.rail — v0 static linter for Rail dynamic-typing quirks
+--
+-- Heuristic / regex-style linter. Does NOT replace HM inference (deferred).
+-- Detects three known compile.rail-era hazards documented in user memory:
+--
+--   Q001 — Heterogeneous numeric literal list (mixes int and float literals)
+--   Q002 — High-arity helper (>10 params; compile.rail has known issues)
+--   Q003 — Cross-function float return not wrapped at call site with "0.0 +"
+--
+-- Usage:
+--   ./rail_native run tools/lint/check_quirks.rail -- <file.rail>
+--   Exit 0 if no warnings; exit 1 otherwise.
+--
+-- Output format:
+--   <file>:<line>: warning: <code> <message>
+
+-- ── Char predicates (avoid char_to_int — direct compare per repo convention) ─
+
+digits_l = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+alpha_lower_l = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"]
+alpha_upper_l = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+
+-- Fast nil-check that avoids the O(n) `length lst == 0` walk. Rail
+-- returns int 0 from `head []`; for char-lists every real char is a
+-- string-tagged value, so `head xs == 0` is true iff xs is nil.
+-- (Only valid for lists whose elements are NEVER the literal int 0.)
+is_nil_chars cs = head cs == 0
+
+has_c item lst =
+  if length lst == 0 then false
+  else if head lst == item then true
+  else has_c item (tail lst)
+
+is_dig c = has_c c digits_l
+is_alpha_c c = has_c c alpha_lower_l || has_c c alpha_upper_l || c == "_"
+is_alnum_c c = is_dig c || is_alpha_c c
+is_id_char c = is_alnum_c c
+
+-- ── Comment / string stripping ──────────────────────────────────────────────
+-- Strip Rail "-- ..." line comments and quoted strings so we don't pattern
+-- match inside them. Returns a "cleaned" line where comments/strings become
+-- blanks. Crude but adequate for v0.
+
+-- Walk chars once, accumulating into a reversed list of chars. At end,
+-- reverse and concat. This is O(n) per line vs O(n²) with repeated append.
+strip_line_acc cs acc in_str =
+  if is_nil_chars cs then acc
+  else
+    let c = head cs
+    let rest = tail cs
+    if in_str then
+      if c == "\"" then strip_line_acc rest (cons " " acc) false
+      else if c == "\\" && (not (is_nil_chars rest)) then
+        strip_line_acc (tail rest) (cons " " (cons " " acc)) true
+      else strip_line_acc rest (cons " " acc) true
+    else if c == "\"" then strip_line_acc rest (cons " " acc) true
+    else if c == "-" && (not (is_nil_chars rest)) && head rest == "-" then
+      -- rest of line is a comment
+      acc
+    else strip_line_acc rest (cons c acc) false
+
+reverse_list lst = reverse_acc lst []
+reverse_acc lst acc =
+  if length lst == 0 then acc
+  else reverse_acc (tail lst) (cons (head lst) acc)
+
+list_to_str lst = join "" lst
+
+strip_line s =
+  let rev_chars = strip_line_acc (chars s) [] false
+  list_to_str (reverse_list rev_chars)
+
+-- ── Tokenization helpers ────────────────────────────────────────────────────
+
+-- Read a number literal starting at cs. Returns (kind, rest) where
+-- kind = "int" if no dot, "float" if a dot follows int digits.
+read_number_kind cs has_dot =
+  if is_nil_chars cs then (if has_dot then "float" else "int", cs)
+  else
+    let c = head cs
+    if is_dig c then read_number_kind (tail cs) has_dot
+    else if c == "." && (not (is_nil_chars (tail cs))) && is_dig (head (tail cs)) then
+      read_number_kind (tail (tail cs)) true
+    else (if has_dot then "float" else "int", cs)
+
+-- Read an identifier; returns (name, rest). Uses reversed-list accumulator
+-- to avoid quadratic append.
+read_id_acc cs acc =
+  if is_nil_chars cs then (list_to_str (reverse_list acc), cs)
+  else
+    let c = head cs
+    if is_id_char c then read_id_acc (tail cs) (cons c acc)
+    else (list_to_str (reverse_list acc), cs)
+
+read_id cs = read_id_acc cs []
+
+-- ── Q001: Heterogeneous numeric literal list ────────────────────────────────
+-- Scan from each '[' until the matching ']' (no nesting tracking — v0 takes
+-- the first ']' on the same line, which is fine for literal lists). Inside,
+-- collect numeric-literal kinds and warn if both int and float appear.
+-- Skip '[' that is preceded by an identifier char (likely indexing, though
+-- Rail doesn't have arr[i] syntax; still cheap to guard).
+
+q001_scan_list cs saw_int saw_float =
+  if is_nil_chars cs then (saw_int, saw_float, cs)
+  else
+    let c = head cs
+    if c == "]" then (saw_int, saw_float, tail cs)
+    else if c == "[" then
+      -- nested — bail out (let outer call retry from inside)
+      (saw_int, saw_float, cs)
+    else if is_dig c then
+      let (kind, rest) = read_number_kind cs false
+      if kind == "float" then q001_scan_list rest saw_int true
+      else q001_scan_list rest true saw_float
+    else if c == "-" && (not (is_nil_chars (tail cs))) && is_dig (head (tail cs)) then
+      let (kind, rest) = read_number_kind (tail cs) false
+      if kind == "float" then q001_scan_list rest saw_int true
+      else q001_scan_list rest true saw_float
+    else if is_alpha_c c then
+      -- skip identifier (e.g., variable in list — not a literal so doesn't
+      -- contribute to het-detection; but a var could be a float, so this
+      -- check has false negatives — documented in README)
+      let (_, rest) = read_id cs
+      q001_scan_list rest saw_int saw_float
+    else q001_scan_list (tail cs) saw_int saw_float
+
+-- Scan a cleaned line for '[' starts and check each for hetero literals.
+q001_scan_line cs found =
+  if is_nil_chars cs then found
+  else
+    let c = head cs
+    if c == "[" then
+      let (si, sf, rest) = q001_scan_list (tail cs) false false
+      if si && sf then q001_scan_line rest true
+      else q001_scan_line rest found
+    else q001_scan_line (tail cs) found
+
+check_q001 cleaned_line =
+  q001_scan_line (chars cleaned_line) false
+
+-- ── Q002: High-arity helper (>10 params on the LHS) ─────────────────────────
+-- Rail syntax: `name p1 p2 p3 ... = body`. Count the tokens between name and
+-- the first top-level '=' (not '==', not after a '|'). Also catch the literal
+-- "fn name(...)" form even though Rail doesn't natively use it — the spec
+-- asks for it.
+
+-- Count space-separated identifier tokens before '='. cs is chars of cleaned
+-- line. Returns -1 if no top-level '=' found (i.e., not a fn def line).
+q002_count_params cs n =
+  if is_nil_chars cs then -1
+  else
+    let c = head cs
+    let rest = tail cs
+    if c == "=" then
+      -- Make sure it's not ==
+      if (not (is_nil_chars rest)) && head rest == "=" then q002_count_params (tail rest) n
+      else n
+    else if c == "|" then -1  -- pattern-match branch, not a fn def
+    else if is_alpha_c c then
+      let (_, after_id) = read_id cs
+      q002_count_params after_id (n + 1)
+    else q002_count_params rest n
+
+-- Detect param-list line; tokens = name + N params, so warn when tokens > 11.
+check_q002_rail_style cleaned_line =
+  -- Only consider lines starting (after leading ws) with an identifier
+  let trimmed = ltrim_acc (chars cleaned_line)
+  if is_nil_chars trimmed then false
+  else if is_alpha_c (head trimmed) then
+    let count = q002_count_params trimmed 0
+    -- name itself counted as a "param"; subtract 1
+    count > 10
+  else false
+
+ltrim_acc cs =
+  if is_nil_chars cs then cs
+  else if head cs == " " || head cs == "\t" then ltrim_acc (tail cs)
+  else cs
+
+-- Q002 also detect literal `fn name(p1, p2, ...)` — count commas inside.
+-- Returns true if 10+ params (>9 commas inside the paren group).
+q002_fn_style line =
+  let cs = chars line
+  q002_fn_scan cs
+
+q002_fn_prefix_at cs =
+  if is_nil_chars cs then false
+  else if head cs == "f" then
+    let r1 = tail cs
+    if (not (is_nil_chars r1)) && head r1 == "n" then
+      let r2 = tail r1
+      if (not (is_nil_chars r2)) && head r2 == " " then true
+      else false
+    else false
+  else false
+
+q002_fn_scan cs =
+  if is_nil_chars cs then false
+  else if q002_fn_prefix_at cs then
+    -- found "fn ", scan to '(' then count commas to ')'
+    q002_fn_to_paren (tail (tail (tail cs)))
+  else q002_fn_scan (tail cs)
+
+q002_fn_to_paren cs =
+  if is_nil_chars cs then false
+  else if head cs == "(" then q002_fn_count_commas (tail cs) 0
+  else if head cs == "\n" then false
+  else q002_fn_to_paren (tail cs)
+
+q002_fn_count_commas cs n =
+  if is_nil_chars cs then false
+  else if head cs == ")" then n > 9
+  else if head cs == "," then q002_fn_count_commas (tail cs) (n + 1)
+  else q002_fn_count_commas (tail cs) n
+
+-- ── Q003: Float-returning fn + un-wrapped call site ─────────────────────────
+-- Heuristic two-pass:
+--   Pass 1: collect names of fns whose last non-blank line ends with a float
+--           literal or has a float operation in the body.
+--   Pass 2: scan all lines for "<name>(" or "<name> " call sites NOT preceded
+--           by "0.0 +" within ~10 chars to the left.
+
+-- Get fn name from a definition line: "name p1 p2 = body" or "name = body".
+fn_name_of_line cleaned =
+  let trimmed = ltrim_acc (chars cleaned)
+  if is_nil_chars trimmed then ""
+  else if is_alpha_c (head trimmed) then
+    let (nm, rest) = read_id trimmed
+    -- only count if there's a top-level '=' on the line
+    if q002_count_params trimmed 0 >= 1 then nm
+    else ""
+  else ""
+
+is_def_line cleaned =
+  not (is_nil_chars (chars (fn_name_of_line cleaned)))
+
+-- Detect float arith / float literal on a line. We treat ANY float literal
+-- (digit.digit) or any of fadd/fmul/fdiv/fcmp/scvtf or `0.0 +`/`+ 0.0` as
+-- a float signal. Also any function call like `sin`/`cos`/`tanh`/`sqrt`.
+has_float_signal cleaned =
+  let cs = chars cleaned
+  has_float_signal_loop cs
+
+has_float_signal_loop cs =
+  if is_nil_chars cs then false
+  else
+    let c = head cs
+    if is_dig c then
+      let (kind, rest) = read_number_kind cs false
+      if kind == "float" then true
+      else has_float_signal_loop rest
+    else if is_alpha_c c then
+      let (nm, rest) = read_id cs
+      if is_float_builtin nm then true
+      else has_float_signal_loop rest
+    else has_float_signal_loop (tail cs)
+
+is_float_builtin nm =
+  has_c nm float_builtin_names
+
+float_builtin_names = ["sin", "cos", "tanh", "sqrt", "exp", "log", "pow", "fabs", "int_to_float", "float_arr_get", "show_float"]
+
+-- Walk all lines, accumulate fn names that are float-returning.
+-- A fn def starts on a "name ... =" line; subsequent non-blank lines that
+-- are more-indented continue its body. We use a simple state: current_fn.
+
+-- Returns 1 if the def has >=1 param (i.e., is a fn, not a constant binding)
+def_has_params cleaned =
+  let trimmed = ltrim_acc (chars cleaned)
+  if is_nil_chars trimmed then false
+  else if is_alpha_c (head trimmed) then
+    q002_count_params trimmed 0 >= 2  -- name + at least 1 param
+  else false
+
+float_fns_acc lines remaining idx cur acc =
+  if remaining <= 0 then acc
+  else
+    let raw = head lines
+    let raw_len = length (chars raw)
+    if raw_len > max_line_len then
+      float_fns_acc (tail lines) (remaining - 1) (idx + 1) cur acc
+    else
+      let cleaned = strip_line raw
+      let cleaned_cs = chars cleaned
+      let is_blank = is_nil_chars cleaned_cs || (head cleaned_cs == " " && is_nil_chars (ltrim_acc cleaned_cs))
+      let zero_indent = (not (is_nil_chars cleaned_cs)) && (head cleaned_cs != " ") && (head cleaned_cs != "\t")
+      -- Treat indent==0 + def-line as a NEW fn boundary, BUT only register
+      -- defs that have at least one param (constants are not float "fns").
+      let starts_def = zero_indent && is_def_line cleaned && def_has_params cleaned
+      let new_cur = if starts_def then fn_name_of_line cleaned
+                    else if is_blank then cur
+                    else if zero_indent && is_def_line cleaned then ""  -- constant; clear cur
+                    else cur
+      -- If this line has a float signal and we're inside a fn, record cur
+      let new_acc = if (not (is_nil_chars (chars new_cur))) && has_float_signal cleaned
+                    then add_unique new_cur acc
+                    else acc
+      float_fns_acc (tail lines) (remaining - 1) (idx + 1) new_cur new_acc
+
+add_unique name lst =
+  if has_c name lst then lst else cons name lst
+
+-- Scan a line for unwrapped calls to any name in fn_set. We walk the
+-- char list once, maintaining a small "recent chars" list (reversed,
+-- max 6 chars). When we hit an identifier matching fn_set, we check if
+-- the recent-chars list matches a `0.0 +` (or `0.0+`) suffix.
+q003_scan_line_for_calls cleaned fn_set self_name =
+  let cs = chars cleaned
+  q003_scan cs [] fn_set self_name false
+
+-- recent: a reversed list of the last <=6 chars seen before current pos.
+-- recent[0] = most recent char.
+q003_scan cs recent fn_set self_name found =
+  if is_nil_chars cs then found
+  else
+    let c = head cs
+    if is_alpha_c c then
+      let (nm, rest, after_chars) = read_id_with_rest cs
+      let is_target = has_c nm fn_set && nm != self_name
+      let wrapped = recent_has_wrap recent
+      let new_recent = recent_push_chars (chars nm) recent
+      if is_target && (not wrapped) then
+        q003_scan after_chars new_recent fn_set self_name true
+      else q003_scan after_chars new_recent fn_set self_name found
+    else
+      q003_scan (tail cs) (recent_push c recent) fn_set self_name found
+
+-- read_id but also return the remaining char list (no string conversion)
+read_id_with_rest cs =
+  let (nm, after) = rid_acc cs []
+  (nm, after, after)
+
+rid_acc cs acc =
+  if is_nil_chars cs then (list_to_str (reverse_list acc), cs)
+  else if is_id_char (head cs) then rid_acc (tail cs) (cons (head cs) acc)
+  else (list_to_str (reverse_list acc), cs)
+
+-- Push a single char into the reversed recent buffer (cap at 6)
+recent_push c recent =
+  let new_list = cons c recent
+  recent_cap new_list 6
+
+recent_cap lst n =
+  if length lst <= n then lst
+  else recent_take lst n
+
+recent_take lst n =
+  if n <= 0 then []
+  else if length lst == 0 then []
+  else cons (head lst) (recent_take (tail lst) (n - 1))
+
+-- Push each char of a string into recent (in order)
+recent_push_chars cs recent =
+  if is_nil_chars cs then recent
+  else recent_push_chars (tail cs) (recent_push (head cs) recent)
+
+-- Check if recent ends with "0.0 +" or "0.0+" (recent is reversed: index 0 = most recent)
+-- Patterns to match: chars reading rightward must end with "0.0 +" or "0.0+".
+-- In recent (reversed), that means the head can be "+", " +", or "+ ", with
+-- "0.0" before. Simplify: look for the FIRST '+' in recent within first 2
+-- entries, then check that the next non-space chars are "0", ".", "0".
+recent_has_wrap recent =
+  if length recent == 0 then false
+  else
+    let r0 = head recent
+    -- Case 1: most recent is '+' → check "0.0" before, optionally with space
+    if r0 == "+" then
+      check_zero_dot_zero (tail recent) true
+    else if r0 == " " && length recent > 1 && head (tail recent) == "+" then
+      check_zero_dot_zero (tail (tail recent)) true
+    else false
+
+-- After consuming the '+', expect optional space, then '0', '.', '0' reading
+-- backward (i.e., next three chars in recent are "0", ".", "0")
+check_zero_dot_zero recent allow_space =
+  if length recent == 0 then false
+  else
+    let r0 = head recent
+    if r0 == " " && allow_space then check_zero_dot_zero (tail recent) false
+    else if length recent >= 3 && r0 == "0" && head (tail recent) == "." && head (tail (tail recent)) == "0"
+    then true
+    else false
+
+-- ── Main lint pass over all lines ───────────────────────────────────────────
+
+-- Emit a warning string
+mk_warn file line code msg =
+  cat [file, ":", show line, ": warning: ", code, " ", msg]
+
+-- Pass 1: build fn_set of float-returning fns
+build_float_set lines nlines = float_fns_acc lines nlines 1 "" []
+
+-- Lines longer than this are skipped entirely. compile.rail has multi-KB
+-- asm-string lines (data_section_asm etc.) that aren't user logic and
+-- explode the linter's per-line O(n) costs into O(n²). Tunable.
+max_line_len = 500
+
+-- O(1)-amortized is_empty: check if length-prefix counter has hit 0.
+-- We pre-count `lines` ONCE and decrement instead of re-calling `length`
+-- in the loop head.
+
+-- Pass 2: per-line checks
+lint_lines lines remaining file fn_set idx cur_fn warnings =
+  if remaining <= 0 then warnings
+  else
+    let raw = head lines
+    let raw_len = length (chars raw)
+    if raw_len > max_line_len then
+      lint_lines (tail lines) (remaining - 1) file fn_set (idx + 1) cur_fn warnings
+    else
+      let cleaned = strip_line raw
+      let cleaned_cs = chars cleaned
+      let zero_indent = (not (is_nil_chars cleaned_cs)) && (head cleaned_cs != " ") && (head cleaned_cs != "\t")
+      let starts_def = zero_indent && is_def_line cleaned
+      let new_cur = if starts_def then fn_name_of_line cleaned else cur_fn
+      -- Q001
+      let q001_hit = check_q001 cleaned
+      let w1 = if q001_hit
+               then cons (mk_warn file idx "Q001" "heterogeneous numeric literal list (int and float mixed); list literals must be homogeneous") warnings
+               else warnings
+      -- Q002 (Rail-native + fn-style)
+      let q002_hit = (starts_def && check_q002_rail_style cleaned) || q002_fn_style cleaned
+      let w2 = if q002_hit
+               then cons (mk_warn file idx "Q002" "function has more than 10 parameters; compile.rail has known issues with high-arity helpers") w1
+               else w1
+      -- Q003 (skip on the def-line of new_cur to avoid self-flag)
+      let q003_hit = q003_scan_line_for_calls cleaned fn_set new_cur
+      let w3 = if q003_hit
+               then cons (mk_warn file idx "Q003" "call to float-returning fn not wrapped in '0.0 +' (cross-function float-return mistype risk)") w2
+               else w2
+      lint_lines (tail lines) (remaining - 1) file fn_set (idx + 1) new_cur w3
+
+-- ── argv handling ───────────────────────────────────────────────────────────
+
+find_file_arg xs =
+  if length xs == 0 then ""
+  else
+    let a = head xs
+    let cs = chars a
+    -- skip flags
+    if length cs >= 2 && head cs == "-" && head (tail cs) == "-" then
+      find_file_arg (tail xs)
+    else if length cs >= 1 && head cs == "-" then
+      find_file_arg (tail xs)
+    else a
+
+emit_warnings ws =
+  if length ws == 0 then 0
+  else
+    let _ = print (head ws)
+    emit_warnings (tail ws)
+
+main =
+  -- args[0] is the binary path; skip it.
+  let argv = if length args > 0 then tail args else args
+  let file = find_file_arg argv
+  if length (chars file) == 0 then
+    let _ = print "usage: rail_native run tools/lint/check_quirks.rail -- <file.rail>"
+    1
+  else
+    let src = read_file file
+    let lines = split "\n" src
+    let nlines = length lines
+    let fn_set = build_float_set lines nlines
+    let warnings_rev = lint_lines lines nlines file fn_set 1 "" []
+    let warnings = reverse warnings_rev
+    let _ = emit_warnings warnings
+    let n = length warnings
+    let _ = print (cat ["[lint] ", show n, " warning(s) in ", file])
+    if n == 0 then 0 else 1

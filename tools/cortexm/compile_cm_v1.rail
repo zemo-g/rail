@@ -1,0 +1,696 @@
+-- tools/cortexm/compile_cm_v1.rail - Rail-flavored source -> Cortex-M Thumb-2.
+--
+-- v1 source language:
+--   Top level: main = STMT*
+--   Statements (newline separated):
+--     let NAME = EXPR              creates a new local (r4..r7), max 4
+--     EXPR                         expression statement (e.g. a builtin call)
+--     mmio_w EXPR EXPR             write right-EXPR to address-EXPR
+--     mmio_r EXPR                  read from address-EXPR (result in r0)
+--     while EXPR do STMT* done
+--     if EXPR then STMT* else STMT* end
+--   Expressions (precedence: < == lowest, then + -, then *, primary highest):
+--     INT_LITERAL  IDENT  ( EXPR )
+--     EXPR + EXPR    EXPR - EXPR    EXPR * EXPR
+--     EXPR < EXPR    EXPR == EXPR
+--   Comments: -- TO END OF LINE   or   # TO END OF LINE
+--
+-- Codegen: stack machine. Each expression leaves its value in r0. Binary
+-- ops compile lhs to r0, push r0, compile rhs to r0, pop r1, op r1 r0 -> r0.
+-- Locals live in r4..r7; a name -> register table maps idents.
+
+import "stdlib/thumb2.rail"
+import "stdlib/cortexm_runtime.rail"
+
+-- ===== Token kinds =====
+-- 0 EOF        4 OP_PLUS       8 OP_LT         12 KW_WHILE
+-- 1 INT        5 OP_MINUS      9 OP_EQ         13 KW_DO
+-- 2 IDENT      6 OP_STAR       10 LPAREN       14 KW_DONE
+-- 3 OP_ASSIGN  7 OP_GT         11 RPAREN       15 (unused)
+-- 16 KW_LET    17 KW_MMIO_W    18 KW_MMIO_R    19 KW_MAIN
+-- 20 KW_IF     21 KW_THEN      22 KW_ELSE      23 KW_END
+-- 24 OP_AND    25 OP_OR        26 OP_XOR
+-- 27 OP_SHL    28 OP_SHR
+-- A token is a 4-element arr [kind, int_value, name_string, _]
+
+mk_tok kind n name =
+  let r = arr_new 4 0
+  let _ = arr_set r 0 kind
+  let _ = arr_set r 1 n
+  let _ = arr_set r 2 name
+  r
+
+tok_kind t = arr_get t 0
+tok_int t = arr_get t 1
+tok_name t = arr_get t 2
+
+-- ===== String equality (for keyword recognition) =====
+-- Pure Rail; iterates char by char.
+
+streq_acc cs1 cs2 =
+  if length cs1 == 0 then length cs2 == 0
+  else if length cs2 == 0 then false
+  else if char_to_int (head cs1) != char_to_int (head cs2) then false
+  else streq_acc (tail cs1) (tail cs2)
+
+streq a b = streq_acc (chars a) (chars b)
+
+-- ===== Tokenizer =====
+-- Walks chars. Whitespace and comments skipped.
+
+is_digit c = c >= 48 && c <= 57
+is_alpha c = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+is_alnum c = is_digit c || is_alpha c
+is_ws c = c == 32 || c == 9 || c == 13
+
+-- Skip comments and whitespace; return remaining chars list.
+skip_ws cs =
+  if length cs == 0 then cs
+  else
+    let c = char_to_int (head cs)
+    if is_ws c then skip_ws (tail cs)
+    else if c == 35 then skip_to_eol (tail cs)         -- '#'
+    else if c == 45 && length cs >= 2 && head (tail cs) == "-" then
+      skip_to_eol (tail (tail cs))                      -- '--'
+    else cs
+
+skip_to_eol cs =
+  if length cs == 0 then cs
+  else if char_to_int (head cs) == 10 then cs
+  else skip_to_eol (tail cs)
+
+-- Read an integer (decimal or 0xHEX). Returns [chars_remaining, value].
+lex_int_dec cs acc =
+  if length cs == 0 then mk_pair cs acc
+  else
+    let c = char_to_int (head cs)
+    if is_digit c then lex_int_dec (tail cs) (acc * 10 + c - 48)
+    else mk_pair cs acc
+
+lex_int_hex cs acc =
+  if length cs == 0 then mk_pair cs acc
+  else
+    let c = char_to_int (head cs)
+    let d = if c >= 48 && c <= 57 then c - 48
+            else if c >= 97 && c <= 102 then c - 87
+            else if c >= 65 && c <= 70 then c - 55
+            else 0 - 1
+    if d < 0 then mk_pair cs acc
+    else lex_int_hex (tail cs) (acc * 16 + d)
+
+mk_pair a b =
+  let r = arr_new 2 0
+  let _ = arr_set r 0 a
+  let _ = arr_set r 1 b
+  r
+
+p_first p = arr_get p 0
+p_second p = arr_get p 1
+
+-- Read an identifier; returns [chars_remaining, name_string].
+lex_ident cs acc =
+  if length cs == 0 then mk_pair cs acc
+  else
+    let c = char_to_int (head cs)
+    if is_alnum c then lex_ident (tail cs) (cat [acc, head cs])
+    else mk_pair cs acc
+
+-- Decide an ident's kind: keyword or generic IDENT.
+kind_of_ident name =
+  if streq name "let" then 16
+  else if streq name "while" then 12
+  else if streq name "do" then 13
+  else if streq name "done" then 14
+  else if streq name "if" then 20
+  else if streq name "then" then 21
+  else if streq name "else" then 22
+  else if streq name "end" then 23
+  else if streq name "main" then 19
+  else if streq name "mmio_w" then 17
+  else if streq name "mmio_r" then 18
+  else 2
+
+-- Tokenize the whole source into a list of tokens.
+lex_loop cs acc =
+  let cs1 = skip_ws cs
+  if length cs1 == 0 then reverse acc
+  else
+    let c = char_to_int (head cs1)
+    if c == 10 then lex_loop (tail cs1) acc                  -- newline: ignore (not significant in v1)
+    else if is_digit c then
+      if c == 48 && length cs1 >= 2 && head (tail cs1) == "x" then
+        let r = lex_int_hex (tail (tail cs1)) 0
+        lex_loop (p_first r) (cons (mk_tok 1 (p_second r) "") acc)
+      else
+        let r = lex_int_dec cs1 0
+        lex_loop (p_first r) (cons (mk_tok 1 (p_second r) "") acc)
+    else if is_alpha c then
+      let r = lex_ident cs1 ""
+      let name = p_second r
+      let k = kind_of_ident name
+      lex_loop (p_first r) (cons (mk_tok k 0 name) acc)
+    else if c == 43 then lex_loop (tail cs1) (cons (mk_tok 4 0 "") acc)
+    else if c == 45 then lex_loop (tail cs1) (cons (mk_tok 5 0 "") acc)
+    else if c == 42 then lex_loop (tail cs1) (cons (mk_tok 6 0 "") acc)
+    else if c == 60 then
+      if length cs1 >= 2 && char_to_int (head (tail cs1)) == 60 then
+        lex_loop (tail (tail cs1)) (cons (mk_tok 27 0 "") acc)   -- <<
+      else lex_loop (tail cs1) (cons (mk_tok 8 0 "") acc)         -- <
+    else if c == 62 then
+      if length cs1 >= 2 && char_to_int (head (tail cs1)) == 62 then
+        lex_loop (tail (tail cs1)) (cons (mk_tok 28 0 "") acc)   -- >>
+      else lex_loop (tail cs1) (cons (mk_tok 7 0 "") acc)         -- >
+    else if c == 38 then lex_loop (tail cs1) (cons (mk_tok 24 0 "") acc)  -- &
+    else if c == 124 then lex_loop (tail cs1) (cons (mk_tok 25 0 "") acc) -- |
+    else if c == 94 then lex_loop (tail cs1) (cons (mk_tok 26 0 "") acc)  -- ^
+    else if c == 40 then lex_loop (tail cs1) (cons (mk_tok 10 0 "") acc)
+    else if c == 41 then lex_loop (tail cs1) (cons (mk_tok 11 0 "") acc)
+    else if c == 61 then
+      if length cs1 >= 2 && head (tail cs1) == "=" then
+        lex_loop (tail (tail cs1)) (cons (mk_tok 9 0 "") acc)
+      else lex_loop (tail cs1) (cons (mk_tok 3 0 "") acc)
+    else lex_loop (tail cs1) acc                              -- skip unknown char
+
+tokenize src = lex_loop (chars src) []
+
+-- ===== Local-variable allocator =====
+-- Maps ident names to register numbers. Up to 4 locals (r4..r7).
+-- Stored as a parallel pair of lists; small enough that linear search
+-- doesn't matter.
+
+local_new _ = arr_new 17 0     -- 1 count + 8 (name, reg) pairs
+local_count tbl = arr_get tbl 0
+
+-- If name already exists, return its existing register (rebind in place)
+-- so `let i = i + 1` updates the same slot. Otherwise allocate a new
+-- register from r4..r11 (8 callee-saved Cortex-M GP registers).
+-- Returns -1 if out of locals.
+local_add tbl name =
+  let existing = local_lookup tbl name
+  if existing >= 0 then existing
+  else
+    let n = local_count tbl
+    if n >= 8 then 0 - 1
+    else
+      let _ = arr_set tbl (1 + n * 2) name
+      let _ = arr_set tbl (1 + n * 2 + 1) (4 + n)
+      let _ = arr_set tbl 0 (n + 1)
+      4 + n
+
+local_lookup_loop tbl n name i =
+  if i >= n then 0 - 1
+  else if streq (arr_get tbl (1 + i * 2)) name then arr_get tbl (1 + i * 2 + 1)
+  else local_lookup_loop tbl n name (i + 1)
+
+local_lookup tbl name = local_lookup_loop tbl (local_count tbl) name 0
+
+-- ===== Parser + codegen (combined - emits as it parses) =====
+-- We use a global mutable "cursor" through the token list, plus the
+-- assembler `asm` and the locals table `locals`.
+-- ctx = [tok_list_ref, asm, locals]
+
+ctx_new toks asm locals =
+  let r = arr_new 3 0
+  let _ = arr_set r 0 toks         -- token list (mutable: peek/advance)
+  let _ = arr_set r 1 asm
+  let _ = arr_set r 2 locals
+  r
+
+ctx_peek ctx =
+  let toks = arr_get ctx 0
+  if length toks == 0 then mk_tok 0 0 ""
+  else head toks
+
+ctx_advance ctx =
+  let toks = arr_get ctx 0
+  let _ = arr_set ctx 0 (tail toks)
+  0
+
+ctx_asm ctx = arr_get ctx 1
+ctx_locals ctx = arr_get ctx 2
+
+-- ===== Expression codegen =====
+-- Each expr leaves result in r0.
+-- Stack discipline: PUSH lhs, eval rhs, POP into r1, op.
+
+emit_push_r0 asm = asm_push asm 1 0           -- push {r0}
+emit_pop_r1 asm = asm_pop asm 2 0             -- pop  {r1}
+emit_movs_r0_imm asm v = asm_movs_imm8 asm 0 v
+emit_loadimm32_r0 asm v =
+  let lo = bit_and v 65535
+  let hi = bit_and (shr v 16) 65535
+  let _ = asm_movw asm 0 lo
+  asm_movt asm 0 hi
+
+-- ADDS r0, r1, r0 (16-bit; encoding 0x1800 | (r0<<6) | (r1<<3) | r0 = 0x1808)
+emit_adds_r0_r1 asm =
+  asm_push_inst asm 0 (bit_or 6144 (bit_or (shl 0 6) (bit_or (shl 1 3) 0))) 0 0 0 2
+
+-- SUBS r0, r1, r0 -> 0x1A00 | (0<<6) | (1<<3) | 0 = 0x1A08
+emit_subs_r0_r1 asm =
+  asm_push_inst asm 0 (bit_or 6656 (bit_or (shl 0 6) (bit_or (shl 1 3) 0))) 0 0 0 2
+
+-- MULS r0, r1 (r0 = r0 * r1) -> 0x4340 | (1<<3) | 0 = 0x4348
+emit_muls_r0_r1 asm =
+  asm_push_inst asm 0 (bit_or 17216 (bit_or (shl 1 3) 0)) 0 0 0 2
+
+-- ANDS r0, r1 (r0 = r0 & r1) -> 0x4000 | (1<<3) | 0 = 0x4008
+emit_ands_r0_r1 asm =
+  asm_push_inst asm 0 (bit_or 16384 (bit_or (shl 1 3) 0)) 0 0 0 2
+
+-- ORRS r0, r1 (r0 = r0 | r1) -> 0x4300 | (1<<3) | 0 = 0x4308
+emit_orrs_r0_r1 asm =
+  asm_push_inst asm 0 (bit_or 17152 (bit_or (shl 1 3) 0)) 0 0 0 2
+
+-- EORS r0, r1 (r0 = r0 ^ r1) -> 0x4040 | (1<<3) | 0 = 0x4048
+emit_eors_r0_r1 asm =
+  asm_push_inst asm 0 (bit_or 16448 (bit_or (shl 1 3) 0)) 0 0 0 2
+
+-- LSLS r0, r1 (r0 = r0 << r1) -> 0x4080 | (1<<3) | 0 = 0x4088
+emit_lsls_r0_r1 asm =
+  asm_push_inst asm 0 (bit_or 16512 (bit_or (shl 1 3) 0)) 0 0 0 2
+
+-- LSRS r0, r1 (r0 = r0 >> r1, logical) -> 0x40C0 | (1<<3) | 0 = 0x40C8
+emit_lsrs_r0_r1 asm =
+  asm_push_inst asm 0 (bit_or 16576 (bit_or (shl 1 3) 0)) 0 0 0 2
+
+-- CMP r1, r0 -> 16-bit 0x4288 | (r0<<3) | r1 ... actually 0x4280 | (r0<<3) | r1
+-- Encoding CMP Rn, Rm (low regs):  010000 1010 mmm nnn  = 0x4280 | (Rm<<3) | Rn
+emit_cmp_r1_r0 asm =
+  asm_push_inst asm 0 (bit_or 17024 (bit_or (shl 0 3) 1)) 0 0 0 2
+
+-- After a CMP, set r0 = 1 if condition true, else 0.
+-- We use an IT-block-free approach: emit Bcond over a "movs r0, #0", then movs r0, #1,
+-- then a label after.
+-- Simpler: use ITE block via MOV imm + Bcond, but we don't have IT in our assembler.
+-- Path: branch over a movs r0,#0; landing at movs r0,#1; common.
+-- We do: bcond label_true ; movs r0,#0 ; b label_done ; label_true: movs r0,#1 ; label_done:
+emit_setcc asm cond =
+  let l_true = asm_decl_label (ctx_asm_unused asm)
+  -- Note: we need ctx; rework signature below.
+  0
+
+ctx_asm_unused asm = asm  -- placeholder so the previous definition compiles
+
+-- Re-implement set-cc using the ctx so we can declare labels.
+emit_setcc_ctx ctx cond =
+  let asm = ctx_asm ctx
+  let l_true = asm_decl_label asm
+  let l_done = asm_decl_label asm
+  let _ = asm_bcond asm l_true cond                  -- if cond, jump to label_true
+  let _ = asm_movs_imm8 asm 0 0                      -- r0 = 0 (false)
+  let _ = asm_b asm l_done
+  let _ = asm_label_here asm l_true
+  let _ = asm_movs_imm8 asm 0 1                      -- r0 = 1 (true)
+  let _ = asm_label_here asm l_done
+  0
+
+-- expr precedence: cmp_expr -> add_expr (('<' | '==') add_expr)?
+parse_primary ctx =
+  let t = ctx_peek ctx
+  let k = tok_kind t
+  if k == 1 then                               -- INT
+    let _ = ctx_advance ctx
+    let v = tok_int t
+    let asm = ctx_asm ctx
+    if v >= 0 && v < 256 then emit_movs_r0_imm asm v
+    else emit_loadimm32_r0 asm v
+  else if k == 2 then                          -- IDENT
+    let _ = ctx_advance ctx
+    let name = tok_name t
+    let r = local_lookup (ctx_locals ctx) name
+    if r < 0 then 0
+    else asm_mov_reg (ctx_asm ctx) 0 r          -- mov r0, rN
+  else if k == 10 then                         -- LPAREN
+    let _ = ctx_advance ctx
+    let _ = parse_cmp_expr ctx
+    let t2 = ctx_peek ctx
+    if tok_kind t2 == 11 then ctx_advance ctx else 0
+  else 0
+
+parse_mul_expr ctx =
+  let _ = parse_primary ctx
+  parse_mul_tail ctx
+
+parse_mul_tail ctx =
+  let t = ctx_peek ctx
+  if tok_kind t == 6 then                      -- '*'
+    let _ = ctx_advance ctx
+    let asm = ctx_asm ctx
+    let _ = emit_push_r0 asm
+    let _ = parse_primary ctx
+    let _ = emit_pop_r1 asm
+    let _ = emit_muls_r0_r1 asm
+    parse_mul_tail ctx
+  else 0
+
+parse_add_expr ctx =
+  let _ = parse_mul_expr ctx
+  parse_add_tail ctx
+
+parse_add_tail ctx =
+  let t = ctx_peek ctx
+  let k = tok_kind t
+  if k == 4 then                               -- '+'
+    let _ = ctx_advance ctx
+    let asm = ctx_asm ctx
+    let _ = emit_push_r0 asm
+    let _ = parse_mul_expr ctx
+    let _ = emit_pop_r1 asm
+    let _ = emit_adds_r0_r1 asm
+    parse_add_tail ctx
+  else if k == 5 then                          -- '-'
+    let _ = ctx_advance ctx
+    let asm = ctx_asm ctx
+    let _ = emit_push_r0 asm
+    let _ = parse_mul_expr ctx
+    let _ = emit_pop_r1 asm
+    let _ = emit_subs_r0_r1 asm
+    parse_add_tail ctx
+  else 0
+
+-- Bit-shift level (between add and cmp): << >>
+parse_shift_expr ctx =
+  let _ = parse_add_expr ctx
+  parse_shift_tail ctx
+
+parse_shift_tail ctx =
+  let t = ctx_peek ctx
+  let k = tok_kind t
+  if k == 27 then                              -- '<<'
+    let _ = ctx_advance ctx
+    let asm = ctx_asm ctx
+    let _ = emit_push_r0 asm
+    let _ = parse_add_expr ctx
+    -- For LSLS r0, r1: we need shift count in r1, value in r0.
+    -- After our pattern (lhs pushed, rhs in r0): pop into r1 to get lhs,
+    -- but LSLS computes r0 = r0 << r1 - so we need value (lhs) in r0
+    -- and count (rhs) in r1. We need to swap: rhs is in r0, lhs on stack.
+    -- So: mov r2, r0 (rhs); pop r1 -> wait, that needs r2 mov which
+    -- is in our toolbox via asm_mov_reg, and the stack pop puts in r1.
+    -- Steps: mov r1, r0 (rhs -> r1) ; pop r0 (lhs -> r0) ; lsls r0, r1
+    let _ = asm_mov_reg asm 1 0
+    let _ = asm_pop asm 1 0                    -- pop {r0}
+    let _ = emit_lsls_r0_r1 asm
+    parse_shift_tail ctx
+  else if k == 28 then                         -- '>>'
+    let _ = ctx_advance ctx
+    let asm = ctx_asm ctx
+    let _ = emit_push_r0 asm
+    let _ = parse_add_expr ctx
+    let _ = asm_mov_reg asm 1 0
+    let _ = asm_pop asm 1 0
+    let _ = emit_lsrs_r0_r1 asm
+    parse_shift_tail ctx
+  else 0
+
+-- Bitwise-AND level (between shift and cmp): &
+parse_and_expr ctx =
+  let _ = parse_shift_expr ctx
+  parse_and_tail ctx
+
+parse_and_tail ctx =
+  let t = ctx_peek ctx
+  let k = tok_kind t
+  if k == 24 then                              -- '&'
+    let _ = ctx_advance ctx
+    let asm = ctx_asm ctx
+    let _ = emit_push_r0 asm
+    let _ = parse_shift_expr ctx
+    let _ = emit_pop_r1 asm
+    let _ = emit_ands_r0_r1 asm
+    parse_and_tail ctx
+  else 0
+
+-- Bitwise-OR / XOR level (between and and cmp): | ^
+parse_or_expr ctx =
+  let _ = parse_and_expr ctx
+  parse_or_tail ctx
+
+parse_or_tail ctx =
+  let t = ctx_peek ctx
+  let k = tok_kind t
+  if k == 25 then                              -- '|'
+    let _ = ctx_advance ctx
+    let asm = ctx_asm ctx
+    let _ = emit_push_r0 asm
+    let _ = parse_and_expr ctx
+    let _ = emit_pop_r1 asm
+    let _ = emit_orrs_r0_r1 asm
+    parse_or_tail ctx
+  else if k == 26 then                         -- '^'
+    let _ = ctx_advance ctx
+    let asm = ctx_asm ctx
+    let _ = emit_push_r0 asm
+    let _ = parse_and_expr ctx
+    let _ = emit_pop_r1 asm
+    let _ = emit_eors_r0_r1 asm
+    parse_or_tail ctx
+  else 0
+
+parse_cmp_expr ctx =
+  let _ = parse_or_expr ctx
+  let t = ctx_peek ctx
+  let k = tok_kind t
+  if k == 8 then                               -- '<'
+    let _ = ctx_advance ctx
+    let asm = ctx_asm ctx
+    let _ = emit_push_r0 asm
+    let _ = parse_or_expr ctx
+    let _ = emit_pop_r1 asm
+    let _ = emit_cmp_r1_r0 asm
+    -- LT = signed less-than = cond 11 ('lt')
+    emit_setcc_ctx ctx 11
+  else if k == 9 then                          -- '=='
+    let _ = ctx_advance ctx
+    let asm = ctx_asm ctx
+    let _ = emit_push_r0 asm
+    let _ = parse_or_expr ctx
+    let _ = emit_pop_r1 asm
+    let _ = emit_cmp_r1_r0 asm
+    emit_setcc_ctx ctx 0                       -- EQ = cond 0
+  else 0
+
+-- ===== Statement parsing =====
+
+parse_stmt ctx =
+  let t = ctx_peek ctx
+  let k = tok_kind t
+  if k == 16 then parse_let ctx                -- let
+  else if k == 12 then parse_while ctx         -- while
+  else if k == 20 then parse_if ctx            -- if
+  else if k == 17 then parse_mmio_w ctx        -- mmio_w
+  else if k == 18 then parse_mmio_r ctx        -- mmio_r
+  else 0 - 1                                    -- end-of-block sentinel
+
+parse_let ctx =
+  let _ = ctx_advance ctx                      -- consume 'let'
+  let t = ctx_peek ctx
+  if tok_kind t != 2 then 0 - 1
+  else
+    let name = tok_name t
+    let _ = ctx_advance ctx
+    let t2 = ctx_peek ctx
+    if tok_kind t2 != 3 then 0 - 1             -- expect '='
+    else
+      let _ = ctx_advance ctx
+      let _ = parse_cmp_expr ctx               -- result in r0
+      let r = local_add (ctx_locals ctx) name
+      if r < 0 then 0 - 1                       -- too many locals
+      else
+        let _ = asm_mov_reg (ctx_asm ctx) r 0   -- rN = r0
+        0
+
+parse_mmio_w ctx =
+  let _ = ctx_advance ctx
+  let asm = ctx_asm ctx
+  -- Parse address expression -> r0
+  let _ = parse_cmp_expr ctx
+  let _ = emit_push_r0 asm                     -- save addr on stack
+  -- Parse value expression -> r0
+  let _ = parse_cmp_expr ctx
+  -- r0 = value; pop addr into r1; STR.W r0, [r1, #0]
+  let _ = emit_pop_r1 asm
+  let _ = asm_str_w asm 0 1 0
+  0
+
+parse_mmio_r ctx =
+  let _ = ctx_advance ctx
+  let asm = ctx_asm ctx
+  let _ = parse_cmp_expr ctx                   -- addr in r0
+  let _ = asm_mov_reg asm 1 0                  -- mov r1, r0
+  let _ = asm_ldr_w asm 0 1 0                  -- ldr.w r0, [r1, #0]
+  0
+
+parse_while ctx =
+  let _ = ctx_advance ctx                      -- consume 'while'
+  let asm = ctx_asm ctx
+  let l_top = asm_decl_label asm
+  let l_end = asm_decl_label asm
+  let _ = asm_label_here asm l_top
+  let _ = parse_cmp_expr ctx                   -- cond in r0
+  let _ = asm_cmp_imm8 asm 0 0                 -- cmp r0, #0
+  let _ = asm_bcond asm l_end 0                -- beq l_end (false -> exit)
+  -- Expect 'do' next
+  let t = ctx_peek ctx
+  if tok_kind t != 13 then 0 - 1
+  else
+    let _ = ctx_advance ctx
+    let _ = parse_block ctx 14                 -- 14 = KW_DONE
+    let _ = asm_b asm l_top                    -- jump back
+    let _ = asm_label_here asm l_end
+    let t2 = ctx_peek ctx
+    if tok_kind t2 == 14 then ctx_advance ctx else 0
+
+parse_if ctx =
+  let _ = ctx_advance ctx
+  let asm = ctx_asm ctx
+  let l_else = asm_decl_label asm
+  let l_done = asm_decl_label asm
+  let _ = parse_cmp_expr ctx                   -- cond in r0
+  let _ = asm_cmp_imm8 asm 0 0
+  let _ = asm_bcond asm l_else 0               -- beq -> else branch
+  let t = ctx_peek ctx
+  if tok_kind t != 21 then 0 - 1               -- 'then'
+  else
+    let _ = ctx_advance ctx
+    let _ = parse_block ctx 22                 -- 22 = KW_ELSE  (or 23 = KW_END if no else)
+    let _ = asm_b asm l_done
+    let _ = asm_label_here asm l_else
+    -- Check whether we hit 'else' or 'end'
+    let t2 = ctx_peek ctx
+    let _ = if tok_kind t2 == 22 then
+              let _ = ctx_advance ctx
+              parse_block ctx 23
+            else 0
+    let _ = asm_label_here asm l_done
+    let t3 = ctx_peek ctx
+    if tok_kind t3 == 23 then ctx_advance ctx else 0
+
+parse_block ctx end_kind =
+  let t = ctx_peek ctx
+  let k = tok_kind t
+  if k == end_kind then 0
+  else if k == 0 then 0                        -- EOF
+  else
+    let r = parse_stmt ctx
+    if r == 0 - 1 then 0
+    else parse_block ctx end_kind
+
+-- ===== Top level =====
+
+parse_program ctx =
+  -- Optionally skip a leading "main =" header.
+  let t = ctx_peek ctx
+  if tok_kind t == 19 then
+    let _ = ctx_advance ctx
+    let t2 = ctx_peek ctx
+    if tok_kind t2 == 3 then
+      let _ = ctx_advance ctx
+      0
+    else 0
+  else 0
+
+cm_compile_v1 src_text =
+  let toks = tokenize src_text
+  let asm = asm_new 8192
+  let locals = local_new 0
+  let l_reset = asm_decl_label asm
+  let l_halt = asm_decl_label asm
+  let l_main = asm_decl_label asm
+  let _ = cm_emit_vector_table asm 537001984 l_reset l_halt 16
+  let _ = asm_label_here asm l_reset
+  let _ = cm_emit_reset asm l_main l_halt
+  let _ = cm_emit_halt asm l_halt
+  let _ = asm_label_here asm l_main
+  -- Push r4..r7 + LR via 16-bit PUSH (reglist8=0xF0); r8..r11 require a
+  -- 32-bit STMDB but we keep v1 simple with the 16-bit form. r4..r7 cover
+  -- the first 4 locals; r8..r11 are saved into the function's local frame
+  -- as needed (NOT in v1 - we trust caller to clobber-tolerate r8..r11).
+  -- TODO v2: emit 32-bit STMDB sp!, {r4..r11, lr}.
+  let _ = asm_push asm 240 1                    -- push {r4..r7, lr}
+  let ctx = ctx_new toks asm locals
+  let _ = parse_program ctx
+  let _ = parse_block ctx 0                     -- consume statements until EOF
+  let _ = asm_pop asm 240 1                     -- pop {r4..r7, pc}
+  let total = cm_finalize_with_raw asm
+  let r = arr_new 2 0
+  let _ = arr_set r 0 asm
+  let _ = arr_set r 1 total
+  r
+
+-- The cm_finalize_with_raw helper from compile_cm.rail -- re-emit here
+-- since we don't import that file (avoids duplicate-symbol issues).
+cm_finalize_with_raw asm =
+  let n_inst = asm_inst_count asm
+  let total = asm_finalize asm
+  let _ = cm_post_loop asm 0 n_inst
+  let _ = cm_raw_loop asm 0 n_inst
+  total
+
+cm_raw_loop asm i n =
+  if i >= n then 0
+  else
+    let inst = asm_inst_get asm i
+    let kind = arr_get inst 0
+    if kind == 0 then
+      let off = arr_get inst 4
+      let hw = arr_get inst 1
+      let buf = asm_buf asm
+      let _ = arr_set buf off       (bit_and hw 255)
+      let _ = arr_set buf (off + 1) (bit_and (shr hw 8) 255)
+      cm_raw_loop asm (i + 1) n
+    else cm_raw_loop asm (i + 1) n
+
+main =
+  let argv = args
+  if length argv < 2 then
+    let _ = print "usage: rail_native run tools/cortexm/compile_cm_v1.rail <src.cm>"
+    1
+  else
+    let src_path = head (tail argv)
+    let _ = print (cat ["compiling ", src_path, " (v1)"])
+    let src = read_file src_path
+    let result = cm_compile_v1 src
+    let asm = arr_get result 0
+    let total = arr_get result 1
+    let _ = print (cat ["  emitted ", show total, " bytes"])
+    let _ = print "  raw bytes (16/row):"
+    let _ = print_bytes_grid (asm_buf asm) total 0
+    let _ = print "  disassembly of code section (post-VT, 100 instrs):"
+    let _ = t2_disasm (asm_buf asm) 128 total 100
+    0
+
+print_bytes_grid buf n i =
+  if i >= n then 0
+  else
+    let line_end = if i + 16 > n then n else i + 16
+    let _ = print (cat ["  ", show_hex_addr i, ": ", bytes_row buf i line_end ""])
+    print_bytes_grid buf n line_end
+
+show_hex_addr n =
+  let h = "0123456789abcdef"
+  let cs = chars h
+  let d3 = bit_and (shr n 12) 15
+  let d2 = bit_and (shr n 8) 15
+  let d1 = bit_and (shr n 4) 15
+  let d0 = bit_and n 15
+  cat [head (drop_n_chars d3 cs), head (drop_n_chars d2 cs),
+       head (drop_n_chars d1 cs), head (drop_n_chars d0 cs)]
+
+drop_n_chars n cs =
+  if n <= 0 then cs
+  else drop_n_chars (n - 1) (tail cs)
+
+bytes_row buf start endp acc =
+  if start >= endp then acc
+  else
+    let b = arr_get buf start
+    let hi = bit_and (shr b 4) 15
+    let lo = bit_and b 15
+    let h = "0123456789abcdef"
+    let cs = chars h
+    let ch = head (drop_n_chars hi cs)
+    let cl = head (drop_n_chars lo cs)
+    let sep = if start + 1 == endp then "" else " "
+    bytes_row buf (start + 1) endp (cat [acc, ch, cl, sep])

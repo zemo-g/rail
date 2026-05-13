@@ -1,0 +1,107 @@
+-- examples/apollo2_blink.rail
+-- First Apollo2 (Instinct gen-1 main MCU) bring-up: GPIO toggle via SysTick.
+--
+-- Build:  ./rail_native cortexm examples/apollo2_blink.rail  -> /tmp/rail_m4.elf
+-- Verify: objdump -d /tmp/rail_m4.elf | head; objdump -s -j .vectors /tmp/rail_m4.elf
+-- Flash:  (TODO) requires bootloader-bypass or hardware SWD path; not testable in qemu
+--         (qemu has no Apollo2 machine; mps2-an386 has different register map).
+--
+-- Register map cross-checked against Ambiq SDK
+--   github.com/sparkfun/AmbiqSuiteSDK/blob/master/mcu/apollo2/regs/am_reg_gpio.h
+-- on 2026-05-08: PADKEY/CFGA/WTSA/WTCA/ENSA addresses + PADKEY=0x73 all match.
+--
+-- Pin number BLINK_PIN is parameterized; actual Instinct pin map (LED/backlight/
+-- vibration motor) needs firmware RE — see docs/plans/PHASE_2_FIRMWARE.md.
+-- Pin 27 chosen as a placeholder (commonly status LED on Ambiq dev boards).
+--
+-- KNOWN GAP: This file does not configure PADREG explicitly. It assumes the
+-- Apollo2 reset default for the chosen pin is FNCSEL=3 (GPIO function). For
+-- pins that may already be muxed for SPI/I2C/UART by Garmin's firmware-loaded
+-- pad config (relevant when chain-loaded vs cold-boot), add a read-modify-write
+-- to PADREG[pin/4] setting bits [(pin%4)*8+5 .. (pin%4)*8+3] = 3, with PADKEY
+-- unlocked first and re-locked (write 0) after.
+
+-- ---------- Apollo2 GPIO register addresses ----------
+
+GPIO_PADKEY  = 0x40010060
+GPIO_CFGA    = 0x40010040
+GPIO_WTSA    = 0x40010090
+GPIO_WTCA    = 0x40010098
+GPIO_ENSA    = 0x400100A8
+
+PADKEY_VALUE = 0x73
+
+-- SysTick (ARM Cortex-M4 standard, same address on Apollo2 and any M4)
+SYSTICK_CTRL = 0xE000E010
+SYSTICK_LOAD = 0xE000E014
+
+-- ---------- Pin under test ----------
+
+BLINK_PIN = 27
+
+-- ---------- GPIO helpers ----------
+
+-- PADREG register for pin N: each PADREG covers 4 pins (8 bits each).
+-- Address = GPIO_BASE + 4 * (N / 4). GPIO_BASE = 0x40010000.
+padreg_addr pin =
+  let group = pin / 4 in
+  0x40010000 + group * 4
+
+-- CFG register for pin N: each CFG covers 8 pins (4 bits each).
+-- Address = 0x40010040 + 4 * (N / 8).
+cfg_addr pin =
+  let group = pin / 8 in
+  GPIO_CFGA + group * 4
+
+-- Within a CFG register, pin N occupies bits [4*(N % 8) .. 4*(N % 8)+3].
+-- Output push-pull = 0x1 (per Apollo2 GPIO_CFG.GPIO<N>_OUTCFG field encoding).
+cfg_shift_for pin = shl 1 (4 * (pin - (pin / 8) * 8))
+
+-- Bit mask for pin N within a 32-pin register (0..31).
+pin_bit pin = shl 1 pin
+
+-- Unlock pad config: PADKEY must be 0x73 before any PADREG write.
+unlock_pads = mmio_write GPIO_PADKEY PADKEY_VALUE
+
+-- Configure pin as push-pull output. Leaves PADREG funcsel at default GPIO (0x3).
+gpio_config_output pin =
+  let _ = unlock_pads in
+  let cfg_a = cfg_addr pin in
+  let cur = mmio_read cfg_a in
+  let new_cfg = bit_or cur (cfg_shift_for pin) in
+  let _ = mmio_write cfg_a new_cfg in
+  mmio_write GPIO_ENSA (pin_bit pin)
+
+-- Atomic set / clear via Apollo2's WTSA/WTCA write-1-to-act registers.
+gpio_set pin   = mmio_write GPIO_WTSA (pin_bit pin)
+gpio_clear pin = mmio_write GPIO_WTCA (pin_bit pin)
+
+-- ---------- ISR + main ----------
+
+-- State byte at start of SRAM tracks last LED state (0 or 1).
+state_addr = 0x10000000
+
+SysTick_Handler =
+  let s = mmio_read state_addr in
+  if s == 0 then
+    let _ = gpio_set BLINK_PIN in
+    mmio_write state_addr 1
+  else
+    let _ = gpio_clear BLINK_PIN in
+    mmio_write state_addr 0
+
+-- Apollo2 default HFRC clock is ~48 MHz divided down; SysTick runs off CPU
+-- clock by default with CTRL bit 2 set. LOAD = 24_000_000 -> ~0.5 s tick at
+-- 48 MHz core. Adjust once HFRC trim is verified against datasheet.
+TICK_RELOAD = 24000000
+
+main =
+  let _ = mmio_write state_addr 0 in
+  let _ = gpio_config_output BLINK_PIN in
+  let _ = gpio_clear BLINK_PIN in
+  let _ = mmio_write SYSTICK_LOAD TICK_RELOAD in
+  let _ = mmio_write SYSTICK_CTRL 7 in
+  spin 0
+
+-- Idle loop: WFI would be nicer but cortexm v0.7 has no inline-asm yet.
+spin n = spin (n + 1)

@@ -10,7 +10,7 @@ Usage:
     "mcpServers": {
       "rail": {
         "command": "/opt/homebrew/bin/python3.11",
-        "args": ["$HOME/projects/rail/tools/mcp/rail_mcp.py"]
+        "args": ["~/projects/rail/tools/mcp/rail_mcp.py"]
       }
     }
   }
@@ -25,9 +25,9 @@ import os
 import tempfile
 import time
 
-RAIL_DIR = os.path.expanduser(os.environ.get("RAIL_DIR", "~/projects/rail"))
+RAIL_DIR = os.path.expanduser("~/projects/rail")
 RAIL_BIN = os.path.join(RAIL_DIR, "rail_native")
-GPU_HOST = os.environ.get("GPU_HOST", "")
+RAZER_HOST = "<retired-host>"
 
 
 def run(cmd, timeout=30, cwd=None):
@@ -111,14 +111,14 @@ def tool_fleet_status() -> dict:
     }
 
     # Razer
-    gpu_out, _, rc = run(f"ssh -o ConnectTimeout=5 {GPU_HOST} 'nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null'", timeout=10)
+    gpu_out, _, rc = run(f"ssh -o ConnectTimeout=5 {RAZER_HOST} 'nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null'", timeout=10)
     if rc == 0 and gpu_out.strip():
         result["razer"] = {"status": "up", "gpu": gpu_out.strip()}
     else:
         result["razer"] = {"status": "unreachable"}
 
     # Check Razer training
-    train_log, _, rc = run(f"ssh -o ConnectTimeout=5 {GPU_HOST} 'tail -3 ~/rail_training/v6_train.log 2>/dev/null'", timeout=10)
+    train_log, _, rc = run(f"ssh -o ConnectTimeout=5 {RAZER_HOST} 'tail -3 ~/rail_training/v6_train.log 2>/dev/null'", timeout=10)
     if rc == 0:
         result["razer"]["training_log"] = train_log.strip()
 

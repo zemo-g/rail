@@ -1,0 +1,115 @@
+-- jit/opt_const_fold.rail
+-- Per-block constant propagation + folding.
+-- For ir_add / ir_sub / ir_mul / ir_lt: if both src registers were defined by
+-- ir_const earlier in the SAME block, replace the instruction with an
+-- ir_const of the computed value and update the known-value table.
+--
+-- Block boundaries reset the known table. A block boundary is the
+-- instruction immediately AFTER a terminator (jmp / jz / ret), and at any
+-- position listed in the block_offsets array (we use the offsets directly).
+--
+-- Depends on jit/ir.rail (op codes + accessors). Caller must import that.
+
+-- known is an int_arr of size n_regs storing constant values.
+-- known_set is a parallel int_arr of size n_regs: 1 if reg holds a known const, else 0.
+clear_known known known_set n i =
+  if i >= n then 0
+  else
+    let _ = arr_set known i 0
+    let _ = arr_set known_set i 0
+    clear_known known known_set n (i + 1)
+
+mark_known known known_set r v =
+  let _ = arr_set known r v
+  let _ = arr_set known_set r 1
+  0
+
+clear_reg known known_set r =
+  let _ = arr_set known_set r 0
+  0
+
+-- Returns 1 if instr index `i` is the start of a block (per block_offsets).
+is_block_start blocks n_blocks i =
+  if n_blocks <= 0 then 0
+  else is_block_start_loop blocks n_blocks i 0
+
+is_block_start_loop blocks n_blocks i k =
+  if k >= n_blocks then 0
+  else if arr_get blocks k == i then 1
+  else is_block_start_loop blocks n_blocks i (k + 1)
+
+-- Apply the binary op to two ints.
+apply_binop op x y =
+  if op == op_add then x + y
+  else if op == op_sub then x - y
+  else if op == op_mul then x * y
+  else if op == op_lt then (if x < y then 1 else 0)
+  else 0
+
+-- Walk instructions in order; mutate ir_out (already a copy of ir_in).
+fold_loop ir_out blocks n_blocks n_instr known known_set i =
+  if i >= n_instr then 0
+  else
+    let _ = if is_block_start blocks n_blocks i == 1 then
+              clear_known known known_set (arr_len known) 0
+            else 0
+    let op = ir_op ir_out i
+    let a = ir_a ir_out i
+    let b = ir_b ir_out i
+    let c = ir_c ir_out i
+    let _ = fold_step ir_out known known_set op a b c i
+    fold_loop ir_out blocks n_blocks n_instr known known_set (i + 1)
+
+fold_step ir_out known known_set op a b c i =
+  if op == op_const then
+    let _ = mark_known known known_set a b
+    0
+  else if is_foldable op == 1 then
+    let kb = arr_get known_set b
+    let kc = arr_get known_set c
+    if kb == 1 then
+      if kc == 1 then
+        let xv = arr_get known b
+        let yv = arr_get known c
+        let r = apply_binop op xv yv
+        let _ = ir_set_op ir_out i op_const
+        let _ = ir_set_a ir_out i a
+        let _ = ir_set_b ir_out i r
+        let _ = ir_set_c ir_out i 0
+        let _ = mark_known known known_set a r
+        0
+      else
+        let _ = clear_reg known known_set a
+        0
+    else
+      let _ = clear_reg known known_set a
+      0
+  else if op_writes_dst op == 1 then
+    -- ir_call or anything else that writes dst with unknown value
+    let _ = clear_reg known known_set a
+    0
+  else
+    -- jmp / jz / ret: nothing to mark
+    0
+
+is_foldable op =
+  if op == op_add then 1
+  else if op == op_sub then 1
+  else if op == op_mul then 1
+  else if op == op_lt then 1
+  else 0
+
+-- Public entry point. Returns a new function struct.
+fold_constants fn =
+  let ir_in = fn_ir fn
+  let n_instr = fn_ninstr fn
+  let n_regs = fn_nregs fn
+  let blocks = fn_blocks fn
+  let n_blocks = arr_len blocks
+  let cap = n_instr * 4
+  let ir_out = arr_new cap 0
+  let _ = copy_ir_slots ir_in ir_out n_instr 0
+  let known = arr_new n_regs 0
+  let known_set = arr_new n_regs 0
+  let _ = fold_loop ir_out blocks n_blocks n_instr known known_set 0
+  make_fn ir_out n_instr n_regs blocks

@@ -1,0 +1,451 @@
+-- stdlib/fit.rail — FIT (Flexible and Interoperable Data Transfer) decoder.
+--
+-- Garmin's binary format for activity, monitoring, sleep, and device data.
+-- Spec: https://developer.garmin.com/fit/protocol/.
+--
+-- Files are slurped via `xxd -p` because Rail's read_file builtin truncates
+-- at the first NUL byte. Fine for files up to a few MB; for huge monitoring
+-- archives a future binary read primitive is in order.
+--
+-- Public API (header level — Phase 1):
+--   fit_load path        -> [buf, total_len, data_off, data_end, valid]
+--   fit_buf, fit_total, fit_data_off, fit_data_end, fit_valid
+--   fit_header_size, fit_protocol, fit_profile, fit_data_size
+--
+-- Walker / decoder (Phase 1 next):
+--   fit_summarize fit    -> [def_count, data_count, last_timestamp,
+--                            sport, has_session, total_distance,
+--                            total_timer_ms, avg_hr, file_type, valid]
+
+import "stdlib/bytes.rail"
+
+-- ── FIT epoch ───────────────────────────────────────────────────────────
+-- 1989-12-31T00:00:00Z = unix 631065600.
+fit_epoch_offset = 631065600
+
+fit_unix_of ts = ts + fit_epoch_offset
+
+-- ── Pure-Rail unix → "YYYY-MM-DD HH:MMZ" ───────────────────────────────
+-- Howard Hinnant's civil_from_days (proleptic Gregorian, 64-bit safe).
+-- We need this because shelling out to `date -u -r` and then carrying
+-- the result string across a subsequent multi-MB shell+chars round seems
+-- to corrupt the heap (observed: segfault on the second file processed
+-- in tools/garmin/dump.rail). Doing the conversion in Rail avoids the
+-- whole issue.
+
+fit_civil_from_days z =
+  let z2 = z + 719468
+  let era = if z2 >= 0 then z2 / 146097 else (z2 - 146096) / 146097
+  let doe = z2 - era * 146097
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let y0 = yoe + era * 400
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  let mp = (5 * doy + 2) / 153
+  let d = doy - (153 * mp + 2) / 5 + 1
+  let m = if mp < 10 then mp + 3 else mp - 9
+  let y = if m <= 2 then y0 + 1 else y0
+  let r = arr_new 3 0
+  let _ = arr_set r 0 y
+  let _ = arr_set r 1 m
+  let _ = arr_set r 2 d
+  r
+
+fit_pad2 n =
+  if n < 10 then cat ["0", show n]
+  else show n
+
+fit_fmt_unix_utc unix =
+  if unix <= 0 then "-"
+  else
+    let days = unix / 86400
+    let secs = unix - days * 86400
+    let h = secs / 3600
+    let mi = (secs - h * 3600) / 60
+    let r = fit_civil_from_days days
+    cat [show (arr_get r 0), "-", fit_pad2 (arr_get r 1),
+         "-", fit_pad2 (arr_get r 2), " ",
+         fit_pad2 h, ":", fit_pad2 mi, "Z"]
+
+-- ── Binary-safe slurp ──────────────────────────────────────────────────
+-- xxd -p emits hex with newlines; tr -d '\n' flattens to one stream.
+-- We can't use bytes.hex_to_bytes here because its `length cs < 2` test is
+-- O(N) per iteration, making the whole loop O(N²) — multi-MB files hang.
+-- Instead we look up the size up-front and iterate by byte count, so each
+-- step is O(1) and the total is O(N).
+
+-- String-to-uint, stops at first non-digit. Used for stat output parsing.
+-- Strings are short here so the O(length) recompute is irrelevant.
+fit_parse_uint_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = char_to_int (head cs) - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else fit_parse_uint_acc (tail cs) (acc * 10 + d)
+
+fit_parse_uint s = fit_parse_uint_acc (chars s) 0
+
+-- File size in bytes via stat. Note: stdlib/stat.rail's file_size uses
+-- `to_int` (which is float→int, not string-parse) so it always returns 0;
+-- this is the working version.
+fit_file_size path =
+  let raw = shell (cat ["stat -f '%z' '", path, "' 2>/dev/null"])
+  fit_parse_uint raw
+
+-- Count-based hex decoder. Caller supplies n_bytes so we never call
+-- `length cs` inside the loop.
+fit_hex_digit c =
+  if c >= 48 && c <= 57 then c - 48
+  else if c >= 97 && c <= 102 then c - 87
+  else if c >= 65 && c <= 70 then c - 55
+  else 0 - 1
+
+fit_hex_decode_n cs arr i n =
+  if i >= n then i
+  else
+    let hi = fit_hex_digit (char_to_int (head cs))
+    let lo = fit_hex_digit (char_to_int (head (tail cs)))
+    let _ = arr_set arr i (bit_or (shl hi 4) lo)
+    fit_hex_decode_n (tail (tail cs)) arr (i + 1) n
+
+read_bin_file path =
+  let n = fit_file_size path
+  if n <= 0 then arr_new 0 0
+  else
+    let cmd = cat ["xxd -p '", path, "' | tr -d '\n'"]
+    let hex = shell cmd
+    let cs = chars hex
+    let arr = arr_new n 0
+    let _ = fit_hex_decode_n cs arr 0 n
+    arr
+
+-- ── 16-bit LE/BE word readers (le32_read is in bytes.rail) ─────────────
+
+le16_read buf off =
+  let b0 = arr_get buf off
+  let b1 = arr_get buf (off + 1)
+  bit_or b0 (shl b1 8)
+
+be16_read buf off =
+  let b0 = arr_get buf off
+  let b1 = arr_get buf (off + 1)
+  bit_or (shl b0 8) b1
+
+-- 32-bit big-endian read (be32_read in bytes.rail predates this; same impl).
+fit_be32_read buf off =
+  let b0 = arr_get buf off
+  let b1 = arr_get buf (off + 1)
+  let b2 = arr_get buf (off + 2)
+  let b3 = arr_get buf (off + 3)
+  bit_or (bit_or (shl b0 24) (shl b1 16)) (bit_or (shl b2 8) b3)
+
+-- Read N-byte unsigned int, given arch (0=LE, 1=BE). N up to 4.
+fit_read_u buf off n arch =
+  if n == 1 then arr_get buf off
+  else if n == 2 then (if arch == 0 then le16_read buf off else be16_read buf off)
+  else if n == 4 then (if arch == 0 then le32_read buf off else fit_be32_read buf off)
+  else 0
+
+-- Sign-extend a 16-bit value.
+fit_s16 v = if v >= 32768 then v - 65536 else v
+
+-- Sign-extend a 32-bit value (Rail ints are 63-bit, no overflow worry).
+fit_s32 v = if v >= 2147483648 then v - 4294967296 else v
+
+-- ── Header parsing ─────────────────────────────────────────────────────
+-- 12- or 14-byte FIT header:
+--   [0]    header_size (12 or 14)
+--   [1]    protocol_version
+--   [2-3]  profile_version (LE u16)
+--   [4-7]  data_size (LE u32) — bytes between header and trailing CRC
+--   [8-11] ".FIT" magic
+--   [12-13] header CRC (LE u16, FIT 2.0 only)
+
+fit_load path =
+  let buf = read_bin_file path
+  let n = arr_len buf
+  let r = arr_new 5 0
+  let _ = arr_set r 0 buf
+  let _ = arr_set r 1 n
+  if n < 12 then
+    let _ = arr_set r 4 0
+    r
+  else
+    let m0 = arr_get buf 8
+    let m1 = arr_get buf 9
+    let m2 = arr_get buf 10
+    let m3 = arr_get buf 11
+    if m0 == 46 && m1 == 70 && m2 == 73 && m3 == 84 then
+      let hdr_size = arr_get buf 0
+      let dsz = le32_read buf 4
+      let _ = arr_set r 2 hdr_size
+      let _ = arr_set r 3 (hdr_size + dsz)
+      let _ = arr_set r 4 1
+      r
+    else
+      let _ = arr_set r 4 0
+      r
+
+fit_buf fit = arr_get fit 0
+fit_total fit = arr_get fit 1
+fit_data_off fit = arr_get fit 2
+fit_data_end fit = arr_get fit 3
+fit_valid fit = arr_get fit 4
+
+fit_header_size fit = arr_get (fit_buf fit) 0
+fit_protocol fit = arr_get (fit_buf fit) 1
+fit_profile fit = le16_read (fit_buf fit) 2
+fit_data_size fit = le32_read (fit_buf fit) 4
+
+-- ── Schema table ───────────────────────────────────────────────────────
+-- 16-slot table indexed by local message type (4-bit). Each slot is 0
+-- (no schema yet) or a schema array:
+--   [0] global_msg_num (u16)
+--   [1] arch (0=LE, 1=BE)
+--   [2] num_fields
+--   [3] total body size (sum of all field sizes)
+--   For i in 0..num_fields-1:
+--     [4 + 4*i + 0] field_def_num
+--     [4 + 4*i + 1] size (bytes)
+--     [4 + 4*i + 2] base_type
+--     [4 + 4*i + 3] field_offset (bytes from start of data record body)
+
+schema_global s = arr_get s 0
+schema_arch s = arr_get s 1
+schema_nfields s = arr_get s 2
+schema_total s = arr_get s 3
+schema_field_def s i = arr_get s (4 + 4 * i)
+schema_field_size s i = arr_get s (4 + 4 * i + 1)
+schema_field_type s i = arr_get s (4 + 4 * i + 2)
+schema_field_offset s i = arr_get s (4 + 4 * i + 3)
+
+-- Build a schema by reading num_fields field-definition triples from buf
+-- starting at off. Returns [schema, total_body_size].
+parse_def_fields schema buf off n i acc =
+  if i >= n then acc
+  else
+    let fdef = arr_get buf (off + 3 * i)
+    let sz = arr_get buf (off + 3 * i + 1)
+    let bt = arr_get buf (off + 3 * i + 2)
+    let base = 4 + 4 * i
+    let _ = arr_set schema base fdef
+    let _ = arr_set schema (base + 1) sz
+    let _ = arr_set schema (base + 2) bt
+    let _ = arr_set schema (base + 3) acc
+    parse_def_fields schema buf off n (i + 1) (acc + sz)
+
+-- Parse a definition message starting at off (one byte past record header).
+-- has_dev = 1 if record header bit 5 set. Returns [schema, after_off].
+parse_def buf off has_dev =
+  let arch = arr_get buf (off + 1)
+  let global = if arch == 0 then le16_read buf (off + 2) else be16_read buf (off + 2)
+  let nf = arr_get buf (off + 4)
+  let body_off = off + 5
+  let s = arr_new (4 + 4 * nf) 0
+  let _ = arr_set s 0 global
+  let _ = arr_set s 1 arch
+  let _ = arr_set s 2 nf
+  let total = parse_def_fields s buf body_off nf 0 0
+  let _ = arr_set s 3 total
+  let dev_off = body_off + 3 * nf
+  let after = if has_dev == 1 then
+                let ndev = arr_get buf dev_off
+                dev_off + 1 + 3 * ndev
+              else dev_off
+  let r = arr_new 2 0
+  let _ = arr_set r 0 s
+  let _ = arr_set r 1 after
+  r
+
+-- ── Field-value reader ─────────────────────────────────────────────────
+-- Returns a tagged result: [kind, value_int, field_off, size]
+--   kind 0 = unsigned int (or enum/byte)
+--   kind 1 = signed int
+--   kind 2 = string (value_int unused; caller can read bytes via field_off)
+--   kind 3 = invalid / unsupported (skip)
+--
+-- base_type encoding (FIT SDK):
+--   0x00 enum, 0x01 sint8, 0x02 uint8, 0x83 sint16, 0x84 uint16,
+--   0x85 sint32, 0x86 uint32, 0x07 string, 0x88 float32, 0x89 float64,
+--   0x0A uint8z, 0x8B uint16z, 0x8C uint32z, 0x0D byte, 0x8E sint64,
+--   0x8F uint64, 0x90 uint64z
+
+fit_decode_field buf off sz base_type arch =
+  let r = arr_new 4 0
+  let _ = arr_set r 2 off
+  let _ = arr_set r 3 sz
+  if base_type == 0 || base_type == 2 || base_type == 10 || base_type == 13 then
+    -- enum / uint8 / uint8z / byte (1B each, but byte arrays may be Nx1B)
+    if sz == 1 then
+      let _ = arr_set r 0 0
+      let _ = arr_set r 1 (arr_get buf off)
+      r
+    else
+      let _ = arr_set r 0 3
+      r
+  else if base_type == 1 then
+    let v = arr_get buf off
+    let _ = arr_set r 0 1
+    let _ = arr_set r 1 (if v >= 128 then v - 256 else v)
+    r
+  else if base_type == 132 then
+    -- 0x84 uint16
+    let _ = arr_set r 0 0
+    let _ = arr_set r 1 (fit_read_u buf off 2 arch)
+    r
+  else if base_type == 139 then
+    -- 0x8B uint16z
+    let _ = arr_set r 0 0
+    let _ = arr_set r 1 (fit_read_u buf off 2 arch)
+    r
+  else if base_type == 131 then
+    -- 0x83 sint16
+    let v = fit_read_u buf off 2 arch
+    let _ = arr_set r 0 1
+    let _ = arr_set r 1 (fit_s16 v)
+    r
+  else if base_type == 134 then
+    -- 0x86 uint32
+    let _ = arr_set r 0 0
+    let _ = arr_set r 1 (fit_read_u buf off 4 arch)
+    r
+  else if base_type == 140 then
+    -- 0x8C uint32z
+    let _ = arr_set r 0 0
+    let _ = arr_set r 1 (fit_read_u buf off 4 arch)
+    r
+  else if base_type == 133 then
+    -- 0x85 sint32
+    let v = fit_read_u buf off 4 arch
+    let _ = arr_set r 0 1
+    let _ = arr_set r 1 (fit_s32 v)
+    r
+  else if base_type == 7 then
+    -- 0x07 string (UTF-8, NUL-padded)
+    let _ = arr_set r 0 2
+    r
+  else
+    -- floats / 64-bit ints / unhandled — skip for Phase 1
+    let _ = arr_set r 0 3
+    r
+
+-- ── High-level summary walk ────────────────────────────────────────────
+-- State arr layout (10 ints):
+--   [0] off (cursor in buf)
+--   [1] def_count
+--   [2] data_count
+--   [3] last_timestamp (FIT epoch seconds, 0 if none)
+--   [4] sport (-1 if unset)
+--   [5] has_session (0/1)
+--   [6] total_distance (uint32, FIT scale: cm; *0.01 → metres)
+--   [7] total_timer_time (uint32, FIT scale: ms; *0.001 → seconds)
+--   [8] avg_heart_rate (uint8, bpm)
+--   [9] file_type (-1 if unset)
+
+state_new _ =
+  let s = arr_new 10 0
+  let _ = arr_set s 4 (0 - 1)
+  let _ = arr_set s 9 (0 - 1)
+  s
+
+-- Look at a decoded data message of global type `g` and pull out the
+-- well-known fields (file_id type, session totals, record timestamp, etc.).
+-- schema = the def schema; record_off = first byte of data body.
+state_observe state schema buf record_off =
+  let g = schema_global schema
+  let nf = schema_nfields schema
+  let arch = schema_arch schema
+  if g == 0 then state_observe_file_id state schema buf record_off nf arch 0
+  else if g == 18 then
+    let _ = arr_set state 5 1
+    state_observe_session state schema buf record_off nf arch 0
+  else if g == 20 then state_observe_record state schema buf record_off nf arch 0
+  else state
+
+state_observe_file_id state schema buf rec_off nf arch i =
+  if i >= nf then state
+  else
+    let fdef = schema_field_def schema i
+    let sz = schema_field_size schema i
+    let bt = schema_field_type schema i
+    let foff = rec_off + schema_field_offset schema i
+    let dec = fit_decode_field buf foff sz bt arch
+    let kind = arr_get dec 0
+    let v = arr_get dec 1
+    if fdef == 0 && kind == 0 then
+      let _ = arr_set state 9 v
+      state_observe_file_id state schema buf rec_off nf arch (i + 1)
+    else state_observe_file_id state schema buf rec_off nf arch (i + 1)
+
+state_observe_session state schema buf rec_off nf arch i =
+  if i >= nf then state
+  else
+    let fdef = schema_field_def schema i
+    let sz = schema_field_size schema i
+    let bt = schema_field_type schema i
+    let foff = rec_off + schema_field_offset schema i
+    let dec = fit_decode_field buf foff sz bt arch
+    let kind = arr_get dec 0
+    let v = arr_get dec 1
+    let _ = if fdef == 5 && kind == 0 then arr_set state 4 v
+            else if fdef == 9 && kind == 0 then arr_set state 6 v
+            else if fdef == 8 && kind == 0 then arr_set state 7 v
+            else if fdef == 16 && kind == 0 then arr_set state 8 v
+            else 0
+    state_observe_session state schema buf rec_off nf arch (i + 1)
+
+state_observe_record state schema buf rec_off nf arch i =
+  if i >= nf then state
+  else
+    let fdef = schema_field_def schema i
+    let sz = schema_field_size schema i
+    let bt = schema_field_type schema i
+    let foff = rec_off + schema_field_offset schema i
+    let dec = fit_decode_field buf foff sz bt arch
+    let kind = arr_get dec 0
+    let v = arr_get dec 1
+    let _ = if fdef == 253 && kind == 0 then arr_set state 3 v else 0
+    state_observe_record state schema buf rec_off nf arch (i + 1)
+
+-- ── Walker ─────────────────────────────────────────────────────────────
+-- table = arr_new 16 0 — local-id → schema (or 0).
+
+fit_walk fit table state =
+  let buf = fit_buf fit
+  let off = arr_get state 0
+  let endp = fit_data_end fit
+  if off >= endp then state
+  else
+    let h = arr_get buf off
+    let after_hdr = off + 1
+    if bit_and h 128 != 0 then
+      -- Compressed timestamp header: deferred to Phase 1.1. Halt walk.
+      state
+    else
+      let local_id = bit_and h 15
+      if bit_and h 64 != 0 then
+        -- Definition message
+        let has_dev = bit_and (shr h 5) 1
+        let dr = parse_def buf after_hdr has_dev
+        let schema = arr_get dr 0
+        let after = arr_get dr 1
+        let _ = arr_set table local_id schema
+        let _ = arr_set state 0 after
+        let _ = arr_set state 1 (arr_get state 1 + 1)
+        fit_walk fit table state
+      else
+        -- Data message
+        let schema = arr_get table local_id
+        if schema == 0 then state
+        else
+          let body = schema_total schema
+          let new_state = state_observe state schema buf after_hdr
+          let _ = arr_set new_state 0 (after_hdr + body)
+          let _ = arr_set new_state 2 (arr_get new_state 2 + 1)
+          fit_walk fit table new_state
+
+fit_summarize fit =
+  let table = arr_new 16 0
+  let st = state_new 0
+  let _ = arr_set st 0 (fit_data_off fit)
+  fit_walk fit table st

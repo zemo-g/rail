@@ -1,0 +1,189 @@
+-- stdlib/fit_emit.rail - FIT encoder: programmatically build a valid (or
+-- deliberately invalid) FIT file as a byte buffer.
+--
+-- Inverse pass of stdlib/fit.rail. Used by tools/garmin/fuzz_fit.rail to
+-- generate corrupted FIT files for parser-fuzz testing on the sealed
+-- Garmin Instinct.
+--
+-- Public API:
+--   fe_new capacity                  -> emitter (a 4-element arr [buf, off, cap, n_records])
+--   fe_buf, fe_off, fe_cap
+--   fe_write_u8, fe_write_u16_le, fe_write_u32_le, fe_write_bytes
+--   fe_emit_header total_data_size   -> writes the 14-byte header (incl trailing CRC field)
+--   fe_emit_def local_id global_id arch fields    -> Definition message
+--                                                       fields = list of [field_def_num, size, base_type]
+--   fe_emit_data local_id payload    -> Data message
+--   fe_finalize_crc emitter          -> compute trailing CRC + patch header data_size
+--
+-- For mutator use, emitters intentionally don't enforce structural
+-- invariants - the caller can pass nonsense values and emit them as-is.
+-- That's the whole point.
+
+-- ---- byte buffer helpers --------------------------------------------
+
+fe_new capacity =
+  let s = arr_new 4 0
+  let _ = arr_set s 0 (arr_new capacity 0)
+  let _ = arr_set s 1 0                  -- offset
+  let _ = arr_set s 2 capacity
+  let _ = arr_set s 3 0                  -- record count
+  s
+
+fe_buf s = arr_get s 0
+fe_off s = arr_get s 1
+fe_cap s = arr_get s 2
+
+fe_write_u8 s v =
+  let buf = fe_buf s
+  let off = fe_off s
+  let _ = arr_set buf off (bit_and v 255)
+  let _ = arr_set s 1 (off + 1)
+  0
+
+fe_write_u16_le s v =
+  let _ = fe_write_u8 s (bit_and v 255)
+  let _ = fe_write_u8 s (bit_and (shr v 8) 255)
+  0
+
+fe_write_u32_le s v =
+  let _ = fe_write_u8 s (bit_and v 255)
+  let _ = fe_write_u8 s (bit_and (shr v 8) 255)
+  let _ = fe_write_u8 s (bit_and (shr v 16) 255)
+  let _ = fe_write_u8 s (bit_and (shr v 24) 255)
+  0
+
+fe_write_bytes_loop s bytes i n =
+  if i >= n then 0
+  else
+    let _ = fe_write_u8 s (arr_get bytes i)
+    fe_write_bytes_loop s bytes (i + 1) n
+
+fe_write_bytes s bytes n = fe_write_bytes_loop s bytes 0 n
+
+-- ---- Header emit ----------------------------------------------------
+-- 14-byte FIT 2.0 header:
+--   header_size (1) = 14
+--   protocol     (1) = 0x10
+--   profile      (2 LE) = 2165
+--   data_size    (4 LE) = (filled at finalize)
+--   ".FIT"       (4)
+--   header_crc   (2 LE) = 0 (we don't bother computing it; many devices ignore it)
+
+fe_emit_header s placeholder_data_size =
+  let _ = fe_write_u8 s 14
+  let _ = fe_write_u8 s 16
+  let _ = fe_write_u16_le s 2165
+  let _ = fe_write_u32_le s placeholder_data_size
+  let _ = fe_write_u8 s 46    -- '.'
+  let _ = fe_write_u8 s 70    -- 'F'
+  let _ = fe_write_u8 s 73    -- 'I'
+  let _ = fe_write_u8 s 84    -- 'T'
+  let _ = fe_write_u16_le s 0
+  0
+
+-- Patch the data_size field (offset 4-7) after the body has been written.
+fe_patch_data_size s data_size =
+  let buf = fe_buf s
+  let _ = arr_set buf 4 (bit_and data_size 255)
+  let _ = arr_set buf 5 (bit_and (shr data_size 8) 255)
+  let _ = arr_set buf 6 (bit_and (shr data_size 16) 255)
+  let _ = arr_set buf 7 (bit_and (shr data_size 24) 255)
+  0
+
+-- ---- Record emit ----------------------------------------------------
+-- Definition message:
+--   record_header (1) = 0x40 | local_id  (bit 6 set = definition)
+--   reserved      (1) = 0
+--   architecture  (1) = arch (0 = LE, 1 = BE)
+--   global_msg    (2) = global_id (LE if arch=0, BE if arch=1)
+--   num_fields    (1)
+--   field_defs    (3 * num_fields)  - each: field_def_num, size, base_type
+
+fe_emit_def_field_loop s fields =
+  if length fields == 0 then 0
+  else
+    let f = head fields  -- f is arr [fdef_num, size, base_type]
+    let _ = fe_write_u8 s (arr_get f 0)
+    let _ = fe_write_u8 s (arr_get f 1)
+    let _ = fe_write_u8 s (arr_get f 2)
+    fe_emit_def_field_loop s (tail fields)
+
+fe_emit_def s local_id global_id arch fields =
+  let _ = fe_write_u8 s (bit_or 64 (bit_and local_id 15))
+  let _ = fe_write_u8 s 0
+  let _ = fe_write_u8 s arch
+  if arch == 0 then
+    let _ = fe_write_u16_le s global_id
+    let _ = fe_write_u8 s (length fields)
+    let _ = fe_emit_def_field_loop s fields
+    let _ = arr_set s 3 (arr_get s 3 + 1)
+    0
+  else
+    -- BE: write high byte first
+    let _ = fe_write_u8 s (bit_and (shr global_id 8) 255)
+    let _ = fe_write_u8 s (bit_and global_id 255)
+    let _ = fe_write_u8 s (length fields)
+    let _ = fe_emit_def_field_loop s fields
+    let _ = arr_set s 3 (arr_get s 3 + 1)
+    0
+
+-- Data message:
+--   record_header (1) = local_id  (bits 6, 7 = 0)
+--   payload bytes per the schema  (caller-provided as arr + len)
+
+fe_emit_data s local_id payload n =
+  let _ = fe_write_u8 s (bit_and local_id 15)
+  let _ = fe_write_bytes s payload n
+  let _ = arr_set s 3 (arr_get s 3 + 1)
+  0
+
+-- Trailing 2-byte CRC: many parsers don't validate it. We write zeros
+-- by default; mutator can override.
+
+fe_emit_trailing_crc s value =
+  let _ = fe_write_u16_le s value
+  0
+
+-- ---- Finalize: compute the data_size and patch header ---------------
+-- data_size in the header excludes the header itself (14 bytes) and the
+-- trailing 2-byte CRC.
+
+fe_finalize s =
+  let total = fe_off s
+  let data_size = total - 14
+  let _ = fe_patch_data_size s data_size
+  total
+
+-- ---- Helper: build a small "list of field defs" via vararg-like API --
+
+fe_field fdef sz base_type =
+  let r = arr_new 3 0
+  let _ = arr_set r 0 fdef
+  let _ = arr_set r 1 sz
+  let _ = arr_set r 2 base_type
+  r
+
+-- ---- Hex output (for shell pipeline, since write_file truncates at NUL) --
+
+fe_to_hex s =
+  let buf = fe_buf s
+  let n = fe_off s
+  fe_to_hex_loop buf n 0 ""
+
+fe_to_hex_loop buf n i acc =
+  if i >= n then acc
+  else
+    let b = arr_get buf i
+    let hi = bit_and (shr b 4) 15
+    let lo = bit_and b 15
+    let ch = if hi < 10 then char_from_int (48 + hi) else char_from_int (87 + hi)
+    let cl = if lo < 10 then char_from_int (48 + lo) else char_from_int (87 + lo)
+    fe_to_hex_loop buf n (i + 1) (cat [acc, ch, cl])
+
+-- Write the byte buffer to disk via shell + xxd (avoids NUL-truncation
+-- in write_file).
+fe_save s path =
+  let hex = fe_to_hex s
+  let _ = write_file (cat [path, ".hex"]) hex
+  let _ = shell (cat ["xxd -r -p '", path, ".hex' > '", path, "' && rm '", path, ".hex'"])
+  0
