@@ -134,6 +134,169 @@ long rcon_chan_recv(long h) {
     return (long)v;
 }
 
+// Recv variant intended for the v1 typed-channel wrapper:
+// returns the same int64 as rcon_chan_recv, but is declared on the Rail
+// side as `-> ptr` so the FFI emitter skips the int-retag (`lsl x0,#1; orr
+// x0,#1`). Used to round-trip raw 64-bit handles to heap-allocated boxes
+// (see stdlib/concurrent.rail::chan_send_v / chan_recv_v).
+//
+// Rail-side arg untagging is still applied to the channel handle (small
+// int, fits cleanly), so no caller change is needed for that arg.
+long rcon_chan_recv_box(long h) {
+    return rcon_chan_recv(h);
+}
+
+
+// ── select primitive (v1) ───────────────────────────────────────────────────
+//
+// Try-recv on each channel in turn; if any has a value, return its index
+// and write the value to *out. If all are empty and at least one is open,
+// sleep briefly and retry. If all are empty and all are closed, return -1.
+//
+// `handles` points to a Rail mutable-array data block (see _rail_arr_new
+// layout: [tag, len, slot_0, slot_1, ...]). We dispatch via a small adapter
+// since the Rail side passes the array pointer verbatim.
+//
+// Performance characteristic: this is a busy-poll with usleep(50us) between
+// rounds. v1 is correctness-first; a true cond-var-driven select (single
+// shared cond + per-channel registration) is deferred to v2.
+//
+// Returns:
+//   >=0  : index of channel that produced a value; *out_value holds it
+//   -1   : all channels closed and drained (caller should treat as EOF)
+
+#include <unistd.h>
+
+// blocking try-once: returns 1 + sets *out if c has a value; 0 otherwise.
+// Distinguishes "empty-but-open" (0) from "empty-and-closed" (-1) via *closed_out.
+static int try_recv_locked(rc_chan_t *c, int64_t *out, int *closed_out) {
+    pthread_mutex_lock(&c->mu);
+    if (c->count > 0) {
+        *out = c->buf[c->head];
+        c->head = (c->head + 1) % c->capacity;
+        c->count--;
+        pthread_cond_signal(&c->not_full);
+        *closed_out = 0;
+        pthread_mutex_unlock(&c->mu);
+        return 1;
+    }
+    *closed_out = c->closed ? 1 : 0;
+    pthread_mutex_unlock(&c->mu);
+    return 0;
+}
+
+// rail_arr_new layout: [type_tag(8), len(8), slot_0(8), slot_1(8), ...]
+// (verified empirically via arr_set/arr_get codegen at compile.rail:1199-1204
+//  which addresses slot_i at base + (i+2)*8).
+static int64_t arr_slot(long arr_ptr, int idx) {
+    int64_t *base = (int64_t*)arr_ptr;
+    return base[2 + idx];
+}
+
+// Untag a Rail tagged-int (LSB=1: arithmetic shift right by 1).
+// LSB=0 values pass through untouched (heap pointers, etc.).
+static int64_t rail_untag(int64_t v) {
+    if (v & 1) return v >> 1;
+    return v;
+}
+
+// Generic select across `count` channels held in `handles_arr`. Returns
+// the index of the channel that produced a value, or -1 if all closed.
+// The recv'd value is placed into the first slot of `out_value_arr` (also
+// a Rail mutable array of length >= 1).
+//
+// Both array pointers come in as Rail heap pointers (LSB=0); Rail's FFI
+// untag is a CSEL no-op for them.
+//
+// `as_tagged_int`:
+//   0 = store the raw wire value (v0 boxed-ptr path: caller derefs)
+//   1 = pre-retag the wire value as Rail tagged int `(v << 1) | 1`
+//       so the caller can read via arr_get and use as a normal int
+//       without further bit manipulation
+//
+// Fairness: a process-wide rotating cursor (`g_select_cursor`) is the
+// scan starting offset on every call. Without rotation, an always-ready
+// channel-0 would starve the rest. The cursor is incremented on each
+// call (atomic-relaxed semantics; tearing on the int is benign for our
+// purposes since the only requirement is "eventually all values").
+static unsigned int g_select_cursor = 0;
+
+static long select_loop(long handles_arr, long count, long out_value_arr, int as_tagged_int) {
+    int64_t *out_base = (int64_t*)out_value_arr;
+    int64_t *out_slot = &out_base[2];  // slot 0 of the out array
+    if (count <= 0) { *out_slot = 0; return -1; }
+    unsigned int rot = g_select_cursor++;
+    while (1) {
+        int all_closed = 1;
+        // Round-robin starting at `rot` (advanced each call) so we don't
+        // perpetually favor channel 0 when several are simultaneously ready.
+        for (long step = 0; step < count; step++) {
+            long i = (rot + step) % count;
+            long h = (long)rail_untag(arr_slot(handles_arr, (int)i));
+            rc_chan_t *c = chan_lookup(h);
+            if (!c) continue;  // bad handle is "closed" for our purposes
+            int64_t v = 0;
+            int closed = 0;
+            int got = try_recv_locked(c, &v, &closed);
+            if (got) {
+                *out_slot = as_tagged_int ? ((v << 1) | 1) : v;
+                return i;
+            }
+            if (!closed) all_closed = 0;
+        }
+        if (all_closed) {
+            *out_slot = 0;
+            return -1;
+        }
+        // Brief sleep + advance rot to give a different channel
+        // first-chance on the next poll round.
+        rot++;
+        usleep(50);  // 50us busy-poll cadence
+    }
+}
+
+// Boxed-value select (for v1 typed channels carrying box pointers).
+// Caller unboxes via arr_get on the recv'd box.
+long rcon_chan_select(long handles_arr, long count, long out_value_arr) {
+    return select_loop(handles_arr, count, out_value_arr, 0);
+}
+
+// Int-value select (for v0 raw-int channels). Pre-retags the wire value
+// as a Rail tagged int so the Rail caller can use arr_get + the value
+// directly as a normal int.
+long rcon_chan_select_int(long handles_arr, long count, long out_value_arr) {
+    return select_loop(handles_arr, count, out_value_arr, 1);
+}
+
+// Non-blocking variant: scans once; returns -1 immediately if no channel
+// has a value. Distinct from rcon_chan_select's -1 (all-closed) — caller
+// pairs with a sentinel default value at the Rail level.
+static long select_try_once(long handles_arr, long count, long out_value_arr, int as_tagged_int) {
+    int64_t *out_base = (int64_t*)out_value_arr;
+    int64_t *out_slot = &out_base[2];
+    for (long i = 0; i < count; i++) {
+        long h = (long)rail_untag(arr_slot(handles_arr, (int)i));
+        rc_chan_t *c = chan_lookup(h);
+        if (!c) continue;
+        int64_t v = 0;
+        int closed = 0;
+        if (try_recv_locked(c, &v, &closed)) {
+            *out_slot = as_tagged_int ? ((v << 1) | 1) : v;
+            return i;
+        }
+    }
+    *out_slot = 0;
+    return -1;
+}
+
+long rcon_chan_select_try(long handles_arr, long count, long out_value_arr) {
+    return select_try_once(handles_arr, count, out_value_arr, 0);
+}
+
+long rcon_chan_select_int_try(long handles_arr, long count, long out_value_arr) {
+    return select_try_once(handles_arr, count, out_value_arr, 1);
+}
+
 // Closes a channel: wakes all blocked senders/recvers, drains permitted but
 // subsequent send returns 0 and subsequent recv on empty returns INT64_MIN.
 long rcon_chan_close(long h) {
