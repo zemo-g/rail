@@ -100,7 +100,7 @@ You're doing it.
 
 ### Phase 1 — Razer environment check (15 min)
 Before writing any code:
-- SSH to Razer (`ssh Detro@100.109.63.37`)
+- SSH to Razer (`ssh <retired-host>`)
 - Verify `flywheel/train_cuda.py` still loads the 4B base model + the
   current adapter (`training/adapters_4b_v5_mlx/`)
 - Verify `nvidia-smi` shows the 8 GB VRAM free
@@ -280,7 +280,7 @@ spike, not engineering. **Expect to learn something either way.**
 
 ## What I'd want to see before starting
 
-1. The Razer SSH session is alive (`ssh Detro@100.109.63.37 'nvidia-smi'`)
+1. The Razer SSH session is alive (`ssh <retired-host> 'nvidia-smi'`)
 2. The current LoRA adapter still loads cleanly:
    `python3 flywheel/train_cuda.py --load-only`
 3. The 14/30 baseline is still reproducible — run `flywheel/bench.rail`

@@ -15,7 +15,7 @@
 // Build:
 //   clang -shared -fobjc-arc \
 //     -framework CoreGraphics -framework Foundation -framework AppKit \
-//     -install_name /Users/user/projects/rail/tools/desk/libquartz_bridge.dylib \
+//     -install_name ~/projects/rail/tools/desk/libquartz_bridge.dylib \
 //     tools/desk/quartz_bridge.m -o tools/desk/libquartz_bridge.dylib
 //
 // Status: SKETCH. Skeleton compiles; tap installation + ring buffer TODO.

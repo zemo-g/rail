@@ -1,7 +1,7 @@
 # Auto-memo fib correctness fix
 
 **Branch**: `worktree-agent-a599a24c724e77632`
-**Worktree**: `/Users/user/projects/rail/.claude/worktrees/agent-a599a24c724e77632`
+**Worktree**: `~/projects/rail/.claude/worktrees/agent-a599a24c724e77632`
 **Date**: 2026-05-13
 
 ## Root cause

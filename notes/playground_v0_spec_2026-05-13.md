@@ -44,12 +44,12 @@ Cons / mitigations:
 
 ## Build artifacts (what files land where)
 
-- **Rail repo** (`/Users/user/projects/rail/`):
+- **Rail repo** (`~/projects/rail/`):
   - `tools/playground/compile_server.rail` — the HTTP handler binary (uses `stdlib/http_server.rail` + `tools/http_server.py` driver). Pattern: same as `tools/http_demo.rail`.
   - `tools/playground/sanitize.rail` — strip dangerous builtins from AST before compile (or fork `tools/compile.rail` into a `--playground-mode` flag).
   - `examples/playground/` — link to existing `examples/wasm/*.rail` (no new sources).
   - Memory entry update: `playground_v0.md` after ship.
-- **ledatic-site repo** (`/Users/user/projects/ledatic-site/`):
+- **ledatic-site repo** (`~/projects/ledatic-site/`):
   - `playground.html` — single-page editor + run button. Vanilla JS + a tiny editor (CodeMirror 6 minimal build, ~80 KB, or just a styled `<textarea>` for v0 honesty).
   - `_shared/rail_playground.js` — WASM instantiation shim (extends the existing demo runner pattern).
   - `worker/worker.js` — add `/api/playground/compile` route that proxies to Mini's compile service over Tailscale.

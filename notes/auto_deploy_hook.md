@@ -42,7 +42,7 @@ Cloudflare KV  ->  Worker  ->  https://ledatic.org/rail/docs/
 | `~/projects/ledatic-site/tools/build_rail_docs.sh`         | md->html builder, parameterized via SRC/OUT env vars     |
 | `~/log/rail-docs-deploy.log`                               | Append-only deploy log (UTC timestamps)                  |
 
-The Studio-side builder at `/Users/user/projects/ledatic-site/tools/build_rail_docs.sh`
+The Studio-side builder at `~/projects/ledatic-site/tools/build_rail_docs.sh`
 is unchanged. Mini's copy is functionally identical but reads `SRC` / `OUT` from
 env so the same script serves both manual (Studio) and auto (Mini) flows.
 
@@ -60,7 +60,7 @@ Empty file is harmless. The file is checked on every push.
   and no deploy fires.
 - **Full rollback**: restore the saved pre-existing hook:
   ```
-  ssh ledaticempire@mini.tb 'cp ~/git/rail.git/hooks/post-receive.bak.* \
+  ssh <user>@<host> 'cp ~/git/rail.git/hooks/post-receive.bak.* \
     ~/git/rail.git/hooks/post-receive'
   ```
 - **Restrict allowlist**: edit / truncate `~/git/rail.git/docs-deploy-branches`.
@@ -101,7 +101,7 @@ The hook never breaks `git push`. Every failure path is logged and swallowed:
 After landing this feature on `next`, run a trivial doc edit + push and check:
 
 ```bash
-ssh ledaticempire@mini.tb 'tail -30 ~/log/rail-docs-deploy.log'
+ssh <user>@<host> 'tail -30 ~/log/rail-docs-deploy.log'
 curl -s -o /dev/null -w "%{http_code}\n" https://ledatic.org/rail/docs/
 ```
 

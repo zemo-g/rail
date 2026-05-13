@@ -18,12 +18,12 @@
 #      mid-comment by the lexer)
 #   5. Tear down. Exit 0 = PASS, non-zero = FAIL.
 #
-# Run from anywhere; uses RAIL_ROOT (default /Users/user/projects/rail).
+# Run from anywhere; uses RAIL_ROOT (default ~/projects/rail).
 
 set -u
 set -o pipefail
 
-RAIL_ROOT="${RAIL_ROOT:-/Users/user/projects/rail}"
+RAIL_ROOT="${RAIL_ROOT:-~/projects/rail}"
 PORT="${PORT:-8766}"
 
 cleanup() {

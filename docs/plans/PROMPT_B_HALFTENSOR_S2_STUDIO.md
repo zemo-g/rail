@@ -113,7 +113,7 @@ When a new `stdlib: X_half wrapper` commit appears:
    ```bash
    cd tools/metal && clang -shared -fobjc-arc \
      -framework Metal -framework Foundation \
-     -install_name /Users/user/projects/rail/tools/metal/libtensor_gpu.dylib \
+     -install_name ~/projects/rail/tools/metal/libtensor_gpu.dylib \
      tensor_gpu_lib.m -o libtensor_gpu.dylib
    ```
 4. 10-step smoke to verify numerics still clean.

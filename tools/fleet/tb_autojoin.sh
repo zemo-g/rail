@@ -16,7 +16,7 @@ set -u
 
 LOG="/var/log/tb_autojoin.log"
 LOG_MAX=1048576                  # 1 MiB
-TB_IP_FILE="/Users/ledaticempire/.fleet/tb-ip"
+TB_IP_FILE="~/.fleet/tb-ip"
 
 # ── Rotate log if oversized ─────────────────────────────────────────────────
 if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ]; then

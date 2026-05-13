@@ -81,11 +81,11 @@ fi
 
 step "Install systemd unit files"
 # Patch ExecStart and User= to match the actual install location and
-# user, since the bundled service files assume /home/zemog.
+# user, since the bundled service files assume <HOME>.
 for unit in witness.service witness_push.service; do
   tmp=$(mktemp)
-  sed -e "s|/home/zemog/\.ledatic/witness|$WITNESS_DIR|g" \
-      -e "s|^User=zemog|User=$USER|" \
+  sed -e "s|~/\.ledatic/witness|$WITNESS_DIR|g" \
+      -e "s|^User=<user>|User=$USER|" \
       "$unit" > "$tmp"
   $SUDO install -m 644 "$tmp" "/etc/systemd/system/$unit"
   rm -f "$tmp"

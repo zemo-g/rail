@@ -6,7 +6,7 @@ This doc is the end-to-end recipe.
 
 ## Prerequisites
 
-- Pi reachable via Tailscale. From `tools/fleet/WITNESSES.md`: fleet0 = Pi Zero 2 W, Tailscale IP `100.87.231.45`. SSH alias `pi` is conventional but verify with `ssh pi hostname` before relying on it.
+- Pi reachable via Tailscale. From `tools/fleet/WITNESSES.md`: fleet0 = Pi Zero 2 W, Tailscale IP `<witness-tailscale-ip>`. SSH alias `pi` is conventional but verify with `ssh pi hostname` before relying on it.
 - The shared `BEACON_TOKEN` lives at `~/.ledatic/entropy/beacon_token` on Studio (used by `tools/attest/frame_attest_ot256_publisher.sh`). Same token authenticates both the entropy publisher (Studio → Worker) and the witness publisher (Pi → Worker).
 - Pi has `openssl`, `curl`, `python3`, `systemctl`, `sha256sum`. Stock Raspberry Pi OS includes all of these.
 
@@ -14,7 +14,7 @@ This doc is the end-to-end recipe.
 
 ```bash
 # 1. From Studio (or wherever the rail repo lives):
-PI=pi   # or 100.87.231.45 — whichever resolves on the tailnet
+PI=pi   # or <witness-tailscale-ip> — whichever resolves on the tailnet
 cd ~/projects/rail
 
 ssh "$PI" 'mkdir -p ~/.ledatic/witness'
@@ -42,7 +42,7 @@ It will:
 2. Generate `witness.sk` (Ed25519) on first run, reuse on subsequent
 3. Print the `pk_fp` (16-hex sha256 of DER-encoded pubkey) for `WITNESSES.md`
 4. Confirm `upload_token` exists (pulls from `$TOKEN_SRC` if not)
-5. Install both systemd units in `/etc/systemd/system/` (rewriting `User=` and the path prefix to match the install location, since the bundled service files assume `/home/zemog/...`)
+5. Install both systemd units in `/etc/systemd/system/` (rewriting `User=` and the path prefix to match the install location, since the bundled service files assume `~/...`)
 6. Pin `WITNESS_NAME=fleet0` via a systemd drop-in if hostname differs
 7. `daemon-reload`, `enable`, `restart` both services
 8. Poll `https://ledatic.org/witness/fleet0/latest` for up to 30 s waiting for the first round-trip, then dump the published record

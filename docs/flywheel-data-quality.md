@@ -221,8 +221,8 @@ cp /tmp/rail_flywheel_data/valid.jsonl /tmp/rail_v4_data/valid.jsonl
 
 **Step 3: Train v4 on Mini (~4h)**
 ```bash
-/Users/ledaticempire/homebrew/bin/python3.11 -m mlx_lm lora \
-  --model /Users/ledaticempire/models/Qwen3.5-4B-4bit \
+~/homebrew/bin/python3.11 -m mlx_lm lora \
+  --model ~/models/Qwen3.5-4B-4bit \
   --train --data /tmp/rail_v4_data/ \
   --iters 3000 --batch-size 1 --learning-rate 1e-5 \
   --num-layers 8 --steps-per-report 100 --steps-per-eval 500 \

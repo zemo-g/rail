@@ -63,7 +63,7 @@ stamping*.
 
 ## Witnesses
 
-### fleet0 (Pi Zero 2 W, Tailscale 100.87.231.45)
+### fleet0 (Pi Zero 2 W, Tailscale <witness-tailscale-ip>)
 
 - **Fingerprint:** `cac5f21a70564aeb`
 - **Algorithm:** Ed25519

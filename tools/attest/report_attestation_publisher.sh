@@ -52,13 +52,13 @@ CLIENT_ID=${7:-demo}
 
 BEACON_URL=${BEACON_URL:-https://ledatic.org/entropy/pulse}
 BEACON_TOKEN_FILE=${BEACON_TOKEN_FILE:-$HOME/.ledatic/entropy/beacon_token}
-WITNESS_HOST=${WITNESS_HOST:-zemog@100.87.231.45}
-SIGNER=${SIGNER:-/home/zemog/.ledatic/witness/sign_attestation.sh}
+WITNESS_HOST=${WITNESS_HOST:-<witness-user>@<witness-host>}
+SIGNER=${SIGNER:-~/.ledatic/witness/sign_attestation.sh}
 # Secondary witness must NOT be the model host. By default we use Mini's
 # Tailscale-resident signer (independent machine; separate Ed25519 key).
 # To run a local-fallback secondary, set MINI_HOST="" and LOCAL_SIGNER to
 # a path on a non-model-host machine.
-MINI_HOST=${MINI_HOST:-user@100.79.50.108}
+MINI_HOST=${MINI_HOST:-<secondary-user>@<secondary-host>}
 MINI_SIGNER=${MINI_SIGNER:-$HOME/.ledatic/witness/sign_attestation.sh}
 REQUIRE_SECONDARY=${REQUIRE_SECONDARY:-${REQUIRE_LOCAL:-0}}
 SITE=${SITE:-https://ledatic.org}

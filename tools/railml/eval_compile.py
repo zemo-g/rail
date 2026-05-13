@@ -3,9 +3,9 @@
 Generates N Rail programs, runs each through ./rail_native, reports pass rate."""
 import os, sys, subprocess, tempfile, argparse
 
-GENERATE = "/Users/ledaticempire/rustane/target/release/generate"
-TOKENIZER = "/Users/ledaticempire/projects/rail/training/tokenizer.json"
-RAIL_NATIVE = "/Users/ledaticempire/projects/rail/rail_native"
+GENERATE = "~/rustane/target/release/generate"
+TOKENIZER = "~/projects/rail/training/tokenizer.json"
+RAIL_NATIVE = "~/projects/rail/rail_native"
 
 # Common Rail seed prompts — short, complete-able
 SEEDS = [

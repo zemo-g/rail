@@ -27,7 +27,7 @@ mv /tmp/rail_out /tmp/getenv_bin
 
 # Direct run:
 /tmp/getenv_bin
-# → /Users/ledaticempire      (works)
+# → /Users/<USER>      (works)
 
 # Via any shell wrapper:
 bash -c /tmp/getenv_bin
@@ -122,12 +122,12 @@ Rail string literals are emitted as `.asciz` followed by `.p2align 2`. That puts
 On macOS (and Linux), those environment strings are laid out contiguously in a single page written by the dynamic linker at program startup. The page is page-aligned (4KB), but the individual strings are **not** guaranteed to be at any particular byte alignment. A given string starts wherever the previous one ended (plus a null terminator). An env like:
 
 ```
-_=/Users/ledaticempire/bin/bash
-HOME=/Users/ledaticempire
+_=~/bin/bash
+HOME=/Users/<USER>
 USER=ledaticempire
 ```
 
-has strings packed end-to-end. The address of `"/Users/ledaticempire"` (what `getenv("HOME")` returns) can land on any byte address — including one with `LSB=1`.
+has strings packed end-to-end. The address of `"/Users/<USER>"` (what `getenv("HOME")` returns) can land on any byte address — including one with `LSB=1`.
 
 When the returned pointer's LSB is 1, Rail's `_rail_print` dispatches to the integer path, does `asr x0, x0, #1` (losing the low bit of the pointer), and prints the shifted value as `%ld`. The observed garbage numbers (3047530103, 3085590135, ...) are exactly `(original_pointer >> 1)` for a range of `0x100000000`-ish macOS ARM64 heap pointers.
 
@@ -224,8 +224,8 @@ Also verify the failing reproduction case:
 ```bash
 ./rail_native /tmp/repro_src.rail > /dev/null
 mv /tmp/rail_out /tmp/getenv_bin
-/tmp/getenv_bin                       # /Users/ledaticempire
-bash -c /tmp/getenv_bin               # /Users/ledaticempire (was garbage)
+/tmp/getenv_bin                       # /Users/<USER>
+bash -c /tmp/getenv_bin               # /Users/<USER> (was garbage)
 ```
 
 Run the test a few times and with different env var names (`HOME`, `USER`, `PATH`, `SHELL`) to confirm the non-determinism is gone.

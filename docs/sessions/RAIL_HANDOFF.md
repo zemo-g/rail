@@ -96,7 +96,7 @@ rm -f /tmp/tensor_gpu.metallib
 xcrun metal -c tensor_gpu.metal -o /tmp/tensor_gpu.air
 xcrun metallib /tmp/tensor_gpu.air -o /tmp/tensor_gpu.metallib
 clang -shared -fobjc-arc -framework Metal -framework Foundation \
-  -install_name /Users/ledaticempire/projects/rail/tools/metal/libtensor_gpu.dylib \
+  -install_name ~/projects/rail/tools/metal/libtensor_gpu.dylib \
   tensor_gpu_lib.m -o libtensor_gpu.dylib
 ./smoke_test  # verify all 29 C-side checks still pass
 ```

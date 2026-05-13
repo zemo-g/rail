@@ -20,8 +20,8 @@ set -euo pipefail
 NODES=(
   "mini:localhost:10.42.0.1"
   "studio:studio:10.42.0.2"
-  "air:reillygomez@100.120.203.70:10.42.0.3"
-  "pi:zemog@100.87.231.45:10.87.231.45"   # Pi uses Tailscale IP
+  "air:<peer-user>@<peer-host>:10.42.0.3"
+  "pi:<witness-user>@<witness-host>:10.87.231.45"   # Pi uses Tailscale IP
 )
 
 NEW_TOKEN=$(openssl rand -hex 32)

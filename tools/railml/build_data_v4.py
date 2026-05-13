@@ -9,7 +9,7 @@ import json, struct
 from pathlib import Path
 from tokenizers import Tokenizer
 
-REPO = Path("/Users/ledaticempire/projects/rail")
+REPO = Path("~/projects/rail")
 OLD = REPO / "training" / "railml_data_curated"
 CLAUDE_JSONL = REPO / "training" / "claude_rail.jsonl"
 OUT = REPO / "training" / "railml_data_v4"

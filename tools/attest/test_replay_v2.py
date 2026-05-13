@@ -146,7 +146,7 @@ def test_field_tamper_v2_rejected():
 def test_toctou_weights_swap():
     """Stand-in for H6: confirm the publisher refuses to sign when a weights
     file has changed between startup and sign-time."""
-    pub = "/Users/user/projects/rail/.claude/worktrees/agent-a9be7dd38ed5a9d68/tools/attest/report_attestation_publisher.sh"
+    pub = "~/projects/rail/.claude/worktrees/agent-a9be7dd38ed5a9d68/tools/attest/report_attestation_publisher.sh"
     with tempfile.TemporaryDirectory() as td:
         wpath = os.path.join(td, "w.bin")
         open(wpath, "w").write("original")

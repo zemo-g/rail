@@ -16,7 +16,7 @@ behind the fixed point.
 
 ## Environment
 
-- Worktree: `/Users/user/projects/rail/.claude/worktrees/agent-a952a2562d8352b6d`
+- Worktree: `~/projects/rail/.claude/worktrees/agent-a952a2562d8352b6d`
 - HEAD: `dcfdce2 docs(claude): add substrate-beyond-compile.rail section`
   (note: the task prompt said `6fbf81b`; that SHA is an ancestor commit, also present in history)
 - Branch: `feat/e-bootstrap-convergence-audit`

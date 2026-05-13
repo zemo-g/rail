@@ -176,7 +176,7 @@ A complete pure-Rail TLS 1.3 stack + X.509 chain validation + HTTPS client. The 
 anthropic_chat "claude-haiku-4-5-20251001" "Reply with exactly: hello from pure rail"
   → HTTP 200, "hello from pure rail"       (6.9 s, pure Rail → Anthropic)
 
-slack_post_text "D0ATHQ1BQD7" "v3.0.0 smoke: pure-Rail TLS"
+slack_post_text "<DM_CHANNEL_ID>" "v3.0.0 smoke: pure-Rail TLS"
   → ok=true, HTTP 200                      (1.0 s, pure Rail → Slack)
 
 https_get_url "https://www.amazon.com/"

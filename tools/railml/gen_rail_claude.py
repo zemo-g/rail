@@ -10,7 +10,7 @@ Usage: gen_rail_claude.py --target 200 --per-call 10 --out training/claude_rail.
 import argparse, subprocess, tempfile, os, json, sys, hashlib, time, random
 from pathlib import Path
 
-REPO = Path("/Users/ledaticempire/projects/rail")
+REPO = Path("~/projects/rail")
 RAIL_NATIVE = REPO / "rail_native"
 DELIM = "--- END PROGRAM ---"
 

@@ -184,16 +184,16 @@ RAIL_ARENA_TRACE=1 RAIL_ARENA_MB=2048 ./rail_native run ... 2>&1 | tail
 
 **Read first:**
 - This document
-- `/Users/user/.claude/projects/-Users-user/memory/float_tco_fixed.md`
-- `/Users/user/.claude/projects/-Users-user/memory/spur_model.md`
-- `/Users/user/.claude/projects/-Users-user/memory/compile_zero_wall.md`
-- `/Users/user/projects/rail/docs/plans/COMPILE_LOSS_DESIGN.md`
+- `~/.claude/projects/-Users-user/memory/float_tco_fixed.md`
+- `~/.claude/projects/-Users-user/memory/spur_model.md`
+- `~/.claude/projects/-Users-user/memory/compile_zero_wall.md`
+- `~/projects/rail/docs/plans/COMPILE_LOSS_DESIGN.md`
 
 **Reference (don't read cover-to-cover):**
-- `/Users/user/projects/rail/docs/plans/SESSION_HANDOFF_2026-04-29.md`
-- `/Users/user/.claude/projects/-Users-user/memory/min_checkpoint_lever.md`
-- `/Users/user/.claude/projects/-Users-user/memory/sampling_was_the_lever.md`
-- `/Users/user/projects/rail/docs/SPUR_HANDOFF_2026-04-30.md` (engineering-side companion)
+- `~/projects/rail/docs/plans/SESSION_HANDOFF_2026-04-29.md`
+- `~/.claude/projects/-Users-user/memory/min_checkpoint_lever.md`
+- `~/.claude/projects/-Users-user/memory/sampling_was_the_lever.md`
+- `~/projects/rail/docs/SPUR_HANDOFF_2026-04-30.md` (engineering-side companion)
 
 **Current strongest checkpoints on disk:**
 - `training/checkpoints_published/d256_half_step3000.tar.gz` — Spur-0.1 (VALID, no re-bench needed unless you want a sanity confirm)

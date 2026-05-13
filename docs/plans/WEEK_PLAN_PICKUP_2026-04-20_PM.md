@@ -117,7 +117,7 @@ Round wall: ~2 min at N=16 vs ~19 min serial (10.6× on Studio).
 - **Studio MLX** on localhost:8080 + 10.42.0.2:8080 (same server, bound
   to 0.0.0.0). Running Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-6bit.
   User noted "better models on disc" — Qwen3.6-35B-A3B-8bit already
-  runs on :8081 for DDA; other options in `/Users/user/models/`:
+  runs on :8081 for DDA; other options in `~/models/`:
   `Qwen3.5-122B-A10B-heretic-v2-2.34bit-msq`, `gemma-4-31b-it-UD-MLX-4bit`,
   `QwQ-32B-4bit`. Model swap = edit plist's `--model` line + launchctl
   reload. Not done this session.
@@ -126,7 +126,7 @@ Round wall: ~2 min at N=16 vs ~19 min serial (10.6× on Studio).
   crash the server under concurrent load; auto-restart via KeepAlive
   should cover.
 - **No adapter path** on the plist currently — the previous
-  `adapter-path /Users/ledaticempire/projects/rail/training/adapters_4b_v5_mlx`
+  `adapter-path ~/projects/rail/training/adapters_4b_v5_mlx`
   (in `tools/train/mlx_watchdog.sh`) was killed by the 2026-04-20 reorg.
   Adapter for this model is baked into the distilled checkpoint.
 - **Parallel session coordination:** parallel Mini session owns

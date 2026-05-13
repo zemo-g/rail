@@ -79,7 +79,7 @@ The compiler is a 4-stage pipeline. Only stage 3 and 4 are hardware-specific:
 3. **Emit AT&T syntax x86_64 assembly** (GAS format, same as ARM64 uses GAS)
 4. **Use `tools/x86_libc.s`** — syscall-based libc (same pattern as linux_libc.s but x86_64 syscall numbers)
 5. **Cross-assemble**: install `x86_64-elf-as` + `x86_64-elf-ld` (or use Razer's native `as`)
-6. **Test**: `scp /tmp/rail_x86 Detro@100.109.63.37:~ && ssh Detro@100.109.63.37 "./rail_x86"`
+6. **Test**: `scp /tmp/rail_x86 <retired-host>:~ && ssh <retired-host> "./rail_x86"`
 7. **Expand**: strings, lists, closures, ADTs, I/O — one feature at a time
 8. **Integrate**: add `build_x86` to compile.rail, dispatch via `./rail_native x86 file.rail`
 

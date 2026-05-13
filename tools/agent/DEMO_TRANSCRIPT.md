@@ -1,7 +1,7 @@
 # JIT-Agent v0 — Demo Transcript
 
 Captured 2026-05-13 on the `feat/agent-jit-loop` branch (worktree
-`/Users/user/projects/rail/.claude/worktrees/agent-a5a8afdc5111183af`).
+`~/projects/rail/.claude/worktrees/agent-a5a8afdc5111183af`).
 
 The harness is `tools/agent/jit_loop.rail`. It is a *single Rail process*
 that:

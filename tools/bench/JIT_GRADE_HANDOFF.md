@@ -2,7 +2,7 @@
 
 Date: 2026-05-13
 Branch: `feat/bench-jit-grade-fastpath` (based on `next` @ `def1bcd`)
-Worktree: `/Users/user/projects/rail/.claude/worktrees/agent-ade4053173276da49`
+Worktree: `~/projects/rail/.claude/worktrees/agent-ade4053173276da49`
 
 ## TL;DR
 

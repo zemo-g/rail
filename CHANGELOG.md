@@ -2,6 +2,67 @@
 
 All notable changes to Rail are documented here.
 
+## v4.0.1 — 2026-05-13 — Public-surface sanitization
+
+Patch release. Removes operator-specific infrastructure strings from the
+public tree: Tailscale IPs, SSH usernames, home-directory paths, internal
+Slack channel IDs, and a stray operator MCP config. No behavior change;
+the compiled binary is identical to v4.0.0.
+
+### What was scrubbed (~110 files)
+
+- **Hard SSH targets** in `tools/attest/*.sh`, `tools/fleet/*.sh`,
+  `tools/fleet/fleet_display.rail`, `tools/apps/control.rail` — replaced
+  with `<witness-user>@<witness-host>` / `<peer-user>@<peer-host>`
+  placeholders. Callers must supply real values via environment.
+- **Tailscale IPs** (`100.87.231.45`, `100.79.50.108`, `100.120.203.70`,
+  `100.109.107.54`, `100.109.63.37`) replaced with role placeholders
+  (`<witness-tailscale-ip>` etc.). Tailscale CGNAT-range addresses aren't
+  reachable from the public internet, but they were operational recon.
+- **Home-directory paths** (`/Users/ledaticempire/`, `/Users/user/`,
+  `/home/zemog/`) replaced with `~/` or `<HOME>` placeholders across
+  source, docs, `docs/plans/`, training fixtures, and Objective-C dispatchers.
+- **Operator service files** — `tools/fleet/witness.service`,
+  `tools/fleet/witness_push.service`, `tools/fleet/com.ledatic.*.plist`
+  renamed to `*.example` with `<user>` / `<HOME>` placeholders. Existing
+  install scripts already substitute these at install time.
+- **Operator MCP config** — `.mcp.json` removed from the tree. It was an
+  operator's Claude Code MCP wiring (path to `tools/mcp/rail_mcp.py`),
+  not a build artifact; the MCP server still runs locally with a
+  per-user `.mcp.json` outside the repo.
+- **Slack channel IDs / DM names** in `CHANGELOG.md`, `README.md`,
+  `stdlib/slack_client.rail` docblock, `docs/sessions/HANDOFF_v3_6.md` —
+  `D0ATHQ1BQD7` and `brockbro2` replaced with `<DM_CHANNEL_ID>` and
+  `<test-dm>`. Slack IDs don't grant access on their own, but these
+  were the only remaining specific-channel references in the public surface.
+
+### What was intentionally NOT scrubbed
+
+- `reillygomez13@icloud.com` in `tools/deploy/gen_*.rail` — public
+  contact email rendered onto ledatic.org pages; meant to be public.
+- Commit messages in the v4.0.0 surface — rewriting history would break
+  existing clones for a topology-recon leak, not a credential leak.
+  The forward tree is clean; git history retains the originals.
+- `~/.ledatic/` path convention — generic project-named subdirectory,
+  not operator-specific.
+
+### Verification
+
+```
+git grep -E "100\.(87|79|109|120)\.|zemog@|user@100|reillygomez@|\
+ledaticempire@|/Users/ledaticempire|/Users/user|/home/zemog|\
+Detro|D0ATHQ1BQD7|brockbro2"
+```
+→ empty across tracked files.
+
+### Why a patch release
+
+v4.0.0 carried operator-recon strings inadvertently included via the
+multi-witness publisher work on the `next` lineage. The `master` lineage
+was scrubbed in `c4f6050` (2026-05-06) but `next` hadn't received the
+same pass. v4.0.1 brings the substrate-track tree to the same hygiene
+standard.
+
 ## v4.0.0 — 2026-05-13 — Substrate maturity
 
 A major version bump tagged on the `next` lineage. (`master` continues the parallel
@@ -801,7 +862,7 @@ Live, in production, the day of the release:
 anthropic_chat "claude-haiku-4-5-20251001" "Reply with exactly: hello from pure rail"
   → status 200, reply "hello from pure rail"   (6.9 s, pure Rail → Anthropic API)
 
-slack_post_text "D0ATHQ1BQD7" "v3.0.0 smoke: pure-Rail TLS direct to slack.com"
+slack_post_text "<DM_CHANNEL_ID>" "v3.0.0 smoke: pure-Rail TLS direct to slack.com"
   → ok, HTTP 200 with x-slack-req-id            (1.0 s, pure Rail → Slack API)
 
 https_get_url "https://www.amazon.com/"
@@ -989,7 +1050,7 @@ default HTTPS path stays ~6 s per connection rather than ~12.
 
 ```
 anthropic_live_test      — live call to api.anthropic.com, HTTP 200
-slack_live_test          — live DM to brockbro2, Slack ok=true
+slack_live_test          — live DM to <test-dm>, Slack ok=true
 https_url_test           — https_get_url api.anthropic.com
 https_smoke_test         — ip-based https_get api.anthropic.com
 rfc8448_trace_test       — RFC 8448 §3 Simple 1-RTT vector, exact

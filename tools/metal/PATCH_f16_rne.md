@@ -88,7 +88,7 @@ a Metal kernel):
 ```bash
 cd ~/projects/rail/tools/metal
 clang -shared -fobjc-arc -framework Metal -framework Foundation \
-      -install_name /Users/user/projects/rail/tools/metal/libtensor_gpu.dylib \
+      -install_name ~/projects/rail/tools/metal/libtensor_gpu.dylib \
       tensor_gpu_lib.m -o libtensor_gpu.dylib
 # verify symbols are intact
 nm libtensor_gpu.dylib | grep -E " T " | wc -l   # expect ≥30
