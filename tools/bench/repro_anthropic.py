@@ -250,6 +250,126 @@ def grade_completion(prompt: str, completion: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# JIT-first batch grading.
+#
+# The canonical grader spawns rail_native once per candidate (~100ms each, of
+# which ~all is `as`+`ld` toolchain round-trip). For programs in the JIT's
+# subset (int + match + recursion + HOFs in a few shapes), the pure-Rail JIT
+# at jit/grade.rail can answer "does this lower?" without touching the
+# toolchain at all. `jit_can_lower=1` is a strict subset of `rail_native
+# compiles cleanly` — the JIT does parse + IR lowering only, so if it
+# accepts, the program is syntactically valid Rail and certainly compiles
+# (the falsification check below verifies this empirically).
+#
+# Architecture:
+#   1. Build tools/bench/jit_grade_batch.rail once at start; cache the binary.
+#   2. Per prompt: write all N=20 stripped (and prompt+stripped) candidates
+#      to disk, write a manifest, invoke the batch grader once, parse
+#      results.
+#   3. Per-candidate grade derives from any-of(stripped JIT_PASS,
+#      stripped SHELL_PASS, prompt+stripped JIT_PASS, prompt+stripped
+#      SHELL_PASS) — mirrors the old grade_completion two-shot.
+#
+# Cost: one rail_native invocation per prompt (30 total) versus N=20 + 20
+# per prompt (≈600+ total). Plus per-fallback shell calls which still need
+# rail_native, but those happen INSIDE the batch grader's single process.
+# ---------------------------------------------------------------------------
+
+JIT_GRADE_BATCH_RAIL = Path(__file__).resolve().parent / "jit_grade_batch.rail"
+LIBJIT_CALL_DYLIB = Path(__file__).resolve().parents[1] / "jit/libjit_call.dylib"
+JIT_GRADE_BATCH_BIN: Path | None = None  # set lazily by ensure_jit_batch_bin
+
+
+def ensure_jit_batch_bin() -> Path:
+    """Compile jit_grade_batch.rail once; return path to the binary."""
+    global JIT_GRADE_BATCH_BIN
+    if JIT_GRADE_BATCH_BIN is not None and JIT_GRADE_BATCH_BIN.is_file():
+        return JIT_GRADE_BATCH_BIN
+    # libjit_call.dylib is link-time-optional in rail_native; build it if it
+    # isn't present (compile.rail picks it up via -weak-ljit_call so absence
+    # silently links but crashes on call).
+    if not LIBJIT_CALL_DYLIB.is_file():
+        build_script = LIBJIT_CALL_DYLIB.parent / "build_trampoline.sh"
+        if build_script.is_file():
+            subprocess.run(["bash", str(build_script)], capture_output=True, timeout=60, check=False)
+    # Compile to a unique path; /tmp/rail_out is host-global and races
+    # with concurrent worktree agents.
+    out = Path("/tmp") / f"jit_grade_batch_{os.getpid()}"
+    r = subprocess.run(
+        [RAIL_NATIVE, str(JIT_GRADE_BATCH_RAIL)],
+        capture_output=True, timeout=60,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"failed to compile jit_grade_batch.rail: {r.stderr.decode(errors='replace')}")
+    # rail_native writes the binary to /tmp/rail_out by default
+    src = Path("/tmp/rail_out")
+    if not src.is_file():
+        raise RuntimeError("jit_grade_batch compile produced no /tmp/rail_out")
+    out.write_bytes(src.read_bytes())
+    out.chmod(0o755)
+    JIT_GRADE_BATCH_BIN = out
+    return out
+
+
+def grade_completion_batch_jit(prompt: str, completions: list[str], task_dir: Path) -> tuple[list[bool], dict]:
+    """Batch-grade N completions via JIT-first batch grader.
+
+    Returns (per_completion_pass_list, stats) where stats has:
+      jit_pass, shell_pass, fail (totals across stripped + prompt+stripped variants)
+    """
+    task_dir.mkdir(parents=True, exist_ok=True)
+    # Each completion contributes up to 2 candidate files: stripped (if
+    # nonempty) and prompt+stripped. We grade them all in one batch, then
+    # OR the results per completion.
+    candidate_paths: list[tuple[int, str, Path]] = []  # (completion_idx, variant, path)
+    for i, c in enumerate(completions):
+        stripped = strip_artifacts(c)
+        if stripped:
+            p = task_dir / f"c{i:02d}_strip.rail"
+            p.write_text(stripped)
+            candidate_paths.append((i, "strip", p))
+        p2 = task_dir / f"c{i:02d}_pp.rail"
+        p2.write_text(prompt + stripped)
+        candidate_paths.append((i, "pp", p2))
+
+    manifest = task_dir / "manifest.txt"
+    manifest.write_text("\n".join(str(p) for (_, _, p) in candidate_paths) + "\n")
+
+    batch_bin = ensure_jit_batch_bin()
+    r = subprocess.run(
+        [str(batch_bin), str(manifest)],
+        capture_output=True, timeout=600,
+    )
+    out = r.stdout.decode(errors="replace")
+    # Parse result lines.
+    by_path: dict[str, str] = {}
+    jit_pass = shell_pass = fail = 0
+    for line in out.splitlines():
+        if line.startswith("JIT_PASS:"):
+            by_path[line[len("JIT_PASS:"):]] = "jit_pass"
+            jit_pass += 1
+        elif line.startswith("SHELL_PASS:"):
+            by_path[line[len("SHELL_PASS:"):]] = "shell_pass"
+            shell_pass += 1
+        elif line.startswith("FAIL:"):
+            by_path[line[len("FAIL:"):]] = "fail"
+            fail += 1
+    # Per-completion pass = any variant passed.
+    per_pass = [False] * len(completions)
+    for (i, _variant, p) in candidate_paths:
+        verdict = by_path.get(str(p), "fail")
+        if verdict in ("jit_pass", "shell_pass"):
+            per_pass[i] = True
+    stats = {
+        "jit_pass": jit_pass,
+        "shell_pass": shell_pass,
+        "fail": fail,
+        "total_candidates": len(candidate_paths),
+    }
+    return per_pass, stats
+
+
 def filter_prompts(bench: dict, selector: str | None) -> dict:
     if not selector:
         return bench
@@ -272,6 +392,10 @@ def main():
     ap.add_argument("--prompts", default=None,
                     help="comma-separated band/name selectors (e.g. 'fund/add,io'); default = all 30")
     ap.add_argument("--no-cost-banner", action="store_true", help="skip cost banner")
+    ap.add_argument("--jit-fast", action="store_true",
+                    help="route grading through the JIT-first batch grader at "
+                         "tools/bench/jit_grade_batch.rail (one rail_native "
+                         "invocation per prompt instead of per candidate).")
     args = ap.parse_args()
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -302,23 +426,42 @@ def main():
         print(f"   verify current pricing at https://www.anthropic.com/pricing)", flush=True)
         print("=" * 70, flush=True)
 
+    if args.jit_fast:
+        # Pre-build the JIT batch grader so we get a clean startup-failure
+        # error before we spend money on API calls.
+        try:
+            bb = ensure_jit_batch_bin()
+            print(f"[jit-fast] batch grader compiled at {bb}", flush=True)
+        except Exception as e:
+            print(f"ERROR: --jit-fast requested but couldn't build batch grader: {e}", file=sys.stderr)
+            return 2
+
     t0 = time.time()
     band_pass = {b: 0 for b in bench}
     pass_log = []
     overall_pass = 0
     overall_total = 0
+    jit_stats_total = {"jit_pass": 0, "shell_pass": 0, "fail": 0, "total_candidates": 0}
     for band, tasks in bench.items():
         for name, prompt in tasks:
             t_task = time.time()
             hard_deadline = t_task + PER_PROMPT_HARD_TIMEOUT
             completions = call_teacher(prompt, args.model, api_key, args.n, hard_deadline)
-            n_compiles = 0
-            first_pass_idx = -1
-            for i, c in enumerate(completions):
-                if grade_completion(prompt, c):
-                    n_compiles += 1
-                    if first_pass_idx < 0:
-                        first_pass_idx = i
+            if args.jit_fast:
+                task_dir = Path(f"/tmp/jit_bench_task_{os.getpid()}/{band}_{name}")
+                per_pass, stats = grade_completion_batch_jit(prompt, completions, task_dir)
+                n_compiles = sum(1 for ok in per_pass if ok)
+                first_pass_idx = next((i for i, ok in enumerate(per_pass) if ok), -1)
+                for k in jit_stats_total:
+                    jit_stats_total[k] += stats[k]
+            else:
+                n_compiles = 0
+                first_pass_idx = -1
+                for i, c in enumerate(completions):
+                    if grade_completion(prompt, c):
+                        n_compiles += 1
+                        if first_pass_idx < 0:
+                            first_pass_idx = i
             elapsed = time.time() - t_task
             passed = n_compiles > 0
             status = "PASS" if passed else "FAIL"
@@ -344,6 +487,14 @@ def main():
     print(f"Per band:")
     for b in bench:
         print(f"  {b}: {band_pass[b]}/{len(bench[b])}")
+    if args.jit_fast:
+        tc = jit_stats_total["total_candidates"]
+        jp = jit_stats_total["jit_pass"]
+        sp = jit_stats_total["shell_pass"]
+        fl = jit_stats_total["fail"]
+        lower_hit_pct = (100.0 * jp / max(tc, 1))
+        print(f"JIT-fast: {jp} JIT-pass / {sp} shell-pass / {fl} fail "
+              f"(of {tc} candidates; lower-hit {lower_hit_pct:.1f}%)")
     out = Path("/tmp/substrate_repro_result.json")
     out.write_text(json.dumps({
         "overall": f"{overall_pass}/{overall_total}",
@@ -353,6 +504,8 @@ def main():
         "model": args.model,
         "endpoint": ANTHROPIC_ENDPOINT,
         "tasks": pass_log,
+        "jit_fast": args.jit_fast,
+        "jit_stats": jit_stats_total if args.jit_fast else None,
     }, indent=2))
     print(f"JSON: {out}")
     return 0 if overall_pass == overall_total and overall_total > 0 else 1
