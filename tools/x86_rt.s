@@ -243,10 +243,37 @@ _rail_add:
     # Inline-codegen fallback enters here when LEFT (rdi) was heap. Test rdi to
     # match that contract: testing rsi mis-routes when the right operand's
     # string-literal address happens to be odd. See str_plus regression.
+    # If LHS is tagged-int but RHS is heap, route through .Ladd_mixed_if
+    # (the mirror of .Ladd_mixed_fi). Without this branch the fast-path
+    # `add rdi, rsi` adds a pointer to a tagged-int and `lea rax,[rdi-1]`
+    # publishes garbage. Bug-class with no current symptom because compile-
+    # time inference promotes inline for `0.0 + i` shapes; reachable via
+    # arr_get-style untyped runtime values (see add_int_float_ordering test).
     test rdi, 1
     jz .Ladd_heap
+    test rsi, 1
+    jz .Ladd_mixed_if
     add rdi, rsi
     lea rax, [rdi-1]
+    ret
+.Ladd_mixed_if:
+    # rdi = tagged-int LHS, rsi = boxed-float RHS. Mirror of .Ladd_mixed_fi
+    # below: promote the int operand to a double and add. Assumes the heap
+    # operand is a boxed float (header 6); int+other-heap is undefined here
+    # (would need a separate dispatch).
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, [rsi+8]
+    addsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd [rax+8], xmm0
+    add rsp, 16
+    pop rbp
     ret
 .Ladd_heap:
     # Heap: check for string concat, float+float add, or float+int mixed add.
