@@ -1,0 +1,239 @@
+-- tools/agent/jit_loop.rail — single-process agentic loop.
+--
+--   problem string  ─►  Anthropic API (Claude)  ─►  Rail source  ─►  JIT  ─►  int
+--
+-- Concretely: take a problem statement on argv[1] (or stdin), ask Claude
+-- for a Rail program that returns the answer as `main`'s int, JIT-compile
+-- and execute it via jit/grade.rail, print the result. One process, no
+-- subprocess round-trip to ./rail_native. "Verifier is a library, not a
+-- tool" made concrete.
+--
+-- Usage (compile then exec preserves quoted argv; `rail_native run` does NOT
+-- preserve spaces inside quoted args — it joins+reshells. For spaced strings
+-- prefer the file-backed variants `--src-file` / `--problem-file`):
+--
+--   ./rail_native tools/agent/jit_loop.rail               -- compile to /tmp/rail_out
+--   /tmp/rail_out --offline                                -- canned fib(10) demo
+--   /tmp/rail_out --src "main = 7 + 13"                    -- raw source, no LLM
+--   /tmp/rail_out --src-file path.rail                     -- raw source from file
+--   /tmp/rail_out "factorial of 8"                         -- online (Anthropic API)
+--   /tmp/rail_out --problem-file path.txt                  -- online, problem from file
+--   /tmp/rail_out --key-path /path/to/key "fib 10"
+--
+-- ./rail_native run is OK with --offline (no positional) or with --src-file /
+-- --problem-file (no spaces in flag values).
+--
+-- Exit codes (process-level):
+--   0  JIT pipeline succeeded; result printed
+--   1  any failure (API down / lower error / model returned non-Rail / etc.)
+
+import "stdlib/anthropic_client.rail"
+import "stdlib/env.rail"
+
+import "jit/heap.rail"
+import "jit/emit.rail"
+import "jit/loader.rail"
+import "jit/lower.rail"
+import "jit/grade.rail"
+
+-- ----------------------------------------------------------------------
+-- Constants
+-- ----------------------------------------------------------------------
+
+default_model _ = "claude-haiku-4-5-20251001"
+default_max_tokens _ = 800
+default_key_path _ = "/Users/ledaticempire/.fleet/anthropic_key"
+system_prompt_path _ = "tools/agent/system_prompt.txt"
+
+-- Canned response used by --offline. Known-good fib 10 = 55. Mirrors
+-- jit/test_lower.rail's "fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)"
+-- shape, which is verified-lowerable in the existing JIT test suite.
+offline_src _ =
+  cat ["fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)\n",
+       "main = fib 10\n"]
+
+-- ----------------------------------------------------------------------
+-- Argv parsing — bare positional or flagged
+-- ----------------------------------------------------------------------
+
+has_flag argv flag =
+  if length argv == 0 then 0
+  else if head argv == flag then 1
+  else has_flag (tail argv) flag
+
+get_flag argv flag def =
+  if length argv == 0 then def
+  else if head argv == flag then
+    if length (tail argv) > 0 then head (tail argv)
+    else def
+  else get_flag (tail argv) flag def
+
+-- First positional (not consumed by a known flag) joined with spaces so
+-- "factorial of 8" works even though argv splits it into 3 tokens. Recognized
+-- flags: --offline (no-arg), --src VAL, --src-file VAL, --problem-file VAL,
+-- --key-path VAL, --model VAL.
+positional_tokens argv =
+  if length argv == 0 then []
+  else
+    let a = head argv
+    if a == "--offline" then positional_tokens (tail argv)
+    else if a == "--src" then
+      if length (tail argv) > 0 then positional_tokens (tail (tail argv))
+      else []
+    else if a == "--src-file" then
+      if length (tail argv) > 0 then positional_tokens (tail (tail argv))
+      else []
+    else if a == "--problem-file" then
+      if length (tail argv) > 0 then positional_tokens (tail (tail argv))
+      else []
+    else if a == "--key-path" then
+      if length (tail argv) > 0 then positional_tokens (tail (tail argv))
+      else []
+    else if a == "--model" then
+      if length (tail argv) > 0 then positional_tokens (tail (tail argv))
+      else []
+    else cons a (positional_tokens (tail argv))
+
+positional_joined argv = join " " (positional_tokens argv)
+
+-- ----------------------------------------------------------------------
+-- Code-fence stripping: model is told NOT to use fences, but some models
+-- can't help themselves. Defense in depth — strip them if present.
+-- ----------------------------------------------------------------------
+
+strip_leading_fence s =
+  let q = "```"
+  let i = str_find q s
+  if i < 0 then s
+  else if i > 8 then s  -- fence too far in; leave alone
+  else
+    -- skip past the fence + optional language tag + newline
+    let after = str_sub s (i + 3) (length s - i - 3)
+    let nl = str_find "\n" after
+    if nl < 0 then after
+    else str_sub after (nl + 1) (length after - nl - 1)
+
+strip_trailing_fence s =
+  let q = "```"
+  let i = str_find q s
+  if i < 0 then s
+  else str_sub s 0 i
+
+clean_response s = strip_trailing_fence (strip_leading_fence s)
+
+-- ----------------------------------------------------------------------
+-- API key resolution. Precedence:
+--   1. --key-path flag (explicit path to file containing the key)
+--   2. ANTHROPIC_API_KEY env var (written to a tmp file for the client)
+--   3. default_key_path (legacy ~/.fleet location)
+-- Returns key file path, or "" if no key is available.
+-- ----------------------------------------------------------------------
+
+resolve_key_path argv =
+  let flagged = get_flag argv "--key-path" ""
+  if length flagged > 0 then flagged
+  else
+    let envk = get_env "ANTHROPIC_API_KEY"
+    if length envk > 0 then
+      let p = "/tmp/rail_jit_agent_key"
+      let _ = write_file p envk
+      p
+    else default_key_path 0
+
+-- ----------------------------------------------------------------------
+-- Build the user prompt — wraps the raw problem in a tiny instruction.
+-- The heavy guidance is in system_prompt.txt.
+-- ----------------------------------------------------------------------
+
+build_user_prompt problem =
+  cat ["Write a Rail program whose `main` returns (or prints + returns) the answer to: ",
+       problem,
+       "\n\nReply with ONLY raw Rail source. No fences. No prose."]
+
+-- ----------------------------------------------------------------------
+-- LLM call: returns Rail source (possibly cleaned). On error, returns "".
+-- ----------------------------------------------------------------------
+
+call_llm argv problem =
+  let sys = read_file (system_prompt_path 0)
+  let user = build_user_prompt problem
+  let prompt = cat [sys, "\n\n", user]
+  let key_path = resolve_key_path argv
+  if length key_path == 0 then
+    let _ = print "ERROR: no API key available (set ANTHROPIC_API_KEY or --key-path)"
+    ""
+  else
+    let model = get_flag argv "--model" (default_model 0)
+    let r = anthropic_chat model prompt (default_max_tokens 0) key_path
+    let status = let (a, _) = r in a
+    let body = let (_, b) = r in b
+    if status == 200 then clean_response body
+    else
+      let _ = print (cat ["ERROR: API status=", show status])
+      let _ = print (cat ["  body head: ", str_sub body 0 (if length body < 240 then length body else 240)])
+      ""
+
+-- ----------------------------------------------------------------------
+-- JIT-and-run the source. Reports lower errors with the model's source.
+-- Returns 0 on success, 1 on failure.
+-- ----------------------------------------------------------------------
+
+jit_run_source src =
+  let _ = print "--- Rail source ---"
+  let _ = print src
+  let _ = print "--- JIT lower + run ---"
+  let r = try_jit_grade src
+  if (head r) == "jit_ok" then
+    let v = head (tail r)
+    let _ = print (cat ["RESULT = ", show v])
+    0
+  else
+    let _ = print (cat ["JIT FAIL: ", head (tail r)])
+    1
+
+-- ----------------------------------------------------------------------
+-- Resolve the problem text: --problem-file > joined positional > stdin.
+-- ----------------------------------------------------------------------
+
+resolve_problem argv =
+  let pf = get_flag argv "--problem-file" ""
+  if length pf > 0 then a_trim_line (read_file pf)
+  else
+    let positional = positional_joined argv
+    if length positional > 0 then positional
+    else read_line 0
+
+resolve_src_override argv =
+  let sf = get_flag argv "--src-file" ""
+  let raw = if length sf > 0 then read_file sf else get_flag argv "--src" ""
+  -- Defense in depth: strip ```rail / ``` fences even on --src-file inputs,
+  -- so feeding the raw LLM response file directly Just Works.
+  if length raw == 0 then "" else clean_response raw
+
+-- ----------------------------------------------------------------------
+-- Main
+-- ----------------------------------------------------------------------
+
+main =
+  let _ = print "rail-on-rail JIT agent v0 — pure-Rail LLM + JIT loop"
+  let _ = print "----------------------------------------------------"
+  if has_flag args "--offline" == 1 then
+    let _ = print "MODE: --offline (canned response, no API)"
+    let _ = print "PROBLEM: fib(10)"
+    jit_run_source (offline_src 0)
+  else
+    let s_override = resolve_src_override args
+    if length s_override > 0 then
+      let _ = print "MODE: --src / --src-file (raw Rail source, no LLM)"
+      jit_run_source s_override
+    else
+      let problem = resolve_problem args
+      if length problem == 0 then
+        let _ = print "ERROR: no problem statement (pass as argv[1] or via stdin)"
+        1
+      else
+        let _ = print "MODE: online (Anthropic API)"
+        let _ = print (cat ["PROBLEM: ", problem])
+        let src = call_llm args problem
+        if length src == 0 then 1
+        else jit_run_source src
