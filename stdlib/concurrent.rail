@@ -1,5 +1,5 @@
--- stdlib/concurrent.rail — v0 concurrency primitive: bounded blocking
--- channels + thread spawn, backed by pthread_mutex + pthread_cond.
+-- stdlib/concurrent.rail — v1 concurrency primitive: bounded blocking
+-- channels + thread spawn + multi-channel select, backed by pthread.
 --
 -- Architecture:
 --   Rail talks to a small C bridge dylib (tools/runtime/libconcurrent.dylib)
@@ -14,11 +14,63 @@
 -- The compiler auto-links libconcurrent.dylib when present (see the
 -- `has_concurrent_lib` branch in tools/compile.rail::build).
 --
--- v0 carries only int64 values through channels. Strings, floats, ADTs, and
--- closures are deferred to v1 — see the "Deferred" section in the session
--- handoff.
+-- ── What channels carry (v1) ────────────────────────────────────────────────
 --
--- Quick usage:
+--   rc_chan_send / rc_chan_recv     -- raw int64 (the v0 path; tagged ints
+--                                      round-trip correctly because the FFI
+--                                      untag-then-retag is identity for
+--                                      LSB=1 values).
+--
+--   chan_send_v   / chan_recv_v     -- ANY tagged Rail value: tagged ints,
+--                                      heap pointers (strings, ADTs, lists),
+--                                      raw float bits. Implemented via a
+--                                      heap-allocated 1-slot box that
+--                                      preserves all 64 bits across the
+--                                      mutex/ring without invoking the
+--                                      FFI's int-untag transform on the
+--                                      payload.
+--
+--   chan_send_float / chan_recv_float -- shorthand for float values; same
+--                                        implementation as chan_send_v.
+--
+-- ── Heap-pointer caveat (READ THIS) ─────────────────────────────────────────
+--
+-- Rail's GC is conservative mark-sweep over thread stacks. When a value is
+-- in flight on a channel (sent but not yet recv'd), the only reference to
+-- its heap allocations lives inside the C ring buffer — NOT on any Rail
+-- stack. That is invisible to the collector. A GC sweep on either thread
+-- between send and recv can free the box (and any heap object reachable
+-- only through it) and corrupt the recv'd value.
+--
+-- v1 mitigations:
+--   - Tagged ints (the common case) DO NOT allocate; they ride the existing
+--     int64 path and are GC-safe.
+--   - For heap-pointer / float sends, keep the live set small (drain
+--     channels promptly), or pin Rail-side references to in-flight values
+--     (a list at module scope) until the receiver has consumed them.
+--   - GC trigger today is a 512MB arena exhaustion — for short-lived
+--     concurrent demos this is rarely hit.
+--
+-- A precise inter-thread root set is a v2 task.
+--
+-- ── select ──────────────────────────────────────────────────────────────────
+--
+--   let (idx, value) = select [ch_a, ch_b, ch_c]
+--     -- blocks until any channel has a value; returns its index in the
+--     -- list (0..n-1) and the recv'd value (as a tagged int — for typed
+--     -- channel values, route the value through chan_recv_v inside each
+--     -- branch instead of using select's value directly).
+--
+--   let (idx, value) = select_with_default [ch_a, ch_b] sentinel
+--     -- non-blocking; if no channel has a value, returns idx=-1 and
+--     -- value=sentinel immediately.
+--
+-- Performance characteristic of select (v1): busy-poll with 50us sleep
+-- between rounds. Each round tries non-blocking recv on each channel,
+-- starting offset rotates to avoid pinning channel 0. A true cond-var
+-- driven select (single shared cond, per-channel registration) is v2.
+--
+-- ── Quick usage ─────────────────────────────────────────────────────────────
 --   import "stdlib/concurrent.rail"
 --   main =
 --     let ch  = rc_chan_make 4              -- bounded channel, capacity 4
@@ -66,6 +118,27 @@ foreign rcon_join task_id -> int
 foreign rcon_spawn_producer ch n -> int
 foreign rcon_spawn_consumer ch -> int
 
+-- v1 typed-channel + select bridges.
+--
+-- rcon_chan_recv_box returns the same int64 as rcon_chan_recv but is
+-- declared `-> ptr` so the FFI emitter skips the int-retag, letting us
+-- round-trip a heap-box pointer bit-exactly.
+--
+-- rcon_chan_select / rcon_chan_select_try fill slot 0 of an out-array
+-- with the recv'd value (raw wire bits) and return the channel index
+-- (or -1 if all closed/none ready). Used by the typed-value Rail
+-- wrapper, which dereferences the returned box pointer.
+--
+-- rcon_chan_select_int / rcon_chan_select_int_try are identical to the
+-- above except they pre-retag the wire value as a Rail tagged int
+-- (`(v << 1) | 1`) before storing it in the out-array. Used by the v0
+-- raw-int Rail wrapper, which then reads the slot directly.
+foreign rcon_chan_recv_box ch -> ptr
+foreign rcon_chan_select handles count out_value -> int
+foreign rcon_chan_select_try handles count out_value -> int
+foreign rcon_chan_select_int handles count out_value -> int
+foreign rcon_chan_select_int_try handles count out_value -> int
+
 
 -- ── High-level Rail wrappers ────────────────────────────────────────────────
 
@@ -95,3 +168,106 @@ rc_spawn_consumer ch = rcon_spawn_consumer ch
 -- Join a task handle; blocks until the thread exits. Returns the int64
 -- result the worker stored on exit.
 rc_join task_id = rcon_join task_id
+
+
+-- ── v1 typed-value channels ─────────────────────────────────────────────────
+--
+-- chan_send_v / chan_recv_v carry ANY tagged Rail value bit-exactly:
+-- tagged ints, heap pointers (strings, lists, ADTs), raw float bits.
+-- Implementation: allocate a 1-slot heap array (a "box"), store the
+-- value with arr_set (raw 64-bit store, no tag manipulation), send the
+-- box pointer through the int-channel. Pointer LSB=0 ⇒ the FFI's
+-- conditional untag is a no-op for it; recv uses the `-> ptr` foreign
+-- variant so the return is not retagged. arr_get on the recv'd box
+-- restores the raw 64 bits.
+--
+-- See the heap-pointer caveat in the file header: in-flight heap values
+-- are invisible to the conservative GC. For long-running channels with
+-- many in-flight messages, prefer the int64 path or pin in-flight values.
+
+chan_send_v ch v =
+  let box = arr_new 1 0
+  let _   = arr_set box 0 v
+  rcon_chan_send ch box
+
+chan_recv_v ch =
+  let box = rcon_chan_recv_box ch
+  arr_get box 0
+
+-- Float convenience aliases (ARM64: floats are register-raw doubles, so
+-- the v1 box path bit-preserves them; on x86 floats are heap-boxed
+-- pointers and ride the same path — the box ends up holding the boxed-
+-- float pointer rather than raw d-bits, which is identical from the
+-- recv-side semantics).
+chan_send_float ch f = chan_send_v ch f
+chan_recv_float ch   = chan_recv_v ch
+
+
+-- ── select ──────────────────────────────────────────────────────────────────
+--
+-- `select handles` blocks until any channel in the list has a value, then
+-- returns (index, value). The value is delivered as a raw int64 (works
+-- directly for tagged-int channels). To select on typed channels (where
+-- the wire payload is a box pointer), recv via chan_recv_v inside each
+-- branch — see the case3 pattern in tools/test/concurrent_select_test.rail.
+--
+-- `select_with_default handles default` is non-blocking: returns
+-- (-1, default) immediately if no channel has a value.
+
+-- `select` is the typed-value variant: assumes channels carry boxed
+-- values (sent via chan_send_v / chan_send_float). Returns the logical
+-- Rail value, not the wire box pointer.
+select handles =
+  let n = length handles
+  let harr = arr_from_list handles n
+  let outv = arr_new 1 0
+  let idx = rcon_chan_select harr n outv
+  if idx == (0 - 1) then (idx, 0)
+  else
+    let box = arr_get outv 0
+    (idx, arr_get box 0)
+
+-- `select_with_default` is the non-blocking typed-value variant.
+-- Returns (-1, default_val) immediately if no channel has a value.
+select_with_default handles default_val =
+  let n = length handles
+  let harr = arr_from_list handles n
+  let outv = arr_new 1 0
+  let idx = rcon_chan_select_try harr n outv
+  if idx == (0 - 1) then (idx, default_val)
+  else
+    let box = arr_get outv 0
+    (idx, arr_get box 0)
+
+-- `select_int` is the raw int64 variant for channels used via the v0
+-- rc_chan_send / rc_chan_recv API. Returns the wire value as a tagged
+-- int. The C side pre-retags the wire bits before writing the out-slot
+-- so Rail can use arr_get directly without further bit manipulation.
+select_int handles =
+  let n = length handles
+  let harr = arr_from_list handles n
+  let outv = arr_new 1 0
+  let idx = rcon_chan_select_int harr n outv
+  (idx, arr_get outv 0)
+
+select_int_with_default handles default_val =
+  let n = length handles
+  let harr = arr_from_list handles n
+  let outv = arr_new 1 0
+  let idx = rcon_chan_select_int_try harr n outv
+  if idx == (0 - 1) then (idx, default_val)
+  else (idx, arr_get outv 0)
+
+-- Small helper: copy a list into a freshly-allocated mutable array of the
+-- given length. Used to flatten the handle list into a layout the C bridge
+-- can index by offset.
+arr_from_list xs n =
+  let a = arr_new n 0
+  let _ = arr_fill_from_list a xs 0
+  a
+
+arr_fill_from_list a xs i =
+  if length xs == 0 then 0
+  else
+    let _ = arr_set a i (head xs)
+    arr_fill_from_list a (tail xs) (i + 1)

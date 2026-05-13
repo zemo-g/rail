@@ -17,4 +17,4 @@ clang -shared -Wall -Wextra -O2 -fPIC \
 
 echo "built $OUT"
 file "$OUT"
-nm "$OUT" | grep -E ' T _rcon_(chan|spawn|join)' | sort
+nm "$OUT" | grep -E ' T _rcon_(chan|spawn|join|select|retag)' | sort
