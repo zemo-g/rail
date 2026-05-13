@@ -2,37 +2,223 @@
 
 All notable changes to Rail are documented here.
 
-## Unreleased — post-renovate (2026-05-12 → 2026-05-13)
+## v4.0.0 — 2026-05-13 — Substrate maturity
 
-Tightening pass after v3.7.0. Six parallel agents shipped backend, harness,
-and ops work; the test floor moved up.
+A major version bump tagged on the `next` lineage. (`master` continues the parallel
+v3.x attestation/agent track; the two have diverged on purpose.) 216 commits since
+`v3.11.0` was tagged on master 11 days ago — concurrency, playground, public JIT,
+dual-backend parity, 30/30 substrate hard-bench publicly reproducible, browser-side
+provenance verifier, four sweeping bug-class closures including a 17-day silent-
+corruption fix discovered by a dual-implementation falsification harness.
 
-- **ARM64 test floor: 137 → 140.** Added `t132` (3-movk integer literal),
-  `t133` (4-movk literal), `t134` (4-movk negative variant) to lock down
-  the wide-integer literal codegen rewrite of `emit_load_int` at
-  `compile.rail:829`. The fix emits `movz` + up to 3 `movk` chunks (bits
-  0-15, 16-31, 32-47, 48-63) with zero chunks at ≥#32 skipped, plus a
-  symmetric `movn` + `movk` path for negatives. `k16`/`k32`/`k48`
-  computed via `shl 1 N` so constant-folding doesn't bake 64-bit
-  literals the seed can't emit. Branch `feat/c-3-movk-literals`,
-  commit `872424b`. 140/140 with byte-identical 2-cycle bootstrap.
-- **x86_64 conformance: 55/60 → 71/79.** Harness extended from 60 to 79
-  representative tests; gaps classified. 8 remaining failures are 3
-  ELF-prefix `_<name>` ffi-libc tests and 5 missing str-runtime
-  symbols. See `tools/test/x86_conformance.sh` and memory entry
-  `x86_backend_status` for the full taxonomy.
-- **Docs auto-deploy.** Mini's bare `~/git/rail.git` repo got a
-  post-receive hook that diff-gates on `docs/site/` and rebuilds +
-  uploads `rail/docs/*.html` to Cloudflare KV. Pushes to the
-  allowlisted `next` branch land at https://ledatic.org/rail/docs/
-  without manual intervention. See `notes/auto_deploy_hook.md` for
-  the topology, allowlist, and rollback path.
-- **Bootstrap convergence audit.** The claim "bootstrap doesn't
-  converge" was falsified: the bootstrap is a 2-cycle limit cycle.
-  gen0's shipped runtime asm doesn't necessarily match what gen0's
-  source emits, so cycle 1 typically differs. gen2 always lands the
-  byte-identical fixed point (gen2 == gen3 == gen4 verified). See
+No public API breaks; the major bump is a positioning marker, not a SemVer surface
+change. The substrate-not-model thesis (`docs/site/jit.md` + `tools/bench/repro_30of30.sh`
++ `https://ledatic.org/verify/<id>` + this entire shipping volume) is now publicly
+defensible without hand-waving.
+
+### What "substrate maturity" means here
+
+- A frontier model + a 1KB Rail spec compiles **30/30 on a held-out hard-bench**,
+  reproducible by any partner with an API key. (`f2c88b2`)
+- The compiler is genuinely self-hosted on **two backends**, each with full
+  same-bug-class parity for the 9 binary ops across both operand orderings.
+  (ARM64 140/140, x86_64 136/136. `9e16aa7` + `c9de6e9` + `b223960`.)
+- The verifier is **a library**, not a tool — `import "jit/grade.rail"` and a Rail
+  program can compile + execute new Rail at runtime in the same process. (`07366ea`)
+- The provenance pipeline is **multi-witness Ed25519, browser-verifiable**, with
+  pulse_id binding closing the prior session-replay gap. (`f732176` + `2ada525`)
+- A **standalone single-file verifier** ships at deterministic SHA — anyone can
+  grade reports without trusting the original signer's infrastructure.
+  (ledatic-site `8f5b928`)
+
+### Compiler & runtime
+
+- **Concurrency v1.** Typed channels + select over a pthread-backed runtime.
+  `import "stdlib/concurrent.rail"` exposes `rc_chan_make`/`rc_chan_send`/
+  `rc_chan_recv`/`rc_spawn`. int64-only values in v0; 9 + 8 falsification tests
+  green. (`4623e72`)
+- **Auto-memo fib silent-corruption — FIXED.** `compile.rail:2593` memo_store emit
+  was double-untagging x19 (which was already untagged in the prologue). Writes
+  went to `memo[n/2]` while reads keyed `memo[n]`; pairs collided on shared slots.
+  `fact` escaped because it has only one recursive call and never reads back; `fib`
+  failed because two recursive reads collide. `fib(10)` was returning `293886`
+  instead of 55. **Found by the JIT REPL agent comparing shell-compile vs JIT** on
+  the same program; one-line fix using x19 directly as the index register.
+  Falsification at `tools/test/auto_memo_fib_correctness.rail`. (`b89a60b`)
+- **Nullary-LHS binary-op bug — FIXED.** Any binary op with a top-level nullary
+  LHS expression was using the prior `x0` instead of the freshly-computed value.
+  `compile.rail::emit_x1` fast-path patched; 2-cycle bootstrap byte-identical.
+  Was the root of the multi-week "CPU substrate is mysteriously wrong" arc; closes
+  the substrate investigation. (pre-window but retroactively notable)
+- **`_rail_join` O(n²) — FIXED.** Runtime asm rewrite of join: 53.5 GB → 267 MB on
+  the 8×100K-float dump pattern (200× memory, 120× wall-clock). Diagnostic
+  harnesses kept at `tools/diagnose/dump_pattern_smoke.rail` +
+  `tools/diagnose/dump_bisect.rail`. (pre-window)
+- **Same-bug-class parity sweep — CLOSED on both backends, both orderings.**
+  Each of 9 binary ops (`+`, `-`, `*`, `/`, `%`, `<`, `>`, `<=`, `>=`) now has
+  symmetric handling for `(int, float)` and `(float, int)` operand orderings.
+  - x86 `(int, float)`: inline emit `check_both` + `.L<op>_mixed_if`. (`b223960`)
+  - x86 `(float, int)`: already covered by `b223960`'s symmetric routing.
+  - ARM64 `(int, float)`: inline emit `check_both` + `.L<op>_mixed_if` mirror.
+    (`9e16aa7` + `d4e3696`)
+  - ARM64 `(float, int)`: `.L<op>_mixed_fi` mirror that takes raw-f64 LHS via
+    `fmov d0, x1`, untags+converts tagged-int RHS via `asr` + `scvtf`. For
+    `_rail_add` specifically the dispatch is inserted at the top of `.Ladd_heap`
+    so the string-append path remains correct. (`c9de6e9`)
+  - 9 + 9 = 18 falsification tests at `tools/test/<op>_{int_float,float_int}_ordering.rail`.
+- **3-movk integer literal codegen.** `emit_load_int` at `compile.rail:829` now
+  emits `movz` + up to 3 `movk` chunks (bits 0-15, 16-31, 32-47, 48-63) with zero
+  chunks at ≥#32 skipped, plus a symmetric `movn` + `movk` path for negatives.
+  `k16`/`k32`/`k48` computed via `shl 1 N` so constant-folding doesn't bake the
+  64-bit literal as a constant the seed can't emit. Regression tests `t132`/`t133`/`t134`.
+  ARM64 floor: 137 → 140. (`872424b`)
+- **Bootstrap convergence audit — published.** The "bootstrap doesn't converge"
+  claim was falsified: it's a 2-cycle limit cycle. gen0's shipped runtime asm
+  doesn't necessarily match what gen0's source emits, so cycle 1 typically differs;
+  gen2 always lands the byte-identical fixed point. See
   `notes/bootstrap_convergence_audit_2026-05-13.md`.
+- **Diagnostic surface.** `strip_trailing_ws` helper replaces `trim` at 4 multi-line
+  `as`/`ld` result sites so undefined-symbol errors and assembly errors no longer
+  silently truncate to the first line. `shell_quote_arg` + `shell_quote_join` +
+  `join_args_quoted` preserve quoted argv through `./rail_native run`. (`b7f267a`,
+  `23fa5fd`)
+
+### Self-hosted JIT — now a first-class tool
+
+- **Public documentation.** `docs/site/jit.md` (109 lines): substrate-honesty
+  framing, end-to-end `test_codegen` demo with output, honest capability + limit
+  table, file map for inspection. Linked from `docs/site/index.md`. Public surface
+  at `https://ledatic.org/rail/docs/jit.html` once deployed. (`def1bcd`)
+- **JIT-first REPL** at `tools/repl_jit.rail`. **~3000× per-line vs shell-compile**
+  (0.1 ms median JIT-line vs 319 ms shell-line). Persistent definitions across
+  lines via string-concat buffer; every line re-lowers the full defs + expr at
+  ~0.4 ms. One-time ~21 s REPL compile mitigated by pre-compiled binary at
+  `/tmp/repl_jit_bin`. 11/11 smoke green including JIT-hits, ADT-fallback,
+  parse-error path. `tools/repl.rail` (the shell-based REPL) untouched. (`6ab2666`)
+- **JIT-grade fast path** at `tools/bench/jit_grade_batch.rail`, opt-in via the
+  `--jit-fast` flag on `tools/bench/repro_anthropic.py`. Modest **1.18× grading-only
+  speedup** (101.75 s → 86.18 s) — the public bench is API-bound, so default driver
+  stays shell-only. Lower-hit 14.2 % on synthesized completions, 40 % on canonical
+  hand-curated shapes. **Soundness finding the falsification test earned:**
+  `jit_can_lower=1` was UNSOUND as a fast-path predicate — JIT recognizes builtins
+  (`str_eq`/`str_len`/`str_at`/`is_nil`) that `rail_native` rejects; naive routing
+  would have silently marked fail cases as passes. `contains_unsafe_jit_builtin`
+  guard added; 26/26 parity. The bug was simultaneously fixed at the JIT source
+  itself in `jit_can_lower`. (`163521e`)
+- **In-process agentic loop** at `tools/agent/jit_loop.rail`. Single Rail program
+  that calls the Anthropic API via `stdlib/anthropic_client.rail`, JIT-compiles
+  the response via `jit/grade.rail`, executes, returns. Offline smoke green (fib 10
+  → 55, fact 6 → 720). 5/5 in-subset programs JIT cleanly; 5/5 out-of-subset
+  reject loudly with diagnostics — hard verifier, no silent wrong answers. (`07366ea`)
+- **JIT lower cluster fixes.** Three closing bugs from the JIT integrations:
+  multi-line `let` inside fn bodies (`parse_fn_body` now `skip_nls`'s before body);
+  `st_fail` no longer prints (uses mutable arr cell pattern from
+  `stdlib/https_session.rail:64`); `jit_can_lower` substring-checks for unsafe
+  builtins. (`09263e6` + `ef88a42` + `1226600`)
+
+### Substrate hard-bench — publicly reproducible
+
+- **F-53 closure.** `tools/bench/substrate_hard_bench.rail` +
+  `tools/bench/repro_anthropic.py` + `tools/bench/repro_30of30.sh` +
+  `tools/bench/README.md`. Two reproduction paths: Anthropic API (~$15–20 / run,
+  ~15–25 min) and local MLX/vLLM (any 100B+ open-weight on an OpenAI-compatible
+  endpoint). Partners can now run the 30/30 bench without Studio access. (`f2c88b2`)
+- The empirical claim it backs: a frontier model + 1KB Rail spec scores 30/30
+  on a held-out hard-bench, beating a fine-tuned ensemble. Every band 5/5; 15.4
+  min wall-clock; multi-witness Ed25519 signed; verifiable at `/verify/<id>`.
+
+### Provenance — v2 with browser-side verify
+
+- **Pulse_id binding.** Attestation v2 binds `pulse_id` so old attestations
+  cannot be replayed against new pulses. TOCTOU on weights closed via re-hash
+  inside the signing transaction. (`f732176`)
+- **Standalone verifier** ships from the ledatic-site repo as a single-file
+  executable with a deterministic SHA. Third parties can grade reports without
+  trusting Studio infrastructure. (ledatic-site `8f5b928`)
+- **Crypto stdlib hardening.** 2 CRITICALs + 7 HIGHs closed via the 2026-05-12
+  parallel security-audit pass. Crypto stdlib + provenance + fleet posture all
+  tightened. See memory entry `security_audit_2026-05-12`. (`bf7ff54`,
+  `f065e0e`, `2ada525`, `39e02fe`)
+- **DNS-match short-circuit fix.** `cv_dns_match` wildcard-vs-equal-length
+  path patched so SAN matching can't bypass on edge inputs. (`47ca7f1`)
+- **Fleet bind to Tailscale IPv4.** `fleet_agent_v3` no longer listens on
+  `0.0.0.0`; bound to the Tailscale IP only. (`1de6cff`)
+
+### x86_64 backend — full conformance
+
+- **136/136.** From the prior 71/79 baseline, the 2026-05-12 punch-list (Agents
+  A–E in parallel) drove the backend to 100 % conformance via:
+  - **Bit-op runtime + `char_from_int` + `byte_at`/`set`** (`60cd486`)
+  - **5 `_rail_str_*` runtime symbols** + harness 79→127 (`e4415a9` + `7588652`)
+  - **Float-arr + `parse_float` + `to_int`** (`04625f2`)
+  - **Thread runtime `_rail_spawn_thread` + `_rail_join_thread`** (`d8623ff`)
+  - **`null_safe_eq` codegen fix** for `arr_init` vs literal-0 SIGSEGV (`17fb3af`)
+  - **`_rail_str_append` strlen+memcpy** instead of strcpy+strcat (`c30ff5f`)
+  - **Foreign-call ELF prefix** — bare `name@PLT` instead of Mach-O `_<name>` (`ba1d411`)
+  - **Conditional-untag int args** before foreign calls (`8cc8633`)
+  - **SysV stack-passing** for >6 args; callee prologue + caller pop + TCO writeback (`1aad573`)
+  - **Linux `libtensor_gpu.so` stub** with 33 no-op `tgl_*` symbols; harness links it (`c5bf567`)
+- **/tmp/rail_out.o race mitigated.** `mktemp` for `.s`/`.o` intermediates so
+  parallel worktree agents on the same host don't silently clobber each other's
+  artifacts. (`b18fe40`)
+
+### Playground (in-flight, committed not deployed)
+
+- **Session A — pre-compile sanitizer + compile_server.** (`4024334`)
+- **Session B + C — browser editor, Worker proxy, deploy script.** (ledatic-site
+  `084249c`)
+- **Session C — staging deploy + recv-loop fix.** (`1a2c88b`)
+- The 16-gated `deploy_playground.sh` is committed but not run. Live URL
+  `https://ledatic.org/playground` not yet active.
+
+### Foundations 2-8 (parallel-v0 batch — 2026-05-11)
+
+- **Test runner** at `tools/test/rail_test.rail` — convention-based discovery
+  via exit code + last-line `PASS`/`OK`.
+- **Diff fuzzer** at `tools/fuzz/diff_fuzz.rail` — two-path differential eval
+  catches silent miscompilation. Int-only grammar today.
+- **Type-quirk lint** at `tools/lint/check_quirks.rail` — Q001/Q002/Q003 codes
+  (het-list, high-arity, unwrapped float-return).
+- **Perf trace** at `tools/trace/rail_trace.rail` — wall/CPU/RSS/page-faults/ctxsw
+  + JSON sidecar.
+- **Pkg manifest** at `tools/pkg/` — INI-style `rail.toml`; local-path deps in v0.
+- **Stdlib docs autogenerator** at `tools/docs/gen_stdlib_ref.rail`.
+- **Public docs site** at `https://ledatic.org/rail/docs/` — md→html build + Mini
+  post-receive hook for auto-deploy on push to allowlisted `next` branch.
+
+### What did NOT change
+
+- **Self-hosting model.** `./rail_native` still compiles itself byte-identically
+  at the 2-cycle fixed point on ARM64. No build-tool dependencies added.
+- **Public API.** No removed or renamed stdlib symbols. No CLI flag changes.
+  No `compile.rail` interface changes for downstream tooling.
+- **Verification protocol.** Provenance v2 is backward-readable; v1 attestations
+  still verify (they just don't carry the `pulse_id` binding).
+
+### What is honestly not yet ready
+
+- **Phase 3 outreach** has not been sent. The pitch v0 at
+  `notes/phase3_external_pilot_pitch_v0.md` includes the JIT proof-point and the
+  five-artifact substrate-honesty bundle, but no candidate partner has been
+  contacted from Ledatic.
+- **Playground deployment** is staged (16-gated dry-run-able), not live.
+- **Industry adoption of substrate-not-model framing** is the goal. This release
+  is the evidence package; the framing shift is still ahead.
+
+### Stats
+
+- 216 commits since `v3.11.0` (174 non-merge + 42 merge commits)
+- ARM64 floor: 137 → 140 hardcoded list, with 12 new sidecar tests in `tools/test/`
+  not yet auto-picked-up (9 float_int_ordering + 1 auto_memo_fib + 2 diagnostic)
+- x86_64 floor: 55/60 → 136/136
+- JIT tests: 6 → 9 (3 new cluster tests)
+- Bootstrap: 2-cycle byte-identical, verified at every milestone
+
+### Migration notes (none required)
+
+If you depend on `next` HEAD, you're already on v4.0.0. If you depend on a
+v3.x tag from master, the v3.x lineage continues there separately — it carries
+the brain/agent/attestation work, not the compiler/runtime track.
 
 ## v3.7.0 — 2026-04-30 — Float-TCO root fix, mixed-precision inference, parallel rerank
 
