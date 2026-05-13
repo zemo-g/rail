@@ -321,8 +321,15 @@ _rail_add:
 
 .global _rail_sub
 _rail_sub:
+    # Same bug class as _rail_add: pre-fix only checked rdi (LHS) tag bit.
+    # For (tagged-int LHS, boxed-float RHS) the int fast path (sar; sar; sub)
+    # subtracted (heap_ptr/2) — UB. Mirror branch .Lsub_mixed_if promotes
+    # the int operand to double and uses subsd. See rail_emit_gotchas
+    # entry "x86 floats are heap-boxed".
     test rdi, 1
     jz .Lsub_float
+    test rsi, 1
+    jz .Lsub_mixed_if
     push rbp
     mov rbp, rsp
     sar rdi, 1
@@ -331,12 +338,44 @@ _rail_sub:
     lea rax, [rdi*2+1]
     pop rbp
     ret
+.Lsub_mixed_if:
+    # rdi = tagged-int LHS, rsi = boxed-float RHS.
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    subsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
 .Lsub_float:
     push rbp
     mov rbp, rsp
     sub rsp, 16
+    # Float LHS; if RHS is tagged-int, promote it. Mirrors .Ladd_mixed_fi.
+    test rsi, 1
+    jnz .Lsub_mixed_fi
     movsd xmm0, qword ptr [rdi+8]
     movsd xmm1, qword ptr [rsi+8]
+    subsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Lsub_mixed_fi:
+    # rdi = boxed-float LHS, rsi = tagged-int RHS.
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
     subsd xmm0, xmm1
     mov rdi, 16
     call _rail_alloc
@@ -348,8 +387,12 @@ _rail_sub:
 
 .global _rail_mul
 _rail_mul:
+    # Same bug class as _rail_add. Mirror branch .Lmul_mixed_if handles
+    # (tagged-int LHS, boxed-float RHS).
     test rdi, 1
     jz .Lmul_float
+    test rsi, 1
+    jz .Lmul_mixed_if
     push rbp
     mov rbp, rsp
     sar rdi, 1
@@ -358,12 +401,41 @@ _rail_mul:
     lea rax, [rdi*2+1]
     pop rbp
     ret
+.Lmul_mixed_if:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    mulsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
 .Lmul_float:
     push rbp
     mov rbp, rsp
     sub rsp, 16
+    test rsi, 1
+    jnz .Lmul_mixed_fi
     movsd xmm0, qword ptr [rdi+8]
     movsd xmm1, qword ptr [rsi+8]
+    mulsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Lmul_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
     mulsd xmm0, xmm1
     mov rdi, 16
     call _rail_alloc
@@ -375,8 +447,12 @@ _rail_mul:
 
 .global _rail_div
 _rail_div:
+    # Same bug class as _rail_add. Mirror branch .Ldiv_mixed_if handles
+    # (tagged-int LHS, boxed-float RHS).
     test rdi, 1
     jz .Ldiv_float
+    test rsi, 1
+    jz .Ldiv_mixed_if
     push rbp
     mov rbp, rsp
     sar rdi, 1
@@ -387,12 +463,41 @@ _rail_div:
     lea rax, [rax*2+1]
     pop rbp
     ret
+.Ldiv_mixed_if:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    divsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
 .Ldiv_float:
     push rbp
     mov rbp, rsp
     sub rsp, 16
+    test rsi, 1
+    jnz .Ldiv_mixed_fi
     movsd xmm0, qword ptr [rdi+8]
     movsd xmm1, qword ptr [rsi+8]
+    divsd xmm0, xmm1
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Ldiv_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
     divsd xmm0, xmm1
     mov rdi, 16
     call _rail_alloc
@@ -404,6 +509,14 @@ _rail_div:
 
 .global _rail_mod
 _rail_mod:
+    # Pre-fix: int-only — assumed both operands tagged-int. For (tagged-int
+    # LHS, boxed-float RHS) the sar/sar/idiv treats the heap pointer as an
+    # int. Mirror branches .Lmod_mixed_if / .Lmod_float / .Lmod_mixed_fi
+    # promote to double and call fmod (from libm; harness already links -lm).
+    test rdi, 1
+    jz .Lmod_float
+    test rsi, 1
+    jz .Lmod_mixed_if
     push rbp
     mov rbp, rsp
     sar rdi, 1
@@ -412,6 +525,50 @@ _rail_mod:
     cqo
     idiv rsi
     lea rax, [rdx*2+1]
+    pop rbp
+    ret
+.Lmod_mixed_if:
+    # rdi = tagged-int LHS, rsi = boxed-float RHS.
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    call fmod@PLT
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Lmod_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    test rsi, 1
+    jnz .Lmod_mixed_fi
+    movsd xmm0, qword ptr [rdi+8]
+    movsd xmm1, qword ptr [rsi+8]
+    call fmod@PLT
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
+    pop rbp
+    ret
+.Lmod_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
+    call fmod@PLT
+    mov rdi, 16
+    call _rail_alloc
+    mov qword ptr [rax], 6
+    movsd qword ptr [rax+8], xmm0
+    add rsp, 16
     pop rbp
     ret
 
@@ -540,16 +697,45 @@ _rail_ne:
 # Convention: rdi = left, rsi = right. Test rdi tag bit; if even, both heap-floats.
 .global _rail_lt
 _rail_lt:
+    # Same bug class as _rail_add: if rdi is tagged-int and rsi is heap-float
+    # (or vice-versa), the raw `cmp rdi, rsi` compares a tagged int to a heap
+    # pointer (always int < ptr ~unsigned, but signed cmp is undefined). Mirror
+    # branches promote the int operand to double and use ucomisd. Comparators
+    # return Rail-tagged bool (1=false, 3=true) — no alloc-header-6.
     test rdi, 1
     jz .Llt_float
+    test rsi, 1
+    jz .Llt_mixed_if
     cmp rdi, rsi
     setl al
     movzx rax, al
     lea rax, [rax*2+1]
     ret
+.Llt_mixed_if:
+    # rdi = tagged-int LHS, rsi = boxed-float RHS.
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setb al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
 .Llt_float:
+    test rsi, 1
+    jnz .Llt_mixed_fi
     movsd xmm0, qword ptr [rdi+8]
     movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setb al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Llt_mixed_fi:
+    # rdi = boxed-float LHS, rsi = tagged-int RHS.
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
     ucomisd xmm0, xmm1
     setb al
     movzx rax, al
@@ -560,14 +746,36 @@ _rail_lt:
 _rail_gt:
     test rdi, 1
     jz .Lgt_float
+    test rsi, 1
+    jz .Lgt_mixed_if
     cmp rdi, rsi
     setg al
     movzx rax, al
     lea rax, [rax*2+1]
     ret
+.Lgt_mixed_if:
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    seta al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
 .Lgt_float:
+    test rsi, 1
+    jnz .Lgt_mixed_fi
     movsd xmm0, qword ptr [rdi+8]
     movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    seta al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lgt_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
     ucomisd xmm0, xmm1
     seta al
     movzx rax, al
@@ -578,14 +786,36 @@ _rail_gt:
 _rail_le:
     test rdi, 1
     jz .Lle_float
+    test rsi, 1
+    jz .Lle_mixed_if
     cmp rdi, rsi
     setle al
     movzx rax, al
     lea rax, [rax*2+1]
     ret
+.Lle_mixed_if:
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setbe al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
 .Lle_float:
+    test rsi, 1
+    jnz .Lle_mixed_fi
     movsd xmm0, qword ptr [rdi+8]
     movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setbe al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lle_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
     ucomisd xmm0, xmm1
     setbe al
     movzx rax, al
@@ -596,14 +826,36 @@ _rail_le:
 _rail_ge:
     test rdi, 1
     jz .Lge_float
+    test rsi, 1
+    jz .Lge_mixed_if
     cmp rdi, rsi
     setge al
     movzx rax, al
     lea rax, [rax*2+1]
     ret
+.Lge_mixed_if:
+    sar rdi, 1
+    cvtsi2sd xmm0, rdi
+    movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setae al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
 .Lge_float:
+    test rsi, 1
+    jnz .Lge_mixed_fi
     movsd xmm0, qword ptr [rdi+8]
     movsd xmm1, qword ptr [rsi+8]
+    ucomisd xmm0, xmm1
+    setae al
+    movzx rax, al
+    lea rax, [rax*2+1]
+    ret
+.Lge_mixed_fi:
+    movsd xmm0, qword ptr [rdi+8]
+    sar rsi, 1
+    cvtsi2sd xmm1, rsi
     ucomisd xmm0, xmm1
     setae al
     movzx rax, al
