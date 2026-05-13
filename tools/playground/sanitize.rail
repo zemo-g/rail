@@ -1,0 +1,165 @@
+-- tools/playground/sanitize.rail — Pre-compile sanitizer for the
+-- public Rail playground. Conservative-reject by design: false
+-- positives are loosened later, false negatives are security holes
+-- (the playground compile service shells out `./rail_native wasm`,
+-- which evaluates the AST under whatever permissions the daemon has).
+--
+-- Public API:
+--   sanitize_source : str -> ["Ok", str] | ["Err", reason]
+--
+-- Approach:
+--   1. Cheap structural floor (size, byte range).
+--   2. Walk a `chars` list with a small state machine that tracks
+--      string-literal and line-comment context, accumulates identifier
+--      runs, and checks each one against a banned list. We work on
+--      1-char strings, NOT byte_at — `byte_at` returns the [9,len,...]
+--      heap-string header byte for non-literal strings, which silently
+--      defeats every check (took an hour to find that the first time).
+--
+-- Notes:
+--   - The banned-id list intentionally overlaps with compile.rail's
+--     `is_banned` (line 4217). Keep them in sync if either changes.
+--     We don't reuse that function because compile.rail isn't a library
+--     and we are forbidden from modifying it this session.
+--   - We can't use the compiler's `tokenize` here — it's a compile.rail
+--     internal, not a runtime builtin (no `_rail_tokenize` symbol).
+--     Hand-rolling a small scanner is the right call.
+--   - `_rail_*` direct calls are escape hatches into runtime asm; reject
+--     any identifier starting with that prefix.
+
+import "stdlib/list.rail"
+import "stdlib/string.rail"
+
+-- ---------- structural checks ----------
+
+-- 32 KB hard cap per the spec. Catches DoS via massive sources.
+sanitize_max_bytes = 32768
+
+is_printable_char c =
+  if c == char_from_int 9 then true        -- tab
+  else if c == char_from_int 10 then true  -- newline
+  else if c == char_from_int 13 then true  -- carriage return
+  else
+    let n = char_to_int c
+    if n >= 32 then n < 127
+    else false
+
+-- Walk the chars list. Returns -1 if all printable, else the
+-- offending char's offset (for reporting).
+first_nonprintable_at cs i =
+  if length cs == 0 then 0 - 1
+  else if is_printable_char (head cs) then first_nonprintable_at (tail cs) (i + 1)
+  else i
+
+-- ---------- character classification (on 1-char strings) ----------
+
+is_lower c =
+  let n = char_to_int c
+  if n >= 97 then n <= 122 else false
+
+is_upper c =
+  let n = char_to_int c
+  if n >= 65 then n <= 90 else false
+
+is_digit c =
+  let n = char_to_int c
+  if n >= 48 then n <= 57 else false
+
+is_ident_start c =
+  if is_lower c then true
+  else if is_upper c then true
+  else if c == "_" then true
+  else false
+
+is_ident_cont c =
+  if is_ident_start c then true
+  else is_digit c
+
+-- ---------- banned-name lookup ----------
+-- Mirrors compile.rail::is_banned (line 4217), plus extras.
+
+is_banned_name n =
+  if n == "shell" then true
+  else if n == "read_file" then true
+  else if n == "read_line" then true
+  else if n == "write_file" then true
+  else if n == "append_file" then true
+  else if n == "import" then true
+  else if n == "spawn" then true
+  else if n == "thread" then true
+  else if n == "arena_mark" then true
+  else if n == "arena_reset" then true
+  else if n == "alloc_stats_snapshot" then true
+  else if n == "ffi" then true
+  else if n == "foreign" then true
+  else if n == "link" then true
+  else if n == "byte_set" then true
+  else if n == "byte_at" then true
+  else if n == "malloc" then true
+  else if n == "free" then true
+  else if n == "tokenize" then true
+  else if n == "tokenize_with_pos" then true
+  else if starts_with "_rail" n then true
+  else false
+
+-- ---------- scanner state machine ----------
+-- State 0: code (default)
+-- State 1: inside line comment (until \n)
+-- State 2: inside string literal (until unescaped ")
+
+scan cs cur state =
+  if length cs == 0 then check_cur cur
+  else
+    let c = head cs
+    if state == 1 then
+      if c == char_from_int 10 then scan (tail cs) "" 0
+      else scan (tail cs) "" 1
+    else if state == 2 then
+      if c == "\\" then
+        if length (tail cs) == 0 then scan (tail cs) "" 2
+        else scan (tail (tail cs)) "" 2
+      else if c == "\"" then scan (tail cs) "" 0
+      else scan (tail cs) "" 2
+    else
+      -- state 0: code
+      if c == "-" then
+        let r = check_cur cur
+        if length r > 0 then r
+        else if length (tail cs) > 0 then
+          if head (tail cs) == "-" then scan (tail (tail cs)) "" 1
+          else scan (tail cs) "" 0
+        else scan (tail cs) "" 0
+      else if c == "\"" then
+        let r = check_cur cur
+        if length r > 0 then r
+        else scan (tail cs) "" 2
+      else if is_ident_cont c then
+        if length cur == 0 then
+          if is_ident_start c then scan (tail cs) c 0
+          else scan (tail cs) "" 0
+        else scan (tail cs) (cat [cur, c]) 0
+      else
+        let r = check_cur cur
+        if length r > 0 then r
+        else scan (tail cs) "" 0
+
+check_cur cur =
+  if length cur == 0 then ""
+  else if is_banned_name cur then cat ["banned token: ", cur]
+  else ""
+
+-- ---------- public API ----------
+
+sanitize_source src =
+  let n = length src
+  if n > sanitize_max_bytes then
+    ["Err", cat ["source too large (", show n, " bytes, max ", show sanitize_max_bytes, ")"]]
+  else
+    let cs = chars src
+    let bad = first_nonprintable_at cs 0
+    if bad >= 0 then
+      ["Err", cat ["non-printable byte at offset ", show bad]]
+    else
+      let reason = scan cs "" 0
+      if length reason > 0 then ["Err", reason]
+      else ["Ok", src]

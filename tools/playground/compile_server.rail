@@ -1,0 +1,263 @@
+-- tools/playground/compile_server.rail — HTTP handler for the public
+-- Rail playground v0. Pattern from tools/http_demo.rail.
+--
+-- Driver: tools/http_server.py (fronted by Cloudflare Worker in
+-- production; localhost in dev). The driver writes the inbound request
+-- to /tmp/rail_http_req.txt, runs this binary, and ships
+-- /tmp/rail_http_resp.txt back over the socket.
+--
+-- Endpoint: POST /api/playground/compile
+-- Request body: {"src":"<rail source>"}
+-- Response: {"ok":true,"wasm_b64":"...","build_ms":N}
+--          or {"ok":false,"error":"<reason>"}
+--
+-- Pipeline:
+--   1. Parse JSON body (single-field extractor — keeping json.rail
+--      out of the call path because it has unrelated polymorphism
+--      issues we don't want to debug from the server today).
+--   2. sanitize_source — reject dangerous tokens BEFORE the compiler
+--      sees the source. This is the security floor.
+--   3. mktemp a per-request workdir; write source to it.
+--   4. flock the wasm step (./rail_native wasm writes fixed
+--      /tmp/rail_out.{wat,wasm} paths — known race surface per
+--      notes/phase1_milestone_audit_2026-05-12.md). Snapshot
+--      /tmp/rail_out.wasm into the per-request workdir IMMEDIATELY
+--      after compile, then release the lock. Subsequent base64 / cleanup
+--      runs unlocked.
+--   5. base64-encode + emit JSON response.
+
+-- Imports: sanitize.rail transitively pulls list.rail + string.rail.
+-- Rail's import system doesn't dedup, so importing list/string again
+-- here triggers `.Lfn_add_fn_start` symbol-redefined at the assembler.
+import "tools/playground/sanitize.rail"
+
+-- ---------- HTTP request parsing ----------
+
+-- HTTP requests separate headers from body with an empty CRLF line.
+-- Returns the body as a string. If no CRLFCRLF found, returns "".
+-- Note: Rail string literals don't escape \r; build it from bytes.
+crlf_crlf = cat [char_from_int 13, char_from_int 10, char_from_int 13, char_from_int 10]
+http_body req =
+  let idx = str_find crlf_crlf req
+  if idx < 0 then
+    -- Fall back to bare LF LF (some clients send just \n\n)
+    let idx2 = str_find "\n\n" req
+    if idx2 < 0 then ""
+    else str_sub req (idx2 + 2) (length req - idx2 - 2)
+  else str_sub req (idx + 4) (length req - idx - 4)
+
+http_method req =
+  let lines = str_split "\n" req
+  if length lines == 0 then ""
+  else
+    let parts = str_split " " (head lines)
+    if length parts == 0 then "" else head parts
+
+-- ---------- single-field JSON extractor ----------
+
+-- Extract the value of `"<field>"` from a top-level JSON object body.
+-- v0 input is constrained ({"src": "..."}) so we don't need a full
+-- parser; we look for the key, the next opening quote, and read until
+-- an unescaped closing quote, applying \" \\ \n \t \r escape rules.
+--
+-- Returns "" if not found.
+--
+-- Note: byte_at is unsafe on Rail heap-strings (it reads past the [9,len]
+-- header). We walk the chars list instead.
+json_extract_str body key =
+  let needle = cat ["\"", key, "\""]
+  let kpos = str_find needle body
+  if kpos < 0 then ""
+  else
+    let after_key = kpos + length needle
+    let cs = drop_n (chars body) after_key
+    let cs1 = skip_to_quote cs
+    if length cs1 == 0 then ""
+    else json_unescape (tail cs1) ""
+
+drop_n cs n =
+  if n <= 0 then cs
+  else if length cs == 0 then []
+  else drop_n (tail cs) (n - 1)
+
+skip_to_quote cs =
+  if length cs == 0 then []
+  else if head cs == "\"" then cs
+  else skip_to_quote (tail cs)
+
+json_unescape cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    if c == "\"" then acc
+    else if c == "\\" then
+      if length (tail cs) == 0 then acc
+      else
+        let nx = head (tail cs)
+        let esc =
+          if nx == "n" then char_from_int 10
+          else if nx == "t" then char_from_int 9
+          else if nx == "r" then char_from_int 13
+          else if nx == "\"" then "\""
+          else if nx == "\\" then "\\"
+          else if nx == "/" then "/"
+          else nx
+        json_unescape (tail (tail cs)) (cat [acc, esc])
+    else json_unescape (tail cs) (cat [acc, c])
+
+-- ---------- JSON response builders ----------
+
+-- Escape a string for safe embedding in a JSON string literal.
+-- v0: we only ever emit ASCII error reasons and base64 wasm bytes (0-9,
+-- A-Z, a-z, +, /, =), so the only escape that actually fires is " and \.
+-- Newlines and control chars in error messages get escaped too.
+json_escape s = json_escape_acc (chars s) ""
+
+json_escape_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    -- Compare 1-char strings directly; byte_at on a Rail heap-string
+    -- would return the [9,len,...] header byte, not the payload.
+    if c == "\"" then json_escape_acc (tail cs) (cat [acc, "\\\""])
+    else if c == "\\" then json_escape_acc (tail cs) (cat [acc, "\\\\"])
+    else if c == char_from_int 10 then json_escape_acc (tail cs) (cat [acc, "\\n"])
+    else if c == char_from_int 13 then json_escape_acc (tail cs) (cat [acc, "\\r"])
+    else if c == char_from_int 9 then json_escape_acc (tail cs) (cat [acc, "\\t"])
+    else json_escape_acc (tail cs) (cat [acc, c])
+
+ok_json wasm_b64 build_ms =
+  cat ["{\"ok\":true,\"wasm_b64\":\"", wasm_b64, "\",\"build_ms\":", show build_ms, "}"]
+
+err_json reason =
+  cat ["{\"ok\":false,\"error\":\"", json_escape reason, "\"}"]
+
+-- ---------- HTTP response framing ----------
+
+cr = char_from_int 13
+nl = char_from_int 10
+
+http_response status status_text content_type body =
+  let crlf = cat [cr, nl]
+  cat [
+    "HTTP/1.1 ", show status, " ", status_text, crlf,
+    "Content-Type: ", content_type, crlf,
+    "Content-Length: ", show (length body), crlf,
+    "Access-Control-Allow-Origin: *", crlf,
+    "Access-Control-Allow-Methods: POST, OPTIONS", crlf,
+    "Access-Control-Allow-Headers: Content-Type", crlf,
+    "Connection: close", crlf,
+    "Server: Rail-Playground/0", crlf,
+    crlf,
+    body]
+
+json_response_200 body = http_response 200 "OK" "application/json" body
+json_response_400 body = http_response 400 "Bad Request" "application/json" body
+
+-- ---------- pipeline ----------
+
+-- millis (date-based, second-resolution; fine for v0 build_ms — we wrap
+-- compute on each side of the compile call).
+now_ms = parse_int_str (trim_str (shell "date +%s%3N 2>/dev/null"))
+
+trim_str s = head (str_split "\n" s)
+
+parse_int_str s = parse_int_acc (chars s) 0
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = digit_val c
+    if d < 0 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+
+digit_val c =
+  if c == "0" then 0
+  else if c == "1" then 1
+  else if c == "2" then 2
+  else if c == "3" then 3
+  else if c == "4" then 4
+  else if c == "5" then 5
+  else if c == "6" then 6
+  else if c == "7" then 7
+  else if c == "8" then 8
+  else if c == "9" then 9
+  else 0 - 1
+
+-- Snapshot the wasm into `out_path` IMMEDIATELY after compile so the
+-- next request can race on /tmp/rail_out.* without corrupting our
+-- result. v0 doesn't lock — `flock` isn't on macOS by default and the
+-- v0 tester is single-shot anyway. `mkdir` is the canonical
+-- POSIX-portable atomic lock when needed; defer adding it until
+-- contention shows up. Returns build_ms (>=0) on success, -1 on fail.
+compile_to_wasm src_path out_path err_path =
+  let t0 = now_ms
+  let cmd = cat [
+    "./rail_native wasm ", src_path, " > ", err_path, " 2>&1; ec=$?; ",
+    "if [ $ec -eq 0 ] && [ -f /tmp/rail_out.wasm ]; then ",
+    "  cp /tmp/rail_out.wasm ", out_path, "; ",
+    "fi; ",
+    "exit $ec"]
+  let _ = shell cmd
+  let t1 = now_ms
+  let ok = trim_str (shell (cat ["test -f ", out_path, " && echo 1 || echo 0"]))
+  if ok == "1" then t1 - t0 else 0 - 1
+
+-- Read the output .wasm and base64-encode. We shell out to the system
+-- `base64` tool because (1) wasm bytes are arbitrary and stdlib's
+-- `base64_encode` walks `chars` + per-char `char_code` (a shell call
+-- per byte — 4 KB wasm = 4000 shell calls), and (2) char_code uses
+-- printf which doesn't round-trip bytes >127 cleanly. macOS `base64`
+-- defaults to wrapped output; pipe through `tr -d '\n'` for a single
+-- line as expected by JSON consumers.
+encode_wasm_b64 path =
+  let raw = trim_str (shell (cat ["base64 < ", path, " 2>/dev/null | tr -d '\\n'"]))
+  raw
+
+-- Step helpers (each returns the response string). Flattened to avoid
+-- the nested-let-in-if-arm parse trap noted in CLAUDE.md.
+
+step_compile src =
+  let workdir = trim_str (shell "mktemp -d /tmp/rail_pg_XXXXXX")
+  let src_path = cat [workdir, "/src.rail"]
+  let wasm_path = cat [workdir, "/out.wasm"]
+  let err_path = cat [workdir, "/err.txt"]
+  let _ = write_file src_path src
+  let build_ms = compile_to_wasm src_path wasm_path err_path
+  let err_text = if build_ms < 0 then read_file err_path else ""
+  let b64 = if build_ms < 0 then "" else encode_wasm_b64 wasm_path
+  let _ = shell (cat ["rm -rf ", workdir])
+  step_compile_finish build_ms err_text b64
+
+step_compile_finish build_ms err_text b64 =
+  if build_ms < 0 then json_response_400 (err_json (cat ["compile failed: ", err_text]))
+  else if length b64 == 0 then json_response_400 (err_json "compile produced no wasm")
+  else json_response_200 (ok_json b64 build_ms)
+
+step_sanitize src =
+  let sresult = sanitize_source src
+  if head sresult == "Err" then json_response_400 (err_json (cat ["sanitize: ", head (tail sresult)]))
+  else step_compile src
+
+step_extract body =
+  let src = json_extract_str body "src"
+  if length src == 0 then json_response_400 (err_json "missing 'src' field")
+  else step_sanitize src
+
+step_body req =
+  let body = http_body req
+  if length body == 0 then json_response_400 (err_json "empty request body")
+  else step_extract body
+
+route_request req =
+  let method = http_method req
+  if method == "OPTIONS" then json_response_200 "{}"
+  else if method != "POST" then json_response_400 (err_json "expected POST")
+  else step_body req
+
+main =
+  let req = read_file "/tmp/rail_http_req.txt"
+  let resp = route_request req
+  let _ = write_file "/tmp/rail_http_resp.txt" resp
+  let _ = shell "cat /tmp/rail_http_resp.txt"
+  0
