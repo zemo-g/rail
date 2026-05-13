@@ -208,3 +208,143 @@ inst_ldr_x27_32      = 4181726203
 inst_ldp_x19_x20_16  = 2839630835
 inst_ldp_fp_lr_post  = 2831645693
 inst_nop             = 3573751839
+
+-- ============================================================================
+-- v5 Phase 0 — AOT-completion encoders.
+--
+-- The JIT only needs what its hot path emits; AOT (compile.rail) emits a
+-- broader ISA. This block fills the gap so jit/arm64.rail can encode every
+-- mnemonic compile.rail currently produces as assembly text. Pre-cursor to
+-- v5.0.0 (Rail emits Mach-O directly, retiring `as` + `ld`).
+--
+-- Encoding sources: ARM Architecture Reference Manual (DDI0487, Chapter C6).
+-- Each base is verified by jit/test_encoders.rail against system `as`.
+-- ============================================================================
+
+-- ── Move ──────────────────────────────────────────────────────────────────
+-- movn xD, #imm16, lsl #(N*16)   N in {0,1,2,3}
+-- Base: 0x92800000 | (N << 21) | (imm << 5) | D
+enc_movn dst imm shift_n =
+  bit_or 2457862144 (bit_or (shl shift_n 21) (bit_or (shl (bit_and imm 65535) 5) dst))
+
+-- ── Bitwise (shifted register, shift=0) ──────────────────────────────────
+-- and xD, xA, xB    Base: 0x8A000000
+enc_and dst a b =
+  bit_or 2315255808 (bit_or (shl b 16) (bit_or (shl a 5) dst))
+
+-- orr xD, xA, xB    Base: 0xAA000000
+enc_orr dst a b =
+  bit_or 2852126720 (bit_or (shl b 16) (bit_or (shl a 5) dst))
+
+-- eor xD, xA, xB    Base: 0xCA000000
+enc_eor dst a b =
+  bit_or 3388997632 (bit_or (shl b 16) (bit_or (shl a 5) dst))
+
+-- tst xA, xB        (alias of ands xzr, xA, xB)   Base: 0xEA00001F
+enc_tst a b =
+  bit_or 3925868575 (bit_or (shl b 16) (shl a 5))
+
+-- ── Variable shifts (register form, 64-bit, data-processing 2-source) ───
+-- lslv xD, xA, xB    Base: 0x9AC02000
+enc_lsl dst a b =
+  bit_or 2596282368 (bit_or (shl b 16) (bit_or (shl a 5) dst))
+
+-- lsrv xD, xA, xB    Base: 0x9AC02400
+enc_lsr dst a b =
+  bit_or 2596283392 (bit_or (shl b 16) (bit_or (shl a 5) dst))
+
+-- asrv xD, xA, xB    Base: 0x9AC02800
+enc_asr dst a b =
+  bit_or 2596284416 (bit_or (shl b 16) (bit_or (shl a 5) dst))
+
+-- ── Arithmetic ───────────────────────────────────────────────────────────
+-- sdiv xD, xA, xB    Base: 0x9AC00C00 (mirror of udiv 0x9AC00800)
+enc_sdiv dst a b =
+  bit_or 2596277248 (bit_or (shl b 16) (bit_or (shl a 5) dst))
+
+-- madd xD, xN, xM, xA    Base: 0x9B000000 | (M<<16) | (A<<10) | (N<<5) | D
+enc_madd dst n m a =
+  bit_or 2600468480 (bit_or (shl m 16) (bit_or (shl a 10) (bit_or (shl n 5) dst)))
+
+-- ── Conditional branches ─────────────────────────────────────────────────
+-- b.cond #byte_off    Encoding: 0x54000000 | (imm19 << 5) | cond
+-- Cond codes: EQ=0 NE=1 CS/HS=2 CC/LO=3 MI=4 PL=5 VS=6 VC=7
+--             HI=8 LS=9 GE=10 LT=11 GT=12 LE=13 AL=14
+enc_bcond_byte_off cond byte_off =
+  let inst_off = byte_off / 4
+  let masked = bit_and inst_off 524287
+  bit_or (bit_or 1409286144 (shl masked 5)) cond
+
+-- Named convenience wrappers (kept for call-site readability + grep).
+enc_beq_byte_off byte_off = enc_bcond_byte_off 0 byte_off
+enc_bcs_byte_off byte_off = enc_bcond_byte_off 2 byte_off
+enc_bhs_byte_off byte_off = enc_bcond_byte_off 2 byte_off  -- alias of cs
+enc_bcc_byte_off byte_off = enc_bcond_byte_off 3 byte_off
+enc_blo_byte_off byte_off = enc_bcond_byte_off 3 byte_off  -- alias of cc
+enc_bhi_byte_off byte_off = enc_bcond_byte_off 8 byte_off
+enc_bls_byte_off byte_off = enc_bcond_byte_off 9 byte_off
+enc_bge_byte_off byte_off = enc_bcond_byte_off 10 byte_off
+enc_blt_byte_off byte_off = enc_bcond_byte_off 11 byte_off
+enc_bgt_byte_off byte_off = enc_bcond_byte_off 12 byte_off
+enc_ble_byte_off byte_off = enc_bcond_byte_off 13 byte_off
+
+-- ── Compare-and-branch (non-zero variant of cbz) ────────────────────────
+-- cbnz xR, #byte_off    Base: 0xB5000000 | ((off19 & 0x7FFFF) << 5) | R
+enc_cbnz_byte_off reg byte_off =
+  let inst_off = byte_off / 4
+  let masked = bit_and inst_off 524287
+  bit_or 3036676096 (bit_or (shl masked 5) reg)
+
+-- ── Branch register (br = branch without link) ──────────────────────────
+-- br xR    Base: 0xD61F0000 | (R << 5)
+enc_br reg =
+  bit_or 3592355840 (shl reg 5)
+
+-- ── adrp xD, label    Page-relative address (immediate is page count) ───
+-- Encoding: 0x90000000 | (immlo<<29) | (immhi<<5) | Rd
+-- immlo = (byte_off >> 12) & 3
+-- immhi = (byte_off >> 14) & 0x7FFFF
+enc_adrp dst byte_off =
+  let page_off = shr byte_off 12
+  let imm21 = bit_and page_off 2097151
+  let immlo = bit_and imm21 3
+  let immhi = bit_and (shr imm21 2) 524287
+  bit_or 2415919104 (bit_or (shl immlo 29) (bit_or (shl immhi 5) dst))
+
+-- ── Supervisor call (Linux syscalls) ────────────────────────────────────
+-- svc #imm16    Base: 0xD4000001 | (imm << 5)
+enc_svc imm =
+  bit_or 3556769793 (shl (bit_and imm 65535) 5)
+
+-- ── Generalised load/store (any base reg, 8-byte-multiple unsigned offset)
+-- ldr xD, [xN, #imm]    Base: 0xF9400000 | ((imm/8)<<10) | (N<<5) | D
+-- imm must be in [0, 32760] and multiple of 8.
+enc_ldr_imm dst n imm =
+  bit_or 4181721088 (bit_or (shl (imm / 8) 10) (bit_or (shl n 5) dst))
+
+-- str xD, [xN, #imm]    Base: 0xF9000000
+enc_str_imm dst n imm =
+  bit_or 4177526784 (bit_or (shl (imm / 8) 10) (bit_or (shl n 5) dst))
+
+-- ── Load/store pair, signed offset (multi-register frame ops) ───────────
+-- ldp xD1, xD2, [xN, #imm]    Base: 0xA9400000 | ((imm/8 & 0x7F)<<15) | (D2<<10) | (N<<5) | D1
+-- imm is signed 7-bit scaled by 8 → range [-512, +504] in 8-byte steps.
+-- Caller must pass non-negative for v1; signed support to come with relocations.
+enc_ldp_imm d1 d2 n imm =
+  let scaled = bit_and (imm / 8) 127
+  bit_or 2839543808 (bit_or (shl scaled 15) (bit_or (shl d2 10) (bit_or (shl n 5) d1)))
+
+-- stp xD1, xD2, [xN, #imm]    Base: 0xA9000000
+enc_stp_imm d1 d2 n imm =
+  let scaled = bit_and (imm / 8) 127
+  bit_or 2835349504 (bit_or (shl scaled 15) (bit_or (shl d2 10) (bit_or (shl n 5) d1)))
+
+-- ── Remaining cset variants compile.rail emits ──────────────────────────
+-- cset xD, ne    Base: 0x9A9F07E0 (cond=eq inverted)
+enc_cset_ne dst = bit_or 2594113504 dst
+-- cset xD, hi    Base: 0x9A9F97E0 (cond=ls inverted)
+enc_cset_hi dst = bit_or 2594150368 dst
+-- cset xD, lo    Base: 0x9A9F27E0 (cond=hs inverted)   alias: cc
+enc_cset_lo dst = bit_or 2594121696 dst
+-- cset xD, hs    Base: 0x9A9F37E0 (cond=lo inverted)   alias: cs
+enc_cset_hs dst = bit_or 2594125792 dst
