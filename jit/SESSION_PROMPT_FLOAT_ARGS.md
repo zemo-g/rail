@@ -281,7 +281,7 @@ If any of those break: stop, root-cause, don't paper over.
     git add jit/... 
     git commit -m "jit: float user-fn args — last named v1 limit"
     git push origin jit                                               # → Mini
-    ssh ledaticempire@mini.tb 'cd ~/projects/rail && git push origin jit'  # → GitHub
+    ssh <user>@<host> 'cd ~/projects/rail && git push origin jit'  # → GitHub
 
 If `tools/compile.rail` changed (it shouldn't for this session — link
 line already picks up the trampoline), bootstrap with

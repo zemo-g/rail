@@ -47,7 +47,7 @@ All three compile clean. Each produces a distinct ckpt name + log path so they d
 `tools/train/run_v04_queue.sh` — runs A → bench → B → bench → C → bench, tees boundary lines to `/tmp/spur_fix_v04_queue.log`. Each variant runs ~85 min A + ~14 min B + ~85 min C = ~3.4h total. Wrap with `nohup` + detach.
 
 ### 9. Teacher harvester (validated end-to-end)
-`tools/train/harvest_teacher.rail` — Qwen 3.6 35B at `10.42.0.2:8081`, model id `/Users/user/models/Qwen3.6-35B-A3B-8bit`. Reads `triples_v2.txt`, prompts teacher for each (broken, diag) pair, validates fix compiles, emits new triples to `training/triples_harvested_v1.txt`. Smoke-validated: 200 input → 16 kept (8% novel-fix rate). Uses curl + jq + perl pipeline (mirrors stdlib/llm.rail). MLX is bound to a Mini-network IP not localhost.
+`tools/train/harvest_teacher.rail` — Qwen 3.6 35B at `10.42.0.2:8081`, model id `~/models/Qwen3.6-35B-A3B-8bit`. Reads `triples_v2.txt`, prompts teacher for each (broken, diag) pair, validates fix compiles, emits new triples to `training/triples_harvested_v1.txt`. Smoke-validated: 200 input → 16 kept (8% novel-fix rate). Uses curl + jq + perl pipeline (mirrors stdlib/llm.rail). MLX is bound to a Mini-network IP not localhost.
 
 `cli_args` is NOT a real Rail builtin — `parse_max_arg` returns the `200` default. Patch by hardcoding or shelling `echo $MAX` before extending.
 

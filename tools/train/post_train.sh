@@ -16,11 +16,11 @@ cd ~/projects/rail
 
 NOTIFY="./tools/train/notify.sh"
 FLEET_TOKEN="fleet-test-token-2026"
-RAZER="100.109.63.37"
+RAZER="<retired-host-tailscale-ip>"
 RAZER_USER="Detro"
 ADAPTER_LOCAL="training/adapters_4b_mlx"
-MLX_PYTHON="/Users/ledaticempire/homebrew/bin/python3.11"
-MODEL_4B="/Users/ledaticempire/models/Qwen3.5-4B-4bit"
+MLX_PYTHON="~/homebrew/bin/python3.11"
+MODEL_4B="~/models/Qwen3.5-4B-4bit"
 PORT=8080
 
 # --- Step 0: Wait for Razer training to produce a checkpoint ---
@@ -95,7 +95,7 @@ from pathlib import Path
 from safetensors.numpy import load_file, save_file
 
 peft_dir = Path("/tmp/peft_adapter_4b")
-out_dir = Path("/Users/ledaticempire/projects/rail/training/adapters_4b_mlx")
+out_dir = Path("~/projects/rail/training/adapters_4b_mlx")
 out_dir.mkdir(exist_ok=True)
 
 # Load PEFT adapter (as numpy — no torch needed)
@@ -151,7 +151,7 @@ mlx_cfg = {
         "scale": float(alpha) / r,
         "keys": sorted(lora_keys)
     },
-    "model": "/Users/ledaticempire/models/Qwen3.5-4B-4bit"
+    "model": "~/models/Qwen3.5-4B-4bit"
 }
 with open(out_dir / "adapter_config.json", "w") as f:
     json.dump(mlx_cfg, f, indent=2)

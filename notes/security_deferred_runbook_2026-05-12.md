@@ -34,7 +34,7 @@ These five items require **your hands on the keyboard** (sudo, OAuth, System Set
 
 ## 2. Apple Remote Desktop / ARDAgent off (`*:3283`)
 
-**Status as of 2026-05-12 21:30**: VNC peer check empty (`lsof -nP -iTCP:5900 -sTCP:ESTABLISHED` returns nothing; `lsof -p 12496` shows zero open network sockets; no Screen-Sharing entry in `who`). PID 12496 is still alive 1d 8h 23m though, so an idle/dropped client cannot be 100% ruled out. **Not auto-executing.** One-shot script staged at `/Users/user/projects/rail/notes/ard_off_after_session.sh` (chmod +x, includes cached-sudo + ESTABLISHED-5900 pre-flight checks). User action sequence: (1) move all work to SSH (`ssh studio`), (2) close any Screen Sharing client window from Air/laptop, (3) `sudo -v` in the same shell to cache creds, (4) run `bash /Users/user/projects/rail/notes/ard_off_after_session.sh`, (5) verify `lsof -nP -iTCP:3283 -sTCP:LISTEN` is empty. Script self-verifies and prints OK + timestamp on success.
+**Status as of 2026-05-12 21:30**: VNC peer check empty (`lsof -nP -iTCP:5900 -sTCP:ESTABLISHED` returns nothing; `lsof -p 12496` shows zero open network sockets; no Screen-Sharing entry in `who`). PID 12496 is still alive 1d 8h 23m though, so an idle/dropped client cannot be 100% ruled out. **Not auto-executing.** One-shot script staged at `~/projects/rail/notes/ard_off_after_session.sh` (chmod +x, includes cached-sudo + ESTABLISHED-5900 pre-flight checks). User action sequence: (1) move all work to SSH (`ssh studio`), (2) close any Screen Sharing client window from Air/laptop, (3) `sudo -v` in the same shell to cache creds, (4) run `bash ~/projects/rail/notes/ard_off_after_session.sh`, (5) verify `lsof -nP -iTCP:3283 -sTCP:LISTEN` is empty. Script self-verifies and prints OK + timestamp on success.
 
 **Current state**: `ARDAgent` (PID 636) listening on `*:3283` IPv6. `com.apple.RemoteManagementAgent` loaded under launchd (last-exit -9, currently re-running). **Active Screen Sharing session present**: `screensharingd` PID 12496 + `ScreensharingAgent` PID 12497, both up 1d 5h 59m. Confirm whether this is **your** session before deactivating — if you're remoted into Studio via Screen Sharing right now, you will be disconnected.
 
@@ -145,17 +145,17 @@ Expect: `true`, `true`, `false`.
 
 ## 4. Colima virtfs scope-down
 
-**Current state**: Active profile `default` (running, x86_64, vz). `~/.colima/default/colima.yaml` has `mounts: []` — meaning **Colima is using its default behavior, which mounts `$HOME` (`/Users/user`) as writable** into the VM. This is what the audit flagged as `virtfs path=/Users/user,security_model=none`.
+**Current state**: Active profile `default` (running, x86_64, vz). `~/.colima/default/colima.yaml` has `mounts: []` — meaning **Colima is using its default behavior, which mounts `$HOME` (`~`) as writable** into the VM. This is what the audit flagged as `virtfs path=~,security_model=none`.
 
 **Proposed tighter mounts**: explicit list, drop `$HOME`, scope to what actually needs to be visible inside the VM.
 
-**Workflow dependencies** (grepped `/Users/user/projects/rail/tools` and `/Users/user/projects/ledatic-site` for non-`projects` paths under `/Users/user/`): **none found**. No build script or deploy script references `/Users/user/<anything-but-projects>`. The x86 conformance cache at `/Users/user/.cache/rail-x86-conformance/` is populated (`asm/`, `import_aux/`), so if the x86 conformance harness runs **inside** the Colima VM (not on host), that path needs to be mounted too. If it only runs on host and reads/writes the cache from host, it does **not** need to be in the VM.
+**Workflow dependencies** (grepped `~/projects/rail/tools` and `~/projects/ledatic-site` for non-`projects` paths under `~/`): **none found**. No build script or deploy script references `~/<anything-but-projects>`. The x86 conformance cache at `~/.cache/rail-x86-conformance/` is populated (`asm/`, `import_aux/`), so if the x86 conformance harness runs **inside** the Colima VM (not on host), that path needs to be mounted too. If it only runs on host and reads/writes the cache from host, it does **not** need to be in the VM.
 
 **Action steps**:
 
 1. Confirm whether the x86 conformance harness runs inside Colima or on host:
    ```
-   grep -rE 'colima|docker run|docker exec' /Users/user/projects/rail/tools/conformance/ 2>/dev/null | head
+   grep -rE 'colima|docker run|docker exec' ~/projects/rail/tools/conformance/ 2>/dev/null | head
    ```
    - If empty → host-only → you do not need `.cache/rail-x86-conformance` mounted.
    - If hits → keep it in the mount list.
@@ -168,9 +168,9 @@ Expect: `true`, `true`, `false`.
 3. Edit `~/.colima/default/colima.yaml`. Replace `mounts: []` with:
    ```yaml
    mounts:
-     - location: /Users/user/projects
+     - location: ~/projects
        writable: true
-     - location: /Users/user/.cache/rail-x86-conformance
+     - location: ~/.cache/rail-x86-conformance
        writable: true     # drop this line if step 1 returned empty
    ```
 
@@ -182,12 +182,12 @@ Expect: `true`, `true`, `false`.
 
 5. Verify the mount inside the VM:
    ```
-   colima ssh -- ls /Users/user/
+   colima ssh -- ls ~/
    ```
    Should now show only `projects` (and `.cache/rail-x86-conformance` if you kept it), **not** the whole home dir.
 
 **Risk**:
-- Any container that reads `/Users/user/<something-outside-projects>` (e.g., `~/.ssh`, `~/.aws`, `~/.config`) will start failing with ENOENT. **This is the security win — those exact paths should not have been in the VM in the first place.**
+- Any container that reads `~/<something-outside-projects>` (e.g., `~/.ssh`, `~/.aws`, `~/.config`) will start failing with ENOENT. **This is the security win — those exact paths should not have been in the VM in the first place.**
 - Restart kills running containers. If you have any active `docker run`, they die.
 - If a future workflow needs another host path inside the VM, you now have to extend `mounts:` and `colima restart` rather than it Just Working.
 
@@ -199,25 +199,25 @@ Expect: `true`, `true`, `false`.
 - **Colima profiles** (`colima list`): only `default` (Running, x86_64, 4 CPU / 4 GiB RAM / 20 GiB disk, runtime=docker). No stale profile to also fix.
 - **In-VM cache verdict**: **YES, keep cache mounts.** `tools/test/x86_conformance.sh:328` runs `docker run --rm --platform=linux/amd64 -v "$STAGE":/stage gcc:latest /stage/runner.sh` with `STAGE="$HOME/.cache/rail-x86-conformance"` (line 17). `tools/test/x86_bitops_smoke.sh:60` does the same with `STAGE="$HOME/.cache/rail-x86-bitops-smoke"` (line 55). Both `-v` mounts require those host paths to be visible inside the Colima VM. Without them, the x86 conformance harness (the 128/128 backend gate) breaks.
   - Note: the original action-step grep hint pointed at `tools/conformance/` and `tools/x86/`, neither of which exist in the tree. The actual scripts live in `tools/test/`. The bitops smoke cache (`rail-x86-bitops-smoke`) was missed by the original §4 template; the prep yaml below adds it.
-- **Other host paths grepped** (`/Users/user/<not-projects>` references in `tools/` + `ledatic-site/`): none. No additional mounts needed.
-- **Prep file**: `/Users/user/projects/rail/notes/colima_scoped_mounts.yaml` (proposed replacement; live config untouched).
+- **Other host paths grepped** (`~/<not-projects>` references in `tools/` + `ledatic-site/`): none. No additional mounts needed.
+- **Prep file**: `~/projects/rail/notes/colima_scoped_mounts.yaml` (proposed replacement; live config untouched).
 - **Replay sequence** (run during a quiet window — 60 seconds end-to-end):
   ```
   colima stop
   cp ~/.colima/default/colima.yaml ~/.colima/default/colima.yaml.bak.$(date +%Y%m%d)
-  cp /Users/user/projects/rail/notes/colima_scoped_mounts.yaml ~/.colima/default/colima.yaml
+  cp ~/projects/rail/notes/colima_scoped_mounts.yaml ~/.colima/default/colima.yaml
   colima start --arch x86_64 --vm-type=vz --vz-rosetta
-  colima ssh -- ls /Users/user/
+  colima ssh -- ls ~/
   ```
 - **Post-restart verification**:
-  1. `colima ssh -- ls /Users/user/` should print **only** `projects` and `.cache` (and `.cache/` should contain only `rail-x86-conformance` and `rail-x86-bitops-smoke`). It should NOT show `.ssh`, `.aws`, `.config`, `Library`, `Documents`, etc. If it does, the new YAML didn't take.
-  2. `colima ssh -- cat /Users/user/.ssh/id_ed25519` should fail with "No such file or directory". If it succeeds, the mount scope-down failed.
-  3. Smoke the x86 backend cache mount: `bash /Users/user/projects/rail/tools/test/x86_bitops_smoke.sh` should still PASS (proves the cache mount path still works inside the VM).
-  4. Full conformance: `bash /Users/user/projects/rail/tools/test/x86_conformance.sh` should still report 128/128 (the backend gate; expected runtime ~minutes).
+  1. `colima ssh -- ls ~/` should print **only** `projects` and `.cache` (and `.cache/` should contain only `rail-x86-conformance` and `rail-x86-bitops-smoke`). It should NOT show `.ssh`, `.aws`, `.config`, `Library`, `Documents`, etc. If it does, the new YAML didn't take.
+  2. `colima ssh -- cat ~/.ssh/id_ed25519` should fail with "No such file or directory". If it succeeds, the mount scope-down failed.
+  3. Smoke the x86 backend cache mount: `bash ~/projects/rail/tools/test/x86_bitops_smoke.sh` should still PASS (proves the cache mount path still works inside the VM).
+  4. Full conformance: `bash ~/projects/rail/tools/test/x86_conformance.sh` should still report 128/128 (the backend gate; expected runtime ~minutes).
 - **Rollback** (if step 3 or 4 fails): `cp ~/.colima/default/colima.yaml.bak.<DATE> ~/.colima/default/colima.yaml && colima stop && colima start --arch x86_64 --vm-type=vz --vz-rosetta`.
 
 ---
 
 ## 5. Token rotation pointer
 
-After items 1-4 land, work through Swarm Agent 3's runbook at `/Users/user/projects/rail/notes/token_rotation_runbook_2026-05-12.md` (or wherever Agent 3 dropped it). That covers CF_TOKEN, GitHub PATs, and any other secrets flagged by Fixer-4's audit. Don't duplicate that work here.
+After items 1-4 land, work through Swarm Agent 3's runbook at `~/projects/rail/notes/token_rotation_runbook_2026-05-12.md` (or wherever Agent 3 dropped it). That covers CF_TOKEN, GitHub PATs, and any other secrets flagged by Fixer-4's audit. Don't duplicate that work here.

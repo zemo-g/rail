@@ -6,7 +6,7 @@
 TOKEN="${RAIL_TELEGRAM_TOKEN:?Set RAIL_TELEGRAM_TOKEN}"
 CHAT_ID="${RAIL_TELEGRAM_CHAT:?Set RAIL_TELEGRAM_CHAT}"
 FLEET_TOKEN="${RAIL_FLEET_TOKEN:-}"
-RAZER="100.109.63.37"
+RAZER="<retired-host-tailscale-ip>"
 PROGRESS="$HOME/projects/rail/training/self_train/progress.txt"
 STLOG="$HOME/projects/rail/training/self_train/log.txt"
 PY="/opt/homebrew/bin/python3.11"

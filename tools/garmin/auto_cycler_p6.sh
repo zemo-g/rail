@@ -49,7 +49,7 @@ while true; do
       fi
       target_subdir=$(echo "$next" | awk '{print $1}')
       src_fit=$(echo "$next" | awk '{print $2}')
-      result=$(/Users/user/projects/rail/tools/garmin/fuzz_phase_a_dir_p6.sh "$target_subdir" "$src_fit" 2>&1)
+      result=$(~/projects/rail/tools/garmin/fuzz_phase_a_dir_p6.sh "$target_subdir" "$src_fit" 2>&1)
       cur_cycle_dir=$(echo "$result" | tail -1)
       label=$(basename "$cur_cycle_dir" | sed -E 's/^cycle_[0-9_]+_(.+)$/\1/')
       tail -n +2 "$queue" > "$queue.tmp" && mv "$queue.tmp" "$queue"
@@ -70,7 +70,7 @@ while true; do
       ;;
     CYCLING:MOUNTED)
       echo "REMOUNTED - running phase B (with 5s flush wait)"
-      verdict_out=$(/Users/user/projects/rail/tools/garmin/fuzz_phase_b.sh "$cur_cycle_dir" 2>&1)
+      verdict_out=$(~/projects/rail/tools/garmin/fuzz_phase_b.sh "$cur_cycle_dir" 2>&1)
       verdict=$(cat "$cur_cycle_dir/verdict" 2>/dev/null || echo 'unknown')
       label=$(basename "$cur_cycle_dir" | sed -E 's/^cycle_[0-9_]+_(.+)$/\1/')
       changed=$(echo "$verdict_out" | grep -E 'content-changed' | awk '{print $NF}')

@@ -6,7 +6,7 @@ your behalf, but every other prerequisite is staged.
 
 ## (a) Audit verdict — Mini bare-relay hooks DIRECT-PUSH to protected refs
 
-Read on 2026-05-12 from `ssh ledaticempire@mini.tb`:
+Read on 2026-05-12 from `ssh <user>@<host>`:
 
 - `~/git/rail.git/hooks/post-receive` → for every ref (incl. `next`),
   runs `git push --quiet origin "$refname"`. `origin` =
@@ -200,7 +200,7 @@ scopes and re-run the PUT.
 
 1. **Decide Option 1 vs 2 vs 3** above. (My recommendation: 1.)
 2. **Edit Mini hooks** per the chosen option:
-   - `ssh ledaticempire@mini.tb`
+   - `ssh <user>@<host>`
    - Back up: `cp ~/git/rail.git/hooks/post-receive{,.pre-protection}`
    - Same for `ledatic-site.git`.
    - Apply the patch.

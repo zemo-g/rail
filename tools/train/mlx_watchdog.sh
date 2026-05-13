@@ -1,8 +1,8 @@
 #!/bin/bash
-MODEL="/Users/ledaticempire/models/Qwen3.5-4B-4bit"
-ADAPTER="/Users/ledaticempire/projects/rail/training/adapters_4b_v5_mlx"
+MODEL="~/models/Qwen3.5-4B-4bit"
+ADAPTER="~/projects/rail/training/adapters_4b_v5_mlx"
 PORT=8080
-PYTHON="/Users/ledaticempire/homebrew/bin/python3.11"
+PYTHON="~/homebrew/bin/python3.11"
 LOG="/tmp/mlx_server.log"
 RESTART_INTERVAL=1800
 

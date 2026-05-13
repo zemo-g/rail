@@ -57,7 +57,7 @@ file_count=$(wc -l < "$out/snapshot.sha256" | tr -d ' ')
 echo "[walkaway] hashed $file_count files"
 
 # 3. Normalize baseline to mount-relative paths
-sed 's|/Users/user/garmin_recon/snapshot_2026-04-28/|./|' "$baseline" | sort -k2 > "$out/baseline.sha256"
+sed 's|~/garmin_recon/snapshot_2026-04-28/|./|' "$baseline" | sort -k2 > "$out/baseline.sha256"
 sort -k2 "$out/snapshot.sha256" > "$out/snapshot.sorted"
 
 # 4. Diff

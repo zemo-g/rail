@@ -15,8 +15,8 @@ set -euo pipefail
 FRAME_PATH=${FRAME_PATH:-/tmp/plasma_ot256.bin}
 BEACON_URL=${BEACON_URL:-https://ledatic.org/entropy/pulse}
 BEACON_TOKEN_FILE=${BEACON_TOKEN_FILE:-$HOME/.ledatic/entropy/beacon_token}
-WITNESS_HOST=${WITNESS_HOST:-zemog@100.87.231.45}
-SIGNER=${SIGNER:-/home/zemog/.ledatic/witness/sign_attestation.sh}
+WITNESS_HOST=${WITNESS_HOST:-<witness-user>@<witness-host>}
+SIGNER=${SIGNER:-~/.ledatic/witness/sign_attestation.sh}
 SITE=${SITE:-https://ledatic.org}
 KIND=${KIND:-ot256}
 

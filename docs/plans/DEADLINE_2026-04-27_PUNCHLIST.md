@@ -42,7 +42,7 @@ Prior handoff estimate: "8-10 h sequential + ~4 h parallel = comfortable." This 
 
 - **Status:** NOT RUN. Blocker: bench harness (`flywheel/bench_railnative.rail`) lives in the private `Ledatic-Empire/rail-training` repo. Not in this repo.
 - **What's missing:**
-  - scp sync from Mini: `scp -r ledaticempire@mini.tb:~/projects/rail-training/flywheel ./flywheel-local/` (or the individual `bench_railnative.rail` + its question fixtures).
+  - scp sync from Mini: `scp -r <user>@<host>:~/projects/rail-training/flywheel ./flywheel-local/` (or the individual `bench_railnative.rail` + its question fixtures).
   - Wire checkpoint path into the bench invocation.
   - Run bench against the d=256 checkpoint when P0.1 lands.
   - Append result row to `flywheel/bench_log.txt` (not `.backup`).

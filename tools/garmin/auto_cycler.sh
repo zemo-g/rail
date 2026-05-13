@@ -74,7 +74,7 @@ while true; do
         echo "QUEUE_EMPTY"
         exit 0
       fi
-      result=$(/Users/user/projects/rail/tools/garmin/fuzz_phase_a_dir.sh "$next" 2>&1)
+      result=$(~/projects/rail/tools/garmin/fuzz_phase_a_dir.sh "$next" 2>&1)
       cur_cycle_dir=$(echo "$result" | tail -1)
       label=$(basename "$cur_cycle_dir" | sed -E 's/^cycle_[0-9_]+_(.+)$/\1/')
       # Pop queue
@@ -97,7 +97,7 @@ while true; do
       ;;
     CYCLING:MOUNTED)
       echo "REMOUNTED - running phase B"
-      verdict_out=$(/Users/user/projects/rail/tools/garmin/fuzz_phase_b.sh "$cur_cycle_dir" 2>&1)
+      verdict_out=$(~/projects/rail/tools/garmin/fuzz_phase_b.sh "$cur_cycle_dir" 2>&1)
       verdict=$(cat "$cur_cycle_dir/verdict" 2>/dev/null || echo 'unknown')
       label=$(basename "$cur_cycle_dir" | sed -E 's/^cycle_[0-9_]+_(.+)$/\1/')
       changed=$(echo "$verdict_out" | grep -E 'content-changed' | awk '{print $NF}')

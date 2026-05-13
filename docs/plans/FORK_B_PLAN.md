@@ -174,7 +174,7 @@ Kill-switch check (insert at top of the inner train step):
 
 ```rail
 is_kill_requested _ =
-  let kill_path = "/Users/ledaticempire/.ledatic/data/.rail_train_kill"
+  let kill_path = "~/.ledatic/data/.rail_train_kill"
   match stat kill_path
   | Ok _ -> true
   | Err _ -> false

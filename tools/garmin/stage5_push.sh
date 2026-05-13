@@ -17,10 +17,10 @@ set -euo pipefail
 mode="${1:-inspect}"
 
 watch_root=/Volumes/GARMIN
-gcd_dir=/Users/user/garmin_recon/firmware/Instinct_1910/Instinct_1910Beta
+gcd_dir=~/garmin_recon/firmware/Instinct_1910/Instinct_1910Beta
 gcd_19_10="${gcd_dir}/System_1910/GUPDATE.GCD"
 gcd_19_01="${gcd_dir}/System_Backdate_1901/GUPDATE.GCD"
-baseline=/Users/user/garmin_recon/snapshot_2026-04-28.sha256
+baseline=~/garmin_recon/snapshot_2026-04-28.sha256
 
 if [[ ! -d "$watch_root/GARMIN" ]]; then
   echo "ERROR: watch not mounted at $watch_root" >&2

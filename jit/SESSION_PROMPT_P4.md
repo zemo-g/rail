@@ -176,7 +176,7 @@ If d-reg vreg allocation tangles:
     git add jit/... tools/jit_call.c
     git commit -m "jit: P4 floats — fadd/fsub/fmul/fdiv + dlsym print_float"
     git push origin jit                                               # → Mini
-    ssh ledaticempire@mini.tb 'cd ~/projects/rail && git push origin jit'  # → GitHub
+    ssh <user>@<host> 'cd ~/projects/rail && git push origin jit'  # → GitHub
 
 If `tools/compile.rail` changed (it shouldn't for P4 — link line already
 picks up new symbols via `-weak-ljit_call`), bootstrap with

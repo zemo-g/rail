@@ -23,7 +23,7 @@ N_RERANK = 20
 MAX_TOKENS = 256
 TEMPERATURE = 0.7
 TIMEOUT = 180
-RAIL_NATIVE = "/Users/user/projects/rail/rail_native"
+RAIL_NATIVE = "~/projects/rail/rail_native"
 
 # 30 bench prompts (extracted from flywheel-local/bench_railnative.rail)
 BENCH = {

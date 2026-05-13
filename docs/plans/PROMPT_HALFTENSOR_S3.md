@@ -102,7 +102,7 @@ Since the run is ~1.5-2 h unattended, this is a good window for one of:
 The model card for the 2026-04-27 deadline. Architecture, precision (fp16 everywhere except bwd/Adam), training config, corpus, the one-liner from the Session 2 result doc. Leave eval-result and `bench_railnative` cells empty; fill when the 3000-step run lands.
 
 **Option B — Task #14 Phase 2d.E retrain bench wiring.**
-Independent of Phase 5. 2-3 h. Needs private repo sync (`scp -r ledaticempire@mini.tb:~/projects/rail-training/flywheel ./flywheel-local/`). Wires `harvest_snapshot 0` + bench parse + `harvest_ab_gate` around the `retrain` call in `run_loop`. Unblocks closed-flywheel-round milestone.
+Independent of Phase 5. 2-3 h. Needs private repo sync (`scp -r <user>@<host>:~/projects/rail-training/flywheel ./flywheel-local/`). Wires `harvest_snapshot 0` + bench parse + `harvest_ab_gate` around the `retrain` call in `run_loop`. Unblocks closed-flywheel-round milestone.
 
 **Option C — `bench_railnative` on the current d=128 × 4-block model.**
 Studio's 4-block result (eval 2.88) hasn't been run through `bench_railnative` yet. If that number comes back ≥5/30 it meaningfully de-risks the deadline. 30 min.
@@ -130,7 +130,7 @@ Pick one. Don't start a second one on Studio — the GPU is busy with the 3000-s
    ```bash
    cd tools/metal && clang -shared -fobjc-arc \
      -framework Metal -framework Foundation \
-     -install_name /Users/user/projects/rail/tools/metal/libtensor_gpu.dylib \
+     -install_name ~/projects/rail/tools/metal/libtensor_gpu.dylib \
      tensor_gpu_lib.m -o libtensor_gpu.dylib
    ```
 3. **Corpus path** (`training/rail_corpus_stdlib.txt`, 544018 chars) present. Same corpus Session 2 used; no need to re-fetch.

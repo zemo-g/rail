@@ -24,10 +24,10 @@ type: reference
 │                 │ Tailscale VPN (100.x.x.x)              ▲                  │
 │                 │                                         │                  │
 │  ┌──────────────▼──────────────┐    ┌────────────────────┘                  │
-│  │  MACBOOK AIR M1 (8GB)      │    │  Tailscale: 100.109.63.37             │
+│  │  MACBOOK AIR M1 (8GB)      │    │  Tailscale: <retired-host-tailscale-ip>             │
 │  │  ─────────────────────     │    │                                        │
 │  │  Keepawake only            │    │  ┌─────────────────────┐              │
-│  │  SSH: 100.120.203.70       │    │  │  PI ZERO 2 W        │              │
+│  │  SSH: <peer-tailscale-ip>       │    │  │  PI ZERO 2 W        │              │
 │  └────────────────────────────┘    │  │  ─────────────      │              │
 │                                    │  │  Rail cross-compile  │              │
 │                                    │  │  LCD Fleet Display   │              │
@@ -488,8 +488,8 @@ type: reference
 
      NETWORK (Tailscale VPN):
      ├── Mini:  localhost / 100.x.x.x
-     ├── M1:    100.120.203.70
-     ├── Razer: 100.109.63.37
+     ├── M1:    <peer-tailscale-ip>
+     ├── Razer: <retired-host-tailscale-ip>
      └── Pi:    (pending — needs reflash + Tailscale)
 ```
 

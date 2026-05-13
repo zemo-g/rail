@@ -131,7 +131,7 @@ Right now we have:
 Primitives (`harvest_snapshot`, `harvest_rollback`, `harvest_ab_gate`)
 are committed in `self_train.rail`. Wiring steps:
 
-1. Sync private repo: `scp -r ledaticempire@mini.tb:~/projects/rail-training/flywheel ./flywheel-local/`
+1. Sync private repo: `scp -r <user>@<host>:~/projects/rail-training/flywheel ./flywheel-local/`
    (or a clone). `flywheel/bench_railnative.rail` is what you need.
 2. In `self_train.rail:run_loop`, before calling `retrain`: call
    `harvest_snapshot 0`. Capture the pre-retrain bench by running
@@ -365,7 +365,7 @@ docs/plans/SESSION_PROMPT_RAIL_ON_RAIL  +this section
 - `tools/linux_libc.s` (Session B may be editing)
 - `rail_native` (toolchain-local; never commit from Studio)
 - `tools/metal/libtensor_gpu.dylib` (rebuilt locally with
-  `-install_name /Users/user/…` override; canonical Mini path stays
+  `-install_name ~/…` override; canonical Mini path stays
   intact in `tensor_gpu_lib.m` — do not commit the install_name line)
 
 ### Next task to pick up
@@ -523,7 +523,7 @@ docs/plans/SESSION_PROMPT_RAIL_ON_RAIL.md +this section
    After B's `abdc2f0` added `tgl_matmul_half_host`, Studio's local
    `libtensor_gpu.dylib` didn't have the symbol; B's Session 1 smoke
    failed to link here until I rebuilt it. Same build line as always
-   with `-install_name /Users/user/…` override — don't commit the
+   with `-install_name ~/…` override — don't commit the
    override.
 
 ### Next task to pick up

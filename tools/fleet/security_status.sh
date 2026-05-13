@@ -9,8 +9,8 @@ set -u
 NODES=(
   "mini:localhost"
   "studio:studio"
-  "air:reillygomez@100.120.203.70"
-  # "pi:zemog@100.87.231.45"   # Pi has no pf / different surface; skipped
+  "air:<peer-user>@<peer-host>"
+  # "pi:<witness-user>@<witness-host>"   # Pi has no pf / different surface; skipped
 )
 
 hr() { printf '%s\n' "────────────────────────────────────────────────────────"; }

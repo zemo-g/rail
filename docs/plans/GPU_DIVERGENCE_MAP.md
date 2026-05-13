@@ -12,7 +12,7 @@ Confirmed by reading `tools/metal/tensor_gpu_lib.m` 2026-05-09:
 
 - `tgl_init` does `dladdr(&tgl_init)` to find its own dylib path → loads `tensor_gpu.metal` (sibling file, fresh string each init) → `[device newLibraryWithSource:opts:&err]`. No metallib cache, no embedded source string.
 - `tools/metal/tensor_gpu.metal` (916 lines, 35 kernels) **already contains** `matmul_f16`, `matmul_blocked_f16`, `matmul_f32x_halfw`, `matmul_bias_relu_f16`, `matmul_bias_gelu_f16`, `tensor_add_f16`, `tensor_scale_f16`, `tensor_transpose_f16`, `tensor_softmax_f16`. The `tools/metal/fp16_drafts/` directory is obsolete — kernels were merged into the main file.
-- Dylib install_name is correct (`/Users/user/projects/rail/tools/metal/libtensor_gpu.dylib`); the `/Users/ledaticempire/...` reference in `stdlib/tensor.rail:204` is a stale comment, not load-bearing.
+- Dylib install_name is correct (`~/projects/rail/tools/metal/libtensor_gpu.dylib`); the `~/...` reference in `stdlib/tensor.rail:204` is a stale comment, not load-bearing.
 - No `double` token in main `.metal` source → silent-killer hypothesis (per `metal_one_source_string.md`) is **falsified**.
 
 ## Surviving hypothesis after this dive

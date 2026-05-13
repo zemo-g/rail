@@ -34,11 +34,11 @@ Cold-start:
    ```bash
    cd tools/metal
    clang -shared -fobjc-arc -framework Metal -framework Foundation \
-     -install_name /Users/user/projects/rail/tools/metal/libtensor_gpu.dylib \
+     -install_name ~/projects/rail/tools/metal/libtensor_gpu.dylib \
      tensor_gpu_lib.m -o libtensor_gpu.dylib
    ```
    Note: the existing install_name in the source points at
-   `/Users/ledaticempire/...` (Mini's path). Patch it to the Studio path
+   `~/...` (Mini's path). Patch it to the Studio path
    **only for the local rebuild** — do not commit that change. Or pass
    `-install_name` override on the command line as shown above.
 4. **Smoke test** — write `tools/test/fp16_matmul_smoke.rail` that:
@@ -68,13 +68,13 @@ below d=128×2-block's 2.87.
   compile.rail, you'll pull and rebuild locally — but you don't drive it.
 - Everything else (stdlib, tools/metal, tools/train, tools/test) is yours
   unless you hit a file Session B is clearly editing — `git status` on
-  Mini (`ssh ledaticempire@mini.tb "cd ~/projects/rail && git status"`)
+  Mini (`ssh <user>@<host> "cd ~/projects/rail && git status"`)
   before touching anything cross-cutting.
 
 ## Commit flow
 
 - No github SSH from Studio. Use Mini proxy per `session_handoff.md`:
-  scp changed files → `ssh ledaticempire@mini.tb` → git add/commit/push
+  scp changed files → `ssh <user>@<host>` → git add/commit/push
   → `git pull --ff-only origin next` back on Studio.
 - Commit granularity: one commit per logical unit (foreign decls,
   host dispatch, smoke test, bench result). Prefix `stdlib:` / `metal:`

@@ -136,7 +136,7 @@ Branch: feat/d-stdlib-auto-regen-v0
 Worktree: worktree-agent-d
 
 Scope:
-  - Mini bare relay's `~/git/rail.git/hooks/post-receive` (SSH to mini.tb via `ssh ledaticempire@mini.tb`)
+  - Mini bare relay's `~/git/rail.git/hooks/post-receive` (SSH to mini.tb via `ssh <user>@<host>`)
   - May require staging `tools/docs/gen_stdlib_ref.rail` to a Mini-resident location, OR running it via rail_native checkout on Mini, OR keeping it Studio-side and triggering via SSH back to Studio.
   - Choose the simplest path that doesn't require Studio to be reachable from Mini's hook (so it works when user is remote from Studio).
 
@@ -181,4 +181,4 @@ After A/B/C/D all land:
 - [ ] Worktrees from prev renovate session cleaned up: `git worktree list` shows only main
 - [ ] Colima up: `colima status` or `colima start --arch x86_64 --vm-type=vz --vz-rosetta`
 - [ ] Baseline smokes confirmed pre-dispatch: 140/140 + 71/79 + cycle-2 byte-identical
-- [ ] Mini reachable: `ssh ledaticempire@mini.tb true`
+- [ ] Mini reachable: `ssh <user>@<host> true`

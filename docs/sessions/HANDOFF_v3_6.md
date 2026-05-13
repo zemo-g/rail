@@ -346,7 +346,7 @@ Every commit on this track must hold:
    non-empty response content. Confirms strict-by-default
    doesn't break the dogfood loop.
 8. `slack_post_text` end-to-end posting "rail v3.6.0 live" to
-   `brockbro2` DM → `ok:true`. Same confirmation for Slack.
+   `<test-dm>` DM → `ok:true`. Same confirmation for Slack.
 
 If gate #6 cannot be set up this session, at minimum manually
 construct a test harness where you modify `/etc/ssl/cert.pem` to

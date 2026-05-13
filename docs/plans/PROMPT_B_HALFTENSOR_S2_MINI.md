@@ -1,6 +1,6 @@
 # HalfTensor Session 2 — Mini lane (kernels + stdlib)
 
-**Machine:** Mini (`ledaticempire@mini.tb`), M4 Pro.
+**Machine:** Mini (`<user>@<host>`), M4 Pro.
 **Branch:** `half-s2-kernels` (off `a7a9bb9` on `next`).
 **Paired with:** Studio lane, `PROMPT_B_HALFTENSOR_S2_STUDIO.md`. You two run concurrently; the main session reconvenes when both finish.
 **Budget:** 3-4 h.
@@ -109,7 +109,7 @@ test: softmax_half smoke
 ```bash
 cd tools/metal && clang -shared -fobjc-arc \
   -framework Metal -framework Foundation \
-  -install_name /Users/ledaticempire/projects/rail/tools/metal/libtensor_gpu.dylib \
+  -install_name ~/projects/rail/tools/metal/libtensor_gpu.dylib \
   tensor_gpu_lib.m -o libtensor_gpu.dylib
 ```
 

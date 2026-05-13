@@ -162,7 +162,7 @@ int main(int argc, char **argv) {
         NSError *err = nil;
 
         // Build metallib if missing — same pattern as tools/metal/tensor_gpu.m.
-        const char *self_dir = "/Users/user/projects/rail/tools/plasma";
+        const char *self_dir = "~/projects/rail/tools/plasma";
         char build_cmd[1024];
         snprintf(build_cmd, sizeof(build_cmd),
                  "test -f /tmp/mhd_ot_2d_256.metallib || "

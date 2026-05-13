@@ -111,7 +111,7 @@ Ranked by leverage:
 
 **Rank 1 — Task #14 Phase 2d.E retrain bench wiring (B or A, 2-3 h).**
 Primitives exist in `tools/train/self_train.rail` (`harvest_snapshot`, `harvest_rollback`, `harvest_ab_gate`). Needs:
-- Private repo sync: `scp -r ledaticempire@mini.tb:~/projects/rail-training/flywheel ./flywheel-local/` or equivalent.
+- Private repo sync: `scp -r <user>@<host>:~/projects/rail-training/flywheel ./flywheel-local/` or equivalent.
 - Wire `harvest_snapshot 0` + bench parse + `harvest_ab_gate` around the `retrain` call in `run_loop`.
 - Force one-round self_train test with `--parallel 4` to validate the gate fires correctly.
 
@@ -133,7 +133,7 @@ From `docs/plans/CODE_JEPA_5_0b.md`. Pure data-munging, no dependency on trainin
 - `rail_native` here is Studio-local; never commit from Studio.
 - Re-sign after any `cp rail_native X`: `codesign -s - --force X`.
 
-**Mini (ledaticempire@mini.tb).**
+**Mini (<user>@<host>).**
 - Canonical push point. Compiler development. M4 Pro GPU.
 - Private repo `Ledatic-Empire/rail-training` lives here (scp to other machines).
 - Self-compile fixed-point requires 2 unsigned passes (ad-hoc codesign bytes differ; cmp two unsigned outputs, not signed-vs-unsigned).
@@ -146,11 +146,11 @@ From `docs/plans/CODE_JEPA_5_0b.md`. Pure data-munging, no dependency on trainin
     -install_name /Users/$USER/projects/rail/tools/metal/libtensor_gpu.dylib \
     tensor_gpu_lib.m -o libtensor_gpu.dylib
   ```
-- Don't commit the `-install_name` override — source stays `/Users/ledaticempire/...`.
+- Don't commit the `-install_name` override — source stays `~/...`.
 
 **Session coordination.**
 - Ownership: Studio = training / GPU experiments; Mini = compiler / stdlib / dylib work. Can be renegotiated per round.
-- Before touching shared files: `ssh ledaticempire@mini.tb "cd ~/projects/rail && git status"`.
+- Before touching shared files: `ssh <user>@<host> "cd ~/projects/rail && git status"`.
 - `/tmp/rail_out` is a shared file per machine — concurrent compile-run on the same machine will collide. Use the other machine or wait.
 - Commit granularity: one commit per logical unit (decls / dispatch / test / bench / docs). Prefix `stdlib:` / `metal:` / `train:` / `test:` / `bench:` / `docs:` / `compile:`.
 
@@ -208,7 +208,7 @@ test tools/metal/tensor_gpu_lib.m -nt tools/metal/libtensor_gpu.dylib && \
 - Don't pursue "fp16 in backward" — Phase 4b proved it diverges by a full nat at step 499. Backward is f64. Write this in the model card.
 - Don't commit `rail_native` from Studio.
 - Don't commit `libtensor_gpu.dylib` (it's gitignored).
-- Don't commit the `-install_name /Users/user/...` patch to `tensor_gpu_lib.m`.
+- Don't commit the `-install_name ~/...` patch to `tensor_gpu_lib.m`.
 - Don't try to get below 0.5 MB/step residual — B's verdict (macOS VA, not a real leak) is the close. Further work there is negative EV.
 
 ---

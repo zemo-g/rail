@@ -2,7 +2,7 @@
 
 Date: 2026-05-13
 Branch: `feat/repl-jit-v0` (local only — NOT pushed)
-Worktree: `/Users/user/projects/rail/.claude/worktrees/agent-addc17aa7f17d9525`
+Worktree: `~/projects/rail/.claude/worktrees/agent-addc17aa7f17d9525`
 
 ## Deliverables
 

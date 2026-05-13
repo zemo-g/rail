@@ -45,7 +45,7 @@ The fleet agent re-reads `~/.fleet/token` on **every request** (no in-process ca
 **Verification** (one-line, run from Mini after rotation):
 
 ```sh
-for h in 10.42.0.1 10.42.0.2 100.120.203.70 100.87.231.45; do printf '%s ' "$h"; curl -sm 5 -H "X-Fleet-Token: $(cat ~/.fleet/token)" "http://$h:9101/health" || echo FAIL; done
+for h in 10.42.0.1 10.42.0.2 <peer-tailscale-ip> <witness-tailscale-ip>; do printf '%s ' "$h"; curl -sm 5 -H "X-Fleet-Token: $(cat ~/.fleet/token)" "http://$h:9101/health" || echo FAIL; done
 ```
 
 Expect `{"status":"ok"...}` (or equivalent OK shape) from all four. The rotator already does this per node, but re-running it from a fresh shell confirms the new token survived disk + reader.
@@ -82,7 +82,7 @@ Expect `{"status":"ok"...}` (or equivalent OK shape) from all four. The rotator 
 #    Restrict to Account = "Ledatic" (account id 2acd6ceb3a0c57f1f2b470433d94bc87).
 #    Copy the new value.
 
-# 2. On Mini (ssh ledaticempire@mini.tb):
+# 2. On Mini (ssh <user>@<host>):
 NEW_CF_TOKEN='<paste-new-value>'
 cp ~/Desktop/rings ~/Desktop/rings.prerotate
 printf '%s' "$NEW_CF_TOKEN" > ~/Desktop/rings
@@ -132,7 +132,7 @@ Expect HTTP 200 on the verify line. After the round-trip succeeds, `rm ~/Desktop
 **Rotate procedure** (already rotated 2026-05-12 per audit memo; this is the procedure for **next** rotation):
 
 ```sh
-# 1. On Mini (ssh ledaticempire@mini.tb):
+# 1. On Mini (ssh <user>@<host>):
 NEW_API_BEARER=$(openssl rand -base64 32 | tr -d '+/=' | head -c 43)
 cp ~/.ledatic/api/bearer_token ~/.ledatic/api/bearer_token.prerotate
 printf '%s' "$NEW_API_BEARER" > ~/.ledatic/api/bearer_token
@@ -233,7 +233,7 @@ Expect a message in the Telegram chat.
 **Where it lives**:
 - File at `~/.fleet/anthropic_key` (mode 600). Per `stdlib/anthropic_client.rail:16`: "Rail's `shell()` doesn't inherit env vars. Pass the API key via a file." Path is **not hardcoded in stdlib** — caller passes a `key_path` argument.
 - Concrete callers in tree (grep `anthropic_key`):
-  - `tools/tls/anthropic_live_test.rail:5` — uses literal `/Users/ledaticempire/.fleet/anthropic_key` (Mini username path; would need adjust on Studio where it'd be `/Users/user/.fleet/anthropic_key`).
+  - `tools/tls/anthropic_live_test.rail:5` — uses literal `~/.fleet/anthropic_key` (Mini username path; would need adjust on Studio where it'd be `~/.fleet/anthropic_key`).
   - `README.md:88` — example uses `/Users/me/.fleet/anthropic_key`.
 - The corpus dumps under `training/corpus_*.txt` reference the path string but those are training data, not consumers.
 
@@ -267,7 +267,7 @@ cd ~/projects/rail && ./rail_native run tools/tls/anthropic_live_test.rail
 # If it returns "" or HTTP non-200, the new key didn't take.
 ```
 
-Note: `anthropic_live_test.rail` hardcodes the Mini path `/Users/ledaticempire/.fleet/anthropic_key`. On Studio, edit the path in that file to `/Users/user/.fleet/anthropic_key` for the test, or invoke `anthropic_chat` from a one-liner with the correct path.
+Note: `anthropic_live_test.rail` hardcodes the Mini path `~/.fleet/anthropic_key`. On Studio, edit the path in that file to `~/.fleet/anthropic_key` for the test, or invoke `anthropic_chat` from a one-liner with the correct path.
 
 **Blast radius if rotated mid-flight**:
 - Any in-flight `self_train.rail` segment that's currently waiting on an HTTP response from `api.anthropic.com` with the old key: that request completes (Anthropic still honors in-flight requests for a brief window, but post-revoke they 401). The next call in the loop reads the file fresh (`read_file key_path` is per-call, not cached) and uses the new value.
@@ -288,7 +288,7 @@ Note: `anthropic_live_test.rail` hardcodes the Mini path `/Users/ledaticempire/.
 **Who reads it**: nobody on Studio today. Mini's `~/git/{rail,ledatic-site}.git/hooks/post-receive` push to GitHub via SSH (key at `~/.ssh/id_ed25519`, not a PAT). Confirm:
 
 ```sh
-ssh ledaticempire@mini.tb 'cat ~/git/rail.git/hooks/post-receive ~/git/ledatic-site.git/hooks/post-receive'
+ssh <user>@<host> 'cat ~/git/rail.git/hooks/post-receive ~/git/ledatic-site.git/hooks/post-receive'
 ```
 
 Expect `git push` invocations using the `git@github.com:` SSH remote, no token in env.

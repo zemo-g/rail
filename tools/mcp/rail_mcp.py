@@ -10,7 +10,7 @@ Usage:
     "mcpServers": {
       "rail": {
         "command": "/opt/homebrew/bin/python3.11",
-        "args": ["/Users/ledaticempire/projects/rail/tools/mcp/rail_mcp.py"]
+        "args": ["~/projects/rail/tools/mcp/rail_mcp.py"]
       }
     }
   }
@@ -27,7 +27,7 @@ import time
 
 RAIL_DIR = os.path.expanduser("~/projects/rail")
 RAIL_BIN = os.path.join(RAIL_DIR, "rail_native")
-RAZER_HOST = "Detro@100.109.63.37"
+RAZER_HOST = "<retired-host>"
 
 
 def run(cmd, timeout=30, cwd=None):

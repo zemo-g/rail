@@ -10,13 +10,13 @@ from a non-Studio machine.)
 
 | Field             | Value                                                                |
 |-------------------|----------------------------------------------------------------------|
-| Rail commit       | TBD (cd /Users/user/projects/rail && git rev-parse HEAD at deploy)   |
-| ledatic-site SHA  | TBD (cd /Users/user/projects/ledatic-site && git rev-parse HEAD)     |
+| Rail commit       | TBD (cd ~/projects/rail && git rev-parse HEAD at deploy)   |
+| ledatic-site SHA  | TBD (cd ~/projects/ledatic-site && git rev-parse HEAD)     |
 | Worker version    | TBD (Cloudflare-assigned ID; capture from deploy_worker.sh output)   |
 | Mini binary mtime | TBD (`ssh mini.tb stat -f %Sm tools/playground/compile_server`)      |
 | Public URL        | https://ledatic.org/playground                                       |
 | API endpoint      | https://ledatic.org/api/playground/compile                           |
-| Backend (private) | http://100.79.50.108:8090 (Mini Tailscale, com.ledatic.playground)   |
+| Backend (private) | http://<secondary-tailscale-ip>:8090 (Mini Tailscale, com.ledatic.playground)   |
 | Metrics endpoint  | https://ledatic.org/api/playground/metrics  (Bearer API_BEARER)      |
 
 ## Acceptance test results
@@ -78,9 +78,9 @@ PHASE-2 MILESTONE: MET
 Run from Studio (or wherever has SSH to Mini and CF_TOKEN):
 
 ```bash
-bash /Users/user/projects/ledatic-site/deploy_playground.sh
+bash ~/projects/ledatic-site/deploy_playground.sh
 # verify this looks right; then on a non-Studio Mac:
-bash /Users/user/projects/ledatic-site/tests/playground_acceptance.sh
+bash ~/projects/ledatic-site/tests/playground_acceptance.sh
 # if PASS=3 FAIL=0, edit this file's [ ] DEPLOYED -> [x] DEPLOYED
 # and fill in the TBD fingerprint fields above.
 ```
@@ -88,7 +88,7 @@ bash /Users/user/projects/ledatic-site/tests/playground_acceptance.sh
 If anything fails, rollback:
 
 ```bash
-bash /Users/user/projects/ledatic-site/deploy_playground.sh --rollback
+bash ~/projects/ledatic-site/deploy_playground.sh --rollback
 ```
 
 ## Known v0 limitations (carried forward from Sessions A + B)
