@@ -28,6 +28,7 @@ The substrate thesis says: **the verifier is the variable**. An AI model interac
 | Compiler is genuinely self-hosted on two backends | ARM64 140/140 + x86_64 128/128 (representative subset), byte-identical self-compile fixed point at gen2 | `./rail_native test && ./rail_native self && cmp rail_native /tmp/rail_self` |
 | Verifier is open and signed | Provenance tier v2 — multi-witness Ed25519 attestations binding `pulse_id`, browser-side verify at `/verify/<id>` | `https://ledatic.org/verify/<id>` — anyone with a browser |
 | Compiler stack has zero C dependencies | Pure Rail + ARM64/x86 asm. Only requires `as` + `ld` | `nm rail_native | grep -c '^.* T '` — every text symbol traces to Rail or asm source in this repo |
+| Substrate is deep enough to JIT itself | Self-hosted JIT in pure Rail (~6,600 LoC across 20 files) lowers IR → ARM64 → `mmap`-executable → callable from the running Rail process. Float arith, recursion, multi-arg user fns. | `./rail_native run jit/test_codegen.rail` — 8 fixtures, ARM64 bytes emitted and executed; documented at `docs/site/jit.md` |
 | Browser playground proves the on-ramp works | Phase-2 Session B/C — *coming, expected EOM May* | `https://ledatic.org/playground` — paste Rail, click Run |
 
 ## What an external pilot looks like
@@ -63,6 +64,7 @@ This list is the honest list. If you're betting on Rail today, you're betting on
 - The compiler, verifier, provenance pipeline, and playground are all one project under one author. **Decisions land in days, not quarters.** Your pilot's blockers are the highest-priority work the project takes on.
 - Every published claim is signed and browser-verifiable. There's no marketing layer over an unaudited result.
 - The structural advantage is genuinely architectural: **we own the verifier**. We can do things published RLVR work cannot — process reward at compile time, parse-trace aux loss, grammar-walked curriculum, compile-in-loop sampling. See `[[structural_advantage_thesis]]`.
+- The substrate is *substrate-honest enough to JIT itself*. The same Rail program that you compile can, at runtime, produce ARM64 machine code for new functions, install them, and call them — not via a C extension, but as ~50 lines of `mmap`+`mprotect` in pure Rail. See [`docs/site/jit.md`](../docs/site/jit.md). The verifier isn't a black box: it's a library you import.
 
 ## The ask
 

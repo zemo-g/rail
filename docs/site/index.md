@@ -30,6 +30,7 @@ For Apple Silicon you're done. Other targets need cross-toolchains — see [back
 - **[quickstart.md](quickstart.md)** — ten steps from `git clone` to a signed bench result. Real commands, real outputs.
 - **[stdlib.md](stdlib.md)** — auto-generated reference for every top-level function in `stdlib/*.rail` (80 files, 1,706 functions). Regenerate with `./rail_native run tools/docs/gen_stdlib_ref.rail`.
 - **[backends.md](backends.md)** — one-page-per-backend with the literal command line you'd type.
+- **[jit.md](jit.md)** — a self-hosted JIT in pure Rail. ARM64 emit + `mmap`-executable, called via a `pthread_create` trampoline. ~6,600 LoC across 20 files.
 - **[examples/](examples/)** — 22 runnable programs with source, command, and real captured output. Start with [hello](examples/hello.md), [pattern_matching](examples/pattern_matching.md), [calculator](examples/calculator.md).
 - **[TODO.md](TODO.md)** — what's deferred for v0 and why.
 
