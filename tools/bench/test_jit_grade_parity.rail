@@ -1,0 +1,139 @@
+-- tools/bench/test_jit_grade_parity.rail — falsification for jit_grade_batch.
+--
+-- Soundness invariant we depend on:
+--
+--   For any Rail source S the batch grader emits as `JIT_PASS:<path>`:
+--     ./rail_native S exits 0 (i.e., as+ld clean)
+--
+-- i.e., every fast-path-marked candidate is ALSO accepted by the canonical
+-- rail_native compile. If this ever flips (any program the batch grader
+-- marks JIT_PASS that rail_native rejects), the bench silently mismarks
+-- failures as passes — credibility bug.
+--
+-- This test does two things:
+--   (a) Documents the known divergence in jit_can_lower itself: programs
+--       using JIT-only string builtins (str_eq, str_len, str_at, is_nil)
+--       lower under the JIT but fail rail_native. The batch grader's
+--       contains_unsafe_jit_builtin guard exists to defend against this.
+--   (b) Verifies that the batch grader's CURRENT JIT_PASS labels are sound:
+--       for every test program where contains_unsafe_jit_builtin=0 AND
+--       jit_can_lower=1, rail_native MUST also exit 0.
+--
+-- Run: ./rail_native run tools/bench/test_jit_grade_parity.rail
+-- Exit 0 = all batch-grader JIT_PASS labels are sound. Exit 1 = at least
+-- one divergence (the batch grader's guard list needs widening).
+
+import "jit/heap.rail"
+import "jit/emit.rail"
+import "jit/loader.rail"
+import "jit/lower.rail"
+import "jit/grade.rail"
+
+is_ws_char c = c == " " || c == "\n" || c == "\t" || c == "\r"
+trim_left_loop s i n =
+  if i >= n then ""
+  else if is_ws_char (str_sub s i 1) then trim_left_loop s (i + 1) n
+  else str_sub s i (n - i)
+trim_right_loop s n =
+  if n <= 0 then ""
+  else if is_ws_char (str_sub s (n - 1) 1) then trim_right_loop s (n - 1)
+  else str_sub s 0 n
+trimL s = trim_left_loop s 0 (length s)
+my_trim s = trim_right_loop (trimL s) (length (trimL s))
+
+pid_str _ = my_trim (shell "echo $$")
+
+shell_compile_ok src tag =
+  let src_path = cat ["/tmp/jit_parity_test_", pid_str 0, "_", tag, ".rail"]
+  let exit_path = cat ["/tmp/jit_parity_test_", pid_str 0, "_", tag, ".exit"]
+  let _ = write_file src_path src
+  let cmd = cat ["./rail_native ", src_path, " > /dev/null 2>&1; echo $? > ", exit_path]
+  let _ = shell cmd
+  let code = my_trim (read_file exit_path)
+  if code == "0" then 1 else 0
+
+-- The batch-grader-internal guard. Keep in sync with
+-- tools/bench/jit_grade_batch.rail :: contains_unsafe_jit_builtin.
+contains_unsafe_jit_builtin src =
+  if str_contains "str_eq" src then 1
+  else if str_contains "str_len" src then 1
+  else if str_contains "str_at" src then 1
+  else if str_contains "is_nil" src then 1
+  else 0
+
+-- Test cases: [label, source]. Two cohorts:
+--   c_* — small handcrafted programs probing the JIT/rail_native overlap.
+--          The c_streq_guard row deliberately uses the JIT-only str_eq
+--          builtin to verify the guard fires.
+--   b_* — canonical-completion shapes for actual substrate hard-bench
+--          prompts. Each "b_<band>_<name>" mirrors what a successful LLM
+--          completion of the corresponding BENCH dict entry looks like.
+cases = [
+  ["c_add",            "main = 7 + 13"],
+  ["c_let_chain",      "main = let a = 1 + 2 in let b = a * 5 in b - 4"],
+  ["c_fact",           "fact n = if n < 2 then 1 else n * fact (n - 1)\nmain = fact 5"],
+  ["c_fact_print",     "fact n = if n <= 1 then 1 else n * fact (n - 1)\nmain = let _ = print (show (fact 5))\n  0\n"],
+  ["c_add2",           "add a b = a + b\nmain = add 7 13"],
+  ["c_max",            "imax a b = if a < b then b else a\nmain = imax 7 13"],
+  ["c_tri",            "tri n = if n < 1 then 0 else n + tri (n - 1)\nmain = let _ = print (show (tri 10))\n  0\n"],
+  ["c_square_sum",     "square x = x * x\nsum_sq a b = square a + square b\nmain = let _ = print (show (sum_sq 3 4))\n  0\n"],
+  ["c_str_lit",        "main = let _ = print \"hello\"\n  0"],
+  ["c_streq_guard",    "main = if str_eq \"abc\" \"abc\" then 1 else 0"],
+  ["c_ssq5",           "ssq n = if n < 1 then 0 else n * n + ssq (n - 1)\nmain = ssq 5"],
+  -- Canonical completions for the substrate hard-bench prompts. Mirrors
+  -- what a frontier model emits to land 30/30.
+  ["b_fund_fact_120",  "fact n = if n <= 1 then 1 else n * fact (n - 1)\nmain = let _ = print (show (fact 5))\n  0\n"],
+  ["b_fund_add",       "add a b = a + b\nmain = let _ = print (show (add 3 4))\n  0\n"],
+  ["b_fund_square_sum","square x = x * x\nsum_sq a b = square a + square b\nmain = let _ = print (show (sum_sq 3 4))\n  0\n"],
+  ["b_fund_fib",       "fib n = if n <= 1 then n else fib (n - 1) + fib (n - 2)\nmain = let _ = print (show (fib 10))\n  0\n"],
+  ["b_fund_triangular","triangular n = if n <= 0 then 0 else n + triangular (n - 1)\nmain = let _ = print (show (triangular 5))\n  0\n"],
+  ["b_io_split_get",   "split_get s = split \" \" s\nmain = let _ = print (show (split_get \"a b c\"))\n  0\n"],
+  ["b_io_join_csv",    "join_csv xs = join \",\" xs\nmain = let _ = print (join_csv [\"a\",\"b\",\"c\"])\n  0\n"],
+  ["b_io_second",      "second xs = head (tail xs)\nmain = let _ = print (show (second [1,2,3]))\n  0\n"],
+  ["b_tools_opt",      "type Opt = | Some x | None\nget_or o = match o | Some x -> x | None -> 0\nmain = let _ = print (show (get_or (Some 7)))\n  0\n"],
+  ["b_tools_pair",     "type Pair = | Pair a b\nfst p = match p | Pair a _ -> a\nmain = let _ = print (show (fst (Pair 7 8)))\n  0\n"],
+  ["b_comp_expr",      "type Expr = | Num x | Add a b\neval e = match e | Num x -> x | Add a b -> eval a + eval b\nmain = let _ = print (show (eval (Add (Num 3) (Num 4))))\n  0\n"],
+  ["b_adv_sum_list",   "sum_list xs = fold add 0 xs\nadd a b = a + b\nmain = let _ = print (show (sum_list [1,2,3,4,5]))\n  0\n"],
+  ["b_adv_doubled",    "doubled xs = map (\\x -> x * 2) xs\nmain = let _ = print (show (doubled [1,2,3]))\n  0\n"],
+  ["b_adv_filter_even","filter_even xs = filter is_even xs\nis_even n = n % 2 == 0\nmain = let _ = print (show (filter_even [1,2,3,4,5,6]))\n  0\n"],
+  ["b_adv_count_lines","count_lines text = length (split \"\\n\" text)\nmain = let _ = print (show (count_lines \"a\\nb\\nc\"))\n  0\n"]
+]
+
+-- For each row, emulate the batch-grader's verdict and verify soundness.
+-- Returns 0 for OK, 1 for a soundness violation, -1 for "skipped" (will
+-- print but not fail the test).
+run_one row =
+  let label = head row
+  let src   = head (tail row)
+  let unsafe = contains_unsafe_jit_builtin src
+  let lo = jit_can_lower src
+  if unsafe == 1 then
+    -- Batch grader's guard fires; this row is NOT a JIT_PASS candidate.
+    let _ = print (cat ["[", label, "] GUARD-FIRED: contains JIT-only builtin; batch grader will shell-grade"])
+    0
+  else if lo == 0 then
+    let _ = print (cat ["[", label, "] N/A: JIT cannot lower"])
+    0
+  else
+    -- Batch grader would emit JIT_PASS here. Confirm rail_native agrees.
+    let sh = shell_compile_ok src label
+    if sh == 1 then
+      let _ = print (cat ["[", label, "] OK: batch grader JIT_PASS is sound (rail_native exit=0)"])
+      0
+    else
+      let _ = print (cat ["[", label, "] UNSOUND: batch grader would emit JIT_PASS but rail_native exit!=0"])
+      1
+
+run_all rows acc =
+  if length rows <= 0 then acc
+  else run_all (tail rows) (acc + (run_one (head rows)))
+
+main =
+  let _ = print "=== JIT-grade batch parity falsification ==="
+  let n_viol = run_all cases 0
+  if n_viol == 0 then
+    let _ = print "PARITY OK: batch grader JIT_PASS labels are sound against rail_native"
+    0
+  else
+    let _ = print (cat ["PARITY VIOLATIONS: ", show n_viol, " — widen contains_unsafe_jit_builtin in jit_grade_batch.rail"])
+    1
