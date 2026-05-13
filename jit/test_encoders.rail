@@ -1,0 +1,175 @@
+-- jit/test_encoders.rail — pure-Rail encoder audit.
+--
+-- For each Rail-encoded ARM64 instruction, we have an equivalent assembly
+-- text. We assemble all of them via `as` and dump the .text section with
+-- `otool -t`, then compare each Rail-encoded int to the assembler's ground
+-- truth. Catches typo-class bugs of the bug-A variety where a 1-bit flip
+-- in a base constant produces a valid-but-wrong instruction (the bug A
+-- typo's stray bit 8 self-aliased for reg=9 — bit 3 of 9 absorbed it —
+-- and stayed silent through 137/137 + every JIT suite).
+--
+-- Mixed-bit-pattern operand sweep (regs 0/9/13/19/27, signed +/- offsets)
+-- defeats that masking class.
+
+import "jit/heap.rail"
+import "jit/emit.rail"
+
+-- Hex parser (lifted from stdlib/http_client.rail to avoid the http import
+-- chain pulling in TLS for a unit test).
+parse_hex s = parse_hex_acc (chars s) 0
+parse_hex_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let n = char_to_int c
+    if n >= 48 then
+      if n <= 57 then parse_hex_acc (tail cs) (acc * 16 + (n - 48))
+      else if n >= 97 then
+        if n <= 102 then parse_hex_acc (tail cs) (acc * 16 + (n - 87))
+        else acc
+      else if n >= 65 then
+        if n <= 70 then parse_hex_acc (tail cs) (acc * 16 + (n - 55))
+        else acc
+      else acc
+    else acc
+
+-- A fixture is [asm_text, rail_int]. Mixed-bit-pattern operands defeat
+-- the bit-3 masking class that hid bug A.
+build_fixtures = [
+  ["mov x19, x10",            enc_mov_reg 19 10],
+  ["mov x27, x9",             enc_mov_reg 27 9],
+  ["mov x0, x27",             enc_mov_reg 0 27],
+  ["mov x19, #42",            enc_mov_imm16 19 42],
+  ["mov x27, #1",             enc_mov_imm16 27 1],
+  ["movk x10, #5, lsl #16",   enc_movk 10 5 1],
+  ["movk x19, #42, lsl #32",  enc_movk 19 42 2],
+  ["movk x27, #99, lsl #48",  enc_movk 27 99 3],
+  ["add x10, x19, x27",       enc_add 10 19 27],
+  ["add x0, x9, x13",         enc_add 0 9 13],
+  ["sub x19, x27, x9",        enc_sub 19 27 9],
+  ["mul x19, x10, x27",       enc_mul 19 10 27],
+  ["cmp x19, x27",            enc_cmp 19 27],
+  ["cmp x9, x19",             enc_cmp 9 19],
+  ["cmp x19, #0",             enc_cmp_imm 19 0],
+  ["cmp x27, #5",             enc_cmp_imm 27 5],
+  ["cmp x9, #100",            enc_cmp_imm 9 100],
+  ["cmp x0, #4095",           enc_cmp_imm 0 4095],
+  ["cset x19, lt",            enc_cset_lt 19],
+  ["cset x27, eq",            enc_cset_eq 27],
+  ["cset x13, le",            enc_cset_le 13],
+  ["cset x19, mi",            enc_cset_mi 19],
+  ["cset x27, ls",            enc_cset_ls 27],
+  ["udiv x19, x27, x9",       enc_udiv 19 27 9],
+  ["msub x19, x27, x9, x13",  enc_msub 19 27 9 13],
+  ["blr x19",                 enc_blr 19],
+  ["blr x27",                 enc_blr 27],
+  ["fadd d10, d3, d15",       enc_fadd 10 3 15],
+  ["fsub d5, d12, d8",        enc_fsub 5 12 8],
+  ["fmul d15, d0, d7",        enc_fmul 15 0 7],
+  ["fdiv d8, d8, d8",         enc_fdiv 8 8 8],
+  ["fcmp d5, d12",            enc_fcmp 5 12],
+  ["scvtf d15, x27",          enc_scvtf 15 27],
+  ["fcvtzs x19, d8",          enc_fcvtzs 19 8],
+  ["fmov d5, x19",            enc_fmov_d_x 5 19],
+  ["fmov d8, d15",            enc_fmov_d_d 8 15],
+  ["ldr x19, [x27, #8]",      enc_ldr_x27 19 8],
+  ["ldr x27, [x27, #120]",    enc_ldr_x27 27 120],
+  ["str x19, [x27, #16]",     enc_str_x27 19 16]
+]
+
+build_asm_loop fixtures acc =
+  if fixtures == [] then acc
+  else
+    let f = head fixtures
+    let asm = head f
+    build_asm_loop (tail fixtures) (cat [acc, "  ", asm, "\n"])
+
+build_asm_file fixtures =
+  cat [".text\n.global _t\n_t:\n", build_asm_loop fixtures ""]
+
+-- Skip the address token (16 hex chars + space). otool emits up to 4 hex
+-- words per line. Walk char-by-char, accumulating tokens.
+extract_hex_words text = extract_acc (chars text) "" [] 0
+
+-- state: 0 = skipping the leading address, 1 = inside hex word, 2 = whitespace.
+-- We use newline as a re-anchor — every new line starts an address again.
+extract_acc cs cur acc state =
+  if cs == [] then
+    if cur == "" then reverse acc
+    else reverse (cons cur acc)
+  else
+    let c = head cs
+    if c == "\n" then
+      let acc2 = if cur == "" then acc else cons cur acc
+      extract_acc (tail cs) "" acc2 0
+    else if (c == " " || c == "\t") then
+      let acc2 = if cur == "" then acc else cons cur acc
+      -- After the first whitespace on a line we leave state 0 (skip-addr)
+      -- and enter state 1 (collecting hex). State 2 just means "between words".
+      let new_state = if state == 0 then 1 else 2
+      extract_acc (tail cs) "" acc2 new_state
+    else if state == 0 then
+      -- still inside the leading address; drop the char.
+      extract_acc (tail cs) "" acc state
+    else
+      extract_acc (tail cs) (cat [cur, c]) acc state
+
+-- Filter the otool output to lines that start with a 16-digit hex address.
+-- Otool prefixes with file name + section header lines; addresses are
+-- exactly 16 hex chars at line start.
+keep_data_lines text =
+  let lines = str_split "\n" text
+  filter line_is_data lines
+
+line_is_data line =
+  if (length (chars line)) < 17 then 0
+  else
+    -- First 16 chars should all be 0-9a-f, position 16 should be space/tab.
+    if (all_hex (chars line) 0 16) == 1 then 1 else 0
+
+all_hex cs i n =
+  if i >= n then 1
+  else if cs == [] then 0
+  else
+    let c = head cs
+    let v = char_to_int c
+    if (v >= 48 && v <= 57) then all_hex (tail cs) (i + 1) n
+    else if (v >= 97 && v <= 102) then all_hex (tail cs) (i + 1) n
+    else if (v >= 65 && v <= 70) then all_hex (tail cs) (i + 1) n
+    else 0
+
+verify_loop fixtures hex_words idx fails =
+  if fixtures == [] then fails
+  else if hex_words == [] then
+    let _ = print (cat ["[idx=", show idx, "] MISSING ground truth"])
+    verify_loop (tail fixtures) [] (idx + 1) (fails + 1)
+  else
+    let f = head fixtures
+    let asm = head f
+    let rail_int = head (tail f)
+    let truth = parse_hex (head hex_words)
+    if rail_int == truth then
+      verify_loop (tail fixtures) (tail hex_words) (idx + 1) fails
+    else
+      let _ = print (cat ["FAIL [", asm, "] rail=", show rail_int, " truth=", show truth])
+      verify_loop (tail fixtures) (tail hex_words) (idx + 1) (fails + 1)
+
+main =
+  let fixtures = build_fixtures
+  let n_fix = length fixtures
+  let asm = build_asm_file fixtures
+  let _ = write_file "/tmp/rail_audit.s" asm
+  let _ = shell "as -arch arm64 -o /tmp/rail_audit.o /tmp/rail_audit.s && otool -t /tmp/rail_audit.o > /tmp/rail_audit.txt"
+  let raw = read_file "/tmp/rail_audit.txt"
+  let data_lines = keep_data_lines raw
+  let joined = join "\n" data_lines
+  let words = extract_hex_words joined
+  let n_words = length words
+  let _ = print (cat ["fixtures=", show n_fix, " ground-truth-words=", show n_words])
+  let fails = verify_loop fixtures words 0 0
+  if fails == 0 then
+    let _ = print (cat ["ALL ", show n_fix, " ENCODERS MATCH"])
+    0
+  else
+    let _ = print (cat ["FAILS: ", show fails, "/", show n_fix])
+    1

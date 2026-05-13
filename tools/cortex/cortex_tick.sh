@@ -18,7 +18,7 @@ if pgrep -f '^/tmp/rail_out$' >/dev/null; then
   exit 0
 fi
 
-cd /Users/ledaticempire/projects/rail-https || exit 1
+cd ~/projects/rail-https || exit 1
 
 ./rail_native run tools/cortex/cortex.rail &
 RAIL_PID=$!

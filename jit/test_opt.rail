@@ -1,0 +1,166 @@
+-- jit/test_opt.rail
+-- Hand-built IR fixtures + smoke tests for opt_const_fold, opt_dce,
+-- profile, and icache. Pure Rail, no FFI, no parse.rail dependency.
+--
+-- Run: ./rail_native run jit/test_opt.rail
+-- Pass: prints PASS for each assertion and exits 0.
+import "jit/ir.rail"
+import "jit/opt_const_fold.rail"
+import "jit/opt_dce.rail"
+import "jit/profile.rail"
+import "jit/icache.rail"
+
+-- Tiny assertion helpers. Track a global pass/fail tally via a 2-elt arr.
+report tally label ok =
+  if ok == 1 then
+    let _ = print (cat ["PASS ", label])
+    let v = arr_get tally 0
+    let _ = arr_set tally 0 (v + 1)
+    0
+  else
+    let _ = print (cat ["FAIL ", label])
+    let v = arr_get tally 1
+    let _ = arr_set tally 1 (v + 1)
+    0
+
+assert_eq tally label got expected =
+  if got == expected then report tally label 1
+  else
+    let _ = print (cat ["  got=", show got, " expected=", show expected])
+    report tally label 0
+
+-- ============================================================
+-- Test 1: const-fold (2+3)+r0 where r0 is an unset input register.
+-- IR plan (single block, block_offsets = [0]):
+--   0: const r1 = 2          op_const r1 2 _
+--   1: const r2 = 3          op_const r2 3 _
+--   2: add r3 = r1 + r2      op_add r3 r1 r2     -> should fold to const r3 5
+--   3: add r4 = r3 + r0      op_add r4 r3 r0     -> NOT folded (r0 unknown)
+--   4: ret r4                op_ret r4 _ _
+-- After fold:
+--   0: const r1 = 2
+--   1: const r2 = 3
+--   2: const r3 = 5         (folded)
+--   3: add r4 = r3 + r0     (r0 unknown -> stays add; r3 known but partner missing)
+--   4: ret r4
+-- ============================================================
+build_test1 =
+  let n_instr = 5
+  let n_regs = 5
+  let ir = arr_new (n_instr * 4) 0
+  let _ = ir_emit ir 0 op_const 1 2 0
+  let _ = ir_emit ir 1 op_const 2 3 0
+  let _ = ir_emit ir 2 op_add   3 1 2
+  let _ = ir_emit ir 3 op_add   4 3 0
+  let _ = ir_emit ir 4 op_ret   4 0 0
+  let blocks = arr_new 1 0
+  let _ = arr_set blocks 0 0
+  make_fn ir n_instr n_regs blocks
+
+run_test1 tally =
+  let fn = build_test1
+  let folded = fold_constants fn
+  let ir = fn_ir folded
+  -- instr 2 should now be const r3 5
+  let _ = assert_eq tally "T1.op2_is_const" (ir_op ir 2) op_const
+  let _ = assert_eq tally "T1.op2_dst_r3"   (ir_a ir 2) 3
+  let _ = assert_eq tally "T1.op2_imm_5"    (ir_b ir 2) 5
+  -- instr 3 should still be add r4 r3 r0
+  let _ = assert_eq tally "T1.op3_is_add"   (ir_op ir 3) op_add
+  let _ = assert_eq tally "T1.op3_dst_r4"   (ir_a ir 3) 4
+  let _ = assert_eq tally "T1.op3_src1_r3"  (ir_b ir 3) 3
+  let _ = assert_eq tally "T1.op3_src2_r0"  (ir_c ir 3) 0
+  -- instr 4 ret r4
+  let _ = assert_eq tally "T1.op4_is_ret"   (ir_op ir 4) op_ret
+  let _ = assert_eq tally "T1.op4_a_r4"     (ir_a ir 4) 4
+  0
+
+-- ============================================================
+-- Test 2: DCE.
+-- IR plan (single block):
+--   0: const r0 = 7         dead (r0 never read)
+--   1: const r1 = 9         live (read by add)
+--   2: add r2 = r1 + r1     live (returned)
+--   3: ret r2
+-- After DCE:
+--   0: const r1 = 9
+--   1: add r2 = r1 + r1
+--   2: ret r2
+-- ============================================================
+build_test2 =
+  let n_instr = 4
+  let n_regs = 3
+  let ir = arr_new (n_instr * 4) 0
+  let _ = ir_emit ir 0 op_const 0 7 0
+  let _ = ir_emit ir 1 op_const 1 9 0
+  let _ = ir_emit ir 2 op_add   2 1 1
+  let _ = ir_emit ir 3 op_ret   2 0 0
+  let blocks = arr_new 1 0
+  let _ = arr_set blocks 0 0
+  make_fn ir n_instr n_regs blocks
+
+run_test2 tally =
+  let fn = build_test2
+  let dced = eliminate_dead fn
+  let ir = fn_ir dced
+  let n = fn_ninstr dced
+  let _ = assert_eq tally "T2.n_instr_3" n 3
+  let _ = assert_eq tally "T2.op0_is_const" (ir_op ir 0) op_const
+  let _ = assert_eq tally "T2.op0_dst_r1"   (ir_a ir 0) 1
+  let _ = assert_eq tally "T2.op0_imm_9"    (ir_b ir 0) 9
+  let _ = assert_eq tally "T2.op1_is_add"   (ir_op ir 1) op_add
+  let _ = assert_eq tally "T2.op1_dst_r2"   (ir_a ir 1) 2
+  let _ = assert_eq tally "T2.op2_is_ret"   (ir_op ir 2) op_ret
+  let _ = assert_eq tally "T2.op2_a_r2"     (ir_a ir 2) 2
+  let blocks = fn_blocks dced
+  let _ = assert_eq tally "T2.block0_offset_0" (arr_get blocks 0) 0
+  0
+
+-- ============================================================
+-- Test 3: counters.
+-- ============================================================
+run_test3 tally =
+  let arr = make_counters 3
+  let _ = bump_counter arr 1
+  let _ = bump_counter arr 1
+  let _ = bump_counter arr 1
+  let _ = bump_counter arr 1
+  let _ = bump_counter arr 1
+  let _ = assert_eq tally "T3.counter_value_5" (read_counter arr 1) 5
+  let _ = assert_eq tally "T3.is_hot_at_5" (is_hot arr 1 5) 1
+  let _ = assert_eq tally "T3.is_hot_at_6" (is_hot arr 1 6) 0
+  let _ = assert_eq tally "T3.other_slot_zero" (read_counter arr 0) 0
+  0
+
+-- ============================================================
+-- Test 4: icache.
+-- Policy: callee mismatch triggers reset; lookup returns the newest callee.
+-- ============================================================
+run_test4 tally =
+  let cache = make_icache 4
+  let _ = ic_record cache 1 42
+  let _ = ic_record cache 1 42
+  let _ = assert_eq tally "T4.lookup_after_two_hits" (ic_lookup cache 1) 42
+  let _ = assert_eq tally "T4.hits_two" (ic_hits cache 1) 2
+  -- New callee at same site -> reset.
+  let _ = ic_record cache 1 99
+  let _ = assert_eq tally "T4.lookup_after_reset" (ic_lookup cache 1) 99
+  let _ = assert_eq tally "T4.hits_one_after_reset" (ic_hits cache 1) 1
+  -- Unknown site lookup is -1.
+  let _ = assert_eq tally "T4.unknown_site_minus1" (ic_lookup cache 7) (0 - 1)
+  -- Second site uses a different slot.
+  let _ = ic_record cache 2 17
+  let _ = assert_eq tally "T4.site2_lookup" (ic_lookup cache 2) 17
+  let _ = assert_eq tally "T4.site1_unchanged" (ic_lookup cache 1) 99
+  0
+
+main =
+  let tally = arr_new 2 0
+  let _ = run_test1 tally
+  let _ = run_test2 tally
+  let _ = run_test3 tally
+  let _ = run_test4 tally
+  let passes = arr_get tally 0
+  let fails = arr_get tally 1
+  let _ = print (cat ["RESULT pass=", show passes, " fail=", show fails])
+  if fails == 0 then 0 else 1

@@ -1,0 +1,155 @@
+-- jit/opt_dce.rail
+-- Dead code elimination. A def is dead if its dst register is never read by
+-- ANY later instruction (any block). Conservative: we treat every later
+-- instruction as potentially live regardless of control flow.
+--
+-- Algorithm:
+--   1. Compute live[r] = 1 if any instruction reads register r as a source
+--      (b or c for binops; a for ret/jz; sources for call args are
+--      conservatively assumed read — see note below).
+--   2. Walk instructions; drop any instruction whose op_writes_dst==1 and
+--      whose dst register's live[r] == 0.
+--   3. Build new ir_arr with surviving instructions, and a mapping
+--      old_index -> new_index. Then patch jmp/jz targets (which are block
+--      indices, not instruction indices, so they don't shift) and rebuild
+--      block_offsets to point at the new instruction indices.
+--
+-- Note: call args. Per the frozen contract `ir_call` has fields
+-- (dst, fn_index, n_args). Argument registers are passed by convention
+-- (reserved low regs); we treat them as live by marking ALL registers
+-- live when an ir_call is seen with n_args > 0. This is conservative
+-- and safe; Sessions A/C may refine the call ABI later.
+--
+-- Depends on jit/ir.rail (op codes + accessors). Caller must import that.
+
+mark_all_live live n i =
+  if i >= n then 0
+  else
+    let _ = arr_set live i 1
+    mark_all_live live n (i + 1)
+
+scan_live ir n_instr n_regs live i =
+  if i >= n_instr then 0
+  else
+    let op = ir_op ir i
+    let a = ir_a ir i
+    let b = ir_b ir i
+    let c = ir_c ir i
+    let _ = scan_live_one op a b c live n_regs
+    scan_live ir n_instr n_regs live (i + 1)
+
+scan_live_one op a b c live n_regs =
+  if op == op_add then
+    let _ = arr_set live b 1
+    let _ = arr_set live c 1
+    0
+  else if op == op_sub then
+    let _ = arr_set live b 1
+    let _ = arr_set live c 1
+    0
+  else if op == op_mul then
+    let _ = arr_set live b 1
+    let _ = arr_set live c 1
+    0
+  else if op == op_lt then
+    let _ = arr_set live b 1
+    let _ = arr_set live c 1
+    0
+  else if op == op_jz then
+    let _ = arr_set live a 1
+    0
+  else if op == op_ret then
+    let _ = arr_set live a 1
+    0
+  else if op == op_call then
+    -- Conservatively: arg registers are passed by convention. Mark all live.
+    let _ = mark_all_live live n_regs 0
+    0
+  else 0
+
+-- Decide which instructions survive. surv[i] = 1 if kept.
+mark_surv ir n_instr live surv i =
+  if i >= n_instr then 0
+  else
+    let op = ir_op ir i
+    let a = ir_a ir i
+    let keep =
+      if op_writes_dst op == 1 then
+        if arr_get live a == 1 then 1 else 0
+      else 1
+    let _ = arr_set surv i keep
+    mark_surv ir n_instr live surv (i + 1)
+
+-- Compute prefix-sum of surv into new_idx: new_idx[i] = new index of old i
+-- (only meaningful where surv[i]==1; otherwise unused).
+build_new_idx surv n_instr new_idx i acc =
+  if i >= n_instr then acc
+  else
+    let s = arr_get surv i
+    let _ = arr_set new_idx i acc
+    let acc2 = if s == 1 then acc + 1 else acc
+    build_new_idx surv n_instr new_idx (i + 1) acc2
+
+-- Map old block-start instruction index to new index. If the old start was
+-- itself dropped, advance to the next surviving instruction (or to the new
+-- count if none remain).
+remap_block_offset surv new_idx n_instr new_count old_start =
+  if old_start >= n_instr then new_count
+  else if arr_get surv old_start == 1 then arr_get new_idx old_start
+  else remap_block_offset surv new_idx n_instr new_count (old_start + 1)
+
+remap_blocks_loop blocks_in blocks_out n_blocks surv new_idx n_instr new_count k =
+  if k >= n_blocks then 0
+  else
+    let old_start = arr_get blocks_in k
+    let new_start = remap_block_offset surv new_idx n_instr new_count old_start
+    let _ = arr_set blocks_out k new_start
+    remap_blocks_loop blocks_in blocks_out n_blocks surv new_idx n_instr new_count (k + 1)
+
+-- Copy surviving instructions into the new ir array.
+copy_surviving ir_in ir_out n_instr surv new_idx i =
+  if i >= n_instr then 0
+  else
+    if arr_get surv i == 1 then
+      let j = arr_get new_idx i
+      let _ = arr_set ir_out (j * 4) (arr_get ir_in (i * 4))
+      let _ = arr_set ir_out (j * 4 + 1) (arr_get ir_in (i * 4 + 1))
+      let _ = arr_set ir_out (j * 4 + 2) (arr_get ir_in (i * 4 + 2))
+      let _ = arr_set ir_out (j * 4 + 3) (arr_get ir_in (i * 4 + 3))
+      copy_surviving ir_in ir_out n_instr surv new_idx (i + 1)
+    else
+      copy_surviving ir_in ir_out n_instr surv new_idx (i + 1)
+
+count_surv surv n acc i =
+  if i >= n then acc
+  else
+    let acc2 = if arr_get surv i == 1 then acc + 1 else acc
+    count_surv surv n acc2 (i + 1)
+
+eliminate_dead fn =
+  let ir_in = fn_ir fn
+  let n_instr = fn_ninstr fn
+  let n_regs = fn_nregs fn
+  let blocks_in = fn_blocks fn
+  let n_blocks = arr_len blocks_in
+
+  let live = arr_new n_regs 0
+  let _ = scan_live ir_in n_instr n_regs live 0
+
+  let surv = arr_new n_instr 0
+  let _ = mark_surv ir_in n_instr live surv 0
+
+  let new_count = count_surv surv n_instr 0 0
+  let new_idx = arr_new n_instr 0
+  let _ = build_new_idx surv n_instr new_idx 0 0
+
+  let cap = if new_count == 0 then 4 else new_count * 4
+  let ir_out = arr_new cap 0
+  let _ = copy_surviving ir_in ir_out n_instr surv new_idx 0
+
+  let blocks_out = arr_new n_blocks 0
+  let _ = remap_blocks_loop blocks_in blocks_out n_blocks surv new_idx n_instr new_count 0
+
+  -- jmp / jz targets are block indices (not instruction indices), so they
+  -- need no rewriting. Block_offsets above do the heavy lifting.
+  make_fn ir_out new_count n_regs blocks_out

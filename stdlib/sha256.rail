@@ -221,3 +221,105 @@ sha256 msg =
 
 sha256_hex msg =
   bytes_to_hex (sha256 msg) 32
+
+-- ── Streaming API ─────────────────────────────────────────────────────────
+-- Init / update / finalize for hashes whose input doesn't fit in memory at
+-- once.  Used by the streaming HTTPS download path so we can hash a multi-GB
+-- response on the way to disk without ever holding it as a Rail string.
+--
+-- State layout (single Rail array of 5 slots):
+--   st[0]  H               8-int running hash (mutated in place)
+--   st[1]  K_TBL            64-int round constants (built once, shared)
+--   st[2]  pending_buf      64-byte working buffer for partial blocks
+--   st[3]  pending_len      bytes currently in pending_buf  (0..63)
+--   st[4]  total_bytes      total bytes consumed (used for length padding)
+--
+-- arena_mark/reset is the caller's responsibility.  The state itself is
+-- allocated on entry to sha256_init; subsequent updates allocate scratch
+-- (the message schedule W and the round-state) per processed block, which
+-- the GC reclaims on the caller's reset.
+
+sha256_init _ =
+  let st = arr_new 5 0
+  let _ = arr_set st 0 (sha256_h_init 0)
+  let _ = arr_set st 1 (sha256_k_table 0)
+  let _ = arr_set st 2 (arr_new 64 0)
+  let _ = arr_set st 3 0
+  let _ = arr_set st 4 0
+  st
+
+-- Feed `n` bytes from `arr` starting at `off` into the running hash.
+-- Returns the same state array (mutated in place).
+sha256_update_arr st arr off n =
+  if n <= 0 then st
+  else
+    let h = arr_get st 0
+    let k_tbl = arr_get st 1
+    let pbuf = arr_get st 2
+    let plen = arr_get st 3
+    let total = arr_get st 4
+    let _ = arr_set st 4 (total + n)
+    let space = 64 - plen
+    if n < space then
+      let _ = sha_copy_bytes arr pbuf off plen n
+      let _ = arr_set st 3 (plen + n)
+      st
+    else
+      let _ = sha_copy_bytes arr pbuf off plen space
+      let scratch = arr_new 8 0
+      let _ = sha_process_block h scratch pbuf k_tbl
+      let _ = arr_set st 3 0
+      sha256_stream_full st arr (off + space) (n - space) k_tbl h
+
+sha256_stream_full st arr off remaining k_tbl h =
+  if remaining < 64 then
+    let pbuf = arr_get st 2
+    let _ = sha_copy_bytes arr pbuf off 0 remaining
+    let _ = arr_set st 3 remaining
+    st
+  else
+    let block = arr_new 64 0
+    let _ = sha_copy_bytes arr block off 0 64
+    let scratch = arr_new 8 0
+    let _ = sha_process_block h scratch block k_tbl
+    sha256_stream_full st arr (off + 64) (remaining - 64) k_tbl h
+
+-- Convenience: feed a Rail string.  Allocates a temporary byte array;
+-- not appropriate for huge strings — use sha256_update_arr from a streaming
+-- producer instead.
+sha256_update_str st s =
+  let arr = string_to_bytes s
+  let n = string_length_bytes s
+  sha256_update_arr st arr 0 n
+
+-- Pad and produce the 32-byte digest.  After finalize the state is spent.
+sha256_finalize st =
+  let h = arr_get st 0
+  let k_tbl = arr_get st 1
+  let pbuf = arr_get st 2
+  let plen = arr_get st 3
+  let total = arr_get st 4
+  let bit_len = total * 8
+  let need_two = plen + 9 > 64
+  let nblocks = if need_two then 2 else 1
+  let buf_size = nblocks * 64
+  let buf = arr_new buf_size 0
+  let _ = sha_copy_bytes pbuf buf 0 0 plen
+  let _ = arr_set buf plen 128
+  let _ = be32_write buf (buf_size - 4) bit_len
+  let scratch = arr_new 8 0
+  let _ = sha_process_block h scratch buf k_tbl
+  let _ = if need_two then sha_process_block h scratch (arr_slice buf 64 64) k_tbl else 0
+  let out = arr_new 32 0
+  let _ = be32_write out 0 (arr_get h 0)
+  let _ = be32_write out 4 (arr_get h 1)
+  let _ = be32_write out 8 (arr_get h 2)
+  let _ = be32_write out 12 (arr_get h 3)
+  let _ = be32_write out 16 (arr_get h 4)
+  let _ = be32_write out 20 (arr_get h 5)
+  let _ = be32_write out 24 (arr_get h 6)
+  let _ = be32_write out 28 (arr_get h 7)
+  out
+
+sha256_finalize_hex st =
+  bytes_to_hex (sha256_finalize st) 32

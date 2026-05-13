@@ -9,10 +9,10 @@
 
 set -u
 
-REPO=$HOME/projects/rail
+REPO=~/projects/rail
 STATE_DIR=$REPO/training/rail_native
 LOG_DIR=$STATE_DIR/logs
-KILL_FILE=$HOME/.ledatic/data/.rail_train_kill
+KILL_FILE=~/.ledatic/data/.rail_train_kill
 
 mkdir -p "$STATE_DIR" "$LOG_DIR" "$(dirname "$KILL_FILE")"
 

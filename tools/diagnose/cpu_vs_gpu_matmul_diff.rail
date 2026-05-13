@@ -1,0 +1,126 @@
+-- tools/diagnose/cpu_vs_gpu_matmul_diff.rail
+--
+-- Localises the GPU bench-vs-CPU divergence to one of three surfaces:
+--   (a) the f64↔f16 C helper in tensor_gpu_lib.m:379-410 (round-toward-zero
+--       mantissa truncation; flush subnormals to zero),
+--   (b) the Metal kernel arithmetic itself,
+--   (c) accumulation order (parallel reductions vs sequential).
+--
+-- Strategy: produce 4 outputs from the same fp64 inputs:
+--   1. cpu_pure   : pure f64 matmul (reference)
+--   2. cpu_rt     : f64 → f16 → f64 (round-trip via C helper) → f64 matmul
+--   3. gpu_half   : f64 → f16 (C helper) → GPU matmul_half → f64
+--   4. gpu_mixed  : f64 acts × fp16 weights × fp32 accum on GPU
+--
+-- Then four max-abs-deltas:
+--   D1 = max|cpu_pure - cpu_rt|     ← cost of fp16 storage alone
+--   D2 = max|cpu_pure - gpu_half|   ← total GPU all-fp16 divergence
+--   D3 = max|cpu_pure - gpu_mixed|  ← total GPU mixed divergence
+--   D4 = max|cpu_rt - gpu_half|     ← divergence WITH fp16 storage normalised → isolates kernel
+--
+-- Decision table:
+--   D4 ≈ 0          → kernel is correct; divergence is pure C-helper rounding.
+--                      Fix: replace round-toward-zero with round-to-nearest-even
+--                      in tensor_gpu_lib.m:382-393.
+--   D4 ~ D2         → kernel arithmetic differs from CPU; divergence is in the
+--                      kernel. Inspect the .metal source for that kernel.
+--   D3 ≪ D2         → fp16 act path is the dominant loss; mixed path is tighter.
+--   D1 large        → CPU round-trip itself is lossy; storage precision is the floor.
+
+import "stdlib/tensor.rail"
+
+cat parts = join "" parts
+
+-- Deterministic ramp + tiny noise: makes mantissa LSBs different across positions
+-- so rounding behavior actually matters. data[i] = (i * 0.001) + ((i % 7) * 0.0003).
+ramp_loop d n i =
+  if i >= n then 0
+  else
+    let primary = int_to_float i * 0.001
+    let perturb = int_to_float (i % 7) * 0.0003
+    let _ = float_arr_set d i (primary + perturb)
+    ramp_loop d n (i + 1)
+
+ramp_tensor m n =
+  let total = m * n
+  let d = float_arr_new total 0.0
+  let _ = ramp_loop d total 0
+  Tensor d (cons m (cons n [])) (compute_strides (cons m (cons n [])))
+
+-- max-abs delta between two f64 float_arrs of equal length
+max_abs_loop ad bd n i max_d =
+  if i >= n then max_d
+  else
+    let a = float_arr_get ad i
+    let b = float_arr_get bd i
+    let raw = a - b
+    let d = if raw < 0.0 then 0.0 - raw else raw
+    let new_max = if d > max_d then d else max_d
+    max_abs_loop ad bd n (i + 1) new_max
+
+-- Extract float_arr from Tensor via destructure. Both inputs MUST be Tensor
+-- (not HalfTensor) — callers convert via tensor_of_half before calling here.
+max_abs_delta_t a b = match a
+  | Tensor ad sa st_a -> match b
+    | Tensor bd sb st_b ->
+      let n = list_product sa
+      max_abs_loop ad bd n 0 0.0
+
+-- For the all-fp16 path we need to compare HalfTensor outputs in their
+-- f64-converted form (via tensor_of_half).
+report label val =
+  let _ = print (cat ["  ", label, " = ", show_float val])
+  0
+
+main =
+  -- Modest size: 16 × 64 × 16 = 16,384 multiply-adds.
+  -- Big enough to trigger different rounding tails, small enough to run fast.
+  let M = 16
+  let K = 64
+  let N = 16
+  let A_f64 = ramp_tensor M K
+  let W_f64 = ramp_tensor K N
+
+  -- (1) Pure CPU f64 matmul — the reference.
+  let cpu_pure = matmul A_f64 W_f64
+
+  -- (2) CPU round-trip: f64 → f16 → f64 → matmul. Same kernel as (1), but
+  --     with fp16 storage normalisation applied via the C helper.
+  let A_rt = tensor_of_half (half_of_tensor A_f64)
+  let W_rt = tensor_of_half (half_of_tensor W_f64)
+  let cpu_rt = matmul A_rt W_rt
+
+  -- (3) GPU all-fp16: convert to HalfTensor, run matmul_half on Metal,
+  --     convert back to f64 for comparison.
+  let A_h = half_of_tensor A_f64
+  let W_h = half_of_tensor W_f64
+  let gpu_half_h = matmul_half A_h W_h
+  let gpu_half = tensor_of_half gpu_half_h
+
+  -- (4) GPU mixed: fp32 acts × fp16 weights × fp32 accum. The kernel here is
+  --     matmul_f32x_halfw (per tensor_gpu.metal:760).
+  let gpu_mixed = matmul_mixed A_f64 W_h
+
+  let _ = print "=== CPU/GPU matmul divergence ==="
+  let _ = print (cat ["  shape: M=", show M, " K=", show K, " N=", show N])
+  let _ = print ""
+
+  let d1 = max_abs_delta_t cpu_pure cpu_rt
+  let d2 = max_abs_delta_t cpu_pure gpu_half
+  let d3 = max_abs_delta_t cpu_pure gpu_mixed
+  let d4 = max_abs_delta_t cpu_rt gpu_half
+
+  let _ = report "D1 cpu_pure - cpu_rt   (fp16 storage alone)" d1
+  let _ = report "D2 cpu_pure - gpu_half (total all-fp16)    " d2
+  let _ = report "D3 cpu_pure - gpu_mixed (total mixed)      " d3
+  let _ = report "D4 cpu_rt   - gpu_half (kernel only)       " d4
+
+  let _ = print ""
+  let _ = print "Decision:"
+  -- Crude thresholds — 1e-3 is the ULP scale at our magnitude.
+  let d4_small = d4 < 0.001
+  let d2_kernel = d4 > (d2 * 0.5)
+  let _ = if d4_small then print "  D4 ~ 0 → kernel is correct; divergence is pure C-helper rounding."
+          else if d2_kernel then print "  D4 ~ D2 → kernel arithmetic itself differs; inspect .metal source."
+          else print "  Mixed: storage rounding contributes part of the loss; kernel adds more."
+  0

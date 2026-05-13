@@ -1,0 +1,160 @@
+-- tools/orch/parse_plan.rail
+--
+-- Pure-Rail markdown parser for EXPERIMENT_PLAN.md. Reads the file and
+-- writes one runs/<arm_id>/run_card.meta per `## arm: <id>` block. The
+-- meta format is KEY=VALUE lines (one per line), matching the existing
+-- checkpoint .meta convention so downstream tools (poll.rail,
+-- launch_arm.sh, run_bench.rail) can parse with grep+cut.
+--
+-- A `## arm: <id>` heading is followed by a fenced code block whose
+-- lines are `key: value` pairs. The parser:
+--   - tracks fenced-code-block state (toggles on ```)
+--   - only treats `## arm: <id>` as a heading when NOT inside a block
+--   - only collects key:value pairs when inside a block AND an arm is
+--     currently set (so the schema-example block in the plan body is
+--     correctly ignored — it has no arm set when its keys appear)
+--
+-- Usage:
+--   ./rail_native run tools/orch/parse_plan.rail [PLAN_PATH]
+-- Default PLAN_PATH: EXPERIMENT_PLAN.md
+--
+-- Exit codes:
+--   0  parsed successfully (some arms may have written empty keys; check stdout)
+--   1  plan file unreadable
+
+import "stdlib/list.rail"
+
+cat parts = join "" parts
+
+-- ── String helpers (no str_starts_with / trim in stdlib today) ─────
+
+trim_left_cs cs =
+  if length cs == 0 then []
+  else
+    let c = head cs
+    if (c == " ") || (c == "\t") then trim_left_cs (tail cs)
+    else cs
+
+trim_left s = join "" (trim_left_cs (chars s))
+trim_right s = join "" (reverse (trim_left_cs (reverse (chars s))))
+trim s = trim_right (trim_left s)
+
+starts_with prefix s =
+  let pcs = chars prefix
+  let scs = chars s
+  sw_loop pcs scs
+
+sw_loop pcs scs =
+  if length pcs == 0 then true
+  else if length scs == 0 then false
+  else if head pcs == head scs then sw_loop (tail pcs) (tail scs)
+  else false
+
+-- ── kv parsing: "key: value" → "key=value", "" if line has no colon ─
+
+parse_kv_line line =
+  if not (str_contains ":" line) then ""
+  else
+    let parts = str_split ":" line
+    let key = trim (head parts)
+    let value_raw = if length parts >= 2 then join ":" (tail parts) else ""
+    let value = trim value_raw
+    if length (chars key) == 0 then ""
+    else cat [key, "=", value]
+
+-- A line is a continuation if it begins with whitespace and has non-empty
+-- content after trim. Used to fold multi-line values like:
+--     rationale:    line one
+--                   line two of one
+-- into a single logical line so parse_kv_line sees just `rationale: line one line two of one`.
+-- Also avoids the "                     bimodal: ..." false-positive where an
+-- indented continuation containing a colon would otherwise be misparsed as a new key.
+is_continuation line =
+  let cs = chars line
+  if length cs == 0 then false
+  else
+    let c = head cs
+    if (c != " ") && (c != "\t") then false
+    else length (chars (trim line)) > 0
+
+join_continuations_loop lines acc =
+  if length lines == 0 then reverse acc
+  else
+    let line = head lines
+    let rest = tail lines
+    if (is_continuation line) && (length acc > 0) then
+      let prev = head acc
+      let merged = cat [prev, " ", trim line]
+      join_continuations_loop rest (cons merged (tail acc))
+    else
+      join_continuations_loop rest (cons line acc)
+
+join_continuations lines = join_continuations_loop lines []
+
+-- ── Side effect: write runs/<arm_id>/run_card.meta and print summary
+
+flush_arm arm_id keys_acc =
+  let dir = cat ["runs/", arm_id]
+  let _ = shell (cat ["mkdir -p ", dir])
+  let path = cat [dir, "/run_card.meta"]
+  let kv_lines = reverse keys_acc
+  let header = cat ["arm_id=", arm_id, "\n"]
+  let body = join "\n" kv_lines
+  let trailer = "\nstatus=queued\n"
+  let _ = write_file path (cat [header, body, trailer])
+  let _ = print (cat ["  wrote ", path, " (", show (length keys_acc), " keys)"])
+  0
+
+-- ── Recursive line-driven parser ────────────────────────────────────
+-- Threads (in_block, current_arm, keys_acc, arm_count) through lines.
+-- Tail-recursive; Rail TCO compiles to a tight loop.
+
+parse_loop lines in_block arm keys_acc count =
+  if length lines == 0 then
+    let _ = if length (chars arm) > 0 then flush_arm arm keys_acc else 0
+    if length (chars arm) > 0 then count + 1 else count
+  else
+    let line = head lines
+    let rest = tail lines
+    let tline = trim line
+    if tline == "```" then
+      parse_loop rest (not in_block) arm keys_acc count
+    else if not in_block then
+      if starts_with "## arm: " line then
+        let _ = if length (chars arm) > 0 then flush_arm arm keys_acc else 0
+        let bumped = if length (chars arm) > 0 then count + 1 else count
+        let new_arm = trim (str_sub line 8 (length (chars line) - 8))
+        parse_loop rest false new_arm [] bumped
+      else if starts_with "## " line then
+        let _ = if length (chars arm) > 0 then flush_arm arm keys_acc else 0
+        let bumped = if length (chars arm) > 0 then count + 1 else count
+        parse_loop rest false "" [] bumped
+      else
+        parse_loop rest false arm keys_acc count
+    else
+      if length (chars arm) == 0 then
+        parse_loop rest true arm keys_acc count
+      else
+        let kv = parse_kv_line line
+        if length (chars kv) == 0 then
+          parse_loop rest true arm keys_acc count
+        else
+          parse_loop rest true arm (cons kv keys_acc) count
+
+-- ── main ────────────────────────────────────────────────────────────
+
+main =
+  let argv = args
+  let plan_path = if length argv >= 2 then nth 1 argv else "EXPERIMENT_PLAN.md"
+  let _ = print (cat ["parse_plan: reading ", plan_path])
+  let content = read_file plan_path
+  if is_error content then
+    let _ = print (cat ["error: cannot read ", plan_path])
+    1
+  else
+    let raw_lines = split "\n" content
+    let lines = join_continuations raw_lines
+    let _ = print (cat ["parse_plan: ", show (length raw_lines), " raw lines, ", show (length lines), " after joining continuations"])
+    let n = parse_loop lines false "" [] 0
+    let _ = print (cat ["parse_plan: parsed ", show n, " arm(s)"])
+    0

@@ -6,6 +6,13 @@ import "stdlib/tls13_client.rail"
 import "stdlib/tls13_record.rail"
 import "stdlib/dns.rail"
 
+-- libc stdio FFI for the streaming-to-file path.  Declared inline (not
+-- via stdlib/file.rail) because file.rail wraps fclose as `close fp`,
+-- which would collide with socket.rail's `foreign close fd -> int`.
+foreign fopen path mode -> ptr
+foreign fwrite buf size count fp
+foreign fclose fp
+
 -- ── Random bytes via /dev/urandom ───────────────────────────────────
 -- Pipe urandom → od → tr to hex on stdout, capture via shell(), parse
 -- with hex_to_bytes. Bytes stay in process memory end-to-end.
@@ -13,7 +20,13 @@ import "stdlib/dns.rail"
 hc_read_random n =
   let cmd = join "" ["dd if=/dev/urandom bs=1 count=", show n, " 2>/dev/null | od -An -v -tx1 | tr -d ' \\n'"]
   let hex = shell cmd
-  hex_to_bytes hex
+  -- Guard against PATH issues / missing tools producing a short or empty
+  -- hex string: if we silently fell back to zero-length output, the
+  -- handshake would proceed with all-zero client random / nonces. Abort
+  -- via `error` so the caller's try/handler can surface this rather
+  -- than silently shipping a zero key.
+  if length hex != 2 * n then error "hc_read_random: short read from /dev/urandom (PATH or tool missing?)"
+  else hex_to_bytes hex
 
 -- ── C-buffer ⇄ Rail int-array byte copies ─────────────────────────
 
@@ -304,15 +317,6 @@ hc_bytes_to_str_loop arr off n acc =
 -- terminate we allocate one buffer of the exact total size and copy
 -- each chunk in place, then convert bytes→string once. Overall work
 -- is O(body_len) instead of the old O(body_len²).
---
--- Termination: previously we read until the socket closed. That
--- silently hung against any HTTP/1.1 server that returned
--- `Connection: keep-alive` (Cloudflare's edge does this for non-GET
--- methods even when the request asked for `Connection: close`). Now,
--- after each record we peek at the accumulated bytes; once we can
--- parse the response headers + Content-Length and the body is
--- complete, we return. If Content-Length is absent (or we never see
--- header end), we fall back to the close-delimited path.
 hc_recv_response fd key iv seq acc =
   hc_recv_loop fd key iv seq [] 0
 
@@ -335,96 +339,8 @@ hc_recv_loop fd key iv seq chunks total =
           let pair = arr_new 2 0
           let _ = arr_set pair 0 frag
           let _ = arr_set pair 1 flen
-          hc_recv_loop_check fd key iv seq (cons pair chunks) (total + flen)
+          hc_recv_loop fd key iv (seq + 1) (cons pair chunks) (total + flen)
         else hc_recv_loop fd key iv (seq + 1) chunks total
-
--- After each application-data record, decode chunks-so-far into a
--- buffer and ask whether we have a complete HTTP/1.1 response. If
--- yes, finalize; otherwise keep reading.
-hc_recv_loop_check fd key iv seq chunks total =
-  if hc_response_complete chunks total then hc_recv_finalize chunks total
-  else hc_recv_loop fd key iv (seq + 1) chunks total
-
-hc_response_complete chunks total =
-  if total < 12 then 0
-  else
-    let buf = arr_new total 0
-    let _ = hc_copy_chunks buf (reverse chunks) 0
-    let h_end = hc_find_double_crlf buf total 0
-    if h_end < 0 then 0
-    else hc_response_complete_known buf total h_end
-
-hc_response_complete_known buf total h_end =
-  let cl = hc_parse_content_length buf h_end
-  if cl < 0 then 0
-  else
-    let need = h_end + 4 + cl
-    if total >= need then 1 else 0
-
--- Find the first occurrence of CRLF CRLF (0x0d 0x0a 0x0d 0x0a) in
--- buf[0..total).  Returns the offset of the first CR, or -1.
-hc_find_double_crlf buf total i =
-  if i + 4 > total then 0 - 1
-  else if hc_dcrlf_at buf i then i
-  else hc_find_double_crlf buf total (i + 1)
-
-hc_dcrlf_at buf i =
-  if arr_get buf i != 13 then 0
-  else if arr_get buf (i + 1) != 10 then 0
-  else if arr_get buf (i + 2) != 13 then 0
-  else if arr_get buf (i + 3) != 10 then 0
-  else 1
-
--- Search the header region (buf[0..h_end]) for "Content-Length:" and
--- parse the integer that follows.  Case-insensitive on the field name.
--- Returns -1 if not found.
-hc_parse_content_length buf h_end =
-  hc_find_cl_at buf h_end 0
-
-hc_find_cl_at buf h_end i =
-  if i + 16 > h_end then 0 - 1
-  else if hc_cl_match_at buf i then hc_parse_cl_value buf h_end (i + 16)
-  else hc_find_cl_at buf h_end (i + 1)
-
--- Match "Content-Length:" or "content-length:" (15 chars + ":" = 16).
-hc_cl_match_at buf i =
-  let c0 = arr_get buf i
-  let cm = if c0 == 67 then 1 else if c0 == 99 then 1 else 0
-  if cm == 0 then 0
-  else hc_cl_match_rest buf i
-
-hc_cl_match_rest buf i =
-  let lit = "ontent-Length:"
-  hc_cl_match_walk buf (i + 1) (chars lit) 0
-
-hc_cl_match_walk buf bi cs ci =
-  if length cs == 0 then 1
-  else
-    let want = char_to_int (head cs)
-    let got = arr_get buf bi
-    let ok = if got == want then 1
-             else if want >= 65 then if want <= 90 then if got == (want + 32) then 1 else 0 else 0
-             else if want >= 97 then if want <= 122 then if got == (want - 32) then 1 else 0 else 0
-             else 0
-    if ok == 0 then 0
-    else hc_cl_match_walk buf (bi + 1) (tail cs) (ci + 1)
-
--- Skip leading spaces, then read digits, until CR.
-hc_parse_cl_value buf h_end i =
-  if i >= h_end then 0 - 1
-  else
-    let c = arr_get buf i
-    if c == 32 then hc_parse_cl_value buf h_end (i + 1)
-    else if c == 9 then hc_parse_cl_value buf h_end (i + 1)
-    else hc_parse_cl_digits buf h_end i 0
-
-hc_parse_cl_digits buf h_end i acc =
-  if i >= h_end then acc
-  else
-    let c = arr_get buf i
-    if c < 48 then acc
-    else if c > 57 then acc
-    else hc_parse_cl_digits buf h_end (i + 1) (acc * 10 + (c - 48))
 
 hc_recv_finalize chunks total =
   if total <= 0 then ""
@@ -602,16 +518,12 @@ https_url_fail _ =
 -- Same FSM as https_get, different request builder. Body is a Rail
 -- string; headers are a list of "Name: Value" strings.
 
-hc_build_post host path ctype body hdrs = hc_build_verb "POST" host path ctype body hdrs
-
-hc_build_put host path ctype body hdrs = hc_build_verb "PUT" host path ctype body hdrs
-
-hc_build_verb verb host path ctype body hdrs =
+hc_build_post host path ctype body hdrs =
   let eol = hc_crlf 0
   let cl = join "" ["Content-Length: ", show (length body), eol]
   let ct = if length ctype == 0 then "" else join "" ["Content-Type: ", ctype, eol]
   let extra = if length hdrs == 0 then "" else join "" [join eol hdrs, eol]
-  let s = join "" [verb, " ", path, " HTTP/1.1", eol,
+  let s = join "" ["POST ", path, " HTTP/1.1", eol,
                    "Host: ", host, eol,
                    ct, cl, extra,
                    "Connection: close", eol,
@@ -667,12 +579,6 @@ https_post_post_hello fd host path ctype body hdrs priv ch_msg ch_msg_len xh =
   else https_post_app_phase fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs
 
 https_post_app_phase fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs =
-  https_send_app_phase "POST" fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs
-
-https_put_app_phase fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs =
-  https_send_app_phase "PUT" fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs
-
-https_send_app_phase verb fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs =
   let fsm = tls13_client_handshake_offline priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl 1 host
   if arr_get fsm 4 == 0 then
     let _ = close fd
@@ -690,135 +596,11 @@ https_send_app_phase verb fd host path ctype body hdrs priv ch_msg ch_msg_len sh
     let s_ap_iv = tls13_derive_iv s_ap
     let cf_rec = tls13_record_encrypt c_hs_key c_hs_iv 0 22 cf_msg cf_len
     let _ = hc_send_bytes fd (arr_get cf_rec 0) (arr_get cf_rec 1)
-    let req = hc_build_verb verb host path ctype body hdrs
+    let req = hc_build_post host path ctype body hdrs
     let req_buf = arr_get req 0
     let req_len = arr_get req 1
-    -- TLS 1.3 plaintext records are capped at 16384 bytes (RFC 8446 §5.1).
-    -- Servers reject anything larger; without fragmentation here, any
-    -- request whose framed size exceeds that cap got silently SIGPIPE'd
-    -- mid-send.  hc_send_app_records walks the request in 16384-byte
-    -- chunks, encrypting each as its own application-data record with
-    -- the sequence number incrementing per record.
-    let _ = hc_send_app_records fd c_ap_key c_ap_iv 0 req_buf req_len 0
-    let body_resp = hc_recv_response fd s_ap_key s_ap_iv 0 ""
-    let _ = close fd
-    let status = hc_parse_status body_resp
-    (status, body_resp)
-
-hc_send_app_records fd key iv seq buf total off =
-  if off >= total then seq
-  else
-    let remain = total - off
-    let chunk_len = if remain > 16384 then 16384 else remain
-    let chunk = arr_slice buf off chunk_len
-    let app_rec = tls13_record_encrypt key iv seq 23 chunk chunk_len
+    let app_rec = tls13_record_encrypt c_ap_key c_ap_iv 0 23 req_buf req_len
     let _ = hc_send_bytes fd (arr_get app_rec 0) (arr_get app_rec 1)
-    hc_send_app_records fd key iv (seq + 1) buf total (off + chunk_len)
-
--- ── Byte-body PUT (for binary uploads) ────────────────────────────────
--- The string-body PUT path can't carry a body containing NUL bytes:
--- hc_build_verb concatenates header + body as a string, and Rail's
--- string ops truncate on NUL.  This variant takes a byte array
--- (e.g. from read_file_bytes) and assembles the full request as a
--- byte buffer end-to-end.
-
--- Build "PUT <path> HTTP/1.1\r\n... \r\n\r\n" as a Rail string, then
--- string_to_bytes it.  Headers are ASCII, no NUL, so this is safe.
-hc_build_verb_headers verb host path ctype body_len hdrs =
-  let eol = hc_crlf 0
-  let cl = join "" ["Content-Length: ", show body_len, eol]
-  let ct = if length ctype == 0 then "" else join "" ["Content-Type: ", ctype, eol]
-  let extra = if length hdrs == 0 then "" else join "" [join eol hdrs, eol]
-  join "" [verb, " ", path, " HTTP/1.1", eol,
-           "Host: ", host, eol,
-           ct, cl, extra,
-           "Connection: close", eol,
-           "User-Agent: rail-https/0.1", eol,
-           eol]
-
--- Combine header bytes + body bytes into one contiguous byte array.
-hc_concat_bytes a alen b blen =
-  let total = alen + blen
-  let out = arr_new total 0
-  let _ = sha_copy_bytes a out 0 0 alen
-  let _ = sha_copy_bytes b out 0 alen blen
-  out
-
-https_put_url_bytes_unsafe_noverify url ctype body_arr body_len hdrs =
-  let parts = https_parse_url url
-  if arr_get parts 4 == 0 then (0, "bad URL")
-  else https_put_url_bytes_dispatch parts ctype body_arr body_len hdrs
-
-https_put_url_bytes_dispatch parts ctype body_arr body_len hdrs =
-  let host = arr_get parts 0
-  let port = arr_get parts 1
-  let path = arr_get parts 2
-  let ip = dns_resolve_a host
-  if length ip == 0 then (0, join "" ["DNS resolve failed for ", host])
-  else https_put_bytes_unsafe_noverify host ip port path ctype body_arr body_len hdrs
-
-https_put_bytes_unsafe_noverify host ip port path ctype body_arr body_len hdrs =
-  let fd = hc_connect_tcp ip port
-  if fd < 0 then (0, "connect failed")
-  else https_put_bytes_on_fd fd host path ctype body_arr body_len hdrs
-
-https_put_bytes_on_fd fd host path ctype body_arr body_len hdrs =
-  let kp = hc_gen_keypair 0
-  let priv = arr_get kp 0
-  let pub = arr_get kp 1
-  let random = hc_read_random 32
-  let sid = hc_read_random 32
-  let ch_rec = tls13_client_hello random sid pub host
-  let ch_wire = arr_get ch_rec 0
-  let ch_wire_len = arr_get ch_rec 1
-  let _ = hc_send_bytes fd ch_wire ch_wire_len
-  let ch_msg_len = ch_wire_len - 5
-  let ch_msg = arr_new ch_msg_len 0
-  let _ = sha_copy_bytes ch_wire ch_msg 5 0 ch_msg_len
-  let xh = hc_exchange_hello fd ch_msg ch_msg_len priv
-  if arr_get xh 5 == 0 then
-    let _ = close fd
-    hc_err "ServerHello parse failed"
-  else https_put_bytes_post_hello fd host path ctype body_arr body_len hdrs priv ch_msg ch_msg_len xh
-
-https_put_bytes_post_hello fd host path ctype body_arr body_len hdrs priv ch_msg ch_msg_len xh =
-  let sh_msg = arr_get xh 0
-  let sh_msg_len = arr_get xh 1
-  let s_hs_key = arr_get xh 2
-  let s_hs_iv = arr_get xh 3
-  let c_hs = arr_get xh 4
-  let flight = hc_read_server_flight fd s_hs_key s_hs_iv
-  let fb = arr_get flight 0
-  let fl = arr_get flight 1
-  if fl < 0 then
-    let _ = close fd
-    hc_err "flight decrypt failed"
-  else https_put_bytes_app_phase fd host path ctype body_arr body_len hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs
-
-https_put_bytes_app_phase fd host path ctype body_arr body_len hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs =
-  let fsm = tls13_client_handshake_offline priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl 1 host
-  if arr_get fsm 4 == 0 then
-    let _ = close fd
-    hc_err "handshake failed"
-  else
-    let c_ap = arr_get fsm 0
-    let s_ap = arr_get fsm 1
-    let cf_msg = arr_get fsm 2
-    let cf_len = arr_get fsm 3
-    let c_hs_key = tls13_derive_key c_hs
-    let c_hs_iv = tls13_derive_iv c_hs
-    let c_ap_key = tls13_derive_key c_ap
-    let c_ap_iv = tls13_derive_iv c_ap
-    let s_ap_key = tls13_derive_key s_ap
-    let s_ap_iv = tls13_derive_iv s_ap
-    let cf_rec = tls13_record_encrypt c_hs_key c_hs_iv 0 22 cf_msg cf_len
-    let _ = hc_send_bytes fd (arr_get cf_rec 0) (arr_get cf_rec 1)
-    let hdr_str = hc_build_verb_headers "PUT" host path ctype body_len hdrs
-    let hdr_bytes = string_to_bytes hdr_str
-    let hdr_len = string_length_bytes hdr_str
-    let req_buf = hc_concat_bytes hdr_bytes hdr_len body_arr body_len
-    let req_len = hdr_len + body_len
-    let _ = hc_send_app_records fd c_ap_key c_ap_iv 0 req_buf req_len 0
     let body_resp = hc_recv_response fd s_ap_key s_ap_iv 0 ""
     let _ = close fd
     let status = hc_parse_status body_resp
@@ -839,17 +621,325 @@ https_post_url_dispatch parts ctype body hdrs =
   if length ip == 0 then (0, join "" ["DNS resolve failed for ", host])
   else https_post_unsafe_noverify host ip port path ctype body hdrs
 
--- ── PUT (leaf-only) ─────────────────────────────────────────────────
--- Same chain-of-functions as POST, but the request line uses PUT.
--- Internal callers route through https_put_app_phase (defined above)
--- which threads "PUT" into hc_build_verb.
+-- ─────────────────────────────────────────────────────────────────────
+-- ── Streaming download to file  (Path A — no in-memory body) ────────
+-- ─────────────────────────────────────────────────────────────────────
+--
+-- `https_get_to_file_unsafe_noverify host ip port path out_path` performs
+-- a TLS 1.3 handshake (leaf-only verification — same threat model as the
+-- other `_unsafe_noverify` drivers above) and streams the response body
+-- straight to `out_path` via fwrite, hashing the bytes through the
+-- streaming sha256 API as they pass through.  No Rail string is built
+-- for the body — memory stays bounded by the TLS record size (~16 KB)
+-- regardless of the file's size.
+--
+-- Returns a 4-element Rail array:
+--   [status, bytes_written, sha256_hex_string, valid]
+-- (Rail's tuples are awkward across modules, so an array is friendlier
+--  for the pursue/sync.rail caller.)
+--
+-- Convenience URL form: `https_get_url_to_file_unsafe_noverify url out`.
+--
+-- HTTP semantics handled:
+--   * Status code parsed from the first response line
+--   * `Connection: close` framing (default)
+--   * `Transfer-Encoding: chunked` decoded chunk-by-chunk on the way
+--     to disk
+--   * 200/206 are written; non-2xx status still streams the body so the
+--     caller can inspect it (e.g. an error page) — but the typical
+--     pursue use case checks status before keeping the file.
 
-https_put_unsafe_noverify host ip port path ctype body hdrs =
+hc_stream_fail _ =
+  let r = arr_new 4 0
+  let _ = arr_set r 0 0
+  let _ = arr_set r 1 0
+  let _ = arr_set r 2 ""
+  let _ = arr_set r 3 0
+  r
+
+-- Copy n bytes of Rail int-array `arr` starting at `arr_off` into the
+-- C-buffer `p` starting at offset 0.  Used for fwrite calls in the
+-- streaming body emitter.
+hc_arr_off_to_cbuf arr arr_off p n =
+  hc_aoc_loop arr arr_off p 0 n
+
+hc_aoc_loop arr arr_off p p_off n =
+  if n <= 0 then 0
+  else
+    let _ = byte_set p p_off (arr_get arr arr_off)
+    hc_aoc_loop arr (arr_off + 1) p (p_off + 1) (n - 1)
+
+-- Scan `buf[start..n)` for the byte sequence 13 10 13 10 (\r\n\r\n).
+-- Returns the index of the first byte AFTER the sequence, or -1.
+hc_scan_blank_line buf start n =
+  if start + 4 > n then 0 - 1
+  else
+    let b0 = arr_get buf start
+    if b0 != 13 then hc_scan_blank_line buf (start + 1) n
+    else
+      let b1 = arr_get buf (start + 1)
+      let b2 = arr_get buf (start + 2)
+      let b3 = arr_get buf (start + 3)
+      if b1 == 10 then
+        if b2 == 13 then
+          if b3 == 10 then start + 4
+          else hc_scan_blank_line buf (start + 1) n
+        else hc_scan_blank_line buf (start + 1) n
+      else hc_scan_blank_line buf (start + 1) n
+
+-- Convert N bytes of a Rail int-array (only used on small header
+-- buffers, capped at 64 KB) into a Rail string for header parsing.
+hc_arr_to_str arr n = join "" (hc_buf_to_chars arr (n - 1) [])
+
+-- Parse a hex-digit-only string into an integer.  Tolerant: stops at
+-- the first non-hex char.  Used for chunked-transfer chunk-length lines.
+hc_parse_hex_str s = hc_phs_loop (chars s) 0
+
+hc_phs_loop cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let n = char_to_int c
+    if n >= 48 then
+      if n <= 57 then hc_phs_loop (tail cs) (acc * 16 + (n - 48))
+      else if n >= 97 then
+        if n <= 102 then hc_phs_loop (tail cs) (acc * 16 + (n - 87))
+        else acc
+      else if n >= 65 then
+        if n <= 70 then hc_phs_loop (tail cs) (acc * 16 + (n - 55))
+        else acc
+      else acc
+    else acc
+
+-- Detect Transfer-Encoding: chunked in a header string (case-insensitive
+-- on the value).
+hc_is_chunked_resp raw =
+  let i = str_find "Transfer-Encoding: chunked" raw
+  if i >= 0 then 1
+  else
+    let j = str_find "transfer-encoding: chunked" raw
+    if j >= 0 then 1 else 0
+
+-- ── Header phase: read TLS records until we have the full HTTP header.
+-- Returns a 5-element array on success:
+--   [header_str, next_seq, body_initial_arr, body_initial_len, valid]
+-- On failure: valid=0.
+hc_read_response_headers fd key iv =
+  let buf = arr_new 65536 0
+  hc_rrh_loop fd key iv 0 buf 0
+
+hc_rrh_loop fd key iv seq buf buf_len =
+  if buf_len > 65000 then hc_rrh_fail 0
+  else
+    let rec_r = hc_read_record fd
+    if arr_get rec_r 2 == 0 then hc_rrh_fail 0
+    else
+      let wire = arr_get rec_r 0
+      let wire_len = arr_get rec_r 1
+      if arr_get wire 0 != 23 then hc_rrh_loop fd key iv seq buf buf_len
+      else
+        let dec = tls13_record_decrypt key iv seq wire wire_len
+        if arr_get dec 3 == 0 then hc_rrh_fail 0
+        else
+          let frag = arr_get dec 0
+          let rtype = arr_get dec 1
+          let flen = arr_get dec 2
+          if rtype == 21 then hc_rrh_fail 0
+          else if rtype != 23 then hc_rrh_loop fd key iv (seq + 1) buf buf_len
+          else
+            let new_len = buf_len + flen
+            if new_len > 65536 then hc_rrh_fail 0
+            else
+              let _ = sha_copy_bytes frag buf 0 buf_len flen
+              let scan_from = if buf_len < 3 then 0 else buf_len - 3
+              let body_off = hc_scan_blank_line buf scan_from new_len
+              if body_off < 0 then hc_rrh_loop fd key iv (seq + 1) buf new_len
+              else
+                let header_str = hc_arr_to_str buf body_off
+                let body_init_len = new_len - body_off
+                let body_init_arr = arr_new body_init_len 0
+                let _ = sha_copy_bytes buf body_init_arr body_off 0 body_init_len
+                let r = arr_new 5 0
+                let _ = arr_set r 0 header_str
+                let _ = arr_set r 1 (seq + 1)
+                let _ = arr_set r 2 body_init_arr
+                let _ = arr_set r 3 body_init_len
+                let _ = arr_set r 4 1
+                r
+
+hc_rrh_fail _ =
+  let z = arr_new 0 0
+  let r = arr_new 5 0
+  let _ = arr_set r 0 ""
+  let _ = arr_set r 1 0
+  let _ = arr_set r 2 z
+  let _ = arr_set r 3 0
+  let _ = arr_set r 4 0
+  r
+
+-- ── Body phase: emit bytes through the chunked decoder if needed,
+-- otherwise straight to disk + hash.
+--
+-- body_state layout (Rail array, mutated in place):
+--   [0] chunked       0 = raw, 1 = chunked
+--   [1] chunk_state   0 = READ_LEN, 1 = READ_BODY, 2 = READ_TRAILER, 3 = DONE
+--   [2] chunk_remain  bytes left in current data chunk
+--   [3] len_acc       string accumulator for hex chunk-length digits
+--   [4] bytes_written total body bytes written to file
+--   [5] trailer_stage 0 = expect \r, 1 = expect \n
+--   [6] sha_st        streaming sha256 state
+--   [7] fp            FILE* (raw int)
+--   [8] cbuf          C buffer for fwrite (sized to TLS record max)
+--   [9] cbuf_size     allocated cbuf size
+
+hc_body_state_init sha_st fp cbuf cbuf_size chunked =
+  let st = arr_new 10 0
+  let _ = arr_set st 0 chunked
+  let _ = arr_set st 1 0
+  let _ = arr_set st 2 0
+  let _ = arr_set st 3 ""
+  let _ = arr_set st 4 0
+  let _ = arr_set st 5 0
+  let _ = arr_set st 6 sha_st
+  let _ = arr_set st 7 fp
+  let _ = arr_set st 8 cbuf
+  let _ = arr_set st 9 cbuf_size
+  st
+
+-- Bulk-write `n` bytes from `frag[off..off+n)` to disk + sha update.
+hc_emit_raw_bulk frag off n body_state =
+  if n <= 0 then 0
+  else
+    let cbuf = arr_get body_state 8
+    let fp = arr_get body_state 7
+    let sha_st = arr_get body_state 6
+    let _ = hc_arr_off_to_cbuf frag off cbuf n
+    let _ = fwrite cbuf 1 n fp
+    let _ = sha256_update_arr sha_st frag off n
+    let bw = arr_get body_state 4
+    let _ = arr_set body_state 4 (bw + n)
+    0
+
+-- Top-level chunk emitter — dispatches on chunked flag.
+hc_emit_body frag off n body_state =
+  if n <= 0 then 0
+  else
+    let chunked = arr_get body_state 0
+    if chunked == 0 then
+      let _ = hc_emit_raw_bulk frag off n body_state
+      0
+    else hc_emit_chunked_dispatch frag off n body_state
+
+hc_emit_chunked_dispatch frag off n body_state =
+  if n <= 0 then 0
+  else
+    let cs = arr_get body_state 1
+    if cs == 3 then 0
+    else if cs == 0 then hc_chunk_read_len frag off n body_state
+    else if cs == 1 then hc_chunk_read_body frag off n body_state
+    else hc_chunk_read_trailer frag off n body_state
+
+hc_chunk_read_len frag off n body_state =
+  if n <= 0 then 0
+  else
+    let b = arr_get frag off
+    if b == 13 then
+      hc_chunk_read_len frag (off + 1) (n - 1) body_state
+    else if b == 10 then
+      let acc = arr_get body_state 3
+      let semi = str_find ";" acc
+      let clean = if semi < 0 then acc else str_sub acc 0 semi
+      let chunk_len = hc_parse_hex_str clean
+      let _ = arr_set body_state 3 ""
+      let _ = arr_set body_state 2 chunk_len
+      if chunk_len == 0 then
+        let _ = arr_set body_state 1 3
+        0
+      else
+        let _ = arr_set body_state 1 1
+        hc_emit_chunked_dispatch frag (off + 1) (n - 1) body_state
+    else
+      let acc = arr_get body_state 3
+      let new_acc = join "" [acc, char_from_int b]
+      let _ = arr_set body_state 3 new_acc
+      hc_chunk_read_len frag (off + 1) (n - 1) body_state
+
+hc_chunk_read_body frag off n body_state =
+  let remaining = arr_get body_state 2
+  let take = if remaining < n then remaining else n
+  let _ = hc_emit_raw_bulk frag off take body_state
+  let new_remaining = remaining - take
+  let _ = arr_set body_state 2 new_remaining
+  if new_remaining == 0 then
+    let _ = arr_set body_state 1 2
+    let _ = arr_set body_state 5 0
+    hc_emit_chunked_dispatch frag (off + take) (n - take) body_state
+  else 0
+
+hc_chunk_read_trailer frag off n body_state =
+  if n <= 0 then 0
+  else
+    let stage = arr_get body_state 5
+    let b = arr_get frag off
+    if stage == 0 then
+      if b == 13 then
+        let _ = arr_set body_state 5 1
+        hc_chunk_read_trailer frag (off + 1) (n - 1) body_state
+      else if b == 10 then
+        let _ = arr_set body_state 1 0
+        hc_emit_chunked_dispatch frag (off + 1) (n - 1) body_state
+      else hc_chunk_read_trailer frag (off + 1) (n - 1) body_state
+    else
+      if b == 10 then
+        let _ = arr_set body_state 5 0
+        let _ = arr_set body_state 1 0
+        hc_emit_chunked_dispatch frag (off + 1) (n - 1) body_state
+      else hc_chunk_read_trailer frag (off + 1) (n - 1) body_state
+
+-- Body recv loop: reads TLS records, decrypts, feeds into emitter.
+hc_stream_body_loop fd key iv seq body_state =
+  let cs_done = arr_get body_state 1
+  if cs_done == 3 then 0
+  else
+    let mk = arena_mark 0
+    let rec_r = hc_read_record fd
+    if arr_get rec_r 2 == 0 then
+      let _ = arena_reset mk
+      0
+    else
+      let wire = arr_get rec_r 0
+      let wire_len = arr_get rec_r 1
+      if arr_get wire 0 != 23 then
+        let _ = arena_reset mk
+        hc_stream_body_loop fd key iv seq body_state
+      else
+        let dec = tls13_record_decrypt key iv seq wire wire_len
+        if arr_get dec 3 == 0 then
+          let _ = arena_reset mk
+          0
+        else
+          let frag = arr_get dec 0
+          let rtype = arr_get dec 1
+          let flen = arr_get dec 2
+          if rtype == 21 then
+            let _ = arena_reset mk
+            0
+          else if rtype != 23 then
+            let _ = arena_reset mk
+            hc_stream_body_loop fd key iv (seq + 1) body_state
+          else
+            let _ = hc_emit_body frag 0 flen body_state
+            let _ = arena_reset mk
+            hc_stream_body_loop fd key iv (seq + 1) body_state
+
+-- ── Top-level streaming GET ─────────────────────────────────────────
+
+https_get_to_file_unsafe_noverify host ip port path out_path =
   let fd = hc_connect_tcp ip port
-  if fd < 0 then (0, "connect failed")
-  else https_put_on_fd fd host path ctype body hdrs
+  if fd < 0 then hc_stream_fail 0
+  else hc_stream_on_fd fd host path out_path
 
-https_put_on_fd fd host path ctype body hdrs =
+hc_stream_on_fd fd host path out_path =
   let kp = hc_gen_keypair 0
   let priv = arr_get kp 0
   let pub = arr_get kp 1
@@ -865,10 +955,10 @@ https_put_on_fd fd host path ctype body hdrs =
   let xh = hc_exchange_hello fd ch_msg ch_msg_len priv
   if arr_get xh 5 == 0 then
     let _ = close fd
-    hc_err "ServerHello parse failed"
-  else https_put_post_hello fd host path ctype body hdrs priv ch_msg ch_msg_len xh
+    hc_stream_fail 0
+  else hc_stream_post_hello fd host path priv ch_msg ch_msg_len xh out_path
 
-https_put_post_hello fd host path ctype body hdrs priv ch_msg ch_msg_len xh =
+hc_stream_post_hello fd host path priv ch_msg ch_msg_len xh out_path =
   let sh_msg = arr_get xh 0
   let sh_msg_len = arr_get xh 1
   let s_hs_key = arr_get xh 2
@@ -879,18 +969,77 @@ https_put_post_hello fd host path ctype body hdrs priv ch_msg ch_msg_len xh =
   let fl = arr_get flight 1
   if fl < 0 then
     let _ = close fd
-    hc_err "flight decrypt failed"
-  else https_put_app_phase fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs
+    hc_stream_fail 0
+  else hc_stream_app_phase fd host path priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs out_path
 
-https_put_url_unsafe_noverify url ctype body hdrs =
+hc_stream_app_phase fd host path priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs out_path =
+  let fsm = tls13_client_handshake_offline priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl 1 host
+  if arr_get fsm 4 == 0 then
+    let _ = close fd
+    hc_stream_fail 0
+  else
+    let c_ap = arr_get fsm 0
+    let s_ap = arr_get fsm 1
+    let cf_msg = arr_get fsm 2
+    let cf_len = arr_get fsm 3
+    let c_hs_key = tls13_derive_key c_hs
+    let c_hs_iv = tls13_derive_iv c_hs
+    let c_ap_key = tls13_derive_key c_ap
+    let c_ap_iv = tls13_derive_iv c_ap
+    let s_ap_key = tls13_derive_key s_ap
+    let s_ap_iv = tls13_derive_iv s_ap
+    let cf_rec = tls13_record_encrypt c_hs_key c_hs_iv 0 22 cf_msg cf_len
+    let _ = hc_send_bytes fd (arr_get cf_rec 0) (arr_get cf_rec 1)
+    let req = hc_build_req host path
+    let req_buf = arr_get req 0
+    let req_len = arr_get req 1
+    let app_rec = tls13_record_encrypt c_ap_key c_ap_iv 0 23 req_buf req_len
+    let _ = hc_send_bytes fd (arr_get app_rec 0) (arr_get app_rec 1)
+    hc_stream_recv fd s_ap_key s_ap_iv out_path
+
+hc_stream_recv fd key iv out_path =
+  let hdr = hc_read_response_headers fd key iv
+  if arr_get hdr 4 == 0 then
+    let _ = close fd
+    hc_stream_fail 0
+  else
+    let header_str = arr_get hdr 0
+    let next_seq = arr_get hdr 1
+    let body_init = arr_get hdr 2
+    let body_init_len = arr_get hdr 3
+    let status = hc_parse_status header_str
+    let chunked = hc_is_chunked_resp header_str
+    let fp = fopen out_path "w"
+    if fp == 0 then
+      let _ = close fd
+      hc_stream_fail 0
+    else
+      let cbuf_size = 16640
+      let cbuf = malloc cbuf_size
+      let sha_st = sha256_init 0
+      let body_state = hc_body_state_init sha_st fp cbuf cbuf_size chunked
+      let _ = hc_emit_body body_init 0 body_init_len body_state
+      let _ = hc_stream_body_loop fd key iv next_seq body_state
+      let _ = close fd
+      let _ = fclose fp
+      let _ = free cbuf
+      let bw = arr_get body_state 4
+      let digest_hex = sha256_finalize_hex sha_st
+      let r = arr_new 4 0
+      let _ = arr_set r 0 status
+      let _ = arr_set r 1 bw
+      let _ = arr_set r 2 digest_hex
+      let _ = arr_set r 3 1
+      r
+
+-- URL convenience wrapper.
+https_get_url_to_file_unsafe_noverify url out_path =
   let parts = https_parse_url url
-  if arr_get parts 4 == 0 then (0, "bad URL")
-  else https_put_url_unsafe_dispatch parts ctype body hdrs
-
-https_put_url_unsafe_dispatch parts ctype body hdrs =
-  let host = arr_get parts 0
-  let port = arr_get parts 1
-  let path = arr_get parts 2
-  let ip = dns_resolve_a host
-  if length ip == 0 then (0, join "" ["DNS resolve failed for ", host])
-  else https_put_unsafe_noverify host ip port path ctype body hdrs
+  if arr_get parts 4 == 0 then hc_stream_fail 0
+  else
+    let host = arr_get parts 0
+    let port = arr_get parts 1
+    let path = arr_get parts 2
+    let ip = dns_resolve_a host
+    if length ip == 0 then hc_stream_fail 0
+    else https_get_to_file_unsafe_noverify host ip port path out_path

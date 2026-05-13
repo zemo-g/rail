@@ -1,7 +1,7 @@
 # HTTPS in Rail — Design Debate
 
 **Branch:** `track-h-https`
-**Worktree:** `$HOME/projects/rail-https`
+**Worktree:** `~/projects/rail-https`
 **Parent:** `next-v2.10` (includes `char_from_int`, `stdlib/http_client.rail`, chunked-transfer decoder)
 **Status:** SCAFFOLD — no implementation yet. Debate first, then build.
 

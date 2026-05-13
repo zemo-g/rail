@@ -40,6 +40,7 @@ NO_WS_FIRST="0"
 RUN_ID="$$"
 DYLD_PATH="tools/metal"
 BIN_OVERRIDE=""
+CORPUS=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -56,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --no-ws-first) NO_WS_FIRST="$2"; shift 2 ;;
     --run-id)      RUN_ID="$2"; shift 2 ;;
     --dyld)        DYLD_PATH="$2"; shift 2 ;;
+    --corpus)      CORPUS="$2"; shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -105,15 +107,28 @@ launch_one() {
   local seed=$((BASE_SEED + i))
   local out="/tmp/rerank_${RUN_ID}_${i}.txt"
   OUTFILES[$i]="$out"
-  DYLD_LIBRARY_PATH="$DYLD_PATH" "$COMPILED_BIN" \
-    --prefix "$PREFIX" \
-    --prompt "$PROMPT" \
-    --max "$MAX" \
-    --k "$K" \
-    --temp "$TEMP" \
-    --seed "$seed" \
-    --no-ws-first "$NO_WS_FIRST" \
-    > "$out" 2>&1 &
+  if [[ -n "$CORPUS" ]]; then
+    DYLD_LIBRARY_PATH="$DYLD_PATH" "$COMPILED_BIN" \
+      --prefix "$PREFIX" \
+      --prompt "$PROMPT" \
+      --max "$MAX" \
+      --k "$K" \
+      --temp "$TEMP" \
+      --seed "$seed" \
+      --no-ws-first "$NO_WS_FIRST" \
+      --corpus "$CORPUS" \
+      > "$out" 2>&1 &
+  else
+    DYLD_LIBRARY_PATH="$DYLD_PATH" "$COMPILED_BIN" \
+      --prefix "$PREFIX" \
+      --prompt "$PROMPT" \
+      --max "$MAX" \
+      --k "$K" \
+      --temp "$TEMP" \
+      --seed "$seed" \
+      --no-ws-first "$NO_WS_FIRST" \
+      > "$out" 2>&1 &
+  fi
   PIDS[$i]=$!
 }
 

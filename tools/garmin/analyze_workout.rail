@@ -1,0 +1,293 @@
+-- tools/garmin/analyze_workout.rail — Per-record sensor analysis for one
+-- FIT file. Walks every data record (FIT global=20), accumulates
+-- HR/speed/cadence/altitude/temperature/GPS stats, prints a dashboard.
+--
+-- Usage:
+--   ./rail_native run tools/garmin/analyze_workout.rail <fit_path>
+
+import "stdlib/fit.rail"
+import "stdlib/fmt.rail"
+
+-- ── Acc layout (32 ints) ─────────────────────────────────────────────
+-- 0 count           1 t_first       2 t_last
+-- 3 hr_sum          4 hr_n          5 hr_min        6 hr_max
+-- 7 cad_sum         8 cad_n         9 cad_max
+-- 10 spd_sum (mm/s) 11 spd_n        12 spd_max (mm/s)
+-- 13 dist_last (cm)
+-- 14 alt_min (raw u16, 0.2m steps, +500m offset)
+-- 15 alt_max (raw)  16 alt_prev (-1=none)
+-- 17 alt_gain (raw deltas) 18 alt_loss (raw)
+-- 19 temp_min       20 temp_max     21 temp_sum     22 temp_n
+-- 23 lat_min (semi) 24 lat_max      25 lon_min      26 lon_max     27 gps_n
+-- 28 pwr_sum        29 pwr_n        30 pwr_max
+-- 31 hr_ge150_secs  (count of records with HR≥150)
+
+acc_new _ =
+  let a = arr_new 32 0
+  let _ = arr_set a 5 9999
+  let _ = arr_set a 14 65535
+  let _ = arr_set a 16 (0 - 1)
+  let _ = arr_set a 19 999
+  let _ = arr_set a 20 (0 - 999)
+  let _ = arr_set a 23 2147483647
+  let _ = arr_set a 24 (0 - 2147483648)
+  let _ = arr_set a 25 2147483647
+  let _ = arr_set a 26 (0 - 2147483648)
+  a
+
+update_max a i v =
+  if v > arr_get a i then arr_set a i v else 0
+
+update_min a i v =
+  if v < arr_get a i then arr_set a i v else 0
+
+update_alt a v =
+  let _ = update_min a 14 v
+  let _ = update_max a 15 v
+  let prev = arr_get a 16
+  if prev < 0 then arr_set a 16 v
+  else
+    let d = v - prev
+    let _ = if d > 0 then arr_set a 17 (arr_get a 17 + d) else 0
+    let _ = if d < 0 then arr_set a 18 (arr_get a 18 - d) else 0
+    arr_set a 16 v
+
+update_field a fdef kind v =
+  if fdef == 253 && kind == 0 then
+    let _ = if arr_get a 1 == 0 then arr_set a 1 v else 0
+    arr_set a 2 v
+  else if fdef == 3 && kind == 0 && v != 255 then
+    let _ = arr_set a 3 (arr_get a 3 + v)
+    let _ = arr_set a 4 (arr_get a 4 + 1)
+    let _ = update_min a 5 v
+    let _ = update_max a 6 v
+    if v >= 150 then arr_set a 31 (arr_get a 31 + 1) else 0
+  else if fdef == 4 && kind == 0 && v != 255 then
+    let _ = arr_set a 7 (arr_get a 7 + v)
+    let _ = arr_set a 8 (arr_get a 8 + 1)
+    update_max a 9 v
+  else if fdef == 5 && kind == 0 && v != 4294967295 then
+    arr_set a 13 v
+  else if fdef == 6 && kind == 0 && v != 65535 then
+    let _ = arr_set a 10 (arr_get a 10 + v)
+    let _ = arr_set a 11 (arr_get a 11 + 1)
+    update_max a 12 v
+  else if fdef == 73 && kind == 0 && v != 4294967295 then
+    let _ = arr_set a 10 (arr_get a 10 + v)
+    let _ = arr_set a 11 (arr_get a 11 + 1)
+    update_max a 12 v
+  else if fdef == 78 && kind == 0 && v != 4294967295 then
+    update_alt a v
+  else if fdef == 7 && kind == 0 && v != 65535 then
+    let _ = arr_set a 28 (arr_get a 28 + v)
+    let _ = arr_set a 29 (arr_get a 29 + 1)
+    update_max a 30 v
+  else if fdef == 13 && kind == 1 && v != 127 then
+    let _ = update_min a 19 v
+    let _ = update_max a 20 v
+    let _ = arr_set a 21 (arr_get a 21 + v)
+    arr_set a 22 (arr_get a 22 + 1)
+  else if fdef == 2 && kind == 0 && v != 65535 then
+    update_alt a v
+  else if fdef == 0 && kind == 1 then
+    let _ = update_min a 23 v
+    let _ = update_max a 24 v
+    arr_set a 27 (arr_get a 27 + 1)
+  else if fdef == 1 && kind == 1 then
+    let _ = update_min a 25 v
+    update_max a 26 v
+  else 0
+
+acc_observe_record a schema buf rec_off nf arch i =
+  if i >= nf then a
+  else
+    let fdef = schema_field_def schema i
+    let sz = schema_field_size schema i
+    let bt = schema_field_type schema i
+    let foff = rec_off + schema_field_offset schema i
+    let dec = fit_decode_field buf foff sz bt arch
+    let kind = arr_get dec 0
+    let v = arr_get dec 1
+    let _ = update_field a fdef kind v
+    acc_observe_record a schema buf rec_off nf arch (i + 1)
+
+-- ── Walker ────────────────────────────────────────────────────────────
+-- Mirrors fit_walk but routes record (g==20) messages through our acc
+-- and observes session (g==18) for sport via the existing helper.
+analyze_walk fit table state acc =
+  let buf = fit_buf fit
+  let off = arr_get state 0
+  let endp = fit_data_end fit
+  if off >= endp then acc
+  else
+    let h = arr_get buf off
+    let after_hdr = off + 1
+    if bit_and h 128 != 0 then acc
+    else
+      let local_id = bit_and h 15
+      if bit_and h 64 != 0 then
+        let has_dev = bit_and (shr h 5) 1
+        let dr = parse_def buf after_hdr has_dev
+        let schema = arr_get dr 0
+        let after = arr_get dr 1
+        let _ = arr_set table local_id schema
+        let _ = arr_set state 0 after
+        analyze_walk fit table state acc
+      else
+        let schema = arr_get table local_id
+        if schema == 0 then acc
+        else
+          let body = schema_total schema
+          let g = schema_global schema
+          let nf = schema_nfields schema
+          let arch = schema_arch schema
+          let _ = if g == 20 then
+                    let _ = acc_observe_record acc schema buf after_hdr nf arch 0
+                    arr_set acc 0 (arr_get acc 0 + 1)
+                  else if g == 18 then
+                    let _ = state_observe_session state schema buf after_hdr nf arch 0
+                    arr_set state 5 1
+                  else if g == 0 then
+                    state_observe_file_id state schema buf after_hdr nf arch 0
+                  else 0
+          let _ = arr_set state 0 (after_hdr + body)
+          analyze_walk fit table state acc
+
+-- ── Formatting helpers ────────────────────────────────────────────────
+sport_name n =
+  if n == 0 then "generic"
+  else if n == 1 then "running"
+  else if n == 2 then "cycling"
+  else if n == 5 then "swimming"
+  else if n == 11 then "walking"
+  else if n == 17 then "hiking"
+  else cat ["sport(", show n, ")"]
+
+fmt_hms secs =
+  let h = secs / 3600
+  let m = (secs / 60) - h * 60
+  let s = secs - (secs / 60) * 60
+  if h > 0 then cat [show h, ":", zero_pad m 2, ":", zero_pad s 2]
+  else cat [show m, ":", zero_pad s 2]
+
+fmt_pct n d =
+  if d <= 0 then "-"
+  else cat [show (n * 100 / d), "%"]
+
+fmt_km cm =
+  if cm <= 0 then "-"
+  else
+    let km_int = cm / 100000
+    let hundredths = (cm / 1000) - km_int * 100
+    cat [show km_int, ".", zero_pad hundredths 2, " km"]
+
+fmt_kmh_mm_per_s mmps =
+  if mmps <= 0 then "-"
+  else
+    let kmh_x100 = mmps * 36 / 100
+    let intp = kmh_x100 / 100
+    let frac = kmh_x100 - intp * 100
+    cat [show intp, ".", zero_pad frac 2, " km/h"]
+
+fmt_alt_raw raw =
+  let m_x10 = raw * 10 / 5 - 5000
+  let intp = m_x10 / 10
+  let frac = m_x10 - intp * 10
+  let frac_abs = if frac < 0 then 0 - frac else frac
+  cat [show intp, ".", show frac_abs, " m"]
+
+fmt_alt_delta_raw raw =
+  let m = raw / 5
+  cat [show m, " m"]
+
+fmt_lat_lon semi =
+  let abs_s = if semi < 0 then 0 - semi else semi
+  let deg_x1e6 = abs_s / 2147 * 180
+  let intp = deg_x1e6 / 1000000
+  let frac = deg_x1e6 - intp * 1000000
+  let sign = if semi < 0 then "-" else ""
+  cat [sign, show intp, ".", zero_pad frac 6]
+
+avg_or_dash sum n =
+  if n <= 0 then "-"
+  else show (sum / n)
+
+main =
+  let argv = args
+  let path = if length argv >= 2 then head (tail argv) else ""
+  if length (chars path) == 0 then
+    let _ = print "usage: rail_native run tools/garmin/analyze_workout.rail <fit_path>"
+    1
+  else
+    let fit = fit_load path
+    if fit_valid fit == 0 then
+      let _ = print (cat ["invalid FIT file: ", path])
+      1
+    else
+      let table = arr_new 16 0
+      let state = state_new 0
+      let _ = arr_set state 0 (fit_data_off fit)
+      let acc = acc_new 0
+      let _ = analyze_walk fit table state acc
+      let count = arr_get acc 0
+      let t_first = arr_get acc 1
+      let t_last = arr_get acc 2
+      let elapsed = if t_last > t_first then t_last - t_first else 0
+      let active_ms = arr_get state 7
+      let active = active_ms / 1000
+      let interval_ms = if count > 0 then active_ms / count else 1000
+      let sport_n = arr_get state 4
+      let _ = print (cat ["Workout Analysis  ", path])
+      let _ = print "================================================="
+      let _ = print (cat ["Sport       ", sport_name sport_n])
+      let _ = print (cat ["Started     ", fit_fmt_unix_utc (fit_unix_of t_first)])
+      let _ = print (cat ["Ended       ", fit_fmt_unix_utc (fit_unix_of t_last)])
+      let _ = print (cat ["Active      ", fmt_hms active, "   Elapsed ", fmt_hms elapsed,
+                          "   (paused ", fmt_hms (elapsed - active), ")"])
+      let _ = print (cat ["Records     ", show count,
+                          "  (~", show interval_ms, " ms/sample, smart recording)"])
+      let _ = print ""
+      let _ = print (cat ["Distance    ", fmt_km (arr_get acc 13)])
+      let spd_avg = if arr_get acc 11 > 0 then arr_get acc 10 / arr_get acc 11 else 0
+      let _ = print (cat ["Speed       avg ", fmt_kmh_mm_per_s spd_avg, ", max ", fmt_kmh_mm_per_s (arr_get acc 12)])
+      let _ = print ""
+      let hr_n = arr_get acc 4
+      let hr_avg = if hr_n > 0 then arr_get acc 3 / hr_n else 0
+      let _ = print (cat ["Heart rate  avg ", show hr_avg,
+                          " bpm, min ", (if hr_n == 0 then "-" else show (arr_get acc 5)),
+                          ", max ", show (arr_get acc 6)])
+      let hr_high_secs = arr_get acc 31 * interval_ms / 1000
+      let _ = print (cat ["            time HR>=150 bpm  ", fmt_hms hr_high_secs,
+                          "  (", fmt_pct (arr_get acc 31) count, " of records)"])
+      let _ = print ""
+      let cad_n = arr_get acc 8
+      let cad_avg = if cad_n > 0 then arr_get acc 7 / cad_n else 0
+      let _ = print (cat ["Cadence     avg ", show cad_avg, " rpm, max ", show (arr_get acc 9), " rpm"])
+      let pwr_n = arr_get acc 29
+      let _ = if pwr_n > 0 then
+                let pavg = arr_get acc 28 / pwr_n
+                print (cat ["Power       avg ", show pavg, " W, max ", show (arr_get acc 30), " W"])
+              else 0
+      let _ = print ""
+      let temp_n = arr_get acc 22
+      let _ = if temp_n > 0 then
+                let tavg = arr_get acc 21 / temp_n
+                print (cat ["Temperature avg ", show tavg, " C, range ",
+                            show (arr_get acc 19), "..", show (arr_get acc 20), " C"])
+              else print "Temperature -"
+      let _ = print ""
+      let alt_min = arr_get acc 14
+      let alt_max = arr_get acc 15
+      let _ = if alt_min < 65535 then
+                let _ = print (cat ["Altitude    range ", fmt_alt_raw alt_min, " .. ", fmt_alt_raw alt_max])
+                print (cat ["            +", fmt_alt_delta_raw (arr_get acc 17),
+                            " gain, -", fmt_alt_delta_raw (arr_get acc 18), " loss"])
+              else print "Altitude    -"
+      let _ = print ""
+      let _ = if arr_get acc 27 > 0 then
+                let _ = print (cat ["GPS bbox    lat  ", fmt_lat_lon (arr_get acc 23),
+                                    " .. ", fmt_lat_lon (arr_get acc 24)])
+                print (cat ["            lon  ", fmt_lat_lon (arr_get acc 25),
+                            " .. ", fmt_lat_lon (arr_get acc 26)])
+              else print "GPS         -"
+      0

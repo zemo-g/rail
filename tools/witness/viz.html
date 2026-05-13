@@ -1,0 +1,219 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>witness · multi-node consensus</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg:    #0b0d11;
+    --panel: #11151b;
+    --line:  #1f242c;
+    --fg:    #cfd6df;
+    --dim:   #6a7886;
+    --ok:    #5fb878;
+    --warn:  #d8a25a;
+    --bad:   #ff6b6b;
+    --accent:#86c5ff;
+  }
+  body { font: 13px/1.5 ui-monospace, "SF Mono", Menlo, monospace; background: var(--bg); color: var(--fg); margin: 0; padding: 24px 32px; }
+  h1 { font-weight: 600; font-size: 16px; margin: 0 0 4px; color: #e6edf3; }
+  .sub { color: var(--dim); margin-bottom: 22px; }
+  .consensus { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px; margin-bottom: 18px; display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; align-items: baseline; }
+  .consensus .k { color: var(--dim); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .consensus .v { font-size: 13.5px; }
+  .consensus .v.tight { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; word-break: break-all; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .card .head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+  .card .head .name { font-weight: 600; font-size: 14px; color: #e6edf3; }
+  .card .head .age { color: var(--dim); font-size: 11.5px; }
+  .card .row { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; padding: 3px 0; align-items: baseline; }
+  .card .row .k { color: var(--dim); font-size: 11.5px; }
+  .card .row .v { font-size: 12.5px; word-break: break-all; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 9999px; font-size: 11px; letter-spacing: 0.02em; }
+  .pill.ok   { background: rgba(95, 184, 120, 0.15); color: var(--ok); border: 1px solid rgba(95, 184, 120, 0.3); }
+  .pill.warn { background: rgba(216, 162, 90, 0.15); color: var(--warn); border: 1px solid rgba(216, 162, 90, 0.3); }
+  .pill.bad  { background: rgba(255, 107, 107, 0.15); color: var(--bad);  border: 1px solid rgba(255, 107, 107, 0.3); }
+  .pill.dim  { background: rgba(106, 120, 134, 0.12); color: var(--dim);  border: 1px solid rgba(106, 120, 134, 0.25); }
+  .footer { margin-top: 20px; color: var(--dim); font-size: 11.5px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .src { font-size: 11px; color: var(--dim); }
+  .src.fixture { color: var(--warn); }
+</style>
+<h1>Witness — multi-node consensus</h1>
+<div class="sub">Independent attestations of <a href="https://ledatic.org/entropy/pulse">entropy/pulse</a>. Each witness Ed25519-signs <code>${pulse_id}|${value_hex}|${witnessed_at}</code> over its local observation. Consensus = all reachable witnesses agree on (pulse_id, value_hex) and chain_verified=true.</div>
+
+<div class="consensus" id="consensus">
+  <div class="k">status</div>     <div class="v" id="status">loading…</div>
+  <div class="k">beacon</div>     <div class="v tight" id="beacon">—</div>
+  <div class="k">witnesses</div>  <div class="v" id="counts">—</div>
+  <div class="k">last poll</div>  <div class="v" id="poll">—</div>
+</div>
+
+<div class="grid" id="cards"></div>
+
+<div class="footer">
+  Endpoints attempted: <code id="endpoints"></code>.<br>
+  Fallback fixtures load from <code>fixtures/&lt;node&gt;.json</code> when live endpoints 404 — viewer remains useful pre-deploy.
+</div>
+
+<script>
+"use strict";
+
+// Witness registry — adapt by appending here.  pk_fp values match
+// tools/fleet/WITNESSES.md.
+const WITNESSES = [
+  { node: 'fleet0', pk_fp: 'cac5f21a70564aeb' },
+];
+
+const BEACON_URL  = 'https://ledatic.org/entropy/pulse';
+const WITNESS_URL = node => `https://ledatic.org/witness/${node}/latest`;
+// Fixture path differs between local-dev and deployed.  Under
+// `python3 -m http.server` from tools/witness/ the relative
+// `fixtures/<node>.json` resolves; once staged, the same files live
+// at the absolute /witness-fixtures/<node>.json so they don't claim
+// the bare `/fixtures/` namespace on ledatic.org.
+const ON_LEDATIC = /(^|\.)ledatic\.org$/.test(location.hostname);
+const FIXTURE_URL = node => ON_LEDATIC
+  ? `/witness-fixtures/${node}.json`
+  : `fixtures/${node}.json`;
+const POLL_MS     = 5000;
+const STALE_S     = 30;
+const VERY_STALE_S = 120;
+
+document.getElementById('endpoints').textContent =
+  WITNESSES.map(w => WITNESS_URL(w.node)).join(', ') +
+  '  (or fixtures/ on 404)';
+
+async function fetchOrFallback(node) {
+  // Try live first; on any non-2xx or network error, fall back to
+  // local fixture and tag the source so the UI surfaces the divergence.
+  try {
+    const r = await fetch(WITNESS_URL(node), { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    return { src: 'live', body: j };
+  } catch (e) {
+    try {
+      const r = await fetch(FIXTURE_URL(node), { cache: 'no-store' });
+      if (!r.ok) throw new Error(`fixture HTTP ${r.status}`);
+      const j = await r.json();
+      return { src: 'fixture', body: j, error: e.message };
+    } catch (e2) {
+      return { src: 'error', error: `live: ${e.message}; fixture: ${e2.message}` };
+    }
+  }
+}
+
+async function fetchBeacon() {
+  try {
+    const r = await fetch(BEACON_URL, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+function ageString(unix_seconds) {
+  if (!unix_seconds) return '—';
+  const dt = (Date.now() / 1000) - unix_seconds;
+  if (dt < 0)        return `+${Math.abs(dt).toFixed(0)}s clock skew`;
+  if (dt < 60)       return `${dt.toFixed(0)} s ago`;
+  if (dt < 3600)     return `${(dt/60).toFixed(1)} min ago`;
+  return `${(dt/3600).toFixed(1)} h ago`;
+}
+
+function freshnessPill(unix_seconds, src) {
+  if (src === 'fixture') return `<span class="pill warn">fixture</span>`;
+  if (src === 'error')   return `<span class="pill bad">no source</span>`;
+  if (!unix_seconds)     return `<span class="pill dim">—</span>`;
+  const dt = (Date.now() / 1000) - unix_seconds;
+  if (dt > VERY_STALE_S) return `<span class="pill bad">stale ${ageString(unix_seconds)}</span>`;
+  if (dt > STALE_S)      return `<span class="pill warn">stale ${ageString(unix_seconds)}</span>`;
+  return `<span class="pill ok">live</span>`;
+}
+
+function chainPill(verified) {
+  if (verified === true)  return `<span class="pill ok">chain ✓</span>`;
+  if (verified === false) return `<span class="pill bad">chain ✗</span>`;
+  return `<span class="pill dim">chain n/a</span>`;
+}
+
+function sigPill(sig) {
+  // We don't verify in-browser (would need ed25519-wasm).  Just
+  // confirm a signature field is present and non-empty.  The hosting
+  // worker is the second factor — it allow-lists the witness name.
+  if (!sig || sig.length < 32) return `<span class="pill bad">no sig</span>`;
+  return `<span class="pill ok">sig present</span>`;
+}
+
+function renderCard(meta, body, src) {
+  const head = `<div class="head"><div class="name">${meta.node}</div><div class="age">${ageString(body && body.witnessed_at)}</div></div>`;
+  if (src === 'error') {
+    return `<div class="card">${head}
+      <div class="row"><div class="k">source</div><div class="v"><span class="pill bad">unreachable</span></div></div>
+      <div class="row"><div class="k">key fp</div><div class="v">${meta.pk_fp}</div></div>
+    </div>`;
+  }
+  const pulseLine = body.pulse_id != null ? `${body.pulse_id}` : '—';
+  const valueShort = (body.value_hex || '').slice(0, 12) + '…' + (body.value_hex || '').slice(-8);
+  return `<div class="card">${head}
+    <div class="row"><div class="k">source</div><div class="v">${freshnessPill(body.witnessed_at, src)} ${chainPill(body.chain_verified)} ${sigPill(body.sig)}</div></div>
+    <div class="row"><div class="k">pulse_id</div><div class="v">${pulseLine}</div></div>
+    <div class="row"><div class="k">value</div><div class="v" title="${body.value_hex || ''}">${valueShort}</div></div>
+    <div class="row"><div class="k">prev</div><div class="v" title="${body.prev_hex || ''}">${(body.prev_hex || '').slice(0, 12)}…</div></div>
+    <div class="row"><div class="k">gap</div><div class="v">${body.gap == null ? '—' : body.gap}</div></div>
+    <div class="row"><div class="k">key fp</div><div class="v">${body.pk_fp || meta.pk_fp}</div></div>
+    <div class="row"><div class="k">beacon ts</div><div class="v">${body.beacon_ts || '—'}</div></div>
+  </div>`;
+}
+
+function renderConsensus(beacon, results) {
+  const live   = results.filter(r => r.src === 'live');
+  const total  = results.length;
+  const counts = `${live.length} live · ${results.filter(r => r.src === 'fixture').length} fixture · ${results.filter(r => r.src === 'error').length} error`;
+  document.getElementById('counts').textContent = counts;
+  document.getElementById('beacon').innerHTML = beacon
+    ? `pulse_id <b>${beacon.pulse_id}</b>  ·  ${(beacon.value_hex || '').slice(0,12)}…${(beacon.value_hex || '').slice(-8)}`
+    : '<span class="pill bad">unreachable</span>';
+  document.getElementById('poll').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
+
+  // Status determination.
+  const pulseSet = new Set(live.map(r => r.body.pulse_id));
+  const valueSet = new Set(live.map(r => r.body.value_hex));
+  let statusHTML;
+  if (live.length === 0) {
+    statusHTML = `<span class="pill bad">no live witnesses</span>  endpoints not yet deployed; running on fixtures`;
+  } else if (live.length < total) {
+    statusHTML = `<span class="pill warn">partial</span>  ${live.length}/${total} witnesses reporting`;
+  } else if (pulseSet.size > 1) {
+    statusHTML = `<span class="pill bad">divergent</span>  ${pulseSet.size} different pulse_ids — investigate`;
+  } else if (valueSet.size > 1) {
+    statusHTML = `<span class="pill bad">value mismatch</span>  same pulse, different value_hex`;
+  } else if (beacon && live.length && beacon.pulse_id !== [...pulseSet][0]) {
+    const drift = beacon.pulse_id - [...pulseSet][0];
+    statusHTML = `<span class="pill warn">behind beacon</span>  witnesses at ${[...pulseSet][0]}, beacon at ${beacon.pulse_id} (drift ${drift})`;
+  } else if (live.some(r => r.body.chain_verified === false)) {
+    statusHTML = `<span class="pill bad">chain break</span>  at least one witness reports chain_verified=false`;
+  } else {
+    statusHTML = `<span class="pill ok">consensus</span>  all live witnesses agree at pulse_id <b>${[...pulseSet][0]}</b>`;
+  }
+  document.getElementById('status').innerHTML = statusHTML;
+}
+
+async function poll() {
+  const beacon = await fetchBeacon();
+  const results = [];
+  for (const w of WITNESSES) {
+    const r = await fetchOrFallback(w.node);
+    results.push({ ...r, meta: w });
+  }
+  document.getElementById('cards').innerHTML =
+    results.map(r => renderCard(r.meta, r.body || {}, r.src)).join('');
+  renderConsensus(beacon, results);
+}
+
+poll();
+setInterval(poll, POLL_MS);
+</script>

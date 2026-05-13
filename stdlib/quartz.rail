@@ -1,0 +1,165 @@
+-- stdlib/quartz.rail — macOS CoreGraphics input + display bindings
+--
+-- Architecture:
+--   Rail talks to a small Objective-C bridge dylib (tools/desk/libquartz_bridge.dylib)
+--   built against the CoreGraphics, Foundation, and AppKit frameworks. The bridge
+--   handles the parts that are hard from pure FFI:
+--     1. CGEventTap installation + the C-side callback (callbacks-into-Rail are
+--        not yet supported by the runtime, so the bridge owns the runloop on a
+--        worker thread and pushes events into a mutex-protected ring buffer).
+--     2. CFRetain/CFRelease lifetimes around CGEvent objects.
+--     3. CFRunLoopRun on a dedicated thread so qb_next_event from Rail is a
+--        simple blocking pop with timeout.
+--
+-- Build the bridge once:
+--   tools/desk/build_quartz_bridge.sh
+--
+-- Then in your Rail program:
+--   import "stdlib/quartz.rail"
+--   let _ = qz_init mask_all_events
+--   let ev = qz_next_event 100   -- 100 ms timeout
+--   match ev
+--     | EvMouseMove dx dy -> ...
+--     | EvKeyDown kc m    -> ...
+--     | EvNone            -> ...
+--
+-- Status: SKETCH (2026-05-09). Bridge stubs compile; ring buffer + tap
+-- installation TODO. See tools/desk/README.md for the punch list.
+
+import "stdlib/file.rail"
+
+-- ── Foreign declarations (resolve at link time against libquartz_bridge.dylib) ──
+--
+-- Initialization. event_mask is a bitmask of the QZ_MASK_* constants below.
+-- Returns 0 on success, -1 on failure (most likely: Accessibility permission
+-- not granted; macOS will pop a System Settings dialog the first time).
+foreign qb_init event_mask -> int
+
+-- Pull next event into out_arr. Blocking with timeout in milliseconds; pass 0
+-- to poll without blocking. Returns the event-type code (see QZ_EV_*); 0 means
+-- timed out / no event. out_arr layout (Rail float_arr; index 0 reserved):
+--   [1] = field0 (dx, button, keycode, scroll_dx)
+--   [2] = field1 (dy, modifier_mask, scroll_dy)
+--   [3] = field2 (absolute x, used for mouse_move only)
+--   [4] = field3 (absolute y, used for mouse_move only)
+foreign qb_next_event out_arr timeout_ms -> int
+
+-- Synthesize events. All return 0 / -1.
+foreign qb_inject_mouse_move x y -> int
+foreign qb_inject_mouse_button button down -> int
+foreign qb_inject_key keycode down flags -> int
+foreign qb_inject_scroll dx dy -> int
+
+-- Display geometry. qb_screen_count returns count; qb_screen_bounds writes
+-- [origin_x, origin_y, width, height] starting at out_arr[1] for screen idx.
+foreign qb_screen_count dummy -> int
+foreign qb_screen_bounds idx out_arr -> int
+
+-- Tear-down — stops the runloop thread, releases tap, frees ring buffer.
+foreign qb_shutdown dummy -> int
+
+
+-- ── Constants ─────────────────────────────────────────────────────────────────
+
+-- Event-type codes (returned by qb_next_event)
+qz_ev_none         = 0
+qz_ev_mouse_move   = 1
+qz_ev_mouse_down   = 2
+qz_ev_mouse_up     = 3
+qz_ev_key_down     = 4
+qz_ev_key_up       = 5
+qz_ev_scroll       = 6
+qz_ev_flags_change = 7
+
+-- Event-mask bits (passed to qb_init). OR them together for what to capture.
+qz_mask_mouse_move   = 1
+qz_mask_mouse_button = 2
+qz_mask_key          = 4
+qz_mask_scroll       = 8
+qz_mask_flags        = 16
+qz_mask_all          = 31  -- bitor of all above
+
+-- Mouse buttons (matches CGMouseButton values).
+qz_btn_left   = 0
+qz_btn_right  = 1
+qz_btn_middle = 2
+
+-- Modifier-flag bits (NSEventModifierFlag values shifted to fit in low bits).
+qz_mod_shift = 1
+qz_mod_ctrl  = 2
+qz_mod_alt   = 4
+qz_mod_cmd   = 8
+qz_mod_fn    = 16
+qz_mod_caps  = 32
+
+
+-- ── ADT for received events ───────────────────────────────────────────────────
+
+type Event =
+  | EvNone
+  | EvMouseMove dx dy
+  | EvMouseDown button
+  | EvMouseUp button
+  | EvKeyDown keycode mods
+  | EvKeyUp keycode mods
+  | EvScroll dx dy
+  | EvFlagsChange mods
+
+
+-- ── High-level Rail wrappers ──────────────────────────────────────────────────
+
+-- Initialize. Recommended event_mask: qz_mask_all unless you have a reason.
+qz_init event_mask = qb_init event_mask
+
+-- Block up to timeout_ms for the next event, decode into an ADT.
+qz_next_event timeout_ms =
+  let buf = float_arr_new 5 0.0
+  let ty  = qb_next_event buf timeout_ms
+  qz_decode_event ty buf
+
+qz_decode_event ty buf =
+  if ty == qz_ev_none then EvNone
+  else if ty == qz_ev_mouse_move   then EvMouseMove (float_arr_get buf 1) (float_arr_get buf 2)
+  else if ty == qz_ev_mouse_down   then EvMouseDown (float_to_int (float_arr_get buf 1))
+  else if ty == qz_ev_mouse_up     then EvMouseUp   (float_to_int (float_arr_get buf 1))
+  else if ty == qz_ev_key_down     then EvKeyDown   (float_to_int (float_arr_get buf 1)) (float_to_int (float_arr_get buf 2))
+  else if ty == qz_ev_key_up       then EvKeyUp     (float_to_int (float_arr_get buf 1)) (float_to_int (float_arr_get buf 2))
+  else if ty == qz_ev_scroll       then EvScroll    (float_arr_get buf 1) (float_arr_get buf 2)
+  else if ty == qz_ev_flags_change then EvFlagsChange (float_to_int (float_arr_get buf 1))
+  else EvNone
+
+-- Inject helpers — same args as the foreign decls but Rail-friendly names.
+qz_move_to x y = qb_inject_mouse_move x y
+qz_click button down = qb_inject_mouse_button button down
+qz_key keycode down mods = qb_inject_key keycode down mods
+qz_scroll dx dy = qb_inject_scroll dx dy
+
+-- Display geometry helpers.
+qz_screen_count _ = qb_screen_count 0
+
+-- Returns [ox, oy, w, h] for screen index idx, or empty on error.
+qz_screen_bounds idx =
+  let buf = float_arr_new 5 0.0
+  let rc  = qb_screen_bounds idx buf
+  if rc < 0 then []
+  else cons (float_arr_get buf 1)
+       (cons (float_arr_get buf 2)
+       (cons (float_arr_get buf 3)
+       (cons (float_arr_get buf 4) [])))
+
+qz_shutdown _ = qb_shutdown 0
+
+
+-- ── Convenience: pretty-print an event for logging ───────────────────────────
+
+qz_event_show ev = match ev
+  | EvNone               -> "(no event)"
+  | EvMouseMove dx dy    -> cat ["mouse_move  dx=", show_float dx, " dy=", show_float dy]
+  | EvMouseDown b        -> cat ["mouse_down  btn=", show b]
+  | EvMouseUp b          -> cat ["mouse_up    btn=", show b]
+  | EvKeyDown kc m       -> cat ["key_down    kc=", show kc, " mods=", show m]
+  | EvKeyUp kc m         -> cat ["key_up      kc=", show kc, " mods=", show m]
+  | EvScroll dx dy       -> cat ["scroll      dx=", show_float dx, " dy=", show_float dy]
+  | EvFlagsChange m      -> cat ["flags       mods=", show m]
+
+cat parts = join "" parts

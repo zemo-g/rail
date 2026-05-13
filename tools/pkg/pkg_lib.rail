@@ -1,0 +1,205 @@
+-- tools/pkg/pkg_lib.rail — Shared manifest parsing + path resolution for v0.
+-- Used by pkg_resolve.rail and pkg_link.rail.
+-- v0 supports only `path:<rel>` dep sources. No network, no versioning.
+
+-- ---------------------------------------------------------------------------
+-- String helpers (intentionally local; we don't import string.rail because
+-- `cat` is already a top-level builtin in the seed compiler).
+-- ---------------------------------------------------------------------------
+
+trim_lead_cs cs =
+  if length cs == 0 then []
+  else if head cs == " " then trim_lead_cs (tail cs)
+  else if head cs == "\t" then trim_lead_cs (tail cs)
+  else cs
+
+trim_trail_cs cs =
+  let r = reverse cs
+  let r2 = trim_lead_cs r
+  reverse r2
+
+trim_nl_cs cs =
+  if length cs == 0 then []
+  else if head cs == "\n" then []
+  else cons (head cs) (trim_nl_cs (tail cs))
+
+trim_str s =
+  let cs = chars s
+  let cs2 = trim_lead_cs cs
+  let cs3 = trim_trail_cs cs2
+  join "" cs3
+
+-- Strip trailing newline (shell output)
+chomp s =
+  let cs = chars s
+  join "" (trim_nl_cs cs)
+
+-- Strip a leading and trailing double-quote, if both present.
+strip_quotes s =
+  let cs = chars s
+  if length cs < 2 then s
+  else if head cs == "\"" then
+    let r = reverse (tail cs)
+    if length r == 0 then s
+    else if head r == "\"" then join "" (reverse (tail r))
+    else s
+  else s
+
+pkg_starts_with prefix s =
+  pkg_sw_check (chars prefix) (chars s)
+
+pkg_sw_check pcs scs =
+  if length pcs == 0 then true
+  else if length scs == 0 then false
+  else if head pcs == head scs then pkg_sw_check (tail pcs) (tail scs)
+  else false
+
+-- Drop the first `n` characters of `s`.
+drop_n s n =
+  let cs = chars s
+  join "" (drop_n_cs cs n)
+
+drop_n_cs cs n =
+  if n <= 0 then cs
+  else if length cs == 0 then cs
+  else drop_n_cs (tail cs) (n - 1)
+
+-- Split a `name = "value"` line at the first `=`. Returns [name, value]
+-- with both sides trimmed. Value still has its quotes (we strip later).
+split_kv line =
+  split_kv_h (chars line) []
+
+split_kv_h cs acc =
+  if length cs == 0 then [join "" (reverse acc), ""]
+  else if head cs == "=" then
+    let k = trim_str (join "" (reverse acc))
+    let v = trim_str (join "" (tail cs))
+    [k, v]
+  else split_kv_h (tail cs) (cons (head cs) acc)
+
+-- ---------------------------------------------------------------------------
+-- Manifest parsing
+-- ---------------------------------------------------------------------------
+-- We model a "dep" as a 3-element list [name, source, resolved_path].
+-- After parsing, resolved_path is "" until resolve_dep fills it in.
+
+-- Check whether a stripped line is a section header like "[xyz]".
+is_section line =
+  let t = trim_str line
+  pkg_starts_with "[" t
+
+section_name line =
+  let t = trim_str line
+  let cs = chars t
+  if length cs < 2 then ""
+  else
+    let inner = tail cs
+    let r = reverse inner
+    if length r == 0 then ""
+    else if head r == "]" then join "" (reverse (tail r))
+    else join "" inner
+
+-- Skip blank/comment lines; comment styles allowed are `#` and `--`.
+is_skip_line line =
+  let t = trim_str line
+  if length t == 0 then true
+  else if pkg_starts_with "#" t then true
+  else if pkg_starts_with "--" t then true
+  else false
+
+-- Parse the manifest text into a list of [name, source, ""] triples.
+parse_deps toml =
+  let lines = split "\n" toml
+  parse_deps_h lines "" []
+
+parse_deps_h lines section acc =
+  if length lines == 0 then reverse acc
+  else
+    let line = head lines
+    let rest = tail lines
+    if is_skip_line line then parse_deps_h rest section acc
+    else if is_section line then parse_deps_h rest (section_name line) acc
+    else if section == "dependencies" then
+      let kv = split_kv line
+      let name = head kv
+      let raw = head (tail kv)
+      let src = strip_quotes raw
+      if length name == 0 then parse_deps_h rest section acc
+      else parse_deps_h rest section (cons [name, src, ""] acc)
+    else parse_deps_h rest section acc
+
+-- Pull the package name out of `[package]` — used for nicer diagnostics.
+parse_pkg_name toml =
+  let lines = split "\n" toml
+  parse_pkg_name_h lines "" ""
+
+parse_pkg_name_h lines section found =
+  if length lines == 0 then found
+  else
+    let line = head lines
+    let rest = tail lines
+    if is_skip_line line then parse_pkg_name_h rest section found
+    else if is_section line then parse_pkg_name_h rest (section_name line) found
+    else if section == "package" then
+      let kv = split_kv line
+      let k = head kv
+      let v = strip_quotes (head (tail kv))
+      if k == "name" then parse_pkg_name_h rest section v
+      else parse_pkg_name_h rest section found
+    else parse_pkg_name_h rest section found
+
+-- ---------------------------------------------------------------------------
+-- Path resolution (v0: only `path:` scheme)
+-- ---------------------------------------------------------------------------
+
+-- Resolve `path:<rel>` against base_dir. Returns "" if scheme not supported
+-- or if the resolved path does not exist on disk.
+resolve_path_source src base_dir =
+  if pkg_starts_with "path:" src then
+    let rel = drop_n src 5
+    let cmd = cat ["cd '", base_dir, "' && cd '", rel, "' 2>/dev/null && pwd || (cd '", base_dir, "' && (test -e '", rel, "' && realpath '", rel, "' || true))"]
+    let raw = shell cmd
+    chomp raw
+  else ""
+
+-- Returns true if path exists (file, dir, or symlink target).
+path_exists p =
+  if length p == 0 then false
+  else
+    let out = chomp (shell (cat ["test -e '", p, "' && echo y || echo n"]))
+    out == "y"
+
+-- Walk the dep list, calling `resolve_path_source` for each. Yields a list of
+-- [name, source, resolved_or_empty] triples.
+resolve_deps deps base_dir =
+  if length deps == 0 then []
+  else
+    let d = head deps
+    let nm = head d
+    let src = head (tail d)
+    let resolved = resolve_path_source src base_dir
+    cons [nm, src, resolved] (resolve_deps (tail deps) base_dir)
+
+-- ---------------------------------------------------------------------------
+-- Entry helpers
+-- ---------------------------------------------------------------------------
+
+-- Compute the absolute CWD.
+cwd_abs _ = chomp (shell "pwd")
+
+-- Resolve a (possibly relative) package directory to an absolute path.
+-- Returns "" if the directory does not exist.
+abs_dir dir =
+  let cmd = cat ["cd '", dir, "' 2>/dev/null && pwd || true"]
+  chomp (shell cmd)
+
+-- Read manifest from a package directory. Returns "" if missing.
+read_manifest_at pkg_dir =
+  let p = cat [pkg_dir, "/rail.toml"]
+  read_file p
+
+-- Pick the package directory from argv. Defaults to "." when none given.
+-- args[0] is the compiled program path, args[1..] are user-supplied.
+pkg_dir_from_args _ =
+  let a = args
+  if length a >= 2 then head (tail a) else "."

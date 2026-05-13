@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+<title>Plasma — mobile (Ledatic)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="_shared/viewer.css?v=52d35266">
+</head>
+<body>
+
+<div class="viewer-root" data-mode="mobile">
+  <canvas id="plasma" width="128" height="128"></canvas>
+
+  <div class="viewer-mark">
+    ledatic <span class="slash">/</span> plasma
+    <span class="sub">live · canvas 2d</span>
+  </div>
+
+  <div class="viewer-status">
+    <span class="dot"></span>
+    <span>pulse <span id="pulse"><span class="placeholder">…</span></span></span>
+  </div>
+
+  <a class="viewer-back" href="https://ledatic.org/">← ledatic.org</a>
+
+  <button class="viewer-details-btn" id="details-btn" title="Details (i)" aria-label="Details">i</button>
+
+  <nav class="viewer-modes" aria-label="Viewer mode">
+    <a href="/mobile.html" data-mode="mobile">mobile</a>
+    <a href="/live4k.html" data-mode="live4k">live4k</a>
+    <a href="/holo.html" data-mode="holo">holo</a>
+  </nav>
+</div>
+
+<div class="viewer-backdrop" id="backdrop"></div>
+<aside class="viewer-drawer" id="drawer" aria-hidden="true">
+  <button class="drawer-close" id="drawer-close">esc ✕</button>
+  <h2 class="drawer-title">ledatic <span class="accent">/</span> plasma</h2>
+
+  <div class="group">
+    <div class="group-head">Status</div>
+    <div class="row"><span class="l">timestamp</span><span class="v" id="ts"><span class="placeholder">…</span></span></div>
+    <div class="row"><span class="l">step</span><span class="v" id="step"><span class="placeholder">…</span></span></div>
+    <div class="row"><span class="l">ρ range</span><span class="v" id="rho_range"><span class="placeholder">…</span></span></div>
+    <div class="row" style="align-items: flex-start;"><span class="l">value_hex</span></div>
+    <div class="hash" id="value_hex"><span class="placeholder">…</span></div>
+    <a class="verify-link" id="verify-link" href="https://ledatic.org/verify">verify →</a>
+  </div>
+
+  <div class="group">
+    <div class="group-head">Solver</div>
+    <p class="solver-blurb">
+      2D ideal magnetohydrodynamics — Orszag-Tang vortex on a
+      <code>128²</code> periodic grid. 6 channels f32. Mass, energy,
+      and <code>∇·B</code> conserved to machine precision.
+    </p>
+  </div>
+
+  <div class="group">
+    <div class="group-head">Renderer</div>
+    <p class="solver-blurb">
+      Canvas 2D · viridis LUT · CPU compositing.
+      Bulletproof fallback for devices where WebGL2 is broken or
+      limited (older iOS, low-end Android, embedded WebViews).
+    </p>
+  </div>
+</aside>
+
+<!-- Optional: Rail-WASM kernels for richer per-pulse compositing
+     (vorticity tint, schlieren edges, magnetic glow, particle sparks).
+     If the script fails to load, the viewer falls back to plain viridis
+     density — bulletproof terminus property is preserved. -->
+<script src="_shared/wasm_render.js"></script>
+
+<script>
+"use strict";
+
+// ── beacon plumbing ──────────────────────────────────────────────────
+//
+// Same beacon as /holo and /live4k, but rendered with Canvas 2D + a
+// CPU colormap LUT.  No WebGL/WebGPU dependency, no float textures, no
+// shader compilation — works on every browser since ~2010.  This is
+// the third-tier viewer, intended as the unconditional fallback for
+// devices where WebGL2 is broken or limited (older iOS, low-end
+// Android, embedded WebViews).
+//
+// Frame format (matches tools/plasma/mhd_beacon.rail):
+//   header (48 B):
+//     u32 LE  width, height, channels, step
+//     f32 LE  m0, e0, mass, energy, divb, rho_min, dt, sim_time
+//   payload: width × height × channels × f32 LE, channel-planar
+//   channels: 0=ρ  1=vx  2=vy  3=p  4=Bx  5=By
+const FRAME_URL = '/entropy/frame/current';
+const PULSE_URL = '/entropy/pulse';
+const POLL_MS   = 2000;
+const N         = 128;
+const CH        = 6;
+const CH_RHO    = 0;
+const HEADER_BYTES = 48;
+
+const canvas = document.getElementById('plasma');
+const ctx    = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const img    = ctx.createImageData(N, N);
+
+// ── viridis-ish 5-stop colormap, baked once into a 256-entry LUT ────
+const LUT = new Uint8ClampedArray(256 * 4);
+(function buildLUT() {
+  const stops = [
+    [0.00,  68,  1, 84],
+    [0.25,  59, 82,139],
+    [0.50,  33,144,141],
+    [0.75,  93,201, 99],
+    [1.00, 253,231, 37],
+  ];
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let lo = stops[0], hi = stops[stops.length - 1];
+    for (let s = 0; s < stops.length - 1; s++) {
+      if (t >= stops[s][0] && t <= stops[s + 1][0]) {
+        lo = stops[s]; hi = stops[s + 1]; break;
+      }
+    }
+    const u = (t - lo[0]) / (hi[0] - lo[0] || 1);
+    LUT[i * 4 + 0] = lo[1] + (hi[1] - lo[1]) * u;
+    LUT[i * 4 + 1] = lo[2] + (hi[2] - lo[2]) * u;
+    LUT[i * 4 + 2] = lo[3] + (hi[3] - lo[3]) * u;
+    LUT[i * 4 + 3] = 255;
+  }
+})();
+
+// Set text + tint to error color. The pulse pill is the most-visible
+// surface, so a failed pulse fetch flashes red there even though the
+// rest of the diagnostics live in the (closed) drawer.
+function setError(target, msg) {
+  const el = document.getElementById(target);
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = '#ff7d6b';
+}
+function clearError(target) {
+  const el = document.getElementById(target);
+  if (el) el.style.color = '';
+}
+
+// ── Rail-WASM kernel handle (optional; falls back to plain viridis if unavailable)
+const wasm = (typeof window !== 'undefined' && window.createWasmRender)
+  ? window.createWasmRender({ N: N, CH: CH, tracerCount: 192, wasmURL: 'render.wasm' })
+  : null;
+
+function uploadFrame(buf) {
+  if (buf.byteLength < HEADER_BYTES + N * N * CH * 4) {
+    setError('rho_range', `short frame (${buf.byteLength} B)`);
+    return;
+  }
+  const dv = new DataView(buf);
+  const w  = dv.getUint32(0, true);
+  const h  = dv.getUint32(4, true);
+  const c  = dv.getUint32(8, true);
+  const step = dv.getUint32(12, true);
+  if (w !== N || h !== N || c !== CH) {
+    setError('rho_range', `bad shape ${w}×${h}×${c}`);
+    return;
+  }
+
+  // Channel-planar f32 view over the whole frame (offsets 0=ρ, 1=vx, 2=vy, 3=p, 4=Bx, 5=By).
+  const all = new Float32Array(buf, HEADER_BYTES, N * N * CH);
+  const rho = all.subarray(CH_RHO * N * N, (CH_RHO + 1) * N * N);
+  const bx  = all.subarray(4       * N * N, 5 * N * N);
+  const by  = all.subarray(5       * N * N, 6 * N * N);
+
+  // Density min/max for normalization.
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < N * N; i++) { const v = rho[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+  const span = (mx - mn) || 1;
+
+  // Optional Rail-WASM derived fields.  Both kernels are CPU-side, ~1 ms
+  // each at 128² on M1 Air.  null means WASM didn't load — composite
+  // gracefully degrades to plain viridis density.
+  //
+  // Particle sparks are intentionally disabled on the mobile viewer.
+  // They write 1-pixel dots into a 128² ImageData which then upscales
+  // 8-10× via image-rendering: pixelated — each spark becomes a chunky
+  // cube on a desktop browser. Vorticity tint + LIC + magnetic glow
+  // carry plenty of motion already.
+  const vort = wasm ? wasm.computeVorticity(all) : null;
+  const schl = wasm ? wasm.computeLIC(all)        : null;   // misnomer kept for clarity below
+  const part = null;
+
+  const data = img.data;
+  // Composite per cell.  Y-flip so the canvas orientation matches OT's
+  // "positive y up" convention.
+  for (let y = 0; y < N; y++) {
+    const ry = N - 1 - y;
+    const row = ry * N;
+    const outRow = y * N;
+    for (let x = 0; x < N; x++) {
+      const idx = row + x;
+
+      // Base layer: viridis-mapped density.
+      const t  = (rho[idx] - mn) / span;
+      const li = ((t * 255) | 0) * 4;
+      let r = LUT[li + 0];
+      let g = LUT[li + 1];
+      let b = LUT[li + 2];
+
+      // Vorticity tint — multiplicative.  ω > 0 → cyan-green,
+      // ω < 0 → magenta.  Saturated at |ω| ≈ 0.1 (peak on the OT IC).
+      if (vort !== null) {
+        const w = vort[idx];
+        const wt = w / 0.1;
+        const wn = wt > 1 ? 1 : wt < -1 ? -1 : wt;            // [-1, 1]
+        // Lerp toward (0.55, 1.0, 0.95) for CCW, (1.0, 0.6, 0.95) for CW.
+        const cR = wn > 0 ? 0.55 : 1.0;
+        const cG = wn > 0 ? 1.0  : 0.6;
+        const cB = 0.95;
+        const m  = Math.abs(wn);
+        const tintR = (1 - m * 0.55) + cR * m * 0.55;
+        const tintG = (1 - m * 0.55) + cG * m * 0.55;
+        const tintB = (1 - m * 0.55) + cB * m * 0.55;
+        r = (r * tintR) | 0;
+        g = (g * tintG) | 0;
+        b = (b * tintB) | 0;
+      }
+
+      // LIC layer (`schl` variable name is historical) — additive
+      // brightening proportional to streamline-aligned noise value.
+      // Range [0, 1]; full strength only adds about 35 luminance units
+      // so it textures the field without washing out the colormap.
+      if (schl !== null) {
+        const lic = schl[idx];           // [0, 1]
+        const add = (lic - 0.5) * 70;    // [-35, 35]
+        r += add; g += add; b += add;
+      }
+
+      // Magnetic glow — soft additive blue accumulating where |B|² is high.
+      // Cheap CPU calc, no kernel needed.
+      const bmag2 = bx[idx] * bx[idx] + by[idx] * by[idx];
+      if (bmag2 > 0.05) {
+        const k = Math.min(1, bmag2 * 0.3) * 28;
+        r += k * 0.2; g += k * 0.5; b += k * 1.0;
+      }
+
+      // Clamp and write.
+      const di = (outRow + x) * 4;
+      data[di + 0] = r > 255 ? 255 : r < 0 ? 0 : r;
+      data[di + 1] = g > 255 ? 255 : g < 0 ? 0 : g;
+      data[di + 2] = b > 255 ? 255 : b < 0 ? 0 : b;
+      data[di + 3] = 255;
+    }
+  }
+
+  // Particle sparks — small bright dots at tracer positions.  Direct
+  // ImageData writes are cheaper than per-particle Canvas 2D fillRect.
+  if (part !== null) {
+    const K = part.length / 2;
+    for (let p = 0; p < K; p++) {
+      const px = part[2 * p]     | 0;
+      const py = (N - 1 - (part[2 * p + 1] | 0));   // flip Y
+      if (px < 0 || px >= N || py < 0 || py >= N) continue;
+      const di = (py * N + px) * 4;
+      data[di + 0] = 255;
+      data[di + 1] = 240;
+      data[di + 2] = 200;
+      data[di + 3] = 255;
+    }
+  }
+
+  ctx.putImageData(img, 0, 0);
+  clearError('rho_range');
+  document.getElementById('rho_range').textContent = `[${mn.toFixed(3)}, ${mx.toFixed(3)}]`;
+  document.getElementById('step').textContent      = step;
+}
+
+// ── poll loops ──────────────────────────────────────────────────────
+let frameInflight = false;
+let lastPulseId   = null;
+
+async function pollFrame() {
+  if (frameInflight) return;
+  frameInflight = true;
+  try {
+    const r = await fetch(FRAME_URL + '?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) throw new Error(`frame ${r.status}`);
+    const buf = await r.arrayBuffer();
+    uploadFrame(buf);
+  } catch (e) {
+    setError('rho_range', e.message || String(e));
+  } finally {
+    frameInflight = false;
+  }
+}
+
+async function pollPulse() {
+  try {
+    const r = await fetch(PULSE_URL + '?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) throw new Error(`pulse ${r.status}`);
+    const j = await r.json();
+    if (j.pulse_id === lastPulseId) return;
+    lastPulseId = j.pulse_id;
+    clearError('pulse');
+    document.getElementById('pulse').textContent = j.pulse_id;
+    document.getElementById('ts').textContent    = j.timestamp_utc;
+    if (j.value_hex) {
+      document.getElementById('value_hex').textContent = j.value_hex;
+      document.getElementById('verify-link').href = '/verify/' + j.value_hex;
+    }
+  } catch (e) {
+    setError('pulse', e.message || String(e));
+  }
+}
+
+let pulseTimer = null, frameTimer = null;
+function start() {
+  if (!pulseTimer) pulseTimer = setInterval(pollPulse, POLL_MS);
+  if (!frameTimer) frameTimer = setInterval(pollFrame, POLL_MS);
+}
+function stop() {
+  clearInterval(pulseTimer); pulseTimer = null;
+  clearInterval(frameTimer); frameTimer = null;
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stop(); else { start(); pollPulse(); pollFrame(); }
+});
+start();
+pollPulse();
+pollFrame();
+
+// ── drawer toggle ───────────────────────────────────────────────────
+// Hotkey `i` or `?` opens/closes; `esc` and click-outside close.
+// Skips when the user is typing in a form field (no forms here today,
+// but it's a 4-byte safeguard against future surprises).
+const drawer   = document.getElementById('drawer');
+const backdrop = document.getElementById('backdrop');
+const detailsBtn = document.getElementById('details-btn');
+const closeBtn = document.getElementById('drawer-close');
+
+function openDrawer() {
+  drawer.classList.add('open');
+  backdrop.classList.add('open');
+  drawer.setAttribute('aria-hidden', 'false');
+}
+function closeDrawer() {
+  drawer.classList.remove('open');
+  backdrop.classList.remove('open');
+  drawer.setAttribute('aria-hidden', 'true');
+}
+function toggleDrawer() {
+  drawer.classList.contains('open') ? closeDrawer() : openDrawer();
+}
+
+detailsBtn.addEventListener('click', toggleDrawer);
+closeBtn.addEventListener('click', closeDrawer);
+backdrop.addEventListener('click', closeDrawer);
+window.addEventListener('keydown', (e) => {
+  if (e.target.matches && e.target.matches('input, textarea')) return;
+  if (e.key === 'Escape') { closeDrawer(); return; }
+  if ((e.key === 'i' || e.key === '?') && !e.metaKey && !e.ctrlKey) {
+    e.preventDefault();
+    toggleDrawer();
+  }
+});
+
+// Highlight the current viewer mode in the bottom navigation pill.
+(function () {
+  const path = location.pathname;
+  let mode = null;
+  if (path.endsWith('/mobile.html')  || path === '/mobile')  mode = 'mobile';
+  else if (path.endsWith('/live4k.html') || path === '/live4k') mode = 'live4k';
+  else if (path.endsWith('/holo.html')   || path === '/holo')   mode = 'holo';
+  if (!mode) return;
+  for (const a of document.querySelectorAll('.viewer-modes a')) {
+    if (a.dataset.mode === mode) a.classList.add('active');
+  }
+})();
+</script>
+</body>
+</html>

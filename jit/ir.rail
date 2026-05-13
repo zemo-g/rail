@@ -1,0 +1,294 @@
+-- jit/ir.rail
+--
+-- Frozen IR contract for the Session A/B/C JIT split.
+--
+-- Encoding:
+--   Each instruction is 4 consecutive ints in an int_arr (arr_new):
+--     [op, a, b, c].  Slot meanings depend on the opcode (see below).
+--   Instruction `i` lives at indices [4*i, 4*i+1, 4*i+2, 4*i+3].
+--
+-- Opcodes (also re-exported as nullary helpers below for consumers
+-- that prefer not to hardcode constants):
+--   ir_const = 0 -- a=dst, b=imm,         c=0
+--   ir_add   = 1 -- a=dst, b=src1,        c=src2
+--   ir_sub   = 2 -- a=dst, b=src1,        c=src2
+--   ir_mul   = 3 -- a=dst, b=src1,        c=src2
+--   ir_lt    = 4 -- a=dst, b=src1,        c=src2  (1 if src1<src2 else 0)
+--   ir_jmp   = 5 -- a=target_block_index, b=0,    c=0
+--   ir_jz    = 6 -- a=src1 (cond),        b=target_block_index, c=0
+--   ir_call  = 7 -- a=dst, b=fn_index,    c=n_args  (reserved; not emitted v1)
+--   ir_ret   = 8 -- a=src1,               b=0,    c=0
+--
+-- Function struct is a 4-element Rail list:
+--   [ir_arr, n_instructions, n_regs, block_offsets_arr]
+--   block_offsets_arr is an int_arr where index k = start instr index of block k.
+
+-- Opcode constants -----------------------------------------------------------
+
+-- Bare nullary bindings (verified safe for == comparisons; do not sum two
+-- of these directly — see rail_top_level_int_add_bug memory).
+op_const     = 0
+op_add       = 1
+op_sub       = 2
+op_mul       = 3
+op_lt        = 4
+op_jmp       = 5
+op_jz        = 6
+op_call      = 7   -- a=dst_reg, b=fn_index, c=packed args (see below)
+-- op_call slot c encoding (multi-arg ABI):
+--   bits 0..3   = n_args  (1..4 supported in v1; 0 reserved for niladic later)
+--   bits 4..8   = arg0_reg
+--   bits 9..13  = arg1_reg
+--   bits 14..18 = arg2_reg
+--   bits 19..23 = arg3_reg
+-- Helpers: call_pack_1 / call_pack_2 / call_pack_3 / call_pack_4 in
+-- jit/ir.rail; call_n_args / call_arg_n in jit/emit.rail decode.
+op_ret       = 8
+op_print_int = 9   -- a=src_reg; emits decimal repr + newline to fd 1
+op_mov       = 10  -- a=dst_reg, b=src_reg
+op_str_lit   = 11  -- a=dst_reg, b=pool_offset (offset of length-prefix in pool)
+op_print_str = 12  -- a=src_ptr_reg (ptr to length-prefixed string); writes to fd 1
+op_str_len   = 13  -- a=dst_reg, b=src_ptr_reg
+op_str_eq    = 14  -- a=dst_reg (0/1), b=s1_ptr, c=s2_ptr
+op_str_at    = 15  -- a=dst_reg, b=src_ptr, c=idx_reg (returns byte in 0..255)
+op_nil       = 16  -- a=dst_reg ; dst := 0
+op_cons      = 17  -- a=dst_reg, b=head_val_reg, c=tail_ptr_reg
+op_head      = 18  -- a=dst_reg, b=src_cell_ptr
+op_tail      = 19  -- a=dst_reg, b=src_cell_ptr
+op_is_nil    = 20  -- a=dst_reg, b=src_ptr (returns 0 or 1)
+op_eq        = 21  -- a=dst_reg, b=src1, c=src2 (1 if eq, else 0)
+op_gt        = 22  -- a=dst_reg, b=src1, c=src2 (1 if src1 > src2)
+op_le        = 23  -- a=dst_reg, b=src1, c=src2 (1 if src1 <= src2)
+op_ge        = 24  -- a=dst_reg, b=src1, c=src2 (1 if src1 >= src2)
+op_div       = 25  -- a=dst_reg, b=src1, c=src2 (unsigned)
+op_mod       = 26  -- a=dst_reg, b=src1, c=src2 (src1 mod src2, unsigned)
+op_apply     = 27  -- a=dst_reg, b=fn_idx_reg, c=arg_reg ; HOF dispatch
+                    -- (P3-variant: closures-without-captures). Emits a linear
+                    -- cmp+b.ne chain over all top-level fn indices; bl's the
+                    -- one matching b's runtime int. 1-arg ABI in v1.
+op_read_file = 28  -- a=dst_reg, b=path_reg (length-prefixed str ptr).
+                    -- Open + lseek-end + lseek-rewind + read + close. Allocates
+                    -- a length-prefixed string in heap (via x27 bump pointer).
+                    -- Pool entries are null-terminated (1 byte after data) so
+                    -- path data ptr (path_reg + 8) is a valid C-string.
+
+-- ============================================================================
+-- Float opcodes (P4). Float vregs occupy a SEPARATE register space `f0..f15`
+-- mapped to ARM64 d-registers `d0..d15`. The IR `a`/`b`/`c` slots hold an
+-- f-vreg whenever the opcode names says so (e.g., op_fadd reads `b` and `c`
+-- as float vregs and writes `a` as a float vreg).
+--
+-- For op_flt/feq/fgt/fge: `a` is an INT vreg (the bool result 0/1), `b` and
+-- `c` are float vregs.
+-- For op_int_to_float: `a` is float vreg, `b` is int vreg.
+-- For op_float_to_int: `a` is int vreg, `b` is float vreg.
+-- For op_print_float: `a` is float vreg.
+-- For op_fconst: `a` is float vreg dst; `b` = lo32 of double bits, `c` = hi32.
+--   Lower time computes lo32/hi32 via `jit_float_bits_lo` / `_hi` foreigns.
+--
+-- v1 caller-save d-regs only (d0..d7). No cross-call float preservation.
+-- ============================================================================
+op_fconst        = 29  -- a=dst_freg, b=lo32, c=hi32 ; emits 4× movz/movk + fmov d,x (5 inst, 20B)
+op_fadd          = 30  -- a=dst_freg, b=src1_freg, c=src2_freg
+op_fsub          = 31
+op_fmul          = 32
+op_fdiv          = 33
+op_flt           = 34  -- a=dst_INTreg, b=src1_freg, c=src2_freg ; fcmp + cset mi
+op_feq           = 35  -- fcmp + cset eq
+op_fgt           = 36  -- fcmp + cset gt
+op_fge           = 37  -- fcmp + cset ge
+op_int_to_float  = 38  -- a=dst_freg, b=src_int     ; scvtf d, x
+op_float_to_int  = 39  -- a=dst_int,  b=src_freg    ; fcvtzs x, d
+op_print_float   = 40  -- a=src_freg ; loads cursor, blr [x27,#24] (jit_print_float)
+op_fmov          = 41  -- a=dst_freg, b=src_freg ; fmov d_dst, d_src (1 inst)
+op_fle           = 42  -- fcmp + cset ls (a=dst_INTreg, b/c=floats)
+op_call_fret     = 43  -- as op_call but a=dst_freg, captured via fmov f_dst, d0
+op_ret_float     = 44  -- a=src_freg ; fmov d0, d_v + epilogue (float return)
+
+-- ABI v1 register classes:
+--   v0..v9   -> x9..x18  (caller-save: clobbered by op_call)
+--   v10..v19 -> x19..x28 (callee-save: preserved across op_call)
+-- For v1 only x19/x20 are actually saved in prologue, so use v10/v11
+-- for cross-call preservation. Higher vregs work but aren't preserved.
+
+-- Mnemonic for an opcode int -------------------------------------------------
+
+ir_op_name op =
+  if op == 0 then "CONST"
+  else if op == 1 then "ADD"
+  else if op == 2 then "SUB"
+  else if op == 3 then "MUL"
+  else if op == 4 then "LT"
+  else if op == 5 then "JMP"
+  else if op == 6 then "JZ"
+  else if op == 7 then "CALL"
+  else if op == 8 then "RET"
+  else if op == 9 then "PRINT_INT"
+  else if op == 10 then "MOV"
+  else if op == 11 then "STR_LIT"
+  else if op == 12 then "PRINT_STR"
+  else if op == 13 then "STR_LEN"
+  else if op == 14 then "STR_EQ"
+  else if op == 15 then "STR_AT"
+  else if op == 16 then "NIL"
+  else if op == 17 then "CONS"
+  else if op == 18 then "HEAD"
+  else if op == 19 then "TAIL"
+  else if op == 20 then "IS_NIL"
+  else if op == 21 then "EQ"
+  else if op == 22 then "GT"
+  else if op == 23 then "LE"
+  else if op == 24 then "GE"
+  else if op == 25 then "DIV"
+  else if op == 26 then "MOD"
+  else if op == 27 then "APPLY"
+  else if op == 28 then "READ_FILE"
+  else if op == 29 then "FCONST"
+  else if op == 30 then "FADD"
+  else if op == 31 then "FSUB"
+  else if op == 32 then "FMUL"
+  else if op == 33 then "FDIV"
+  else if op == 34 then "FLT"
+  else if op == 35 then "FEQ"
+  else if op == 36 then "FGT"
+  else if op == 37 then "FGE"
+  else if op == 38 then "I2F"
+  else if op == 39 then "F2I"
+  else if op == 40 then "PRINT_FLOAT"
+  else if op == 41 then "FMOV"
+  else if op == 42 then "FLE"
+  else if op == 43 then "CALL_FRET"
+  else if op == 44 then "RET_FLOAT"
+  else "??"
+
+-- Instruction-buffer accessors ----------------------------------------------
+
+make_ir n_instructions = arr_new (4 * n_instructions) 0
+
+ir_op   ir i = arr_get ir (4 * i)
+ir_a    ir i = arr_get ir (4 * i + 1)
+ir_b    ir i = arr_get ir (4 * i + 2)
+ir_c    ir i = arr_get ir (4 * i + 3)
+
+ir_set_op ir i v = arr_set ir (4 * i)     v
+ir_set_a  ir i v = arr_set ir (4 * i + 1) v
+ir_set_b  ir i v = arr_set ir (4 * i + 2) v
+ir_set_c  ir i v = arr_set ir (4 * i + 3) v
+
+-- Pack a full instruction in one call (returns 0; mutates ir) ---------------
+ir_emit ir i op a b c =
+  let _ = ir_set_op ir i op
+  let _ = ir_set_a  ir i a
+  let _ = ir_set_b  ir i b
+  let _ = ir_set_c  ir i c
+  0
+
+-- Function-struct accessors --------------------------------------------------
+-- Layout (P4-arg-ext): [ir_arr, n_instructions, n_regs, block_offsets_arr,
+--                      n_args, arg_types_arr]
+-- arg_types_arr is an int_arr of size n_args. Slot i = 0 (int) or 1 (float).
+-- emit_prologue and emit_op_call read this to dispatch per-arg moves.
+
+make_function ir n_instr n_regs blocks =
+  let arg_types = arr_new 1 0
+  [ir, n_instr, n_regs, blocks, 1, arg_types]
+
+fn_ir     fn = head fn
+fn_ninstr fn = head (tail fn)
+fn_nregs  fn = head (tail (tail fn))
+fn_blocks fn = head (tail (tail (tail fn)))
+fn_nargs  fn = head (tail (tail (tail (tail fn))))
+fn_arg_types fn = head (tail (tail (tail (tail (tail fn)))))
+
+fn_nblocks fn = arr_len (fn_blocks fn)
+fn_block_start fn k = arr_get (fn_blocks fn) k
+
+-- Compute which block instruction `i` belongs to (linear scan; small inputs).
+fn_block_of_inst fn i =
+  let blocks = fn_blocks fn
+  let nb = arr_len blocks
+  fn_block_of_inst_loop blocks nb i 0 0
+
+fn_block_of_inst_loop blocks nb i k best =
+  if k >= nb then best
+  else
+    let start = arr_get blocks k
+    if start <= i then fn_block_of_inst_loop blocks nb i (k + 1) k
+    else best
+
+-- Session B compatibility helpers -------------------------------------------
+-- Default 1-arg make_fn (back-compat for existing hand-built fixtures).
+make_fn ir n_instr n_regs blocks = make_function ir n_instr n_regs blocks
+-- Multi-arg variant: include n_args. arg_types defaults to all-int.
+make_fn_n ir n_instr n_regs blocks n_args =
+  let arg_types = arr_new n_args 0
+  [ir, n_instr, n_regs, blocks, n_args, arg_types]
+-- Multi-arg variant with explicit per-arg type bits (P4-arg-ext).
+-- arg_types_arr is an int_arr of size n_args; slot i = 0 (int) or 1 (float).
+make_fn_n_typed ir n_instr n_regs blocks n_args arg_types =
+  [ir, n_instr, n_regs, blocks, n_args, arg_types]
+
+is_terminator op =
+  if op == op_jmp then 1
+  else if op == op_jz then 1
+  else if op == op_ret then 1
+  else 0
+
+op_writes_dst op =
+  if op == op_const then 1
+  else if op == op_add then 1
+  else if op == op_sub then 1
+  else if op == op_mul then 1
+  else if op == op_lt then 1
+  else if op == op_call then 1
+  else 0
+
+copy_ir_slots src dst n_used i =
+  if i >= n_used then 0
+  else
+    let _ = arr_set dst (i * 4)     (arr_get src (i * 4))
+    let _ = arr_set dst (i * 4 + 1) (arr_get src (i * 4 + 1))
+    let _ = arr_set dst (i * 4 + 2) (arr_get src (i * 4 + 2))
+    let _ = arr_set dst (i * 4 + 3) (arr_get src (i * 4 + 3))
+    copy_ir_slots src dst n_used (i + 1)
+
+-- op_call argument packing helpers. Each builds the int that goes into
+-- ir_emit's `c` slot. v0..v31 (5-bit) per arg, n_args in low 4 bits.
+-- bits 0..3   = n_args
+-- bits 4..23  = arg vregs (5 bits each)
+-- bits 24..27 = per-arg type bits (0=int, 1=float)
+-- bit  28     = ret type bit (0=int, 1=float; folds op_call_fret)
+call_pack_1 a0           = bit_or 1 (shl a0 4)
+call_pack_2 a0 a1        = bit_or 2 (bit_or (shl a0 4) (shl a1 9))
+call_pack_3 a0 a1 a2     = bit_or 3 (bit_or (shl a0 4) (bit_or (shl a1 9) (shl a2 14)))
+call_pack_4 a0 a1 a2 a3  = bit_or 4 (bit_or (shl a0 4) (bit_or (shl a1 9) (bit_or (shl a2 14) (shl a3 19))))
+
+-- Typed pack. n is 1..4; v0..v3 are arg vregs (unused slots can be 0);
+-- t0..t3 are arg type bits (0=int, 1=float; unused slots 0); ret_t is the
+-- return type bit. Untyped call_pack_N produces equivalent encoding when
+-- t0..t3 = 0 and ret_t = 0 (back-compat).
+call_pack_typed n v0 v1 v2 v3 t0 t1 t2 t3 ret_t =
+  let base = if n == 0 then 0
+             else if n == 1 then call_pack_1 v0
+             else if n == 2 then call_pack_2 v0 v1
+             else if n == 3 then call_pack_3 v0 v1 v2
+             else call_pack_4 v0 v1 v2 v3
+  let arg_bits = bit_or (bit_or t0 (shl t1 1)) (bit_or (shl t2 2) (shl t3 3))
+  bit_or (bit_or base (shl arg_bits 24)) (shl ret_t 28)
+
+call_n_args c       = bit_and c 15
+call_arg_0    c     = bit_and (shr c 4)  31
+call_arg_1    c     = bit_and (shr c 9)  31
+call_arg_2    c     = bit_and (shr c 14) 31
+call_arg_3    c     = bit_and (shr c 19) 31
+
+-- Per-arg type bit at slot n (0..3). Returns 0 (int) or 1 (float).
+call_arg_type_n c n = bit_and (shr c (24 + n)) 1
+call_ret_type   c   = bit_and (shr c 28) 1
+
+-- Indexed arg vreg lookup (n in 0..3).
+call_arg_n c n =
+  if n == 0 then call_arg_0 c
+  else if n == 1 then call_arg_1 c
+  else if n == 2 then call_arg_2 c
+  else call_arg_3 c

@@ -22,7 +22,7 @@ BEACON_TOKEN_FILE=${BEACON_TOKEN_FILE:-$HOME/.ledatic/entropy/beacon_token}
 WITNESS_HOST_FILE=${WITNESS_HOST_FILE:-$HOME/.ledatic/witness/host}
 WITNESS_HOST=${WITNESS_HOST:-$(cat "$WITNESS_HOST_FILE" 2>/dev/null || echo "")}
 [ -n "$WITNESS_HOST" ] || { echo "no witness host (set WITNESS_HOST or write $WITNESS_HOST_FILE)" >&2; exit 4; }
-SIGNER=${SIGNER:-/home/zemog/.ledatic/witness/sign_attestation.sh}
+SIGNER=${SIGNER:-<HOME>/.ledatic/witness/sign_attestation.sh}
 SITE=${SITE:-https://ledatic.org}
 
 [ -f "$FRAME_PATH" ] || { echo "no frame at $FRAME_PATH" >&2; exit 2; }

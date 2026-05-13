@@ -9,9 +9,28 @@ alpha_upper = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", 
 
 has item lst = if length lst == 0 then false else if head lst == item then true else has item (tail lst)
 is_digit c = has c digits
+hex_letters = ["a", "b", "c", "d", "e", "f", "A", "B", "C", "D", "E", "F"]
+is_hex_digit c = is_digit c || has c hex_letters
 is_alpha c = has c alpha_lower || has c alpha_upper || c == "_"
 is_alnum c = is_digit c || is_alpha c
 is_space c = c == " " || c == "\t"
+
+hex_digit_val c =
+  if has c digits then char_to_int c - 48
+  else if c == "a" || c == "A" then 10
+  else if c == "b" || c == "B" then 11
+  else if c == "c" || c == "C" then 12
+  else if c == "d" || c == "D" then 13
+  else if c == "e" || c == "E" then 14
+  else if c == "f" || c == "F" then 15
+  else 0
+
+htint_acc cs acc =
+  if length cs == 0 then acc
+  else htint_acc (tail cs) (acc * 16 + hex_digit_val (head cs))
+
+htint s acc =
+  htint_acc (chars s) acc
 kw_list = ["let", "in", "if", "then", "else", "match", "type", "import", "module", "export", "effect", "perform", "handle", "with", "resume", "foreign", "link"]
 is_kw w = has w kw_list
 
@@ -56,6 +75,10 @@ tc cs acc pacc ln col =
     else if c == "\"" then
       let (s, af, sn) = lx_str r "" 0
       tc af (cons ("str", s) acc) (cons (ln, col) pacc) ln (col + 1 + sn)
+    else if c == "0" && nx == "x" then
+      let (hex_chars, af_h, hn) = lx_col is_hex_digit (tail r)
+      let val = htint hex_chars 0
+      tc af_h (cons ("int", show val) acc) (cons (ln, col) pacc) ln (col + 2 + hn)
     else if is_digit c then
       let (nr, af, nn) = lx_col is_digit r
       let whole = append c nr
@@ -805,23 +828,35 @@ str_to_int s =
 
 emit_load_int v =
   let n = str_to_int v
+  -- Compute 2^16, 2^32, 2^48 via runtime shifts so `opt` can't fold them
+  -- into bare 64-bit literals that the seed compiler can't emit yet.
+  let k16 = shl 1 16
+  let k32 = shl 1 32
+  let k48 = shl 1 48
   if n < 0 then
     let pos = 0 - n
     let inv = pos - 1
     if inv <= 65535 then cat ["    movn x0, #", show inv, "\n"]
     else
-      let lo = inv % 65536
-      let hi = inv / 65536
-      cat ["    movn x0, #", show lo, "\n    movk x0, #", show (65535 - hi), ", lsl #16\n"]
+      let c0 = inv % k16
+      let c1 = (inv / k16) % k16
+      let c2 = (inv / k32) % k16
+      let c3 = (inv / k48) % k16
+      let head = cat ["    movn x0, #", show c0, "\n"]
+      let part1 = cat [head, "    movk x0, #", show (65535 - c1), ", lsl #16\n"]
+      let part2 = if c2 == 0 then part1 else cat [part1, "    movk x0, #", show (65535 - c2), ", lsl #32\n"]
+      if c3 == 0 then part2 else cat [part2, "    movk x0, #", show (65535 - c3), ", lsl #48\n"]
   else if n <= 65535 then cat ["    mov x0, #", v, "\n"]
   else
-    let lo = n % 65536
-    let hi = n / 65536
+    let lo = n % k16
+    let hi = n / k16
     if hi <= 65535 then cat ["    movz x0, #", show lo, "\n    movk x0, #", show hi, ", lsl #16\n"]
     else
-      let hi1 = hi % 65536
-      let hi2 = hi / 65536
-      cat ["    movz x0, #", show lo, "\n    movk x0, #", show hi1, ", lsl #16\n    movk x0, #", show hi2, ", lsl #32\n"]
+      let hi1 = hi % k16
+      let hi2 = (n / k32) % k16
+      let hi3 = (n / k48) % k16
+      let base = cat ["    movz x0, #", show lo, "\n    movk x0, #", show hi1, ", lsl #16\n    movk x0, #", show hi2, ", lsl #32\n"]
+      if hi3 == 0 then base else cat [base, "    movk x0, #", show hi3, ", lsl #48\n"]
 
 used_in_arith name node =
   let tg = head node
@@ -948,17 +983,29 @@ get_opc_inline op lc =
   let heap_lbl = cat [".Lop_heap_", show lc]
   let done_lbl = cat [".Lop_done_", show lc]
   let check = cat ["    tst x1, #1\n    b.eq ", heap_lbl, "\n"]
+  -- For `+`, the int fast-path assumes BOTH operands are tagged-int. The
+  -- single-operand `tst x1,#1` only covers (heap LHS, *). For (tagged-int
+  -- LHS, heap RHS) the fast-path produces garbage by adding a pointer to a
+  -- tagged-int (or SIGSEGVs downstream when the result is dereferenced).
+  -- Route those through _rail_add too (which now has a .Ladd_mixed_if mirror
+  -- branch for (int, float) - see radd in rt_core). The check_both uses an
+  -- `and x8, x1, x0; tst x8, #1` to take ONE branch instead of two - same
+  -- number of fast-path instructions, just sequenced before the add. Same
+  -- bug class extended to -, *, /, %, <, >, <=, >= on 2026-05-13 (mirror
+  -- of x86 b223960). Each runtime helper has a `.L<op>_mixed_if` mirror
+  -- branch (see rt_core radd/rsub/rmul/rdiv/rmod/rlt/rgt/rle/rge below).
+  let check_both = cat ["    and x8, x1, x0\n    tst x8, #1\n    b.eq ", heap_lbl, "\n"]
   let int_end = cat ["    b ", done_lbl, "\n"]
   let fallback_end = cat [done_lbl, ":\n"]
-  if op == "+" then cat [check, "    add x0, x1, x0\n    sub x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_add\n", fallback_end]
-  else if op == "-" then cat [check, "    sub x0, x1, x0\n    add x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_sub\n", fallback_end]
-  else if op == "*" then cat [check, "    asr x1, x1, #1\n    asr x0, x0, #1\n    mul x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_mul\n", fallback_end]
-  else if op == "/" then cat [check, "    asr x1, x1, #1\n    asr x0, x0, #1\n    sdiv x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_div\n", fallback_end]
-  else if op == "%" then cat [check, "    asr x1, x1, #1\n    asr x0, x0, #1\n    sdiv x8, x1, x0\n    msub x0, x8, x0, x1\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_mod\n", fallback_end]
-  else if op == "<" then cat [check, "    cmp x1, x0\n    cset x0, lt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_lt\n", fallback_end]
-  else if op == ">" then cat [check, "    cmp x1, x0\n    cset x0, gt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_gt\n", fallback_end]
-  else if op == "<=" then cat [check, "    cmp x1, x0\n    cset x0, le\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_le\n", fallback_end]
-  else if op == ">=" then cat [check, "    cmp x1, x0\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_ge\n", fallback_end]
+  if op == "+" then cat [check_both, "    add x0, x1, x0\n    sub x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_add\n", fallback_end]
+  else if op == "-" then cat [check_both, "    sub x0, x1, x0\n    add x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_sub\n", fallback_end]
+  else if op == "*" then cat [check_both, "    asr x1, x1, #1\n    asr x0, x0, #1\n    mul x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_mul\n", fallback_end]
+  else if op == "/" then cat [check_both, "    asr x1, x1, #1\n    asr x0, x0, #1\n    sdiv x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_div\n", fallback_end]
+  else if op == "%" then cat [check_both, "    asr x1, x1, #1\n    asr x0, x0, #1\n    sdiv x8, x1, x0\n    msub x0, x8, x0, x1\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_mod\n", fallback_end]
+  else if op == "<" then cat [check_both, "    cmp x1, x0\n    cset x0, lt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_lt\n", fallback_end]
+  else if op == ">" then cat [check_both, "    cmp x1, x0\n    cset x0, gt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_gt\n", fallback_end]
+  else if op == "<=" then cat [check_both, "    cmp x1, x0\n    cset x0, le\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_le\n", fallback_end]
+  else if op == ">=" then cat [check_both, "    cmp x1, x0\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n", int_end, heap_lbl, ":\n    bl _rail_ge\n", fallback_end]
   else if op == "==" then "    bl _rail_eq\n"
   else if op == "!=" then "    bl _rail_ne\n"
   else if op == "&&" then "    and x0, x1, x0\n"
@@ -1007,9 +1054,6 @@ cg_bi2 fname args env ar lc sl tp fs =
   else if fname == "read_file" then
     let (aa, lc1, sl1) = cg (head args) env ar lc sl false fs
     (cat [aa, "    bl _rail_read_file\n"], lc1, sl1)
-  else if fname == "read_file_bytes" then
-    let (aa, lc1, sl1) = cg (head args) env ar lc sl false fs
-    (cat [aa, "    bl _rail_read_file_bytes\n"], lc1, sl1)
   else if fname == "to_float" then
     let (aa, lc1, sl1) = cg (head args) env ar lc sl false fs
     (cat [aa, "    asr x0, x0, #1\n    scvtf d0, x0\n    fmov x0, d0\n"], lc1, sl1)
@@ -1437,7 +1481,13 @@ cg node env ar lc sl tp fs =
       let result = if is_cmp_op then "    lsl x0, x0, #1\n    orr x0, x0, #1\n" else "    fmov x0, d0\n"
       (cat [la, "    str x0, [sp, #-16]!\n", ra, "    ldr x1, [sp], #16\n", ld_l, ld_r, fop, result], lc2 + 1, sl2)
     else
-    let both_simple = (ltg == "V" || ltg == "I") && (rtg == "V" || rtg == "I")
+    -- emit_x1 only handles V vars that are in the local env; for top-level
+    -- nullary bindings (off == -1) it falls through to `mov x1, x0` which
+    -- silently uses whatever was in x0 from the prior expression. Force
+    -- the slow path when LHS is a non-env V so cg2's nullary handler runs.
+    let l_in_env = ltg == "V" && efind (head (tail lnode)) env != (0 - 1)
+    let l_simple = ltg == "I" || (ltg == "V" && l_in_env)
+    let both_simple = l_simple && (rtg == "V" || rtg == "I")
     let both_int = is_int lnode env && is_int rnode env
     if both_simple then
       let la_x1 = emit_x1 lnode env
@@ -1928,50 +1978,39 @@ is_float_fn fname =
 -- returns_float: does the RETURN expression of this AST node yield a float?
 -- Unlike body_has_float, this only checks the return path, not the whole body.
 -- Used to mark user functions as float-returning in the arity map.
---
--- The `flocals` arg threads a list of names known-locally to be float-typed
--- (because they were `let`-bound to a float-returning expression earlier in
--- the function body).  Without this, a function whose return is
---   if cond then 0.0 else p_raw
--- where `p_raw` is a previously-let-bound float would NOT get the float-
--- return marker, because the V case would short-circuit to false.  That
--- omission was the root cause of the 2026-04-28 multiplication-with-float-
--- parameter bug — see rail-bugs.md.
 returns_float node fret_list =
-  rf_inner node fret_list []
-
-rf_inner node fret_list flocals =
   let tg = head node
   if tg == "FL" then true
   else if tg == "I" || tg == "S" || tg == "B" || tg == "NULL" then false
-  else if tg == "V" then rf_has (head (tail node)) flocals
+  else if tg == "V" then false
   else if tg == "?" then
-    rf_inner (head (tail (tail node))) fret_list flocals && rf_inner (head (tail (tail (tail node)))) fret_list flocals
+    -- if/then/else: both branches must return float
+    returns_float (head (tail (tail node))) fret_list && returns_float (head (tail (tail (tail node)))) fret_list
   else if tg == "D" || tg == "TD" then
-    let nm = head (tail node)
-    let vl = head (tail (tail node))
-    let bd = head (tail (tail (tail node)))
-    let flocals2 = if rf_inner vl fret_list flocals then cons nm flocals else flocals
-    rf_inner bd fret_list flocals2
+    -- let binding: check the body (continuation), not the value
+    returns_float (head (tail (tail (tail node)))) fret_list
   else if tg == "A" then
+    -- function call: check if callee is a known float function
     let (fname, _) = flat node
     if is_float_fn fname then true
     else rf_has fname fret_list
   else if tg == "O" then
+    -- binary op: +,-,*,/ with float operand returns float
     let op = head (tail node)
     if op == "+" || op == "-" || op == "*" || op == "/" then
-      rf_inner (head (tail (tail node))) fret_list flocals || rf_inner (head (tail (tail (tail node)))) fret_list flocals
+      returns_float (head (tail (tail node))) fret_list || returns_float (head (tail (tail (tail node)))) fret_list
     else false
   else if tg == "M" then
-    rf_all_arms (head (tail (tail node))) fret_list flocals
+    -- match: all arms must return float
+    rf_all_arms (head (tail (tail node))) fret_list
   else false
 
-rf_all_arms arms fret_list flocals =
+rf_all_arms arms fret_list =
   if length arms == 0 then true
   else
     let arm = head arms
     let arm_body = head (tail (tail arm))
-    if rf_inner arm_body fret_list flocals then rf_all_arms (tail arms) fret_list flocals
+    if returns_float arm_body fret_list then rf_all_arms (tail arms) fret_list
     else false
 
 rf_has name lst =
@@ -2054,7 +2093,7 @@ is_pure_fn node =
   let tg = head node
   if tg == "A" then
     let (fname, _) = flat node
-    if fname == "print" || fname == "write_file" || fname == "read_file" || fname == "read_file_bytes" || fname == "shell" || fname == "append_file" || fname == "byte_set" || fname == "arr_set" || fname == "free" then false
+    if fname == "print" || fname == "write_file" || fname == "read_file" || fname == "shell" || fname == "append_file" || fname == "byte_set" || fname == "arr_set" || fname == "free" then false
     else ipf_list (tail node)
   else if tg == "O" then
     is_pure_fn (head (tail (tail node))) && is_pure_fn (head (tail (tail (tail node))))
@@ -2212,10 +2251,10 @@ infer_is_float_builtin n =
   n == "to_float" || n == "int_to_float" || n == "float_arr_get" || n == "fneg" || n == "fsqrt" || n == "fabs" || n == "parse_float" || n == "sqrt" || n == "sin" || n == "cos" || n == "tanh" || n == "exp" || n == "log" || n == "pow" || n == "floor" || n == "ceil" || n == "atan2"
 
 infer_is_int_builtin n =
-  n == "length" || n == "str_to_int" || n == "ord" || n == "float_to_int" || n == "byte_get" || n == "arr_len" || n == "str_find" || n == "is_error" || n == "char_to_int" || n == "to_int" || n == "fcmp_lt" || n == "fcmp_eq"
+  n == "length" || n == "str_to_int" || n == "ord" || n == "float_to_int" || n == "byte_get" || n == "arr_len" || n == "str_find" || n == "is_error" || n == "char_to_int" || n == "to_int" || n == "fcmp_lt" || n == "fcmp_eq" || n == "parse_int"
 
 infer_is_heap_builtin n =
-  n == "cat" || n == "join" || n == "show" || n == "show_float" || n == "cons" || n == "append" || n == "reverse" || n == "map" || n == "filter" || n == "range" || n == "chars" || n == "split" || n == "str_split" || n == "str_replace" || n == "str_sub" || n == "trim" || n == "read_file" || n == "read_file_bytes" || n == "read_line" || n == "shell" || n == "arr_new" || n == "float_arr_new" || n == "err_msg" || n == "tokenize" || n == "tokenize_with_pos" || n == "char_from_int" || n == "alloc_stats_snapshot"
+  n == "cat" || n == "join" || n == "show" || n == "show_float" || n == "cons" || n == "append" || n == "reverse" || n == "map" || n == "filter" || n == "range" || n == "chars" || n == "split" || n == "str_split" || n == "str_replace" || n == "str_sub" || n == "trim" || n == "read_file" || n == "read_line" || n == "shell" || n == "arr_new" || n == "float_arr_new" || n == "err_msg" || n == "tokenize" || n == "tokenize_with_pos" || n == "char_from_int" || n == "alloc_stats_snapshot"
 
 -- Decode the arity field for a fname out of the arity map.
 -- Returns (0 - 1) when not found.
@@ -2551,7 +2590,14 @@ compile_func d ar lc =
   -- Auto-memoization: pure self-recursive single-arg int functions
   let can_memo = if nm == "main" then false else if length ps != 1 then false else if use_regs == false then false else if base_int == false then false else if is_self_rec nm bd == false then false else is_pure_fn bd
   let memo_lookup = if can_memo then cat ["    asr x8, x0, #1\n    cmp x8, #1024\n    b.hs .Lmm_", nm, "\n    adrp x9, _memo_", nm, "@PAGE\n    add x9, x9, _memo_", nm, "@PAGEOFF\n    ldr x10, [x9, x8, lsl #3]\n    cbnz x10, .Lmh_", nm, "\n.Lmm_", nm, ":\n"] else ""
-  let memo_store = if can_memo then cat ["    asr x8, x19, #1\n    cmp x8, #1024\n    b.hs .Lms_", nm, "\n    adrp x9, _memo_", nm, "@PAGE\n    add x9, x9, _memo_", nm, "@PAGEOFF\n    str x0, [x9, x8, lsl #3]\n.Lms_", nm, ":\n"] else ""
+  -- memo_store key = x19 directly. x19 already holds the UNTAGGED arg
+  -- (set by `asr x19, x0, #1` at function entry in .Lmm_<fn>).
+  -- The prior emit did `asr x8, x19, #1` which double-untagged x19 → stored
+  -- to memo[n/2] instead of memo[n], silently corrupting any single-arg
+  -- pure-int recursive function with two or more recursive calls (fib).
+  -- Fix: index by x19 directly; also bounds-check x19 against #1024.
+  -- Reject negative keys (b.lt) to avoid signed-overflow into the table.
+  let memo_store = if can_memo then cat ["    cmp x19, #0\n    b.lt .Lms_", nm, "\n    cmp x19, #1024\n    b.hs .Lms_", nm, "\n    adrp x9, _memo_", nm, "@PAGE\n    add x9, x9, _memo_", nm, "@PAGEOFF\n    str x0, [x9, x19, lsl #3]\n.Lms_", nm, ":\n"] else ""
   let memo_hit = if can_memo then cat [".Lmh_", nm, ":\n    mov x0, x10\n    ret\n"] else ""
   let memo_decl = if can_memo then cat [".comm _memo_", nm, ",8192,3\n"] else ""
   let self_loop_lbl = if use_regs && is_self_rec nm bd then cat [".Lself_", show lc, ":\n"] else ""
@@ -2594,10 +2640,16 @@ compile_funcs_loop decls ar lc asm_acc desc_acc =
 rt_core =
   let req = "_rail_eq:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    tst x1, #1\n    b.eq .Lreq_heap\n    cmp x1, x0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_heap:\n    cbz x1, .Lreq_raw_cmp\n    cbz x0, .Lreq_raw_cmp\n    tst x0, #1\n    b.ne .Lreq_mismatch\n    ldr x2, [x1]\n    and x2, x2, #0x7fffffffffffffff\n    cmp x2, #6\n    b.eq .Lreq_float\n    str x0, [x29, #16]\n    mov x0, x1\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _str_unwrap\n    mov x1, x0\n    ldr x0, [x29, #24]\n    bl _strcmp\n    cmp x0, #0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_raw_cmp:\n    cmp x1, x0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_mismatch:\n    mov x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n\n"
   let rne = "_rail_ne:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    tst x1, #1\n    b.eq .Lrne_heap\n    cmp x1, x0\n    cset x0, ne\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lrne_heap:\n    cbz x1, .Lrne_raw_cmp\n    cbz x0, .Lrne_raw_cmp\n    tst x0, #1\n    b.ne .Lrne_mismatch\n    ldr x2, [x1]\n    and x2, x2, #0x7fffffffffffffff\n    cmp x2, #6\n    b.eq .Lrne_float\n    str x0, [x29, #16]\n    mov x0, x1\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _str_unwrap\n    mov x1, x0\n    ldr x0, [x29, #24]\n    bl _strcmp\n    cmp x0, #0\n    cset x0, ne\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lrne_raw_cmp:\n    cmp x1, x0\n    cset x0, ne\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lrne_mismatch:\n    mov x0, #3\n    ldp x29, x30, [sp], #32\n    ret\n.Lrne_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, ne\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n\n"
-  let radd = "_rail_add:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    tst x1, #1\n    b.eq .Ladd_heap\n    asr x1, x1, #1\n    asr x0, x0, #1\n    add x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #16\n    ret\n.Ladd_heap:\n    ldr x2, [x1]\n    cmp x2, #6\n    b.eq .Ladd_float\n    mov x2, x0\n    mov x0, x1\n    mov x1, x2\n    bl _rail_str_append\n    ldp x29, x30, [sp], #16\n    ret\n.Ladd_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fadd d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
-  let rprint = "_rail_print:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    tst x0, #1\n    b.eq .Lprnt_heap\n    asr x0, x0, #1\n    mov x1, #0\n    cmp x0, #0\n    b.ge .Lpi_pos\n    neg x0, x0\n    mov x1, #1\n.Lpi_pos:\n    str x1, [x29, #48]\n    mov x2, #0\n    mov x3, #10\n    add x4, x29, #16\n.Lpi_div:\n    udiv x5, x0, x3\n    msub x6, x5, x3, x0\n    add x6, x6, #48\n    str x6, [sp, #-16]!\n    add x2, x2, #1\n    mov x0, x5\n    cbnz x0, .Lpi_div\n    cbz x2, .Lpi_zero\n    mov x7, #0\n    ldr x1, [x29, #48]\n    cbz x1, .Lpi_nosign\n    mov w1, #45\n    strb w1, [x4, x7]\n    add x7, x7, #1\n.Lpi_nosign:\n.Lpi_rev:\n    ldr x6, [sp], #16\n    strb w6, [x4, x7]\n    add x7, x7, #1\n    sub x2, x2, #1\n    cbnz x2, .Lpi_rev\n    mov w1, #10\n    strb w1, [x4, x7]\n    add x7, x7, #1\n    mov x0, #1\n    mov x1, x4\n    mov x2, x7\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lprnt_done\n.Lpi_zero:\n    mov w0, #48\n    strb w0, [x4]\n    mov w0, #10\n    strb w0, [x4, #1]\n    mov x0, #1\n    mov x1, x4\n    mov x2, #2\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lprnt_done\n.Lprnt_heap:\n    ldr x1, [x0]\n    and x1, x1, #0x7fffffffffffffff\n    cmp x1, #6\n    b.eq .Lprnt_float\n    bl _str_unwrap\n    str x0, [x29, #16]\n    bl _strlen\n    mov x2, x0\n    mov x0, #1\n    ldr x1, [x29, #16]\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov w0, #10\n    strb w0, [x29, #24]\n    mov x0, #1\n    add x1, x29, #24\n    mov x2, #1\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lprnt_done\n.Lprnt_float:\n    ldr d0, [x0, #8]\n    str d0, [x29, #16]\n    mov x0, #32\n    bl _rail_chained_malloc\n    str x0, [x29, #24]\n    ldr d0, [x29, #16]\n    str d0, [sp, #-16]!\n    ldr x0, [x29, #24]\n    mov x1, #32\n    adrp x2, _fmt_gbare@PAGE\n    add x2, x2, _fmt_gbare@PAGEOFF\n    bl _snprintf\n    add sp, sp, #16\n    ldr x0, [x29, #24]\n    bl _strlen\n    mov x2, x0\n    mov x0, #1\n    ldr x1, [x29, #24]\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov w0, #10\n    strb w0, [x29, #32]\n    mov x0, #1\n    add x1, x29, #32\n    mov x2, #1\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr x0, [x29, #24]\n    bl _free\n.Lprnt_done:\n    mov x0, #1\n    ldp x29, x30, [sp], #64\n    ret\n\n"
+  let radd = "_rail_add:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    tst x1, #1\n    b.eq .Ladd_heap\n    tst x0, #1\n    b.eq .Ladd_mixed_if\n    asr x1, x1, #1\n    asr x0, x0, #1\n    add x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #16\n    ret\n.Ladd_heap:\n    tst x0, #1\n    b.ne .Ladd_mixed_fi\n    ldr x2, [x1]\n    cmp x2, #6\n    b.eq .Ladd_float\n    mov x2, x0\n    mov x0, x1\n    mov x1, x2\n    bl _rail_str_append\n    ldp x29, x30, [sp], #16\n    ret\n.Ladd_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fadd d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n.Ladd_mixed_if:\n    asr x1, x1, #1\n    scvtf d0, x1\n    fmov d1, x0\n    fadd d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n.Ladd_mixed_fi:\n    fmov d0, x1\n    asr x0, x0, #1\n    scvtf d1, x0\n    fadd d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
+  let rprint = "_rail_print:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    tst x0, #1\n    b.eq .Lprnt_heap\n    asr x0, x0, #1\n    mov x1, #0\n    cmp x0, #0\n    b.ge .Lpi_pos\n    neg x0, x0\n    mov x1, #1\n.Lpi_pos:\n    str x1, [x29, #48]\n    mov x2, #0\n    mov x3, #10\n    add x4, x29, #16\n.Lpi_div:\n    udiv x5, x0, x3\n    msub x6, x5, x3, x0\n    add x6, x6, #48\n    str x6, [sp, #-16]!\n    add x2, x2, #1\n    mov x0, x5\n    cbnz x0, .Lpi_div\n    cbz x2, .Lpi_zero\n    mov x7, #0\n    ldr x1, [x29, #48]\n    cbz x1, .Lpi_nosign\n    mov w1, #45\n    strb w1, [x4, x7]\n    add x7, x7, #1\n.Lpi_nosign:\n.Lpi_rev:\n    ldr x6, [sp], #16\n    strb w6, [x4, x7]\n    add x7, x7, #1\n    sub x2, x2, #1\n    cbnz x2, .Lpi_rev\n    mov w1, #10\n    strb w1, [x4, x7]\n    add x7, x7, #1\n    mov x0, #1\n    mov x1, x4\n    mov x2, x7\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lprnt_done\n.Lpi_zero:\n    mov w0, #48\n    strb w0, [x4]\n    mov w0, #10\n    strb w0, [x4, #1]\n    mov x0, #1\n    mov x1, x4\n    mov x2, #2\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lprnt_done\n.Lprnt_heap:\n    ldr x1, [x0]\n    and x1, x1, #0x7fffffffffffffff\n    cmp x1, #6\n    b.eq .Lprnt_float\n    bl _str_unwrap\n    str x0, [x29, #16]\n    bl _strlen\n    mov x2, x0\n    mov x0, #1\n    ldr x1, [x29, #16]\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov w0, #10\n    strb w0, [x29, #24]\n    mov x0, #1\n    add x1, x29, #24\n    mov x2, #1\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lprnt_done\n.Lprnt_float:\n    ldr d0, [x0, #8]\n    str d0, [x29, #16]\n    mov x0, #32\n    bl _malloc\n    str x0, [x29, #24]\n    ldr d0, [x29, #16]\n    str d0, [sp, #-16]!\n    ldr x0, [x29, #24]\n    mov x1, #32\n    adrp x2, _fmt_gbare@PAGE\n    add x2, x2, _fmt_gbare@PAGEOFF\n    bl _snprintf\n    add sp, sp, #16\n    ldr x0, [x29, #24]\n    bl _strlen\n    mov x2, x0\n    mov x0, #1\n    ldr x1, [x29, #24]\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov w0, #10\n    strb w0, [x29, #32]\n    mov x0, #1\n    add x1, x29, #32\n    mov x2, #1\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr x0, [x29, #24]\n    bl _free\n.Lprnt_done:\n    mov x0, #1\n    ldp x29, x30, [sp], #64\n    ret\n\n"
   let rshow = "_rail_show:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    bl _rail_show_inner\n    bl _rail_wrap_str\n    ldp x29, x30, [sp], #16\n    ret\n\n_rail_show_inner:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    tst x0, #1\n    b.eq .Lshow_heap\n    asr x0, x0, #1\n    str x0, [x29, #16]\n    mov x0, #24\n    bl _rail_chained_malloc\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    ldr x1, [x29, #24]\n    mov x6, #0\n    cmp x0, #0\n    b.ge .Lsi_pos\n    neg x0, x0\n    mov w7, #45\n    strb w7, [x1, x6]\n    add x6, x6, #1\n.Lsi_pos:\n    str x6, [x29, #16]\n    mov x2, #0\n    mov x3, #10\n.Lsi_div:\n    udiv x4, x0, x3\n    msub x5, x4, x3, x0\n    add x5, x5, #48\n    str x5, [sp, #-16]!\n    add x2, x2, #1\n    mov x0, x4\n    cbnz x0, .Lsi_div\n    cbz x2, .Lsi_zero\n    ldr x6, [x29, #16]\n    ldr x1, [x29, #24]\n.Lsi_rev:\n    ldr x5, [sp], #16\n    strb w5, [x1, x6]\n    add x6, x6, #1\n    sub x2, x2, #1\n    cbnz x2, .Lsi_rev\n    mov w5, #0\n    strb w5, [x1, x6]\n    ldr x0, [x29, #24]\n    ldp x29, x30, [sp], #32\n    ret\n.Lsi_zero:\n    ldr x6, [x29, #16]\n    ldr x1, [x29, #24]\n    mov w0, #48\n    strb w0, [x1, x6]\n    add x6, x6, #1\n    mov w0, #0\n    strb w0, [x1, x6]\n    ldr x0, [x29, #24]\n    ldp x29, x30, [sp], #32\n    ret\n.Lshow_heap:\n    ldr x1, [x0]\n    cmp x1, #6\n    b.eq .Lshow_float\n    cmp x1, #2\n    b.eq .Lshow_nil\n    cmp x1, #1\n    b.eq .Lshow_list\n    ldp x29, x30, [sp], #32\n    ret\n.Lshow_nil:\n    mov x0, #4\n    bl _rail_chained_malloc\n    mov w1, #91\n    strb w1, [x0]\n    mov w1, #93\n    strb w1, [x0, #1]\n    mov w1, #0\n    strb w1, [x0, #2]\n    ldp x29, x30, [sp], #32\n    ret\n.Lshow_list:\n    bl _rail_show_list\n    ldp x29, x30, [sp], #32\n    ret\n.Lshow_float:\n    ldr d0, [x0, #8]\n    str d0, [x29, #24]\n    mov x0, #32\n    bl _rail_chained_malloc\n    str x0, [x29, #16]\n    ldr d0, [x29, #24]\n    str d0, [sp, #-16]!\n    ldr x0, [x29, #16]\n    mov x1, #32\n    adrp x2, _fmt_gbare@PAGE\n    add x2, x2, _fmt_gbare@PAGEOFF\n    bl _snprintf\n    add sp, sp, #16\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #32\n    ret\n\n_rail_show_list:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x0, [x29, #16]\n    mov x0, #4\n    bl _rail_chained_malloc\n    mov w1, #91\n    strb w1, [x0]\n    mov w1, #0\n    strb w1, [x0, #1]\n    str x0, [x29, #24]\n    mov x0, #4\n    bl _rail_chained_malloc\n    mov w1, #44\n    strb w1, [x0]\n    mov w1, #32\n    strb w1, [x0, #1]\n    mov w1, #0\n    strb w1, [x0, #2]\n    str x0, [x29, #32]\n    mov x0, #4\n    bl _rail_chained_malloc\n    mov w1, #93\n    strb w1, [x0]\n    mov w1, #0\n    strb w1, [x0, #1]\n    str x0, [x29, #40]\n    mov x0, #1\n    str x0, [x29, #48]\n.Lshowl_loop:\n    ldr x0, [x29, #16]\n    tst x0, #1\n    b.ne .Lshowl_done\n    ldr x1, [x0]\n    cmp x1, #2\n    b.eq .Lshowl_done\n    cmp x1, #1\n    b.ne .Lshowl_done\n    ldr x0, [x29, #48]\n    cbnz x0, .Lshowl_skip_sep\n    ldr x0, [x29, #24]\n    ldr x1, [x29, #32]\n    bl _rail_str_append\n    str x0, [x29, #24]\n.Lshowl_skip_sep:\n    str xzr, [x29, #48]\n    ldr x0, [x29, #16]\n    ldr x0, [x0, #8]\n    bl _rail_show\n    mov x1, x0\n    ldr x0, [x29, #24]\n    bl _rail_str_append\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    ldr x0, [x0, #16]\n    str x0, [x29, #16]\n    b .Lshowl_loop\n.Lshowl_done:\n    ldr x0, [x29, #24]\n    ldr x1, [x29, #40]\n    bl _rail_str_append\n    ldp x29, x30, [sp], #64\n    ret\n\n"
-  let rstrapp = "_rail_str_append:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    bl _str_unwrap\n    str x0, [x29, #16]\n    ldr x0, [x29, #24]\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _strlen\n    str x0, [x29, #32]\n    ldr x0, [x29, #24]\n    bl _strlen\n    ldr x1, [x29, #32]\n    add x0, x0, x1\n    add x0, x0, #1\n    bl _rail_chained_malloc\n    str x0, [x29, #40]\n    ldr x1, [x29, #16]\n    bl _strcpy\n    ldr x0, [x29, #40]\n    ldr x1, [x29, #24]\n    bl _strcat\n    ldr x0, [x29, #40]\n    ldp x29, x30, [sp], #48\n    ret\n\n"
+  -- ARM64 _rail_str_append: O(n+m) via strlen+memcpy, mirroring the x86
+  -- fix at c30ff5f. The previous strcpy+strcat sequence was O(n^2) on
+  -- chained `s = s + chunk` accumulators because strcat re-scans the
+  -- destination to find NUL on every call. Now both copies use memcpy
+  -- with pre-computed lengths and we plant the NUL explicitly.
+  -- Frame: #16=str1_uw, #24=str2_uw, #32=len1, #40=buf, #48=len2.
+  let rstrapp = "_rail_str_append:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    bl _str_unwrap\n    str x0, [x29, #16]\n    ldr x0, [x29, #24]\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _strlen\n    str x0, [x29, #32]\n    ldr x0, [x29, #24]\n    bl _strlen\n    str x0, [x29, #48]\n    ldr x1, [x29, #32]\n    add x0, x0, x1\n    add x0, x0, #1\n    bl _rail_chained_malloc\n    str x0, [x29, #40]\n    ldr x1, [x29, #16]\n    ldr x2, [x29, #32]\n    bl _memcpy\n    ldr x0, [x29, #40]\n    ldr x1, [x29, #32]\n    add x0, x0, x1\n    ldr x1, [x29, #24]\n    ldr x2, [x29, #48]\n    bl _memcpy\n    ldr x0, [x29, #40]\n    ldr x1, [x29, #32]\n    ldr x2, [x29, #48]\n    add x1, x1, x2\n    add x0, x0, x1\n    strb wzr, [x0]\n    ldr x0, [x29, #40]\n    ldp x29, x30, [sp], #64\n    ret\n\n"
   cat [req, rne, radd, rprint, rshow, rstrapp]
 
 rt_list =
@@ -2619,7 +2671,14 @@ rt_list =
 
 rt_closure =
   let rmap = "_rail_map:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    ldr x2, [x1]\n    cmp x2, #2\n    b.eq .Lmap_nil\n    ldr x3, [x1, #8]\n    str x3, [x29, #32]\n    ldr x3, [x1, #16]\n    str x3, [x29, #40]\n    ldr x2, [x29, #16]\n    ldr x5, [x2, #8]\n    ldr x3, [x2, #16]\n    ldr x0, [x29, #32]\n    cmp x3, #0\n    b.eq .Lmap_call\n    ldr x1, [x2, #24]\n    cmp x3, #1\n    b.eq .Lmap_call\n    ldr x4, [x2, #32]\n    mov x2, x4\n.Lmap_call:\n    blr x5\n    str x0, [sp, #-16]!\n    ldr x0, [x29, #16]\n    ldr x1, [x29, #40]\n    bl _rail_map\n    mov x1, x0\n    ldr x0, [sp], #16\n    bl _rail_cons\n    ldp x29, x30, [sp], #48\n    ret\n.Lmap_nil:\n    adrp x0, _rail_nil@PAGE\n    add x0, x0, _rail_nil@PAGEOFF\n    ldp x29, x30, [sp], #48\n    ret\n\n"
-  let rjoin = "_rail_join:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    ldr x2, [x1]\n    cmp x2, #2\n    b.eq .Ljoin_empty\n    ldr x3, [x1, #8]\n    str x3, [x29, #32]\n    ldr x4, [x1, #16]\n    ldr x2, [x4]\n    cmp x2, #2\n    b.eq .Ljoin_single\n    ldr x0, [x29, #16]\n    mov x1, x4\n    bl _rail_join\n    str x0, [x29, #40]\n    ldr x0, [x29, #32]\n    ldr x1, [x29, #16]\n    bl _rail_str_append\n    ldr x1, [x29, #40]\n    bl _rail_str_append\n    ldp x29, x30, [sp], #48\n    ret\n.Ljoin_empty:\n    adrp x0, _rail_empty_str@PAGE\n    add x0, x0, _rail_empty_str@PAGEOFF\n    ldp x29, x30, [sp], #48\n    ret\n.Ljoin_single:\n    ldr x0, [x29, #32]\n    ldp x29, x30, [sp], #48\n    ret\n\n"
+  -- _rail_join: two-pass linear. Old recursive head+sep+(join sep tail)
+  -- pattern allocated O(n^2) bytes via repeated _rail_str_append calls
+  -- through _rail_chained_malloc (system malloc — never reclaimed). For
+  -- n=100k, 6-char items: 30 GB live. New version walks the list twice
+  -- (compute total length, then memcpy items+seps into one buffer), so
+  -- allocation is O(n * avg_len). Callee-saved: x19=sep_uw, x20=sep_len,
+  -- x21=iter, x22=total->pos, x23=n_items->result_buf.
+  let rjoin = "_rail_join:\n    stp x29, x30, [sp, #-96]!\n    mov x29, sp\n    stp x19, x20, [sp, #16]\n    stp x21, x22, [sp, #32]\n    str x23, [sp, #48]\n    ldr x2, [x1]\n    cmp x2, #2\n    b.eq .Ljoin_empty\n    str x0, [sp, #56]\n    str x1, [sp, #64]\n    bl _str_unwrap\n    mov x19, x0\n    bl _strlen\n    mov x20, x0\n    ldr x21, [sp, #64]\n    mov x22, #0\n    mov x23, #0\n.Ljoin_p1_loop:\n    ldr x2, [x21]\n    cmp x2, #2\n    b.eq .Ljoin_p1_done\n    ldr x0, [x21, #8]\n    bl _str_unwrap\n    bl _strlen\n    add x22, x22, x0\n    add x23, x23, #1\n    ldr x21, [x21, #16]\n    b .Ljoin_p1_loop\n.Ljoin_p1_done:\n    sub x4, x23, #1\n    madd x22, x4, x20, x22\n    add x0, x22, #1\n    bl _rail_chained_malloc\n    mov x23, x0\n    ldr x21, [sp, #64]\n    mov x22, #0\n    mov x4, #1\n.Ljoin_p2_loop:\n    ldr x2, [x21]\n    cmp x2, #2\n    b.eq .Ljoin_p2_done\n    cbnz x4, .Ljoin_p2_skip_sep\n    add x0, x23, x22\n    mov x1, x19\n    mov x2, x20\n    str x4, [sp, #72]\n    str x21, [sp, #80]\n    bl _memcpy\n    ldr x4, [sp, #72]\n    ldr x21, [sp, #80]\n    add x22, x22, x20\n.Ljoin_p2_skip_sep:\n    str x4, [sp, #72]\n    str x21, [sp, #80]\n    ldr x0, [x21, #8]\n    bl _str_unwrap\n    str x0, [sp, #56]\n    bl _strlen\n    str x0, [sp, #88]\n    add x0, x23, x22\n    ldr x1, [sp, #56]\n    ldr x2, [sp, #88]\n    bl _memcpy\n    ldr x4, [sp, #72]\n    ldr x21, [sp, #80]\n    ldr x6, [sp, #88]\n    add x22, x22, x6\n    mov x4, #0\n    ldr x21, [x21, #16]\n    b .Ljoin_p2_loop\n.Ljoin_p2_done:\n    add x0, x23, x22\n    strb wzr, [x0]\n    mov x0, x23\n    ldr x23, [sp, #48]\n    ldp x21, x22, [sp, #32]\n    ldp x19, x20, [sp, #16]\n    ldp x29, x30, [sp], #96\n    ret\n.Ljoin_empty:\n    adrp x0, _rail_empty_str@PAGE\n    add x0, x0, _rail_empty_str@PAGEOFF\n    ldr x23, [sp, #48]\n    ldp x21, x22, [sp, #32]\n    ldp x19, x20, [sp, #16]\n    ldp x29, x30, [sp], #96\n    ret\n\n"
   let rchars = "_rail_chars:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    bl _str_unwrap\n    str x0, [x29, #16]\n    bl _strlen\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    ldr x1, [x29, #24]\n    bl _rail_chars_build\n    ldp x29, x30, [sp], #32\n    ret\n_rail_chars_build:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    adrp x2, _rail_nil@PAGE\n    add x2, x2, _rail_nil@PAGEOFF\n    str x2, [x29, #32]\n    sub x3, x1, #1\n    str x3, [x29, #40]\n.Lchars_loop:\n    ldr x3, [x29, #40]\n    cmp x3, #0\n    b.lt .Lchars_done\n    mov x0, #2\n    bl _rail_chained_malloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #16]\n    ldr x3, [x29, #40]\n    ldrb w2, [x1, x3]\n    strb w2, [x0]\n    mov w2, #0\n    strb w2, [x0, #1]\n    ldr x0, [sp], #16\n    bl _rail_wrap_str\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    str x0, [x29, #32]\n    ldr x3, [x29, #40]\n    sub x3, x3, #1\n    str x3, [x29, #40]\n    b .Lchars_loop\n.Lchars_done:\n    ldr x0, [x29, #32]\n    ldp x29, x30, [sp], #48\n    ret\n\n"
   let rsplit = "_rail_split:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x1, [x29, #24]\n    bl _str_unwrap\n    str x0, [x29, #16]\n    ldrb w2, [x0]\n    str x2, [x29, #32]\n    ldr x0, [x29, #24]\n    bl _str_unwrap\n    str x0, [x29, #24]\n    bl _strlen\n    str x0, [x29, #40]\n    ldr x0, [x29, #24]\n    ldr x1, [x29, #40]\n    ldr x2, [x29, #32]\n    bl _rail_split_build\n    ldp x29, x30, [sp], #48\n    ret\n_rail_split_build:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x2, [x29, #24]\n    adrp x3, _rail_nil@PAGE\n    add x3, x3, _rail_nil@PAGEOFF\n    str x3, [x29, #32]\n    str x1, [x29, #40]\n    sub x3, x1, #1\n    str x3, [x29, #48]\n.Lsplit_bk:\n    ldr x3, [x29, #48]\n    cmp x3, #0\n    b.lt .Lsplit_first\n    ldr x0, [x29, #16]\n    ldrb w4, [x0, x3]\n    ldr x5, [x29, #24]\n    cmp w4, w5\n    b.eq .Lsplit_hit\n    sub x3, x3, #1\n    str x3, [x29, #48]\n    b .Lsplit_bk\n.Lsplit_hit:\n    ldr x5, [x29, #40]\n    sub x6, x5, x3\n    sub x6, x6, #1\n    str x6, [x29, #56]\n    add x0, x6, #1\n    bl _rail_chained_malloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #16]\n    ldr x3, [x29, #48]\n    add x1, x1, x3\n    add x1, x1, #1\n    ldr x6, [x29, #56]\n    mov x4, #0\n.Lsplit_cp1:\n    cmp x4, x6\n    b.ge .Lsplit_cp1d\n    ldrb w7, [x1, x4]\n    strb w7, [x0, x4]\n    add x4, x4, #1\n    b .Lsplit_cp1\n.Lsplit_cp1d:\n    mov w7, #0\n    strb w7, [x0, x6]\n    ldr x0, [sp], #16\n    bl _rail_wrap_str\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    str x0, [x29, #32]\n    ldr x3, [x29, #48]\n    str x3, [x29, #40]\n    sub x3, x3, #1\n    str x3, [x29, #48]\n    b .Lsplit_bk\n.Lsplit_first:\n    ldr x6, [x29, #40]\n    str x6, [x29, #56]\n    add x0, x6, #1\n    bl _rail_chained_malloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #16]\n    ldr x6, [x29, #56]\n    mov x4, #0\n.Lsplit_cp2:\n    cmp x4, x6\n    b.ge .Lsplit_cp2d\n    ldrb w7, [x1, x4]\n    strb w7, [x0, x4]\n    add x4, x4, #1\n    b .Lsplit_cp2\n.Lsplit_cp2d:\n    mov w7, #0\n    strb w7, [x0, x6]\n    ldr x0, [sp], #16\n    bl _rail_wrap_str\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    ldp x29, x30, [sp], #64\n    ret\n\n"
   let rfilter = "_rail_filter:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    ldr x2, [x1]\n    cmp x2, #2\n    b.eq .Lfilt_nil\n    ldr x3, [x1, #8]\n    str x3, [x29, #32]\n    ldr x3, [x1, #16]\n    str x3, [x29, #40]\n    ldr x2, [x29, #16]\n    ldr x5, [x2, #8]\n    ldr x3, [x2, #16]\n    ldr x0, [x29, #32]\n    cmp x3, #0\n    b.eq .Lfilt_call\n    ldr x1, [x2, #24]\n.Lfilt_call:\n    blr x5\n    str x0, [sp, #-16]!\n    ldr x0, [x29, #16]\n    ldr x1, [x29, #40]\n    bl _rail_filter\n    ldr x1, [sp], #16\n    cmp x1, #3\n    b.ne .Lfilt_skip\n    mov x1, x0\n    ldr x0, [x29, #32]\n    bl _rail_cons\n    ldp x29, x30, [sp], #48\n    ret\n.Lfilt_skip:\n    ldp x29, x30, [sp], #48\n    ret\n.Lfilt_nil:\n    adrp x0, _rail_nil@PAGE\n    add x0, x0, _rail_nil@PAGEOFF\n    ldp x29, x30, [sp], #48\n    ret\n\n"
@@ -2631,23 +2690,22 @@ rt_closure =
 
 rt_io =
   let rwritefile = "_rail_write_file:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x1, [x29, #16]\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _str_unwrap\n    str x0, [x29, #16]\n    ldr x0, [x29, #24]\n    adrp x1, _mode_w@PAGE\n    add x1, x1, _mode_w@PAGEOFF\n    bl _fopen\n    str x0, [x29, #32]\n    ldr x0, [x29, #16]\n    bl _strlen\n    ldr x3, [x29, #32]\n    mov x2, x0\n    ldr x0, [x29, #16]\n    mov x1, #1\n    bl _fwrite\n    ldr x0, [x29, #32]\n    bl _fclose\n    mov x0, #1\n    ldp x29, x30, [sp], #48\n    ret\n\n"
-  let rshell = "_rail_shell:\n    stp x29, x30, [sp, #-96]!\n    mov x29, sp\n    bl _str_unwrap\n    str x0, [x29, #16]\n    movz x16, #42\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    str w0, [x29, #24]\n    str w1, [x29, #28]\n    movz x16, #2\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    cbz x1, .Lsh_parent\n    ldr w0, [x29, #28]\n    mov x1, #1\n    movz x16, #90\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr w0, [x29, #24]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr w0, [x29, #28]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    adr x0, .Lsh_binsh\n    str x0, [x29, #48]\n    adr x0, .Lsh_cflag\n    str x0, [x29, #56]\n    ldr x0, [x29, #16]\n    str x0, [x29, #64]\n    str xzr, [x29, #72]\n    adr x0, .Lsh_binsh\n    add x1, x29, #48\n    adrp x2, _rail_envp@PAGE\n    ldr x2, [x2, _rail_envp@PAGEOFF]\n    movz x16, #59\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x0, #1\n    movz x16, #1\n    movk x16, #0x200, lsl #16\n    svc #0x80\n.Lsh_binsh:\n    .asciz \"/bin/sh\"\n    .p2align 2\n.Lsh_cflag:\n    .asciz \"-c\"\n    .p2align 2\n.Lsh_parent:\n    str x0, [x29, #32]\n    ldr w0, [x29, #28]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x0, #65536\n    bl _rail_chained_malloc\n    str x0, [x29, #40]\n    str xzr, [x29, #48]\n.Lsh_read:\n    ldr w0, [x29, #24]\n    ldr x1, [x29, #40]\n    ldr x2, [x29, #48]\n    add x1, x1, x2\n    mov x2, #4096\n    movz x16, #3\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    cmp x0, #0\n    b.le .Lsh_done\n    ldr x1, [x29, #48]\n    add x1, x1, x0\n    str x1, [x29, #48]\n    b .Lsh_read\n.Lsh_done:\n    ldr w0, [x29, #24]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x0, #-1\n    add x1, x29, #56\n    mov x2, #0\n    mov x3, #0\n    movz x16, #7\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr x0, [x29, #40]\n    ldr x1, [x29, #48]\n    mov w2, #0\n    strb w2, [x0, x1]\n    ldr x0, [x29, #40]\n    bl _rail_wrap_str\n    str x0, [x29, #56]\n    ldr x0, [x29, #40]\n    bl _free\n    ldr x0, [x29, #56]\n    ldp x29, x30, [sp], #96\n    ret\n\n"
-  let rreadfile = "_rail_read_file:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    bl _str_unwrap\n    adrp x1, _mode_r@PAGE\n    add x1, x1, _mode_r@PAGEOFF\n    bl _fopen\n    cbz x0, .Lrf_empty\n    str x0, [x29, #16]\n    mov x1, #0\n    mov x2, #2\n    bl _fseek\n    ldr x0, [x29, #16]\n    bl _ftell\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    mov x1, #0\n    mov x2, #0\n    bl _fseek\n    ldr x0, [x29, #24]\n    add x0, x0, #1\n    bl _rail_chained_malloc\n    str x0, [x29, #32]\n    mov x1, #1\n    ldr x2, [x29, #24]\n    ldr x3, [x29, #16]\n    bl _fread\n    ldr x0, [x29, #32]\n    ldr x1, [x29, #24]\n    mov w2, #0\n    strb w2, [x0, x1]\n    ldr x0, [x29, #16]\n    bl _fclose\n    ldr x0, [x29, #32]\n    bl _rail_wrap_str\n    str x0, [x29, #16]\n    ldr x0, [x29, #32]\n    bl _free\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #48\n    ret\n.Lrf_empty:\n    adrp x0, _rail_empty_str@PAGE\n    add x0, x0, _rail_empty_str@PAGEOFF\n    bl _rail_wrap_str\n    ldp x29, x30, [sp], #48\n    ret\n\n"
-  let rreadfilebytes = "_rail_read_file_bytes:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    bl _str_unwrap\n    adrp x1, _mode_r@PAGE\n    add x1, x1, _mode_r@PAGEOFF\n    bl _fopen\n    cbz x0, .Lrfb_empty\n    str x0, [x29, #16]\n    mov x1, #0\n    mov x2, #2\n    bl _fseek\n    ldr x0, [x29, #16]\n    bl _ftell\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    mov x1, #0\n    mov x2, #0\n    bl _fseek\n    ldr x0, [x29, #24]\n    cbz x0, .Lrfb_empty_close\n    bl _rail_chained_malloc\n    str x0, [x29, #32]\n    mov x1, #1\n    ldr x2, [x29, #24]\n    ldr x3, [x29, #16]\n    bl _fread\n    ldr x0, [x29, #16]\n    bl _fclose\n    ldr x0, [x29, #24]\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    mov x1, #1\n    bl _rail_arr_new\n    str x0, [x29, #40]\n    ldr x4, [x29, #32]\n    ldr x5, [x29, #24]\n    mov x6, #0\n.Lrfb_loop:\n    cmp x6, x5\n    b.hs .Lrfb_done\n    ldrb w7, [x4, x6]\n    lsl x7, x7, #1\n    orr x7, x7, #1\n    add x8, x6, #2\n    ldr x9, [x29, #40]\n    str x7, [x9, x8, lsl #3]\n    add x6, x6, #1\n    b .Lrfb_loop\n.Lrfb_done:\n    ldr x0, [x29, #32]\n    bl _free\n    ldr x0, [x29, #40]\n    ldp x29, x30, [sp], #64\n    ret\n.Lrfb_empty_close:\n    ldr x0, [x29, #16]\n    bl _fclose\n.Lrfb_empty:\n    mov x0, #1\n    mov x1, #1\n    bl _rail_arr_new\n    ldp x29, x30, [sp], #64\n    ret\n\n"
-  cat [rwritefile, rshell, rreadfile, rreadfilebytes]
+  let rshell = "_rail_shell:\n    stp x29, x30, [sp, #-96]!\n    mov x29, sp\n    bl _str_unwrap\n    str x0, [x29, #16]\n    movz x16, #42\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    str w0, [x29, #24]\n    str w1, [x29, #28]\n    movz x16, #2\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    cbz x1, .Lsh_parent\n    ldr w0, [x29, #28]\n    mov x1, #1\n    movz x16, #90\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr w0, [x29, #24]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr w0, [x29, #28]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    adr x0, .Lsh_binsh\n    str x0, [x29, #48]\n    adr x0, .Lsh_cflag\n    str x0, [x29, #56]\n    ldr x0, [x29, #16]\n    str x0, [x29, #64]\n    str xzr, [x29, #72]\n    adr x0, .Lsh_binsh\n    add x1, x29, #48\n    adrp x2, _rail_envp@PAGE\n    ldr x2, [x2, _rail_envp@PAGEOFF]\n    movz x16, #59\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x0, #1\n    movz x16, #1\n    movk x16, #0x200, lsl #16\n    svc #0x80\n.Lsh_binsh:\n    .asciz \"/bin/sh\"\n    .p2align 2\n.Lsh_cflag:\n    .asciz \"-c\"\n    .p2align 2\n.Lsh_parent:\n    str x0, [x29, #32]\n    ldr w0, [x29, #28]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x0, #65536\n    bl _malloc\n    str x0, [x29, #40]\n    str xzr, [x29, #48]\n.Lsh_read:\n    ldr w0, [x29, #24]\n    ldr x1, [x29, #40]\n    ldr x2, [x29, #48]\n    add x1, x1, x2\n    mov x2, #4096\n    movz x16, #3\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    cmp x0, #0\n    b.le .Lsh_done\n    ldr x1, [x29, #48]\n    add x1, x1, x0\n    str x1, [x29, #48]\n    b .Lsh_read\n.Lsh_done:\n    ldr w0, [x29, #24]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x0, #-1\n    add x1, x29, #56\n    mov x2, #0\n    mov x3, #0\n    movz x16, #7\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr x0, [x29, #40]\n    ldr x1, [x29, #48]\n    mov w2, #0\n    strb w2, [x0, x1]\n    ldr x0, [x29, #40]\n    bl _rail_wrap_str\n    str x0, [x29, #56]\n    ldr x0, [x29, #40]\n    bl _free\n    ldr x0, [x29, #56]\n    ldp x29, x30, [sp], #96\n    ret\n\n"
+  let rreadfile = "_rail_read_file:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    bl _str_unwrap\n    adrp x1, _mode_r@PAGE\n    add x1, x1, _mode_r@PAGEOFF\n    bl _fopen\n    cbz x0, .Lrf_empty\n    str x0, [x29, #16]\n    mov x1, #0\n    mov x2, #2\n    bl _fseek\n    ldr x0, [x29, #16]\n    bl _ftell\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    mov x1, #0\n    mov x2, #0\n    bl _fseek\n    ldr x0, [x29, #24]\n    add x0, x0, #1\n    bl _malloc\n    str x0, [x29, #32]\n    mov x1, #1\n    ldr x2, [x29, #24]\n    ldr x3, [x29, #16]\n    bl _fread\n    ldr x0, [x29, #32]\n    ldr x1, [x29, #24]\n    mov w2, #0\n    strb w2, [x0, x1]\n    ldr x0, [x29, #16]\n    bl _fclose\n    ldr x0, [x29, #32]\n    bl _rail_wrap_str\n    str x0, [x29, #16]\n    ldr x0, [x29, #32]\n    bl _free\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #48\n    ret\n.Lrf_empty:\n    adrp x0, _rail_empty_str@PAGE\n    add x0, x0, _rail_empty_str@PAGEOFF\n    bl _rail_wrap_str\n    ldp x29, x30, [sp], #48\n    ret\n\n"
+  cat [rwritefile, rshell, rreadfile]
 
 rt_args =
   "_rail_args:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    adrp x0, _rail_argc@PAGE\n    ldr x0, [x0, _rail_argc@PAGEOFF]\n    adrp x1, _rail_argv@PAGE\n    ldr x1, [x1, _rail_argv@PAGEOFF]\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    adrp x0, _rail_nil@PAGE\n    add x0, x0, _rail_nil@PAGEOFF\n    str x0, [x29, #32]\n    ldr x0, [x29, #16]\n    sub x0, x0, #1\n    str x0, [x29, #16]\n.Largs_lp:\n    ldr x0, [x29, #16]\n    cmp x0, #0\n    b.lt .Largs_dn\n    ldr x1, [x29, #24]\n    ldr x0, [x1, x0, lsl #3]\n    str x0, [x29, #40]\n    bl _strlen\n    add x0, x0, #1\n    bl _rail_chained_malloc\n    str x0, [x29, #48]\n    ldr x1, [x29, #40]\n    bl _strcpy\n    ldr x0, [x29, #48]\n    bl _rail_wrap_str\n    ldr x1, [x29, #32]\n    bl _rail_cons\n    str x0, [x29, #32]\n    ldr x0, [x29, #16]\n    sub x0, x0, #1\n    str x0, [x29, #16]\n    b .Largs_lp\n.Largs_dn:\n    ldr x0, [x29, #32]\n    ldp x29, x30, [sp], #64\n    ret\n\n"
 
 rt_arith =
-  let rsub = "_rail_sub:\n    tst x1, #1\n    b.eq .Lsub_float\n    asr x1, x1, #1\n    asr x0, x0, #1\n    sub x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lsub_float:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fsub d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
-  let rmul = "_rail_mul:\n    tst x1, #1\n    b.eq .Lmul_float\n    asr x1, x1, #1\n    asr x0, x0, #1\n    mul x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lmul_float:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fmul d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
-  let rdiv = "_rail_div:\n    tst x1, #1\n    b.eq .Ldiv_float\n    asr x1, x1, #1\n    asr x0, x0, #1\n    sdiv x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Ldiv_float:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fdiv d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
-  let rmod = "_rail_mod:\n    asr x1, x1, #1\n    asr x0, x0, #1\n    sdiv x2, x1, x0\n    msub x0, x2, x0, x1\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
-  let rlt = "_rail_lt:\n    tst x1, #1\n    b.eq .Llt_float\n    cmp x1, x0\n    cset x0, lt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Llt_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, lo\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
-  let rgt = "_rail_gt:\n    tst x1, #1\n    b.eq .Lgt_float\n    cmp x1, x0\n    cset x0, gt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lgt_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, gt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
-  let rle = "_rail_le:\n    tst x1, #1\n    b.eq .Lle_float\n    cmp x1, x0\n    cset x0, le\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lle_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, ls\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
-  let rge = "_rail_ge:\n    tst x1, #1\n    b.eq .Lge_float\n    cmp x1, x0\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lge_float:\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
+  let rsub = "_rail_sub:\n    tst x1, #1\n    b.eq .Lsub_float\n    tst x0, #1\n    b.eq .Lsub_mixed_if\n    asr x1, x1, #1\n    asr x0, x0, #1\n    sub x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lsub_float:\n    tst x0, #1\n    b.ne .Lsub_mixed_fi\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fsub d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n.Lsub_mixed_if:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    asr x1, x1, #1\n    scvtf d0, x1\n    fmov d1, x0\n    fsub d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n.Lsub_mixed_fi:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    fmov d0, x1\n    asr x0, x0, #1\n    scvtf d1, x0\n    fsub d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
+  let rmul = "_rail_mul:\n    tst x1, #1\n    b.eq .Lmul_float\n    tst x0, #1\n    b.eq .Lmul_mixed_if\n    asr x1, x1, #1\n    asr x0, x0, #1\n    mul x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lmul_float:\n    tst x0, #1\n    b.ne .Lmul_mixed_fi\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fmul d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n.Lmul_mixed_if:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    asr x1, x1, #1\n    scvtf d0, x1\n    fmov d1, x0\n    fmul d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n.Lmul_mixed_fi:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    fmov d0, x1\n    asr x0, x0, #1\n    scvtf d1, x0\n    fmul d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
+  let rdiv = "_rail_div:\n    tst x1, #1\n    b.eq .Ldiv_float\n    tst x0, #1\n    b.eq .Ldiv_mixed_if\n    asr x1, x1, #1\n    asr x0, x0, #1\n    sdiv x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Ldiv_float:\n    tst x0, #1\n    b.ne .Ldiv_mixed_fi\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fdiv d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n.Ldiv_mixed_if:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    asr x1, x1, #1\n    scvtf d0, x1\n    fmov d1, x0\n    fdiv d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n.Ldiv_mixed_fi:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    fmov d0, x1\n    asr x0, x0, #1\n    scvtf d1, x0\n    fdiv d0, d0, d1\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
+  let rmod = "_rail_mod:\n    tst x1, #1\n    b.eq .Lmod_float\n    tst x0, #1\n    b.eq .Lmod_mixed_if\n    asr x1, x1, #1\n    asr x0, x0, #1\n    sdiv x2, x1, x0\n    msub x0, x2, x0, x1\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lmod_float:\n    tst x0, #1\n    b.ne .Lmod_mixed_fi\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    bl _fmod\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n.Lmod_mixed_if:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    asr x1, x1, #1\n    scvtf d0, x1\n    fmov d1, x0\n    bl _fmod\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n.Lmod_mixed_fi:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    fmov d0, x1\n    asr x0, x0, #1\n    scvtf d1, x0\n    bl _fmod\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
+  let rlt = "_rail_lt:\n    tst x1, #1\n    b.eq .Llt_float\n    tst x0, #1\n    b.eq .Llt_mixed_if\n    cmp x1, x0\n    cset x0, lt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Llt_float:\n    tst x0, #1\n    b.ne .Llt_mixed_fi\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, lo\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Llt_mixed_if:\n    asr x1, x1, #1\n    scvtf d0, x1\n    fmov d1, x0\n    fcmp d0, d1\n    cset x0, lo\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Llt_mixed_fi:\n    fmov d0, x1\n    asr x0, x0, #1\n    scvtf d1, x0\n    fcmp d0, d1\n    cset x0, lo\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
+  let rgt = "_rail_gt:\n    tst x1, #1\n    b.eq .Lgt_float\n    tst x0, #1\n    b.eq .Lgt_mixed_if\n    cmp x1, x0\n    cset x0, gt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lgt_float:\n    tst x0, #1\n    b.ne .Lgt_mixed_fi\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, gt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lgt_mixed_if:\n    asr x1, x1, #1\n    scvtf d0, x1\n    fmov d1, x0\n    fcmp d0, d1\n    cset x0, gt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lgt_mixed_fi:\n    fmov d0, x1\n    asr x0, x0, #1\n    scvtf d1, x0\n    fcmp d0, d1\n    cset x0, gt\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
+  let rle = "_rail_le:\n    tst x1, #1\n    b.eq .Lle_float\n    tst x0, #1\n    b.eq .Lle_mixed_if\n    cmp x1, x0\n    cset x0, le\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lle_float:\n    tst x0, #1\n    b.ne .Lle_mixed_fi\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, ls\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lle_mixed_if:\n    asr x1, x1, #1\n    scvtf d0, x1\n    fmov d1, x0\n    fcmp d0, d1\n    cset x0, ls\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lle_mixed_fi:\n    fmov d0, x1\n    asr x0, x0, #1\n    scvtf d1, x0\n    fcmp d0, d1\n    cset x0, ls\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
+  let rge = "_rail_ge:\n    tst x1, #1\n    b.eq .Lge_float\n    tst x0, #1\n    b.eq .Lge_mixed_if\n    cmp x1, x0\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lge_float:\n    tst x0, #1\n    b.ne .Lge_mixed_fi\n    ldr d0, [x1, #8]\n    ldr d1, [x0, #8]\n    fcmp d0, d1\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lge_mixed_if:\n    asr x1, x1, #1\n    scvtf d0, x1\n    fmov d1, x0\n    fcmp d0, d1\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n.Lge_mixed_fi:\n    fmov d0, x1\n    asr x0, x0, #1\n    scvtf d1, x0\n    fcmp d0, d1\n    cset x0, ge\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
   -- rc_alloc: allocate refcounted object. x0 = size (tagged). Returns ptr to data (refcount at ptr-8)
   let rrcalloc = "_rail_rc_alloc:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    asr x0, x0, #1\n    add x0, x0, #8\n    bl _malloc\n    mov x1, #1\n    str x1, [x0]\n    add x0, x0, #8\n    ldp x29, x30, [sp], #16\n    ret\n\n"
   -- rc_release: decrement refcount, free if zero
@@ -2872,10 +2930,10 @@ rt_string =
   -- str_contains needle haystack → tagged bool (3=true, 1=false)
   let scont = "_rail_str_contains:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x1, [x29, #16]\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _str_unwrap\n    ldr x1, [x29, #24]\n    bl _strstr\n    cmp x0, #0\n    cset x0, ne\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n\n"
   -- str_sub string start len → new string
-  let ssub = "_rail_str_sub:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x1, [x29, #24]\n    str x2, [x29, #32]\n    bl _str_unwrap\n    str x0, [x29, #16]\n    ldr x1, [x29, #24]\n    asr x1, x1, #1\n    str x1, [x29, #24]\n    ldr x2, [x29, #32]\n    asr x2, x2, #1\n    str x2, [x29, #32]\n    add x0, x2, #1\n    bl _rail_chained_malloc\n    str x0, [x29, #40]\n    ldr x1, [x29, #16]\n    ldr x2, [x29, #24]\n    add x1, x1, x2\n    ldr x2, [x29, #32]\n    mov x3, x2\n.Lss_cp:\n    cbz x3, .Lss_done\n    ldrb w4, [x1], #1\n    strb w4, [x0], #1\n    sub x3, x3, #1\n    b .Lss_cp\n.Lss_done:\n    mov w4, #0\n    strb w4, [x0]\n    ldr x0, [x29, #40]\n    bl _rail_wrap_str\n    str x0, [x29, #16]\n    ldr x0, [x29, #40]\n    bl _free\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #48\n    ret\n\n"
+  let ssub = "_rail_str_sub:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str x1, [x29, #24]\n    str x2, [x29, #32]\n    bl _str_unwrap\n    str x0, [x29, #16]\n    ldr x1, [x29, #24]\n    asr x1, x1, #1\n    str x1, [x29, #24]\n    ldr x2, [x29, #32]\n    asr x2, x2, #1\n    str x2, [x29, #32]\n    add x0, x2, #1\n    bl _malloc\n    str x0, [x29, #40]\n    ldr x1, [x29, #16]\n    ldr x2, [x29, #24]\n    add x1, x1, x2\n    ldr x2, [x29, #32]\n    mov x3, x2\n.Lss_cp:\n    cbz x3, .Lss_done\n    ldrb w4, [x1], #1\n    strb w4, [x0], #1\n    sub x3, x3, #1\n    b .Lss_cp\n.Lss_done:\n    mov w4, #0\n    strb w4, [x0]\n    ldr x0, [x29, #40]\n    bl _rail_wrap_str\n    str x0, [x29, #16]\n    ldr x0, [x29, #40]\n    bl _free\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #48\n    ret\n\n"
   -- str_replace old new string → new string (replaces all occurrences)
   -- Uses strstr loop with proper frame management
-  let srepl = "_rail_str_replace:\n    stp x29, x30, [sp, #-96]!\n    mov x29, sp\n    str x1, [x29, #24]\n    str x2, [x29, #32]\n    bl _str_unwrap\n    str x0, [x29, #16]\n    ldr x0, [x29, #24]\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #32]\n    bl _str_unwrap\n    str x0, [x29, #32]\n    bl _strlen\n    str x0, [x29, #40]\n    ldr x0, [x29, #16]\n    bl _strlen\n    str x0, [x29, #48]\n    ldr x0, [x29, #24]\n    bl _strlen\n    str x0, [x29, #56]\n    ldr x0, [x29, #40]\n    lsl x0, x0, #2\n    add x0, x0, #64\n    bl _rail_chained_malloc\n    str x0, [x29, #64]\n    str xzr, [x29, #72]\n    ldr x0, [x29, #32]\n    str x0, [x29, #80]\n.Lsr_loop:\n    ldr x0, [x29, #80]\n    ldr x1, [x29, #16]\n    bl _strstr\n    cbz x0, .Lsr_rest\n    str x0, [x29, #88]\n    ldr x1, [x29, #80]\n    sub x2, x0, x1\n    ldr x3, [x29, #64]\n    ldr x4, [x29, #72]\n    add x5, x3, x4\n    mov x6, x2\n.Lsr_cp1:\n    cbz x6, .Lsr_cp1d\n    ldrb w7, [x1], #1\n    strb w7, [x5], #1\n    sub x6, x6, #1\n    b .Lsr_cp1\n.Lsr_cp1d:\n    ldr x4, [x29, #72]\n    add x4, x4, x2\n    ldr x1, [x29, #24]\n    ldr x6, [x29, #56]\n.Lsr_cp2:\n    cbz x6, .Lsr_cp2d\n    ldrb w7, [x1], #1\n    strb w7, [x5], #1\n    sub x6, x6, #1\n    b .Lsr_cp2\n.Lsr_cp2d:\n    ldr x6, [x29, #56]\n    add x4, x4, x6\n    str x4, [x29, #72]\n    ldr x0, [x29, #88]\n    ldr x1, [x29, #48]\n    add x0, x0, x1\n    str x0, [x29, #80]\n    b .Lsr_loop\n.Lsr_rest:\n    ldr x1, [x29, #80]\n    ldr x3, [x29, #64]\n    ldr x4, [x29, #72]\n    add x5, x3, x4\n.Lsr_cp3:\n    ldrb w7, [x1], #1\n    strb w7, [x5], #1\n    cbnz w7, .Lsr_cp3\n    ldr x0, [x29, #64]\n    bl _rail_wrap_str\n    str x0, [x29, #16]\n    ldr x0, [x29, #64]\n    bl _free\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #96\n    ret\n\n"
+  let srepl = "_rail_str_replace:\n    stp x29, x30, [sp, #-96]!\n    mov x29, sp\n    str x1, [x29, #24]\n    str x2, [x29, #32]\n    bl _str_unwrap\n    str x0, [x29, #16]\n    ldr x0, [x29, #24]\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #32]\n    bl _str_unwrap\n    str x0, [x29, #32]\n    bl _strlen\n    str x0, [x29, #40]\n    ldr x0, [x29, #16]\n    bl _strlen\n    str x0, [x29, #48]\n    ldr x0, [x29, #24]\n    bl _strlen\n    str x0, [x29, #56]\n    ldr x0, [x29, #40]\n    lsl x0, x0, #2\n    add x0, x0, #64\n    bl _malloc\n    str x0, [x29, #64]\n    str xzr, [x29, #72]\n    ldr x0, [x29, #32]\n    str x0, [x29, #80]\n.Lsr_loop:\n    ldr x0, [x29, #80]\n    ldr x1, [x29, #16]\n    bl _strstr\n    cbz x0, .Lsr_rest\n    str x0, [x29, #88]\n    ldr x1, [x29, #80]\n    sub x2, x0, x1\n    ldr x3, [x29, #64]\n    ldr x4, [x29, #72]\n    add x5, x3, x4\n    mov x6, x2\n.Lsr_cp1:\n    cbz x6, .Lsr_cp1d\n    ldrb w7, [x1], #1\n    strb w7, [x5], #1\n    sub x6, x6, #1\n    b .Lsr_cp1\n.Lsr_cp1d:\n    ldr x4, [x29, #72]\n    add x4, x4, x2\n    ldr x1, [x29, #24]\n    ldr x6, [x29, #56]\n.Lsr_cp2:\n    cbz x6, .Lsr_cp2d\n    ldrb w7, [x1], #1\n    strb w7, [x5], #1\n    sub x6, x6, #1\n    b .Lsr_cp2\n.Lsr_cp2d:\n    ldr x6, [x29, #56]\n    add x4, x4, x6\n    str x4, [x29, #72]\n    ldr x0, [x29, #88]\n    ldr x1, [x29, #48]\n    add x0, x0, x1\n    str x0, [x29, #80]\n    b .Lsr_loop\n.Lsr_rest:\n    ldr x1, [x29, #80]\n    ldr x3, [x29, #64]\n    ldr x4, [x29, #72]\n    add x5, x3, x4\n.Lsr_cp3:\n    ldrb w7, [x1], #1\n    strb w7, [x5], #1\n    cbnz w7, .Lsr_cp3\n    ldr x0, [x29, #64]\n    bl _rail_wrap_str\n    str x0, [x29, #16]\n    ldr x0, [x29, #64]\n    bl _free\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #96\n    ret\n\n"
   -- str_split delim string → list (multi-char delimiter)
   let ssplit = "_rail_str_split:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x1, [x29, #24]\n    bl _str_unwrap\n    str x0, [x29, #16]\n    ldr x0, [x29, #24]\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _strlen\n    str x0, [x29, #32]\n    adrp x0, _rail_nil@PAGE\n    add x0, x0, _rail_nil@PAGEOFF\n    str x0, [x29, #40]\n    ldr x0, [x29, #24]\n    str x0, [x29, #48]\n.Lssp_loop:\n    ldr x0, [x29, #48]\n    ldr x1, [x29, #16]\n    bl _strstr\n    cbz x0, .Lssp_last\n    str x0, [x29, #56]\n    ldr x1, [x29, #48]\n    sub x2, x0, x1\n    add x0, x2, #1\n    bl _rail_chained_malloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #48]\n    ldr x3, [x29, #56]\n    sub x2, x3, x1\n    mov x4, x2\n.Lssp_cp:\n    cbz x4, .Lssp_cpd\n    ldrb w5, [x1], #1\n    strb w5, [x0], #1\n    sub x4, x4, #1\n    b .Lssp_cp\n.Lssp_cpd:\n    mov w5, #0\n    strb w5, [x0]\n    ldr x0, [sp], #16\n    bl _rail_wrap_str\n    ldr x1, [x29, #40]\n    bl _rail_cons\n    str x0, [x29, #40]\n    ldr x0, [x29, #56]\n    ldr x1, [x29, #32]\n    add x0, x0, x1\n    str x0, [x29, #48]\n    b .Lssp_loop\n.Lssp_last:\n    ldr x0, [x29, #48]\n    bl _strlen\n    add x0, x0, #1\n    bl _rail_chained_malloc\n    str x0, [sp, #-16]!\n    ldr x1, [x29, #48]\n    bl _strcpy\n    ldr x0, [sp], #16\n    bl _rail_wrap_str\n    ldr x1, [x29, #40]\n    bl _rail_cons\n    str x0, [x29, #40]\n    ldr x0, [x29, #40]\n    bl _rail_reverse\n    ldp x29, x30, [sp], #64\n    ret\n\n"
   -- read_line → string (reads one line from stdin)
@@ -2891,9 +2949,9 @@ rt_string =
 
 rt_float =
   -- show_float: d0 = double, returns string pointer in x0
-  let rshowf = "_rail_show_float:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str d0, [x29, #16]\n    mov x0, #32\n    bl _rail_chained_malloc\n    str x0, [x29, #24]\n    ldr d0, [x29, #16]\n    str d0, [sp, #-16]!\n    ldr x0, [x29, #24]\n    mov x1, #32\n    adrp x2, _fmt_gbare@PAGE\n    add x2, x2, _fmt_gbare@PAGEOFF\n    bl _snprintf\n    add sp, sp, #16\n    ldr x0, [x29, #24]\n    bl _rail_wrap_str\n    str x0, [x29, #16]\n    ldr x0, [x29, #24]\n    bl _free\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #32\n    ret\n\n"
+  let rshowf = "_rail_show_float:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str d0, [x29, #16]\n    mov x0, #32\n    bl _malloc\n    str x0, [x29, #24]\n    ldr d0, [x29, #16]\n    str d0, [sp, #-16]!\n    ldr x0, [x29, #24]\n    mov x1, #32\n    adrp x2, _fmt_gbare@PAGE\n    add x2, x2, _fmt_gbare@PAGEOFF\n    bl _snprintf\n    add sp, sp, #16\n    ldr x0, [x29, #24]\n    bl _rail_wrap_str\n    str x0, [x29, #16]\n    ldr x0, [x29, #24]\n    bl _free\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #32\n    ret\n\n"
   -- print_float: d0 = double, prints with newline
-  let rprintf = "_rail_print_float:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str d0, [x29, #16]\n    mov x0, #32\n    bl _rail_chained_malloc\n    str x0, [x29, #24]\n    ldr d0, [x29, #16]\n    str d0, [sp, #-16]!\n    ldr x0, [x29, #24]\n    mov x1, #32\n    adrp x2, _fmt_gbare@PAGE\n    add x2, x2, _fmt_gbare@PAGEOFF\n    bl _snprintf\n    add sp, sp, #16\n    ldr x0, [x29, #24]\n    bl _strlen\n    mov x2, x0\n    mov x0, #1\n    ldr x1, [x29, #24]\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov w0, #10\n    strb w0, [x29, #32]\n    mov x0, #1\n    add x1, x29, #32\n    mov x2, #1\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr x0, [x29, #24]\n    bl _free\n    mov x0, #1\n    ldp x29, x30, [sp], #48\n    ret\n\n"
+  let rprintf = "_rail_print_float:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    str d0, [x29, #16]\n    mov x0, #32\n    bl _malloc\n    str x0, [x29, #24]\n    ldr d0, [x29, #16]\n    str d0, [sp, #-16]!\n    ldr x0, [x29, #24]\n    mov x1, #32\n    adrp x2, _fmt_gbare@PAGE\n    add x2, x2, _fmt_gbare@PAGEOFF\n    bl _snprintf\n    add sp, sp, #16\n    ldr x0, [x29, #24]\n    bl _strlen\n    mov x2, x0\n    mov x0, #1\n    ldr x1, [x29, #24]\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov w0, #10\n    strb w0, [x29, #32]\n    mov x0, #1\n    add x1, x29, #32\n    mov x2, #1\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr x0, [x29, #24]\n    bl _free\n    mov x0, #1\n    ldp x29, x30, [sp], #48\n    ret\n\n"
   -- float_arr_new: x0 = size (tagged), d0 = init value (from x1 as raw bits)
   let rfarrnew = "_rail_float_arr_new:\n    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n    asr x2, x0, #1\n    str x2, [x29, #16]\n    fmov d0, x1\n    str d0, [x29, #24]\n    lsl x0, x2, #3\n    add x0, x0, #8\n    bl _rail_chained_malloc\n    str x0, [x29, #32]\n    ldr x2, [x29, #16]\n    str x2, [x0]\n    ldr d0, [x29, #24]\n    mov x3, #0\n    ldr x4, [x29, #32]\n.Lfan_loop:\n    cmp x3, x2\n    b.hs .Lfan_done\n    add x5, x3, #1\n    str d0, [x4, x5, lsl #3]\n    add x3, x3, #1\n    b .Lfan_loop\n.Lfan_done:\n    ldr x0, [x29, #32]\n    ldp x29, x30, [sp], #48\n    ret\n\n"
   -- float_arr_get: x0 = arr, x1 = idx (tagged) → raw double bits in x0
@@ -2904,10 +2962,10 @@ rt_float =
   let rfarrlen = "_rail_float_arr_len:\n    ldr x0, [x0]\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ret\n\n"
   -- float_arr_to_f32_file: x0 = path (str), x1 = arr, x2 = n (tagged)
   -- Writes n float32 values (converted from f64) to path. Returns 3 (true).
-  let rfartof32 = "_rail_float_arr_to_f32_file:\n    stp x29, x30, [sp, #-80]!\n    mov x29, sp\n    stp x19, x20, [x29, #48]\n    str x21, [x29, #64]\n    str x1, [x29, #16]\n    asr x2, x2, #1\n    str x2, [x29, #24]\n    bl _str_unwrap\n    mov x1, #0x601\n    mov x2, #0x1b6\n    movz x16, #5\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    cmp x0, #0\n    b.lt .Lf32w_err\n    str x0, [x29, #32]\n    ldr x21, [x29, #24]\n    lsl x0, x21, #2\n    bl _rail_chained_malloc\n    str x0, [x29, #40]\n    mov x19, #0\n    ldr x20, [x29, #16]\n.Lf32w_loop:\n    cmp x19, x21\n    b.hs .Lf32w_done\n    add x6, x19, #1\n    ldr d0, [x20, x6, lsl #3]\n    fcvt s0, d0\n    ldr x7, [x29, #40]\n    lsl x8, x19, #2\n    str s0, [x7, x8]\n    add x19, x19, #1\n    b .Lf32w_loop\n.Lf32w_done:\n    ldr x0, [x29, #32]\n    ldr x1, [x29, #40]\n    lsl x2, x21, #2\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr x0, [x29, #32]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x0, #3\n    ldp x19, x20, [x29, #48]\n    ldr x21, [x29, #64]\n    ldp x29, x30, [sp], #80\n    ret\n.Lf32w_err:\n    mov x0, #1\n    ldp x19, x20, [x29, #48]\n    ldr x21, [x29, #64]\n    ldp x29, x30, [sp], #80\n    ret\n\n"
+  let rfartof32 = "_rail_float_arr_to_f32_file:\n    stp x29, x30, [sp, #-80]!\n    mov x29, sp\n    stp x19, x20, [x29, #48]\n    str x21, [x29, #64]\n    str x1, [x29, #16]\n    asr x2, x2, #1\n    str x2, [x29, #24]\n    bl _str_unwrap\n    mov x1, #0x601\n    mov x2, #0x1b6\n    movz x16, #5\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    cmp x0, #0\n    b.lt .Lf32w_err\n    str x0, [x29, #32]\n    ldr x21, [x29, #24]\n    lsl x0, x21, #2\n    bl _malloc\n    str x0, [x29, #40]\n    mov x19, #0\n    ldr x20, [x29, #16]\n.Lf32w_loop:\n    cmp x19, x21\n    b.hs .Lf32w_done\n    add x6, x19, #1\n    ldr d0, [x20, x6, lsl #3]\n    fcvt s0, d0\n    ldr x7, [x29, #40]\n    lsl x8, x19, #2\n    str s0, [x7, x8]\n    add x19, x19, #1\n    b .Lf32w_loop\n.Lf32w_done:\n    ldr x0, [x29, #32]\n    ldr x1, [x29, #40]\n    lsl x2, x21, #2\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr x0, [x29, #40]\n    bl _free\n    ldr x0, [x29, #32]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x0, #3\n    ldp x19, x20, [x29, #48]\n    ldr x21, [x29, #64]\n    ldp x29, x30, [sp], #80\n    ret\n.Lf32w_err:\n    mov x0, #1\n    ldp x19, x20, [x29, #48]\n    ldr x21, [x29, #64]\n    ldp x29, x30, [sp], #80\n    ret\n\n"
   -- float_arr_from_f32_file: x0 = path (str), x1 = arr, x2 = n (tagged)
   -- Reads n float32 values from path into arr (converted to f64). Returns 3 (true).
-  let rfarfromf32 = "_rail_float_arr_from_f32_file:\n    stp x29, x30, [sp, #-80]!\n    mov x29, sp\n    stp x19, x20, [x29, #48]\n    str x21, [x29, #64]\n    str x1, [x29, #16]\n    asr x2, x2, #1\n    str x2, [x29, #24]\n    bl _str_unwrap\n    mov x1, #0\n    movz x16, #5\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    cmp x0, #0\n    b.lt .Lf32r_err\n    str x0, [x29, #32]\n    ldr x21, [x29, #24]\n    lsl x0, x21, #2\n    bl _rail_chained_malloc\n    str x0, [x29, #40]\n    ldr x0, [x29, #32]\n    ldr x1, [x29, #40]\n    lsl x2, x21, #2\n    movz x16, #3\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x19, #0\n    ldr x20, [x29, #16]\n.Lf32r_loop:\n    cmp x19, x21\n    b.hs .Lf32r_done\n    ldr x7, [x29, #40]\n    lsl x8, x19, #2\n    ldr s0, [x7, x8]\n    fcvt d0, s0\n    add x6, x19, #1\n    str d0, [x20, x6, lsl #3]\n    add x19, x19, #1\n    b .Lf32r_loop\n.Lf32r_done:\n    ldr x0, [x29, #32]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x0, #3\n    ldp x19, x20, [x29, #48]\n    ldr x21, [x29, #64]\n    ldp x29, x30, [sp], #80\n    ret\n.Lf32r_err:\n    mov x0, #1\n    ldp x19, x20, [x29, #48]\n    ldr x21, [x29, #64]\n    ldp x29, x30, [sp], #80\n    ret\n\n"
+  let rfarfromf32 = "_rail_float_arr_from_f32_file:\n    stp x29, x30, [sp, #-80]!\n    mov x29, sp\n    stp x19, x20, [x29, #48]\n    str x21, [x29, #64]\n    str x1, [x29, #16]\n    asr x2, x2, #1\n    str x2, [x29, #24]\n    bl _str_unwrap\n    mov x1, #0\n    movz x16, #5\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    cmp x0, #0\n    b.lt .Lf32r_err\n    str x0, [x29, #32]\n    ldr x21, [x29, #24]\n    lsl x0, x21, #2\n    bl _malloc\n    str x0, [x29, #40]\n    ldr x0, [x29, #32]\n    ldr x1, [x29, #40]\n    lsl x2, x21, #2\n    movz x16, #3\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x19, #0\n    ldr x20, [x29, #16]\n.Lf32r_loop:\n    cmp x19, x21\n    b.hs .Lf32r_done\n    ldr x7, [x29, #40]\n    lsl x8, x19, #2\n    ldr s0, [x7, x8]\n    fcvt d0, s0\n    add x6, x19, #1\n    str d0, [x20, x6, lsl #3]\n    add x19, x19, #1\n    b .Lf32r_loop\n.Lf32r_done:\n    ldr x0, [x29, #40]\n    bl _free\n    ldr x0, [x29, #32]\n    movz x16, #6\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov x0, #3\n    ldp x19, x20, [x29, #48]\n    ldr x21, [x29, #64]\n    ldp x29, x30, [sp], #80\n    ret\n.Lf32r_err:\n    mov x0, #1\n    ldp x19, x20, [x29, #48]\n    ldr x21, [x29, #64]\n    ldp x29, x30, [sp], #80\n    ret\n\n"
   cat [rshowf, rprintf, rfarrnew, rfarrget, rfarrset, rfarrlen, rfartof32, rfarfromf32]
 
 -- Effect handlers: try/catch with setjmp/longjmp
@@ -3302,7 +3360,6 @@ tc_builtin_ret fname =
   else if fname == "show" then ("any", "string", 1)
   else if fname == "print" then ("any", "int", 1)
   else if fname == "read_file" then ("string", "string", 1)
-  else if fname == "read_file_bytes" then ("string", "list", 1)
   else if fname == "shell" then ("string", "string", 1)
   else if fname == "chars" then ("string", "list", 1)
   else if fname == "char_to_int" then ("string", "int", 1)
@@ -3592,29 +3649,56 @@ get_runtime_dir _ =
   probe
 
 build prefix asm_text =
-  let _ = write_file (cat [prefix, ".s"]) asm_text
+  -- Use a unique mktemp prefix for the .s/.o/llm_tramp intermediates so that
+  -- concurrent `./rail_native <file>` invocations on the same host don't
+  -- clobber each other's assembler intermediates. The user-visible binary
+  -- still lands at `prefix` (per the documented contract: e.g. /tmp/rail_out).
+  -- Symptom prior to this: two agents racing on /tmp/rail_out.o, one wins the
+  -- ld stage and the other gets "No such file or directory" at exec time.
+  -- See memory entry: feedback_rail_test_tmp_race.
+  let tmp = trim (shell "mktemp -u /tmp/rail_build_XXXXXX")
+  let _ = write_file (cat [tmp, ".s"]) asm_text
   let uname = trim (shell "uname -s 2>/dev/null")
-  if uname == "Linux" then build_native_linux prefix asm_text
+  if uname == "Linux" then
+    let r = build_native_linux prefix asm_text
+    let _ = shell (cat ["rm -f ", tmp, ".s 2>/dev/null"])
+    r
   else
     let sdk = trim (shell "xcrun --show-sdk-path")
     let rtdir = get_runtime_dir 0
-    let as_result = trim (shell (cat ["as -o ", prefix, ".o ", prefix, ".s 2>&1"]))
+    let as_result = strip_trailing_ws (shell (cat ["as -o ", tmp, ".o ", tmp, ".s 2>&1"]))
     let _ = if as_result != "" then print (cat ["  as: ", as_result]) else print "  as: OK"
-    let has_llm = trim (shell (cat ["grep -c 'b _llm' ", prefix, ".s 2>/dev/null || echo 0"]))
+    let has_llm = trim (shell (cat ["grep -c 'b _llm' ", tmp, ".s 2>/dev/null || echo 0"]))
     let _ = if has_llm != "0" then
       let tramp = ".global _llm\n_llm:\n    b _rail_llm\n"
-      let _ = shell (cat ["echo '", tramp, "' > ", prefix, "_llm_tramp.s && as -o ", prefix, "_llm_tramp.o ", prefix, "_llm_tramp.s 2>&1"])
+      let _ = shell (cat ["echo '", tramp, "' > ", tmp, "_llm_tramp.s && as -o ", tmp, "_llm_tramp.o ", tmp, "_llm_tramp.s 2>&1"])
       0
     else 0
-    let rt_objs = if has_llm != "0" then cat [" ", rtdir, "/llm.o ", prefix, "_llm_tramp.o"] else ""
+    let rt_objs = if has_llm != "0" then cat [" ", rtdir, "/llm.o ", tmp, "_llm_tramp.o"] else ""
     -- Optionally link libtensor_gpu.dylib if present (for Rail programs using tgl_* foreign symbols)
     let has_gpu_lib = trim (shell "test -f tools/metal/libtensor_gpu.dylib && echo 1 || echo 0")
     let gpu_lib = if has_gpu_lib == "1" then " -L tools/metal -weak-ltensor_gpu" else ""
-    let ld_cmd = cat ["ld -o ", prefix, " ", prefix, ".o", rt_objs, gpu_lib, " -lSystem -syslibroot ", sdk, " -arch arm64 -stack_size 0x10000000 2>&1"]
-    let ld_result = trim (shell ld_cmd)
+    -- Optionally link jit/libjit_call.dylib if present (for the pure-Rail JIT's
+    -- direct-call trampoline; replaces pthread_create when Rail programs declare
+    -- `foreign jit_call fn arg -> int`).
+    let has_jit_lib = trim (shell "test -f jit/libjit_call.dylib && echo 1 || echo 0")
+    let jit_lib = if has_jit_lib == "1" then " -L jit -weak-ljit_call" else ""
+    -- Optionally link tools/desk/libquartz_bridge.dylib (for Rail programs using
+    -- qb_* CoreGraphics bridge symbols via stdlib/quartz.rail).
+    let has_quartz_lib = trim (shell "test -f tools/desk/libquartz_bridge.dylib && echo 1 || echo 0")
+    let quartz_lib = if has_quartz_lib == "1" then " -L tools/desk -weak-lquartz_bridge -framework CoreGraphics -framework Foundation -framework AppKit -framework ApplicationServices" else ""
+    -- Optionally link tools/runtime/libconcurrent.dylib (for Rail programs using
+    -- rcon_* blocking-channel + thread-spawn symbols via stdlib/concurrent.rail).
+    let has_concurrent_lib = trim (shell "test -f tools/runtime/libconcurrent.dylib && echo 1 || echo 0")
+    let concurrent_lib = if has_concurrent_lib == "1" then " -L tools/runtime -weak-lconcurrent" else ""
+    let ld_cmd = cat ["ld -o ", prefix, " ", tmp, ".o", rt_objs, gpu_lib, jit_lib, quartz_lib, concurrent_lib, " -lSystem -syslibroot ", sdk, " -arch arm64 -stack_size 0x10000000 2>&1"]
+    let ld_result = strip_trailing_ws (shell ld_cmd)
     let _ = if ld_result != "" then print (cat ["  ld: ", ld_result]) else print "  ld: OK"
     let _ = shell (cat ["codesign -s - ", prefix, " 2>&1"])
-    0
+    let _ = shell (cat ["rm -f ", tmp, ".s ", tmp, ".o ", tmp, "_llm_tramp.s ", tmp, "_llm_tramp.o 2>/dev/null"])
+    if as_result != "" then 1
+    else if ld_result != "" then 1
+    else 0
 
 build_native_linux prefix asm_text =
   -- On native Linux: use build_linux pipeline (transform macOS asm → Linux ELF).
@@ -3625,6 +3709,23 @@ build_native_linux prefix asm_text =
   0
 
 trim s = head (split "\n" s)
+
+-- Multi-line-preserving "strip trailing whitespace". Used for shell results
+-- that may legitimately span multiple lines (e.g. `ld` linker error output
+-- listing several undefined symbols). `trim` above truncates to the first
+-- line, which silently hides the actual error text -- the user sees only
+-- "ld: Undefined symbols" and has to re-run the link by hand to find what
+-- was missing. `strip_trailing_ws` walks back over trailing \n / space / \t
+-- / \r and slices via str_sub, preserving any interior newlines intact.
+strip_trailing_ws_loop s n =
+  if n <= 0 then ""
+  else
+    let c = str_sub s (n - 1) 1
+    if c == "\n" || c == " " then strip_trailing_ws_loop s (n - 1)
+    else if c == "\t" || c == "\r" then strip_trailing_ws_loop s (n - 1)
+    else str_sub s 0 n
+
+strip_trailing_ws s = strip_trailing_ws_loop s (length s)
 
 run_test name src expected =
   let _ = print (cat ["  --- ", name, " ---"])
@@ -3696,9 +3797,7 @@ compile_file prefix path =
   let _ = print (cat ["Compiling ", path, " (", show (length src), " chars)..."])
   let asm = compile_program_with_file src path
   if length asm == 0 then 1
-  else
-    let _ = build prefix asm
-    0
+  else build prefix asm
 
 -- Track B: dump cross-function return-type inference for one or more files.
 -- Reports per-fn type and aggregate coverage (% non-UNKNOWN). Used to verify
@@ -3800,7 +3899,7 @@ run_tests _ =
   let t27 = run_test "tup3" "main =\n  let (a, b, c) = (100, 20, 3)\n  a + b + c" "123"
   let t28 = run_test "chars" "main =\n  let cs = chars \"abc\"\n  let _ = print (head cs)\n  length cs" "a"
   let t29 = run_test "split" "main =\n  let _ = print (head (tail (split \",\" \"a,b,c\")))\n  0" "b"
-  let t30 = run_test "fileio" "main =\n  let _ = write_file \"/tmp/rail_test.txt\" \"hello42\"\n  let s = read_file \"/tmp/rail_test.txt\"\n  let _ = print s\n  0" "hello42"
+  let t30 = run_test "fileio" "main =\n  let _ = write_file \"/tmp/rail_native_t30_fileio.txt\" \"hello42\"\n  let s = read_file \"/tmp/rail_native_t30_fileio.txt\"\n  let _ = print s\n  0" "hello42"
   let t31 = run_test "shell" "main =\n  let _ = print (head (split \"\\n\" (shell \"echo hi\")))\n  0" "hi"
   let t32 = run_test "integ" "cat parts = join \"\" parts\ndbl x = x * 2\nmain =\n  let xs = map dbl [3, 5, 7]\n  let (a, b) = (head xs, length xs)\n  let _ = print (cat [\"sum=\", show (a + b)])\n  0" "sum=9"
   let t33 = run_test "tco" "loop n = if n == 0 then 42 else loop (n - 1)\nmain =\n  let _ = print (show (loop 50000))\n  0" "42"
@@ -3818,8 +3917,8 @@ run_tests _ =
   let home = trim (shell "echo $HOME")
   let t45 = run_test "ffi_getenv" "foreign getenv s -> str\nmain =\n  let _ = print (getenv \"HOME\")\n  0" home
   let t46 = run_test "wildcard" "type T = | A x | B x | C\nmain = match (B 99)\n  | A x -> 0\n  | _ -> 42" "42"
-  let _ = write_file "/tmp/rail_importlib.rail" "double x = x * 2\ntriple x = x * 3\n"
-  let t47 = run_test "import" "import \"/tmp/rail_importlib.rail\"\nmain = double 21 + triple 1" "45"
+  let _ = write_file "/tmp/rail_native_t47_importlib.rail" "double x = x * 2\ntriple x = x * 3\n"
+  let t47 = run_test "import" "import \"/tmp/rail_native_t47_importlib.rail\"\nmain = double 21 + triple 1" "45"
   let t48 = run_test "arena" "main =\n  let m = arena_mark 0\n  let _ = cons 1 [2, 3]\n  let _ = arena_reset m\n  42" "42"
   let t49 = run_test "filter" "gt2 x = if x > 2 then true else false\nmain = length (filter gt2 [1, 2, 3, 4, 5])" "3"
   let t50 = run_test "fold" "add a b = a + b\nmain = fold add 0 [1, 2, 3, 4, 5]" "15"
@@ -3832,8 +3931,8 @@ run_tests _ =
   let t57 = run_test "spawn" "work x = x * 2\nmain =\n  let f = spawn (\\x -> work 21)\n  fiber_await f" "42"
   let t58 = run_test "match_int" "classify n = match n\n  | 0 -> \"zero\"\n  | 1 -> \"one\"\n  | _ -> \"other\"\nmain =\n  let _ = print (classify 1)\n  0" "one"
   let t59 = run_test "guard" "type Option = | Some x | None\nsafe_div a b = match b\n  | 0 -> None\n  | _ -> Some (a / b)\nmain = match (safe_div 10 2)\n  | Some x -> x\n  | None -> 0" "5"
-  let _ = write_file "/tmp/rail_quallib.rail" "double x = x * 2\n_private x = x\n"
-  let t60 = run_test "qual_import" "import \"/tmp/rail_quallib.rail\" as M\nmain = M_double 21" "42"
+  let _ = write_file "/tmp/rail_native_t60_quallib.rail" "double x = x * 2\n_private x = x\n"
+  let t60 = run_test "qual_import" "import \"/tmp/rail_native_t60_quallib.rail\" as M\nmain = M_double 21" "42"
   let t61 = run_test "rc" "foreign free p\nmain =\n  let p = rc_alloc 16\n  let _ = rc_retain p\n  let _ = rc_release p\n  let _ = rc_release p\n  42" "42"
   let t62 = run_test "channel" "main =\n  let ch = channel 0\n  let _ = send ch 10\n  let _ = send ch 20\n  let _ = send ch 30\n  let a = recv ch\n  let b = recv ch\n  a + b" "30"
   let t63 = run_test "ffi_float" "foreign sqrt x -> float\nmain =\n  let _ = print (show (to_int (sqrt (to_float 144))))\n  0" "12"
@@ -3888,7 +3987,7 @@ run_tests _ =
   let t101 = run_test "sci_notation_int_exp" "main =\n  let v = 1e6 +. 5.0e2\n  let _ = print (show (to_int v))\n  0" "1000500"
   let t102 = run_test "sci_notation_frac" "main =\n  let v = 1.5e3 +. 2.5e-1 *. 4.0\n  let _ = print (show (to_int v))\n  0" "1501"
   let t103 = run_test "null_safe_eq" "type T = | T x\nmain =\n  let t = T 42\n  let a = arr_new 2 0\n  let _ = arr_set a 1 t\n  let v0 = arr_get a 0\n  let v1 = arr_get a 1\n  let z0 = if v0 == 0 then 1 else 0\n  let z1 = if v1 == 0 then 1 else 0\n  z0 * 10 + z1" "10"
-  let t104 = run_test "f32_io_roundtrip" "main =\n  let src = float_arr_new 3 0.0\n  let _ = float_arr_set src 0 1.5\n  let _ = float_arr_set src 1 (0.0 -. 3.25)\n  let _ = float_arr_set src 2 0.125\n  let _ = float_arr_to_f32_file \"/tmp/rail_test_f32.bin\" src 3\n  let dst = float_arr_new 3 0.0\n  let _ = float_arr_from_f32_file \"/tmp/rail_test_f32.bin\" dst 3\n  let s = float_arr_get dst 0 +. float_arr_get dst 1 +. float_arr_get dst 2\n  let _ = print (show (to_int (s *. 8.0)))\n  0" "-13"
+  let t104 = run_test "f32_io_roundtrip" "main =\n  let src = float_arr_new 3 0.0\n  let _ = float_arr_set src 0 1.5\n  let _ = float_arr_set src 1 (0.0 -. 3.25)\n  let _ = float_arr_set src 2 0.125\n  let _ = float_arr_to_f32_file \"/tmp/rail_native_t104_f32roundtrip.bin\" src 3\n  let dst = float_arr_new 3 0.0\n  let _ = float_arr_from_f32_file \"/tmp/rail_native_t104_f32roundtrip.bin\" dst 3\n  let s = float_arr_get dst 0 +. float_arr_get dst 1 +. float_arr_get dst 2\n  let _ = print (show (to_int (s *. 8.0)))\n  0" "-13"
   let t105 = run_test "tensor_prims" "import \"stdlib/tensor.rail\"\nmain =\n  let x = tensor_new (cons 4 []) 0.0\n  let _ = tensor_set_flat x 0 (0.0 - 2.0)\n  let _ = tensor_set_flat x 1 0.5\n  let _ = tensor_set_flat x 2 (0.0 - 1.0)\n  let _ = tensor_set_flat x 3 3.0\n  let m = tensor_relu_mask x\n  let n = tensor_get_flat m 0 + tensor_get_flat m 1 + tensor_get_flat m 2 + tensor_get_flat m 3\n  to_int n" "2"
   -- t106: runtime type-check promotion in float ops. When one operand is
   -- a float literal and the other is an int variable that isn't statically
@@ -3939,6 +4038,15 @@ run_tests _ =
   let t129 = run_test "tls13_parse_server_hello" "import \"stdlib/tls13_hs.rail\"\nmain =\n  let sh = hex_to_bytes \"020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304\"\n  let r = tls13_parse_server_hello sh 90\n  let _ = print (cat [show (arr_get r 3), \" \", show (arr_get r 1), \" \", bytes_to_hex (arr_get r 2) 32])\n  0" "1 4865 c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f"
   let t130 = run_test "tls13_record_roundtrip" "import \"stdlib/tls13.rail\"\nimport \"stdlib/tls13_record.rail\"\nmain =\n  let key = hex_to_bytes \"808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f\"\n  let iv  = hex_to_bytes \"070000004041424344454647\"\n  let frag = string_to_bytes \"Hello, TLS 1.3!\"\n  let enc = tls13_record_encrypt key iv 0 22 frag 15\n  let wire = arr_get enc 0\n  let wire_len = arr_get enc 1\n  let dec = tls13_record_decrypt key iv 0 wire wire_len\n  let _ = print (cat [bytes_to_hex wire wire_len, \" \", show (arr_get dec 3), \" \", show (arr_get dec 1), \" \", bytes_to_hex (arr_get dec 0) (arr_get dec 2)])\n  0" "1703030020d71e85316ed160ee59b1afca18b22bb8683ce64dc136d5a0b2a318ce895ca9f4 1 22 48656c6c6f2c20544c5320312e3321"
   let t131 = run_test "tls13_handshake_msg_parsers" "import \"stdlib/tls13_hs.rail\"\nmain =\n  let stream = hex_to_bytes \"0800000200000b00000e0000000a000005616263646500000f00000c08040008414243444546474814000020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n  let m1 = tls13_hs_read_msg stream 0\n  let v1 = tls13_parse_encrypted_extensions stream (arr_get m1 1) (arr_get m1 2)\n  let m2 = tls13_hs_read_msg stream (arr_get m1 3)\n  let cert = tls13_parse_certificate stream (arr_get m2 1) (arr_get m2 2)\n  let m3 = tls13_hs_read_msg stream (arr_get m2 3)\n  let cv = tls13_parse_certificate_verify stream (arr_get m3 1) (arr_get m3 2)\n  let m4 = tls13_hs_read_msg stream (arr_get m3 3)\n  let fin = tls13_parse_finished stream (arr_get m4 1) (arr_get m4 2)\n  let _ = print (cat [show (arr_get m1 0), \" \", show v1, \" \", show (arr_get m2 0), \" \", show (arr_get cert 2), \" \", bytes_to_hex (arr_get cert 0) (arr_get cert 1), \" \", show (arr_get m3 0), \" \", show (arr_get cv 0), \" \", bytes_to_hex (arr_get cv 1) (arr_get cv 2), \" \", show (arr_get m4 0), \" \", show (arr_get fin 2), \" \", bytes_to_hex (arr_get fin 0) (arr_get fin 1)])\n  0" "8 1 11 1 6162636465 15 2052 4142434445464748 20 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  -- t132/t133: 3-movk and 4-movk integer literals. Pre-fix, emit_load_int
+  -- only handled lo/hi/hi1/hi2 chunks (bits 0-47), and hi2 was unmasked so
+  -- it overflowed 16 bits for bit-48+ literals -> `as: immediate must be
+  -- in range [0, 65535]`. Diff_fuzz LCG seed surfaced the bug 2026-05-11.
+  -- t132 exercises a 3-movk literal (bit 40 set). t133 exercises a 4-movk
+  -- literal (bit 48 set). Negative variant (t134) tests the movn path.
+  let t132 = run_test "int_lit_3movk" "main =\n  let n = 1099511627776\n  let _ = print (show n)\n  0" "1099511627776"
+  let t133 = run_test "int_lit_4movk" "main =\n  let n = 281474976710656\n  let _ = print (show n)\n  0" "281474976710656"
+  let t134 = run_test "int_lit_4movk_neg" "main =\n  let n = 0 - 281474976710656\n  let _ = print (show n)\n  0" "-281474976710656"
   let s1 = (if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0)
   let s2 = (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0)
   let s3 = (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0)
@@ -3949,7 +4057,7 @@ run_tests _ =
   let s8 = (if t71 then 1 else 0) + (if t72 then 1 else 0) + (if t73 then 1 else 0) + (if t74 then 1 else 0) + (if t75 then 1 else 0) + (if t76 then 1 else 0) + (if t77 then 1 else 0) + (if t78 then 1 else 0) + (if t79 then 1 else 0) + (if t80 then 1 else 0)
   let s9 = (if t81 then 1 else 0) + (if t82 then 1 else 0) + (if t83 then 1 else 0) + (if t84 then 1 else 0) + (if t85 then 1 else 0) + (if t86 then 1 else 0) + (if t87 then 1 else 0) + (if t88 then 1 else 0) + (if t89 then 1 else 0) + (if t90 then 1 else 0)
   let s10 = (if t91 then 1 else 0) + (if t92 then 1 else 0) + (if t93 then 1 else 0) + (if t94 then 1 else 0) + (if t95 then 1 else 0) + (if t96 then 1 else 0) + (if t97 then 1 else 0) + (if t98 then 1 else 0)
-  let s11 = (if t99 then 1 else 0) + (if t100 then 1 else 0) + (if t101 then 1 else 0) + (if t102 then 1 else 0) + (if t103 then 1 else 0) + (if t104 then 1 else 0) + (if t105 then 1 else 0) + (if t106 then 1 else 0) + (if t107 then 1 else 0) + (if t108 then 1 else 0) + (if t109 then 1 else 0) + (if t110 then 1 else 0) + (if t111 then 1 else 0) + (if t112 then 1 else 0) + (if t113 then 1 else 0) + (if t114 then 1 else 0) + (if t115 then 1 else 0) + (if t116 then 1 else 0) + (if t117 then 1 else 0) + (if t118 then 1 else 0) + (if t119 then 1 else 0) + (if t120 then 1 else 0) + (if t121 then 1 else 0) + (if t122 then 1 else 0) + (if t123 then 1 else 0) + (if t124 then 1 else 0) + (if t125 then 1 else 0) + (if t126 then 1 else 0) + (if t127 then 1 else 0) + (if t128 then 1 else 0) + (if t129 then 1 else 0) + (if t130 then 1 else 0) + (if t131 then 1 else 0)
+  let s11 = (if t99 then 1 else 0) + (if t100 then 1 else 0) + (if t101 then 1 else 0) + (if t102 then 1 else 0) + (if t103 then 1 else 0) + (if t104 then 1 else 0) + (if t105 then 1 else 0) + (if t106 then 1 else 0) + (if t107 then 1 else 0) + (if t108 then 1 else 0) + (if t109 then 1 else 0) + (if t110 then 1 else 0) + (if t111 then 1 else 0) + (if t112 then 1 else 0) + (if t113 then 1 else 0) + (if t114 then 1 else 0) + (if t115 then 1 else 0) + (if t116 then 1 else 0) + (if t117 then 1 else 0) + (if t118 then 1 else 0) + (if t119 then 1 else 0) + (if t120 then 1 else 0) + (if t121 then 1 else 0) + (if t122 then 1 else 0) + (if t123 then 1 else 0) + (if t124 then 1 else 0) + (if t125 then 1 else 0) + (if t126 then 1 else 0) + (if t127 then 1 else 0) + (if t128 then 1 else 0) + (if t129 then 1 else 0) + (if t130 then 1 else 0) + (if t131 then 1 else 0) + (if t132 then 1 else 0) + (if t133 then 1 else 0) + (if t134 then 1 else 0)
   -- Track B: cross-function return-type inference (precise-GC plan).
   let i1 = run_infer_test "pure_int" "square x = x * x\nmain = square 7" "square" 1
   let i2 = run_infer_test "pure_float" "halve x = x +. 0.0\nmain = 0" "halve" 2
@@ -3959,8 +4067,8 @@ run_tests _ =
   let i6 = run_infer_test "match_int" "type Shape = | Circ r | Sq s\narea sh = match sh\n  | Circ r -> r * r * 3\n  | Sq s -> s * s\nmain = 0" "area" 1
   let s_inf = (if i1 then 1 else 0) + (if i2 then 1 else 0) + (if i3 then 1 else 0) + (if i4 then 1 else 0) + (if i5 then 1 else 0) + (if i6 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s_inf
-  let _ = print (cat [show total, "/137 tests passed"])
-  if total == 137 then 0 else 1
+  let _ = print (cat [show total, "/140 tests passed"])
+  if total == 140 then 0 else 1
 
 self_compile _ =
   let _ = print "\n=== Self-compilation ==="
@@ -3970,10 +4078,10 @@ self_compile _ =
   let _ = write_file "/tmp/rail_self.s" self_asm
   let _ = print "  Compiled to assembly"
   let sdk = trim (shell "xcrun --show-sdk-path")
-  let as_res = trim (shell "as -o /tmp/rail_self.o /tmp/rail_self.s 2>&1")
+  let as_res = strip_trailing_ws (shell "as -o /tmp/rail_self.o /tmp/rail_self.s 2>&1")
   let _ = if as_res != "" then print (cat ["  as: ", as_res]) else print "  as: OK"
   let rtdir2 = get_runtime_dir 0
-  let ld_res = trim (shell (cat ["ld -o /tmp/rail_self /tmp/rail_self.o -lSystem -syslibroot ", sdk, " -arch arm64 -stack_size 0x10000000 2>&1"]))
+  let ld_res = strip_trailing_ws (shell (cat ["ld -o /tmp/rail_self /tmp/rail_self.o -lSystem -syslibroot ", sdk, " -arch arm64 -stack_size 0x10000000 2>&1"]))
   let _ = if ld_res != "" then print (cat ["  ld: ", ld_res]) else print "  ld: OK"
   let _ = shell "codesign -s - /tmp/rail_self 2>&1"
   let _ = print "  Binary: /tmp/rail_self"
@@ -3985,6 +4093,31 @@ join_args lst n =
     else join_args (tail lst) (n - 1)
   else join " " lst
 
+-- Shell-quote a single argument for safe interpolation into a `shell` command.
+-- Wraps in single quotes and escapes embedded single-quotes as `'\''` (POSIX
+-- standard idiom). Preserves spaces, tabs, globs, $-expansions, etc.
+-- Empty string becomes `''` (a valid empty shell argument), not `` (which
+-- the shell would swallow entirely).
+shell_quote_arg s =
+  if length s == 0 then "''"
+  else cat ["'", str_replace "'" "'\\''" s, "'"]
+
+-- Shell-quote each element of `lst` and join with single spaces. Used for
+-- forwarding `rail_native run`'s trailing argv to the child process. The
+-- naive `join " " lst` flattens "hello world" into two arguments; this
+-- helper preserves the one-to-one argv mapping.
+shell_quote_join lst =
+  if length lst == 0 then ""
+  else join " " (map shell_quote_arg lst)
+
+-- Like `join_args` but shell-quotes each element so embedded spaces /
+-- specials survive the `shell` call in compile_and_run.
+join_args_quoted lst n =
+  if n > 0 then
+    if length lst == 0 then ""
+    else join_args_quoted (tail lst) (n - 1)
+  else shell_quote_join lst
+
 compile_and_run prefix path extra =
   let _ = compile_file prefix path
   let cmd = if length extra > 0 then cat [prefix, " ", extra, " 2>&1"] else cat [prefix, " 2>&1"]
@@ -3992,70 +4125,45 @@ compile_and_run prefix path extra =
   let _ = if length out > 0 then print out else 0
   0
 
+-- Parse-only check. Runs tokenize + pprog + ce_decls. Skips codegen + as + ld.
+-- Returns 0 if the file parses cleanly, 1 if there are parse errors.
+-- Used by grammar-walked sampling to verify-as-you-decode without paying
+-- the full compile pipeline cost (~145ms → ~30-50ms).
+dispatch_parse_check path =
+  let src = read_file path
+  let (toks, positions) = tokenize_with_pos src
+  let ntoks = length toks
+  let decls = pprog toks
+  let errs = ce_decls decls
+  let nerrs = report_errors errs positions ntoks path
+  if nerrs > 0 then 1 else 0
+
 build_linux asm_text =
   let _ = write_file "/tmp/rail_macos.s" asm_text
   -- Transform macOS assembly to GNU/Linux ELF syntax
   let uname_check = trim (shell "uname -s 2>/dev/null")
-  -- Mach-O→ELF transform. Three classes:
-  --   1) section directives: __TEXT/__text → .text, __DATA/__data → .data
-  --   2) page-relative addressing: @PAGE/@PAGEOFF → :lo12: form
-  --   3) Mach-O-only directives that have no ELF equivalent:
-  --        .zerofill   (replaced with .bss + .space below)
-  --        .section __DATA,__mod_init_func,mod_init_funcs (and the
-  --          two following lines that name the constructor) — Linux
-  --          uses .init_array, but our custom _start wrapper calls
-  --          _rail_arena_init explicitly so we drop the stanza entirely.
-  -- (An earlier branch routed through fleet0's /home/zemog/tools/transform.sh
-  -- on native Linux, but that script lacked the __mod_init_func awk and
-  -- the runtime-stub strip — caused duplicate-symbol assembler errors on
-  -- Pi self-host. Always use the in-tree sed+awk now.)
-  -- Anchor section-directive substitutions to ^ — without that, the sed
-  -- patterns silently rewrite their own string literals when compile.rail
-  -- cross-compiles itself (the sed-command string contains the
-  -- `.section __DATA,__data` pattern, gets emitted as `.asciz "..."` in
-  -- the .s, then THIS sed run rewrites that .asciz, dropping the sed
-  -- string from the next-generation binary). Caught self-host on Pi 2026-05-02.
-  let _ = shell "sed -E -e 's/^\\.section __TEXT,__text/.text/' -e 's/^\\.section __DATA,__data/.data/' -e 's/([_a-zA-Z][_a-zA-Z0-9]*)@PAGEOFF/:lo12:\\1/g' -e 's/@PAGEOFF/RAIL_TMP_PGOFF/g' -e 's/@PAGE//g' -e 's/RAIL_TMP_PGOFF/@PAGEOFF/g' -e '/^\\.zerofill/d' -e 's/^\\.comm ([^,]+),(.+),3/.comm \\1,\\2,8/g' /tmp/rail_macos.s > /tmp/rail_linux_pre.s"
-  let _ = shell "awk '/^\\.section __DATA,__mod_init_func/{skip=3} skip>0{skip--;next} {print}' /tmp/rail_linux_pre.s > /tmp/rail_linux_code.s"
-  -- Linux _start entry. Saves argc/argv/envp into the rail globals,
-  -- calls the runtime arena initializer (Mach-O does this automatically
-  -- via __mod_init_func; ELF's .init_array equivalent is dropped above
-  -- so we invoke it explicitly), then jumps to _main and exits via
-  -- syscall. Linux startup stack layout: [argc | argv[0..argc] |
-  -- NULL | envp[0..n] | NULL | auxv]. envp pointer is at sp + 8 +
-  -- (argc+1)*8 = sp + 8*(argc+2). Without this, _main's prologue
-  -- saves a stale x2 into _rail_envp and shell-spawned children get
-  -- an empty environment (caught 2026-05-02 — sign_attestation.sh
-  -- failed with `HOME: unbound variable`).
-  let start_wrapper = "\n.text\n.global _start\n_start:\n    mov x29, sp\n    bl _rail_arena_init\n    ldr x0, [sp]\n    add x1, sp, #8\n    add x2, x0, #2\n    lsl x2, x2, #3\n    add x2, sp, x2\n    bl _main\n    mov x8, #93\n    svc #0\n\n"
+  let has_transform = trim (shell "test -f ~/tools/transform.sh && echo yes || echo no")
+  let _ = if uname_check == "Linux" && has_transform == "yes" then
+    shell "~/tools/transform.sh /tmp/rail_macos.s /tmp/rail_linux_code.s"
+  else
+    shell "sed -E -e 's/\\.section __TEXT,__text/.text/' -e 's/\\.section __DATA,__data/.data/' -e 's/([_a-zA-Z][_a-zA-Z0-9]*)@PAGEOFF/:lo12:\\1/g' -e 's/@PAGEOFF/RAIL_TMP_PGOFF/g' -e 's/@PAGE//g' -e 's/RAIL_TMP_PGOFF/@PAGEOFF/g' -e '/\\.zerofill/d' -e 's/\\.comm ([^,]+),(.+),3/.comm \\1,\\2,8/g' /tmp/rail_macos.s > /tmp/rail_linux_code.s"
+  let start_wrapper = "\n.text\n.global _start\n_start:\n    mov x29, sp\n    ldr x0, [sp]\n    add x1, sp, #8\n    bl _main\n    mov x8, #93\n    svc #0\n\n"
   let bss = "\n.bss\n.p2align 3\n_rail_heap:\n    .space 1073741824\n"
   let _ = write_file "/tmp/rail_linux_start.s" start_wrapper
   let _ = write_file "/tmp/rail_linux_bss.s" bss
   -- Find linux_libc.s (in cwd/tools/ or alongside binary)
   let libc_path = trim (shell "ls tools/linux_libc.s 2>/dev/null || ls ~/tools/linux_libc.s 2>/dev/null || ls ~/projects/rail/tools/linux_libc.s 2>/dev/null || echo MISSING")
-  -- linux_data.s used to be a fallback when an older Pi-bootstrapped
-  -- compiler didn't emit its own data section. The current cross-compile
-  -- flow always emits data via data_section_asm + the Mach-O→ELF transform,
-  -- so including linux_data.s would duplicate _fmt_int / _rail_nil / etc.
-  -- Drop it.
-  let data_path = ""
+  -- On native Linux, include data section fallback (compiler may not emit its own)
+  let data_path = if uname_check == "Linux" then
+    trim (shell "ls tools/linux_data.s 2>/dev/null || ls ~/tools/linux_data.s 2>/dev/null || echo ''")
+  else ""
   -- Strip Mac-emitted runtime stubs that collide with linux_libc.s.
   -- Mac codegen inlines _strlen/_strcmp/_strcpy/_strcat/_atoi/_strstr/_read/_free
   -- as ARM64 assembly. Linux build uses syscall-based versions in linux_libc.s.
   -- awk: enter skip mode at any of these labels; exit when next ^_ label appears.
-  -- Strip Mac runtime stubs that collide with linux_libc.s (or that have
-  -- Darwin-only syscall ABI). End-of-function detection: the next
-  -- `^_<letter>` label OR a section directive (`.section`/`.data`/
-  -- `.text`/`.global`). Without the section-directive arm, stripping
-  -- _rail_arena_init at the tail of the .text block would also skip the
-  -- `.data` directive that prefixes data_section_asm's heap globals,
-  -- landing _rail_heap_base/_ptr/_end in the read-only .text segment
-  -- (caught 2026-05-02 cross-compile bisect).
-  -- Always strip — duplicate symbols across the Mac stubs and linux_libc.s
-  -- happen on both cross (Mac→Linux) and native Linux builds. Earlier this
-  -- was guarded behind `uname != Linux` and self-host on Pi failed at the
-  -- assembler with `symbol 'strlen' is already defined`.
-  let _ = shell "awk 'BEGIN{skip=0} /^_(strlen|strcmp|strcpy|strcat|atoi|strstr|read|free|fopen|fwrite|fread|fclose|fseek|ftell|fflush|malloc|setjmp|longjmp|write|printf|snprintf|open|close|ioctl|rail_print|rail_arena_init|rail_print_float|rail_shell|rail_malloc_chain_drain):$/{skip=1;next} skip && (/^_[a-z]/ || /^\\.(section|data|text|global)/){skip=0} !skip' /tmp/rail_linux_code.s > /tmp/rail_linux_code_stripped.s && mv /tmp/rail_linux_code_stripped.s /tmp/rail_linux_code.s"
+  let _ = if uname_check != "Linux" then
+    shell "awk 'BEGIN{skip=0} /^_(strlen|strcmp|strcpy|strcat|atoi|strstr|read|free|fopen|fwrite|fread|fclose|fseek|ftell|fflush|malloc|setjmp|longjmp|write|printf|snprintf|open|close|ioctl):$/{skip=1;next} skip && /^_[a-z]/{skip=0} !skip' /tmp/rail_linux_code.s > /tmp/rail_linux_code_stripped.s && mv /tmp/rail_linux_code_stripped.s /tmp/rail_linux_code.s"
+  else 0
   let _ = shell (cat ["cat /tmp/rail_linux_code.s /tmp/rail_linux_start.s ", libc_path, " ", data_path, " /tmp/rail_linux_bss.s > /tmp/rail_linux.s"])
   -- Detect if running on Linux (native) or macOS (cross)
   let uname = trim (shell "uname -s 2>/dev/null")
@@ -4170,7 +4278,6 @@ compile_linux path =
 is_banned name =
   if name == "shell" then true
   else if name == "read_file" then true
-  else if name == "read_file_bytes" then true
   else if name == "write_file" then true
   else if name == "import" then true
   else if name == "spawn" then true
@@ -5366,28 +5473,49 @@ x86_get_opc_inline op lc =
   let heap_lbl = cat [".Lx_op_heap_", show lc]
   let done_lbl = cat [".Lx_op_done_", show lc]
   let check = cat ["    test rcx, 1\n    jz ", heap_lbl, "\n"]
+  -- For `+`, the int fast-path assumes BOTH operands are tagged-int. The
+  -- single-operand `test rcx,1` only covers (heap LHS, *). For (tagged-int
+  -- LHS, heap RHS) the fast-path produces garbage by adding a pointer to a
+  -- tagged-int. Route those through _rail_add too (which now has a mirror
+  -- branch for (int, float) — see .Ladd_mixed_if in tools/x86_rt.s). The
+  -- check_both uses an `and r10, rcx, rax; test r10, 1` to take ONE branch
+  -- instead of two — same number of fast-path instructions, just sequenced
+  -- before the add. Same bug class extended to -, *, /, %, <, >, <=, >=
+  -- on 2026-05-12 — each operator now uses check_both and each runtime
+  -- helper has a `.L<op>_mixed_if` mirror branch (see tools/x86_rt.s).
+  let check_both = cat ["    mov r10, rcx\n    and r10, rax\n    test r10, 1\n    jz ", heap_lbl, "\n"]
   let int_end = cat ["    jmp ", done_lbl, "\n"]
   let fb_end = cat [done_lbl, ":\n"]
-  if op == "+" then cat [check, "    add rax, rcx\n    dec rax\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_add@PLT\n", fb_end]
-  else if op == "-" then cat [check, "    sub rcx, rax\n    lea rax, [rcx+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_sub@PLT\n", fb_end]
-  else if op == "*" then cat [check, "    sar rcx, 1\n    sar rax, 1\n    imul rax, rcx\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_mul@PLT\n", fb_end]
-  else if op == "/" then cat [check, "    mov r10, rax\n    sar r10, 1\n    mov rax, rcx\n    sar rax, 1\n    cqo\n    idiv r10\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_div@PLT\n", fb_end]
-  else if op == "%" then cat [check, "    mov r10, rax\n    sar r10, 1\n    mov rax, rcx\n    sar rax, 1\n    cqo\n    idiv r10\n    lea rax, [rdx*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_mod@PLT\n", fb_end]
-  else if op == "<" then cat [check, "    cmp rcx, rax\n    setl al\n    movzx rax, al\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_lt@PLT\n", fb_end]
-  else if op == ">" then cat [check, "    cmp rcx, rax\n    setg al\n    movzx rax, al\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_gt@PLT\n", fb_end]
-  else if op == "<=" then cat [check, "    cmp rcx, rax\n    setle al\n    movzx rax, al\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_le@PLT\n", fb_end]
-  else if op == ">=" then cat [check, "    cmp rcx, rax\n    setge al\n    movzx rax, al\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_ge@PLT\n", fb_end]
+  if op == "+" then cat [check_both, "    add rax, rcx\n    dec rax\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_add@PLT\n", fb_end]
+  else if op == "-" then cat [check_both, "    sub rcx, rax\n    lea rax, [rcx+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_sub@PLT\n", fb_end]
+  else if op == "*" then cat [check_both, "    sar rcx, 1\n    sar rax, 1\n    imul rax, rcx\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_mul@PLT\n", fb_end]
+  else if op == "/" then cat [check_both, "    mov r10, rax\n    sar r10, 1\n    mov rax, rcx\n    sar rax, 1\n    cqo\n    idiv r10\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_div@PLT\n", fb_end]
+  else if op == "%" then cat [check_both, "    mov r10, rax\n    sar r10, 1\n    mov rax, rcx\n    sar rax, 1\n    cqo\n    idiv r10\n    lea rax, [rdx*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_mod@PLT\n", fb_end]
+  else if op == "<" then cat [check_both, "    cmp rcx, rax\n    setl al\n    movzx rax, al\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_lt@PLT\n", fb_end]
+  else if op == ">" then cat [check_both, "    cmp rcx, rax\n    setg al\n    movzx rax, al\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_gt@PLT\n", fb_end]
+  else if op == "<=" then cat [check_both, "    cmp rcx, rax\n    setle al\n    movzx rax, al\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_le@PLT\n", fb_end]
+  else if op == ">=" then cat [check_both, "    cmp rcx, rax\n    setge al\n    movzx rax, al\n    lea rax, [rax*2+1]\n", int_end, heap_lbl, ":\n    mov rdi, rcx\n    mov rsi, rax\n    call _rail_ge@PLT\n", fb_end]
   else if op == "==" then "    mov rdi, rcx\n    mov rsi, rax\n    call _rail_eq@PLT\n"
   else if op == "!=" then "    mov rdi, rcx\n    mov rsi, rax\n    call _rail_ne@PLT\n"
   else if op == "&&" then "    and rax, rcx\n"
   else if op == "||" then "    or rax, rcx\n"
   else "    ; unknown op\n"
 
-x86_save_params params idx =
+-- Args 0-5 arrive in rdi/rsi/rdx/rcx/r8/r9 (System V AMD64). Args 6+ are
+-- passed on the caller's stack at [rbp+frame_size+16 + (idx-6)*8] (above the
+-- saved rbp + saved RIP). Without this load, args 7+ silently take whatever
+-- rax happened to hold at function entry — surfaced 2026-05-15 by the hkdf
+-- and x25519 SIGSEGV bisect (hkdf_expand_loop has 9 args).
+x86_save_params params idx fs =
   if length params == 0 then ""
   else
     let off = 16 + idx * 8
-    cat ["    mov [rbp+", show off, "], ", x86_arg_reg idx, "\n", x86_save_params (tail params) (idx + 1)]
+    let stmt = if idx >= 6 then
+      let src = fs + 16 + (idx - 6) * 16
+      cat ["    mov rax, [rbp+", show src, "]\n    mov [rbp+", show off, "], rax\n"]
+    else
+      cat ["    mov [rbp+", show off, "], ", x86_arg_reg idx, "\n"]
+    cat [stmt, x86_save_params (tail params) (idx + 1) fs]
 
 x86_save_params_reg params idx =
   if length params == 0 then ""
@@ -5406,6 +5534,49 @@ x86_cg_push_args args env ar lc sl fs =
 x86_cg_pop_regs n i =
   if i >= n then ""
   else cat ["    mov ", x86_arg_reg (n - 1 - i), ", [rsp]\n    add rsp, 16\n", x86_cg_pop_regs n (i + 1)]
+
+-- Load args 0..min(n-1,5) from their push-slots into x86 SysV arg registers
+-- via direct addressing. Push-slot for arg i is at [rsp + 16*(n-1-i)] (last
+-- push is at top of stack).
+x86_load_arg_regs n i =
+  let nreg = if n < 6 then n else 6
+  if i >= nreg then ""
+  else
+    let off = (n - 1 - i) * 16
+    cat ["    mov ", x86_arg_reg i, ", [rsp+", show off, "]\n", x86_load_arg_regs n (i + 1)]
+
+-- For args 6..n-1 (the SysV stack args), move from push-slot to upper slots
+-- so that after `add rsp, 96` they land at [rsp+0..(n-7)*16] in correct order.
+x86_move_stack_args_up n i =
+  if i >= n then ""
+  else
+    let src = (n - 1 - i) * 16
+    let dst = 96 + (i - 6) * 16
+    cat ["    mov rax, [rsp+", show src, "]\n    mov [rsp+", show dst, "], rax\n", x86_move_stack_args_up n (i + 1)]
+
+-- For TCO with >6 args (self-recursion): write new args 7+ to the CALLER's
+-- own stack-arg slots so they survive `add rsp, fs; pop rbp; jmp`. The new
+-- callee will then read them at the same relative offset from its rbp.
+-- `fs` is the string-form frame_size (the assembler computes fs+local at link).
+x86_move_stack_args_tco n i fs =
+  if i >= n then ""
+  else
+    let src = (n - 1 - i) * 16
+    let dst_local = 16 + (i - 6) * 16
+    cat ["    mov rax, [rsp+", show src, "]\n    mov [rbp+", fs, "+", show dst_local, "], rax\n", x86_move_stack_args_tco n (i + 1) fs]
+
+-- Conditional-untag args in System V int-arg registers before a foreign call.
+-- ARM64 mirror is `untag_args` (compile.rail:1711). Tag bit (LSB=1) marks an
+-- int; clear LSB means raw pointer (string, malloc'd buf, etc.). We use r10 as
+-- a scratch since it's caller-saved and not a System V arg reg. cmovnz reads
+-- the FLAGS set by `test`, picking the untagged-form only when the value was
+-- tagged. Closes ffi_abs (got 9 expected 5: 9 == abs(tagged(-5)) == abs(-11)
+-- before this; with untag we now compute abs(-5) = 5).
+x86_untag_args n i =
+  if i >= n then ""
+  else
+    let r = x86_arg_reg i
+    cat ["    mov r10, ", r, "\n    sar r10, 1\n    test ", r, ", 1\n    cmovnz ", r, ", r10\n", x86_untag_args n (i + 1)]
 
 x86_cg_list elems env ar lc sl fs =
   if length elems == 0 then
@@ -5507,6 +5678,16 @@ x86_cg_bi fname args env ar lc sl tp fs =
   else if fname == "tail" then
     let (aa, lc1, sl1) = x86_cg (head args) env ar lc sl false fs
     (cat [aa, "    mov rdi, rax\n    call _rail_tail\n"], lc1, sl1)
+  else if fname == "char_to_int" then
+    -- x86 strings are raw C strings (no [9,len,bytes] header), so just
+    -- load the first byte, zero-extend, and re-tag. Matches ARM64 semantics
+    -- once _str_unwrap is a no-op for the x86 representation.
+    let (aa, lc1, sl1) = x86_cg (head args) env ar lc sl false fs
+    (cat [aa, "    movzx rax, byte ptr [rax]\n    lea rax, [rax*2+1]\n"], lc1, sl1)
+  else if fname == "parse_int" then
+    -- libc strtol(str, NULL, 10) on raw C string; re-tag the int64 result.
+    let (aa, lc1, sl1) = x86_cg (head args) env ar lc sl false fs
+    (cat [aa, "    mov rdi, rax\n    xor rsi, rsi\n    mov rdx, 10\n    call strtol@PLT\n    lea rax, [rax*2+1]\n"], lc1, sl1)
   else x86_cg_bi2 fname args env ar lc sl tp fs
 
 x86_cg_bi2 fname args env ar lc sl tp fs =
@@ -5522,9 +5703,6 @@ x86_cg_bi2 fname args env ar lc sl tp fs =
   else if fname == "read_file" then
     let (aa, lc1, sl1) = x86_cg (head args) env ar lc sl false fs
     (cat [aa, "    mov rdi, rax\n    call _rail_read_file\n"], lc1, sl1)
-  else if fname == "read_file_bytes" then
-    let (aa, lc1, sl1) = x86_cg (head args) env ar lc sl false fs
-    (cat [aa, "    mov rdi, rax\n    call _rail_read_file_bytes\n"], lc1, sl1)
   else if fname == "not" then
     let (aa, lc1, sl1) = x86_cg (head args) env ar lc sl false fs
     (cat [aa, "    xor rax, 2\n"], lc1, sl1)
@@ -5551,6 +5729,13 @@ x86_cg_bi2 fname args env ar lc sl tp fs =
     (cat [pa, x86_cg_pop_regs (length args) 0, "    call _rail_str_sub\n"], lc1, sl1)
   else if fname == "read_line" then
     ("    call _rail_read_line\n", lc, sl)
+  else if fname == "spawn_thread" then
+    -- x86 mirror of the ARM64 emit. _rail_spawn_thread is in tools/x86_rt.s.
+    let (pa, lc1, sl1) = x86_cg_push_args args env ar lc sl fs
+    (cat [pa, x86_cg_pop_regs (length args) 0, "    call _rail_spawn_thread\n"], lc1, sl1)
+  else if fname == "join_thread" then
+    let (aa, lc1, sl1) = x86_cg (head args) env ar lc sl false fs
+    (cat [aa, "    mov rdi, rax\n    call _rail_join_thread\n"], lc1, sl1)
   else if fname == "join" then
     let (pa, lc1, sl1) = x86_cg_push_args args env ar lc sl fs
     (cat [pa, x86_cg_pop_regs (length args) 0, "    call _rail_join\n"], lc1, sl1)
@@ -5558,6 +5743,9 @@ x86_cg_bi2 fname args env ar lc sl tp fs =
     let (pa, lc1, sl1) = x86_cg_push_args args env ar lc sl fs
     (cat [pa, x86_cg_pop_regs (length args) 0, "    call _rail_cat\n"], lc1, sl1)
   else if fname == "map" then
+    let (pa, lc1, sl1) = x86_cg_push_args args env ar lc sl fs
+    (cat [pa, x86_cg_pop_regs (length args) 0, "    call _rail_map\n"], lc1, sl1)
+  else if fname == "gpu_map" then
     let (pa, lc1, sl1) = x86_cg_push_args args env ar lc sl fs
     (cat [pa, x86_cg_pop_regs (length args) 0, "    call _rail_map\n"], lc1, sl1)
   else if fname == "filter" then
@@ -5594,7 +5782,7 @@ x86_cg_bi3 fname args env ar lc sl tp fs =
     let (aa, lc1, sl1) = x86_cg (head args) env ar lc sl false fs
     let elbl = cat [".Lx_iserr_", show lc]
     let dlbl = cat [".Lx_iserd_", show lc]
-    (cat [aa, "    test rax, 1\n    jnz ", elbl, "\n    mov rcx, [rax]\n    and rcx, 0x7fffffffffffffff\n    cmp rcx, 8\n    jne ", elbl, "\n    mov rax, 3\n    jmp ", dlbl, "\n", elbl, ":\n    mov rax, 1\n", dlbl, ":\n"], lc1 + 1, sl1)
+    (cat [aa, "    test rax, 1\n    jnz ", elbl, "\n    mov rcx, [rax]\n    btr rcx, 63\n    cmp rcx, 8\n    jne ", elbl, "\n    mov rax, 3\n    jmp ", dlbl, "\n", elbl, ":\n    mov rax, 1\n", dlbl, ":\n"], lc1 + 1, sl1)
   else if fname == "err_msg" then
     let (aa, lc1, sl1) = x86_cg (head args) env ar lc sl false fs
     (cat [aa, "    mov rax, [rax+8]\n"], lc1, sl1)
@@ -5614,15 +5802,22 @@ x86_cg_bi3 fname args env ar lc sl tp fs =
     else
     let ar_raw = afind fname ar
     if ar_raw >= 1000 then
-      -- Foreign function
+      -- Foreign function call into Linux glibc via @PLT.
+      -- ELF symbols for libc are bare (`abs`, `strlen`, `getenv`) — no leading
+      -- underscore, unlike macOS Mach-O. Emitting `call _abs` linked to junk
+      -- or stray weak aliases; switching to bare `name@PLT` matches glibc's
+      -- exported symbol table directly. Closes ffi_abs / ffi_strlen /
+      -- ffi_getenv_root on the x86_64 conformance harness (~22d-old item from
+      -- rail_native_gotchas).
       -- Encoding: 1000=int, 2000=str, 3000=float, 4000=raw ptr
       let is_str_ret = ar_raw >= 2000 && ar_raw < 3000
       let is_raw_ret = ar_raw >= 4000
       let no_retag = is_str_ret || is_raw_ret
       let (pa, lc1, sl1) = x86_cg_push_args args env ar lc sl fs
       let pop = x86_cg_pop_regs (length args) 0
+      let untag = x86_untag_args (length args) 0
       let retag = if no_retag then "" else "    lea rax, [rax*2+1]\n"
-      (cat [pa, pop, "    call _", fname, "\n", retag], lc1, sl1)
+      (cat [pa, pop, untag, "    call ", fname, "@PLT\n", retag], lc1, sl1)
     else
     let voff = efind fname env
     if voff != (0 - 1) then
@@ -5644,7 +5839,17 @@ x86_cg_bi3 fname args env ar lc sl tp fs =
     else
       let (pa, lc1, sl1) = x86_cg_push_args args env ar lc sl fs
       let rr = x86_reg_restore env
-      let call = if tp then cat [rr, x86_cg_pop_regs (length args) 0, "    add rsp, ", fs, "\n    pop rbp\n    jmp _", fname, "\n"] else cat [x86_cg_pop_regs (length args) 0, "    call _", fname, "\n"]
+      let nargs = length args
+      let load = x86_load_arg_regs nargs 0
+      let has_stack = nargs > 6
+      let release_amt = if has_stack then "96" else show (nargs * 16)
+      let move_up = if has_stack then x86_move_stack_args_up nargs 6 else ""
+      let cleanup = if has_stack then cat ["    add rsp, ", show ((nargs - 6) * 16), "\n"] else ""
+      let tco_writeback = if has_stack then x86_move_stack_args_tco nargs 6 fs else ""
+      let call = if tp then
+        cat [rr, load, tco_writeback, "    add rsp, ", show (nargs * 16), "\n    add rsp, ", fs, "\n    pop rbp\n    jmp _", fname, "\n"]
+      else
+        cat [load, move_up, "    add rsp, ", release_amt, "\n    call _", fname, "\n", cleanup]
       (cat [pa, call], lc1, sl1)
 
 -- x86_64 MAIN CODEGEN
@@ -5669,7 +5874,7 @@ x86_cg node env ar lc sl tp fs =
     let v = head (tail node)
     let slbl = cat [".Lx_str_", show lc]
     let albl = cat [".Lx_after_", show lc]
-    (cat ["    jmp ", albl, "\n", slbl, ":\n    .asciz \"", esc_asm v, "\"\n    .p2align 3\n", albl, ":\n    lea rax, [rip+", slbl, "]\n"], lc + 1, sl)
+    (cat ["    jmp ", albl, "\n    .p2align 3\n", slbl, ":\n    .asciz \"", esc_asm v, "\"\n    .p2align 3\n", albl, ":\n    lea rax, [rip+", slbl, "]\n"], lc + 1, sl)
   else if tg == "V" then
     let nm = head (tail node)
     let off = efind nm env
@@ -5822,7 +6027,7 @@ x86_cg2 node env ar lc sl tg tp fs =
     let lam_frame_size = ((lam_raw_fs + 15) / 16) * 16
     let lam_fs = show lam_frame_size
     let (basm, lc1, _) = x86_cg inner_body lam_env ar (lc + 1) lam_first_sl true lam_fs
-    let fasm = cat ["    jmp ", albl, "\n", flbl, ":\n    push rbp\n    sub rsp, ", lam_fs, "\n    mov rbp, rsp\n", x86_save_params all_ps 0, basm, "    add rsp, ", lam_fs, "\n    pop rbp\n    ret\n", albl, ":\n"]
+    let fasm = cat ["    jmp ", albl, "\n", flbl, ":\n    push rbp\n    sub rsp, ", lam_fs, "\n    mov rbp, rsp\n", x86_save_params all_ps 0 lam_frame_size, basm, "    add rsp, ", lam_fs, "\n    pop rbp\n    ret\n", albl, ":\n"]
     let pcaps = x86_push_captured caps env
     let casm = cat [pcaps, "    mov rdi, ", show (24 + ncap * 8), "\n    call _rail_alloc\n    mov qword ptr [rax], 4\n    lea rcx, [rip+", flbl, "]\n    mov [rax+8], rcx\n    mov qword ptr [rax+16], ", show ncap, "\n", x86_pop_to_closure ncap 0]
     (cat [fasm, casm], lc1, sl)
@@ -5886,7 +6091,6 @@ x86_compile_func d ar lc =
   let save_args = if nm == "main" then cat ["    lea r10, [rip+_rail_argc]\n    lea rax, [rdi*2+1]\n    mov [r10], rax\n    lea r10, [rip+_rail_argv]\n    mov [r10], rsi\n"] else ""
   let use_regs = nm != "main" && length ps >= 1 && length ps <= 3 && all_params_int ps bd
   let nregs = if use_regs then length ps else 0
-  let sv = if use_regs then x86_save_params_reg ps 0 else x86_save_params ps 0
   let env = if use_regs then mk_env_reg ps 16 0 else mk_env ps 16
   let env = if length ps <= 3 then mark_int_params ps bd env else env
   let env = cons ("__nregs", nregs) env
@@ -5896,13 +6100,16 @@ x86_compile_func d ar lc =
   let raw_fs = if final_sl < 48 then 48 else final_sl
   let frame_size = ((raw_fs + 15) / 16) * 16
   let fs = show frame_size
+  let sv = if use_regs then x86_save_params_reg ps 0 else x86_save_params ps 0 frame_size
   let base_int = if head bd == "?" then is_int (head (tail (tail bd))) env else false
   let env = if base_int then cons (cat ["__rt_", nm], 1) env else env
   let (body_asm, lc1, _) = x86_cg bd env ar lc first_sl is_tp fs
-  let main_untag = if nm == "main" then "    sar rax, 1\n" else ""
+  -- _main returns a tagged value; x86_rt.s `main` wrapper does the sar rax,1
+  -- before passing it back to libc. Untagging here too caused a double-shift
+  -- (e.g., `main = 42` exited 21 instead of 42).
   let restore = x86_gen_restore nregs
   let pro = cat ["_", nm, ":\n", save_args, "    push rbp\n    sub rsp, ", fs, "\n    mov rbp, rsp\n"]
-  let epi = cat [main_untag, restore, "    add rsp, ", fs, "\n    pop rbp\n    ret\n\n"]
+  let epi = cat [restore, "    add rsp, ", fs, "\n    pop rbp\n    ret\n\n"]
   (cat [pro, sv, body_asm, epi], lc1)
 
 x86_compile_funcs decls ar lc =
@@ -5958,9 +6165,634 @@ compile_x86 path =
       let _ = print "  Binary: /tmp/rail_x86"
       0
     else
-      -- No local cross-tools — copy the .s to a Linux x86_64 host and assemble there.
-      let _ = print "  No local x86_64 assembler. scp /tmp/rail_x86.s to a Linux x86_64 host and run: gcc -o rail_x86 rail_x86.s"
+      -- No local cross-tools — install x86_64-elf-as / x86_64-elf-ld or copy
+      -- the .s to a Linux x86_64 host with native binutils.
+      let _ = print "  No local x86_64 assembler. Install x86_64-elf-as / x86_64-elf-ld, or copy /tmp/rail_x86.s to a Linux x86_64 host and assemble there."
       0
+
+-- ============================================================
+-- Cortex-M4 (Thumb-2) backend - bare-metal codegen for Apollo2.
+-- Subset: integer return values from main, integer arithmetic,
+-- function calls, conditionals. No runtime, no GC, no malloc.
+-- Builds incrementally toward Stage 11 (Rail watchface on chip).
+-- ============================================================
+
+cm_emit_int v =
+  if v >= 0 then
+    if v <= 65535 then cat ["    movw r0, #", show v, "\n"]
+    else
+      let hi = v / 65536
+      let lo = v - (hi * 65536)
+      cat ["    movw r0, #", show lo, "\n    movt r0, #", show hi, "\n"]
+  else
+    let abs_v = 0 - v
+    let abs_hi = abs_v / 65536
+    let abs_lo = abs_v - (abs_hi * 65536)
+    let inv_lo = 65535 - abs_lo
+    let inv_hi = 65535 - abs_hi
+    let lo = if inv_lo == 65535 then 0 else inv_lo + 1
+    let hi = if inv_lo == 65535 then inv_hi + 1 else inv_hi
+    cat ["    movw r0, #", show lo, "\n    movt r0, #", show hi, "\n"]
+
+-- Env entries: ["P", name, reg_idx] for params (in r4..r6),
+--              ["L", name, slot_idx] for locals (at [r7, #-4*(slot+1)])
+-- r7 is the frame pointer (set in prologue).
+cm_env_lookup env name =
+  if length env == 0 then ["NONE"]
+  else
+    let e = head env
+    if head (tail e) == name then e
+    else cm_env_lookup (tail env) name
+
+cm_param_reg i =
+  if i == 0 then "r4"
+  else if i == 1 then "r5"
+  else if i == 2 then "r6"
+  else "r0"
+
+cm_emit_var env name =
+  let e = cm_env_lookup env name
+  if head e == "NONE" then
+    -- Not a param/local/ctor; treat as a 0-arg call to a global function.
+    -- Linker fails if the name isn't a defined Rail function.
+    cat ["    bl _rail_", name, "\n"]
+  else if head e == "P" then
+    let idx = head (tail (tail e))
+    cat ["    mov r0, ", cm_param_reg idx, "\n"]
+  else if head e == "C" then
+    -- Constructor reference: emit its tag (only valid for arity-0 ctors today).
+    let tag = head (tail (tail e))
+    cat ["    movw r0, #", show tag, "\n"]
+  else
+    let idx = head (tail (tail e))
+    cat ["    ldr r0, [r7, #-", show (4 * (idx + 1)), "]\n"]
+
+cm_count_locals_in_env env =
+  if length env == 0 then 0
+  else if head (head env) == "L" then 1 + cm_count_locals_in_env (tail env)
+  else cm_count_locals_in_env (tail env)
+
+cm_count_arms_sum arms =
+  if length arms == 0 then 0
+  else
+    let arm = head arms
+    let binds = head (tail arm)
+    let body = head (tail (tail arm))
+    length binds + cm_count_lets body + cm_count_arms_sum (tail arms)
+
+cm_count_lets node =
+  let tg = head node
+  if tg == "D" then 1 + cm_count_lets (head (tail (tail node))) + cm_count_lets (head (tail (tail (tail node))))
+  else if tg == "O" then cm_count_lets (head (tail (tail node))) + cm_count_lets (head (tail (tail (tail node))))
+  else if tg == "?" then cm_count_lets (head (tail node)) + cm_count_lets (head (tail (tail node))) + cm_count_lets (head (tail (tail (tail node))))
+  else if tg == "A" then cm_count_lets (head (tail node)) + cm_count_lets (head (tail (tail node)))
+  else if tg == "M" then cm_count_lets (head (tail node)) + cm_count_arms_sum (head (tail (tail node)))
+  else 0
+
+cm_build_param_env params i =
+  if length params == 0 then []
+  else cons ["P", head params, i] (cm_build_param_env (tail params) (i + 1))
+
+-- Constructor env entries: ["C", ctor_name, tag, arity].
+-- For tag-only ADTs (arity 0), the constructor reference emits movw r0, #tag.
+-- Constructors with payloads are NOT yet supported (arity ignored at use sites
+-- but available for future codegen).
+cm_variants_to_ctors vs =
+  if length vs == 0 then []
+  else
+    let v = head vs
+    let ctor = head v
+    let idx = head (tail v)
+    let ar = head (tail (tail v))
+    cons ["C", ctor, idx, ar] (cm_variants_to_ctors (tail vs))
+
+cm_build_ctor_env decls =
+  if length decls == 0 then []
+  else
+    let d = head decls
+    if head d == "TY" then
+      let variants = head (tail (tail d))
+      append (cm_variants_to_ctors variants) (cm_build_ctor_env (tail decls))
+    else cm_build_ctor_env (tail decls)
+
+cm_op_instr op =
+  if op == "+" then "    add r0, r0, r1\n"
+  else if op == "-" then "    sub r0, r0, r1\n"
+  else if op == "*" then "    mul r0, r0, r1\n"
+  else if op == "/" then "    sdiv r0, r0, r1\n"
+  else if op == "%" then "    sdiv r2, r0, r1\n    mul r2, r2, r1\n    sub r0, r0, r2\n"
+  else cat ["    @ unsupported op: ", op, "\n"]
+
+cm_collect_args node acc =
+  if head node == "A" then
+    cm_collect_args (head (tail node)) (cons (head (tail (tail node))) acc)
+  else (node, acc)
+
+cm_neg_branch op =
+  if op == "==" then "bne"
+  else if op == "!=" then "beq"
+  else if op == "<" then "bge"
+  else if op == ">" then "ble"
+  else if op == "<=" then "bgt"
+  else if op == ">=" then "blt"
+  else "beq"
+
+cm_op_to_cond op =
+  if op == "==" then "eq"
+  else if op == "!=" then "ne"
+  else if op == "<" then "lt"
+  else if op == ">" then "gt"
+  else if op == "<=" then "le"
+  else if op == ">=" then "ge"
+  else "eq"
+
+cm_neg_cond op =
+  if op == "==" then "ne"
+  else if op == "!=" then "eq"
+  else if op == "<" then "ge"
+  else if op == ">" then "le"
+  else if op == "<=" then "gt"
+  else if op == ">=" then "lt"
+  else "ne"
+
+cm_cmp_to_bool op =
+  let ct = cm_op_to_cond op
+  let cf = cm_neg_cond op
+  cat ["    ite ", ct, "\n    mov", ct, " r0, #1\n    mov", cf, " r0, #0\n"]
+
+cm_is_cmp op =
+  op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">="
+
+cm_push_args args env fname lc n_total =
+  if length args == 0 then ("", lc)
+  else if length args == 1 then
+    let (a, lc1) = cm_emit_expr (head args) env fname lc
+    let last_idx = n_total - 1
+    if last_idx == 0 then (a, lc1)
+    else (cat [a, "    mov r", show last_idx, ", r0\n"], lc1)
+  else
+    let (a, lc1) = cm_emit_expr (head args) env fname lc
+    let (rest, lc2) = cm_push_args (tail args) env fname lc1 n_total
+    (cat [a, "    push {r0}\n", rest], lc2)
+
+cm_pop_chain_rev cur =
+  if cur < 0 then ""
+  else cat ["    pop {r", show cur, "}\n", cm_pop_chain_rev (cur - 1)]
+
+cm_emit_ctor_payload tag arg env fname lc =
+  let (a, lc1) = cm_emit_expr arg env fname lc
+  (cat [a, "    lsl r0, r0, #4\n    orr r0, r0, #", show tag, "\n"], lc1)
+
+cm_emit_call env fname lc fn args =
+  if head fn == "V" then
+    let name = head (tail fn)
+    let n = length args
+    -- MMIO intrinsics: emit STR/LDR inline instead of `bl`.
+    if name == "mmio_write" && n == 2 then
+      let a0 = head args
+      let a1 = head (tail args)
+      let (aa, lc1) = cm_emit_expr a0 env fname lc
+      let (va, lc2) = cm_emit_expr a1 env fname lc1
+      (cat [aa, "    push {r0}\n", va, "    mov r1, r0\n    pop {r0}\n    str r1, [r0]\n"], lc2)
+    else if name == "mmio_read" && n == 1 then
+      let (aa, lc1) = cm_emit_expr (head args) env fname lc
+      (cat [aa, "    ldr r0, [r0]\n"], lc1)
+    else if (name == "bit_and" || name == "bit_or" || name == "bit_xor" || name == "shl" || name == "shr") && n == 2 then
+      let a0 = head args
+      let a1 = head (tail args)
+      let (la, lc1) = cm_emit_expr a0 env fname lc
+      let (ra, lc2) = cm_emit_expr a1 env fname lc1
+      let op_instr = if name == "bit_and" then "and"
+                     else if name == "bit_or" then "orr"
+                     else if name == "bit_xor" then "eor"
+                     else if name == "shl" then "lsl"
+                     else "lsr"
+      (cat [la, "    push {r0}\n", ra, "    mov r1, r0\n    pop {r0}\n    ", op_instr, " r0, r0, r1\n"], lc2)
+    else
+      let ce = cm_env_lookup env name
+      if head ce == "C" then
+        let tag = head (tail (tail ce))
+        let arity = head (tail (tail (tail ce)))
+        if arity == 1 && n == 1 then cm_emit_ctor_payload tag (head args) env fname lc
+        else (cat ["    @ ctor ", name, " arity=", show arity, " n=", show n, " unsupported\n    movs r0, #0\n"], lc)
+      else if n == 0 then (cat ["    bl _rail_", name, "\n"], lc)
+      else if n <= 4 then
+        let (push_asm, lc1) = cm_push_args args env fname lc n
+        (cat [push_asm, cm_pop_chain_rev (n - 2), "    bl _rail_", name, "\n"], lc1)
+      else (cat ["    @ ", show n, "-arg call not yet supported (>4 spilled args)\n    movs r0, #0\n"], lc)
+  else (cat ["    @ non-name function in call\n    movs r0, #0\n"], lc)
+
+cm_emit_cond_branch cond env fname lc else_lbl =
+  if head cond == "O" && cm_is_cmp (head (tail cond)) then
+    let op = head (tail cond)
+    let l = head (tail (tail cond))
+    let r = head (tail (tail (tail cond)))
+    let (la, lc1) = cm_emit_expr l env fname lc
+    let (ra, lc2) = cm_emit_expr r env fname lc1
+    (cat [la, "    push {r0}\n", ra, "    mov r1, r0\n    pop {r0}\n    cmp r0, r1\n    ", cm_neg_branch op, " ", else_lbl, "\n"], lc2)
+  else
+    let (ca, lc1) = cm_emit_expr cond env fname lc
+    (cat [ca, "    cmp r0, #0\n    beq ", else_lbl, "\n"], lc1)
+
+cm_emit_if cond then_e else_e env fname lc =
+  let lc0 = lc
+  let else_lbl = cat [".L", fname, "_else_", show lc0]
+  let end_lbl = cat [".L", fname, "_end_", show lc0]
+  let (cond_asm, lc1) = cm_emit_cond_branch cond env fname (lc + 1) else_lbl
+  let (then_asm, lc2) = cm_emit_expr then_e env fname lc1
+  let (else_asm, lc3) = cm_emit_expr else_e env fname lc2
+  (cat [cond_asm, then_asm, "    b ", end_lbl, "\n", else_lbl, ":\n", else_asm, end_lbl, ":\n"], lc3)
+
+cm_emit_let n v b env fname lc =
+  let (va, lc1) = cm_emit_expr v env fname lc
+  let slot = cm_count_locals_in_env env
+  let store = cat ["    str r0, [r7, #-", show (4 * (slot + 1)), "]\n"]
+  let new_env = cons ["L", n, slot] env
+  let (ba, lc2) = cm_emit_expr b new_env fname lc1
+  (cat [va, store, ba], lc2)
+
+cm_bind_payload binds env =
+  if length binds == 0 then ("", env)
+  else
+    let bn = head binds
+    let slot = cm_count_locals_in_env env
+    let extract = cat ["    ldr r0, [sp]\n    asr r0, r0, #4\n    str r0, [r7, #-", show (4 * (slot + 1)), "]\n"]
+    let new_env = cons ["L", bn, slot] env
+    let (rest_a, final_env) = cm_bind_payload (tail binds) new_env
+    (cat [extract, rest_a], final_env)
+
+cm_emit_arms arms i env fname lc end_lbl mid =
+  if length arms == 0 then ("", lc)
+  else
+    let arm = head arms
+    let ctor = head arm
+    let binds = head (tail arm)
+    let body = head (tail (tail arm))
+    let e = cm_env_lookup env ctor
+    let tag = if head e == "C" then head (tail (tail e)) else 0 - 1
+    let next_lbl = cat [".L", fname, "_arm_", show mid, "_", show i, "_next"]
+    let (bind_a, body_env) = cm_bind_payload binds env
+    let (body_a, lc1) = cm_emit_expr body body_env fname lc
+    let (rest_a, lc2) = cm_emit_arms (tail arms) (i + 1) env fname lc1 end_lbl mid
+    (cat ["    ldr r0, [sp]\n    and r0, r0, #15\n    cmp r0, #", show tag, "\n    bne ", next_lbl, "\n", bind_a, "    pop {r0}\n", body_a, "    b ", end_lbl, "\n", next_lbl, ":\n", rest_a], lc2)
+
+cm_emit_match scrut arms env fname lc =
+  let lc0 = lc
+  let end_lbl = cat [".L", fname, "_match_end_", show lc0]
+  let (scrut_a, lc1) = cm_emit_expr scrut env fname (lc + 1)
+  let (arms_a, lc2) = cm_emit_arms arms 0 env fname lc1 end_lbl lc0
+  (cat [scrut_a, "    push {r0}\n", arms_a, "    pop {r0}\n", end_lbl, ":\n"], lc2)
+
+cm_emit_expr node env fname lc =
+  let tg = head node
+  if tg == "I" then (cm_emit_int (parse_int (head (tail node))), lc)
+  else if tg == "V" then (cm_emit_var env (head (tail node)), lc)
+  else if tg == "O" then
+    let op = head (tail node)
+    let l = head (tail (tail node))
+    let r = head (tail (tail (tail node)))
+    let (la, lc1) = cm_emit_expr l env fname lc
+    let (ra, lc2) = cm_emit_expr r env fname lc1
+    if cm_is_cmp op then
+      (cat [la, "    push {r0}\n", ra, "    mov r1, r0\n    pop {r0}\n    cmp r0, r1\n", cm_cmp_to_bool op], lc2)
+    else
+      (cat [la, "    push {r0}\n", ra, "    mov r1, r0\n    pop {r0}\n", cm_op_instr op], lc2)
+  else if tg == "A" then
+    let (fn, args) = cm_collect_args node []
+    cm_emit_call env fname lc fn args
+  else if tg == "?" then
+    let c = head (tail node)
+    let t = head (tail (tail node))
+    let e = head (tail (tail (tail node)))
+    cm_emit_if c t e env fname lc
+  else if tg == "D" then
+    let n = head (tail node)
+    let v = head (tail (tail node))
+    let b = head (tail (tail (tail node)))
+    cm_emit_let n v b env fname lc
+  else if tg == "M" then
+    let scrut = head (tail node)
+    let arms = head (tail (tail node))
+    cm_emit_match scrut arms env fname lc
+  else (cat ["    @ unsupported expr node: ", tg, "\n    movs r0, #0\n"], lc)
+
+cm_save_params n i =
+  if i >= n then ""
+  else cat ["    mov r", show (4 + i), ", r", show i, "\n", cm_save_params n (i + 1)]
+
+cm_emit_func d ctors =
+  let name = head (tail d)
+  let params = head (tail (tail d))
+  let body = head (tail (tail (tail d)))
+  let lbl = if name == "main" then "_main" else cat ["_rail_", name]
+  let nparams = length params
+  let nlocals = cm_count_lets body
+  let param_env = cm_build_param_env params 0
+  let env = append param_env ctors
+  let alloc = if nlocals == 0 then "" else cat ["    sub sp, sp, #", show (4 * nlocals), "\n"]
+  let prologue = cat ["    push {r4-r7, lr}\n    mov r7, sp\n", cm_save_params nparams 0, alloc]
+  let (body_asm, _) = cm_emit_expr body env name 0
+  cat ["\n.global ", lbl, "\n.type ", lbl, ", %function\n", lbl, ":\n    .thumb_func\n", prologue, body_asm, "    mov sp, r7\n    pop {r4-r7, pc}\n"]
+
+cm_emit_decls decls ctors =
+  if length decls == 0 then ""
+  else
+    let d = head decls
+    if head d == "fn" then cat [cm_emit_func d ctors, cm_emit_decls (tail decls) ctors]
+    else cm_emit_decls (tail decls) ctors
+
+cm_compile_checked decls =
+  let header = ".syntax unified\n.thumb\n.cpu cortex-m4\n.text\n"
+  let ctors = cm_build_ctor_env decls
+  cat [header, cm_emit_decls decls ctors]
+
+compile_cortexm path =
+  let src = read_file path
+  let _ = print (cat ["Compiling ", path, " -> Cortex-M4 (Thumb-2)..."])
+  let (toks, positions) = tokenize_with_pos src
+  let ntoks = length toks
+  let decls = pprog toks
+  let errs = ce_decls decls
+  let nerrs = report_errors errs positions ntoks path
+  if nerrs > 0 then
+    let _ = print (cat [show nerrs, " error(s) found"])
+    1
+  else
+    let asm = cm_compile_checked decls
+    let _ = write_file "/tmp/rail_m4.s" asm
+    let _ = print (cat ["  Assembly: /tmp/rail_m4.s (", show (length asm), " chars)"])
+    let as_res = trim (shell "clang --target=thumbv7em-none-eabi -mthumb -mcpu=cortex-m4 -c /tmp/rail_m4.s -o /tmp/rail_m4.o 2>&1")
+    let _ = if length as_res > 0 then print (cat ["  as: ", as_res]) else print "  as: OK -> /tmp/rail_m4.o"
+    -- Compile bare-metal startup. Look in cwd/tools/cortexm_rt first, then binary dir.
+    let bindir = trim (shell (cat ["dirname '", head args, "'"]))
+    let rt_cwd = "tools/cortexm_rt/startup.s"
+    let rt_bin = cat [bindir, "/tools/cortexm_rt/startup.s"]
+    let rt_path = if length (read_file rt_cwd) > 0 then rt_cwd else rt_bin
+    let ld_cwd = "tools/cortexm_rt/apollo2.ld"
+    let ld_bin = cat [bindir, "/tools/cortexm_rt/apollo2.ld"]
+    let ld_path = if length (read_file ld_cwd) > 0 then ld_cwd else ld_bin
+    let su_res = trim (shell (cat ["clang --target=thumbv7em-none-eabi -mthumb -mcpu=cortex-m4 -c ", rt_path, " -o /tmp/rail_m4_rt.o 2>&1"]))
+    let _ = if length su_res > 0 then print (cat ["  startup as: ", su_res]) else print "  startup as: OK"
+    -- Link with ld.lld (homebrew). Falls back to a printed hint if missing.
+    let lld_path = trim (shell "which ld.lld 2>/dev/null")
+    if length lld_path == 0 then
+      let _ = print "  ld: ld.lld not found - install with: brew install lld"
+      0
+    else
+      let ld_res = trim (shell (cat [lld_path, " -T ", ld_path, " /tmp/rail_m4.o /tmp/rail_m4_rt.o -o /tmp/rail_m4.elf 2>&1"]))
+      let _ = if length ld_res > 0 then print (cat ["  ld: ", ld_res]) else print "  ld: OK -> /tmp/rail_m4.elf"
+      0
+
+-- ============================================================
+-- RISC-V (rv32imc) backend - mirrors cortexm subset with rv32 mnemonics.
+-- Frame layout: s0 = frame pointer; s1/s2/s3 = saved params (0..2);
+-- locals at -4*(slot+1)(s0). Function call via `call`.
+-- ============================================================
+
+cv_param_reg i =
+  if i == 0 then "s1"
+  else if i == 1 then "s2"
+  else if i == 2 then "s3"
+  else "a0"
+
+cv_emit_int v = cat ["    li a0, ", show v, "\n"]
+
+cv_emit_var env name =
+  let e = cm_env_lookup env name
+  if head e == "NONE" then cat ["    call _rail_", name, "\n"]
+  else if head e == "P" then
+    let idx = head (tail (tail e))
+    cat ["    mv a0, ", cv_param_reg idx, "\n"]
+  else if head e == "C" then
+    let tag = head (tail (tail e))
+    cat ["    li a0, ", show tag, "\n"]
+  else
+    let idx = head (tail (tail e))
+    cat ["    lw a0, -", show (4 * (idx + 1)), "(s0)\n"]
+
+cv_op_instr op =
+  if op == "+" then "    add a0, a0, a1\n"
+  else if op == "-" then "    sub a0, a0, a1\n"
+  else if op == "*" then "    mul a0, a0, a1\n"
+  else if op == "/" then "    div a0, a0, a1\n"
+  else if op == "%" then "    rem a0, a0, a1\n"
+  else cat ["    # unsupported op: ", op, "\n"]
+
+cv_emit_cmp_branch op else_lbl =
+  if op == "==" then cat ["    bne a0, a1, ", else_lbl, "\n"]
+  else if op == "!=" then cat ["    beq a0, a1, ", else_lbl, "\n"]
+  else if op == "<" then cat ["    bge a0, a1, ", else_lbl, "\n"]
+  else if op == ">" then cat ["    bge a1, a0, ", else_lbl, "\n"]
+  else if op == "<=" then cat ["    blt a1, a0, ", else_lbl, "\n"]
+  else if op == ">=" then cat ["    blt a0, a1, ", else_lbl, "\n"]
+  else cat ["    bne a0, a1, ", else_lbl, "\n"]
+
+cv_emit_cmp_value op =
+  if op == "==" then "    sub a0, a0, a1\n    seqz a0, a0\n"
+  else if op == "!=" then "    sub a0, a0, a1\n    snez a0, a0\n"
+  else if op == "<" then "    slt a0, a0, a1\n"
+  else if op == ">" then "    slt a0, a1, a0\n"
+  else if op == "<=" then "    slt a0, a1, a0\n    xori a0, a0, 1\n"
+  else if op == ">=" then "    slt a0, a0, a1\n    xori a0, a0, 1\n"
+  else "    li a0, 0\n"
+
+cv_collect_args node acc =
+  if head node == "A" then
+    cv_collect_args (head (tail node)) (cons (head (tail (tail node))) acc)
+  else (node, acc)
+
+cv_push_args args env fname lc n_total =
+  if length args == 0 then ("", lc)
+  else if length args == 1 then
+    let (a, lc1) = cv_emit_expr (head args) env fname lc
+    let last_idx = n_total - 1
+    if last_idx == 0 then (a, lc1)
+    else (cat [a, "    mv a", show last_idx, ", a0\n"], lc1)
+  else
+    let (a, lc1) = cv_emit_expr (head args) env fname lc
+    let (rest, lc2) = cv_push_args (tail args) env fname lc1 n_total
+    (cat [a, "    addi sp, sp, -16\n    sw a0, 0(sp)\n", rest], lc2)
+
+cv_pop_chain_rev cur =
+  if cur < 0 then ""
+  else cat ["    lw a", show cur, ", 0(sp)\n    addi sp, sp, 16\n", cv_pop_chain_rev (cur - 1)]
+
+cv_emit_ctor_payload tag arg env fname lc =
+  let (a, lc1) = cv_emit_expr arg env fname lc
+  (cat [a, "    slli a0, a0, 4\n    ori a0, a0, ", show tag, "\n"], lc1)
+
+cv_emit_call env fname lc fn args =
+  if head fn == "V" then
+    let name = head (tail fn)
+    let n = length args
+    let ce = cm_env_lookup env name
+    if head ce == "C" then
+      let tag = head (tail (tail ce))
+      let arity = head (tail (tail (tail ce)))
+      if arity == 1 && n == 1 then cv_emit_ctor_payload tag (head args) env fname lc
+      else (cat ["    # ctor ", name, " unsupported\n    li a0, 0\n"], lc)
+    else if n == 0 then (cat ["    call _rail_", name, "\n"], lc)
+    else if n <= 3 then
+      let (push_a, lc1) = cv_push_args args env fname lc n
+      (cat [push_a, cv_pop_chain_rev (n - 2), "    call _rail_", name, "\n"], lc1)
+    else (cat ["    # ", show n, "-arg call unsupported\n    li a0, 0\n"], lc)
+  else (cat ["    # non-name call\n    li a0, 0\n"], lc)
+
+cv_emit_cond_branch cond env fname lc else_lbl =
+  if head cond == "O" && cm_is_cmp (head (tail cond)) then
+    let op = head (tail cond)
+    let l = head (tail (tail cond))
+    let r = head (tail (tail (tail cond)))
+    let (la, lc1) = cv_emit_expr l env fname lc
+    let (ra, lc2) = cv_emit_expr r env fname lc1
+    (cat [la, "    addi sp, sp, -16\n    sw a0, 0(sp)\n", ra, "    mv a1, a0\n    lw a0, 0(sp)\n    addi sp, sp, 16\n", cv_emit_cmp_branch op else_lbl], lc2)
+  else
+    let (ca, lc1) = cv_emit_expr cond env fname lc
+    (cat [ca, "    beqz a0, ", else_lbl, "\n"], lc1)
+
+cv_emit_if cond t e env fname lc =
+  let lc0 = lc
+  let else_lbl = cat [".L", fname, "_else_", show lc0]
+  let end_lbl = cat [".L", fname, "_end_", show lc0]
+  let (cond_a, lc1) = cv_emit_cond_branch cond env fname (lc + 1) else_lbl
+  let (then_a, lc2) = cv_emit_expr t env fname lc1
+  let (else_a, lc3) = cv_emit_expr e env fname lc2
+  (cat [cond_a, then_a, "    j ", end_lbl, "\n", else_lbl, ":\n", else_a, end_lbl, ":\n"], lc3)
+
+cv_emit_let n v b env fname lc =
+  let (va, lc1) = cv_emit_expr v env fname lc
+  let slot = cm_count_locals_in_env env
+  let store = cat ["    sw a0, -", show (4 * (slot + 1)), "(s0)\n"]
+  let new_env = cons ["L", n, slot] env
+  let (ba, lc2) = cv_emit_expr b new_env fname lc1
+  (cat [va, store, ba], lc2)
+
+cv_bind_payload binds env =
+  if length binds == 0 then ("", env)
+  else
+    let bn = head binds
+    let slot = cm_count_locals_in_env env
+    let extract = cat ["    lw a0, 0(sp)\n    srai a0, a0, 4\n    sw a0, -", show (4 * (slot + 1)), "(s0)\n"]
+    let new_env = cons ["L", bn, slot] env
+    let (rest_a, final_env) = cv_bind_payload (tail binds) new_env
+    (cat [extract, rest_a], final_env)
+
+cv_emit_arms arms i env fname lc end_lbl mid =
+  if length arms == 0 then ("", lc)
+  else
+    let arm = head arms
+    let ctor = head arm
+    let binds = head (tail arm)
+    let body = head (tail (tail arm))
+    let e = cm_env_lookup env ctor
+    let tag = if head e == "C" then head (tail (tail e)) else 0 - 1
+    let next_lbl = cat [".L", fname, "_arm_", show mid, "_", show i, "_next"]
+    let (bind_a, body_env) = cv_bind_payload binds env
+    let (body_a, lc1) = cv_emit_expr body body_env fname lc
+    let (rest_a, lc2) = cv_emit_arms (tail arms) (i + 1) env fname lc1 end_lbl mid
+    (cat ["    lw a0, 0(sp)\n    andi a0, a0, 15\n    li a1, ", show tag, "\n    bne a0, a1, ", next_lbl, "\n", bind_a, "    addi sp, sp, 16\n", body_a, "    j ", end_lbl, "\n", next_lbl, ":\n    addi sp, sp, 16\n", rest_a], lc2)
+
+cv_emit_match scrut arms env fname lc =
+  let lc0 = lc
+  let end_lbl = cat [".L", fname, "_match_end_", show lc0]
+  let (scrut_a, lc1) = cv_emit_expr scrut env fname (lc + 1)
+  let (arms_a, lc2) = cv_emit_arms arms 0 env fname lc1 end_lbl lc0
+  (cat [scrut_a, "    addi sp, sp, -16\n    sw a0, 0(sp)\n", arms_a, end_lbl, ":\n"], lc2)
+
+cv_emit_expr node env fname lc =
+  let tg = head node
+  if tg == "I" then (cv_emit_int (parse_int (head (tail node))), lc)
+  else if tg == "V" then (cv_emit_var env (head (tail node)), lc)
+  else if tg == "O" then
+    let op = head (tail node)
+    let l = head (tail (tail node))
+    let r = head (tail (tail (tail node)))
+    let (la, lc1) = cv_emit_expr l env fname lc
+    let (ra, lc2) = cv_emit_expr r env fname lc1
+    if cm_is_cmp op then
+      (cat [la, "    addi sp, sp, -16\n    sw a0, 0(sp)\n", ra, "    mv a1, a0\n    lw a0, 0(sp)\n    addi sp, sp, 16\n", cv_emit_cmp_value op], lc2)
+    else
+      (cat [la, "    addi sp, sp, -16\n    sw a0, 0(sp)\n", ra, "    mv a1, a0\n    lw a0, 0(sp)\n    addi sp, sp, 16\n", cv_op_instr op], lc2)
+  else if tg == "A" then
+    let (fn, args) = cv_collect_args node []
+    cv_emit_call env fname lc fn args
+  else if tg == "?" then
+    let c = head (tail node)
+    let t = head (tail (tail node))
+    let e = head (tail (tail (tail node)))
+    cv_emit_if c t e env fname lc
+  else if tg == "D" then
+    let n = head (tail node)
+    let v = head (tail (tail node))
+    let b = head (tail (tail (tail node)))
+    cv_emit_let n v b env fname lc
+  else if tg == "M" then
+    let scrut = head (tail node)
+    let arms = head (tail (tail node))
+    cv_emit_match scrut arms env fname lc
+  else (cat ["    # unsupported expr: ", tg, "\n    li a0, 0\n"], lc)
+
+cv_save_params n i =
+  if i >= n then ""
+  else cat ["    mv s", show (1 + i), ", a", show i, "\n", cv_save_params n (i + 1)]
+
+cv_emit_func d ctors =
+  let name = head (tail d)
+  let params = head (tail (tail d))
+  let body = head (tail (tail (tail d)))
+  let lbl = if name == "main" then "_main" else cat ["_rail_", name]
+  let nparams = length params
+  let nlocals = cm_count_lets body
+  let param_env = cm_build_param_env params 0
+  let env = append param_env ctors
+  -- Frame: ra(4) + s0(4) + s1(4) + s2(4) + s3(4) = 20 + locals*4, padded to 16-byte align
+  let raw = 20 + 4 * nlocals
+  let pad = if raw % 16 == 0 then 0 else 16 - (raw % 16)
+  let frame = raw + pad
+  let prologue = cat ["    addi sp, sp, -", show frame, "\n    sw ra, ", show (frame - 4), "(sp)\n    sw s0, ", show (frame - 8), "(sp)\n    sw s1, ", show (frame - 12), "(sp)\n    sw s2, ", show (frame - 16), "(sp)\n    sw s3, ", show (frame - 20), "(sp)\n    addi s0, sp, ", show (frame - 20), "\n", cv_save_params nparams 0]
+  let (body_asm, _) = cv_emit_expr body env name 0
+  let epilogue = cat ["    lw s3, ", show (frame - 20), "(sp)\n    lw s2, ", show (frame - 16), "(sp)\n    lw s1, ", show (frame - 12), "(sp)\n    lw s0, ", show (frame - 8), "(sp)\n    lw ra, ", show (frame - 4), "(sp)\n    addi sp, sp, ", show frame, "\n    ret\n"]
+  cat ["\n.global ", lbl, "\n", lbl, ":\n", prologue, body_asm, epilogue]
+
+cv_emit_decls decls ctors =
+  if length decls == 0 then ""
+  else
+    let d = head decls
+    if head d == "fn" then cat [cv_emit_func d ctors, cv_emit_decls (tail decls) ctors]
+    else cv_emit_decls (tail decls) ctors
+
+cv_compile_checked decls =
+  let ctors = cm_build_ctor_env decls
+  cat [".section .text\n.option norvc\n", cv_emit_decls decls ctors]
+
+compile_riscv32 path =
+  let src = read_file path
+  let _ = print (cat ["Compiling ", path, " -> RISC-V (rv32imc)..."])
+  let (toks, positions) = tokenize_with_pos src
+  let ntoks = length toks
+  let decls = pprog toks
+  let errs = ce_decls decls
+  let nerrs = report_errors errs positions ntoks path
+  if nerrs > 0 then
+    let _ = print (cat [show nerrs, " error(s) found"])
+    1
+  else
+    let asm = cv_compile_checked decls
+    let _ = write_file "/tmp/rail_rv32.s" asm
+    let _ = print (cat ["  Assembly: /tmp/rail_rv32.s (", show (length asm), " chars)"])
+    let bindir = trim (shell (cat ["dirname '", head args, "'"]))
+    let rt_cwd = "tools/cortexm_rt/rv_startup.s"
+    let rt_path = if length (read_file rt_cwd) > 0 then rt_cwd else cat [bindir, "/tools/cortexm_rt/rv_startup.s"]
+    let ld_cwd = "tools/cortexm_rt/rv_virt.ld"
+    let ld_path = if length (read_file ld_cwd) > 0 then ld_cwd else cat [bindir, "/tools/cortexm_rt/rv_virt.ld"]
+    let cc = "/opt/homebrew/opt/llvm/bin/clang"
+    let as_res = trim (shell (cat [cc, " --target=riscv32-unknown-none-elf -march=rv32imc -mabi=ilp32 -c /tmp/rail_rv32.s -o /tmp/rail_rv32.o 2>&1"]))
+    let _ = if length as_res > 0 then print (cat ["  as: ", as_res]) else print "  as: OK"
+    let su_res = trim (shell (cat [cc, " --target=riscv32-unknown-none-elf -march=rv32imc -mabi=ilp32 -c ", rt_path, " -o /tmp/rail_rv32_rt.o 2>&1"]))
+    let _ = if length su_res > 0 then print (cat ["  startup: ", su_res]) else print "  startup: OK"
+    let ld_res = trim (shell (cat ["ld.lld -T ", ld_path, " /tmp/rail_rv32.o /tmp/rail_rv32_rt.o -o /tmp/rail_rv32.elf 2>&1"]))
+    let _ = if length ld_res > 0 then print (cat ["  ld: ", ld_res]) else print "  ld: OK -> /tmp/rail_rv32.elf"
+    0
 
 -- Parse optional --out-prefix <val> flag in the first slot.
 -- Returns (prefix, args-with-flag-stripped). Default prefix is /tmp/rail_out
@@ -5993,9 +6825,24 @@ main =
       if length a >= 3 then compile_linux (head (tail (tail a)))
       else let _ = print "Usage: rail linux <file.rail>"
       1
+    else if cmd == "cortexm" then
+      if length a >= 3 then compile_cortexm (head (tail (tail a)))
+      else let _ = print "Usage: rail cortexm <file.rail>"
+      1
+    else if cmd == "riscv32" then
+      if length a >= 3 then compile_riscv32 (head (tail (tail a)))
+      else let _ = print "Usage: rail riscv32 <file.rail>"
+      1
     else if cmd == "run" then
-      if length a >= 3 then compile_and_run prefix (head (tail (tail a))) (join_args a 3)
+      -- Use shell-quoted join so quoted argv with embedded spaces survives.
+      -- Pre-fix: `./rail_native run x.rail "hello world"` saw argv[1] == "hello"
+      -- because join_args produced "hello world" -> shell split on space.
+      if length a >= 3 then compile_and_run prefix (head (tail (tail a))) (join_args_quoted a 3)
       else let _ = print "Usage: rail run <file.rail>"
+      1
+    else if cmd == "parse-check" then
+      if length a >= 3 then dispatch_parse_check (head (tail (tail a)))
+      else let _ = print "Usage: rail parse-check <file.rail>"
       1
     else if cmd == "safe" then
       if length a >= 3 then dispatch_safe (head (tail (tail a)))

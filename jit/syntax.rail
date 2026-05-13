@@ -1,0 +1,481 @@
+-- jit/syntax.rail — recursive-descent parser for the Rail subset
+-- the JIT can lower.
+--
+-- Grammar:
+--   program  ::= fn_def* eof
+--   fn_def   ::= IDENT IDENT* '=' expr (NL | EOF)
+--   expr     ::= cmp_expr
+--   cmp_expr ::= add_expr ('<' add_expr)?
+--   add_expr ::= mul_expr (('+'|'-') mul_expr)*
+--   mul_expr ::= app_expr ('*' app_expr)*
+--   app_expr ::= primary primary*
+--   primary  ::= INT
+--              | IDENT
+--              | '(' expr ')'
+--              | 'if' expr 'then' expr 'else' expr
+--              | 'let' IDENT '=' expr 'in' expr
+--
+-- Public entry: parse_program tokens -> [program_ast | ["error", msg]]
+-- AST node tags: "int", "var", "op", "if", "let", "app", "fn_def", "program".
+-- Special idents reserved as keywords: if, then, else, let, in.
+-- Function names "print" / "show" are kept as plain idents; the lowerer
+-- recognises the `print (show e)` shape.
+
+-- AST constructors.
+ast_int n           = cons "int"   (cons n [])
+ast_float s         = cons "float" (cons s [])
+ast_str s           = cons "str"   (cons s [])
+ast_var name        = cons "var"   (cons name [])
+ast_op op lhs rhs   = cons "op"    (cons op (cons lhs (cons rhs [])))
+ast_if c t e        = cons "if"    (cons c (cons t (cons e [])))
+ast_let name v body = cons "let"   (cons name (cons v (cons body [])))
+ast_app f arg       = cons "app"   (cons f (cons arg []))
+ast_lambda arg body = cons "lambda" (cons arg (cons body []))
+ast_fn name args body = cons "fn_def" (cons name (cons args (cons body [])))
+ast_prog defs       = cons "program" (cons defs [])
+ast_err msg         = cons "error" (cons msg [])
+
+ast_tag a = head a
+
+-- Token-list cursor.
+peek toks       = if toks == [] then cons "eof" (cons 0 []) else head toks
+advance toks    = if toks == [] then [] else tail toks
+peek_tag toks   = head (peek toks)
+peek_val toks   = head (tail (peek toks))
+
+is_eof toks     = if (peek_tag toks) == "eof" then 1 else 0
+is_nl  toks     = if (peek_tag toks) == "nl" then 1 else 0
+
+-- Skip any leading newlines.
+skip_nls toks =
+  if (is_nl toks) == 1 then skip_nls (advance toks)
+  else toks
+
+-- True iff the head token is a keyword identifier with the given name.
+is_kw toks name =
+  if (peek_tag toks) == "ident" then
+    if (peek_val toks) == name then 1 else 0
+  else 0
+
+-- True iff the head token is an op with the given symbol.
+is_op_sym toks sym =
+  if (peek_tag toks) == "op" then
+    if (peek_val toks) == sym then 1 else 0
+  else 0
+
+-- Result wrapper: pair of (ast, remaining_tokens) OR (error_ast, []).
+-- Encoded as a 2-element list.
+ok ast toks         = cons ast (cons toks [])
+res_ast r           = head r
+res_toks r          = head (tail r)
+is_err r            = if (ast_tag (res_ast r)) == "error" then 1 else 0
+
+-- ============================================================================
+-- Primary
+-- ============================================================================
+
+parse_primary toks =
+  let tag = peek_tag toks
+  if tag == "int" then
+    ok (ast_int (peek_val toks)) (advance toks)
+  else if tag == "float" then
+    ok (ast_float (peek_val toks)) (advance toks)
+  else if tag == "str" then
+    ok (ast_str (peek_val toks)) (advance toks)
+  else if tag == "lparen" then
+    parse_paren_expr (advance toks)
+  else if tag == "lbracket" then
+    parse_list_lit (advance toks)
+  else if tag == "ident" then
+    parse_ident_primary toks
+  else if tag == "bslash" then
+    parse_lambda (advance toks)
+  else if (is_op_sym toks "-") == 1 then
+    -- unary minus: -e desugars to (0 - e)
+    let r = parse_primary (advance toks)
+    if (is_err r) == 1 then r
+    else ok (ast_op "-" (ast_int 0) (res_ast r)) (res_toks r)
+  else
+    ok (ast_err (cat ["primary: unexpected token tag=", tag])) []
+
+-- Parse a lambda after consuming the leading '\'.
+-- Form: \arg -> body  (single-arg only in v1).
+-- Token stream at entry: ident("arg") arrow body...
+parse_lambda toks =
+  if (peek_tag toks) != "ident" then
+    ok (ast_err "lambda: expected arg name after '\\'") []
+  else
+    let arg_name = peek_val toks
+    let toks2 = advance toks
+    if (peek_tag toks2) != "arrow" then
+      ok (ast_err "lambda: expected '->' after arg name") []
+    else
+      let r = parse_expr (advance toks2)
+      if (is_err r) == 1 then r
+      else ok (ast_lambda arg_name (res_ast r)) (res_toks r)
+
+-- Parse [e1, e2, ..., eN] — desugars to cons(e1, cons(e2, ..., cons(eN, nil))).
+-- Empty list `[]` desugars to `nil` directly.
+parse_list_lit toks =
+  if (peek_tag toks) == "rbracket" then
+    ok (ast_var "nil") (advance toks)
+  else
+    let r = parse_expr toks
+    if (is_err r) == 1 then r
+    else parse_list_tail (cons (res_ast r) []) (res_toks r)
+
+parse_list_tail acc toks =
+  if (peek_tag toks) == "rbracket" then
+    ok (build_cons_chain (reverse acc)) (advance toks)
+  else if (peek_tag toks) == "comma" then
+    let r = parse_expr (advance toks)
+    if (is_err r) == 1 then r
+    else parse_list_tail (cons (res_ast r) acc) (res_toks r)
+  else
+    ok (ast_err "expected ',' or ']' in list literal") []
+
+-- Build cons(e1, cons(e2, ..., nil)) from a list of element ASTs.
+build_cons_chain elems =
+  if elems == [] then ast_var "nil"
+  else
+    let h = head elems
+    let t = build_cons_chain (tail elems)
+    ast_app (ast_app (ast_var "cons") h) t
+
+-- After consuming '(', parse expr then expect ')'.
+parse_paren_expr toks =
+  let r = parse_expr toks
+  if (is_err r) == 1 then r
+  else
+    let toks2 = res_toks r
+    if (peek_tag toks2) == "rparen" then
+      ok (res_ast r) (advance toks2)
+    else
+      ok (ast_err "expected ')'") []
+
+-- After seeing an ident: maybe it's `if`, `let`, `match`, or just a var.
+parse_ident_primary toks =
+  let name = peek_val toks
+  if name == "if" then parse_if_expr (advance toks)
+  else if name == "let" then parse_let_expr (advance toks)
+  else if name == "match" then parse_match_expr (advance toks)
+  else if name == "then" then ok (ast_err "unexpected 'then'") []
+  else if name == "else" then ok (ast_err "unexpected 'else'") []
+  else if name == "in" then ok (ast_err "unexpected 'in'") []
+  else ok (ast_var name) (advance toks)
+
+-- After 'if': parse cond, expect 'then', parse then, expect 'else', parse else.
+parse_if_expr toks =
+  let r1 = parse_expr toks
+  if (is_err r1) == 1 then r1
+  else parse_if_then (res_ast r1) (res_toks r1)
+
+parse_if_then cond toks =
+  if (is_kw toks "then") == 0 then ok (ast_err "expected 'then'") []
+  else
+    let r2 = parse_expr (advance toks)
+    if (is_err r2) == 1 then r2
+    else parse_if_else cond (res_ast r2) (res_toks r2)
+
+parse_if_else cond t toks =
+  if (is_kw toks "else") == 0 then ok (ast_err "expected 'else'") []
+  else
+    let r3 = parse_expr (advance toks)
+    if (is_err r3) == 1 then r3
+    else ok (ast_if cond t (res_ast r3)) (res_toks r3)
+
+-- After 'let': parse IDENT, expect '=', parse value, expect 'in', parse body.
+parse_let_expr toks =
+  if (peek_tag toks) == "ident" then parse_let_named toks
+  else ok (ast_err "expected ident after 'let'") []
+
+parse_let_named toks =
+  let name = peek_val toks
+  let toks2 = advance toks
+  if (peek_tag toks2) == "eq" then parse_let_value name (advance toks2)
+  else ok (ast_err "expected '=' after let-name") []
+
+parse_let_value name toks =
+  let r = parse_expr toks
+  if (is_err r) == 1 then r
+  else parse_let_in name (res_ast r) (res_toks r)
+
+parse_let_in name v toks =
+  -- Accept either explicit `in` keyword OR a newline (newline-form let).
+  -- `main = let _ = print (show n)\n  0` is the canonical Rail idiom.
+  if (is_kw toks "in") == 1 then
+    let r = parse_expr (advance toks)
+    if (is_err r) == 1 then r
+    else ok (ast_let name v (res_ast r)) (res_toks r)
+  else if (is_nl toks) == 1 then
+    let r = parse_expr (skip_nls toks)
+    if (is_err r) == 1 then r
+    else ok (ast_let name v (res_ast r)) (res_toks r)
+  else ok (ast_err "expected 'in' or newline after let-value") []
+
+-- ============================================================================
+-- Match expression: parse-time desugar to nested if/let.
+-- Grammar (v1, list patterns only):
+--   match_expr ::= 'match' expr ('|' pattern '->' expr)+
+--   pattern    ::= 'nil' | 'cons' IDENT IDENT
+-- Either branch order is accepted. Result desugars to:
+--   let __match_tmp = scrutinee in
+--   if is_nil __match_tmp then nil_body
+--   else let h = head __match_tmp in
+--        let t = tail __match_tmp in
+--        cons_body
+-- ============================================================================
+
+parse_match_expr toks =
+  let r = parse_expr toks
+  if (is_err r) == 1 then r
+  else parse_match_branches (res_ast r) (res_toks r)
+
+parse_match_branches scrutinee toks =
+  if (peek_tag toks) == "pipe" then parse_match_collect scrutinee [] toks
+  else ok (ast_err "match: expected '|' after scrutinee") []
+
+parse_match_collect scrutinee acc toks =
+  if (peek_tag toks) != "pipe" then ok (desugar_match scrutinee (reverse acc)) toks
+  else
+    let r = parse_match_branch (advance toks)
+    if (is_err r) == 1 then r
+    else parse_match_collect scrutinee (cons (res_ast r) acc) (res_toks r)
+
+parse_match_branch toks =
+  if (peek_tag toks) != "ident" then ok (ast_err "match branch: expected pattern ident") []
+  else parse_match_branch_named (peek_val toks) (advance toks)
+
+parse_match_branch_named pname toks =
+  if pname == "nil" then parse_match_branch_arrow pname [] toks
+  else if pname == "cons" then parse_match_branch_cons toks
+  else ok (ast_err (cat ["match: unsupported pattern ", pname, " (v1: nil | cons h t)"])) []
+
+parse_match_branch_cons toks =
+  if (peek_tag toks) != "ident" then ok (ast_err "cons pattern: expected head binder ident") []
+  else
+    let h = peek_val toks
+    let toks2 = advance toks
+    if (peek_tag toks2) != "ident" then ok (ast_err "cons pattern: expected tail binder ident") []
+    else
+      let t = peek_val toks2
+      parse_match_branch_arrow "cons" (cons h (cons t [])) (advance toks2)
+
+parse_match_branch_arrow pname binders toks =
+  if (peek_tag toks) != "arrow" then ok (ast_err "match: expected '->' after pattern") []
+  else
+    let r = parse_expr (advance toks)
+    if (is_err r) == 1 then r
+    else ok (cons "branch" (cons pname (cons binders (cons (res_ast r) [])))) (res_toks r)
+
+-- Each branch is encoded as ["branch", pname, binders_list, body_ast].
+desugar_match scrutinee branches =
+  let nil_body = find_branch_body branches "nil"
+  let cons_info = find_cons_branch branches
+  if nil_body == 0 then ast_err "match: missing nil branch (v1 requires both nil and cons)"
+  else if cons_info == 0 then ast_err "match: missing cons branch (v1 requires both nil and cons)"
+  else build_match_desugar scrutinee nil_body cons_info
+
+build_match_desugar scrutinee nil_body cons_info =
+  let h_name = head cons_info
+  let t_name = head (tail cons_info)
+  let cons_body = head (tail (tail cons_info))
+  let m_var = ast_var "__match_tmp"
+  let inner_t_let = ast_let t_name (ast_app (ast_var "tail") m_var) cons_body
+  let inner_h_let = ast_let h_name (ast_app (ast_var "head") m_var) inner_t_let
+  let cond = ast_app (ast_var "is_nil") m_var
+  let if_node = ast_if cond nil_body inner_h_let
+  ast_let "__match_tmp" scrutinee if_node
+
+find_branch_body branches name =
+  if branches == [] then 0
+  else
+    let b = head branches
+    if (head (tail b)) == name then head (tail (tail (tail b)))
+    else find_branch_body (tail branches) name
+
+find_cons_branch branches =
+  if branches == [] then 0
+  else
+    let b = head branches
+    if (head (tail b)) == "cons" then build_cons_info b
+    else find_cons_branch (tail branches)
+
+build_cons_info b =
+  let binders = head (tail (tail b))
+  let body = head (tail (tail (tail b)))
+  cons (head binders) (cons (head (tail binders)) (cons body []))
+
+-- ============================================================================
+-- Application: primary primary*  (left-associative)
+-- ============================================================================
+
+parse_app toks =
+  let r = parse_primary toks
+  if (is_err r) == 1 then r
+  else parse_app_loop (res_ast r) (res_toks r)
+
+parse_app_loop f toks =
+  if (is_app_continuation toks) == 0 then ok f toks
+  else
+    let r = parse_primary toks
+    if (is_err r) == 1 then r
+    else parse_app_loop (ast_app f (res_ast r)) (res_toks r)
+
+-- An app continues if the next token starts a primary AND isn't a keyword
+-- that would terminate the application (then/else/in/let/if would parse
+-- a fresh primary but they're rarely chained without parens; we stop on
+-- those for safety).
+is_app_continuation toks =
+  let tag = peek_tag toks
+  if tag == "int" then 1
+  else if tag == "float" then 1
+  else if tag == "str" then 1
+  else if tag == "lparen" then 1
+  else if tag == "lbracket" then 1
+  else if tag == "ident" then is_app_ident toks
+  else 0
+
+is_app_ident toks =
+  let name = peek_val toks
+  if name == "then" then 0
+  else if name == "else" then 0
+  else if name == "in" then 0
+  else if name == "let" then 0
+  else if name == "if" then 0
+  else 1
+
+-- ============================================================================
+-- Multiplicative: app_expr ('*' app_expr)*
+-- ============================================================================
+
+parse_mul toks =
+  let r = parse_app toks
+  if (is_err r) == 1 then r
+  else parse_mul_loop (res_ast r) (res_toks r)
+
+parse_mul_loop lhs toks =
+  if (is_op_sym toks "*") == 1 then parse_mul_step "*" lhs toks
+  else if (is_op_sym toks "/") == 1 then parse_mul_step "/" lhs toks
+  else ok lhs toks
+
+parse_mul_step op lhs toks =
+  let r = parse_app (advance toks)
+  if (is_err r) == 1 then r
+  else parse_mul_loop (ast_op op lhs (res_ast r)) (res_toks r)
+
+-- ============================================================================
+-- Additive: mul_expr (('+' | '-') mul_expr)*
+-- ============================================================================
+
+parse_add toks =
+  let r = parse_mul toks
+  if (is_err r) == 1 then r
+  else parse_add_loop (res_ast r) (res_toks r)
+
+parse_add_loop lhs toks =
+  if (is_op_sym toks "+") == 1 then parse_add_step "+" lhs toks
+  else if (is_op_sym toks "-") == 1 then parse_add_step "-" lhs toks
+  else ok lhs toks
+
+parse_add_step op lhs toks =
+  let r = parse_mul (advance toks)
+  if (is_err r) == 1 then r
+  else parse_add_loop (ast_op op lhs (res_ast r)) (res_toks r)
+
+-- ============================================================================
+-- Comparison: add_expr ('<' add_expr)?
+-- ============================================================================
+
+parse_cmp toks =
+  let r = parse_add toks
+  if (is_err r) == 1 then r
+  else parse_cmp_tail (res_ast r) (res_toks r)
+
+parse_cmp_tail lhs toks =
+  if (is_op_sym toks "<")  == 1 then parse_cmp_step "<"  lhs toks
+  else if (is_op_sym toks ">")  == 1 then parse_cmp_step ">"  lhs toks
+  else if (is_op_sym toks "==") == 1 then parse_cmp_step "==" lhs toks
+  else if (is_op_sym toks "<=") == 1 then parse_cmp_step "<=" lhs toks
+  else if (is_op_sym toks ">=") == 1 then parse_cmp_step ">=" lhs toks
+  else ok lhs toks
+
+parse_cmp_step op lhs toks =
+  let r = parse_add (advance toks)
+  if (is_err r) == 1 then r
+  else ok (ast_op op lhs (res_ast r)) (res_toks r)
+
+parse_expr toks = parse_or toks
+
+-- Boolean OR: cmp_expr ("||" cmp_expr)* — desugars to nested
+-- `if lhs then 1 else rhs`. Short-circuit semantics preserved.
+parse_or toks =
+  let r = parse_and toks
+  if (is_err r) == 1 then r
+  else parse_or_loop (res_ast r) (res_toks r)
+
+parse_or_loop lhs toks =
+  if (is_op_sym toks "||") == 0 then ok lhs toks
+  else
+    let r = parse_and (advance toks)
+    if (is_err r) == 1 then r
+    else parse_or_loop (ast_if lhs (ast_int 1) (res_ast r)) (res_toks r)
+
+-- Boolean AND: cmp_expr ("&&" cmp_expr)* — desugars to
+-- `if lhs then rhs else 0`.
+parse_and toks =
+  let r = parse_cmp toks
+  if (is_err r) == 1 then r
+  else parse_and_loop (res_ast r) (res_toks r)
+
+parse_and_loop lhs toks =
+  if (is_op_sym toks "&&") == 0 then ok lhs toks
+  else
+    let r = parse_cmp (advance toks)
+    if (is_err r) == 1 then r
+    else parse_and_loop (ast_if lhs (res_ast r) (ast_int 0)) (res_toks r)
+
+-- ============================================================================
+-- Top level: program ::= fn_def*
+-- A fn_def is `name arg* = expr` ending at a newline or EOF.
+-- ============================================================================
+
+parse_program toks =
+  parse_program_loop (skip_nls toks) []
+
+parse_program_loop toks acc =
+  let toks2 = skip_nls toks
+  if (is_eof toks2) == 1 then ok (ast_prog (reverse acc)) toks2
+  else
+    let r = parse_fn_def toks2
+    if (is_err r) == 1 then r
+    else parse_program_loop (res_toks r) (cons (res_ast r) acc)
+
+parse_fn_def toks =
+  if (peek_tag toks) == "ident" then parse_fn_named (peek_val toks) (advance toks)
+  else ok (ast_err (cat ["fn_def: expected ident, got tag=", peek_tag toks])) []
+
+parse_fn_named name toks =
+  parse_fn_args name [] toks
+
+-- Collect args (idents) until '=' or end-of-something.
+parse_fn_args name acc toks =
+  if (peek_tag toks) == "eq" then parse_fn_body name (reverse acc) (advance toks)
+  else if (peek_tag toks) == "ident" then
+    parse_fn_args name (cons (peek_val toks) acc) (advance toks)
+  else ok (ast_err "fn_def: expected ident or '=' in args") []
+
+parse_fn_body name args toks =
+  -- Allow newline(s) between `=` and the body. `main =\n  let _ = print "hi"\n  0`
+  -- is the canonical Rail idiom (newline-as-implicit-`in`) and the body parser
+  -- below treats the let chain correctly via the existing parse_let_in newline
+  -- branch. Without this skip_nls, parse_primary would see the leading nl as
+  -- an "unexpected token" and reject every multi-line fn body.
+  let toks_body = skip_nls toks
+  let r = parse_expr toks_body
+  if (is_err r) == 1 then r
+  else
+    let toks2 = res_toks r
+    -- expect newline or EOF after the body
+    let toks3 = skip_nls toks2
+    ok (ast_fn name args (res_ast r)) toks3
