@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="#releases"><img src="https://img.shields.io/badge/v3.0.0-Rail%20speaks%20TLS-ff5500?style=for-the-badge" alt="v3.0.0"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/v4.0.0-Substrate%20maturity-ff5500?style=for-the-badge" alt="v4.0.0"></a>
 </p>
 
 <p align="center">
@@ -29,7 +29,7 @@
 
 ---
 
-Rail compiles itself. The compiler — ~6,719 lines of Rail — produces a ~1.0 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. As of v3.0.0, the TLS 1.3 client is Rail too: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat.
+Rail compiles itself. The compiler — ~6,000+ lines of Rail — produces a ~1.0 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. The TLS 1.3 client is also Rail: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat. As of **v4.0.0**, the substrate is mature on two backends with full same-bug-class parity, ships its own JIT in pure Rail, and a frontier model + 1 KB Rail spec compiles 30/30 on a held-out hard-bench — publicly reproducible.
 
 ```
 ./rail_native self && cp /tmp/rail_self ./rail_native  # cycle 1
@@ -166,6 +166,18 @@ Tail-recursive loops match C `-O2` (5 instructions per iteration). The full arch
 
 ## Releases
 
+### v4.0.0 — 2026-05-13 — *Substrate maturity*
+
+A major-version bump positioning Rail as a substrate, not a model. 216 commits since v3.11.0 across concurrency, JIT, dual-backend parity, attested provenance, and 30/30 hard-bench reproducibility.
+
+- **30/30 hard-bench, publicly reproducible.** A frontier model + a 1 KB Rail spec compiles 30/30 of a held-out hard-bench. Anyone with an API key can re-run.
+- **Self-hosted on two backends with full parity.** ARM64 140/140 and x86_64 136/136. The same compiler runs both; same-bug-class sweep closed for all 9 binary ops across both operand orderings.
+- **Concurrency v1.** Typed channels + select over a pthread-backed runtime. `import "stdlib/concurrent.rail"`.
+- **JIT in pure Rail.** `import "jit/grade.rail"` — a Rail program can compile + execute new Rail at runtime in the same process. Found a 17-day silent-corruption auto-memo bug by dual-implementing the compile path.
+- **Multi-witness Ed25519 attestation.** Browser-verifiable provenance with pulse_id binding. Standalone single-file verifier ships at deterministic SHA.
+
+v4.0.1 (2026-05-13) is a public-surface sanitization patch over v4.0.0 — see [CHANGELOG.md](CHANGELOG.md). The compiled binary is identical.
+
 ### v3.0.0 — 2026-04-18 — *Rail speaks TLS*
 
 A complete pure-Rail TLS 1.3 stack + X.509 chain validation + HTTPS client. The `~/.fleet/tls_proxies.sh` socat daemons are no longer on any critical path.
@@ -206,6 +218,13 @@ Native floats in ARM64 d-registers, effect handlers via setjmp/longjmp, GC in as
 
 | Version | Date | Headline |
 |---|---|---|
+| **v4.0.1** | 2026-05-13 | Public-surface sanitization (no behavior change) |
+| **v4.0.0** | 2026-05-13 | Substrate maturity — 30/30 hard-bench, JIT, dual-backend parity, multi-witness attest |
+| **v3.11.0** | 2026-05-02 | Pi self-hosts (98/137 on aarch64 Linux); attest fully Rail-native |
+| **v3.10.0** | 2026-05-02 | Pi signer in pure Rail; Linux backend gains atof + snprintf + print_float |
+| **v3.9.0** | 2026-05-02 | Linux cross-compile fixed (`./rail_native linux foo.rail` → working ELF) |
+| **v3.8.0** | 2026-05-01 | Releases physicified — every binary attested against a live entropy beacon |
+| **v3.7.0** | 2026-04-30 | Float-TCO root fix, mixed-precision inference, parallel rerank |
 | **v3.0.0** | 2026-04-18 | Rail speaks TLS — pure-Rail HTTPS, chain validation to macOS trust store |
 | **v2.23.0** | 2026-04-17 | Pure-Rail HTTP/1.1 client + `char_from_int` |
 | **v2.0.0** | 2026-04-06 | Self-improving flywheel, native floats, effect handlers, GC in asm |
