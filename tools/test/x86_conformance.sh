@@ -172,6 +172,14 @@ TESTS=(
 'f32_io_roundtrip|-13|main =\n  let src = float_arr_new 3 0.0\n  let _ = float_arr_set src 0 1.5\n  let _ = float_arr_set src 1 (0.0 -. 3.25)\n  let _ = float_arr_set src 2 0.125\n  let _ = float_arr_to_f32_file "/tmp/rail_x86conf_f32roundtrip.bin" src 3\n  let dst = float_arr_new 3 0.0\n  let _ = float_arr_from_f32_file "/tmp/rail_x86conf_f32roundtrip.bin" dst 3\n  let s = float_arr_get dst 0 +. float_arr_get dst 1 +. float_arr_get dst 2\n  let _ = print (show (to_int (s *. 8.0)))\n  0'
 'mixed_float_int_op|6|fill arr i =\n  if i >= 3 then 0\n  else\n    let _ = float_arr_set arr i (0.0 + (i + 1))\n    fill arr (i + 1)\nmain =\n  let a = float_arr_new 3 0.0\n  let _ = fill a 0\n  let s = float_arr_get a 0 + float_arr_get a 1 + float_arr_get a 2\n  to_int s'
 
+# (int LHS, float RHS) ordering through _rail_add. Pre-fix x86_rt.s only
+# checked LHS for tagged-int before the fast-path, so a tagged-int + boxed-
+# float pair did `add rdi, rsi; lea rax,[rdi-1]` — UB. Falsification test:
+# arr_get returns an untyped tagged value, forcing runtime dispatch through
+# _rail_add. Expected: 2 + 5.5 = 7.5 → to_int = 7. Mirror of mixed_float_int_op
+# above (which exercises the float LHS / int RHS direction).
+'add_int_float_ordering|7|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 2\n  let _ = arr_set a 1 5.5\n  let v = (arr_get a 0) + (arr_get a 1)\n  let _ = print (show (to_int v))\n  0'
+
 # t107: char_to_int on a runtime-extracted char
 # Expected: portable (already uses char_to_int which is portable, and chars/head are portable)
 'char_to_int_rt|57|main =\n  let c = head (chars "9")\n  char_to_int c'
