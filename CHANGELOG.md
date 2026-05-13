@@ -2,6 +2,103 @@
 
 All notable changes to Rail are documented here.
 
+## v4.1.0 — 2026-05-13 — Repo hygiene + leak-guard CI
+
+Minor release. Comprehensive cleanup pass over the public tree. No
+compiled-binary change; no language or stdlib changes.
+
+### CI + leak-prevention (B1)
+
+- **New workflow** `.github/workflows/leak-guard.yml` — every push and PR
+  is grep-scanned for the operator-recon pattern set (Tailscale IPs,
+  internal SSH targets, home-directory paths, internal Slack channel
+  IDs). Fails the build on any hit. Per-line opt-out via the comment
+  marker `leak-guard-allow`. CHANGELOG.md and the guard file are
+  excluded.
+- **ci.yml** triggers extended to include `next` branch and `v*` tags.
+  Test-count assertion generalised from hardcoded `137/137` to any
+  matching `N/N` (master is 137, next is 140, future may grow).
+- **.gitignore** — explicit ignores for `.mcp.json`, `.ledatic/`,
+  `.fleet/`, `*.pre-*`. Closes the casual-`git add` recurrence path
+  for the v4.0.1 leak class.
+
+### Branch hygiene (B2)
+
+21 remote branches deleted from origin:
+
+- 18 `feat/*` branches fully merged into `next` (security A/B/C lanes,
+  x86 conformance harness, x86 runtime extensions, JIT fixes, docs
+  refresh, auto-deploy, punch-list integration).
+- `jit` (merged into `next`).
+- `track-mhd-kernel` (merged into `master`).
+- `history-scrub-prep-2026-05-12` (unused experimental branch).
+
+Remaining: `master`, `next`, `half-s2-kernels` (open compiler work),
+`compound/exp-008-bytes_to_str` (halted POC artifact). Down from 26
+branches to 4.
+
+### Doc pruning (B3)
+
+~104 operator session-handoff files removed from the public tree:
+
+- `docs/plans/` (74 files) — operator session-planning notes
+  (SESSION_HANDOFF_*, PROMPT_SESSION_*, WEEK_PLAN_*, PHASE_*, etc.).
+- `notes/` orphan files (12).
+- `docs/handoffs/` orphans (8).
+- `jit/` operator notes (9) — SCRATCH, CONTINUATION, SESSION_PROMPT*,
+  AGENT_DRY_RUN, NEXT_STAGES, closures, floats.
+- `SECURITY_HANDOFF.md` — internal Fort Knox punch list (the public
+  policy lives in `SECURITY.md`).
+
+Kept: docs referenced from CHANGELOG (`notes/bootstrap_convergence_audit_*`,
+`notes/phase3_external_pilot_pitch_v0`); `jit/` code + README + CHANGELOG;
+`docs/sessions/` versioned handoffs (CHANGELOG-linked).
+
+### Dead-code pruning (B4)
+
+- Deleted `tools/autocatalyst_v4.rail` (broken — referenced runtime/llm.o
+  which never landed in-tree, flywheel-v1 artifact).
+- Deleted `tools/ac_dashboard.rail` (orphan, flywheel dashboard).
+- Removed Razer3070 live-path references (decommissioned 2026-04-17):
+  - `tools/apps/control.rail` — Razer fleet row + curl status segment.
+  - `tools/fleet/fleet_display.rail` — razer_status/razer_iter/razer_max/
+    razer_ping/razer_loss + RAZER row in the SPI-LCD render.
+  - `tools/mcp/rail_mcp.rail` — tool_fleet_status no longer SSHes for
+    nvidia-smi / v6_train.log; description updated.
+  - `tools/compile.rail` — compile_x86 fallback message no longer
+    recommends scp-to-Razer; suggests cross-tools or native host.
+    Byte-identical bootstrap preserved.
+- `CLAUDE.md` target list: 'Linux x86_64 (Razer WSL)' →
+  'Linux x86_64 (cross-compile)'.
+
+### Structure pass (B5)
+
+- Deleted 7 docs with no CHANGELOG or code references:
+  `RAIL_ENGINEER_PROMPT.md`, `flywheel-data-quality.md`,
+  `flywheel-world-research.md`, `cascade-training.md`,
+  `rail-plasma.md`, `railgpt-from-scratch.md`,
+  `self-improving-playbook.md`.
+- Flattened `docs/handoffs/` (down to a single entry after B3 prune):
+  `docs/handoffs/2026-05-02.md` → `docs/handoff-2026-05-02.md`.
+
+### README polish (B6)
+
+- Badge: v3.0.0 → v4.0.0; tagline → "Substrate maturity".
+- Intro paragraph adds the v4.0.0 substrate-maturity lede (dual-backend
+  parity, JIT in Rail, 30/30 hard-bench, multi-witness attest).
+- New Releases section entry for v4.0.0 + a v4.0.1 sanitization note.
+- History table extended: 7 new rows spanning v3.7.0 → v4.0.1
+  (previously jumped from v3.0.0 to v2.23.0).
+
+### Verification
+
+- Leak guard: 0 hits across tracked files for the union pattern set.
+- Test suite: 140/140 on the v4.1.0 tree (modulo the documented
+  `/tmp/rail_out` orphan-process collision when run concurrently with
+  another `rail_native test`).
+- `git push` on next: clean fast-forward; tag v4.1.0 cuts at 6 commits
+  past v4.0.1, all CI-green via the new workflow.
+
 ## v4.0.1 — 2026-05-13 — Public-surface sanitization
 
 Patch release. Removes operator-specific infrastructure strings from the
