@@ -186,12 +186,16 @@ TESTS=(
 # Post-fix: each helper has a `.L<op>_mixed_if` mirror branch; each inline
 # `x86_get_opc_inline` case uses `check_both` (mov r10,rcx; and r10,rax;
 # test r10,1) so the heap-fallback runs on EITHER operand being heap.
-# Each test prints PASS / FAIL using `==` (which is already tag-aware via
-# _rail_eq) so we don't double-test the bug class through the assertion.
-'sub_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 10\n  let _ = arr_set a 1 5.5\n  let v = (arr_get a 0) - (arr_get a 1)\n  if v == 4.5 then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
-'mul_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 3\n  let _ = arr_set a 1 2.5\n  let v = (arr_get a 0) * (arr_get a 1)\n  if v == 7.5 then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
-'div_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 10\n  let _ = arr_set a 1 2.5\n  let v = (arr_get a 0) / (arr_get a 1)\n  if v == 4.0 then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
-'mod_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 10\n  let _ = arr_set a 1 4.25\n  let v = (arr_get a 0) % (arr_get a 1)\n  if v == 1.5 then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
+# Each test verifies via `show v == "<n>"` (string compare). x86 floats are
+# heap-boxed throughout, so `v == <literal>` would also work — but ARM64
+# native floats v2.0 leaves the literal as a raw f64 bit pattern while the
+# `_rail_<op>` helpers box their result, so `_rail_eq` can't bridge the two.
+# Routing through `show` produces the same string on both backends and
+# falsifies the same bug class.
+'sub_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 10\n  let _ = arr_set a 1 5.5\n  let v = (arr_get a 0) - (arr_get a 1)\n  if show v == "4.5" then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
+'mul_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 3\n  let _ = arr_set a 1 2.5\n  let v = (arr_get a 0) * (arr_get a 1)\n  if show v == "7.5" then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
+'div_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 10\n  let _ = arr_set a 1 2.5\n  let v = (arr_get a 0) / (arr_get a 1)\n  if show v == "4" then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
+'mod_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 10\n  let _ = arr_set a 1 4.25\n  let v = (arr_get a 0) % (arr_get a 1)\n  if show v == "1.5" then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
 'lt_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 2\n  let _ = arr_set a 1 5.5\n  let v = (arr_get a 0) < (arr_get a 1)\n  if v then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
 'gt_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 10\n  let _ = arr_set a 1 5.5\n  let v = (arr_get a 0) > (arr_get a 1)\n  if v then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
 'le_int_float_ordering|PASS|main =\n  let a = arr_new 2 0\n  let _ = arr_set a 0 5\n  let _ = arr_set a 1 5.5\n  let v = (arr_get a 0) <= (arr_get a 1)\n  if v then\n    let _ = print "PASS"\n    0\n  else\n    let _ = print "FAIL"\n    1'
