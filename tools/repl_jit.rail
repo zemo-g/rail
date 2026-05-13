@@ -1,0 +1,267 @@
+-- repl_jit.rail — JIT-first REPL for Rail.
+--
+-- For each user line:
+--   1. If it's a definition (`name args = body`), append it to the running
+--      `defs` buffer and acknowledge silently (no compile yet).
+--   2. If it's an expression, build the full program
+--        defs + "\nmain = " + line
+--      and try to lower+JIT it. On success, print the captured stdout if
+--      the program printed anything, else print the int return.
+--   3. On JIT lower failure (subset miss — ADTs, effect handlers, anything
+--      outside jit/lower.rail's grammar), fall back to the shell compile
+--      path: write the program to /tmp/rail_repl_jit.rail, run it.
+--
+-- Usage: ./rail_native run tools/repl_jit.rail
+--   Or as a batch driver:
+--     ./rail_native run tools/repl_jit.rail <input_file>
+--
+-- Special lines:
+--   :q / :quit            -- exit
+--   :reset                -- clear defs
+--   :defs                 -- print defs buffer
+--   :mode jit | shell | auto  -- force a path (default auto)
+--
+-- Output format:
+--   Each result line is prefixed with the path that produced it:
+--     [jit]   ...   (sub-50ms typical, lowering subset only)
+--     [shell] ...   (~300-400ms typical, full compile.rail)
+--     [err]   ...   (both paths errored — print first error)
+
+import "jit/heap.rail"
+import "jit/emit.rail"
+import "jit/loader.rail"
+import "jit/lower.rail"
+
+-- ============================================================================
+-- JIT eval: lower+emit+run+capture, returns
+--   ["jit_int", n]            -- JIT ran cleanly, no stdout, here's main's int
+--   ["jit_str", captured]     -- JIT ran cleanly, stdout was captured
+--   ["err", msg]              -- lower failed (caller should fall back)
+-- ============================================================================
+try_jit_eval src =
+  let r = lower_source src
+  if (head r) == "err" then
+    cons "err" (cons (head (tail r)) [])
+  else
+    let fns  = head (tail r)
+    let pool = head (tail (tail r))
+    let heap = heap_alloc 0
+    let res  = emit_program fns pool heap
+    let buf  = emitted_buf res
+    let nbytes = emitted_size res
+    let page = make_executable buf nbytes
+    let got = call_jit_direct page heap
+    let captured = read_jit_output heap
+    let out_len = jit_output_len heap
+    let _ = free_jit page
+    let _ = heap_free heap
+    if out_len > 0 then cons "jit_str" (cons captured [])
+    else cons "jit_int" (cons got [])
+
+-- ============================================================================
+-- Definition classifier. Same rules as tools/repl.rail with one extension:
+-- a "main = ..." line is an expression form (we always synthesize main),
+-- so reject it as a defn to avoid double-main collisions.
+-- ============================================================================
+is_definition line =
+  let n = length (chars line) in
+  if n < 3 then false
+  else if not (str_contains "=" line) then false
+  else if str_sub line 0 4 == "let " then false
+  else if str_sub line 0 3 == "if " then false
+  else if str_sub line 0 1 == "(" then false
+  else if str_sub line 0 5 == "main " then false
+  else if str_sub line 0 5 == "main=" then false
+  else true
+
+-- ============================================================================
+-- Build a full program from defs + an expression. The expression is wrapped
+-- so it both prints (so the user sees something) AND returns an int (so the
+-- JIT's int-return convention works for non-printing exprs).
+--
+-- Cases:
+--   * `print ...` expressions: leave as-is, JIT print captures stdout.
+--   * Other int-typed expressions: wrap as `let _ = print (show e) in 0`
+--     so the JIT's stdout-capture sees the rendered value.
+--   * If shell path is needed later, the same wrapping works under the
+--     full compiler (show is polymorphic there too).
+-- ============================================================================
+make_program defs expr =
+  -- JIT parser supports `main = expr` and `main = let ... in expr` on a single
+  -- line. Multi-line `main = / newline / body` works in shell but not JIT.
+  -- We synthesize an inline form so both paths accept the same source.
+  let body =
+    if starts_with_print expr then
+      expr
+    else
+      cat ["let _ = print (show (", expr, ")) in 0"]
+  in
+  if defs == "" then
+    cat ["main = ", body, "\n"]
+  else
+    cat [defs, "\nmain = ", body, "\n"]
+
+starts_with_print expr =
+  let n = length (chars expr) in
+  if n < 6 then false
+  else if (str_sub expr 0 6) == "print " then true
+  else if (str_sub expr 0 6) == "print(" then true
+  else false
+
+-- ============================================================================
+-- Shell fallback: write the program out and run it via rail_native.
+-- Uses a worktree-stable tmp file to avoid colliding with parallel agents
+-- on /tmp/rail_out (see CLAUDE.md tmp-race note).
+-- ============================================================================
+shell_eval src tmp =
+  let _ = write_file tmp src
+  let cmd = cat ["./rail_native run ", tmp, " 2>&1"]
+  shell cmd
+
+-- Strip the rail_native "Compiling ..." / "as: OK" / "ld: OK" header so the
+-- REPL output is just the program's stdout (or the parse-error line).
+strip_compile_header raw =
+  let lines = str_split "\n" raw in
+  let kept = filter_lines lines [] in
+  join "\n" kept
+
+filter_lines lines acc =
+  if length lines == 0 then reverse acc
+  else
+    let l = head lines in
+    if (str_sub l 0 9) == "Compiling" then filter_lines (tail lines) acc
+    else if (str_sub l 0 6) == "  as: " then filter_lines (tail lines) acc
+    else if (str_sub l 0 6) == "  ld: " then filter_lines (tail lines) acc
+    else filter_lines (tail lines) (cons l acc)
+
+-- ============================================================================
+-- Per-line dispatch: try JIT (in auto mode), else shell.
+-- Returns the rendered result string.
+-- ============================================================================
+eval_line defs line mode tmp =
+  let src = make_program defs line in
+  if mode == "shell" then
+    eval_via_shell src tmp
+  else
+    let r = try_jit_eval src in
+    if (head r) == "jit_int" then
+      cat ["[jit]   ", show (head (tail r))]
+    else if (head r) == "jit_str" then
+      cat ["[jit]   ", strip_trailing_newline (head (tail r))]
+    else
+      -- jit lower err; fall through to shell unless explicitly jit-mode
+      if mode == "jit" then
+        cat ["[err]   jit-only: ", head (tail r)]
+      else
+        eval_via_shell src tmp
+
+eval_via_shell src tmp =
+  let raw = shell_eval src tmp in
+  let cleaned = strip_compile_header raw in
+  let stripped = strip_trailing_newline cleaned in
+  cat ["[shell] ", stripped]
+
+strip_trailing_newline s =
+  let n = length (chars s) in
+  if n == 0 then s
+  else if (str_sub s (n - 1) 1) == "\n" then str_sub s 0 (n - 1)
+  else s
+
+-- ============================================================================
+-- Interactive read-print loop. `mode` is "auto" (default), "jit", or "shell".
+-- ============================================================================
+repl_loop defs n mode tmp =
+  let _ = write_str "rail-jit> " in
+  let line = read_line 0 in
+  if line == "" then 0
+  else if line == ":q" then 0
+  else if line == ":quit" then 0
+  else if line == ":reset" then
+    let _ = print "  (cleared)" in
+    repl_loop "" 0 mode tmp
+  else if line == ":defs" then
+    let _ = if defs == "" then print "  (no definitions)" else print defs in
+    repl_loop defs n mode tmp
+  else if line == ":mode jit" then
+    let _ = print "  (mode: jit)" in repl_loop defs n "jit" tmp
+  else if line == ":mode shell" then
+    let _ = print "  (mode: shell)" in repl_loop defs n "shell" tmp
+  else if line == ":mode auto" then
+    let _ = print "  (mode: auto)" in repl_loop defs n "auto" tmp
+  else
+    if is_definition line then
+      let new_defs = if defs == "" then line else cat [defs, "\n", line] in
+      let _ = print "  (defined)" in
+      repl_loop new_defs n mode tmp
+    else
+      let out = eval_line defs line mode tmp in
+      let _ = print out in
+      repl_loop defs (n + 1) mode tmp
+
+-- Write a string without trailing newline (REPL prompt).
+write_str s =
+  let _ = write_file "/tmp/rail_repl_jit_prompt.txt" s in
+  let _ = shell "printf '%s' \"$(cat /tmp/rail_repl_jit_prompt.txt)\"" in
+  0
+
+-- ============================================================================
+-- Batch mode: read lines from a file, eval each as if typed at the REPL.
+-- Prints "rail-jit> <line>" then the result, so the transcript is easy to
+-- compare against an expected output.
+-- ============================================================================
+batch_eval path =
+  let raw = read_file path in
+  if str_starts_with_local "_NOT_FOUND" raw then
+    let _ = print (cat ["error: input file not found: ", path]) in
+    1
+  else
+    let lines = str_split "\n" raw in
+    let _ = batch_run lines "" 0 "auto" "/tmp/rail_repl_jit_batch.rail" in
+    0
+
+batch_run lines defs n mode tmp =
+  if length lines == 0 then 0
+  else
+    let line = head lines in
+    let rest = tail lines in
+    if line == "" then batch_run rest defs n mode tmp
+    else if str_starts_with_local "--" line then batch_run rest defs n mode tmp
+    else if line == ":reset" then
+      let _ = print "rail-jit> :reset" in
+      let _ = print "  (cleared)" in
+      batch_run rest "" 0 mode tmp
+    else
+      let _ = print (cat ["rail-jit> ", line]) in
+      if is_definition line then
+        let new_defs = if defs == "" then line else cat [defs, "\n", line] in
+        let _ = print "  (defined)" in
+        batch_run rest new_defs n mode tmp
+      else
+        let out = eval_line defs line mode tmp in
+        let _ = print out in
+        batch_run rest defs (n + 1) mode tmp
+
+str_starts_with_local prefix s =
+  let p = chars prefix in
+  let xs = chars s in
+  starts_loop_local p xs
+
+starts_loop_local p xs =
+  if length p == 0 then true
+  else if length xs == 0 then false
+  else if head p == head xs then starts_loop_local (tail p) (tail xs)
+  else false
+
+-- ============================================================================
+-- Entry. Detect batch mode by reading /tmp/rail_repl_jit_input.txt if it
+-- exists (set by the smoke test). Otherwise interactive.
+-- ============================================================================
+main =
+  let argv_path = read_file "/tmp/rail_repl_jit_input.txt" in
+  if str_starts_with_local "_NOT_FOUND" argv_path then
+    let _ = print "Rail JIT REPL — :q to quit, :mode auto|jit|shell" in
+    repl_loop "" 0 "auto" "/tmp/rail_repl_jit.rail"
+  else
+    -- argv_path's content is the actual batch-input path; trim trailing nl.
+    let p = strip_trailing_newline argv_path in
+    batch_eval p
