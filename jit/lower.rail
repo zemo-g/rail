@@ -82,7 +82,11 @@ mk_state _ =
   let _ = arr_set ctr 10 0    -- float caller-save free-bitmap (bits 0..7 = f0..f7 reusable)
   let _ = arr_set ctr 11 0    -- float caller-save lock-mask (bit i = f_i is env-bound, never freed)
   let blocks = arr_new max_blocks_per_fn 0
-  let err_msg = cons "" []
+  -- 1-element mutable cell holding the first error message string. Storing
+  -- strings in arr cells is the same pattern stdlib/https_session.rail uses
+  -- to thread strings through state. Initial sentinel "" means "no err yet".
+  let err_msg = arr_new 1 0
+  let _ = arr_set err_msg 0 ""
   cons ir (cons ctr (cons blocks (cons err_msg [])))
 
 st_ir       s = head s
@@ -103,15 +107,21 @@ st_track_reg s v =
   else 0
 
 -- Fail with a message; sets err_flag and stores the message.
+-- Stores only the FIRST error (later failures on the same lowering get
+-- the boilerplate "lower failed" message; we want the root cause). Silent
+-- by design: callers retrieve the message via st_get_err_msg or via the
+-- ["err", msg] tuple that lower_source returns. Previous versions printed
+-- "LOWER ERR: ..." to stdout, which polluted programmatic callers (the
+-- bench-grade harness had to filter it out).
 st_fail s msg =
   let _ = arr_set (st_ctr s) 5 1
   let cell = st_err_msg s
-  -- replace head of cell with msg (cell is `cons msg []`)
-  -- workaround: just store via a side-channel — we use a Rail list mutation hack:
-  -- Rail lists are immutable, so we store the err in the err_msg cell via
-  -- a different slot. For v1, we just print the err and rely on err_flag.
-  let _ = print (cat ["LOWER ERR: ", msg])
+  let prev = arr_get cell 0
+  let _ = if prev == "" then arr_set cell 0 msg else 0
   0 - 1     -- sentinel return
+
+-- Read the stored error message ("" if none).
+st_get_err_msg s = arr_get (st_err_msg s) 0
 
 -- Caller-save allocator: scans live mask for the lowest free bit in v1..v9.
 -- v0 is reserved for the input arg. Returns -1 (via st_fail) on overflow.
@@ -1611,9 +1621,18 @@ lower_fn_def fn_def registry pool =
   else lower_fn_body name args body registry pool n_args
 
 mk_err_fn msg =
-  let _ = print (cat ["LOWER ERR: ", msg])
-  -- A sentinel "error" function struct (caller checks).
+  -- A sentinel "error" function struct (caller checks). Silent — the message
+  -- propagates through the return tuple. lower_source surfaces it via the
+  -- ["err", msg] return value.
   cons "ERR" (cons msg [])
+
+-- State-aware variant: prefer the first message captured into st_err_msg
+-- (typically the deepest st_fail call), falling back to the boilerplate
+-- `fallback` if state didn't record anything (rare; defensive).
+mk_err_fn_from_state s fallback =
+  let stored = st_get_err_msg s
+  if stored == "" then mk_err_fn fallback
+  else mk_err_fn stored
 
 lower_fn_body name args body registry pool n_args =
   let s = mk_state_with_registry registry pool
@@ -1622,7 +1641,7 @@ lower_fn_body name args body registry pool n_args =
   -- block 0 starts at instruction 0
   let _ = st_set_block_start s (st_reserve_block s)
   let env = build_arg_env s args body name
-  if (st_get_err s) == 1 then mk_err_fn "lower failed during arg setup"
+  if (st_get_err s) == 1 then mk_err_fn_from_state s "lower failed during arg setup"
   else lower_fn_after_args s env body name
 
 -- Bind args. Each positional arg has a type from the registry's per-fn
@@ -1713,7 +1732,7 @@ lower_fn_after_args s env body name =
   -- and float-arg references correctly.
   let body_ty = infer_type env body
   let v_result = lower_expr s env body
-  if (st_get_err s) == 1 then mk_err_fn "lower failed (see prior LOWER ERR)"
+  if (st_get_err s) == 1 then mk_err_fn_from_state s "lower failed (see prior LOWER ERR)"
   else lower_fn_finalize s v_result body_ty name
 
 lower_fn_finalize s v_result body_ty name =
