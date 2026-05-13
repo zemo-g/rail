@@ -51,7 +51,7 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 - **Tests**: `./rail_native test` — 140 tests, should be 140/140. Count fluctuates only when concurrent sessions collide on `/tmp/rail_out` — rerun to confirm. (Was 137 prior to 2026-05-12; t132/t133/t134 cover 3-/4-movk integer literal codegen.)
 - **Checkpoints**: `stdlib/checkpoint.rail` — `save_checkpoint prefix weights adams step best_val` + `load_checkpoint` / in-place `load_model_into` / `load_adam_states_into`. Atomic via `<prefix>.committed` sentinel. `corpus_split text val_pct` for eval splits. `tools/train/lm_transformer.rail:run_segments` wires resume + periodic checkpoint into the training loop.
 - **Performance**: Tail-recursive loops match C -O2 (5 instructions/iteration). Self-loop optimization, untagged register params, bottom-test with `subs`.
-- **Targets**: macOS ARM64 (native), Linux ARM64 (Pi Zero), Linux x86_64 (Razer WSL)
+- **Targets**: macOS ARM64 (native), Linux ARM64 (Pi Zero), Linux x86_64 (cross-compile)
 
 ### Key Commands
 
