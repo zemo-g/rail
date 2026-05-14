@@ -1,0 +1,215 @@
+-- stdlib/codesign.rail — Apple ad-hoc code signing in pure Rail.
+--
+-- v5 Phase 2. Emits the LC_CODE_SIGNATURE blob that Apple Silicon's
+-- kernel requires for every executable. Reuses stdlib/sha256.rail for
+-- hashing. No external `codesign` invocation.
+--
+-- Layout produced (vs canonical `codesign --sign -`):
+--   SuperBlob header (12 B)            CSMAGIC_EMBEDDED_SIGNATURE
+--   2 × BlobIndex (16 B)               (CodeDirectory, Requirements wrapper)
+--   CodeDirectory (~192 B)             v0x20400, flags=adhoc, hashes 1+2
+--   Requirements wrapper (12 B)        empty
+-- Total: ~232 bytes (vs canonical 290; we drop the redundant 3rd blob).
+--
+-- All multi-byte ints in code-sign blobs are BIG-ENDIAN (vs Mach-O's LE).
+--
+-- Caller MUST `import "stdlib/macho.rail"` BEFORE this file — we reuse its
+-- byte-buffer primitives (arr_set, etc.) and Rail's import system doesn't
+-- deduplicate, so importing macho here would clash.
+
+import "stdlib/sha256.rail"
+
+-- ============================================================================
+-- Constants  (Apple `cs_blobs.h`)
+-- ============================================================================
+
+cs_magic_embedded_signature = 4208856256  -- 0xFADE0CC0
+cs_magic_codedirectory      = 4208856066  -- 0xFADE0C02
+cs_magic_requirements       = 4208856065  -- 0xFADE0C01
+
+cs_slot_codedirectory = 0
+cs_slot_requirements  = 2
+
+cs_adhoc_flag = 2
+
+cs_hashtype_sha256 = 2
+cs_hashsize_sha256 = 32
+
+cs_execseg_main_binary = 1   -- low bit of execSegFlags
+
+-- CodeDirectory version that supports execSeg fields (Apple Silicon).
+cd_version_20400 = 132096    -- 0x20400
+
+-- Page size as log2.  Canonical codesign uses 14 (= 16 KB page).
+cd_pagesize_log2_16k = 14
+
+-- ============================================================================
+-- Big-endian byte writers (code-sign blobs are network byte order).
+-- ============================================================================
+
+cs_u32_be buf off v =
+  let _ = arr_set buf off       (bit_and (shr v 24) 255)
+  let _ = arr_set buf (off + 1) (bit_and (shr v 16) 255)
+  let _ = arr_set buf (off + 2) (bit_and (shr v 8) 255)
+  let _ = arr_set buf (off + 3) (bit_and v 255)
+  off + 4
+
+cs_u64_be buf off v =
+  let _ = arr_set buf off       (bit_and (shr v 56) 255)
+  let _ = arr_set buf (off + 1) (bit_and (shr v 48) 255)
+  let _ = arr_set buf (off + 2) (bit_and (shr v 40) 255)
+  let _ = arr_set buf (off + 3) (bit_and (shr v 32) 255)
+  let _ = arr_set buf (off + 4) (bit_and (shr v 24) 255)
+  let _ = arr_set buf (off + 5) (bit_and (shr v 16) 255)
+  let _ = arr_set buf (off + 6) (bit_and (shr v 8) 255)
+  let _ = arr_set buf (off + 7) (bit_and v 255)
+  off + 8
+
+-- ============================================================================
+-- Layout for our minimal ad-hoc signature.
+-- Identifier "rail.v5" + NUL = 8 bytes (chosen to be 8-byte aligned).
+-- ============================================================================
+
+cs_ident_string = "rail.v5"
+cs_ident_len = 8                            -- "rail.v5" (7) + NUL
+
+cs_cd_fixed_size = 88                       -- bytes before identifier
+cs_cd_special_slots = 2
+cs_cd_code_slots = 1
+cs_cd_hashes_size = 96                      -- (2+1) * 32
+cs_cd_size = 192                            -- 88 + 8 + 96 = 192
+
+cs_req_size = 12                            -- empty Requirements wrapper
+
+cs_sb_header_size = 12
+cs_sb_index_size = 16                       -- 2 index entries × 8 B
+cs_sig_total_size = 232                     -- 12 + 16 + 192 + 12
+
+-- Offsets within the signature blob.
+cs_off_cd  = 28                             -- 12 (sb header) + 16 (2 indices)
+cs_off_req = 220                            -- cs_off_cd + cs_cd_size = 28 + 192
+
+-- Offsets within the CodeDirectory.
+cs_cd_ident_off = 88                        -- right after fixed-size header
+cs_cd_hashes_start = 96                     -- 88 + 8 (ident)
+cs_cd_hash_off_in_cd = 160                  -- where code slot 0 begins:
+                                            -- 96 + (2 * 32) = 160
+
+-- ============================================================================
+-- Emit the empty Requirements wrapper into buf at off.  Returns off+12.
+-- ============================================================================
+emit_requirements buf off =
+  let o1 = cs_u32_be buf off  cs_magic_requirements
+  let o2 = cs_u32_be buf o1   12             -- length
+  cs_u32_be buf o2            0              -- count = 0
+
+-- ============================================================================
+-- Emit the CodeDirectory fixed-size header into buf at off.
+-- ============================================================================
+emit_cd_header buf off code_limit text_seg_base text_seg_limit =
+  let o1  = cs_u32_be buf off  cs_magic_codedirectory
+  let o2  = cs_u32_be buf o1   cs_cd_size
+  let o3  = cs_u32_be buf o2   cd_version_20400
+  let o4  = cs_u32_be buf o3   cs_adhoc_flag
+  let o5  = cs_u32_be buf o4   cs_cd_hash_off_in_cd
+  let o6  = cs_u32_be buf o5   cs_cd_ident_off
+  let o7  = cs_u32_be buf o6   cs_cd_special_slots
+  let o8  = cs_u32_be buf o7   cs_cd_code_slots
+  let o9  = cs_u32_be buf o8   code_limit
+  let _   = arr_set  buf o9     cs_hashsize_sha256
+  let _   = arr_set  buf (o9 + 1) cs_hashtype_sha256
+  let _   = arr_set  buf (o9 + 2) 0                          -- platform
+  let _   = arr_set  buf (o9 + 3) cd_pagesize_log2_16k
+  let o10 = cs_u32_be buf (o9 + 4) 0                         -- spare2
+  let o11 = cs_u32_be buf o10  0                             -- scatterOffset
+  let o12 = cs_u32_be buf o11  0                             -- teamOffset
+  let o13 = cs_u32_be buf o12  0                             -- spare3
+  let o14 = cs_u64_be buf o13  0                             -- codeLimit64
+  let o15 = cs_u64_be buf o14  text_seg_base                 -- execSegBase
+  let o16 = cs_u64_be buf o15  text_seg_limit                -- execSegLimit
+  cs_u64_be buf o16            cs_execseg_main_binary        -- execSegFlags
+
+-- Write the identifier string at the right offset within the CD.  Returns
+-- offset of byte after the trailing NUL.
+emit_cd_identifier buf cd_start =
+  let pos = cd_start + cs_cd_ident_off
+  let cs  = chars cs_ident_string
+  let after = emit_cd_ident_chars buf pos cs
+  let _ = arr_set buf after 0
+  after + 1
+
+emit_cd_ident_chars buf off cs =
+  if cs == [] then off
+  else
+    let _ = arr_set buf off (char_to_int (head cs))
+    emit_cd_ident_chars buf (off + 1) (tail cs)
+
+-- ============================================================================
+-- Hashing helpers
+-- ============================================================================
+
+-- Compute SHA-256 of bytes [off, off+n) in src buffer.  Returns a 32-byte
+-- array (the hash digest).
+cs_sha256_range src off n =
+  let st = sha256_init 0
+  let _ = sha256_update_arr st src off n
+  sha256_finalize st
+
+-- Copy 32 bytes from src arr into dst buf at dst_off.
+cs_copy_hash dst dst_off src =
+  cs_copy_hash_loop dst dst_off src 0
+
+cs_copy_hash_loop dst dst_off src i =
+  if i >= 32 then dst_off + 32
+  else
+    let _ = arr_set dst (dst_off + i) (arr_get src i)
+    cs_copy_hash_loop dst dst_off src (i + 1)
+
+-- ============================================================================
+-- Top-level: write the full signature blob into `buf` starting at `sig_off`.
+--   binary_buf  - the Mach-O buffer being signed
+--   sig_off     - file offset where the signature starts (= start of __LINKEDIT)
+--   code_limit  - bytes hashed (= sig_off, conventionally)
+--   text_base   - __TEXT segment base in the file (0)
+--   text_limit  - __TEXT segment file size
+--
+-- Caller must have written LC_CODE_SIGNATURE referencing
+-- (dataoff = sig_off, datasize = cs_sig_total_size) BEFORE calling this,
+-- so the page hash captures the LC entry itself.
+-- ============================================================================
+emit_signature binary_buf sig_off code_limit text_base text_limit =
+  -- ── Requirements blob (last in the layout but emit first so we can hash it)
+  let req_off = sig_off + cs_off_req
+  let _ = emit_requirements binary_buf req_off
+
+  -- ── SuperBlob header
+  let h1 = cs_u32_be binary_buf sig_off       cs_magic_embedded_signature
+  let h2 = cs_u32_be binary_buf h1            cs_sig_total_size
+  let h3 = cs_u32_be binary_buf h2            2                   -- count
+
+  -- ── BlobIndex entries
+  let i1 = cs_u32_be binary_buf h3            cs_slot_codedirectory
+  let i2 = cs_u32_be binary_buf i1            cs_off_cd
+  let i3 = cs_u32_be binary_buf i2            cs_slot_requirements
+  let i4 = cs_u32_be binary_buf i3            cs_off_req
+
+  -- ── CodeDirectory header + identifier
+  let cd_start = sig_off + cs_off_cd
+  let _ = emit_cd_header binary_buf cd_start code_limit text_base text_limit
+  let _ = emit_cd_identifier binary_buf cd_start
+
+  -- ── Special slot -2 (Requirements hash)
+  let req_hash = cs_sha256_range binary_buf req_off cs_req_size
+  let slot_m2_off = cd_start + cs_cd_hashes_start          -- first 32 B
+  let _ = cs_copy_hash binary_buf slot_m2_off req_hash
+
+  -- ── Special slot -1 (Info.plist) — 32 zero bytes (already zero-init'd)
+  let slot_m1_off = slot_m2_off + 32
+
+  -- ── Code slot 0 (sha256 of bytes 0..code_limit, AFTER LC_CODE_SIGNATURE
+  --    was patched in)
+  let code_hash = cs_sha256_range binary_buf 0 code_limit
+  let slot_c0_off = slot_m1_off + 32
+  let _ = cs_copy_hash binary_buf slot_c0_off code_hash
+
+  sig_off + cs_sig_total_size
