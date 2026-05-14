@@ -2,6 +2,102 @@
 
 All notable changes to Rail are documented here.
 
+## v5.0.0 — 2026-05-14 — Self-hosted toolchain (Linux ELF substrate)
+
+Major release.  Rail produces its own aarch64 Linux ELF binaries —
+encoder, assembler, static linker, and ELF writer are all pure Rail.
+On the supported subset of inputs, the build pipeline invokes no
+external `as`, `ld`, or `codesign`.
+
+### What ships
+
+Built on top of v4 Phase 0–4b (encoder, Mach-O writer, ad-hoc
+codesigner, assembler-text → Mach-O driver) with three new modules:
+
+| Module | Lines | Role |
+|---|---|---|
+| `jit/arm64.rail` | +200 | 23 new encoders for the Linux mnemonic set: `ldrb`/`strb` (imm, reg-offset, post-index), `clz`, `neg`, `cmn` (imm + reg), `rev`, `rev16`, `fneg`, `frinta`, `fcvt s_d` / `fcvt d_s`, `tbnz`, `stp`/`ldp` pre/post-index, `add`/`sub` immediate, `asr`/`lsr`/`lsl` immediate (sbfm/ubfm aliases) |
+| `stdlib/elf.rail` | 175 | `Elf64_Ehdr` + program-header writer for static aarch64 binaries; `elf_emit_tiny` (1 PT_LOAD R+X) + `elf_emit_full` (PT_LOAD text RX + PT_LOAD data RW with BSS via memsz > filesz) |
+| `tools/v5/elf_asm.rail` | 567 | Section-aware ARM64 assembler + static linker.  Two-pass scan: pass 1 collects section sizes + `(name, section, offset)` labels; caller resolves to virtual addresses via layout; pass 2 emits bytes with `adrp` / `:lo12:` symbol resolution.  Handles `.text` / `.data` / `.bss` / `.rodata` / `.section __DATA,__mod_init_func` (skipped), `.quad` / `.byte` / `.long` / `.ascii` / `.asciz` / `.space` / `.comm` / `.p2align` / `.align`, plus the writeback `stp` / `ldp` variants and the `adrp` + `add :lo12:` / `ldr [base, :lo12:]` / `str [base, :lo12:]` Linux-ELF symbol-load idiom |
+| `tools/v5/compile_elf.rail` | 30 | Tiny driver (single segment, no data).  Useful for exit-code-only smoke tests |
+| `tools/v5/compile_elf_full.rail` | 80 | Full driver: source `.s` → 3-pass pipeline → multi-segment ELF.  Patches `e_entry` to `_start` if present |
+
+Plus 23 new encoder verifications wired into `jit/test_encoders_v5.rail`
+(31/31 byte-identical against canonical `as` + `objdump`).
+
+### Verified end-to-end on aarch64 Linux (Pi Zero 2 W via Tailscale)
+
+| Program | ELF size | Result | Substrate exercised |
+|---|---|---|---|
+| `tools/v5/exit42_linux.s` | 132 B | exit 42 | smallest valid static ELF |
+| `tools/v5/fib_linux.s` | 204 B | `exit(fib(10)) = 55` | function calls, `stp`/`ldp` pre/post-index writeback, conditional branches |
+| `tools/v5/hello_linux.s` | 4105 B | prints `"v5 lives\n"`, exit 9 | `adrp` + `add :lo12:`, `.data` segment, raw `write` syscall |
+| `tools/v5/bss_test_linux.s` | 4096 B | BSS counter loop, exit 7 | `.bss` segment, `.space N` reservation, BSS memsz > filesz |
+
+Each binary's `.text` bytes are byte-equivalent to canonical
+`as` + `ld` output for the same source.  Pipeline invokes neither
+external assembler nor linker.
+
+### compile.rail Linux pipeline hardening (precursor to substrate integration)
+
+Two long-standing bugs in `build_linux` fixed:
+
+- **Duplicate-symbol awk strip gate dropped.**  The macOS-emitted
+  runtime stubs (`_rail_print`, `_rail_print_float`, `_rail_shell`,
+  `_rail_arena_init`, `_rail_malloc_chain_drain`) were not being
+  stripped before concatenation with `tools/linux_libc.s` (which
+  redefines them via raw syscalls).  Result: `as` would reject the
+  combined `.s` with redefinition errors on both macOS-cross and Pi
+  native builds.  Strip list extended to cover them and the macOS-only
+  gate removed.
+- **`.section __DATA,__mod_init_func` block stripped.**  The macOS
+  constructor block (`.quad _rail_arena_init`) has no ELF analogue and
+  was triggering `as` errors at the section line.  New awk pass drops
+  the block on Linux.
+- **`linux_libc.s`** gains `_memcpy` (raw byte copy) and `_fmod`
+  (truncation-toward-zero double modulo) — the two libSystem references
+  Rail's compiler emits that had no Linux-side definition.  Sufficient
+  for a clean assemble + link of `compile.rail`-generated Linux output.
+
+Self-compile fixed point preserved (round-to-round byte-identical).
+Test suite unchanged at 136/140 — the 4 `tensor_*` failures predate v5
+and trace to a missing `tools/metal/libtensor_gpu.dylib` artifact, not
+to v5 changes.
+
+### Substrate-thesis scope statement
+
+v5.0 claims: **Rail emits aarch64 Linux ELF binaries via the pure-Rail
+toolchain for the subset of ARM64 assembly emitted by compile.rail's
+Linux backend.**  The new modules handle every mnemonic + addressing
+mode that appears in the canonical `.s` for any Rail program, including
+the full `tools/linux_libc.s` runtime body.
+
+What is **deferred**:
+
+- **Pi self-host of `rail_native test` via the new toolchain.**  The
+  current `.s` allocates ~1.2 GB of BSS for the young-generation GC,
+  which exceeds Pi Zero 2 W's 512 MB physical RAM.  Both canonical
+  `as` + `ld` and v5 pipeline produce semantically equivalent binaries
+  that share this limit.  Path forward (v5.1): heap-size configuration
+  knob in `build_linux` + bigger Linux test target.
+- **macOS Mach-O end-to-end with dyld stubs.**  Phase 4b's
+  `tools/v5/compile_macho.rail` covers the libSystem-free subset
+  (e.g. exit-code-only programs).  Stub-aware Mach-O — `LC_LOAD_DYLIB`,
+  indirect symbol table, `__stubs`, `__got` / `__la_symbol_ptr`,
+  bind-opcode stream — is roughly 1500 more lines.  Tracked as v5.2.
+
+### Tag-readiness checklist
+
+- [x] `compile.rail` Linux output of a real Rail program traverses the
+      new pipeline → byte-equivalent ELF to canonical
+- [x] Linux ELF substrate verified on real aarch64 hardware (Pi)
+- [x] Encoders byte-verified against `as`: 89 + 56 + 31 = **176 total**
+- [x] No regression on `./rail_native test` (136/140; 4 pre-existing)
+- [x] No regression on `./rail_native self` byte-identical fixed point
+- [x] CHANGELOG.md v5.0.0 entry (this section)
+- [x] Leak guard CI still passes
+- [ ] macOS dyld-stub path — deferred to v5.2
+
 ## v4.1.0 — 2026-05-13 — Repo hygiene + leak-guard CI
 
 Minor release. Comprehensive cleanup pass over the public tree. No

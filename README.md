@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="#releases"><img src="https://img.shields.io/badge/v4.0.0-Substrate%20maturity-ff5500?style=for-the-badge" alt="v4.0.0"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/v5.0.0-Self--hosted%20toolchain-ff5500?style=for-the-badge" alt="v5.0.0"></a>
 </p>
 
 <p align="center">
@@ -218,6 +218,8 @@ Native floats in ARM64 d-registers, effect handlers via setjmp/longjmp, GC in as
 
 | Version | Date | Headline |
 |---|---|---|
+| **v5.0.0** | 2026-05-14 | Self-hosted toolchain — Rail emits aarch64 Linux ELF binaries via pure-Rail encoder + assembler + static linker + ELF writer. `as` / `ld` no longer in the build path for the supported subset. |
+| **v4.1.0** | 2026-05-13 | Repo hygiene + leak-guard CI |
 | **v4.0.1** | 2026-05-13 | Public-surface sanitization (no behavior change) |
 | **v4.0.0** | 2026-05-13 | Substrate maturity — 30/30 hard-bench, JIT, dual-backend parity, multi-witness attest |
 | **v3.11.0** | 2026-05-02 | Pi self-hosts (98/137 on aarch64 Linux); attest fully Rail-native |
