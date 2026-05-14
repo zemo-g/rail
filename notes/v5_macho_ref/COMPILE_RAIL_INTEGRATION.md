@@ -125,13 +125,79 @@ to the macho path on macOS. The text path stays available behind a
 - ✅ `jit/arm64.rail` — AOT-complete encoder (Phase 0, shipped)
 - ✅ `stdlib/macho.rail` — Mach-O writer (Phase 1, shipped)
 - ✅ `stdlib/codesign.rail` — ad-hoc signer (Phase 2, shipped)
-- ✅ `tools/v5/rail_emit_exit.rail` + `tools/v5/rail_emit_arith.rail` —
-  parametric + multi-instruction demos (Phase 4 partial, shipped)
-- ⏳ Mini-phases 4a–4d — full `compile.rail` integration
+- ✅ Hand-built demos that emit signed exit-code Mach-Os (Phase 4 partial, shipped)
+- ✅ `tools/v5/asm.rail` — Rail-native ARM64 assembler covering ~40
+  mnemonics + addressing modes (Phase 4a/4b, shipped)
+- ✅ `tools/v5/compile_macho.rail` — file-level driver: takes any
+  self-contained `.s` file → signed runnable Mach-O (Phase 4b, shipped)
+- ⏳ Full `compile.rail` integration — see "The dyld-stub gap" below
 
-v5.0.0 RC can ship today; the substrate-thesis story is intact (Rail
-produces signed ARM64 Mach-O binaries with no external tools, as
-demonstrated by the test programs). v5.0.0 GA waits on 4a–4d.
+## The dyld-stub gap (the real remaining work)
+
+When `compile.rail` is invoked on **any** Rail program — even
+`main = 42` — it emits roughly 12,000 instructions of `.s` that
+includes the full runtime (allocator, GC, print, file I/O, syscalls).
+That runtime uses **external symbols**: `bl _malloc`, `bl _fopen`,
+`bl _strlen`, `bl _fwrite`, etc., resolved at load time by `dyld`
+against `/usr/lib/libSystem.B.dylib`.
+
+Tonight's `tools/v5/asm.rail` cannot resolve external references; it
+only encodes the mnemonic. To take compile.rail's actual output and
+produce a runnable Mach-O, the toolchain needs:
+
+1. **`LC_LOAD_DYLIB` load command** — tells dyld to map libSystem.
+2. **Indirect symbol table** in `__LINKEDIT` — list of imported
+   external symbols (`_malloc`, `_free`, etc.).
+3. **`__stubs` section** in `__TEXT` — one 12-byte trampoline per
+   external symbol. The trampoline reads a pointer from `__got` /
+   `__la_symbol_ptr` and branches to it.
+4. **`__got` / `__la_symbol_ptr` section** in `__DATA` —
+   one 8-byte slot per imported symbol; dyld fills these at load time.
+5. **Rewriting `bl _foo` calls** to target the stub address instead of
+   the (unknown) library address.
+
+That's roughly **~1,000 additional lines** of pure-Rail Mach-O
+plumbing, plus an extension to the assembler's symbol-resolution pass
+to rewrite external `bl` operands to stub-relative offsets.
+
+After that, `.data` and `.zerofill` sections need to be supported
+(static globals like `_rail_argc`, `_rail_envp`), which means a
+`__DATA` segment + `LC_SEGMENT_64 __DATA`.
+
+**Total remaining estimate**: ~1,500 lines on top of Phase 4b. Half a
+session if it goes well, more likely 2–3.
+
+## What's defensible today
+
+The v5 substrate-thesis claim is **publicly defensible** at RC quality
+on programs that don't pull in libSystem:
+
+```
+./rail_native run tools/v5/compile_macho.rail tools/v5/example_program.s
+   → assembled 24 bytes (6 instructions)
+   → wrote /tmp/v5_compiled (16,616 B, self-signed)
+
+/tmp/v5_compiled ; echo $?      → 42  (= 2 × 21 computed on real ARM64)
+
+codesign -v /tmp/v5_compiled    → exit 0 (signature validates)
+```
+
+End-to-end: arbitrary self-contained ARM64 assembly → bytes → Mach-O →
+ad-hoc signed → runs. No external macOS toolchain involved.
+
+For v5.0.0 GA, the remaining work is the dyld-stub gap above. After
+that, every `./rail_native foo.rail` produces a native Mach-O for any
+Rail program.
+
+## Linux (still deferred)
+
+ELF emission is conceptually identical to Mach-O emission. Same data
+flow: codegen → bytes → ELF writer. No code-signing requirement on
+Linux. **But also no dyld-stub problem**: compile.rail's Linux output
+uses raw syscalls (no libc), so once Phase 4b's pipeline is wired and
+an ELF writer (~1,000 lines) exists, Linux works without the extra
+LC_LOAD_DYLIB / stub / GOT machinery. Linux might therefore land
+**before** macOS GA.
 
 ## Linux (deferred)
 
