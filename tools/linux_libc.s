@@ -1429,6 +1429,31 @@ _strtol:
     mul x0, x10, x11
     ret
 
+// memcpy(dst=x0, src=x1, n=x2) → x0  (returns original dst).
+// Naive byte copy.  Used by _rail_str_append and _rail_join on Linux.
+_memcpy:
+    mov x4, x0          // save dst
+    cbz x2, .Lmemcpy_done
+.Lmemcpy_loop:
+    ldrb w3, [x1], #1
+    strb w3, [x0], #1
+    sub x2, x2, #1
+    cbnz x2, .Lmemcpy_loop
+.Lmemcpy_done:
+    mov x0, x4
+    ret
+
+// fmod(a=d0, b=d1) → d0  (a mod b for doubles).
+// Truncation-toward-zero variant: r = a - trunc(a/b) * b.
+// Sufficient for Rail's modulo-on-floats use case (not IEEE-precise edge).
+_fmod:
+    fdiv d2, d0, d1
+    fcvtzs x3, d2
+    scvtf d2, x3
+    fmul d2, d2, d1
+    fsub d0, d0, d2
+    ret
+
 // BSS reservations for young-generation semispace GC.
 // Mac codegen declares these via .zerofill which the transform sed strips.
 // .comm provides equivalent BSS allocation in ELF.
