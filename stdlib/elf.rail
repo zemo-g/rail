@@ -1,0 +1,188 @@
+-- stdlib/elf.rail — Linux aarch64 ELF64 writer in pure Rail.
+--
+-- v5 Phase 5. Emits a minimal but valid ELF64 little-endian aarch64
+-- static executable with:
+--   ELF64 header (e_ident + e_type=EXEC + e_machine=AARCH64)
+--   N program headers (PT_LOAD for text, optional data, optional bss)
+--   No section headers, no dynamic linking, no symbol table.
+--
+-- The Linux backend of compile.rail produces static binaries (no libc,
+-- no dynamic linker, raw syscalls via linux_libc.s). Therefore the
+-- format we need is fully described by:
+--   - 1 PT_LOAD R+X for the text segment (Ehdr + Phdrs + code packed in)
+--   - optional PT_LOAD R+W for .data
+--   - optional PT_LOAD R+W for .bss (filesz=0, memsz>0; kernel zero-fills)
+--
+-- Layout (single-segment case, exit-42 reference):
+--   [0..63]    Ehdr (entry points at code_start)
+--   [64..119]  Phdr (PT_LOAD R+X covering bytes [0..end])
+--   [120..]    code bytes
+--   total: 120 + code_size
+--
+-- Caller MUST import "stdlib/macho.rail" BEFORE this file — we reuse its
+-- byte-buffer primitives (mw_u8, mw_u32, mw_u64, mw_zeros, macho_write_file)
+-- and Rail's import system doesn't deduplicate.
+
+-- ============================================================================
+-- ELF constants (sources: <elf.h>, AArch64 ABI ELF Supplement)
+-- ============================================================================
+
+elf_magic_0 = 127       -- 0x7F
+elf_magic_1 = 69        -- 'E'
+elf_magic_2 = 76        -- 'L'
+elf_magic_3 = 70        -- 'F'
+
+elf_class_64    = 2
+elf_data_2lsb   = 1
+elf_version     = 1
+elf_osabi_sysv  = 0
+
+et_exec         = 2
+em_aarch64      = 183   -- 0xB7
+
+-- Program-header types
+pt_load         = 1
+pt_phdr         = 6
+
+-- Program-header flags
+pf_x            = 1
+pf_w            = 2
+pf_r            = 4
+pf_rx           = 5    -- 4 | 1
+pf_rw           = 6    -- 4 | 2
+
+-- Sizes
+ehdr_size       = 64
+phdr_size       = 56
+
+-- Conventional base virtual address for static aarch64 ELFs.
+-- (The linker default; the kernel doesn't care as long as PIE isn't set
+-- and the address is page-aligned.)
+elf_text_vaddr  = 4194304    -- 0x400000
+elf_page_size   = 4096       -- 0x1000 — aarch64 standard 4K pages
+
+-- ============================================================================
+-- ELF header (64 bytes)
+-- ============================================================================
+
+-- entry        = virtual address of the first instruction
+-- phoff        = file offset of the first program header (always 64 for us)
+-- phnum        = number of program headers
+elf_emit_ehdr buf off entry phnum =
+  let _ = arr_set buf (off + 0)  elf_magic_0
+  let _ = arr_set buf (off + 1)  elf_magic_1
+  let _ = arr_set buf (off + 2)  elf_magic_2
+  let _ = arr_set buf (off + 3)  elf_magic_3
+  let _ = arr_set buf (off + 4)  elf_class_64
+  let _ = arr_set buf (off + 5)  elf_data_2lsb
+  let _ = arr_set buf (off + 6)  elf_version
+  let _ = arr_set buf (off + 7)  elf_osabi_sysv
+  let _ = mw_zeros buf (off + 8) 8                           -- e_ident pad
+  let _ = arr_set buf (off + 16) (bit_and et_exec 255)
+  let _ = arr_set buf (off + 17) (bit_and (shr et_exec 8) 255)
+  let _ = arr_set buf (off + 18) (bit_and em_aarch64 255)
+  let _ = arr_set buf (off + 19) (bit_and (shr em_aarch64 8) 255)
+  let _ = mw_u32 buf (off + 20) elf_version                  -- e_version
+  let _ = mw_u64 buf (off + 24) entry                        -- e_entry
+  let _ = mw_u64 buf (off + 32) ehdr_size                    -- e_phoff = 64
+  let _ = mw_u64 buf (off + 40) 0                            -- e_shoff = 0 (no sections)
+  let _ = mw_u32 buf (off + 48) 0                            -- e_flags
+  -- e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx
+  let _ = arr_set buf (off + 52) (bit_and ehdr_size 255)
+  let _ = arr_set buf (off + 53) (bit_and (shr ehdr_size 8) 255)
+  let _ = arr_set buf (off + 54) (bit_and phdr_size 255)
+  let _ = arr_set buf (off + 55) (bit_and (shr phdr_size 8) 255)
+  let _ = arr_set buf (off + 56) (bit_and phnum 255)
+  let _ = arr_set buf (off + 57) (bit_and (shr phnum 8) 255)
+  let _ = mw_zeros buf (off + 58) 6                          -- shentsize/shnum/shstrndx = 0
+  off + ehdr_size
+
+-- ============================================================================
+-- Program header (56 bytes)
+-- ============================================================================
+
+elf_emit_phdr buf off p_type p_flags p_offset p_vaddr p_filesz p_memsz p_align =
+  let o1 = mw_u32 buf off      p_type
+  let o2 = mw_u32 buf o1       p_flags
+  let o3 = mw_u64 buf o2       p_offset
+  let o4 = mw_u64 buf o3       p_vaddr
+  let o5 = mw_u64 buf o4       p_vaddr                   -- p_paddr = p_vaddr (legacy)
+  let o6 = mw_u64 buf o5       p_filesz
+  let o7 = mw_u64 buf o6       p_memsz
+  mw_u64 buf o7                p_align
+
+-- ============================================================================
+-- Single-segment driver (exit-42 reference case)
+--
+-- Pack Ehdr + Phdr + code into one PT_LOAD R+X mapping.
+-- Returns total file size.
+-- ============================================================================
+
+elf_emit_tiny buf code_buf code_size =
+  let header_size = ehdr_size + phdr_size            -- 120
+  let total = header_size + code_size
+  let code_vaddr = elf_text_vaddr + header_size
+  let _ = elf_emit_ehdr buf 0 code_vaddr 1
+  let _ = elf_emit_phdr buf ehdr_size pt_load pf_rx 0 elf_text_vaddr total total elf_page_size
+  -- Copy code into the buffer at offset header_size.
+  let _ = elf_copy_bytes buf header_size code_buf 0 code_size
+  total
+
+elf_copy_bytes dst dst_off src src_off n =
+  if n <= 0 then dst_off
+  else
+    let _ = arr_set dst dst_off (arr_get src src_off)
+    elf_copy_bytes dst (dst_off + 1) src (src_off + 1) (n - 1)
+
+-- ============================================================================
+-- Multi-segment driver (full Rail program: .text + .data + .bss)
+--
+-- Layout:
+--   [0..63]               Ehdr
+--   [64..63+N*56]         N program headers
+--   [aligned to 4K]       text bytes
+--   [aligned to 4K]       data bytes (filesz=data_size, memsz=data_size+bss_size)
+--   (no .bss in file — extended via memsz>filesz on the data PT_LOAD)
+--
+-- N = 1 (text only)   if data_size=0 and bss_size=0
+-- N = 2 (text + data) otherwise
+-- ============================================================================
+
+elf_align_up x a =
+  let r = x - (x / a) * a
+  if r == 0 then x else x + (a - r)
+
+-- Emit a binary with up to two PT_LOADs (text RX, data RW).  The data
+-- segment's memsz extends into bss territory if bss_size > 0.
+elf_emit_full buf text_buf text_size data_buf data_size bss_size =
+  let phnum = if data_size + bss_size > 0 then 2 else 1
+  let header_size = ehdr_size + phnum * phdr_size
+  -- Text segment starts at file offset 0 and covers the headers + code.
+  let text_total = header_size + text_size
+  let text_seg_file_size = text_total                -- includes headers
+  -- Data segment file offset must be aligned up to page size, and its
+  -- virtual address must be congruent mod page size.
+  let data_file_off = elf_align_up text_total elf_page_size
+  let data_vaddr = elf_text_vaddr + data_file_off    -- maintain congruence
+  let entry_vaddr = elf_text_vaddr + header_size
+  -- Emit Ehdr
+  let _ = elf_emit_ehdr buf 0 entry_vaddr phnum
+  -- Emit Phdrs
+  let _ = elf_emit_phdr buf ehdr_size pt_load pf_rx 0 elf_text_vaddr text_seg_file_size text_seg_file_size elf_page_size
+  let _ = if phnum > 1 then
+    elf_emit_phdr buf (ehdr_size + phdr_size) pt_load pf_rw data_file_off data_vaddr data_size (data_size + bss_size) elf_page_size
+  else 0
+  -- Copy text bytes
+  let _ = elf_copy_bytes buf header_size text_buf 0 text_size
+  -- Pad to data offset (zeros — buf was zero-init).
+  -- Copy data bytes
+  let _ = if data_size > 0 then elf_copy_bytes buf data_file_off data_buf 0 data_size else data_file_off
+  -- Return total file size.  bss isn't in the file.
+  if phnum > 1 then data_file_off + data_size else text_total
+
+-- ============================================================================
+-- Disk writer (reuses macho.rail's hex+xxd pipeline so NUL bytes survive)
+-- ============================================================================
+
+elf_write_file path buf n =
+  macho_write_file path buf n
