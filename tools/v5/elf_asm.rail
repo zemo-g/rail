@@ -1,0 +1,927 @@
+-- tools/v5/elf_asm.rail — Linux-targeting ARM64 assembler + static linker.
+--
+-- v5 Phase 5b.  Takes the Linux-transformed assembly text compile.rail
+-- emits (after the sed step in build_linux that rewrites @PAGEOFF →
+-- :lo12: and strips macOS-specific section names), produces:
+--   - a text byte buffer
+--   - a data byte buffer
+--   - a BSS size
+--   - a label → virtual-address map (for symbol-relative encoding)
+--
+-- Out of scope: dynamic linking, relocations, debug info.  Out of scope
+-- for honest static binaries on Linux aarch64 because linux_libc.s
+-- provides every libc-shaped symbol via raw syscalls.
+--
+-- Reuses jit/arm64.rail encoders and stdlib/macho.rail byte primitives.
+-- Does NOT use tools/v5/asm.rail — the Linux feature set is large enough
+-- that a fresh module is cleaner than wrapping asm.rail.
+
+import "jit/arm64.rail"
+import "stdlib/macho.rail"
+
+-- ============================================================================
+-- Section IDs and layout (caller-supplied virtual addresses)
+-- ============================================================================
+
+sec_text = 0
+sec_data = 1
+sec_bss  = 2
+
+-- ============================================================================
+-- Character / string helpers (kept inline so we do not depend on asm.rail)
+-- ============================================================================
+
+ea_ltrim s = ea_ltrim_loop (chars s)
+ea_ltrim_loop cs =
+  if cs == [] then ""
+  else if (head cs) == " " || (head cs) == "\t" then ea_ltrim_loop (tail cs)
+  else join "" (ea_chars_to_strs cs)
+
+ea_chars_to_strs cs =
+  if cs == [] then []
+  else cons (char_from_int (char_to_int (head cs))) (ea_chars_to_strs (tail cs))
+
+ea_rtrim s = join "" (reverse (ea_rtrim_loop (reverse (ea_chars_to_strs (chars s)))))
+ea_rtrim_loop cs =
+  if cs == [] then []
+  else if (head cs) == " " || (head cs) == "\t" || (head cs) == "\r" then ea_rtrim_loop (tail cs)
+  else cs
+
+-- Drop "//" or "@" comments. (Linux assembler uses // for line comments.)
+ea_strip_comment s = ea_strip_loop (chars s) [] 0
+ea_strip_loop cs acc in_str =
+  if cs == [] then join "" (reverse acc)
+  else
+    let c = head cs
+    if in_str == 0 && c == "/" && (tail cs) != [] && (head (tail cs)) == "/" then
+      join "" (reverse acc)
+    else if c == "\"" then
+      ea_strip_loop (tail cs) (cons (char_from_int (char_to_int c)) acc) (1 - in_str)
+    else
+      ea_strip_loop (tail cs) (cons (char_from_int (char_to_int c)) acc) in_str
+
+-- Starts with prefix?
+ea_starts cs p = ea_starts_loop cs (chars p)
+ea_starts_loop cs ps =
+  if ps == [] then 1
+  else if cs == [] then 0
+  else if (head cs) == (head ps) then ea_starts_loop (tail cs) (tail ps)
+  else 0
+
+-- Is char a digit?
+ea_is_digit c =
+  let n = char_to_int c
+  if n >= 48 && n <= 57 then 1 else 0
+
+-- Parse decimal integer (positive); ignores trailing non-digit.
+ea_parse_int_chars cs acc =
+  if cs == [] then acc
+  else
+    let c = char_to_int (head cs)
+    if c >= 48 && c <= 57 then ea_parse_int_chars (tail cs) (acc * 10 + (c - 48))
+    else acc
+
+-- Parse hex (after optional 0x prefix).
+ea_parse_hex_chars cs acc =
+  if cs == [] then acc
+  else
+    let c = char_to_int (head cs)
+    if c >= 48 && c <= 57 then ea_parse_hex_chars (tail cs) (acc * 16 + (c - 48))
+    else if c >= 97 && c <= 102 then ea_parse_hex_chars (tail cs) (acc * 16 + (c - 87))
+    else if c >= 65 && c <= 70 then ea_parse_hex_chars (tail cs) (acc * 16 + (c - 55))
+    else acc
+
+-- Parse a string that may begin with "#" or "-", may be hex (0x) or decimal.
+ea_imm s =
+  let cs = chars s
+  if cs == [] then 0
+  else if (head cs) == "#" then ea_imm (join "" (ea_chars_to_strs (tail cs)))
+  else if (head cs) == "-" then 0 - (ea_imm (join "" (ea_chars_to_strs (tail cs))))
+  else if (head cs) == "0" && (tail cs) != [] && (head (tail cs)) == "x" then
+    ea_parse_hex_chars (tail (tail cs)) 0
+  else
+    ea_parse_int_chars cs 0
+
+-- Parse "xN" / "wN" / "dN" / "sN" / "sp" / "xzr" / "wzr" → integer N.
+-- Returns -1 if not a register.  Check "sp"/"zr" forms BEFORE single-letter
+-- prefixes because "s" is also the prefix for sD float registers.
+ea_reg_num s =
+  if s == "sp" then 31
+  else if s == "xzr" then 31
+  else if s == "wzr" then 31
+  else if s == "lr" then 30
+  else if s == "fp" then 29
+  else
+    let cs = chars s
+    if cs == [] then 0 - 1
+    else
+      let first = head cs
+      if first == "x" || first == "w" || first == "d" || first == "s" then
+        ea_parse_int_chars (tail cs) 0
+      else 0 - 1
+
+-- Split operand string on commas, returning a list of pieces with both
+-- leading and trailing whitespace stripped.  Trailing whitespace matters
+-- because comment-stripping leaves the gap between operand and `//` intact.
+ea_split_commas s = ea_split_c (chars s) [] []
+ea_split_c cs cur acc =
+  if cs == [] then
+    if cur == [] then reverse acc
+    else reverse (cons (ea_rtrim (ea_ltrim (join "" (reverse cur)))) acc)
+  else if (head cs) == "," then
+    ea_split_c (tail cs) [] (cons (ea_rtrim (ea_ltrim (join "" (reverse cur)))) acc)
+  else
+    ea_split_c (tail cs) (cons (char_from_int (char_to_int (head cs))) cur) acc
+
+-- Split a line into (mnemonic, operand_string).
+ea_split_mn s =
+  let cs = chars s
+  ea_split_mn_loop cs []
+
+ea_split_mn_loop cs acc =
+  if cs == [] then [join "" (reverse acc), ""]
+  else if (head cs) == " " || (head cs) == "\t" then
+    [join "" (reverse acc), ea_ltrim (join "" (ea_chars_to_strs (tail cs)))]
+  else
+    ea_split_mn_loop (tail cs) (cons (char_from_int (char_to_int (head cs))) acc)
+
+-- Strip enclosing brackets from "[xN" or "xN]" or "[xN]".
+ea_strip_brackets s =
+  let cs = chars s
+  let no_open = if cs == [] then cs else if (head cs) == "[" then tail cs else cs
+  let rev = reverse no_open
+  let no_close = if rev == [] then rev else if (head rev) == "]" || (head rev) == "!" then tail rev else rev
+  let rev2 = reverse no_close
+  let rev3 = if rev2 != [] && (head (reverse rev2)) == "!" then tail (reverse rev2) else reverse rev2
+  join "" (ea_chars_to_strs (reverse rev3))
+
+-- True if string contains ":lo12:" substring.
+ea_has_lo12 s = ea_find_lo12 (chars s)
+ea_find_lo12 cs =
+  if length cs < 6 then 0
+  else if ea_starts cs ":lo12:" == 1 then 1
+  else ea_find_lo12 (tail cs)
+
+-- Strip the ":lo12:" prefix and bracket/banged chars, return bare symbol name.
+ea_extract_lo12_sym s =
+  ea_extract_lo12_loop (chars s)
+ea_extract_lo12_loop cs =
+  if cs == [] then ""
+  else if ea_starts cs ":lo12:" == 1 then
+    -- drop ":lo12:", then strip trailing ] / ! / whitespace
+    let after = drop_n_chars 6 cs
+    ea_trim_sym after []
+  else ea_extract_lo12_loop (tail cs)
+
+drop_n_chars n cs =
+  if n <= 0 then cs
+  else if cs == [] then cs
+  else drop_n_chars (n - 1) (tail cs)
+
+ea_trim_sym cs acc =
+  if cs == [] then join "" (reverse acc)
+  else
+    let c = head cs
+    if c == "]" || c == "!" || c == " " || c == "," then join "" (reverse acc)
+    else ea_trim_sym (tail cs) (cons (char_from_int (char_to_int c)) acc)
+
+-- True if string ends with "!" (writeback pre-index marker on the closing bracket).
+ea_ends_writeback s =
+  let cs = reverse (chars s)
+  if cs == [] then 0
+  else if (head cs) == "!" then 1
+  else 0
+
+-- ============================================================================
+-- Label table — flat list: [name, vaddr, name, vaddr, ...]
+-- ============================================================================
+
+lt_lookup name labels =
+  if labels == [] then 0 - 1
+  else
+    let n = head labels
+    let v = head (tail labels)
+    if n == name then v
+    else lt_lookup name (tail (tail labels))
+
+-- ============================================================================
+-- Pass 1 — scan source.
+--
+-- Computes:
+--   text_size, data_size, bss_size   (in bytes)
+--   labels (flat list: name, sec_id, byte_off_in_section, ...)
+--
+-- BSS reservations from .comm:  immediately advance bss_off by `size`,
+-- after aligning bss_off up to `align`.
+-- ============================================================================
+
+-- Classify a line into a kind tag.
+-- IMPORTANT: label check (line ending in ":") happens BEFORE generic "."
+-- prefix-skip so that local labels like ".Lbase:" don't get eaten.
+ea_classify s =
+  let cs = chars s
+  if cs == [] then "skip"
+  else if (head cs) == "/" && (tail cs) != [] && (head (tail cs)) == "/" then "skip"
+  else if (head (reverse cs)) == ":" then "label"
+  else if ea_starts cs ".text" == 1 then "sec_text"
+  else if ea_starts cs ".data" == 1 then "sec_data"
+  else if ea_starts cs ".bss" == 1 then "sec_bss"
+  else if ea_starts cs ".section .rodata" == 1 then "sec_data"
+  else if ea_starts cs ".section __DATA,__data" == 1 then "sec_data"
+  else if ea_starts cs ".section __DATA,__mod_init_func" == 1 then "sec_skip"
+  else if ea_starts cs ".global" == 1 then "skip"
+  else if ea_starts cs ".globl" == 1 then "skip"
+  else if ea_starts cs ".p2align" == 1 then "align"
+  else if ea_starts cs ".align" == 1 then "align"
+  else if ea_starts cs ".space" == 1 then "space"
+  else if ea_starts cs ".zero" == 1 then "space"
+  else if ea_starts cs ".comm" == 1 then "comm"
+  else if ea_starts cs ".quad" == 1 then "quad"
+  else if ea_starts cs ".byte" == 1 then "byte"
+  else if ea_starts cs ".long" == 1 then "long"
+  else if ea_starts cs ".word" == 1 then "long"
+  else if ea_starts cs ".ascii" == 1 then "ascii"
+  else if ea_starts cs "." == 1 then "skip"
+  else "insn"
+
+-- Strip the trailing colon on a label line.
+ea_label_name s =
+  let cs = chars (ea_rtrim s)
+  let rev = reverse cs
+  if rev == [] then ""
+  else if (head rev) == ":" then join "" (ea_chars_to_strs (reverse (tail rev)))
+  else join "" (ea_chars_to_strs cs)
+
+-- Align x up to multiple of a (power-of-2 alignment).
+ea_align_up x a =
+  if a <= 1 then x
+  else
+    let r = x - (x / a) * a
+    if r == 0 then x else x + (a - r)
+
+-- Parse `.p2align N` → 2^N alignment.
+ea_p2align_value line =
+  let parts = ea_split_mn line
+  let arg = head (tail parts)
+  let n = ea_imm arg
+  ea_pow2 n
+
+-- Parse `.align N` → already in bytes (GAS default for code).
+ea_align_value line =
+  let parts = ea_split_mn line
+  ea_imm (head (tail parts))
+
+ea_pow2 n =
+  if n <= 0 then 1
+  else 2 * ea_pow2 (n - 1)
+
+-- Parse `.space N` → N bytes.
+ea_space_size line =
+  let parts = ea_split_mn line
+  ea_imm (head (tail parts))
+
+-- Parse `.comm name, size, align` → (name, size, align).
+ea_comm_parts line =
+  let parts = ea_split_mn line
+  let arg_s = head (tail parts)
+  let pieces = ea_split_commas arg_s
+  pieces
+
+-- Count bytes a data directive contributes.
+ea_data_bytes line =
+  let k = ea_classify line
+  if k == "quad" then 8
+  else if k == "byte" then ea_byte_count line
+  else if k == "long" then 4
+  else if k == "ascii" then ea_ascii_byte_count line
+  else 0
+
+ea_byte_count line =
+  -- ".byte 1, 2, 3" → 3 bytes
+  let parts = ea_split_mn line
+  let arg_s = head (tail parts)
+  length (ea_split_commas arg_s)
+
+ea_ascii_byte_count line =
+  -- ".ascii \"hello\"" → 5 bytes (no NUL appended by .ascii)
+  let parts = ea_split_mn line
+  let arg_s = ea_ltrim (head (tail parts))
+  let cs = chars arg_s
+  ea_ascii_count_loop cs 0 0
+
+ea_ascii_count_loop cs in_str n =
+  if cs == [] then n
+  else
+    let c = head cs
+    if c == "\"" then ea_ascii_count_loop (tail cs) (1 - in_str) n
+    else if in_str == 0 then ea_ascii_count_loop (tail cs) 0 n
+    else if c == "\\" && (tail cs) != [] then
+      -- counted escape (\\, \n, \t, \", etc.) — emit 1 byte
+      ea_ascii_count_loop (tail (tail cs)) 1 (n + 1)
+    else ea_ascii_count_loop (tail cs) 1 (n + 1)
+
+-- ============================================================================
+-- Pass 1 driver.  Returns a 7-tuple: [text_size, data_size, bss_size, labels].
+-- (Using a list as a tuple because Rail tuples don't always survive nested
+-- nesting across function returns.)
+-- ============================================================================
+
+ea_pass1 lines =
+  ea_pass1_loop lines sec_text 0 0 0 []
+
+ea_pass1_loop lines cur_sec t_off d_off b_off labels =
+  if lines == [] then [t_off, d_off, b_off, labels]
+  else
+    let raw = head lines
+    let line = ea_ltrim (ea_strip_comment raw)
+    let kind = ea_classify line
+    if kind == "skip" then ea_pass1_loop (tail lines) cur_sec t_off d_off b_off labels
+    else if kind == "sec_text" then ea_pass1_loop (tail lines) sec_text t_off d_off b_off labels
+    else if kind == "sec_data" then ea_pass1_loop (tail lines) sec_data t_off d_off b_off labels
+    else if kind == "sec_bss" then ea_pass1_loop (tail lines) sec_bss t_off d_off b_off labels
+    else if kind == "sec_skip" then
+      -- Skip until next section directive; consume lines until we hit one.
+      ea_pass1_loop (ea_skip_until_section (tail lines)) cur_sec t_off d_off b_off labels
+    else if kind == "align" then
+      let a = if ea_starts (chars line) ".p2align" == 1 then ea_p2align_value line
+              else ea_align_value line
+      if cur_sec == sec_text then ea_pass1_loop (tail lines) cur_sec (ea_align_up t_off a) d_off b_off labels
+      else if cur_sec == sec_data then ea_pass1_loop (tail lines) cur_sec t_off (ea_align_up d_off a) b_off labels
+      else ea_pass1_loop (tail lines) cur_sec t_off d_off (ea_align_up b_off a) labels
+    else if kind == "space" then
+      let n = ea_space_size line
+      if cur_sec == sec_bss then ea_pass1_loop (tail lines) cur_sec t_off d_off (b_off + n) labels
+      else if cur_sec == sec_data then ea_pass1_loop (tail lines) cur_sec t_off (d_off + n) b_off labels
+      else ea_pass1_loop (tail lines) cur_sec (t_off + n) d_off b_off labels
+    else if kind == "comm" then
+      -- ".comm _sym, size, align" — reserve in BSS at next align-aligned position.
+      let parts = ea_comm_parts line
+      let name = head parts
+      let size = ea_imm (head (tail parts))
+      let alignv = if (tail (tail parts)) == [] then 1 else ea_imm (head (tail (tail parts)))
+      let aligned_b = ea_align_up b_off alignv
+      let new_labels = cons name (cons (sec_bss * 1000000000 + aligned_b) labels)
+      ea_pass1_loop (tail lines) cur_sec t_off d_off (aligned_b + size) new_labels
+    else if kind == "label" then
+      let name = ea_label_name line
+      let off = if cur_sec == sec_text then t_off
+                else if cur_sec == sec_data then d_off
+                else b_off
+      let new_labels = cons name (cons (cur_sec * 1000000000 + off) labels)
+      ea_pass1_loop (tail lines) cur_sec t_off d_off b_off new_labels
+    else if kind == "quad" || kind == "byte" || kind == "long" || kind == "ascii" then
+      let n = ea_data_bytes line
+      if cur_sec == sec_text then ea_pass1_loop (tail lines) cur_sec (t_off + n) d_off b_off labels
+      else if cur_sec == sec_data then ea_pass1_loop (tail lines) cur_sec t_off (d_off + n) b_off labels
+      else ea_pass1_loop (tail lines) cur_sec t_off d_off (b_off + n) labels
+    else
+      -- instruction: 4 bytes (only emit in text section)
+      ea_pass1_loop (tail lines) cur_sec (t_off + 4) d_off b_off labels
+
+-- Skip lines until we reach a section directive line (so we can drop
+-- bytes inside __mod_init_func or other ignored sections).
+ea_skip_until_section lines =
+  if lines == [] then lines
+  else
+    let line = ea_ltrim (ea_strip_comment (head lines))
+    let cs = chars line
+    if cs == [] then ea_skip_until_section (tail lines)
+    else if ea_starts cs ".text" == 1 then lines
+    else if ea_starts cs ".data" == 1 then lines
+    else if ea_starts cs ".bss" == 1 then lines
+    else if ea_starts cs ".section" == 1 then lines
+    else ea_skip_until_section (tail lines)
+
+-- ============================================================================
+-- Resolve a label (encoded as sec*1e9 + offset) into a final virtual address.
+-- ============================================================================
+
+ea_resolve sec_off text_vaddr data_vaddr bss_vaddr =
+  let sec = sec_off / 1000000000
+  let off = sec_off - sec * 1000000000
+  if sec == sec_text then text_vaddr + off
+  else if sec == sec_data then data_vaddr + off
+  else bss_vaddr + off
+
+-- Build a flat `name → vaddr` table from the encoded label list.
+ea_build_vaddr_map labels text_vaddr data_vaddr bss_vaddr =
+  if labels == [] then []
+  else
+    let n = head labels
+    let sec_off = head (tail labels)
+    let vaddr = ea_resolve sec_off text_vaddr data_vaddr bss_vaddr
+    cons n (cons vaddr (ea_build_vaddr_map (tail (tail labels)) text_vaddr data_vaddr bss_vaddr))
+
+-- ============================================================================
+-- Pass 2 — emit text bytes (and data bytes via a separate walk).
+--
+-- Inputs:
+--   lines, label_vaddrs, text_vaddr  (for adrp PC), data_vaddr, bss_vaddr
+-- Outputs:
+--   text_buf populated up to text_size; data_buf populated up to data_size.
+-- ============================================================================
+
+ea_write_u32_le buf off w =
+  let _ = arr_set buf off       (bit_and w 255)
+  let _ = arr_set buf (off + 1) (bit_and (shr w 8) 255)
+  let _ = arr_set buf (off + 2) (bit_and (shr w 16) 255)
+  let _ = arr_set buf (off + 3) (bit_and (shr w 24) 255)
+  off + 4
+
+-- Encode a single instruction line.
+-- `cur_vaddr` is the virtual address of THIS instruction (= text_vaddr + t_off).
+ea_encode_insn line cur_vaddr labels =
+  let parts = ea_split_mn line
+  let mn = head parts
+  let ops_str = head (tail parts)
+  let ops = ea_split_commas ops_str
+  ea_dispatch mn ops cur_vaddr labels
+
+ea_dispatch mn ops cur_vaddr labels =
+  if mn == "mov" then ea_mov ops
+  else if mn == "movz" then ea_movz ops
+  else if mn == "movk" then ea_movk ops
+  else if mn == "add" then
+    if (tail (tail ops)) != [] && ea_has_lo12 (head (tail (tail ops))) == 1 then ea_add_lo12 ops labels 0
+    else ea_3reg_or_imm ops 0
+  else if mn == "sub" then
+    if (tail (tail ops)) != [] && ea_has_lo12 (head (tail (tail ops))) == 1 then ea_add_lo12 ops labels 1
+    else ea_3reg_or_imm ops 1
+  else if mn == "mul" then ea_3reg ops enc_mul
+  else if mn == "cmp" then ea_cmp ops
+  else if mn == "cmn" then ea_cmn ops
+  else if mn == "neg" then enc_neg (ea_reg_num (head ops)) (ea_reg_num (head (tail ops)))
+  else if mn == "clz" then enc_clz (ea_reg_num (head ops)) (ea_reg_num (head (tail ops)))
+  else if mn == "rev" then enc_rev (ea_reg_num (head ops)) (ea_reg_num (head (tail ops)))
+  else if mn == "rev16" then enc_rev16 (ea_reg_num (head ops)) (ea_reg_num (head (tail ops)))
+  else if mn == "ret" then enc_ret
+  else if mn == "nop" then inst_nop
+  else if mn == "svc" then enc_svc (ea_imm (head ops))
+  else if mn == "bl"  then ea_branch ops cur_vaddr labels enc_bl_byte_off
+  else if mn == "b"   then ea_branch ops cur_vaddr labels enc_b_byte_off
+  else if mn == "b.ne" then ea_branch ops cur_vaddr labels enc_bne_byte_off
+  else if mn == "b.eq" then ea_branch ops cur_vaddr labels enc_beq_byte_off
+  else if mn == "b.lt" then ea_branch ops cur_vaddr labels enc_blt_byte_off
+  else if mn == "b.gt" then ea_branch ops cur_vaddr labels enc_bgt_byte_off
+  else if mn == "b.le" then ea_branch ops cur_vaddr labels enc_ble_byte_off
+  else if mn == "b.ge" then ea_branch ops cur_vaddr labels enc_bge_byte_off
+  else if mn == "b.cs" then ea_branch ops cur_vaddr labels enc_bcs_byte_off
+  else if mn == "b.hs" then ea_branch ops cur_vaddr labels enc_bhs_byte_off
+  else if mn == "b.cc" then ea_branch ops cur_vaddr labels enc_bcc_byte_off
+  else if mn == "b.lo" then ea_branch ops cur_vaddr labels enc_blo_byte_off
+  else if mn == "b.hi" then ea_branch ops cur_vaddr labels enc_bhi_byte_off
+  else if mn == "b.ls" then ea_branch ops cur_vaddr labels enc_bls_byte_off
+  else if mn == "cbz"  then ea_cb ops cur_vaddr labels enc_cbz_byte_off
+  else if mn == "cbnz" then ea_cb ops cur_vaddr labels enc_cbnz_byte_off
+  else if mn == "tbnz" then ea_tbnz ops cur_vaddr labels
+  else if mn == "blr"  then enc_blr (ea_reg_num (head ops))
+  else if mn == "br"   then enc_br  (ea_reg_num (head ops))
+  else if mn == "and"  then ea_3reg ops enc_and
+  else if mn == "orr"  then ea_3reg ops enc_orr
+  else if mn == "eor"  then ea_3reg ops enc_eor
+  else if mn == "lsl"  then ea_3reg ops enc_lsl
+  else if mn == "lsr"  then ea_3reg ops enc_lsr
+  else if mn == "asr"  then ea_3reg ops enc_asr
+  else if mn == "sdiv" then ea_3reg ops enc_sdiv
+  else if mn == "udiv" then ea_3reg ops enc_udiv
+  else if mn == "madd" then ea_4reg ops enc_madd
+  else if mn == "msub" then ea_4reg ops enc_msub
+  else if mn == "tst"  then enc_tst (ea_reg_num (head ops)) (ea_reg_num (head (tail ops)))
+  else if mn == "cset" then ea_cset ops
+  else if mn == "ldr"  then ea_mem ops 1 cur_vaddr labels
+  else if mn == "str"  then ea_mem ops 0 cur_vaddr labels
+  else if mn == "ldrb" then ea_ldrb ops
+  else if mn == "strb" then ea_strb ops
+  else if mn == "ldp"  then ea_pair ops 1
+  else if mn == "stp"  then ea_pair ops 0
+  else if mn == "fadd" then ea_3dreg ops enc_fadd
+  else if mn == "fsub" then ea_3dreg ops enc_fsub
+  else if mn == "fmul" then ea_3dreg ops enc_fmul
+  else if mn == "fdiv" then ea_3dreg ops enc_fdiv
+  else if mn == "fcmp" then enc_fcmp (ea_reg_num (head ops)) (ea_reg_num (head (tail ops)))
+  else if mn == "scvtf" then enc_scvtf (ea_reg_num (head ops)) (ea_reg_num (head (tail ops)))
+  else if mn == "fcvtzs" then enc_fcvtzs (ea_reg_num (head ops)) (ea_reg_num (head (tail ops)))
+  else if mn == "fcvt" then ea_fcvt ops
+  else if mn == "fmov" then ea_fmov ops
+  else if mn == "fneg" then enc_fneg (ea_reg_num (head ops)) (ea_reg_num (head (tail ops)))
+  else if mn == "frinta" then enc_frinta (ea_reg_num (head ops)) (ea_reg_num (head (tail ops)))
+  else if mn == "adr"  then ea_adr ops cur_vaddr labels
+  else if mn == "adrp" then ea_adrp ops cur_vaddr labels
+  else 0 - 1
+
+-- mov xD, #imm | mov xD, xS
+-- Special case: when either operand is SP (= reg 31), the `mov` mnemonic
+-- aliases to `add Rd, Rn, #0` (since orr Rd, xzr, Rm cannot represent SP).
+ea_mov ops =
+  let dst = head ops
+  let src = head (tail ops)
+  let src_cs = chars src
+  if src_cs == [] then 0 - 1
+  else if (head src_cs) == "#" then enc_mov_imm16 (ea_reg_num dst) (ea_imm src)
+  else if dst == "sp" || src == "sp" then enc_add_imm (ea_reg_num dst) (ea_reg_num src) 0
+  else enc_mov_reg (ea_reg_num dst) (ea_reg_num src)
+
+ea_movz ops =
+  let dst = ea_reg_num (head ops)
+  let imm = ea_imm (head (tail ops))
+  if (tail (tail ops)) == [] then enc_mov_imm16 dst imm
+  else
+    let shift_arg = head (tail (tail ops))
+    let shift_n = (ea_imm (ea_after_lsl shift_arg)) / 16
+    enc_movk dst imm shift_n
+
+ea_movk ops =
+  let dst = ea_reg_num (head ops)
+  let imm = ea_imm (head (tail ops))
+  let shift_arg = head (tail (tail ops))
+  let shift_n = (ea_imm (ea_after_lsl shift_arg)) / 16
+  enc_movk dst imm shift_n
+
+ea_after_lsl s =
+  let cs = chars s
+  ea_drop_word_loop cs
+
+ea_drop_word_loop cs =
+  if cs == [] then ""
+  else if (head cs) == " " || (head cs) == "\t" then ea_ltrim (join "" (ea_chars_to_strs (tail cs)))
+  else ea_drop_word_loop (tail cs)
+
+-- add xD, xN, xM  /  add xD, xN, #imm  /  add xD, xN, :lo12:_sym
+ea_3reg_or_imm ops is_sub =
+  let dst = ea_reg_num (head ops)
+  let a = ea_reg_num (head (tail ops))
+  ea_3reg_or_imm_body dst a (head (tail (tail ops))) is_sub
+
+ea_3reg_or_imm_body dst a b_s is_sub =
+  let b_cs = chars b_s
+  if b_cs == [] then 0 - 1
+  else if (head b_cs) == "#" then
+    let imm = ea_imm b_s
+    if is_sub == 0 then enc_add_imm dst a imm else enc_sub_imm dst a imm
+  else if ea_has_lo12 b_s == 1 then
+    -- :lo12:_sym is resolved against the current label map by the caller —
+    -- but ea_dispatch's signature doesn't pass labels here, so we route
+    -- through a wrapper that does.  This branch fires only when labels
+    -- argument is forwarded via the public entry below.
+    0 - 1
+  else
+    let b = ea_reg_num b_s
+    if is_sub == 0 then enc_add dst a b else enc_sub dst a b
+
+-- add with :lo12:_sym requires label resolution; called from ea_dispatch's
+-- add branch when the third operand contains :lo12:.
+ea_add_lo12 ops labels is_sub =
+  let dst = ea_reg_num (head ops)
+  let a = ea_reg_num (head (tail ops))
+  let b_s = head (tail (tail ops))
+  let sym = ea_extract_lo12_sym b_s
+  let vaddr = lt_lookup sym labels
+  if vaddr < 0 then 0 - 1
+  else
+    let imm12 = bit_and vaddr 4095
+    if is_sub == 0 then enc_add_imm dst a imm12 else enc_sub_imm dst a imm12
+
+ea_3reg ops enc_fn =
+  enc_fn (ea_reg_num (head ops)) (ea_reg_num (head (tail ops))) (ea_reg_num (head (tail (tail ops))))
+
+ea_3dreg ops enc_fn =
+  enc_fn (ea_reg_num (head ops)) (ea_reg_num (head (tail ops))) (ea_reg_num (head (tail (tail ops))))
+
+ea_4reg ops enc_fn =
+  enc_fn (ea_reg_num (head ops)) (ea_reg_num (head (tail ops))) (ea_reg_num (head (tail (tail ops)))) (ea_reg_num (head (tail (tail (tail ops)))))
+
+-- cmp xA, xB | cmp xA, #imm
+ea_cmp ops =
+  let a = ea_reg_num (head ops)
+  let b_s = head (tail ops)
+  let b_cs = chars b_s
+  if b_cs == [] then 0 - 1
+  else if (head b_cs) == "#" then enc_cmp_imm a (ea_imm b_s)
+  else enc_cmp a (ea_reg_num b_s)
+
+ea_cmn ops =
+  let a = ea_reg_num (head ops)
+  let b_s = head (tail ops)
+  let b_cs = chars b_s
+  if b_cs == [] then 0 - 1
+  else if (head b_cs) == "#" then enc_cmn_imm a (ea_imm b_s)
+  else enc_cmn_reg a (ea_reg_num b_s)
+
+ea_cset ops =
+  let dst = ea_reg_num (head ops)
+  let cond = head (tail ops)
+  if cond == "eq" then enc_cset_eq dst
+  else if cond == "ne" then enc_cset_ne dst
+  else if cond == "lt" then enc_cset_lt dst
+  else if cond == "gt" then enc_cset_gt dst
+  else if cond == "le" then enc_cset_le dst
+  else if cond == "ge" then enc_cset_ge dst
+  else if cond == "hi" then enc_cset_hi dst
+  else if cond == "ls" then enc_cset_ls dst
+  else if cond == "lo" then enc_cset_lo dst
+  else if cond == "hs" then enc_cset_hs dst
+  else if cond == "mi" then enc_cset_mi dst
+  else 0 - 1
+
+ea_branch ops cur_vaddr labels enc_fn =
+  let target_name = head ops
+  let tgt = lt_lookup target_name labels
+  if tgt < 0 then 0 - 1
+  else enc_fn (tgt - cur_vaddr)
+
+ea_cb ops cur_vaddr labels enc_fn =
+  let reg = ea_reg_num (head ops)
+  let target_name = head (tail ops)
+  let tgt = lt_lookup target_name labels
+  if tgt < 0 then 0 - 1
+  else enc_fn reg (tgt - cur_vaddr)
+
+ea_tbnz ops cur_vaddr labels =
+  let reg = ea_reg_num (head ops)
+  let bit_pos = ea_imm (head (tail ops))
+  let target_name = head (tail (tail ops))
+  let tgt = lt_lookup target_name labels
+  if tgt < 0 then 0 - 1
+  else enc_tbnz_byte_off reg bit_pos (tgt - cur_vaddr)
+
+-- ldr xD, [xN, #imm] | ldr xD, [xN, :lo12:_sym]
+ea_mem ops is_ldr cur_vaddr labels =
+  let dst = ea_reg_num (head ops)
+  let base_s = head (tail ops)
+  let off_s = if (tail (tail ops)) == [] then "" else head (tail (tail ops))
+  let base = ea_reg_num (ea_strip_brackets base_s)
+  if off_s == "" then
+    if is_ldr == 1 then enc_ldr_imm dst base 0 else enc_str_imm dst base 0
+  else if ea_has_lo12 off_s == 1 then
+    let sym = ea_extract_lo12_sym off_s
+    let vaddr = lt_lookup sym labels
+    if vaddr < 0 then 0 - 1
+    else
+      let imm12 = bit_and vaddr 4095
+      if is_ldr == 1 then enc_ldr_imm dst base imm12 else enc_str_imm dst base imm12
+  else
+    let imm = ea_imm (ea_strip_brackets off_s)
+    if is_ldr == 1 then enc_ldr_imm dst base imm else enc_str_imm dst base imm
+
+-- ldrb wD, [xN]  /  [xN, #imm]  /  [xN, xM]  /  [xN], #imm
+ea_ldrb ops =
+  let dst = ea_reg_num (head ops)
+  let base_s = head (tail ops)
+  let off_s = if (tail (tail ops)) == [] then "" else head (tail (tail ops))
+  let base = ea_reg_num (ea_strip_brackets base_s)
+  let base_cs = chars base_s
+  let base_ends_close = if (reverse base_cs) == [] then 0 else if (head (reverse base_cs)) == "]" then 1 else 0
+  if base_ends_close == 1 && off_s == "" then
+    enc_ldrb_imm dst base 0
+  else if base_ends_close == 1 then
+    -- ldrb wD, [xN], #imm  (post-index)
+    enc_ldrb_postidx dst base (ea_imm off_s)
+  else
+    let off_clean = ea_strip_brackets off_s
+    let off_cs = chars off_clean
+    if off_cs != [] && ((head off_cs) == "x" || (head off_cs) == "w") then
+      enc_ldrb_regoff dst base (ea_reg_num off_clean)
+    else
+      enc_ldrb_imm dst base (ea_imm off_clean)
+
+ea_strb ops =
+  let dst = ea_reg_num (head ops)
+  let base_s = head (tail ops)
+  let off_s = if (tail (tail ops)) == [] then "" else head (tail (tail ops))
+  let base = ea_reg_num (ea_strip_brackets base_s)
+  let base_cs = chars base_s
+  let base_ends_close = if (reverse base_cs) == [] then 0 else if (head (reverse base_cs)) == "]" then 1 else 0
+  if base_ends_close == 1 && off_s == "" then
+    enc_strb_imm dst base 0
+  else if base_ends_close == 1 then
+    enc_strb_postidx dst base (ea_imm off_s)
+  else
+    let off_clean = ea_strip_brackets off_s
+    let off_cs = chars off_clean
+    if off_cs != [] && ((head off_cs) == "x" || (head off_cs) == "w") then
+      enc_strb_regoff dst base (ea_reg_num off_clean)
+    else
+      enc_strb_imm dst base (ea_imm off_clean)
+
+-- ldp / stp with optional pre/post-index writeback.
+-- Operand list shapes:
+--   simple offset:    [d1, d2, "[xN", "#imm]"]    (4 tokens)  no writeback
+--   pre-index:        [d1, d2, "[xN", "#imm]!"]   (4 tokens)  base ends with "!"
+--   post-index:       [d1, d2, "[xN]", "#imm"]    (4 tokens)  base ends with "]" no "!"
+ea_pair ops is_ldp =
+  let d1 = ea_reg_num (head ops)
+  let d2 = ea_reg_num (head (tail ops))
+  let base_s = head (tail (tail ops))
+  let off_s = if (tail (tail (tail ops))) == [] then "0" else head (tail (tail (tail ops)))
+  let base = ea_reg_num (ea_strip_brackets base_s)
+  let off_cs = chars off_s
+  let base_cs = chars base_s
+  -- pre-index writeback if the OFFSET token ends with "!"
+  let pre_idx = if (reverse off_cs) == [] then 0 else if (head (reverse off_cs)) == "!" then 1 else 0
+  -- post-index if the BASE token ends with "]" (closing bracket on base means offset is outside)
+  let post_idx = if (reverse base_cs) == [] then 0 else if (head (reverse base_cs)) == "]" then 1 else 0
+  let imm = ea_imm (ea_strip_brackets off_s)
+  if pre_idx == 1 then
+    if is_ldp == 1 then enc_ldp_preidx d1 d2 base imm else enc_stp_preidx d1 d2 base imm
+  else if post_idx == 1 then
+    if is_ldp == 1 then enc_ldp_postidx d1 d2 base imm else enc_stp_postidx d1 d2 base imm
+  else
+    if is_ldp == 1 then enc_ldp_imm d1 d2 base imm else enc_stp_imm d1 d2 base imm
+
+-- adr xD, _label   → adr xD, (target - cur_vaddr)
+ea_adr ops cur_vaddr labels =
+  let dst = ea_reg_num (head ops)
+  let sym = head (tail ops)
+  let tgt = lt_lookup sym labels
+  if tgt < 0 then 0 - 1
+  else enc_adr dst (tgt - cur_vaddr)
+
+-- adrp xD, _label  → adrp xD, ((target_page - cur_vaddr_page))
+ea_adrp ops cur_vaddr labels =
+  let dst = ea_reg_num (head ops)
+  let sym = head (tail ops)
+  let tgt = lt_lookup sym labels
+  if tgt < 0 then 0 - 1
+  else
+    let tgt_page = tgt - bit_and tgt 4095
+    let cur_page = cur_vaddr - bit_and cur_vaddr 4095
+    enc_adrp dst (tgt_page - cur_page)
+
+-- fcvt sD, dS  (d→s) or  fcvt dD, sS  (s→d)
+ea_fcvt ops =
+  let dst = head ops
+  let src = head (tail ops)
+  let dst_first = head (chars dst)
+  let src_first = head (chars src)
+  if dst_first == "s" && src_first == "d" then
+    enc_fcvt_s_d (ea_reg_num dst) (ea_reg_num src)
+  else
+    enc_fcvt_d_s (ea_reg_num dst) (ea_reg_num src)
+
+-- fmov dD, xS   (bitcast)  or  fmov dD, dS   (copy)
+ea_fmov ops =
+  let dst = head ops
+  let src = head (tail ops)
+  let src_first = head (chars src)
+  if src_first == "d" then enc_fmov_d_d (ea_reg_num dst) (ea_reg_num src)
+  else enc_fmov_d_x (ea_reg_num dst) (ea_reg_num src)
+
+-- ============================================================================
+-- Pass 2 — emit text bytes into text_buf.
+-- ============================================================================
+
+ea_emit_text lines text_buf labels text_vaddr =
+  ea_emit_text_loop lines text_buf 0 sec_text labels text_vaddr
+
+ea_emit_text_loop lines buf t_off cur_sec labels text_vaddr =
+  if lines == [] then t_off
+  else
+    let raw = head lines
+    let line = ea_ltrim (ea_strip_comment raw)
+    let kind = ea_classify line
+    if kind == "skip" then ea_emit_text_loop (tail lines) buf t_off cur_sec labels text_vaddr
+    else if kind == "sec_text" then ea_emit_text_loop (tail lines) buf t_off sec_text labels text_vaddr
+    else if kind == "sec_data" then ea_emit_text_loop (tail lines) buf t_off sec_data labels text_vaddr
+    else if kind == "sec_bss"  then ea_emit_text_loop (tail lines) buf t_off sec_bss labels text_vaddr
+    else if kind == "sec_skip" then ea_emit_text_loop (ea_skip_until_section (tail lines)) buf t_off cur_sec labels text_vaddr
+    else if kind == "label" then ea_emit_text_loop (tail lines) buf t_off cur_sec labels text_vaddr
+    else if kind == "comm" then ea_emit_text_loop (tail lines) buf t_off cur_sec labels text_vaddr
+    else if kind == "align" then
+      let a = if ea_starts (chars line) ".p2align" == 1 then ea_p2align_value line else ea_align_value line
+      if cur_sec == sec_text then ea_emit_text_loop (tail lines) buf (ea_align_up t_off a) cur_sec labels text_vaddr
+      else ea_emit_text_loop (tail lines) buf t_off cur_sec labels text_vaddr
+    else if kind == "space" then
+      let n = ea_space_size line
+      if cur_sec == sec_text then ea_emit_text_loop (tail lines) buf (t_off + n) cur_sec labels text_vaddr
+      else ea_emit_text_loop (tail lines) buf t_off cur_sec labels text_vaddr
+    else if kind == "quad" || kind == "byte" || kind == "long" || kind == "ascii" then
+      -- Data items in .text section: emit as raw bytes (rare; e.g. PC-relative tables).
+      if cur_sec == sec_text then
+        let after = ea_emit_data_at line buf t_off labels
+        ea_emit_text_loop (tail lines) buf after cur_sec labels text_vaddr
+      else ea_emit_text_loop (tail lines) buf t_off cur_sec labels text_vaddr
+    else if cur_sec == sec_text then
+      -- Instruction.  cur_vaddr = text_vaddr + t_off.
+      let word = ea_encode_insn line (text_vaddr + t_off) labels
+      let _ = ea_write_u32_le buf t_off word
+      ea_emit_text_loop (tail lines) buf (t_off + 4) cur_sec labels text_vaddr
+    else
+      -- Instruction outside .text (rare in practice) — count but don't emit.
+      ea_emit_text_loop (tail lines) buf t_off cur_sec labels text_vaddr
+
+-- ============================================================================
+-- Emit a data directive (.quad / .byte / .long / .ascii) into buf at off.
+-- Returns the offset after the bytes.
+-- ============================================================================
+
+ea_emit_data_at line buf off labels =
+  let kind = ea_classify line
+  let parts = ea_split_mn line
+  let arg_s = head (tail parts)
+  if kind == "quad" then ea_emit_quad arg_s buf off labels
+  else if kind == "byte" then ea_emit_byte_list arg_s buf off
+  else if kind == "long" then ea_emit_long arg_s buf off
+  else if kind == "ascii" then ea_emit_ascii arg_s buf off
+  else off
+
+-- .quad expr   — 8-byte little-endian.  expr is either a number or a symbol.
+ea_emit_quad arg_s buf off labels =
+  let v = ea_eval_expr arg_s labels
+  let _ = arr_set buf (off + 0) (bit_and v 255)
+  let _ = arr_set buf (off + 1) (bit_and (shr v 8) 255)
+  let _ = arr_set buf (off + 2) (bit_and (shr v 16) 255)
+  let _ = arr_set buf (off + 3) (bit_and (shr v 24) 255)
+  let _ = arr_set buf (off + 4) (bit_and (shr v 32) 255)
+  let _ = arr_set buf (off + 5) (bit_and (shr v 40) 255)
+  let _ = arr_set buf (off + 6) (bit_and (shr v 48) 255)
+  let _ = arr_set buf (off + 7) (bit_and (shr v 56) 255)
+  off + 8
+
+ea_eval_expr s labels =
+  let cs = chars (ea_ltrim s)
+  if cs == [] then 0
+  else if (head cs) == "0" && (tail cs) != [] && (head (tail cs)) == "x" then
+    ea_parse_hex_chars (tail (tail cs)) 0
+  else if (head cs) == "-" then 0 - (ea_eval_expr (join "" (ea_chars_to_strs (tail cs))) labels)
+  else if ea_is_digit (head cs) == 1 then ea_parse_int_chars cs 0
+  else
+    let v = lt_lookup (ea_ltrim s) labels
+    if v < 0 then 0 else v
+
+ea_emit_byte_list arg_s buf off =
+  let pieces = ea_split_commas arg_s
+  ea_emit_byte_list_loop pieces buf off
+
+ea_emit_byte_list_loop pieces buf off =
+  if pieces == [] then off
+  else
+    let v = ea_imm (head pieces)
+    let _ = arr_set buf off (bit_and v 255)
+    ea_emit_byte_list_loop (tail pieces) buf (off + 1)
+
+ea_emit_long arg_s buf off =
+  let pieces = ea_split_commas arg_s
+  ea_emit_long_loop pieces buf off
+
+ea_emit_long_loop pieces buf off =
+  if pieces == [] then off
+  else
+    let v = ea_imm (head pieces)
+    let _ = ea_write_u32_le buf off v
+    ea_emit_long_loop (tail pieces) buf (off + 4)
+
+ea_emit_ascii arg_s buf off =
+  let cs = chars (ea_ltrim arg_s)
+  ea_emit_ascii_loop cs buf off 0
+
+ea_emit_ascii_loop cs buf off in_str =
+  if cs == [] then off
+  else
+    let c = head cs
+    if c == "\"" then ea_emit_ascii_loop (tail cs) buf off (1 - in_str)
+    else if in_str == 0 then ea_emit_ascii_loop (tail cs) buf off 0
+    else if c == "\\" && (tail cs) != [] then
+      let esc = head (tail cs)
+      let v = if esc == "n" then 10
+              else if esc == "t" then 9
+              else if esc == "r" then 13
+              else if esc == "0" then 0
+              else if esc == "\"" then 34
+              else if esc == "\\" then 92
+              else char_to_int esc
+      let _ = arr_set buf off v
+      ea_emit_ascii_loop (tail (tail cs)) buf (off + 1) 1
+    else
+      let _ = arr_set buf off (char_to_int c)
+      ea_emit_ascii_loop (tail cs) buf (off + 1) 1
+
+-- ============================================================================
+-- Emit data segment.
+--
+-- Walks the source again, tracking current section, emits .quad/.byte/.long/
+-- .ascii into data_buf when cur_sec == sec_data.
+-- ============================================================================
+
+ea_emit_data lines data_buf labels =
+  ea_emit_data_loop lines data_buf 0 sec_text labels
+
+ea_emit_data_loop lines buf d_off cur_sec labels =
+  if lines == [] then d_off
+  else
+    let line = ea_ltrim (ea_strip_comment (head lines))
+    let kind = ea_classify line
+    if kind == "sec_text" then ea_emit_data_loop (tail lines) buf d_off sec_text labels
+    else if kind == "sec_data" then ea_emit_data_loop (tail lines) buf d_off sec_data labels
+    else if kind == "sec_bss" then ea_emit_data_loop (tail lines) buf d_off sec_bss labels
+    else if kind == "sec_skip" then ea_emit_data_loop (ea_skip_until_section (tail lines)) buf d_off cur_sec labels
+    else if cur_sec != sec_data then ea_emit_data_loop (tail lines) buf d_off cur_sec labels
+    else if kind == "align" then
+      let a = if ea_starts (chars line) ".p2align" == 1 then ea_p2align_value line else ea_align_value line
+      ea_emit_data_loop (tail lines) buf (ea_align_up d_off a) cur_sec labels
+    else if kind == "space" then
+      let n = ea_space_size line
+      ea_emit_data_loop (tail lines) buf (d_off + n) cur_sec labels
+    else if kind == "quad" || kind == "byte" || kind == "long" || kind == "ascii" then
+      let after = ea_emit_data_at line buf d_off labels
+      ea_emit_data_loop (tail lines) buf after cur_sec labels
+    else ea_emit_data_loop (tail lines) buf d_off cur_sec labels

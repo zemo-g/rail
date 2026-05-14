@@ -1,0 +1,97 @@
+-- tools/v5/compile_elf_full.rail
+-- v5 Phase 5b — full Linux assembler + linker + ELF emitter driver.
+--
+-- Replaces tools/v5/compile_elf.rail's tiny scope (single section, no
+-- symbols) with the full pipeline: section-aware scan, symbol layout,
+-- adrp/:lo12: resolution, multi-segment ELF (text RX + data RW with
+-- BSS via memsz>filesz).
+--
+-- Usage:
+--   ./rail_native run tools/v5/compile_elf_full.rail path/to/prog.s [out_path]
+
+import "tools/v5/elf_asm.rail"
+import "stdlib/elf.rail"
+
+elf_header_size_pass1 phnum = ehdr_size + phnum * phdr_size
+
+main =
+  let s_path = head (tail args)
+  let out_path = if (tail (tail args)) == [] then "/tmp/v5_elf_full" else head (tail (tail args))
+  let src = read_file s_path
+  let _ = print (cat ["read ", show (length (chars src)), " chars from ", s_path])
+
+  let lines = str_split "\n" src
+
+  -- Pass 1: section sizes + label-section-offset table.
+  let p1 = ea_pass1 lines
+  let text_size = head p1
+  let data_size = head (tail p1)
+  let bss_size  = head (tail (tail p1))
+  let labels_se = head (tail (tail (tail p1)))
+  let _ = print (cat ["text=", show text_size, " data=", show data_size, " bss=", show bss_size])
+
+  -- Layout: choose phnum first (text only vs text+data+bss).
+  let phnum = if data_size + bss_size > 0 then 2 else 1
+  let header_size = elf_header_size_pass1 phnum
+  -- Text segment file_off = 0; includes the Ehdr + Phdrs.
+  let text_seg_total = header_size + text_size
+  let text_vaddr = elf_text_vaddr
+  let code_vaddr = text_vaddr + header_size      -- entry & label-resolution origin
+  -- Data segment file_off aligned to page; vaddr = text_vaddr + file_off.
+  let data_file_off = ea_align_up text_seg_total elf_page_size
+  let data_vaddr = text_vaddr + data_file_off
+  let bss_vaddr  = data_vaddr + data_size        -- BSS lives at end of data segment (memsz>filesz)
+  let _ = print (cat ["text_vaddr=0x", show_hex code_vaddr, " data_vaddr=0x", show_hex data_vaddr, " bss_vaddr=0x", show_hex bss_vaddr])
+
+  -- Resolve labels: section-offset → absolute virtual address.
+  let labels = ea_build_vaddr_map labels_se code_vaddr data_vaddr bss_vaddr
+
+  -- Allocate output buffers.
+  let text_buf = arr_new (text_size + 16) 0
+  let data_buf = arr_new (data_size + 16) 0
+
+  -- Pass 2: emit text + data bytes.
+  let actual_text = ea_emit_text lines text_buf labels code_vaddr
+  let actual_data = ea_emit_data lines data_buf labels
+  let _ = print (cat ["emitted text=", show actual_text, " data=", show actual_data])
+
+  -- Build ELF.
+  let file_size = if phnum == 1 then text_seg_total else data_file_off + data_size
+  let elf_buf = arr_new file_size 0
+  let _ = elf_emit_full elf_buf text_buf text_size data_buf data_size bss_size
+
+  -- Override entry to a specific label if present (default: code_vaddr i.e. first byte of code).
+  -- Look up _start; if present, point the Ehdr there.
+  let start_vaddr = lt_lookup "_start" labels
+  let _ = if start_vaddr >= 0 then patch_entry elf_buf start_vaddr else 0
+
+  -- Write to disk.
+  let _ = elf_write_file out_path elf_buf file_size
+  let _ = print (cat ["wrote ", out_path, " (", show file_size, " bytes)"])
+  0
+
+-- Hex-dump helper for log lines (no leading 0x).
+show_hex v =
+  if v < 16 then show_hex_digit v
+  else cat [show_hex (v / 16), show_hex_digit (v - (v / 16) * 16)]
+
+show_hex_digit n =
+  if n < 10 then show n
+  else if n == 10 then "a"
+  else if n == 11 then "b"
+  else if n == 12 then "c"
+  else if n == 13 then "d"
+  else if n == 14 then "e"
+  else "f"
+
+-- Patch the Ehdr's e_entry (offset 24..31 of buf) to point at vaddr.
+patch_entry buf entry =
+  let _ = arr_set buf 24 (bit_and entry 255)
+  let _ = arr_set buf 25 (bit_and (shr entry 8) 255)
+  let _ = arr_set buf 26 (bit_and (shr entry 16) 255)
+  let _ = arr_set buf 27 (bit_and (shr entry 24) 255)
+  let _ = arr_set buf 28 (bit_and (shr entry 32) 255)
+  let _ = arr_set buf 29 (bit_and (shr entry 40) 255)
+  let _ = arr_set buf 30 (bit_and (shr entry 48) 255)
+  let _ = arr_set buf 31 (bit_and (shr entry 56) 255)
+  0
