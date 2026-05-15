@@ -44,19 +44,34 @@ codesign --sign - --force "$attest_bin" >/dev/null 2>&1 || true
 "$attest_bin" "$bin" "$bin_att"
 "$attest_bin" "$src" "$src_att"
 
-# Stage the bytes alongside their attestations so publish.rail ships
+# Stage the bytes alongside their attestations so publish.sh ships
 # both — attestation without the artifact is unverifiable.
 cp "$bin" "$dest/$(basename "$bin")"
 cp "$src" "$dest/$(basename "$src")"
 
-# Build index.json via release_index.rail (compile once, exec direct so
-# child stdout isn't captured by the `run` subcommand).
-idx_bin=$(mktemp -t release_index.XXXXXX)
-trap 'rm -f "$attest_bin" "$idx_bin"' EXIT
-./rail_native tools/attest/release_index.rail >/dev/null
-cp -p /tmp/rail_out "$idx_bin"
-codesign --sign - --force "$idx_bin" >/dev/null 2>&1 || true
-"$idx_bin" "$tag" "$commit" "$short" "$bin" "$bin_att" "$src" "$src_att" > "$dest/index.json"
+bin_pulse=$(python3 -c "import json;print(json.load(open('$bin_att'))['witness']['pulse_id'])")
+src_pulse=$(python3 -c "import json;print(json.load(open('$src_att'))['witness']['pulse_id'])")
+bin_sha=$(python3 -c "import json;print(json.load(open('$bin_att'))['artifact']['sha256'])")
+src_sha=$(python3 -c "import json;print(json.load(open('$src_att'))['artifact']['sha256'])")
+
+python3 - "$tag" "$commit" "$short" "$bin" "$bin_sha" "$bin_pulse" \
+  "$src" "$src_sha" "$src_pulse" > "$dest/index.json" <<'PY'
+import json, sys, os
+tag, commit, short, bin_, bin_sha, bin_pulse, src, src_sha, src_pulse = sys.argv[1:]
+out = {
+  "kind": "ledatic.release",
+  "version": 1,
+  "tag": tag,
+  "git": {"commit": commit, "short": short},
+  "artifacts": [
+    {"path": bin_, "sha256": bin_sha, "pulse_id": int(bin_pulse),
+     "attestation": f"{os.path.basename(bin_)}.attestation.json"},
+    {"path": src, "sha256": src_sha, "pulse_id": int(src_pulse),
+     "attestation": f"{os.path.basename(src)}.attestation.json"},
+  ],
+}
+print(json.dumps(out, indent=2))
+PY
 
 echo "release attested: $dest/"
 ls -la "$dest"
