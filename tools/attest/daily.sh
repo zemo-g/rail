@@ -47,8 +47,8 @@ dirty=""
 git diff --quiet 2>/dev/null || dirty="-dirty"
 short="${short}${dirty}"
 
-run "publish builds/$short"   ./rail_native run tools/attest/publish.rail "builds/$short"
-run "publish selfhost/$short" ./rail_native run tools/attest/publish.rail "selfhost/$short"
+run "publish builds/$short"   ./tools/attest/publish.sh "builds/$short"
+run "publish selfhost/$short" ./tools/attest/publish.sh "selfhost/$short"
 
 # "latest" pointers — small JSON blobs that name the current SHA.  A
 # consumer GETs /builds/latest, reads .short, then GETs the per-SHA

@@ -39,7 +39,7 @@ bash tools/attest/verify.sh releases/vX.Y.Z/compile.rail       releases/vX.Y.Z/c
 # → ok  artifact=<n>  pulse_id=<N>  pk_fp=cac5f21a70564aeb  (×2)
 
 # 4. Publish to ledatic.org
-./rail_native run tools/attest/publish.rail releases/vX.Y.Z
+bash tools/attest/publish.sh releases/vX.Y.Z
 # → 5 ok, 0 fail
 
 # 5. Commit + push (see gotcha #1)
@@ -70,10 +70,12 @@ on every release.
 ### #2 — `~/.ledatic/witness/signer_url` format
 
 The file contains a full URL (`http://100.87.231.45:9102/sign`).
-`attest.rail` expects a bare IP — `hc_connect_tcp` can't parse a URL as
-IPv4 dotted-quad — and silently fails when the file holds a URL.
+`attest.sh` reads it as a URL — works. `attest.rail` reads it expecting
+a bare IP — silently fails (`hc_connect_tcp` can't parse a URL as
+IPv4 dotted-quad).
 
-**Workaround:** `SIGNER_IP=100.87.231.45 bash tools/attest/attest_release.sh vX.Y.Z`.
+**Workaround for attest.rail callers:** `SIGNER_IP=100.87.231.45
+bash tools/attest/attest_release.sh vX.Y.Z`.
 
 **Real fix (TODO):** either standardize the file to bare IP, or teach
 attest.rail to parse URLs.
@@ -121,6 +123,28 @@ not the commit. Use `git rev-parse vX.Y.Z^{commit}` to dereference.
 tag name, fine for the directory; but if you build `index.json` by
 hand make sure `git.commit` is the commit hash, not the tag object.
 
+## Known open bugs blocking pure-Rail attestation
+
+### ftell FFI returns state-dependent garbage
+
+`read_file_bytes` in `stdlib/file.rail` uses `foreign ftell fp -> int`
+to determine file size. On the current rail_native (any version from
+v4.0.0 through f851882), `ftell` returns values like 14, 29, 44, 80, 89
+— not the actual file size. The emitted ARM64 asm *looks* correct
+(load arg, conditional untag, call, retag), but the runtime behavior
+is wrong. Suspected: GC-aware stack-slot type confusion for raw FFI
+pointer returns, OR FFI prologue/epilogue interacting with sp
+alignment in some non-obvious way.
+
+**Consequence:** `attest.rail` computes wrong sha256 + size_bytes for
+any artifact. The shell `attest.sh` (curl + shasum + python) is the
+working alternative.
+
+**Repro:** `./rail_native tools/test/ftell_read_smoke.rail && /tmp/rail_out`
+— should print PASS but currently FAILs.
+
+**Until fixed:** all releases must use `attest.sh`, not `attest.rail`.
+
 ## Backfilling missed releases
 
 If a tag was pushed without going through this flow:
@@ -131,16 +155,11 @@ mkdir -p releases/$TAG
 git show "$TAG":rail_native        > releases/$TAG/rail_native
 chmod +x releases/$TAG/rail_native
 git show "$TAG":tools/compile.rail > releases/$TAG/compile.rail
-SIGNER_IP=100.87.231.45 ./rail_native run tools/attest/attest.rail \
+SIGNER_URL=http://100.87.231.45:9102/sign bash tools/attest/attest.sh \
   releases/$TAG/rail_native      releases/$TAG/rail_native.attestation.json
-SIGNER_IP=100.87.231.45 ./rail_native run tools/attest/attest.rail \
+SIGNER_URL=http://100.87.231.45:9102/sign bash tools/attest/attest.sh \
   releases/$TAG/compile.rail     releases/$TAG/compile.rail.attestation.json
-COMMIT=$(git rev-parse "$TAG^{commit}")
-SHORT=$(git rev-parse --short "$TAG^{commit}")
-./rail_native run tools/attest/release_index.rail "$TAG" "$COMMIT" "$SHORT" \
-  rail_native releases/$TAG/rail_native.attestation.json \
-  tools/compile.rail releases/$TAG/compile.rail.attestation.json \
-  > releases/$TAG/index.json
+# then hand-build index.json with COMMIT=$(git rev-parse "$TAG^{commit}")
 ```
 
 The pulse_id will be from "now" — the backfilled attestation proves
