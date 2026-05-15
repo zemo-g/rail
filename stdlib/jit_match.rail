@@ -1,0 +1,115 @@
+-- stdlib/jit_match.rail — Phase 2.4 of trace+JIT plan
+-- (rail-jit-fused-kernels-plan).
+--
+-- Walks a JitNode DAG (built via stdlib/jit_tape.rail) and identifies
+-- subgraphs that match known fusion shapes.  Returns a list of FuseMatch
+-- records, one per opportunity, in tape order.
+--
+-- Currently recognizes two patterns:
+--   FuseRmsQKV    : an "rmsnorm" node whose output feeds 3+ "matmul"
+--                   children as their parents[0] — the Q/K/V projection
+--                   pattern.  Emits one match with the first 3 matmul
+--                   indices in encounter order.
+--   FuseSiluHad   : a "silu" node whose output feeds a "hadamard" child
+--                   as its parents[0] — the SwiGLU elementwise piece.
+--
+-- Phase 2.5 will consume these matches to emit MSL.  This module is
+-- pure DAG walking; no codegen, no Tensor data, no GPU.
+
+import "stdlib/jit_node.rail"
+
+-- ───────────────────────────────────────────────────────────────────────
+-- FuseMatch — one identified fusion candidate.
+-- Stores tape indices only; shapes/dtypes are looked up via the tape.
+-- ───────────────────────────────────────────────────────────────────────
+type FuseMatch =
+  | FuseRmsQKV rms_idx q_idx k_idx v_idx
+  | FuseSiluHad silu_idx had_idx
+
+match_kind m = match m
+  | FuseRmsQKV _ _ _ _ -> "rmsnorm_qkv"
+  | FuseSiluHad _ _    -> "silu_hadamard"
+
+-- ───────────────────────────────────────────────────────────────────────
+-- Children search.
+-- find_matmul_children tape p i n acc:
+--   walk tape from index i to n, accumulating tape indices of "matmul"
+--   nodes whose parents[0] == p.  Returns the list in tape order.
+-- ───────────────────────────────────────────────────────────────────────
+find_matmul_children tape p i n acc =
+  if i >= n then reverse acc
+  else
+    let node = jit_tape_get tape i
+    let tag = node_tag node
+    let parents = node_parents node
+    if tag == "matmul" then
+      if length parents > 0 then
+        if (head parents) == p then find_matmul_children tape p (i + 1) n (cons i acc)
+        else find_matmul_children tape p (i + 1) n acc
+      else find_matmul_children tape p (i + 1) n acc
+    else find_matmul_children tape p (i + 1) n acc
+
+-- Returns -1 if no matching hadamard child found.
+find_hadamard_child tape p i n =
+  if i >= n then 0 - 1
+  else
+    let node = jit_tape_get tape i
+    let tag = node_tag node
+    let parents = node_parents node
+    if tag == "hadamard" then
+      if length parents > 0 then
+        if (head parents) == p then i
+        else find_hadamard_child tape p (i + 1) n
+      else find_hadamard_child tape p (i + 1) n
+    else find_hadamard_child tape p (i + 1) n
+
+-- ───────────────────────────────────────────────────────────────────────
+-- Per-pattern emitters.  Each appends 0 or 1 FuseMatch to acc.
+-- ───────────────────────────────────────────────────────────────────────
+try_qkv_match tape rms_idx n acc =
+  let kids = find_matmul_children tape rms_idx 0 n []
+  if length kids >= 3 then
+    let q = jit_nth 0 kids
+    let k = jit_nth 1 kids
+    let v = jit_nth 2 kids
+    cons (FuseRmsQKV rms_idx q k v) acc
+  else acc
+
+try_silu_match tape silu_idx n acc =
+  let kid = find_hadamard_child tape silu_idx 0 n
+  if kid >= 0 then cons (FuseSiluHad silu_idx kid) acc
+  else acc
+
+-- ───────────────────────────────────────────────────────────────────────
+-- Main walker.
+-- ───────────────────────────────────────────────────────────────────────
+walk_tape_loop tape i n acc =
+  if i >= n then reverse acc
+  else
+    let node = jit_tape_get tape i
+    let tag = node_tag node
+    let new_acc = if tag == "rmsnorm" then try_qkv_match tape i n acc
+                  else if tag == "silu" then try_silu_match tape i n acc
+                  else acc
+    walk_tape_loop tape (i + 1) n new_acc
+
+walk_tape tape =
+  let n = length tape
+  walk_tape_loop tape 0 n []
+
+-- ───────────────────────────────────────────────────────────────────────
+-- Debug helper: print all matches one per line.
+-- ───────────────────────────────────────────────────────────────────────
+dump_match m = match m
+  | FuseRmsQKV r q k v -> print (cat ["  FuseRmsQKV rms=", show r, " q=", show q, " k=", show k, " v=", show v])
+  | FuseSiluHad s h    -> print (cat ["  FuseSiluHad silu=", show s, " had=", show h])
+
+dump_matches_loop ms =
+  if length ms == 0 then 0
+  else
+    let _ = dump_match (head ms)
+    dump_matches_loop (tail ms)
+
+dump_matches ms =
+  let _ = print (cat ["=== ", show (length ms), " fusion match(es) ==="])
+  dump_matches_loop ms

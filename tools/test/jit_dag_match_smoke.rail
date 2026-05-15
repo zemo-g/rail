@@ -1,0 +1,108 @@
+-- jit_dag_match_smoke.rail — Phase 2.4 smoke.
+--
+-- Builds two known fusion-shaped DAGs by hand-pushing JitNodes onto a
+-- tape, then runs the walker and asserts that it identifies the
+-- expected matches.  No tensor data, no GPU, no codegen — pure DAG
+-- shape recognition.
+
+import "stdlib/jit_match.rail"
+
+-- Wrap jit_tape_push to extract the new tape + the assigned index.
+-- Returns (new_tape, idx) as a pair encoded as a 2-element list.
+push tape node =
+  let r = jit_tape_push tape node
+  cons (head r) (cons (head (tail r)) [])
+
+push_tape p = head p
+push_idx p = head (tail p)
+
+main =
+  let _ = print "=== Phase 2.4 — DAG matcher smoke ==="
+
+  -- ───────────── Pattern 1: rmsnorm + 3 matmul (QKV) ─────────────
+  -- Build:  x → rmsnorm → {q, k, v}  (each matmul also takes a weight leaf)
+  let t = jit_tape_new 0
+
+  let r1 = push t (JitNode "leaf" (cons 16 (cons 64 [])) "f32" [])
+  let t1 = push_tape r1
+  let i_x = push_idx r1
+
+  let r2 = push t1 (JitNode "leaf" (cons 64 []) "f32" [])
+  let t2 = push_tape r2
+  let i_g = push_idx r2
+
+  let r3 = push t2 (JitNode "rmsnorm" (cons 16 (cons 64 [])) "f32" (cons i_x (cons i_g [])))
+  let t3 = push_tape r3
+  let i_rms = push_idx r3
+
+  let r4 = push t3 (JitNode "leaf" (cons 64 (cons 64 [])) "f32" [])
+  let t4 = push_tape r4
+  let i_wq = push_idx r4
+  let r5 = push t4 (JitNode "leaf" (cons 64 (cons 64 [])) "f32" [])
+  let t5 = push_tape r5
+  let i_wk = push_idx r5
+  let r6 = push t5 (JitNode "leaf" (cons 64 (cons 64 [])) "f32" [])
+  let t6 = push_tape r6
+  let i_wv = push_idx r6
+
+  let r7 = push t6 (JitNode "matmul" (cons 16 (cons 64 [])) "f32" (cons i_rms (cons i_wq [])))
+  let t7 = push_tape r7
+  let i_q = push_idx r7
+  let r8 = push t7 (JitNode "matmul" (cons 16 (cons 64 [])) "f32" (cons i_rms (cons i_wk [])))
+  let t8 = push_tape r8
+  let i_k = push_idx r8
+  let r9 = push t8 (JitNode "matmul" (cons 16 (cons 64 [])) "f32" (cons i_rms (cons i_wv [])))
+  let t9 = push_tape r9
+  let i_v = push_idx r9
+
+  -- ───────────── Pattern 2: silu → hadamard (SwiGLU piece) ─────────────
+  let rA = push t9 (JitNode "leaf" (cons 16 (cons 192 [])) "f32" [])
+  let tA = push_tape rA
+  let i_hg = push_idx rA
+  let rB = push tA (JitNode "silu" (cons 16 (cons 192 [])) "f32" (cons i_hg []))
+  let tB = push_tape rB
+  let i_silu = push_idx rB
+  let rC = push tB (JitNode "leaf" (cons 16 (cons 192 [])) "f32" [])
+  let tC = push_tape rC
+  let i_up = push_idx rC
+  let rD = push tC (JitNode "hadamard" (cons 16 (cons 192 [])) "f32" (cons i_silu (cons i_up [])))
+  let tD = push_tape rD
+  let i_had = push_idx rD
+
+  let _ = jit_tape_dump tD
+
+  let matches = walk_tape tD
+  let _ = dump_matches matches
+
+  -- ───────────── Assertions ─────────────
+  -- Expect exactly 2 matches, in tape order:
+  --   matches[0] = FuseRmsQKV i_rms i_q i_k i_v
+  --   matches[1] = FuseSiluHad i_silu i_had
+  let n = length matches
+  let ok_count = if n == 2 then 1 else 0
+  let _ = print (cat ["[assert] match count = ", show n, " (expect 2): ", if ok_count == 1 then "OK" else "FAIL"])
+
+  let m0 = jit_nth 0 matches
+  let m1 = jit_nth 1 matches
+  let ok_kind0 = if match_kind m0 == "rmsnorm_qkv" then 1 else 0
+  let ok_kind1 = if match_kind m1 == "silu_hadamard" then 1 else 0
+  let _ = print (cat ["[assert] match[0] kind = ", match_kind m0, ": ", if ok_kind0 == 1 then "OK" else "FAIL"])
+  let _ = print (cat ["[assert] match[1] kind = ", match_kind m1, ": ", if ok_kind1 == 1 then "OK" else "FAIL"])
+
+  -- Verify the rmsnorm_qkv match carries the right indices.
+  let ok_rms = match m0
+    | FuseRmsQKV r q k v ->
+      if r == i_rms then if q == i_q then if k == i_k then if v == i_v then 1 else 0 else 0 else 0 else 0
+    | FuseSiluHad _ _ -> 0
+  let _ = print (cat ["[assert] FuseRmsQKV indices: ", if ok_rms == 1 then "OK" else "FAIL"])
+
+  let ok_silu = match m1
+    | FuseRmsQKV _ _ _ _ -> 0
+    | FuseSiluHad s h ->
+      if s == i_silu then if h == i_had then 1 else 0 else 0
+  let _ = print (cat ["[assert] FuseSiluHad indices: ", if ok_silu == 1 then "OK" else "FAIL"])
+
+  let total = ok_count + ok_kind0 + ok_kind1 + ok_rms + ok_silu
+  let _ = if total == 5 then print "\n=== PHASE 2.4 — GREEN: DAG matcher found both fusion patterns with correct indices ==="
+          else print (cat ["\n=== FAIL — ", show total, "/5 assertions passed ==="])
+  0

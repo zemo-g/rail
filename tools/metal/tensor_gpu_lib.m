@@ -343,16 +343,34 @@ int tgl_init(int dummy) {
     // works regardless of what HOME the caller has (rail_native's child
     // process runs with an empty env).
     Dl_info dl;
-    if (dladdr((const void *)&tgl_init, &dl) == 0 || !dl.dli_fname) return -1;
+    if (dladdr((const void *)&tgl_init, &dl) == 0 || !dl.dli_fname) {
+        fprintf(stderr, "[tgl_init] dladdr failed\n"); return -1;
+    }
     NSString *dylib_path = [NSString stringWithUTF8String:dl.dli_fname];
     NSString *src_path = [[dylib_path stringByDeletingLastPathComponent]
                           stringByAppendingPathComponent:@"tensor_gpu.metal"];
+    fprintf(stderr, "[tgl_init] dylib=%s src_path=%s\n",
+            [dylib_path UTF8String], [src_path UTF8String]);
     NSError *err = nil;
     NSString *src = [NSString stringWithContentsOfFile:src_path encoding:NSUTF8StringEncoding error:&err];
-    if (!src) return -1;
+    if (!src) {
+        fprintf(stderr, "[tgl_init] read failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "?");
+        return -1;
+    }
     MTLCompileOptions *opts = [MTLCompileOptions new];
+    // MSL 3.1 needed for bfloat (Metal 3.1, macOS 14+). Default opts pin
+    // to an older version — see lm_v3_chunked_bf16 launch debugging 2026-05-14.
+    if (@available(macOS 14.0, *)) {
+        opts.languageVersion = MTLLanguageVersion3_1;
+    }
     g_lib = [g_device newLibraryWithSource:src options:opts error:&err];
-    if (!g_lib) return -1;
+    if (!g_lib) {
+        fprintf(stderr, "[tgl_init] newLibraryWithSource failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "?");
+        return -1;
+    }
+    fprintf(stderr, "[tgl_init] OK — %lu functions\n", (unsigned long)[g_lib functionNames].count);
 
     g_queue = [g_device newCommandQueue];
     g_pipes = [NSMutableDictionary dictionary];
@@ -1657,6 +1675,392 @@ int tgl_softmax_half_host(const double *A, double *C, int rows, int cols) {
 
         memcpy(Cptr, bufC.contents, bytes);
         pool_release(bufA); pool_release(bufC);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Transformer fused-op wrappers (added 2026-05-14)
+// CPU-equivalent in stdlib/transformer.rail:
+//   rms_rows_save / rope_positions / silu_fwd_loop
+// ────────────────────────────────────────────────────────────────────
+
+// X: [n_rows, dim] f64; Y: same shape; G: [dim] f64 gamma; RSTD: [n_rows] f64 out.
+// eps fixed at 1e-5 (matches stdlib/transformer.rail:rmsnorm_save default).
+// Rail's FFI doesn't route a mid-signature `double` to d0 — hardcoding sidesteps that.
+int tgl_rmsnorm_save_f64(const double *X, double *Y, const double *G,
+                         double *RSTD, int dim, int n_rows) {
+    if (ensure_init() != 1) return -1;
+    const double *Xp = X+1; const double *Gp = G+1;
+    double *Yp = Y+1; double *Rp = RSTD+1;
+    uint32_t total = (uint32_t)(n_rows * dim);
+    @autoreleasepool {
+        id<MTLBuffer> bX = pool_acquire(total*4);
+        id<MTLBuffer> bY = pool_acquire(total*4);
+        id<MTLBuffer> bG = pool_acquire(dim*4);
+        id<MTLBuffer> bR = pool_acquire(n_rows*4);
+        f64_to_f32(Xp, (float*)bX.contents, total);
+        f64_to_f32(Gp, (float*)bG.contents, dim);
+
+        id<MTLComputePipelineState> p = pso(@"rmsnorm_save");
+        if (!p) return -1;
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bX offset:0 atIndex:0];
+        [enc setBuffer:bY offset:0 atIndex:1];
+        [enc setBuffer:bG offset:0 atIndex:2];
+        [enc setBuffer:bR offset:0 atIndex:3];
+        uint32_t du = (uint32_t)dim; float epsf = 1.0e-5f;
+        [enc setBytes:&du length:4 atIndex:4];
+        [enc setBytes:&epsf length:4 atIndex:5];
+        // one threadgroup per row, 64 threads (matches kernel's threadgroup partial[64])
+        [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        f32_to_f64((float*)bY.contents, Yp, total);
+        f32_to_f64((float*)bR.contents, Rp, n_rows);
+        pool_release(bX); pool_release(bY); pool_release(bG); pool_release(bR);
+    }
+    return 1;
+}
+
+// X: [seq, d] f64, mutated in place.  sign = +1 forward, -1 inverse.
+int tgl_rope_apply_f64(double *X, int seq, int d, double sign) {
+    if (ensure_init() != 1) return -1;
+    double *Xp = X+1;
+    uint32_t total = (uint32_t)(seq * d);
+    @autoreleasepool {
+        id<MTLBuffer> bX = pool_acquire(total*4);
+        f64_to_f32(Xp, (float*)bX.contents, total);
+
+        id<MTLComputePipelineState> p = pso(@"rope_apply");
+        if (!p) return -1;
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bX offset:0 atIndex:0];
+        uint32_t su = (uint32_t)seq, du = (uint32_t)d;
+        float sf = (float)sign;
+        [enc setBytes:&su length:4 atIndex:1];
+        [enc setBytes:&du length:4 atIndex:2];
+        [enc setBytes:&sf length:4 atIndex:3];
+        uint half_d = d / 2;
+        [enc dispatchThreads:MTLSizeMake(half_d, seq, 1)
+          threadsPerThreadgroup:MTLSizeMake(half_d < 16 ? half_d : 16,
+                                            seq    < 16 ? seq    : 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        f32_to_f64((float*)bX.contents, Xp, total);
+        pool_release(bX);
+    }
+    return 1;
+}
+
+// X: [N] f64.  Y: [N] f64 = silu(X).  SIG: [N] f64 = σ(X) for backward.
+int tgl_silu_fwd_f64(const double *X, double *Y, double *SIG, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Xp = X+1;
+    double *Yp = Y+1; double *Sp = SIG+1;
+    @autoreleasepool {
+        id<MTLBuffer> bX = pool_acquire(N*4);
+        id<MTLBuffer> bY = pool_acquire(N*4);
+        id<MTLBuffer> bS = pool_acquire(N*4);
+        f64_to_f32(Xp, (float*)bX.contents, N);
+
+        id<MTLComputePipelineState> p = pso(@"silu_fwd");
+        if (!p) return -1;
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bX offset:0 atIndex:0];
+        [enc setBuffer:bY offset:0 atIndex:1];
+        [enc setBuffer:bS offset:0 atIndex:2];
+        uint32_t nu = (uint32_t)N;
+        [enc setBytes:&nu length:4 atIndex:3];
+        dispatch_1d(enc, N);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        f32_to_f64((float*)bY.contents, Yp, N);
+        f32_to_f64((float*)bS.contents, Sp, N);
+        pool_release(bX); pool_release(bY); pool_release(bS);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Phase 0 — JIT compile foundation (rail-jit-fused-kernels-plan.md)
+// Read MSL source from /tmp/rail_jit_kernel.metal, compile via
+// newLibraryWithSource at runtime, cache the MTLComputePipelineState
+// in an array.  Rail receives back an integer kernel ID.  Proves the
+// "Rail emits MSL → Rail dispatches" loop end-to-end.
+// ────────────────────────────────────────────────────────────────────
+static NSMutableArray *g_jit_pipes = nil;
+
+int tgl_jit_compile_from_tmp_file(int dummy) {
+    (void)dummy;
+    if (ensure_init() != 1) return -1;
+    if (!g_jit_pipes) g_jit_pipes = [NSMutableArray array];
+    NSError *err = nil;
+    NSString *src = [NSString stringWithContentsOfFile:@"/tmp/rail_jit_kernel.metal"
+                                              encoding:NSUTF8StringEncoding
+                                                 error:&err];
+    if (!src) {
+        fprintf(stderr, "tgl_jit_compile: read /tmp/rail_jit_kernel.metal failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "?");
+        return -1;
+    }
+    MTLCompileOptions *opts = [MTLCompileOptions new];
+    id<MTLLibrary> lib = [g_device newLibraryWithSource:src options:opts error:&err];
+    if (!lib) {
+        fprintf(stderr, "tgl_jit_compile: newLibraryWithSource failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "?");
+        return -1;
+    }
+    NSArray *names = [lib functionNames];
+    if (names.count == 0) {
+        fprintf(stderr, "tgl_jit_compile: no functions in compiled library\n");
+        return -1;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:names[0]];
+    if (!fn) return -1;
+    id<MTLComputePipelineState> p = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!p) return -1;
+    [g_jit_pipes addObject:p];
+    return (int)(g_jit_pipes.count - 1);
+}
+
+// Minimal 1-in-1-out dispatcher for the JIT'd kernel.  Same buffer/grid
+// shape as tgl_silu_fwd minus the sigmoid-save output, so the smoke test
+// can feed it the same MSL signature.
+int tgl_jit_dispatch_1in1out(int kid, const double *X, double *Y, int N) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (ensure_init() != 1) return -1;
+    const double *Xp = X + 1;
+    double *Yp = Y + 1;
+    @autoreleasepool {
+        id<MTLBuffer> bX = pool_acquire(N * 4);
+        id<MTLBuffer> bY = pool_acquire(N * 4);
+        f64_to_f32(Xp, (float*)bX.contents, N);
+        id<MTLComputePipelineState> p = g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bX offset:0 atIndex:0];
+        [enc setBuffer:bY offset:0 atIndex:1];
+        uint32_t nu = (uint32_t)N;
+        [enc setBytes:&nu length:4 atIndex:2];
+        dispatch_1d(enc, N);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        f32_to_f64((float*)bY.contents, Yp, N);
+        pool_release(bX); pool_release(bY);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// bf16 host-side staging helpers (added 2026-05-14).
+// bf16 layout = upper 16 bits of f32 representation; conversion is
+// just a bit-shift with round-to-nearest-even.
+// ────────────────────────────────────────────────────────────────────
+static inline void f64_to_bf16(const double *src, uint16_t *dst, int n) {
+    for (int i = 0; i < n; i++) {
+        float f = (float)src[i];
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
+        uint32_t lsb = (bits >> 16) & 1u;
+        uint32_t rounding_bias = 0x7FFFu + lsb;
+        bits += rounding_bias;
+        dst[i] = (uint16_t)(bits >> 16);
+    }
+}
+
+static inline void bf16_to_f64(const uint16_t *src, double *dst, int n) {
+    for (int i = 0; i < n; i++) {
+        uint32_t bits = ((uint32_t)src[i]) << 16;
+        float f;
+        memcpy(&f, &bits, 4);
+        dst[i] = (double)f;
+    }
+}
+
+// Drop-in for tgl_matmul_f16 — same Rail-side signature, bf16 internally.
+int tgl_matmul_bf16(const double *A, const double *B, double *C, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = A + 1, *Bptr = B + 1;
+    double *Cptr = C + 1;
+
+    @autoreleasepool {
+        uint32_t sA = M*K, sB = K*N, sC = M*N;
+        id<MTLBuffer> bufA = pool_acquire(sA*2);
+        id<MTLBuffer> bufB = pool_acquire(sB*2);
+        id<MTLBuffer> bufC = pool_acquire(sC*2);
+
+        f64_to_bf16(Aptr, (uint16_t*)bufA.contents, sA);
+        f64_to_bf16(Bptr, (uint16_t*)bufB.contents, sB);
+
+        id<MTLComputePipelineState> p = pso(@"matmul_bf16");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBuffer:bufC offset:0 atIndex:2];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:3];
+        [enc setBytes:&ku length:4 atIndex:4];
+        [enc setBytes:&nu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((N+15)/16, (M+15)/16, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        bf16_to_f64((uint16_t*)bufC.contents, Cptr, sC);
+        pool_release(bufA); pool_release(bufB); pool_release(bufC);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Phase 1.1 — JIT dispatcher for the fused rmsnorm+QKV pattern.
+// 5 input buffers (X, G, WQ, WK, WV f64), 3 output buffers (Q, K, V f64),
+// 2 constants (SEQ, D).  Stages f64↔f32 host-side, dispatches one
+// threadgroup per row with 64 threads.
+// ────────────────────────────────────────────────────────────────────
+// 8-arg form: caller passes a single packed output buffer
+// (3*SEQ*D + SEQ doubles: Q | K | V | R) and SEQ/D packed as (SEQ<<16)|D.
+// R is the rstd row vector needed by the backward pass.
+int tgl_jit_dispatch_rmsnorm_qkv(int kid,
+                                  const double *X, const double *G,
+                                  const double *WQ, const double *WK, const double *WV,
+                                  double *QKV_packed,
+                                  int SEQ_D) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (ensure_init() != 1) return -1;
+    int SEQ = (SEQ_D >> 16) & 0xFFFF;
+    int D   =  SEQ_D        & 0xFFFF;
+    const double *Xp=X+1, *Gp=G+1, *WQp=WQ+1, *WKp=WK+1, *WVp=WV+1;
+    double *QKVp = QKV_packed + 1;
+    uint32_t sX=SEQ*D, sW=D*D, sQ=SEQ*D, sQKV=3*SEQ*D, sQKVR=sQKV+SEQ, sQKVRL=sQKVR+sQ;
+    @autoreleasepool {
+        id<MTLBuffer> bX = pool_acquire(sX*4);
+        id<MTLBuffer> bG = pool_acquire(D*4);
+        id<MTLBuffer> bWQ = pool_acquire(sW*4);
+        id<MTLBuffer> bWK = pool_acquire(sW*4);
+        id<MTLBuffer> bWV = pool_acquire(sW*4);
+        // Single Metal output buffer; kernel sees Q/K/V/R/LN1 as 5 device
+        // pointers via setBuffer:offset: at five byte-offsets into one buffer.
+        // Layout: Q | K | V | R | LN1  (total 4*SEQ*D + SEQ floats)
+        id<MTLBuffer> bQKV = pool_acquire(sQKVRL*4);
+        f64_to_f32(Xp,  (float*)bX.contents,  sX);
+        f64_to_f32(Gp,  (float*)bG.contents,  D);
+        f64_to_f32(WQp, (float*)bWQ.contents, sW);
+        f64_to_f32(WKp, (float*)bWK.contents, sW);
+        f64_to_f32(WVp, (float*)bWV.contents, sW);
+
+        id<MTLComputePipelineState> p = g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bX  offset:0          atIndex:0];
+        [enc setBuffer:bG  offset:0          atIndex:1];
+        [enc setBuffer:bWQ offset:0          atIndex:2];
+        [enc setBuffer:bWK offset:0          atIndex:3];
+        [enc setBuffer:bWV offset:0          atIndex:4];
+        [enc setBuffer:bQKV offset:0          atIndex:5];  // Q range
+        [enc setBuffer:bQKV offset:sQ*4       atIndex:6];  // K range
+        [enc setBuffer:bQKV offset:2*sQ*4     atIndex:7];  // V range
+        uint32_t su=SEQ, du=D;
+        [enc setBytes:&su length:4 atIndex:8];
+        [enc setBytes:&du length:4 atIndex:9];
+        [enc setBuffer:bQKV offset:3*sQ*4     atIndex:10]; // R range (rstd, SEQ floats)
+        [enc setBuffer:bQKV offset:(3*sQ+SEQ)*4 atIndex:11]; // LN1 range (normalized X, SEQ*D floats)
+        [enc dispatchThreadgroups:MTLSizeMake(SEQ, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        f32_to_f64((float*)bQKV.contents, QKVp, sQKVRL);
+        pool_release(bX); pool_release(bG);
+        pool_release(bWQ); pool_release(bWK); pool_release(bWV);
+        pool_release(bQKV);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Phase 1.4 — Generic 2-in-1-out JIT dispatcher.
+// Used by silu+hadamard (SwiGLU's elementwise piece) and any future
+// elementwise fusion that takes two same-shape inputs and produces one
+// same-shape output.  4 args fit easily in Rail's FFI register window.
+// ────────────────────────────────────────────────────────────────────
+int tgl_jit_dispatch_2in1out(int kid, const double *A, const double *B,
+                              double *C, int N) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (ensure_init() != 1) return -1;
+    const double *Ap = A+1, *Bp = B+1;
+    double *Cp = C+1;
+    @autoreleasepool {
+        id<MTLBuffer> bA = pool_acquire(N*4);
+        id<MTLBuffer> bB = pool_acquire(N*4);
+        id<MTLBuffer> bC = pool_acquire(N*4);
+        f64_to_f32(Ap, (float*)bA.contents, N);
+        f64_to_f32(Bp, (float*)bB.contents, N);
+        id<MTLComputePipelineState> p = g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bA offset:0 atIndex:0];
+        [enc setBuffer:bB offset:0 atIndex:1];
+        [enc setBuffer:bC offset:0 atIndex:2];
+        uint32_t nu = (uint32_t)N;
+        [enc setBytes:&nu length:4 atIndex:3];
+        dispatch_1d(enc, N);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        f32_to_f64((float*)bC.contents, Cp, N);
+        pool_release(bA); pool_release(bB); pool_release(bC);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Specialized silu+hadamard dispatcher.  Like 2in1out, but the output
+// buffer is 2*N doubles: out[0..N) holds h_act = silu(G)*U, and
+// sig[N..2N) holds sigmoid(G) so the backward pass can reuse it.
+// Caller-side FFI is still 5 args (kid, G, U, OutSig, N).
+// ────────────────────────────────────────────────────────────────────
+int tgl_jit_dispatch_silu_hadamard(int kid, const double *A, const double *B,
+                                    double *C, int N) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (ensure_init() != 1) return -1;
+    const double *Ap = A+1, *Bp = B+1;
+    double *Cp = C+1;
+    @autoreleasepool {
+        id<MTLBuffer> bA = pool_acquire(N*4);
+        id<MTLBuffer> bB = pool_acquire(N*4);
+        // Output buffer holds 2*N floats: out followed by sigmoid.
+        id<MTLBuffer> bC = pool_acquire(2*N*4);
+        f64_to_f32(Ap, (float*)bA.contents, N);
+        f64_to_f32(Bp, (float*)bB.contents, N);
+        id<MTLComputePipelineState> p = g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bA offset:0   atIndex:0];
+        [enc setBuffer:bB offset:0   atIndex:1];
+        [enc setBuffer:bC offset:0   atIndex:2];  // O range
+        uint32_t nu = (uint32_t)N;
+        [enc setBytes:&nu length:4 atIndex:3];
+        [enc setBuffer:bC offset:N*4 atIndex:4];  // S range (sigmoid)
+        dispatch_1d(enc, N);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        f32_to_f64((float*)bC.contents, Cp, 2*N);
+        pool_release(bA); pool_release(bB); pool_release(bC);
     }
     return 1;
 }
