@@ -1,0 +1,170 @@
+# Releases — operational runbook
+
+Every Rail release is signed against a live entropy beacon by the
+fleet0 witness. This page is the recipe — read it before cutting a
+release, and especially before cutting one from a fresh worktree.
+
+## What a release looks like
+
+For a tag `vX.Y.Z`:
+
+```
+releases/vX.Y.Z/
+  rail_native                          ← the ARM64 substrate binary
+  rail_native.attestation.json         ← Ed25519 sig + pulse_id + sha
+  tools/compile.rail → compile.rail    ← the source
+  compile.rail.attestation.json
+  index.json                           ← pins git commit + per-artifact pulse_id
+```
+
+Five files. They're all published to `https://ledatic.org/releases/vX.Y.Z/<file>`
+via Cloudflare KV.
+
+## Cutting a release
+
+Assumes you're on the tag commit (or the working tree matches it byte-for-byte
+for both `rail_native` and `tools/compile.rail`).
+
+```bash
+# 1. Pi witness must be live
+curl -sf --max-time 5 http://100.87.231.45:9102/health
+# → {"ok": true, "name": "fleet0"}
+
+# 2. Attest + emit index
+bash tools/attest/attest_release.sh vX.Y.Z
+
+# 3. Verify locally before shipping anything
+bash tools/attest/verify.sh releases/vX.Y.Z/rail_native        releases/vX.Y.Z/rail_native.attestation.json
+bash tools/attest/verify.sh releases/vX.Y.Z/compile.rail       releases/vX.Y.Z/compile.rail.attestation.json
+# → ok  artifact=<n>  pulse_id=<N>  pk_fp=cac5f21a70564aeb  (×2)
+
+# 4. Publish to ledatic.org
+bash tools/attest/publish.sh releases/vX.Y.Z
+# → 5 ok, 0 fail
+
+# 5. Commit + push (see gotcha #1)
+git add releases/vX.Y.Z
+git add -f releases/vX.Y.Z/rail_native.attestation.json    # see gotcha #1
+git commit -m "attest: vX.Y.Z release artifacts + attestations"
+git push origin master
+```
+
+## Gotchas earned over multiple releases
+
+### #1 — `.gitignore` swallows `rail_native.attestation.json`
+
+`.gitignore` has `rail_native.*` (intended to ignore backup binaries like
+`rail_native.bak`). The glob also matches `rail_native.attestation.json`.
+
+**Symptom:** `git add releases/vX.Y.Z` silently drops the rail_native
+attestation. Existing tracked attestations are grandfathered, so prior
+releases look fine — but the new release ships without its rail_native
+attestation file in-tree.
+
+**Workaround:** explicit `git add -f releases/vX.Y.Z/rail_native.attestation.json`
+on every release.
+
+**Real fix (TODO):** add `!releases/**/rail_native.attestation.json` to
+`.gitignore` whitelist.
+
+### #2 — `~/.ledatic/witness/signer_url` format
+
+The file contains a full URL (`http://100.87.231.45:9102/sign`).
+`attest.sh` reads it as a URL — works. `attest.rail` reads it expecting
+a bare IP — silently fails (`hc_connect_tcp` can't parse a URL as
+IPv4 dotted-quad).
+
+**Workaround for attest.rail callers:** `SIGNER_IP=100.87.231.45
+bash tools/attest/attest_release.sh vX.Y.Z`.
+
+**Real fix (TODO):** either standardize the file to bare IP, or teach
+attest.rail to parse URLs.
+
+### #3 — `runtime/llm.o` is git-ignored
+
+`.gitignore` excludes `runtime/`. The compile.rail linker step needs
+`runtime/llm.o` (the LLM trampoline object); it must exist on disk for
+ld to succeed.
+
+**Symptom:** fresh worktree off master gives `ld: file cannot be open()ed,
+errno=2 path=runtime/llm.o`.
+
+**Workaround:** seed from any working worktree:
+```bash
+mkdir -p runtime && cp ~/projects/rail/runtime/llm.o runtime/
+```
+
+(The .o is built from `tools/llm_runtime.c` somewhere — find and
+canonicalize that build step in a follow-up.)
+
+### #4 — Plasma beacon owns `/tmp/rail_out`
+
+`com.ledatic.mhd` LaunchAgent runs the plasma beacon, which compiles to
+`/tmp/rail_out` and execs it. Long-running. Any subsequent compile that
+also writes to `/tmp/rail_out` works (macOS unlinks + creates), but you
+**cannot** `./rail_native run /tmp/rail_out` against the beacon binary —
+that re-execs the daemon. Use explicit output paths when smoke-testing.
+
+### #5 — `./rail_native run` captures stdout
+
+The `run` subcommand captures child stdout in memory and only flushes at
+the end. For tests that should stream output, compile separately and
+exec the binary directly:
+```bash
+./rail_native my_test.rail   # compiles to /tmp/rail_out
+/tmp/rail_out                 # streams normally
+```
+
+### #6 — Annotated tags vs commit hashes
+
+`git rev-parse vX.Y.Z` returns the **tag object** hash (annotated tag),
+not the commit. Use `git rev-parse vX.Y.Z^{commit}` to dereference.
+`attest_release.sh` uses `git describe --tags HEAD` which gives the
+tag name, fine for the directory; but if you build `index.json` by
+hand make sure `git.commit` is the commit hash, not the tag object.
+
+## Known open bugs blocking pure-Rail attestation
+
+### ftell FFI returns state-dependent garbage
+
+`read_file_bytes` in `stdlib/file.rail` uses `foreign ftell fp -> int`
+to determine file size. On the current rail_native (any version from
+v4.0.0 through f851882), `ftell` returns values like 14, 29, 44, 80, 89
+— not the actual file size. The emitted ARM64 asm *looks* correct
+(load arg, conditional untag, call, retag), but the runtime behavior
+is wrong. Suspected: GC-aware stack-slot type confusion for raw FFI
+pointer returns, OR FFI prologue/epilogue interacting with sp
+alignment in some non-obvious way.
+
+**Consequence:** `attest.rail` computes wrong sha256 + size_bytes for
+any artifact. The shell `attest.sh` (curl + shasum + python) is the
+working alternative.
+
+**Repro:** `./rail_native tools/test/ftell_read_smoke.rail && /tmp/rail_out`
+— should print PASS but currently FAILs.
+
+**Until fixed:** all releases must use `attest.sh`, not `attest.rail`.
+
+## Backfilling missed releases
+
+If a tag was pushed without going through this flow:
+
+```bash
+TAG=vX.Y.Z
+mkdir -p releases/$TAG
+git show "$TAG":rail_native        > releases/$TAG/rail_native
+chmod +x releases/$TAG/rail_native
+git show "$TAG":tools/compile.rail > releases/$TAG/compile.rail
+SIGNER_URL=http://100.87.231.45:9102/sign bash tools/attest/attest.sh \
+  releases/$TAG/rail_native      releases/$TAG/rail_native.attestation.json
+SIGNER_URL=http://100.87.231.45:9102/sign bash tools/attest/attest.sh \
+  releases/$TAG/compile.rail     releases/$TAG/compile.rail.attestation.json
+# then hand-build index.json with COMMIT=$(git rev-parse "$TAG^{commit}")
+```
+
+The pulse_id will be from "now" — the backfilled attestation proves
+*the bytes existed before pulse N*, which for the original release is
+trivially true.
+
+Backfilled in May 2026: v4.0.0 (pulse 987510), v4.0.1 (pulse 987510),
+v4.1.0 (pulse 987511).
