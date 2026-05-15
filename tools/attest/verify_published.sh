@@ -56,7 +56,7 @@ fi
 
 # Drop pre-historic tags before walking — they have no manifest and
 # never will. Without this filter, the script reports them as `miss`
-# with a fix command (`./tools/attest/publish.sh releases/<tag>`)
+# with a fix command (`./rail_native run tools/attest/publish.rail releases/<tag>`)
 # that would fail because the local releases/<tag>/ directory
 # doesn't exist either.
 declare -a PREHISTORIC_SKIPPED=()
@@ -168,7 +168,7 @@ for tag in "${CANDIDATES[@]}"; do
   case "$rc" in
     3)
       MISSING+=("$tag")
-      [ "$JSON" = "0" ] && echo "  miss   $tag (manifest 404 — run: ./tools/attest/publish.sh releases/$tag)"
+      [ "$JSON" = "0" ] && echo "  miss   $tag (manifest 404 — run: ./rail_native run tools/attest/publish.rail releases/$tag)"
       continue
       ;;
     4)
