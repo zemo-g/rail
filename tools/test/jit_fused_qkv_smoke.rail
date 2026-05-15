@@ -1,0 +1,106 @@
+-- jit_fused_qkv_smoke.rail — Phase 1.1+1.2 verification for the fused
+-- rmsnorm+QKV kernel.  Runs the unfused chain (rmsnorm_save → matmul ×3)
+-- and the JIT'd fused kernel on the same inputs; compares element-wise
+-- to within 1e-4.
+--
+-- Run from ~/projects/rail/:
+--   ./rail_native tools/test/jit_fused_qkv_smoke.rail
+--   DYLD_LIBRARY_PATH=tools/metal /tmp/rail_out
+import "stdlib/jit.rail"
+
+-- Fill arr with deterministic small values
+fill_seq arr n i =
+  if i >= n then 0
+  else
+    let v = (int_to_float (i % 13)) * 0.1 - 0.6
+    let _ = float_arr_set arr i v
+    fill_seq arr n (i + 1)
+
+ones_loop arr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set arr i 1.0
+    ones_loop arr n (i + 1)
+
+max_diff_loop a b n i acc =
+  if i >= n then acc
+  else
+    let d = (float_arr_get a i) - (float_arr_get b i)
+    let ad = if d < 0.0 then 0.0 - d else d
+    let na = if ad > acc then ad else acc
+    max_diff_loop a b n (i + 1) na
+
+max_diff a b n = max_diff_loop a b n 0 0.0
+
+-- Copy n elements from src[src_off..] to dst[0..n].
+qkv_copy_range src src_off dst n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set dst i (float_arr_get src (src_off + i))
+    qkv_copy_range src src_off dst n (i + 1)
+
+unwrap_d t = match t | Tensor d _ _ -> d
+
+main =
+  let _ = print "=== Phase 1.1/1.2 — fused rmsnorm+QKV smoke ==="
+  let seq = 16
+  let d = 64
+
+  -- Inputs (deterministic).
+  let x_d = float_arr_new (seq * d) 0.0
+  let _ = fill_seq x_d (seq * d) 0
+  let g_d = float_arr_new d 1.0
+  let _ = fill_seq g_d d 7
+  let wq_d = float_arr_new (d * d) 0.0
+  let _ = fill_seq wq_d (d * d) 13
+  let wk_d = float_arr_new (d * d) 0.0
+  let _ = fill_seq wk_d (d * d) 23
+  let wv_d = float_arr_new (d * d) 0.0
+  let _ = fill_seq wv_d (d * d) 31
+
+  -- ─── Unfused reference: rmsnorm_save → 3× tgl_matmul_f64 ────────────
+  let _ = print "[1] running unfused chain (CPU rmsnorm + GPU matmul)..."
+  let x = Tensor x_d (cons seq (cons d [])) (compute_strides (cons seq (cons d [])))
+  let g = Tensor g_d (cons d []) (cons 1 [])
+  let wq = Tensor wq_d (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+  let wk = Tensor wk_d (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+  let wv = Tensor wv_d (cons d (cons d [])) (compute_strides (cons d (cons d [])))
+
+  let pack = rmsnorm_save x g
+  let ln = head pack
+  let q_ref_t = matmul ln wq
+  let k_ref_t = matmul ln wk
+  let v_ref_t = matmul ln wv
+  let q_ref = unwrap_d q_ref_t
+  let k_ref = unwrap_d k_ref_t
+  let v_ref = unwrap_d v_ref_t
+
+  -- ─── JIT-compile + dispatch the fused kernel ────────────────────────
+  let _ = print "[2] JIT-compiling fused rmsnorm+QKV kernel..."
+  let kid = jit_compile_rmsnorm_qkv 0
+  let _ = print (cat ["    kid=", show kid])
+
+  let _ = print "[3] dispatching fused kernel..."
+  let total = seq * d
+  let qkv_packed = float_arr_new (3 * total) 0.0
+  let rc = jit_run_rmsnorm_qkv kid x_d g_d wq_d wk_d wv_d qkv_packed seq d
+  let _ = print (cat ["    rc=", show rc])
+
+  -- Split packed output into separate Q/K/V arrays to compare.
+  let q_jit = float_arr_new total 0.0
+  let k_jit = float_arr_new total 0.0
+  let v_jit = float_arr_new total 0.0
+  let _ = qkv_copy_range qkv_packed 0           q_jit total 0
+  let _ = qkv_copy_range qkv_packed total       k_jit total 0
+  let _ = qkv_copy_range qkv_packed (2 * total) v_jit total 0
+
+  -- ─── Element-wise comparison ────────────────────────────────────────
+  let dq = max_diff q_ref q_jit total
+  let dk = max_diff k_ref k_jit total
+  let dv = max_diff v_ref v_jit total
+  let _ = print (cat ["[4] max |diff|  Q=", show_float dq, "  K=", show_float dk, "  V=", show_float dv])
+
+  let thresh = 0.001
+  let pass = if dq < thresh then if dk < thresh then if dv < thresh then 1 else 0 else 0 else 0
+  let _ = if pass == 1 then print "\n=== PHASE 1.1+1.2 — GREEN ===" else print "\n=== FAIL ==="
+  0

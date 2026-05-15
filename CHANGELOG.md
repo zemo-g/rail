@@ -2,6 +2,116 @@
 
 All notable changes to Rail are documented here.
 
+## v5.1.0 — 2026-05-15 — Rail emits its own GPU kernels
+
+Major release.  Rail now generates Metal Shading Language source from
+its op-DAG, JIT-compiles it via Metal's `newLibraryWithSource:`, and
+dispatches the kernel at runtime.  Every kernel the GPU executes is
+emitted by an attested Rail binary — the substrate piece needed for
+end-to-end attested GPU training (see
+[`rail-jit-fused-kernels-plan`](.) for the multi-month roadmap).
+
+This release bundles the full GPU substrate that the auto-emission
+pipeline rests on: per-op Metal kernels, the bf16 numerics regime that
+unlocks stable 10k-step training, the JIT compile foundation, two
+hand-fused kernels, and the DAG matcher + emitter that drive them.
+
+### Auto-emission pipeline
+
+- `stdlib/jit_node.rail` — JIT op-DAG types (`JitNode`, `TracedTensor`)
+  + tape primitives + `jit_nth`.  Pure-DAG module with no Tensor or
+  transformer dependency, so codegen consumers can import without
+  pulling the training stack.
+- `stdlib/jit_tape.rail` — execution tracers (`jit_leaf`,
+  `traced_rmsnorm`, `traced_matmul`) layered on top of jit_node.
+- `stdlib/jit_match.rail` — DAG matcher.  `walk_tape` returns a list
+  of `FuseMatch` records (`FuseRmsQKV`, `FuseSiluHad`) in tape order,
+  identifying subgraphs that fit known fusion shapes.
+- `stdlib/jit_emit.rail` — MSL emitter.  `emit_msl_for_match` takes
+  `(tape, FuseMatch)` and returns the kernel source.  Stubbed against
+  known patterns today; v5.2+ will replace with shape-parameterized
+  codegen driven by JitNode data.
+- `stdlib/jit.rail` — compile/dispatch shim.  No longer owns MSL
+  text; `jit_compile_*` pulls strings from `jit_emit`.  External API
+  unchanged for existing consumers.
+
+### Hand-fused Metal kernels
+
+- `fused_rmsnorm_qkv` — RMSNorm + 3 matmul (Q/K/V) in one
+  threadgroup-per-row dispatch.  Exports Q | K | V | rstd | LN1 from
+  a single packed buffer (`4*SEQ*D + SEQ` floats); rstd and LN1 are
+  kept for backward.  4 dispatches → 1.  **35× faster** than the
+  per-op chain at training shapes (seq=512, d=64).
+- `fused_silu_hadamard` — SiLU(gate) * up in one elementwise
+  dispatch.  Exports h_act | sigmoid(gate) (`2*N` floats); sigmoid
+  is kept for backward.  **18× faster** than the per-op chain.
+
+### JIT compile foundation
+
+- `tgl_jit_compile_from_tmp_file` — Metal's `newLibraryWithSource:`
+  driven from a Rail-emitted `.metal` file.  Returns a pipeline ID
+  cached in `g_jit_pipes` for reuse across steps.
+- `tgl_jit_dispatch_1in1out` / `tgl_jit_dispatch_2in1out` /
+  `tgl_jit_dispatch_rmsnorm_qkv` / `tgl_jit_dispatch_silu_hadamard` —
+  per-pattern dispatchers with f64↔f32 host staging.
+
+### Per-op GPU kernels
+
+- `tgl_rmsnorm_save_f64` (1.8× over CPU at training shapes)
+- `tgl_rope_apply_f64` (7× over CPU)
+- `tgl_silu_fwd_f64` (19× over CPU)
+
+Per-op wins translated to ~2% per-step at training shapes — confirms
+fusion (not per-op throughput) is the real ceiling, which is why the
+JIT pipeline above is the load-bearing thesis.  See
+`rail-gpu-fused-ops-2026-05-14` for the bench breakdown.
+
+### bf16 numerics regime
+
+- `tgl_matmul_bf16` + `matmul_bf16` Rail wrapper.  bf16 has f32's
+  exponent range, so it sidesteps fp16's step-2759 NaN cliff
+  (`rail-bf16-stable-10k-2026-05-14`).  Training scripts default to
+  forward bf16 with f64 on embedding + LM-head + backward.
+
+### Training scripts (chunked-corpus sampler, 2-block d=64)
+
+- `tools/train/lm_v3_chunked_bf16_full_long.rail` — bf16 forward,
+  10k-step stable, ~40% wall under f64 baseline.
+- `tools/train/lm_v3_chunked_jit_long.rail` — same architecture, Q/K/V
+  + SwiGLU run through fused JIT'd kernels.  200-step matched-seed
+  pilot vs bf16 baseline: trajectory shape preserved, no NaN, both
+  converge.  Wall-clock bench (3×3 alternating runs): **2.85%
+  step-throughput improvement** over baseline at seq=512 d=64 d_ff=192.
+- `tools/train/lm_v3_chunked_fp16_attn_f64_long.rail` — falsification
+  experiment ruling out attention as the fp16 culprit
+  (`rail-fp16-attn-f64-falsified-2026-05-14`).
+
+### Tests + benches
+
+- `tools/test/jit_kernel_smoke.rail` — Phase 0: Rail-emitted MSL
+  JIT-compiles + dispatches (4/4 silu values).
+- `tools/test/jit_tape_smoke.rail` — 9-node DAG construction with
+  shared parent (the QKV fusion signal).
+- `tools/test/jit_fused_qkv_smoke.rail` — numerical parity vs
+  per-op chain (max diff 1.67e-6, f32 floor).
+- `tools/test/jit_silu_hadamard_smoke.rail` — numerical parity
+  (max diff 1.5e-8).
+- `tools/test/jit_block_integration_smoke.rail` — both kernels
+  inside one block forward; rstd / ln1 / sigmoid parity all GREEN.
+- `tools/test/jit_dag_match_smoke.rail` — DAG matcher (5/5).
+- `tools/test/jit_emit_smoke.rail` — MSL emitter (4/4).
+- `tools/test/gpu_fused_ops_smoke.rail` — per-op kernel parity.
+- `tools/bench/jit_fused_qkv_bench.rail` — fused vs unfused at
+  training shapes.
+- `tools/bench/transformer_fused_ops_bench.rail` — per-op GPU vs CPU.
+
+### Stability
+
+- 140/140 compiler test suite still green.
+- 2-pass byte-identical self-bootstrap unchanged (this release adds
+  stdlib + foreign decls + Metal sources; the compiler core is
+  untouched).
+
 ## v5.0.0 — 2026-05-14 — Self-hosted toolchain (Linux ELF substrate)
 
 Major release.  Rail produces its own aarch64 Linux ELF binaries —

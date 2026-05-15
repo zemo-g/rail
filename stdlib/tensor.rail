@@ -228,6 +228,32 @@ foreign tgl_softmax_backward_f64 y dy dx rows cols -> int
 foreign tgl_ce_softmax_backward_f64 probs targets grad batch vocab -> int
 foreign tgl_layernorm_backward_f64 x mean rstd gamma dy dx rows dim -> int
 
+-- Transformer fused ops added 2026-05-14 — Metal kernels for the elementwise
+-- bottleneck of the training step (RMSNorm fwd, RoPE in-place, SiLU fwd).
+-- CPU equivalents stay in stdlib/transformer.rail; these are GPU drop-ins.
+foreign tgl_rmsnorm_save_f64 x y g rstd dim n_rows -> int  -- eps hardcoded 1e-5
+foreign tgl_rope_apply_f64   x seq d sign -> int
+foreign tgl_silu_fwd_f64     x y sig n -> int
+
+-- Phase 0 of the trace+JIT plan (rail-jit-fused-kernels-plan.md, 2026-05-14).
+-- tgl_jit_compile_from_tmp_file reads MSL source from /tmp/rail_jit_kernel.metal
+-- and returns an integer pipeline ID. tgl_jit_dispatch_1in1out runs a 1-in/1-out
+-- kernel with that ID at a 1D grid of size n. Both prove the JIT loop end-to-end.
+foreign tgl_jit_compile_from_tmp_file dummy -> int
+foreign tgl_jit_dispatch_1in1out kid x y n -> int
+
+-- bf16 forward matmul (added 2026-05-14, replaces fp16 for the long-tail
+-- stability question — bf16 has f32's exponent range, no 65504 overflow).
+foreign tgl_matmul_bf16 a b c m k n -> int
+
+-- Phase 1.1 (2026-05-15): JIT dispatcher for the fused rmsnorm+QKV kernel.
+-- 5 inputs (X, G, WQ, WK, WV) + 3 outputs (Q, K, V) + SEQ + D.  The kid
+-- comes from tgl_jit_compile_from_tmp_file after writing the fused MSL.
+foreign tgl_jit_dispatch_rmsnorm_qkv kid x g wq wk wv qkv_packed seq_d -> int
+foreign tgl_jit_dispatch_2in1out      kid a b c n -> int
+-- silu+hadamard variant: output buffer is 2*N doubles (h_act | sigmoid).
+foreign tgl_jit_dispatch_silu_hadamard kid g u out_sig n -> int
+
 -- fp16 variants (Phase 4a Option A, labrat-produced kernels).
 -- Same Rail-side signature as the f64 siblings: pass float_arr (double*);
 -- the dylib stages down to half on the way in and back to double on the
@@ -452,6 +478,20 @@ matmul_f16 a b = match a
       let n_dim = head (tail b_shape)
       let c_data = float_arr_new (m_dim * n_dim) 0.0
       let _ = tgl_matmul_f16 a_data b_data c_data m_dim k_dim n_dim
+      Tensor c_data (cons m_dim (cons n_dim [])) (compute_strides (cons m_dim (cons n_dim [])))
+
+-- bf16 matmul (added 2026-05-14): same Rail signature as matmul_f16.
+-- Dylib stages f64→bf16 on input and bf16→f64 on output; accumulator
+-- stays fp32 inside the kernel. bf16's exponent range matches f32
+-- (~3.4e38) — fp16's step-2759 overflow simply cannot happen here.
+matmul_bf16 a b = match a
+  | Tensor a_data a_shape a_strides -> match b
+    | Tensor b_data b_shape b_strides ->
+      let m_dim = head a_shape
+      let k_dim = head (tail a_shape)
+      let n_dim = head (tail b_shape)
+      let c_data = float_arr_new (m_dim * n_dim) 0.0
+      let _ = tgl_matmul_bf16 a_data b_data c_data m_dim k_dim n_dim
       Tensor c_data (cons m_dim (cons n_dim [])) (compute_strides (cons m_dim (cons n_dim [])))
 
 -- fp16 fused matmul+bias+relu. `bias` is a float_arr (length n) — stays
