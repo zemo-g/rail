@@ -25,7 +25,7 @@
 # cadence to refresh the binding (daily / weekly).
 #
 # Output: releases/witness-fleet0/{fleet0.pub.pem, fleet0.pub.pem.attestation.json}
-# Publish: tools/attest/publish.rail releases/witness-fleet0
+# Publish: tools/attest/publish.sh releases/witness-fleet0
 
 set -euo pipefail
 
@@ -53,4 +53,4 @@ echo "  ./rail_native run tools/attest/verify.rail \\"
 echo "    $dest/fleet0.pub.pem \\"
 echo "    $dest/fleet0.pub.pem.attestation.json"
 echo "publish:"
-echo "  ./rail_native run tools/attest/publish.rail $dest"
+echo "  ./tools/attest/publish.sh $dest"

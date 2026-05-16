@@ -41,9 +41,6 @@ bash tools/attest/verify.sh releases/vX.Y.Z/compile.rail       releases/vX.Y.Z/c
 # 4. Publish to ledatic.org
 bash tools/attest/publish.sh releases/vX.Y.Z
 # → 5 ok, 0 fail
-# (publish.rail can ship JSON + .rail text but not the rail_native binary
-#  yet — https_put has no byte-array body path. publish.sh still owns the
-#  binary push.)
 
 # 5. Commit + push (see gotcha #1)
 git add releases/vX.Y.Z
