@@ -44,7 +44,7 @@ codesign --sign - --force "$attest_bin" >/dev/null 2>&1 || true
 "$attest_bin" "$bin" "$bin_att"
 "$attest_bin" "$src" "$src_att"
 
-# Stage the bytes alongside their attestations so publish.rail ships
+# Stage the bytes alongside their attestations so publish.sh ships
 # both — attestation without the artifact is unverifiable.
 cp "$bin" "$dest/$(basename "$bin")"
 cp "$src" "$dest/$(basename "$src")"
