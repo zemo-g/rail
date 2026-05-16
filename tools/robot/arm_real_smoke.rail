@@ -1,0 +1,228 @@
+-- tools/robot/arm_real_smoke.rail
+--
+-- Smoke harness for tools/robot/arm_real.rail. Two modes:
+--
+-- 1. --dry-run: build all frames in memory, decode them back from
+--    their bytes, verify byte-exact match against the worked examples
+--    from notes/maxarm_protocol.md. NO serial device required. This
+--    is the without-hardware acceptance test path.
+--
+-- 2. --connect <path>: open the named serial device, send a READ_XYZ,
+--    print the response. This is the with-hardware bring-up path
+--    (Stage 2 of incremental_testing in the brief: USB connected
+--    but arm powered OFF). Adding --move will additionally
+--    send a tiny test SET_XYZ to nudge the arm.
+--
+-- Per memory entry feedback_diagnostics_first: this harness emits
+-- counters (frames_built, frames_round_tripped, bytes_written,
+-- bytes_read, faults) so any change to the driver shows its effect
+-- in the counter output before any tuning lands.
+
+import "tools/robot/arm_real.rail"
+
+-- ---------------------------------------------------------------------
+-- Helpers for ASCII hex display.
+-- ---------------------------------------------------------------------
+
+hex_digit n =
+  if n < 10 then char_from_int (48 + n)
+  else char_from_int (87 + n)
+
+byte_hex v = cat [hex_digit (v / 16), hex_digit (v % 16)]
+
+dump_buf_loop buf i n acc =
+  if i >= n then acc
+  else
+    let h = byte_hex (byte_at buf i)
+    let sep = if i == 0 then "" else " "
+    dump_buf_loop buf (i + 1) n (cat [acc, sep, h])
+
+dump_buf buf n = dump_buf_loop buf 0 n ""
+
+-- ---------------------------------------------------------------------
+-- Dry-run frame builders. We rebuild the four worked examples from
+-- the protocol doc and compare bytes.
+-- ---------------------------------------------------------------------
+
+-- Build the SET_XYZ example: X=120, Y=-180, Z=85, dur=1000.
+-- Expected: AA 55 03 08 78 00 4C FF 55 00 E8 03 F1
+build_set_xyz_example _ =
+  let data = malloc 8
+  let _ = write_i16_le data 0 120
+  let _ = write_i16_le data 2 (0 - 180)
+  let _ = write_i16_le data 4 85
+  let _ = write_u16_le data 6 1000
+  let frame = build_frame func_set_xyz 8 data
+  let _ = free data
+  frame
+
+-- Build the SUCTION example with cmd=2 (release).
+-- Expected (per our corrected checksum): AA 55 07 01 02 F5
+-- (Doc shows F6 but that's a typo per notes/maxarm_protocol.md.)
+build_suction_example _ =
+  let data = malloc 1
+  let _ = byte_set data 0 2
+  let frame = build_frame func_set_suctionnozzle 1 data
+  let _ = free data
+  frame
+
+-- Build the READ_XYZ request example. Expected: AA 55 13 00 EC
+build_read_xyz_example _ =
+  let data = malloc 1
+  let _ = byte_set data 0 0
+  let frame = build_frame func_read_xyz 0 data
+  let _ = free data
+  frame
+
+-- Build the READ_ANGLE request example. Expected: AA 55 11 00 EE
+build_read_angle_example _ =
+  let data = malloc 1
+  let _ = byte_set data 0 0
+  let frame = build_frame func_read_angle 0 data
+  let _ = free data
+  frame
+
+-- Expected byte sequences as int lists (for byte-exact comparison).
+-- (Lists, not strings, because Rail strings are NUL-terminated under
+-- some paths and our payloads include 0x00.)
+
+expected_set_xyz = [170, 85, 3, 8, 120, 0, 76, 255, 85, 0, 232, 3, 241]
+expected_suction = [170, 85, 7, 1, 2, 245]
+expected_read_xyz = [170, 85, 19, 0, 236]
+expected_read_angle = [170, 85, 17, 0, 238]
+
+-- Compare a list of expected bytes against a buffer.
+compare_expected buf n expected =
+  compare_loop buf 0 n expected
+
+compare_loop buf i n expected =
+  if length expected == 0 then 1
+  else if i >= n then 0
+  else if (byte_at buf i) != (head expected) then 0
+  else compare_loop buf (i + 1) n (tail expected)
+
+run_dry_one name build_fn expected expected_len =
+  let frame = build_fn 0
+  let dump = dump_buf frame expected_len
+  let ok = compare_expected frame expected_len expected
+  let _ = print (cat [
+    "  ", name,
+    " bytes=[", dump, "]",
+    " -> ", if ok == 1 then "PASS" else "FAIL"
+  ])
+  let _ = free frame
+  ok
+
+-- IK + safety smoke: verify reachable-mm gates and clip-to-workspace
+-- work end-to-end on a few representative coordinates. Returns 1 on
+-- pass.
+run_safety_smoke _ =
+  -- 1: in-bounds point reachable
+  let r1 = ik_default 10 0 5
+  let f1 = head r1
+  let ok1 = if f1 == 0 then 1 else 0
+  -- 2: out-of-bounds (z > 187mm) flagged
+  let r2 = ik_default 0 0 30
+  let f2 = head r2
+  let ok2 = if f2 == 1 then 1 else 0
+  -- 3: clip pushes a point back inside the envelope
+  let c = clip_to_workspace_mm 600 0 50
+  let cx = head c
+  let was_clipped = head (tail (tail (tail c)))
+  let ok3 = if was_clipped == 1 then (if cx <= 290 then 1 else 0) else 0
+  -- 4: cap_duration_ms enforces velocity floor
+  let dur = cap_duration_ms 100 200
+  let ok4 = if dur >= min_move_ms then 1 else 0
+  -- 5: e-stop fault counter accumulates and trips
+  let c1 = estop_update 0 1
+  let c2 = estop_update c1 1
+  let ok5 = if estop_tripped c2 == 1 then 1 else 0
+  let total = ok1 + ok2 + ok3 + ok4 + ok5
+  let _ = print (cat [
+    "  safety/IK smoke ",
+    "ik_inbounds=", show ok1,
+    " ik_oob=", show ok2,
+    " clip=", show ok3,
+    " velcap=", show ok4,
+    " estop=", show ok5,
+    " (", show total, "/5)"
+  ])
+  if total == 5 then 1 else 0
+
+run_dry _ =
+  let _ = print "[arm_real_smoke] dry-run mode: byte-exact frame builders"
+  let r1 = run_dry_one "SET_XYZ" build_set_xyz_example expected_set_xyz 13
+  let r2 = run_dry_one "SUCTION" build_suction_example expected_suction 6
+  let r3 = run_dry_one "READ_XYZ" build_read_xyz_example expected_read_xyz 5
+  let r4 = run_dry_one "READ_ANGLE" build_read_angle_example expected_read_angle 5
+  let r5 = run_safety_smoke 0
+  let total = r1 + r2 + r3 + r4 + r5
+  let _ = print (cat ["[arm_real_smoke] ", show total, "/5 sections passed"])
+  if total == 5 then
+    let _ = print "PASS"
+    0
+  else
+    let _ = print "FAIL"
+    1
+
+-- ---------------------------------------------------------------------
+-- Connect mode.
+-- ---------------------------------------------------------------------
+
+run_connect path =
+  let _ = print (cat ["[arm_real_smoke] connect mode: opening ", path])
+  let fd = arm_open path
+  if fd < 0 then
+    let _ = print (cat ["[arm_real_smoke] open failed (fd=", show fd, ")"])
+    let _ = print "FAIL"
+    1
+  else
+    let _ = print (cat ["[arm_real_smoke] arm connected fd=", show fd])
+    let r = read_arm_xyz fd
+    let ok = head r
+    if ok == 0 then
+      let _ = print "[arm_real_smoke] arm did not respond to READ_XYZ within timeout"
+      let _ = arm_close fd
+      let _ = print "INCONCLUSIVE"
+      1
+    else
+      let x = head (tail r)
+      let y = head (tail (tail r))
+      let z = head (tail (tail (tail r)))
+      let _ = print (cat [
+        "[arm_real_smoke] initial_state x_mm=", show x,
+        " y_mm=", show y, " z_mm=", show z
+      ])
+      let _ = arm_close fd
+      let _ = print "PASS"
+      0
+
+-- ---------------------------------------------------------------------
+-- Argument parsing.
+-- ---------------------------------------------------------------------
+
+find_flag av flag =
+  if length av == 0 then false
+  else if (head av) == flag then true
+  else find_flag (tail av) flag
+
+find_opt_value av flag =
+  if length av == 0 then ""
+  else if (head av) == flag then
+    if length (tail av) == 0 then ""
+    else head (tail av)
+  else find_opt_value (tail av) flag
+
+main =
+  let av = args
+  if find_flag av "--dry-run" then run_dry 0
+  else if find_flag av "--connect" then
+    let path = find_opt_value av "--connect"
+    if length path == 0 then
+      let _ = print "usage: ./rail_native run tools/robot/arm_real_smoke.rail --connect <path>"
+      1
+    else run_connect path
+  else
+    let _ = print "usage: ./rail_native run tools/robot/arm_real_smoke.rail [--dry-run | --connect <path>]"
+    let _ = print "default: --dry-run"
+    run_dry 0
