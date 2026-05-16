@@ -1,0 +1,156 @@
+-- tools/spurarm/train/bench_eval.rail
+--
+-- Single-shot bench-v0 grader for a Spur-arm checkpoint.
+--
+-- Per the diagnostics-first discipline (feedback_diagnostics_first):
+-- this file is shipped BEFORE any training run completes, so it can
+-- be empirically smoke-tested against a random-weight checkpoint and
+-- confirmed to produce ~0/20 (the expected floor for an untrained
+-- model). After training, the same script grades each ckpt.
+--
+-- Usage:
+--   ./rail_native run tools/spurarm/train/bench_eval.rail \
+--       --prefix training/checkpoints/spurarm-base-v0_seed42_sft_step3000 \
+--       [--max-gen 100] [--out /tmp/bench_eval_42_3000.txt]
+--
+-- Behavior:
+--   1. For each of 20 bench prompts in tools/robot/bench_v0.txt:
+--      - Tokenize <bos> prompt <sep>
+--      - Run greedy argmax (k=1) decode up to --max-gen tokens or <eos>
+--      - Detokenize the generated section
+--      - Pass through tools/robot/grader.rail
+--      - Record stage / goal_reach
+--   2. Print a chain-counters sentinel block.
+--   3. Exit 0.
+--
+-- Key design choice: argmax (k=1) decoding throughout, per
+-- inference_seed_segfault memory. The brief documents this in the
+-- "Bench evaluation" section.
+--
+-- Generation strategy: we shell out to tools/spurarm/train/generate.rail
+-- (the actual transformer-driven generator) once per prompt. That
+-- separation keeps bench_eval.rail compileable and runnable even when
+-- the generator is partially built. If the generator doesn't exist
+-- yet, we record "no_generator" as the candidate -- which the grader
+-- will fail with stage=0, giving honest 0/20.
+
+import "stdlib/list.rail"
+import "stdlib/args.rail"
+
+bench_file _ = "tools/robot/bench_v0.txt"
+default_max_gen _ = 100
+generator_path _ = "tools/spurarm/train/generate.rail"
+
+-- ----------------------------------------------------------------------
+-- Bench loader.
+-- ----------------------------------------------------------------------
+
+is_comment_or_blank ln =
+  if length ln == 0 then true
+  else if (head (chars ln)) == "#" then true
+  else false
+
+parse_bench_lines lines acc =
+  if length lines == 0 then reverse acc
+  else
+    let ln = head lines
+    if is_comment_or_blank ln then parse_bench_lines (tail lines) acc
+    else
+      let parts = str_split "|" ln
+      if length parts < 10 then parse_bench_lines (tail lines) acc
+      else parse_bench_lines (tail lines) (cons parts acc)
+
+load_bench _ =
+  let body = read_file (bench_file 0)
+  let lines = split (char_from_int 10) body
+  parse_bench_lines lines []
+
+-- ----------------------------------------------------------------------
+-- Per-row grading: feeds the prompt to generate.rail and the result to
+-- grader.rail. Generator failure is non-fatal -- we record "no_generator"
+-- as the candidate file content and let the grader return stage=0.
+-- ----------------------------------------------------------------------
+
+grade_one bench_id prompt prefix max_gen =
+  let cand_path = cat ["/tmp/spurarm_cand_", bench_id, ".rail"]
+  -- Compile generator once (cached) then invoke binary directly so the
+  -- compile banner doesn't leak into the candidate file.
+  let bin_path = cat ["/tmp/spurarm_gen_bin"]
+  let _ = shell (cat ["test -x ", bin_path, " && grep -q 'gen-rail-cache' ", bin_path, ".tag 2>/dev/null || (./rail_native ", (generator_path 0), " >/dev/null 2>&1 && cp /tmp/rail_out ", bin_path, " && touch ", bin_path, ".tag && echo gen-rail-cache > ", bin_path, ".tag)"])
+  let gen_cmd = cat [
+    bin_path,
+    " --prefix ", prefix,
+    " --max ", show max_gen,
+    " --prompt ", "\"", prompt, "\"",
+    " > ", cand_path, " 2>/tmp/spurarm_gen_err.txt"
+  ]
+  let _ = shell gen_cmd
+  -- If generator failed or produced nothing, leave a dummy candidate so
+  -- the grader has something to read.
+  let _ = shell (cat ["test -s ", cand_path, " || echo 'script = []' > ", cand_path])
+
+  -- Now invoke the grader.
+  let grader_cmd = cat [
+    "./rail_native run tools/robot/grader.rail ",
+    bench_id, " ", cand_path
+  ]
+  let raw = shell grader_cmd
+  -- Look for "stage=X goal_reach=Y" in the GRADE line.
+  let i = str_find "GRADE" raw
+  if i < 0 then 0
+  else
+    let after = str_sub raw i (length raw - i)
+    -- Find "goal_reach=" value
+    let gj = str_find "goal_reach=" after
+    if gj < 0 then 0
+    else
+      let after_gj = str_sub after (gj + length "goal_reach=") (length after - gj - length "goal_reach=")
+      let after_chars = chars after_gj
+      if length after_chars == 0 then 0
+      else
+        let first = head after_chars
+        if first == "1" then 1
+        else 0
+
+-- ----------------------------------------------------------------------
+-- Driver
+-- ----------------------------------------------------------------------
+
+grade_all_loop rows prefix max_gen passes total =
+  if length rows == 0 then (passes, total)
+  else
+    let row = head rows
+    let bench_id = head row
+    let prompt = head (tail row)
+    let _ = print (cat ["grading ", bench_id, " ..."])
+    let gr = grade_one bench_id prompt prefix max_gen
+    let _ = print (cat ["  ", bench_id, " goal_reach=", show gr])
+    grade_all_loop (tail rows) prefix max_gen (passes + gr) (total + 1)
+
+main =
+  let argv = args
+  let parsed = parse_args argv
+  let (_flags, opts, _pos) = parsed
+
+  let prefix = get_opt opts "prefix" "training/checkpoints/spurarm-base-v0_best"
+  let max_gen_str = get_opt opts "max-gen" ""
+  let max_gen = if length max_gen_str == 0 then (default_max_gen 0) else parse_int max_gen_str
+
+  let _ = print (cat ["bench_eval prefix=", prefix, " max_gen=", show max_gen])
+
+  let rows = load_bench 0
+  let total_rows = length rows
+  let _ = print (cat ["loaded ", show total_rows, " bench rows"])
+
+  let result = grade_all_loop rows prefix max_gen 0 0
+  let (passes, total) = result
+
+  let _ = print "==========================================="
+  let _ = print (cat ["bench_v0 result: ", show passes, "/", show total])
+  let _ = print "==========================================="
+
+  -- Sentinel block for watcher consumption.
+  let _ = print "===BENCH_EVAL_RESULT==="
+  let _ = print (cat ["{\"passes\": ", show passes, ", \"total\": ", show total, ", \"prefix\": \"", prefix, "\"}"])
+  let _ = print "===END==="
+  0
