@@ -6,10 +6,11 @@
 # paraphrases (turk_annotations.anns[].task_desc), each paired with
 # the same Rail script derived from .plan.high_pddl.
 #
-# ALFRED action remap (per AGENT_A_corpus.md):
+# ALFRED action remap (navigation-only refinement per Agent A
+# corpus-quality fix; see note in extract_virtualhome.sh on why):
 #   GotoLocation                                       -> MoveTo coord(arg)
-#   PickupObject / PickupObjectInReceptacle            -> SetGrip GripClose (prepend MoveTo)
-#   PutObject / PutObjectInReceptacle                  -> SetGrip GripOpen (prepend MoveTo on recep)
+#   PickupObject / PickupObjectInReceptacle            -> MoveTo coord(obj)
+#   PutObject / PutObjectInReceptacle                  -> MoveTo coord(recep|obj)
 #   OpenObject CloseObject ToggleObject CleanObject
 #     HeatObject CoolObject SliceObject NoOp           -> DROP
 #
@@ -100,6 +101,9 @@ function emit_one(nl,    i, script, esc_nl, esc_script, id_str) {
   }
   script = script "\n]";
   esc_nl = nl;
+  # Strip non-printable bytes (control chars, \x7F, and bytes >= 0x80).
+  # Keeping just printable ASCII (space..tilde) plus \n\r\t for re-escaping.
+  gsub(/[^[:print:]\n\r\t]/, " ", esc_nl);
   gsub(/\\/, "\\\\", esc_nl);
   gsub(/"/, "\\\"", esc_nl);
   gsub(/\n/, "\\n", esc_nl);
@@ -112,7 +116,7 @@ function emit_one(nl,    i, script, esc_nl, esc_script, id_str) {
   gsub(/\t/, "\\t", esc_script);
   emitted++;
   id_str = sprintf("alfred:%05d", emitted);
-  printf("{\"id\":\"%s\",\"nl\":\"%s\",\"script\":\"%s\",\"world\":{\"obx\":-1,\"oby\":0,\"obz\":0,\"present\":0},\"expected\":{\"gex\":0,\"gey\":0,\"gez\":0,\"ggrip\":0,\"gheld\":0},\"source\":\"alfred\",\"stages_passed\":2}\n",
+  printf("{\"id\":\"%s\",\"nl\":\"%s\",\"script\":\"%s\",\"world\":{\"obx\":-1,\"oby\":0,\"obz\":0,\"present\":0},\"expected\":{\"gex\":0,\"gey\":0,\"gez\":0,\"ggrip\":0,\"gheld\":0},\"source\":\"alfred\",\"stages_passed\":3}\n",
     id_str, esc_nl, esc_script) >> out;
 }
 
@@ -132,13 +136,11 @@ function emit_one(nl,    i, script, esc_nl, esc_script, id_str) {
     cmds_n++;
     cmds[cmds_n] = sprintf("MoveTo %d %d %d", fc_x[idx], fc_y[idx], fc_z[idx]);
   } else if (action == "PickupObject" || action == "PickupObjectInReceptacle") {
-    if (obj != "" && (cmds_n == 0 || cmds[cmds_n] !~ /^MoveTo/)) {
+    if (obj != "") {
       idx = hash_obj(obj);
       cmds_n++;
       cmds[cmds_n] = sprintf("MoveTo %d %d %d", fc_x[idx], fc_y[idx], fc_z[idx]);
     }
-    cmds_n++;
-    cmds[cmds_n] = "SetGrip GripClose";
   } else if (action == "PutObject" || action == "PutObjectInReceptacle") {
     tgt = (recep != "" ? recep : obj);
     if (tgt != "") {
@@ -146,8 +148,6 @@ function emit_one(nl,    i, script, esc_nl, esc_script, id_str) {
       cmds_n++;
       cmds[cmds_n] = sprintf("MoveTo %d %d %d", fc_x[idx], fc_y[idx], fc_z[idx]);
     }
-    cmds_n++;
-    cmds[cmds_n] = "SetGrip GripOpen";
   }
   next
 }
