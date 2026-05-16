@@ -1,0 +1,116 @@
+-- measure_jit_trampoline.rail — pure-Rail timing of JIT v1 trampoline.
+--
+-- Purpose:
+--   Measure the per-call wall-clock overhead of the JIT v1 trampoline
+--   (`call_jit` in jit/loader.rail) — i.e. the pthread_create + pthread_join
+--   round trip that v1 uses for indirect dispatch. This is the BASELINE
+--   number the v2 direct-call path (`call_addr` via libjit_call.dylib) must
+--   beat by ≥40 µs on the JIT-fast distill corpus.
+--
+-- Methodology:
+--   - Build a trivial IR function (op_const + op_ret) that returns 42.
+--   - emit_function → make_executable: page is RX, code is hot in i-cache.
+--   - K=200 outer batches × INNER=50 inner calls each = 10000 total calls.
+--   - For each batch, sample wall clock (date +%s%N via shell) before & after
+--     the batch, compute per-call µs = (t1 - t0) / 1000 / INNER.
+--   - Print the 200 batch means as a comma-separated list to stdout.
+--   - The shell wrapper sorts them, picks index 99 (p50) and 179 (p90), and
+--     emits the sentinel block. (Computing percentiles via shell `sort -n`
+--     keeps this Rail file simple and avoids float-show quirks.)
+--
+-- Why 50-call batches rather than per-call timing?
+--   Shelling out to `date +%s%N` is ~1-5 ms — orders of magnitude greater
+--   than a single pthread_create round-trip (~50-200 µs). Batching amortizes
+--   shell-out cost while still yielding 200 independent samples — enough for
+--   honest p50/p90 estimates.
+--
+-- Sanity range: pthread_create+join on macOS Apple Silicon is typically
+--   30-200 µs. Values outside ~10-1000 µs indicate measurement bug.
+--
+-- Idempotent: re-running yields fresh samples; no filesystem mutation
+--   beyond /tmp scratch files.
+
+import "jit/heap.rail"
+import "jit/emit.rail"
+import "jit/loader.rail"
+
+-- === wall-clock nanoseconds via shell =========================
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = char_to_int (head cs) - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+
+now_ns _ =
+  let s = shell "date +%s%N | tr -d '\\n'"
+  parse_int_acc (chars s) 0
+
+-- === build trivial IR: op_const dst=1, val=42 ; op_ret 1 ======
+build_const42 _ =
+  let ir = arr_new 8 0
+  let _ = ir_emit ir 0 op_const 1 42 0
+  let _ = ir_emit ir 1 op_ret 1 0 0
+  let blocks = arr_new 1 0
+  let _ = arr_set blocks 0 0
+  make_fn ir 2 2 blocks
+
+-- === inner call loop (this is what we time) ===================
+-- Calls call_jit `inner` times against the already-mapped page.
+-- The `arg` value is irrelevant (the JIT body ignores it).
+call_loop page arg inner =
+  if inner <= 0 then 0
+  else
+    let _ = call_jit page arg
+    call_loop page arg (inner - 1)
+
+-- === one batch: time `inner` calls, return per-call ns avg ====
+batch_per_call_ns page inner =
+  let t0 = now_ns 0
+  let _ = call_loop page 0 inner
+  let t1 = now_ns 0
+  (t1 - t0) / inner
+
+-- === outer: run `k` batches, print comma-separated ns/call ====
+run_batches page k inner first =
+  if k <= 0 then 0
+  else
+    let ns = batch_per_call_ns page inner
+    let sep = if first == 1 then "" else ","
+    let _ = print_no_newline (cat [sep, show ns])
+    run_batches page (k - 1) inner 0
+
+-- Rail's `print` adds \n; we want a single line of CSV samples.
+-- Workaround: write to /tmp/rail_trampoline_samples in append mode.
+print_no_newline s =
+  let _ = shell (cat ["printf '%s' '", s, "' >> /tmp/rail_trampoline_samples"])
+  0
+
+main =
+  -- Reset sample file.
+  let _ = shell "rm -f /tmp/rail_trampoline_samples"
+  let _ = shell "touch /tmp/rail_trampoline_samples"
+
+  -- Build & JIT once. Page stays mapped for the entire run.
+  let fn = build_const42 0
+  let heap = heap_alloc 0
+  let res = emit_function fn heap
+  let buf = emitted_buf res
+  let nbytes = emitted_size res
+  let page = make_executable buf nbytes
+
+  -- Warm-up: 50 calls to settle TLB/i-cache & let pthread machinery warm.
+  let _ = call_loop page 0 50
+
+  -- 200 batches × 50 calls = 10000 timed calls.
+  let _ = run_batches page 200 50 1
+
+  -- Cleanup.
+  let _ = free_jit page
+  let _ = heap_free heap
+
+  -- Newline at end for the shell wrapper.
+  let _ = shell "echo '' >> /tmp/rail_trampoline_samples"
+  let _ = print "DONE"
+  0

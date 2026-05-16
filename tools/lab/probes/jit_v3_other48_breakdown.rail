@@ -1,0 +1,341 @@
+-- tools/lab/probes/jit_v3_other48_breakdown.rail
+--
+-- PURE MEASUREMENT. NO lowering changes. NO modifications to jit/lower.rail.
+-- Refines the classifier of the parent probe (jit_v3_headroom.rail) so the
+-- chain has a meaningful breakdown of the `other:48` fallback bucket.
+--
+-- Strategy: identical sampling + lowering pipeline as jit_v3_headroom.rail
+-- (N=300 FIXED-block sources from training/triples_v2.txt). The ONLY change
+-- is the classifier:
+--   * Lower-pipeline errors that start with "lower: " keep the parent
+--     probe's specific buckets (unbound_var, unimplemented, unknown_function,
+--     unknown_ast, unknown_binop, vreg_overflow, etc.)
+--   * Lower-pipeline errors that don't start with "lower: " (these are the
+--     uncaught lower-side bugs like "<fname> is not callable", builtin
+--     arity-check messages, and the *-overflow strings) get pattern-routed
+--     to richer buckets: `arity:<name>`, `not_callable:<name>`, etc.
+--   * Parser errors (passed through from parse_program with no "lower: "
+--     prefix) get routed to `parse:<form>` where <form> identifies the
+--     syntactic construct that failed: `parse:primary_token`, `parse:match_pattern`,
+--     `parse:match_branch`, `parse:fn_def`, `parse:let`, `parse:lambda`,
+--     `parse:if`, `parse:list_lit`, `parse:paren`.
+--
+-- Counters emitted (per run.spec.md §4 wire format):
+--   total_fallback_count       same as parent fallback_count (sanity: == 48)
+--   top_5_fallback_categories  "cat1:N,cat2:N,cat3:N,cat4:N,cat5:N"
+--   unique_fallback_categories number of distinct buckets used
+--   largest_single_bucket_count N of the top bucket
+--   lower_hit_rate_pct         sanity-check vs parent 84
+--   mean_grade_us              microseconds per lower_source call
+--
+-- Verdict mapping (per the brief):
+--   largest_single_bucket_count >= 15                         -> PASS
+--   unique_fallback_categories >= 10 AND
+--     largest_single_bucket_count <= 5                        -> FALSIFIED
+--   otherwise                                                 -> INCONCLUSIVE
+--
+-- Run:
+--   RAIL_ARENA_MB=4096 ./rail_native run tools/lab/probes/jit_v3_other48_breakdown.rail
+
+import "jit/ir.rail"
+import "jit/lower.rail"
+import "stdlib/time_us.rail"
+
+corpus_path = "training/triples_v2.txt"
+sample_n    = 300
+
+-- =====================================================================
+-- Triple parsing (mirrors parent probe + analyze_lower_hits.rail).
+-- =====================================================================
+
+extract_fixed chunk =
+  let f_off = str_find "<FIXED>\n" chunk
+  if f_off < 0 then ""
+  else
+    let start = f_off + 8
+    let total = length (chars chunk)
+    str_sub chunk start (total - start)
+
+-- =====================================================================
+-- String helpers.
+-- =====================================================================
+
+starts_with s prefix =
+  let n = length (chars prefix)
+  let m = length (chars s)
+  if m < n then 0
+  else if (str_sub s 0 n) == prefix then 1
+  else 0
+
+substr_contains s needle =
+  if str_find needle s < 0 then 0 else 1
+
+first_token_at s start =
+  let n = length (chars s)
+  first_token_loop s start n start
+
+first_token_loop s i n start =
+  if i >= n then str_sub s start (n - start)
+  else
+    let c = str_sub s i 1
+    if c == " " || c == "\n" || c == "\t" || c == ":" || c == "," || c == "(" then str_sub s start (i - start)
+    else first_token_loop s (i + 1) n start
+
+-- =====================================================================
+-- Refined classifier.
+--
+-- Order of routing:
+--   1. If msg starts with "lower: " → strip prefix and route through the
+--      parent probe's named buckets, but with TWO extra routes:
+--        - "<fname> is not callable" → `not_callable:<fname>`
+--        - falls through "lower: " catch-all → `lower_misc`
+--   2. Else if msg starts with a parser/runtime token → route to a
+--      `parse:<form>` or `arity:<name>` bucket:
+--        - "primary: unexpected token tag=..."        → parse:primary_token
+--        - "match: unsupported pattern X"             → parse:match_pat:X
+--        - "match: expected '|' after scrutinee"      → parse:match_pipe
+--        - "match: expected '->' after pattern"       → parse:match_arrow
+--        - "match: missing nil branch ..."            → parse:match_missing_nil
+--        - "match: missing cons branch ..."           → parse:match_missing_cons
+--        - "match branch: expected pattern ident"     → parse:match_branch
+--        - "cons pattern: expected ..."               → parse:cons_pattern
+--        - "fn_def: expected ..."                     → parse:fn_def
+--        - "expected '|' after scrutinee"             → parse:match_pipe
+--        - "expected 'then'" / "'else'" / "in" ...    → parse:if|let
+--        - "expected ',' or ']' in list literal"      → parse:list_lit
+--        - "expected ')'"                             → parse:paren
+--        - "expected ident after 'let'" / "= after"   → parse:let
+--        - "expected 'in' or newline after let-value" → parse:let
+--        - "lambda: expected ..."                     → parse:lambda
+--        - "fold: N args ..." / "join: N args ..." /
+--          "X: N arg required" / "X: N args required" → arity:<name>
+--        - "empty program"                            → parse:empty
+--        - "unexpected 'then|else|in'"                → parse:keyword_misuse
+--   3. Anything else                                  → other:<first-token>
+-- =====================================================================
+
+classify_msg msg =
+  if starts_with msg "lower: " then
+    let body = str_sub msg 7 (length (chars msg) - 7)
+    classify_lower_body body
+  else classify_non_lower msg
+
+classify_lower_body body =
+  if starts_with body "unbound variable " then
+    cat ["unbound_var:", first_token_at body 17]
+  else if starts_with body "unimplemented builtin " then
+    cat ["unimplemented:", first_token_at body 22]
+  else if starts_with body "unknown function " then
+    cat ["unknown_function:", first_token_at body 17]
+  else if starts_with body "unknown ast tag " then
+    cat ["unknown_ast:", first_token_at body 16]
+  else if starts_with body "unknown binary op " then
+    cat ["unknown_binop:", first_token_at body 18]
+  else if starts_with body "unknown float arith op " then
+    cat ["unknown_float_op:", first_token_at body 23]
+  else if starts_with body "unsupported float compare " then
+    cat ["unsupported_float_cmp:", first_token_at body 26]
+  else if starts_with body "HOF" then "hof_nonvar_head"
+  else if starts_with body "cannot use " then "type_mismatch"
+  else if starts_with body "op_apply" then "op_apply_arity"
+  else if starts_with body "lambda call" then "lambda_arity"
+  else if starts_with body ">4 arg call" then "call_arity_gt4"
+  else if substr_contains body "is not callable" then
+    cat ["not_callable:", first_token_at body 0]
+  else if substr_contains body "vreg overflow" then "vreg_overflow"
+  else if substr_contains body "instruction overflow" then "instr_overflow"
+  else if substr_contains body "block overflow" then "block_overflow"
+  else if substr_contains body "callee-save" then "callee_save_overflow"
+  else cat ["lower_misc:", first_token_at body 0]
+
+classify_non_lower msg =
+  -- Parser / no-prefix-runtime errors. Order by specificity.
+  if starts_with msg "primary: unexpected token" then "parse:primary_token"
+  else if starts_with msg "match: unsupported pattern " then
+    cat ["parse:match_pat:", first_token_at msg 27]
+  else if starts_with msg "match: expected '|'" then "parse:match_pipe"
+  else if starts_with msg "match: expected '->'" then "parse:match_arrow"
+  else if starts_with msg "match: missing nil" then "parse:match_missing_nil"
+  else if starts_with msg "match: missing cons" then "parse:match_missing_cons"
+  else if starts_with msg "match branch:" then "parse:match_branch"
+  else if starts_with msg "cons pattern:" then "parse:cons_pattern"
+  else if starts_with msg "fn_def:" then "parse:fn_def"
+  else if starts_with msg "lambda:" then "parse:lambda"
+  else if starts_with msg "expected 'then'" then "parse:if_then"
+  else if starts_with msg "expected 'else'" then "parse:if_else"
+  else if starts_with msg "expected 'in'" then "parse:let_in"
+  else if starts_with msg "expected ident after 'let'" then "parse:let_ident"
+  else if starts_with msg "expected '=' after let-name" then "parse:let_eq"
+  else if starts_with msg "expected ',' or ']'" then "parse:list_lit"
+  else if starts_with msg "expected ')'" then "parse:paren_close"
+  else if starts_with msg "unexpected 'then'" then "parse:kw_misuse:then"
+  else if starts_with msg "unexpected 'else'" then "parse:kw_misuse:else"
+  else if starts_with msg "unexpected 'in'" then "parse:kw_misuse:in"
+  else if msg == "empty program" then "parse:empty"
+  -- Runtime builtin arity messages (no "lower: " prefix):
+  --   "fold: 3 args required (fn, init, list); got N"
+  --   "join: 2 args required (sep, list); got N"
+  --   "int_to_float: 1 arg required"  etc
+  else if substr_contains msg ": 1 arg required" then
+    cat ["arity:", first_token_at msg 0]
+  else if substr_contains msg ": 2 args required" then
+    cat ["arity:", first_token_at msg 0]
+  else if substr_contains msg ": 3 args required" then
+    cat ["arity:", first_token_at msg 0]
+  else cat ["other:", first_token_at msg 0]
+
+-- =====================================================================
+-- Bucket store (parallel arrays, linear scan; capacity 128).
+-- =====================================================================
+
+mk_buckets _ =
+  let names  = arr_new 128 ""
+  let counts = arr_new 128 0
+  let meta   = arr_new 1 0
+  let _ = arr_set meta 0 0
+  cons names (cons counts (cons meta []))
+
+bk_names  b = head b
+bk_counts b = head (tail b)
+bk_meta   b = head (tail (tail b))
+
+bucket_find_idx b cls i n =
+  if i >= n then 0 - 1
+  else if (arr_get (bk_names b) i) == cls then i
+  else bucket_find_idx b cls (i + 1) n
+
+bucket_add b cls =
+  let n = arr_get (bk_meta b) 0
+  let idx = bucket_find_idx b cls 0 n
+  if idx >= 0 then
+    let prev = arr_get (bk_counts b) idx
+    let _ = arr_set (bk_counts b) idx (prev + 1)
+    0
+  else if n >= 128 then 0
+  else
+    let _ = arr_set (bk_names b) n cls
+    let _ = arr_set (bk_counts b) n 1
+    let _ = arr_set (bk_meta b) 0 (n + 1)
+    0
+
+-- =====================================================================
+-- Top-5 selection scan (O(5*128)).
+-- =====================================================================
+
+bk_find_max_excluding b excl_mask =
+  let n = arr_get (bk_meta b) 0
+  bk_find_max_loop b excl_mask 0 n (0 - 1) (0 - 1)
+
+bk_find_max_loop b excl_mask i n best_idx best_count =
+  if i >= n then best_idx
+  else
+    let skip = arr_get excl_mask i
+    if skip == 1 then bk_find_max_loop b excl_mask (i + 1) n best_idx best_count
+    else
+      let c = arr_get (bk_counts b) i
+      if c > best_count then bk_find_max_loop b excl_mask (i + 1) n i c
+      else bk_find_max_loop b excl_mask (i + 1) n best_idx best_count
+
+append_pair acc name count =
+  if (length (chars acc)) == 0 then
+    cat [name, ":", show count]
+  else
+    cat [acc, ",", name, ":", show count]
+
+topN_string b max_n =
+  let excl = arr_new 128 0
+  topN_loop b excl 0 max_n ""
+
+topN_loop b excl i max_n acc =
+  if i >= max_n then acc
+  else
+    let idx = bk_find_max_excluding b excl
+    if idx < 0 then acc
+    else
+      let _ = arr_set excl idx 1
+      let name = arr_get (bk_names b) idx
+      let count = arr_get (bk_counts b) idx
+      topN_loop b excl (i + 1) max_n (append_pair acc name count)
+
+-- Read the count of the largest bucket (no exclusions).
+largest_bucket_count b =
+  let excl = arr_new 128 0
+  let idx = bk_find_max_excluding b excl
+  if idx < 0 then 0
+  else arr_get (bk_counts b) idx
+
+-- =====================================================================
+-- Main probe loop. Returns [hits, fb, total_us, n_seen].
+-- =====================================================================
+
+probe_loop chunks remaining hits fb total_us seen b =
+  if remaining <= 0 then [hits, fb, total_us, seen]
+  else if length chunks == 0 then [hits, fb, total_us, seen]
+  else
+    let chunk = head chunks
+    let src = extract_fixed chunk
+    if length (chars src) == 0 then
+      probe_loop (tail chunks) remaining hits fb total_us seen b
+    else
+      let tv = malloc 16
+      let t0 = time_us_now_into tv
+      let r = lower_source src
+      let t1 = time_us_now_into tv
+      let dt = t1 - t0
+      let tag = head r
+      if tag == "ok" then
+        probe_loop (tail chunks) (remaining - 1) (hits + 1) fb (total_us + dt) (seen + 1) b
+      else
+        let msg = head (tail r)
+        let cls = classify_msg msg
+        let _ = bucket_add b cls
+        probe_loop (tail chunks) (remaining - 1) hits (fb + 1) (total_us + dt) (seen + 1) b
+
+-- =====================================================================
+-- Verdict.
+-- =====================================================================
+
+verdict_for largest unique =
+  if largest >= 15 then "PASS"
+  else if unique >= 10 && largest <= 5 then "FALSIFIED"
+  else "INCONCLUSIVE"
+
+-- =====================================================================
+-- Entry.
+-- =====================================================================
+
+main =
+  let corpus = read_file corpus_path
+  let chunks = str_split "<END>\n\n" corpus
+  let b = mk_buckets 0
+  let r = probe_loop chunks sample_n 0 0 0 0 b
+  let hits      = head r
+  let fb        = head (tail r)
+  let total_us  = head (tail (tail r))
+  let n_seen    = head (tail (tail (tail r)))
+  let pct       = if n_seen <= 0 then 0 else (hits * 100) / n_seen
+  let mean_us   = if n_seen <= 0 then 0 else total_us / n_seen
+  let top5      = topN_string b 5
+  let n_unique  = arr_get (bk_meta b) 0
+  let largest   = largest_bucket_count b
+  let verdict   = verdict_for largest n_unique
+
+  let _ = print (cat ["[probe] sampled ", show n_seen, " FIXED blocks from ", corpus_path])
+  let _ = print (cat ["[probe] lower_hits=", show hits, " fallbacks=", show fb,
+                      " lower_hit_rate=", show pct, "%"])
+  let _ = print (cat ["[probe] mean_grade_us=", show mean_us])
+  let _ = print (cat ["[probe] unique_buckets=", show n_unique,
+                      " largest_bucket_count=", show largest])
+  let _ = print (cat ["[probe] top_5_fallback_categories=", top5])
+  let _ = print (cat ["[probe] verdict=", verdict])
+
+  let _ = print "===RAIL_LAB_COUNTERS==="
+  let _ = print (cat ["{\"counter\": \"total_fallback_count\", \"value\": ", show fb, "}"])
+  let _ = print (cat ["{\"counter\": \"unique_fallback_categories\", \"value\": ", show n_unique, "}"])
+  let _ = print (cat ["{\"counter\": \"largest_single_bucket_count\", \"value\": ", show largest, "}"])
+  let _ = print (cat ["{\"counter\": \"top_5_fallback_categories\", \"value\": \"", top5, "\"}"])
+  let _ = print (cat ["{\"counter\": \"lower_hit_rate_pct\", \"value\": ", show pct, "}"])
+  let _ = print (cat ["{\"counter\": \"mean_grade_us\", \"value\": ", show mean_us, "}"])
+  let _ = print "===END==="
+  let _ = print (cat ["===VERDICT=== ", verdict])
+  0

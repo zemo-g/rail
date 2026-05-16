@@ -1,0 +1,953 @@
+-- tools/lab/entry.rail — Attestable Experiment Entry primitive (piece 1 of 3).
+--
+-- Full implementation. See tools/lab/specs/entry.spec.md for the contract.
+--
+-- Reuses:
+--   stdlib/sha256.rail   — content addressing (sha256_hex, string_to_bytes,
+--                          bytes_to_hex, hex_to_bytes, sha_copy_bytes,
+--                          and the bytes.rail helpers it transitively brings in).
+--   stdlib/sha512.rail   — required by ed25519 (transitively).
+--   stdlib/x25519.rail   — required by ed25519.
+--   stdlib/ed25519.rail  — ed25519_verify (RFC 8032). Verify-only — no signing.
+--
+-- NOTE on JSON: stdlib/json.rail has a parse error when imported alongside
+-- our other deps (lambda destructure quirk in its encode helper). We carry
+-- a tightly-scoped JSON encoder/decoder here that only needs to handle the
+-- fixed entry schema. See §entry_serialize / §entry_deserialize.
+--
+-- Sibling files in this subsystem:
+--   tools/lab/chain.rail     — piece 2: storage + parent linkage
+--   tools/lab/witness.rail   — piece 3: multi-witness gossip (future)
+--   tools/lab/test_entry.rail — acceptance tests (companion file)
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+
+-- ── Types ─────────────────────────────────────────────────────────────
+
+-- Verdict — exactly three values. Anything else rejects at sign/verify.
+type Verdict = | Pass | Falsified | Inconclusive
+
+-- Result — verdict plus a list of (name, value_str) pairs.
+-- Values are caller-supplied strings to keep canonicalization stable
+-- across Rail float-printing quirks. See spec §3 R-NUM.
+type Result = | Result verdict numbers
+
+-- Entry — the experiment record. All 13 fields carried positionally.
+-- Field order is FROZEN; do not reorder without bumping format version.
+-- (Single-line constructor: multi-line `type` definitions with one field
+-- per line do not parse correctly in this Rail; the skeleton had the
+-- multi-line form but it was a no-op because no body referenced it.)
+type Entry = | Entry id parents goal hypothesis kill_target counters cmd result pulse_id weights_hash created_at sig signer
+
+-- Witness — countersignature over an entry id. Lives OUTSIDE the
+-- canonical body; attach/detach must NOT change entry.id.
+type Witness = | Witness key sig witnessed_at
+
+-- ── Low-level char / ASCII helpers ────────────────────────────────────
+
+-- Is `c` (a single-char Rail string) inside [0x20, 0x7E] (ASCII printable)?
+is_ascii_printable c =
+  let n = char_to_int c
+  if n < 32 then false
+  else if n > 126 then false
+  else true
+
+-- Forbidden inside a canonical field (no escaping; we just reject).
+is_forbidden_in_field c =
+  if c == "|" then true
+  else if c == "\n" then true
+  else if c == "\t" then true
+  else if c == "\r" then true
+  else false
+
+-- Walk chars; return true iff every char is ASCII-printable and not |\n\t\r.
+field_ascii_ok_cs cs =
+  if length cs == 0 then true
+  else
+    let c = head cs
+    if is_forbidden_in_field c then false
+    else if is_ascii_printable c then field_ascii_ok_cs (tail cs)
+    else false
+
+field_ascii_ok s = field_ascii_ok_cs (chars s)
+
+-- Counter-name regex: [A-Za-z_][A-Za-z0-9_]*
+is_alpha_under c =
+  let n = char_to_int c
+  if n >= 65 && n <= 90 then true            -- A-Z
+  else if n >= 97 && n <= 122 then true      -- a-z
+  else if n == 95 then true                   -- _
+  else false
+
+is_alnum_under c =
+  let n = char_to_int c
+  if is_alpha_under c then true
+  else if n >= 48 && n <= 57 then true       -- 0-9
+  else false
+
+counter_name_ok_rest cs =
+  if length cs == 0 then true
+  else if is_alnum_under (head cs) then counter_name_ok_rest (tail cs)
+  else false
+
+counter_name_ok s =
+  let cs = chars s
+  if length cs == 0 then false
+  else if is_alpha_under (head cs) then counter_name_ok_rest (tail cs)
+  else false
+
+-- ── Time format check: YYYY-MM-DDTHH:MM:SSZ ───────────────────────────
+
+is_digit_char c =
+  let n = char_to_int c
+  if n >= 48 && n <= 57 then true else false
+
+-- Slot positions 0..19 must match the template.
+-- 0123 4 56 7 89 T 12 : 45 : 78 Z
+-- 0123456789012345678901
+time_char_ok i c =
+  if i == 4 then c == "-"
+  else if i == 7 then c == "-"
+  else if i == 10 then c == "T"
+  else if i == 13 then c == ":"
+  else if i == 16 then c == ":"
+  else if i == 19 then c == "Z"
+  else is_digit_char c
+
+time_format_check_loop cs i =
+  if i >= 20 then
+    if length cs == 0 then true else false
+  else if length cs == 0 then false
+  else if time_char_ok i (head cs) then time_format_check_loop (tail cs) (i + 1)
+  else false
+
+time_format_ok s = time_format_check_loop (chars s) 0
+
+-- ── Hex validation ────────────────────────────────────────────────────
+
+is_lower_hex_char c =
+  let n = char_to_int c
+  if n >= 48 && n <= 57 then true            -- 0-9
+  else if n >= 97 && n <= 102 then true      -- a-f
+  else false
+
+all_lower_hex_cs cs =
+  if length cs == 0 then true
+  else if is_lower_hex_char (head cs) then all_lower_hex_cs (tail cs)
+  else false
+
+all_lower_hex s = all_lower_hex_cs (chars s)
+
+hex_len_ok s n =
+  if length (chars s) == n then all_lower_hex s
+  else false
+
+-- ── Digit string validation (for pulse_id) ────────────────────────────
+
+all_digits_cs cs =
+  if length cs == 0 then true
+  else if is_digit_char (head cs) then all_digits_cs (tail cs)
+  else false
+
+all_digits s = all_digits_cs (chars s)
+
+-- ── String sort (ASCII-ascending) ─────────────────────────────────────
+-- Compare two strings lexicographically using ASCII byte order.
+
+str_lex_le_cs a b =
+  if length a == 0 then true
+  else if length b == 0 then false
+  else
+    let ca = char_to_int (head a)
+    let cb = char_to_int (head b)
+    if ca < cb then true
+    else if ca > cb then false
+    else str_lex_le_cs (tail a) (tail b)
+
+str_lex_le a b = str_lex_le_cs (chars a) (chars b)
+
+-- Sort list of strings ASCII-ascending (insertion sort).
+sort_strings xs =
+  if length xs == 0 then []
+  else insert_string (head xs) (sort_strings (tail xs))
+
+insert_string x sorted =
+  if length sorted == 0 then [x]
+  else if str_lex_le x (head sorted) then cons x sorted
+  else cons (head sorted) (insert_string x (tail sorted))
+
+-- Sort list of (name, value) pairs by name.
+sort_pairs xs =
+  if length xs == 0 then []
+  else insert_pair (head xs) (sort_pairs (tail xs))
+
+insert_pair p sorted =
+  if length sorted == 0 then [p]
+  else
+    let (pn, _pv) = p
+    let (sn, _sv) = head sorted
+    if str_lex_le pn sn then cons p sorted
+    else cons (head sorted) (insert_pair p (tail sorted))
+
+-- ── Constructor ───────────────────────────────────────────────────────
+
+-- Build a fresh unsigned entry with empty optional fields and a default
+-- Inconclusive result. Validates every required field shape; returns
+-- error with the first failing code.
+entry_new goal hypothesis kill_target counters cmd created_at =
+  if length (chars goal) == 0 then error "E-MISSING-GOAL: goal must be non-empty"
+  else if field_ascii_ok goal == false then error "E-NON-ASCII: goal has forbidden bytes"
+  else if length (chars hypothesis) > 0 && field_ascii_ok hypothesis == false then
+    error "E-NON-ASCII: hypothesis has forbidden bytes"
+  else if length (chars kill_target) == 0 then
+    error "E-MISSING-KILL: kill_target must be non-empty"
+  else if field_ascii_ok kill_target == false then
+    error "E-NON-ASCII: kill_target has forbidden bytes"
+  else if length counters == 0 then
+    error "E-EMPTY-COUNTERS: counters list must contain at least one name"
+  else if counters_all_named_ok counters == false then
+    error "E-BAD-COUNTER-NAME: each counter name must match [A-Za-z_][A-Za-z0-9_]*"
+  else if length (chars cmd) == 0 then error "E-MISSING-CMD: cmd must be non-empty"
+  else if field_ascii_ok cmd == false then error "E-NON-ASCII: cmd has forbidden bytes"
+  else if time_format_ok created_at == false then
+    error "E-BAD-TIME: created_at must match YYYY-MM-DDTHH:MM:SSZ"
+  else
+    let r = Result Inconclusive []
+    Entry "" [] goal hypothesis kill_target counters cmd r "" "" created_at "" ""
+
+counters_all_named_ok cs =
+  if length cs == 0 then true
+  else if counter_name_ok (head cs) == false then false
+  else counters_all_named_ok (tail cs)
+
+-- ── Setters (return new Entry) ────────────────────────────────────────
+
+entry_set_result e verdict numbers =
+  if numbers_ok numbers == false then
+    error "E-NON-ASCII: number name or value has forbidden bytes"
+  else if numbers_names_ok numbers == false then
+    error "E-BAD-COUNTER-NAME: number name must match [A-Za-z_][A-Za-z0-9_]*"
+  else match e
+    | Entry id parents goal hyp kill cs cmd _ pul wts created sig signer ->
+        Entry id parents goal hyp kill cs cmd (Result verdict numbers) pul wts created sig signer
+
+numbers_ok ns =
+  if length ns == 0 then true
+  else
+    let (n, v) = head ns
+    if field_ascii_ok n == false then false
+    else if field_ascii_ok v == false then false
+    else numbers_ok (tail ns)
+
+numbers_names_ok ns =
+  if length ns == 0 then true
+  else
+    let (n, _v) = head ns
+    if counter_name_ok n == false then false
+    else numbers_names_ok (tail ns)
+
+entry_set_parents e parent_ids =
+  if parents_all_hex_ok parent_ids == false then
+    error "E-BAD-PARENT-ID: each parent must be a 64-char lowercase hex string"
+  else match e
+    | Entry id _parents goal hyp kill cs cmd r pul wts created sig signer ->
+        Entry id parent_ids goal hyp kill cs cmd r pul wts created sig signer
+
+parents_all_hex_ok ps =
+  if length ps == 0 then true
+  else if hex_len_ok (head ps) 64 == false then false
+  else parents_all_hex_ok (tail ps)
+
+entry_set_pulse e pulse_id_str =
+  if length (chars pulse_id_str) == 0 then
+    match e
+      | Entry id parents goal hyp kill cs cmd r _ wts created sig signer ->
+          Entry id parents goal hyp kill cs cmd r "" wts created sig signer
+  else if all_digits pulse_id_str == false then
+    error "E-BAD-PULSE: pulse_id must be decimal digits or empty"
+  else match e
+    | Entry id parents goal hyp kill cs cmd r _ wts created sig signer ->
+        Entry id parents goal hyp kill cs cmd r pulse_id_str wts created sig signer
+
+entry_set_weights e weights_hash_hex =
+  if length (chars weights_hash_hex) == 0 then
+    match e
+      | Entry id parents goal hyp kill cs cmd r pul _ created sig signer ->
+          Entry id parents goal hyp kill cs cmd r pul "" created sig signer
+  else if hex_len_ok weights_hash_hex 64 == false then
+    error "E-BAD-WEIGHTS: weights_hash must be 64-char lowercase hex or empty"
+  else match e
+    | Entry id parents goal hyp kill cs cmd r pul _ created sig signer ->
+        Entry id parents goal hyp kill cs cmd r pul weights_hash_hex created sig signer
+
+entry_set_hypothesis e text =
+  if length (chars text) > 0 && field_ascii_ok text == false then
+    error "E-NON-ASCII: hypothesis has forbidden bytes"
+  else match e
+    | Entry id parents goal _hyp kill cs cmd r pul wts created sig signer ->
+        Entry id parents goal text kill cs cmd r pul wts created sig signer
+
+-- ── Verdict helpers ───────────────────────────────────────────────────
+
+verdict_to_string v = match v
+  | Pass -> "PASS"
+  | Falsified -> "FALSIFIED"
+  | Inconclusive -> "INCONCLUSIVE"
+
+verdict_from_string s =
+  if s == "PASS" then Pass
+  else if s == "FALSIFIED" then Falsified
+  else if s == "INCONCLUSIVE" then Inconclusive
+  else error "E-BAD-VERDICT: verdict must be PASS, FALSIFIED, or INCONCLUSIVE"
+
+result_verdict r = match r
+  | Result v _ns -> v
+
+result_numbers r = match r
+  | Result _v ns -> ns
+
+-- ── Required-fields validator ─────────────────────────────────────────
+
+entry_validate_required_fields e = match e
+  | Entry _id _parents goal _hyp kill cs cmd result _pul _wts created _sig _signer ->
+      if length (chars goal) == 0 then error "E-MISSING-GOAL: goal empty"
+      else if field_ascii_ok goal == false then error "E-NON-ASCII: goal has forbidden bytes"
+      else if length (chars kill) == 0 then error "E-MISSING-KILL: kill_target empty"
+      else if field_ascii_ok kill == false then error "E-NON-ASCII: kill_target has forbidden bytes"
+      else if length cs == 0 then error "E-EMPTY-COUNTERS: counters list empty"
+      else if counters_all_named_ok cs == false then
+        error "E-BAD-COUNTER-NAME: each counter name must match [A-Za-z_][A-Za-z0-9_]*"
+      else if length (chars cmd) == 0 then error "E-MISSING-CMD: cmd empty"
+      else if field_ascii_ok cmd == false then error "E-NON-ASCII: cmd has forbidden bytes"
+      else if time_format_ok created == false then
+        error "E-BAD-TIME: created_at must match YYYY-MM-DDTHH:MM:SSZ"
+      else
+        let _vstr = verdict_to_string (result_verdict result)
+        1
+
+-- ── Canonical form ────────────────────────────────────────────────────
+
+-- Body shape (spec §3):
+-- entry|v1|<goal>|<hypothesis>|<kill_target>|<counters>|<cmd>|<verdict>|
+--   <numbers>|<parents>|<pulse_id>|<weights_hash>|<created_at>|<signer>
+
+join_counters cs =
+  let sorted = sort_strings cs
+  join "," sorted
+
+render_number p =
+  let (n, v) = p
+  cat [n, "=", v]
+
+join_numbers ns =
+  if length ns == 0 then ""
+  else
+    let sorted = sort_pairs ns
+    join "," (map render_number sorted)
+
+join_parents ps = join "," ps
+
+entry_canonical_body e =
+  let v = entry_validate_required_fields e
+  if is_error v then v
+  else match e
+    | Entry _id parents goal hyp kill cs cmd result pul wts created _sig signer ->
+        if length (chars hyp) > 0 && field_ascii_ok hyp == false then
+          error "E-NON-ASCII: hypothesis has forbidden bytes"
+        else if all_strings_ascii parents == false then
+          error "E-NON-ASCII: parent id has forbidden bytes"
+        else if numbers_ok (result_numbers result) == false then
+          error "E-NON-ASCII: number name or value has forbidden bytes"
+        else if length (chars pul) > 0 && all_digits pul == false then
+          error "E-BAD-PULSE: pulse_id must be decimal digits or empty"
+        else if length (chars wts) > 0 && hex_len_ok wts 64 == false then
+          error "E-BAD-WEIGHTS: weights_hash must be 64-char hex or empty"
+        else if length (chars signer) > 0 && hex_len_ok signer 64 == false then
+          error "E-BAD-PUBKEY-HEX: signer must be 64-char lowercase hex"
+        else
+          let counters_field =
+            if length cs == 0 then "<EMPTY-COUNTERS>"
+            else join_counters cs
+          let verdict_field = verdict_to_string (result_verdict result)
+          let numbers_field = join_numbers (result_numbers result)
+          let parents_field = join_parents parents
+          join "|" ["entry", "v1", goal, hyp, kill, counters_field, cmd,
+                   verdict_field, numbers_field, parents_field, pul, wts,
+                   created, signer]
+
+all_strings_ascii ss =
+  if length ss == 0 then true
+  else if field_ascii_ok (head ss) == false then false
+  else all_strings_ascii (tail ss)
+
+entry_content_hash e =
+  let body = entry_canonical_body e
+  if is_error body then body
+  else sha256_hex body
+
+-- ── Sign (caller-supplied 64-byte Ed25519 signature) ──────────────────
+
+entry_sign e signer_pubkey_hex signature_hex =
+  let v = entry_validate_required_fields e
+  if is_error v then v
+  else if hex_len_ok signer_pubkey_hex 64 == false then
+    error "E-BAD-PUBKEY-HEX: signer pubkey must be 64-char lowercase hex"
+  else if hex_len_ok signature_hex 128 == false then
+    error "E-BAD-SIG-HEX: signature must be 128-char lowercase hex"
+  else
+    -- Inject signer first so canonicalization binds it into the digest.
+    let e1 = match e
+      | Entry _id parents goal hyp kill cs cmd r pul wts created _sig _signer ->
+          Entry "" parents goal hyp kill cs cmd r pul wts created "" signer_pubkey_hex
+    let id = entry_content_hash e1
+    if is_error id then id
+    else match e1
+      | Entry _id parents goal hyp kill cs cmd r pul wts created _sig signer ->
+          Entry id parents goal hyp kill cs cmd r pul wts created signature_hex signer
+
+-- ── Verify (pure-Rail ed25519_verify) ─────────────────────────────────
+
+entry_verify e =
+  let v = entry_validate_required_fields e
+  if is_error v then v
+  else match e
+    | Entry id _parents _goal _hyp _kill _cs _cmd _r _pul _wts _created sig signer ->
+        if hex_len_ok id 64 == false then error "E-BAD-ID: entry.id must be 64-char hex"
+        else if hex_len_ok signer 64 == false then
+          error "E-BAD-PUBKEY-HEX: signer pubkey must be 64-char lowercase hex"
+        else if hex_len_ok sig 128 == false then
+          error "E-BAD-SIG-HEX: signature must be 128-char lowercase hex"
+        else
+          let body = entry_canonical_body e
+          if is_error body then body
+          else
+            let recomputed = sha256_hex body
+            if recomputed == id then
+              let pub_bytes = hex_to_bytes signer
+              let sig_bytes = hex_to_bytes sig
+              let msg_bytes = string_to_bytes body
+              let msg_len = length (chars body)
+              ed25519_verify pub_bytes msg_bytes msg_len sig_bytes
+            else 0
+
+-- ── Witness ops (outside the canonical body) ──────────────────────────
+
+entry_attach_witness e witnesses key sig witnessed_at =
+  if entry_is_signed e == false then
+    error "E-UNSIGNED-ENTRY: sign the entry before attaching a witness"
+  else if hex_len_ok key 64 == false then
+    error "E-BAD-PUBKEY-HEX: witness key must be 64-char lowercase hex"
+  else if hex_len_ok sig 128 == false then
+    error "E-BAD-SIG-HEX: witness signature must be 128-char lowercase hex"
+  else if time_format_ok witnessed_at == false then
+    error "E-BAD-TIME: witnessed_at must match YYYY-MM-DDTHH:MM:SSZ"
+  else append witnesses [Witness key sig witnessed_at]
+
+entry_is_signed e = match e
+  | Entry id _p _g _h _k _c _cm _r _pu _w _ca sig signer ->
+      if hex_len_ok id 64 == false then false
+      else if hex_len_ok sig 128 == false then false
+      else if hex_len_ok signer 64 == false then false
+      else true
+
+entry_verify_witness e w =
+  if entry_is_signed e == false then
+    error "E-UNSIGNED-ENTRY: entry must be signed before its witness can be verified"
+  else match w
+    | Witness wkey wsig _wts ->
+        if hex_len_ok wkey 64 == false then
+          error "E-BAD-PUBKEY-HEX: witness key must be 64-char lowercase hex"
+        else if hex_len_ok wsig 128 == false then
+          error "E-BAD-SIG-HEX: witness sig must be 128-char lowercase hex"
+        else
+          let id = entry_id e
+          let pub_bytes = hex_to_bytes wkey
+          let sig_bytes = hex_to_bytes wsig
+          let msg_bytes = string_to_bytes id
+          let msg_len = length (chars id)
+          ed25519_verify pub_bytes msg_bytes msg_len sig_bytes
+
+-- ── JSON encode / decode (tailored to entry schema) ───────────────────
+-- We can't use stdlib/json.rail directly (lambda destructure parse error
+-- when imported alongside our crypto deps). Schema is fixed, so a
+-- bespoke encoder + decoder is short and avoids the regression.
+
+-- JSON string-escape: only \" and \\ supported (everything else is
+-- ASCII-printable by R-ASCII; control chars are rejected at canon-time).
+json_escape_cs cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    if c == "\"" then json_escape_cs (tail cs) (append acc "\\\"")
+    else if c == "\\" then json_escape_cs (tail cs) (append acc "\\\\")
+    else json_escape_cs (tail cs) (append acc c)
+
+json_str s = cat ["\"", json_escape_cs (chars s) "", "\""]
+
+json_str_array ss =
+  if length ss == 0 then "[]"
+  else cat ["[", join "," (map json_str ss), "]"]
+
+json_num_obj p =
+  let (n, v) = p
+  cat ["{\"name\":", json_str n, ",\"value\":", json_str v, "}"]
+
+json_numbers ns =
+  if length ns == 0 then "[]"
+  else cat ["[", join "," (map json_num_obj ns), "]"]
+
+json_witness w = match w
+  | Witness k s t ->
+      cat ["{\"key\":", json_str k,
+           ",\"sig\":", json_str s,
+           ",\"witnessed_at\":", json_str t, "}"]
+
+json_witnesses ws =
+  if length ws == 0 then "[]"
+  else cat ["[", join "," (map json_witness ws), "]"]
+
+entry_serialize e witnesses = match e
+  | Entry id parents goal hyp kill cs cmd result pul wts created sig signer ->
+      cat ["{",
+           "\"kind\":\"ledatic.lab.entry\"",
+           ",\"version\":1",
+           ",\"id\":", json_str id,
+           ",\"parents\":", json_str_array parents,
+           ",\"goal\":", json_str goal,
+           ",\"hypothesis\":", json_str hyp,
+           ",\"kill_target\":", json_str kill,
+           ",\"counters\":", json_str_array cs,
+           ",\"cmd\":", json_str cmd,
+           ",\"result\":{",
+             "\"verdict\":", json_str (verdict_to_string (result_verdict result)),
+             ",\"numbers\":", json_numbers (result_numbers result),
+           "}",
+           ",\"pulse_id\":", json_str pul,
+           ",\"weights_hash\":", json_str wts,
+           ",\"created_at\":", json_str created,
+           ",\"signer\":", json_str signer,
+           ",\"sig\":", json_str sig,
+           ",\"witnesses\":", json_witnesses witnesses,
+           "}"]
+
+-- ── JSON parser (entry-shape only) ────────────────────────────────────
+-- Returns: ("ok", value, rest_chars) | ("err", code, [])
+--
+-- We support: strings (with \" and \\ escapes), numbers (integer only),
+-- arrays of values, objects with string keys, true/false/null.
+
+ws_skip cs =
+  if length cs == 0 then cs
+  else
+    let c = head cs
+    if c == " " then ws_skip (tail cs)
+    else if c == "\t" then ws_skip (tail cs)
+    else if c == "\n" then ws_skip (tail cs)
+    else if c == "\r" then ws_skip (tail cs)
+    else cs
+
+-- Parse a JSON string after the opening quote has been consumed.
+-- Returns (acc, rest_cs, ok). On invalid escape or EOF, ok = false.
+p_str_loop cs acc =
+  if length cs == 0 then (acc, [], false)
+  else
+    let c = head cs
+    if c == "\"" then (acc, tail cs, true)
+    else if c == "\\" then
+      if length (tail cs) == 0 then (acc, [], false)
+      else
+        let nx = head (tail cs)
+        if nx == "\"" then p_str_loop (tail (tail cs)) (append acc "\"")
+        else if nx == "\\" then p_str_loop (tail (tail cs)) (append acc "\\")
+        else if nx == "n" then p_str_loop (tail (tail cs)) (append acc "\n")
+        else if nx == "t" then p_str_loop (tail (tail cs)) (append acc "\t")
+        else if nx == "r" then p_str_loop (tail (tail cs)) (append acc "\r")
+        else if nx == "/" then p_str_loop (tail (tail cs)) (append acc "/")
+        else (acc, [], false)
+    else p_str_loop (tail cs) (append acc c)
+
+-- Parse integer (no fractions, no exponent — we only emit "version":1).
+is_digit_or_minus c = if c == "-" then true else is_digit_char c
+
+p_num_loop cs acc =
+  if length cs == 0 then (acc, cs)
+  else if is_digit_or_minus (head cs) then
+    p_num_loop (tail cs) (append acc (head cs))
+  else (acc, cs)
+
+-- Parse one JSON value. Returns (tag, value, rest_cs) on success,
+-- ("err", code, []) on failure. Value shapes:
+--   ("str", string)
+--   ("int", int)
+--   ("bool", 1|0)
+--   ("null", 0)
+--   ("arr", [json_value])
+--   ("obj", [(key, json_value)])
+
+parse_value cs =
+  let ws = ws_skip cs
+  if length ws == 0 then ("err", "E-BAD-JSON: unexpected end of input", [])
+  else
+    let c = head ws
+    if c == "\"" then
+      let (s, rest, ok) = p_str_loop (tail ws) ""
+      if ok == false then ("err", "E-BAD-JSON: malformed string literal", [])
+      else ("str", s, rest)
+    else if c == "[" then parse_array (tail ws) []
+    else if c == "{" then parse_object (tail ws) []
+    else if c == "t" then parse_keyword ws "true" ("bool", 1)
+    else if c == "f" then parse_keyword ws "false" ("bool", 0)
+    else if c == "n" then parse_keyword ws "null" ("null", 0)
+    else if is_digit_or_minus c then
+      let (numstr, rest) = p_num_loop ws ""
+      if length (chars numstr) == 0 then ("err", "E-BAD-JSON: expected number", [])
+      else ("int", parse_int_dec numstr, rest)
+    else ("err", "E-BAD-JSON: unexpected character", [])
+
+parse_keyword cs kw value =
+  if starts_with_chars (chars kw) cs then
+    (head value, head (tail value), drop_n (length (chars kw)) cs)
+  else ("err", "E-BAD-JSON: bad keyword", [])
+
+starts_with_chars pref cs =
+  if length pref == 0 then true
+  else if length cs == 0 then false
+  else if head pref == head cs then starts_with_chars (tail pref) (tail cs)
+  else false
+
+drop_n n cs =
+  if n <= 0 then cs
+  else if length cs == 0 then cs
+  else drop_n (n - 1) (tail cs)
+
+-- Decimal-int parser. Accepts optional leading '-'.
+parse_int_dec s =
+  let cs = chars s
+  if length cs == 0 then 0
+  else if head cs == "-" then 0 - (parse_int_pos (tail cs) 0)
+  else parse_int_pos cs 0
+
+parse_int_pos cs acc =
+  if length cs == 0 then acc
+  else
+    let d = char_to_int (head cs) - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else parse_int_pos (tail cs) (acc * 10 + d)
+
+parse_array cs acc =
+  let ws = ws_skip cs
+  if length ws == 0 then ("err", "E-BAD-JSON: unterminated array", [])
+  else if head ws == "]" then ("arr", reverse acc, tail ws)
+  else
+    let (t, v, rest) = parse_value ws
+    if t == "err" then ("err", v, [])
+    else
+      let item = (t, v)
+      let after = ws_skip rest
+      if length after == 0 then ("err", "E-BAD-JSON: unterminated array", [])
+      else if head after == "," then parse_array (tail after) (cons item acc)
+      else if head after == "]" then ("arr", reverse (cons item acc), tail after)
+      else ("err", "E-BAD-JSON: expected , or ] in array", [])
+
+parse_object cs acc =
+  let ws = ws_skip cs
+  if length ws == 0 then ("err", "E-BAD-JSON: unterminated object", [])
+  else if head ws == "}" then ("obj", reverse acc, tail ws)
+  else if head ws != "\"" then ("err", "E-BAD-JSON: object key must be a string", [])
+  else
+    let (key, rest1, ok) = p_str_loop (tail ws) ""
+    if ok == false then ("err", "E-BAD-JSON: malformed object key", [])
+    else
+      let ws2 = ws_skip rest1
+      if length ws2 == 0 then ("err", "E-BAD-JSON: missing colon", [])
+      else if head ws2 != ":" then ("err", "E-BAD-JSON: expected : after key", [])
+      else
+        let (t, v, rest2) = parse_value (tail ws2)
+        if t == "err" then ("err", v, [])
+        else
+          let pair = (key, (t, v))
+          let after = ws_skip rest2
+          if length after == 0 then ("err", "E-BAD-JSON: unterminated object", [])
+          else if head after == "," then parse_object (tail after) (cons pair acc)
+          else if head after == "}" then ("obj", reverse (cons pair acc), tail after)
+          else ("err", "E-BAD-JSON: expected , or } in object", [])
+
+-- Lookup helpers over parsed object pairs.
+lookup_pair pairs key =
+  if length pairs == 0 then ("missing", "", [])
+  else
+    let (k, v) = head pairs
+    if k == key then ("ok", k, v)
+    else lookup_pair (tail pairs) key
+
+-- Helper: extract string. Returns error tag if shape wrong.
+val_str v =
+  let (t, x) = v
+  if t == "str" then ("ok", x)
+  else ("err", "E-MISSING-FIELD: expected string")
+
+val_int v =
+  let (t, x) = v
+  if t == "int" then ("ok", x)
+  else ("err", "E-MISSING-FIELD: expected int")
+
+val_arr v =
+  let (t, x) = v
+  if t == "arr" then ("ok", x)
+  else ("err", "E-MISSING-FIELD: expected array")
+
+val_obj v =
+  let (t, x) = v
+  if t == "obj" then ("ok", x)
+  else ("err", "E-MISSING-FIELD: expected object")
+
+-- Required string field by key.
+req_str pairs key =
+  let (s, _k, v) = lookup_pair pairs key
+  if s == "missing" then ("err", cat ["E-MISSING-FIELD: ", key])
+  else
+    let (st, sv) = val_str v
+    if st == "err" then ("err", cat ["E-MISSING-FIELD: ", key, " (not a string)"])
+    else ("ok", sv)
+
+-- Required array-of-strings field.
+req_str_arr pairs key =
+  let (s, _k, v) = lookup_pair pairs key
+  if s == "missing" then ("err", cat ["E-MISSING-FIELD: ", key])
+  else
+    let (at, av) = val_arr v
+    if at == "err" then ("err", cat ["E-MISSING-FIELD: ", key, " (not an array)"])
+    else
+      let r = collect_strings av []
+      let (rt, rv) = r
+      if rt == "err" then ("err", rv)
+      else ("ok", rv)
+
+collect_strings items acc =
+  if length items == 0 then ("ok", reverse acc)
+  else
+    let (t, x) = head items
+    if t == "str" then collect_strings (tail items) (cons x acc)
+    else ("err", "E-MISSING-FIELD: array contains non-string")
+
+-- Parse Result object: { "verdict": "...", "numbers": [...] }
+parse_result_obj pairs =
+  let vr = req_str pairs "verdict"
+  let (vt, vv) = vr
+  if vt == "err" then ("err", vv)
+  else
+    let nv = lookup_pair pairs "numbers"
+    let (ns, _nk, nval) = nv
+    if ns == "missing" then ("err", "E-MISSING-FIELD: result.numbers")
+    else
+      let (at, av) = val_arr nval
+      if at == "err" then ("err", "E-MISSING-FIELD: result.numbers (not array)")
+      else
+        let pr = parse_number_items av []
+        let (pt, pv) = pr
+        if pt == "err" then ("err", pv)
+        else
+          let verdict = verdict_from_string vv
+          if is_error verdict then ("err", err_msg verdict)
+          else ("ok", Result verdict pv)
+
+parse_number_items items acc =
+  if length items == 0 then ("ok", reverse acc)
+  else
+    let (t, x) = head items
+    if t != "obj" then ("err", "E-MISSING-FIELD: numbers element not object")
+    else
+      let nr = req_str x "name"
+      let (nt, nv) = nr
+      if nt == "err" then ("err", nv)
+      else
+        let vr = req_str x "value"
+        let (vt2, vv) = vr
+        if vt2 == "err" then ("err", vv)
+        else parse_number_items (tail items) (cons (nv, vv) acc)
+
+-- Witness list parser.
+parse_witness_items items acc =
+  if length items == 0 then ("ok", reverse acc)
+  else
+    let (t, x) = head items
+    if t != "obj" then ("err", "E-MISSING-FIELD: witnesses element not object")
+    else
+      let kr = req_str x "key"
+      let (kt, kv) = kr
+      if kt == "err" then ("err", kv)
+      else
+        let sr = req_str x "sig"
+        let (st, sv) = sr
+        if st == "err" then ("err", sv)
+        else
+          let wr = req_str x "witnessed_at"
+          let (wt2, wv) = wr
+          if wt2 == "err" then ("err", wv)
+          else parse_witness_items (tail items) (cons (Witness kv sv wv) acc)
+
+-- ASCII-validate every string field in the parsed entry. Returns ("ok",0)
+-- or ("err", code).
+ascii_all_fields parents goal hyp kill cs cmd pul wts created signer sig id =
+  if field_ascii_ok id == false && length (chars id) > 0 then ("err", "E-NON-ASCII: id")
+  else if field_ascii_ok goal == false then ("err", "E-NON-ASCII: goal")
+  else if field_ascii_ok hyp == false && length (chars hyp) > 0 then ("err", "E-NON-ASCII: hypothesis")
+  else if field_ascii_ok kill == false then ("err", "E-NON-ASCII: kill_target")
+  else if field_ascii_ok cmd == false then ("err", "E-NON-ASCII: cmd")
+  else if all_strings_ascii parents == false then ("err", "E-NON-ASCII: parents")
+  else if all_strings_ascii cs == false then ("err", "E-NON-ASCII: counters")
+  else if field_ascii_ok pul == false && length (chars pul) > 0 then ("err", "E-NON-ASCII: pulse_id")
+  else if field_ascii_ok wts == false && length (chars wts) > 0 then ("err", "E-NON-ASCII: weights_hash")
+  else if field_ascii_ok created == false then ("err", "E-NON-ASCII: created_at")
+  else if field_ascii_ok signer == false && length (chars signer) > 0 then ("err", "E-NON-ASCII: signer")
+  else if field_ascii_ok sig == false && length (chars sig) > 0 then ("err", "E-NON-ASCII: sig")
+  else ("ok", 0)
+
+entry_deserialize json_string =
+  let (t, v, _rest) = parse_value (chars json_string)
+  if t == "err" then error (cat ["E-BAD-JSON: ", v])
+  else if t != "obj" then error "E-BAD-JSON: top-level must be object"
+  else
+    let pairs = v
+    -- kind / version
+    let kr = req_str pairs "kind"
+    let (kt, kv) = kr
+    if kt == "err" then error "E-MISSING-FIELD: kind"
+    else if kv != "ledatic.lab.entry" then error "E-BAD-KIND: kind != ledatic.lab.entry"
+    else
+      let vrn = lookup_pair pairs "version"
+      let (vs, _vk, vv) = vrn
+      if vs == "missing" then error "E-MISSING-FIELD: version"
+      else
+        let (vit, viv) = val_int vv
+        if vit == "err" then error "E-BAD-KIND: version not an integer"
+        else if viv != 1 then error "E-BAD-KIND: version != 1"
+        else entry_deserialize_body pairs
+
+entry_deserialize_body pairs =
+  let ir = req_str pairs "id"
+  let (it, iv) = ir
+  if it == "err" then error iv
+  else
+    let pr = req_str_arr pairs "parents"
+    let (pt, pv) = pr
+    if pt == "err" then error pv
+    else
+      let gr = req_str pairs "goal"
+      let (gt, gv) = gr
+      if gt == "err" then error gv
+      else
+        let hr = req_str pairs "hypothesis"
+        let (ht, hv) = hr
+        if ht == "err" then error hv
+        else
+          let klr = req_str pairs "kill_target"
+          let (klt, klv) = klr
+          if klt == "err" then error klv
+          else
+            let cr = req_str_arr pairs "counters"
+            let (ct, cv) = cr
+            if ct == "err" then error cv
+            else
+              let mr = req_str pairs "cmd"
+              let (mt, mv) = mr
+              if mt == "err" then error mv
+              else entry_deserialize_more pairs iv pv gv hv klv cv mv
+
+entry_deserialize_more pairs id parents goal hyp kill counters cmd =
+  let rlookup = lookup_pair pairs "result"
+  let (rs, _rk, rv) = rlookup
+  if rs == "missing" then error "E-MISSING-FIELD: result"
+  else
+    let (rot, rov) = val_obj rv
+    if rot == "err" then error "E-MISSING-FIELD: result not object"
+    else
+      let rpr = parse_result_obj rov
+      let (rpt, rpv) = rpr
+      if rpt == "err" then error rpv
+      else
+        let pur = req_str pairs "pulse_id"
+        let (put, puv) = pur
+        if put == "err" then error puv
+        else
+          let wr = req_str pairs "weights_hash"
+          let (wt, wv) = wr
+          if wt == "err" then error wv
+          else
+            let cat_r = req_str pairs "created_at"
+            let (cat_t, cat_v) = cat_r
+            if cat_t == "err" then error cat_v
+            else
+              let sgr = req_str pairs "signer"
+              let (sgt, sgv) = sgr
+              if sgt == "err" then error sgv
+              else
+                let sir = req_str pairs "sig"
+                let (sit, siv) = sir
+                if sit == "err" then error siv
+                else entry_deserialize_finish pairs id parents goal hyp kill counters cmd rpv puv wv cat_v sgv siv
+
+entry_deserialize_finish pairs id parents goal hyp kill counters cmd result pul wts created signer sig =
+  let chk = ascii_all_fields parents goal hyp kill counters cmd pul wts created signer sig id
+  let (cht, chv) = chk
+  if cht == "err" then error chv
+  else
+    let wlookup = lookup_pair pairs "witnesses"
+    let (ws, _wk, wv) = wlookup
+    let entry = Entry id parents goal hyp kill counters cmd result pul wts created sig signer
+    if ws == "missing" then (entry, [])
+    else
+      let (at2, av) = val_arr wv
+      if at2 == "err" then error "E-BAD-JSON: witnesses not an array"
+      else
+        let pr = parse_witness_items av []
+        let (pt, pv) = pr
+        if pt == "err" then error pv
+        else (entry, pv)
+
+-- ── Field accessors ───────────────────────────────────────────────────
+
+entry_id e = match e
+  | Entry id _p _g _h _k _c _cm _r _pu _w _ca _s _sg -> id
+
+entry_parents e = match e
+  | Entry _id parents _g _h _k _c _cm _r _pu _w _ca _s _sg -> parents
+
+entry_goal e = match e
+  | Entry _id _p goal _h _k _c _cm _r _pu _w _ca _s _sg -> goal
+
+entry_hypothesis e = match e
+  | Entry _id _p _g hyp _k _c _cm _r _pu _w _ca _s _sg -> hyp
+
+entry_kill_target e = match e
+  | Entry _id _p _g _h kill _c _cm _r _pu _w _ca _s _sg -> kill
+
+entry_counters e = match e
+  | Entry _id _p _g _h _k cs _cm _r _pu _w _ca _s _sg -> cs
+
+entry_cmd e = match e
+  | Entry _id _p _g _h _k _c cmd _r _pu _w _ca _s _sg -> cmd
+
+entry_result e = match e
+  | Entry _id _p _g _h _k _c _cm r _pu _w _ca _s _sg -> r
+
+entry_pulse_id e = match e
+  | Entry _id _p _g _h _k _c _cm _r pul _w _ca _s _sg -> pul
+
+entry_weights_hash e = match e
+  | Entry _id _p _g _h _k _c _cm _r _pu wts _ca _s _sg -> wts
+
+entry_created_at e = match e
+  | Entry _id _p _g _h _k _c _cm _r _pu _w created _s _sg -> created
+
+entry_sig e = match e
+  | Entry _id _p _g _h _k _c _cm _r _pu _w _ca sig _sg -> sig
+
+entry_signer e = match e
+  | Entry _id _p _g _h _k _c _cm _r _pu _w _ca _s signer -> signer
+
+-- ── End of entry.rail ─────────────────────────────────────────────────

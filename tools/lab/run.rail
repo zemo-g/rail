@@ -1,0 +1,1066 @@
+-- tools/lab/run.rail — put-goal runner for the attestable work chain.
+--
+-- Piece 3 of 3 in the attestable-work-chain subsystem.
+-- See tools/lab/specs/run.spec.md for the full contract.
+--
+-- Library policy: this file IS an executable program (defines `main`).
+-- It uses entry.rail + chain.rail; both are pulled in by chain.rail's
+-- transitive import. We do NOT re-import sha256/ed25519/json.
+
+import "stdlib/args.rail"
+import "tools/lab/chain.rail"
+-- chain.rail transitively imports entry.rail + sha256/sha512/x25519/ed25519
+-- AND stdlib/file.rail + stdlib/env.rail. Re-importing them here would
+-- collide on _get_env/_append_line/etc. symbols.
+
+-- ===========================================================================
+-- Constants & exit codes
+-- ===========================================================================
+
+RUN_VERSION = "1.0.0"
+
+DEFAULT_TIMEOUT_S        = 600
+MAX_TIMEOUT_S            = 86400
+DEFAULT_SEARCH_LIMIT     = 5
+
+COUNTERS_OPEN            = "===RAIL_LAB_COUNTERS==="
+COUNTERS_CLOSE           = "===END==="
+VERDICT_SENTINEL         = "===VERDICT==="
+
+EXIT_OK                  = 0
+EXIT_GENERIC             = 1
+EXIT_USER_CANCEL         = 2
+EXIT_EXEC_FAILED         = 3
+EXIT_NO_VERDICT          = 4
+EXIT_COUNTER_MISSING     = 5
+EXIT_TIMEOUT             = 6
+EXIT_CHAIN_LOCKED        = 7
+EXIT_SIGN_FAILED         = 8
+EXIT_GOSSIP_REQUIRED     = 9
+
+-- ===========================================================================
+-- String helpers (str_trim, starts_with helpers, padded compares)
+-- ===========================================================================
+
+-- Pad with leading dummy args so the two operands land at slots 4+ where
+-- they are tagged and string == compares contents, not raw register bits.
+str_eq3 _d1 _d2 _d3 a b = if a == b then 1 else 0
+
+is_ws_char c =
+  if c == " " then true
+  else if c == "\t" then true
+  else if c == "\n" then true
+  else if c == "\r" then true
+  else false
+
+str_ltrim_cs cs =
+  if length cs == 0 then cs
+  else if is_ws_char (head cs) then str_ltrim_cs (tail cs)
+  else cs
+
+reverse_cs xs = reverse xs
+
+str_trim_cs cs =
+  let left = str_ltrim_cs cs
+  let rev = reverse_cs left
+  let right_trimmed = str_ltrim_cs rev
+  reverse_cs right_trimmed
+
+cs_to_string cs =
+  if length cs == 0 then ""
+  else append (head cs) (cs_to_string (tail cs))
+
+str_trim s = cs_to_string (str_trim_cs (chars s))
+
+-- chain.rail exports `str_starts_with prefix s` (inlined to avoid pulling
+-- stdlib/string.rail). Use it directly.
+
+-- Decimal-int parser local to run.rail (avoid relying on `to_int "42"`).
+is_digit_c c =
+  let n = char_to_int c
+  if n >= 48 then if n <= 57 then true else false else false
+
+parse_int_run_cs cs acc =
+  if length cs == 0 then acc
+  else
+    let d = char_to_int (head cs) - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else parse_int_run_cs (tail cs) (acc * 10 + d)
+
+parse_int_run s =
+  let cs = chars s
+  if length cs == 0 then 0
+  else if head cs == "-" then 0 - (parse_int_run_cs (tail cs) 0)
+  else parse_int_run_cs cs 0
+
+-- Counter-name regex check: [A-Za-z_][A-Za-z0-9_]*
+is_alpha_under_c c =
+  let n = char_to_int c
+  if n >= 65 then if n <= 90 then true
+    else if n == 95 then true
+    else if n >= 97 then if n <= 122 then true else false
+    else false
+  else if n == 95 then true
+  else false
+
+is_alnum_under_c c =
+  if is_alpha_under_c c then true
+  else if is_digit_c c then true
+  else false
+
+counter_name_ok_rest_cs cs =
+  if length cs == 0 then true
+  else if is_alnum_under_c (head cs) then counter_name_ok_rest_cs (tail cs)
+  else false
+
+counter_name_ok_run s =
+  let cs = chars s
+  if length cs == 0 then false
+  else if is_alpha_under_c (head cs) then counter_name_ok_rest_cs (tail cs)
+  else false
+
+any_invalid_counter_name xs =
+  if length xs == 0 then false
+  else if counter_name_ok_run (head xs) == false then true
+  else any_invalid_counter_name (tail xs)
+
+-- Split a string on commas; trim each token.
+split_commas_trim raw =
+  let toks = str_split "," raw
+  trim_each toks []
+
+trim_each xs acc =
+  if length xs == 0 then reverse acc
+  else
+    let t = str_trim (head xs)
+    if length (chars t) == 0 then trim_each (tail xs) acc
+    else trim_each (tail xs) (cons t acc)
+
+-- ===========================================================================
+-- Time stamp (UTC ISO-8601 "YYYY-MM-DDTHH:MM:SSZ")
+-- ===========================================================================
+
+current_iso_utc _ =
+  let out = shell "date -u +%Y-%m-%dT%H:%M:%SZ | tr -d '\\n'"
+  str_trim out
+
+-- ===========================================================================
+-- Argv → (flags, opts, positionals)
+-- ===========================================================================
+-- `args` is a zero-arg builtin; the resulting list starts with the
+-- compiled binary path. parse_args (stdlib/args.rail) strips it.
+
+-- ===========================================================================
+-- Help / version
+-- ===========================================================================
+
+print_help_lines _ =
+  let _ = print "usage: ./rail_native run tools/lab/run.rail <subcommand> [args]"
+  let _ = print ""
+  let _ = print "subcommands:"
+  let _ = print "  put-goal \"<goal>\"   run experiment + append to chain"
+  let _ = print "  read <id>            print one entry by id prefix"
+  let _ = print "  search <substr>      search prior entries by goal"
+  let _ = print "  verify <id>          re-verify entry signature"
+  let _ = print "  rebuild-index        rebuild the secondary search index"
+  let _ = print ""
+  let _ = print "common flags:"
+  let _ = print "  --root=<dir>            chain root (default: $RAIL_LAB_HOME or ~/.rail/lab)"
+  let _ = print "  --timeout=<seconds>     per-exec timeout (default 600, max 86400)"
+  let _ = print "  --no-gossip             skip witness countersign"
+  let _ = print "  --require-witnesses=N   exit 9 if <N witnesses respond"
+  let _ = print "  --witnesses=<path>      witnesses.toml-style host list"
+  let _ = print "  --key=<path>            Ed25519 signing key (PEM); else env RAIL_LAB_SIGNING_KEY"
+  let _ = print "  --non-interactive       all fields via flags below (no prompts)"
+  let _ = print "    --kill=<text> --counters=a,b,c --cmd=<text> --parents=<id,id>"
+  let _ = print "    --hypothesis=<text>   (optional; empty when omitted)"
+  let _ = print "  --help    --version"
+  0
+
+print_version_lines _ =
+  let _ = print (cat ["rail-lab-run ", RUN_VERSION])
+  0
+
+-- ===========================================================================
+-- Subcommand: search
+-- ===========================================================================
+
+cmd_search opts pos =
+  if length pos == 0 then
+    let _ = print "error: search requires a substring positional arg"
+    EXIT_GENERIC
+  else
+    let q = head pos
+    let root = get_opt opts "root" ""
+    let h = chain_open_ro root
+    if is_error h then
+      let _ = print (cat ["error: chain open failed: ", err_msg h])
+      EXIT_CHAIN_LOCKED
+    else
+      let ids = chain_search_goal h q
+      let limit = parse_int_run (get_opt opts "limit" (show DEFAULT_SEARCH_LIMIT))
+      let rollup = build_rollup h ids
+      let (pass_c, fals_c, inc_c) = rollup
+      let _ = print (cat [show (length ids), " match(es): ",
+                          show pass_c, " PASS, ",
+                          show fals_c, " FALSIFIED, ",
+                          show inc_c, " INCONCLUSIVE"])
+      let _ = print_match_list h ids limit
+      let _ = chain_close h
+      EXIT_OK
+
+-- Build (pass, falsified, inconclusive) rollup over an id list.
+build_rollup h ids =
+  rollup_loop h ids 0 0 0
+
+rollup_loop h ids pc fc ic =
+  if length ids == 0 then (pc, fc, ic)
+  else
+    let blob = chain_read h (head ids)
+    if is_error blob then rollup_loop h (tail ids) pc fc ic
+    else
+      let parsed = entry_deserialize blob
+      if is_error parsed then rollup_loop h (tail ids) pc fc ic
+      else
+        let (e, _ws) = parsed
+        let v = verdict_to_string (result_verdict (entry_result e))
+        if v == "PASS" then rollup_loop h (tail ids) (pc + 1) fc ic
+        else if v == "FALSIFIED" then rollup_loop h (tail ids) pc (fc + 1) ic
+        else rollup_loop h (tail ids) pc fc (ic + 1)
+
+print_match_list h ids limit =
+  pml_loop h ids limit 0
+
+pml_loop h ids limit i =
+  if length ids == 0 then 0
+  else if i >= limit then
+    let _ = print (cat ["      ... and ", show (length ids), " more (use --limit=N)"])
+    0
+  else
+    let id = head ids
+    let _ = print_one_match h id
+    pml_loop h (tail ids) limit (i + 1)
+
+print_one_match h id =
+  let blob = chain_read h id
+  if is_error blob then
+    let _ = print (cat ["      ", id, " (unreadable)"])
+    0
+  else
+    let parsed = entry_deserialize blob
+    if is_error parsed then
+      let _ = print (cat ["      ", id, " (corrupt)"])
+      0
+    else
+      let (e, _ws) = parsed
+      let short_id = str_sub id 0 8
+      let when = entry_created_at e
+      let v = verdict_to_string (result_verdict (entry_result e))
+      let g = entry_goal e
+      let gp = if length (chars g) > 60 then cat [str_sub g 0 60, "..."] else g
+      let _ = print (cat ["      ", short_id, "  ", when, "  ", v, "  \"", gp, "\""])
+      0
+
+-- ===========================================================================
+-- Subcommand: read
+-- ===========================================================================
+
+cmd_read opts pos =
+  if length pos == 0 then
+    let _ = print "error: read requires an id prefix"
+    EXIT_GENERIC
+  else
+    let prefix_in = head pos
+    let root = get_opt opts "root" ""
+    let h = chain_open_ro root
+    if is_error h then
+      let _ = print (cat ["error: chain open failed: ", err_msg h])
+      EXIT_CHAIN_LOCKED
+    else
+      let full = chain_lookup_prefix h prefix_in
+      if full == "NONE" then
+        let _ = print (cat ["error: no entry matches prefix ", prefix_in])
+        let _ = chain_close h
+        EXIT_GENERIC
+      else if full == "AMBIGUOUS" then
+        let _ = print (cat ["error: prefix ", prefix_in, " matches multiple entries"])
+        let _ = chain_close h
+        EXIT_GENERIC
+      else
+        let blob = chain_read h full
+        if is_error blob then
+          let _ = print (cat ["error: chain_read: ", err_msg blob])
+          let _ = chain_close h
+          EXIT_GENERIC
+        else
+          let _ = print blob
+          let _ = chain_close h
+          EXIT_OK
+
+-- ===========================================================================
+-- Subcommand: verify
+-- ===========================================================================
+
+cmd_verify opts pos =
+  if length pos == 0 then
+    let _ = print "error: verify requires an id prefix"
+    EXIT_GENERIC
+  else
+    let prefix_in = head pos
+    let root = get_opt opts "root" ""
+    let h = chain_open_ro root
+    if is_error h then
+      let _ = print (cat ["error: chain open failed: ", err_msg h])
+      EXIT_CHAIN_LOCKED
+    else
+      let full = chain_lookup_prefix h prefix_in
+      if full == "NONE" then
+        let _ = print (cat ["error: no entry matches prefix ", prefix_in])
+        let _ = chain_close h
+        EXIT_GENERIC
+      else if full == "AMBIGUOUS" then
+        let _ = print (cat ["error: ambiguous prefix ", prefix_in])
+        let _ = chain_close h
+        EXIT_GENERIC
+      else
+        let ok = chain_verify h full
+        let _ = chain_close h
+        if ok then
+          let _ = print (cat ["OK ", full])
+          EXIT_OK
+        else
+          let _ = print (cat ["FAIL ", full])
+          EXIT_GENERIC
+
+-- ===========================================================================
+-- Subcommand: rebuild-index
+-- ===========================================================================
+
+cmd_rebuild_index opts =
+  let root = get_opt opts "root" ""
+  let h = chain_open root
+  if is_error h then
+    let _ = print (cat ["error: chain open failed: ", err_msg h])
+    EXIT_CHAIN_LOCKED
+  else
+    let (h2, n) = chain_rebuild_index_h h
+    if is_error n then
+      let _ = print (cat ["error: rebuild: ", err_msg n])
+      let _ = chain_close h2
+      EXIT_GENERIC
+    else
+      let _ = print (cat ["rebuilt index: ", show n, " entries"])
+      let _ = chain_close h2
+      EXIT_OK
+
+-- ===========================================================================
+-- Subcommand: put-goal (the main path)
+-- ===========================================================================
+
+cmd_put_goal flags opts pos =
+  if length pos == 0 then
+    let _ = print "error: put-goal requires a goal string as positional arg"
+    EXIT_USER_CANCEL
+  else
+    let goal = head pos
+    let root = get_opt opts "root" ""
+    let h = chain_open root
+    if is_error h then
+      let _ = print (cat ["error: chain open failed: ", err_msg h])
+      EXIT_CHAIN_LOCKED
+    else
+      put_goal_with_handle h goal flags opts
+
+put_goal_with_handle h goal flags opts =
+  let non_interactive = has_flag flags "non-interactive"
+  -- Step 1: prior-attempt surface — MANDATORY.
+  let _ = step1_show_priors h goal
+  -- Steps 2-5 (+ optional hypothesis): gather kill/hyp/counters/cmd/parents.
+  let (kill, kill_ok) = step2_kill flags opts non_interactive
+  if kill_ok == 0 then
+    let _ = chain_close h
+    EXIT_USER_CANCEL
+  else
+    let hyp = step_hypothesis flags opts non_interactive
+    let (counters, counters_ok) = step3_counters flags opts non_interactive
+    if counters_ok == 0 then
+      let _ = chain_close h
+      EXIT_USER_CANCEL
+    else
+      let (cmd_str, cmd_ok) = step4_cmd flags opts non_interactive
+      if cmd_ok == 0 then
+        let _ = chain_close h
+        EXIT_USER_CANCEL
+      else
+        let (parents, parents_ok) = step5_parents h flags opts non_interactive
+        if parents_ok == 0 then
+          let _ = chain_close h
+          EXIT_USER_CANCEL
+        else
+          let proceed = confirm_box goal kill counters cmd_str parents non_interactive
+          if proceed == 0 then
+            let _ = chain_close h
+            EXIT_USER_CANCEL
+          else
+            put_goal_phase_c h goal hyp kill counters cmd_str parents flags opts
+
+-- ----- Step 1 --------------------------------------------------------------
+
+step1_show_priors h goal =
+  let _ = print "[1/5] Searching chain for prior attempts on this goal..."
+  let ids = chain_search_goal h goal
+  let (pc, fc, ic) = build_rollup h ids
+  let _ = print (cat ["      ", show (length ids), " prior attempts (",
+                      show pc, " PASS, ",
+                      show fc, " FALSIFIED, ",
+                      show ic, " INCONCLUSIVE)"])
+  if length ids == 0 then
+    let _ = print "      (no prior attempts in window)"
+    0
+  else
+    let _ = print "      Top matches:"
+    let _ = print_match_list h ids DEFAULT_SEARCH_LIMIT
+    0
+
+-- ----- Step 2: kill_target -------------------------------------------------
+
+step2_kill flags opts non_interactive =
+  if non_interactive then
+    let v = str_trim (get_opt opts "kill" "")
+    if length (chars v) == 0 then
+      let _ = print "error: --kill=<text> is required (kill_target)"
+      ("", 0)
+    else (v, 1)
+  else
+    let _ = print "[2/5] Define kill_target (required):"
+    let _ = print "      > (enter on one line, then Return)"
+    let raw = read_line 0
+    let v = str_trim raw
+    if length (chars v) == 0 then
+      let _ = print "error: kill_target required; rerun with a real falsification condition"
+      ("", 0)
+    else (v, 1)
+
+-- ----- Step 2.5 (optional): hypothesis -------------------------------------
+-- Optional free-text field. Empty when omitted (preserves pre-flag behavior).
+-- Validation deferred to entry.rail (entry_new / entry_set_hypothesis).
+
+step_hypothesis flags opts non_interactive =
+  if non_interactive then get_opt opts "hypothesis" ""
+  else
+    let _ = print "[opt] Hypothesis (free text, Enter to skip):"
+    let _ = print "      > "
+    let raw = read_line 0
+    str_trim raw
+
+-- ----- Step 3: counters ----------------------------------------------------
+
+step3_counters flags opts non_interactive =
+  let raw =
+    if non_interactive then get_opt opts "counters" ""
+    else
+      let _ = print "[3/5] Define counters (>=1, comma-separated):"
+      let _ = print "      > "
+      read_line 0
+  let toks = split_commas_trim raw
+  if length toks == 0 then
+    let _ = print "error: at least one counter name is required"
+    ([], 0)
+  else if any_invalid_counter_name toks then
+    let _ = print "error: counter names must match [A-Za-z_][A-Za-z0-9_]*"
+    ([], 0)
+  else (toks, 1)
+
+-- ----- Step 4: cmd ---------------------------------------------------------
+
+step4_cmd flags opts non_interactive =
+  if non_interactive then
+    let v = str_trim (get_opt opts "cmd" "")
+    if length (chars v) == 0 then
+      let _ = print "error: --cmd=<text> is required"
+      ("", 0)
+    else (v, 1)
+  else
+    let _ = print "[4/5] Command to execute:"
+    let _ = print "      > "
+    let raw = read_line 0
+    let v = str_trim raw
+    if length (chars v) == 0 then
+      let _ = print "error: cmd required"
+      ("", 0)
+    else (v, 1)
+
+-- ----- Step 5: parents -----------------------------------------------------
+
+step5_parents h flags opts non_interactive =
+  let raw =
+    if non_interactive then get_opt opts "parents" ""
+    else
+      let _ = print "[5/5] Parent entries (comma-separated id prefixes, blank for none):"
+      let _ = print "      > "
+      read_line 0
+  let trimmed = str_trim raw
+  if length (chars trimmed) == 0 then ([], 1)
+  else
+    let toks = split_commas_trim trimmed
+    resolve_parent_ids h toks []
+
+resolve_parent_ids h toks acc =
+  if length toks == 0 then (reverse acc, 1)
+  else
+    let tok = head toks
+    let full = chain_lookup_prefix h tok
+    if full == "NONE" then
+      let _ = print (cat ["error: parent prefix not found: ", tok])
+      ([], 0)
+    else if full == "AMBIGUOUS" then
+      let _ = print (cat ["error: ambiguous parent prefix: ", tok])
+      ([], 0)
+    else resolve_parent_ids h (tail toks) (cons full acc)
+
+-- ----- Confirmation --------------------------------------------------------
+
+confirm_box goal kill counters cmd parents non_interactive =
+  let _ = print ""
+  let _ = print "About to run:"
+  let _ = print (cat ["  goal:        ", goal])
+  let _ = print (cat ["  kill_target: ", kill])
+  let _ = print (cat ["  counters:    ", join ", " counters])
+  let _ = print (cat ["  cmd:         ", cmd])
+  let _ = print (cat ["  parents:     ", if length parents == 0 then "(none)" else join ", " parents])
+  if non_interactive then 1
+  else
+    let _ = print "Proceed [y/N]? "
+    let r = str_trim (read_line 0)
+    if r == "y" then 1
+    else if r == "Y" then 1
+    else
+      let _ = print "aborted."
+      0
+
+-- ===========================================================================
+-- Phase C..I: exec + parse + sign + append + gossip
+-- ===========================================================================
+
+put_goal_phase_c h goal hyp kill counters cmd parents flags opts =
+  let timeout_s = parse_timeout_opt opts
+  if timeout_s <= 0 then
+    let _ = chain_close h
+    EXIT_GENERIC
+  else
+    let pid = shell_pid 0
+    let capture_dir = cat ["/tmp/rail_lab_run_", show pid]
+    let _ = shell_rc (cat ["rm -rf '", capture_dir, "' && mkdir -p '", capture_dir, "'"])
+    -- Phase C: exec.
+    let (ec, out, _err) = exec_with_timeout cmd timeout_s capture_dir
+    -- Phase D: parse counters + verdict.
+    let block_status = find_counters_block out
+    let verdict_status = find_verdict_token out
+    -- Phase E..H: route by decision.
+    decide_and_record h goal hyp kill counters cmd parents flags opts ec out block_status verdict_status capture_dir timeout_s
+
+parse_timeout_opt opts =
+  let raw = get_opt opts "timeout" (show DEFAULT_TIMEOUT_S)
+  let t = parse_int_run raw
+  if t <= 0 then
+    let _ = print (cat ["error: bad --timeout=", raw])
+    0 - 1
+  else if t > MAX_TIMEOUT_S then
+    let _ = print (cat ["error: --timeout=", raw, " exceeds max ", show MAX_TIMEOUT_S])
+    0 - 1
+  else t
+
+-- ----- Timeout/exec --------------------------------------------------------
+-- Returns (ec, stdout, stderr_unused). ec is string "TIMEOUT" or numeric.
+
+exec_with_timeout cmd timeout_s capture_dir =
+  let out_path = cat [capture_dir, "/out.txt"]
+  let err_path = cat [capture_dir, "/err.txt"]
+  let ec_path  = cat [capture_dir, "/ec.txt"]
+  let cmd_path = cat [capture_dir, "/cmd.sh"]
+  -- Write cmd as a shell script (preserves multi-word commands literally).
+  let _ = write_file cmd_path (cat ["#!/bin/sh\n", cmd, "\n"])
+  let _ = shell_rc (cat ["chmod +x '", cmd_path, "'"])
+  -- Launch with a killer subshell: TERM after T, KILL after T+2.
+  -- We pkill -P the killer to ensure its `sleep` child dies when we
+  -- cancel; otherwise the wait/shell-call blocks for the full timeout
+  -- even after the experiment completes.
+  let timeout_lit = show timeout_s
+  let runner = cat [
+        "{ ( '", cmd_path, "' > '", out_path, "' 2> '", err_path, "' ) & ",
+        "pid=$!; ",
+        "( sleep ", timeout_lit, "; kill -TERM $pid 2>/dev/null; ",
+        "  sleep 2; kill -KILL $pid 2>/dev/null ) & ",
+        "killer=$!; ",
+        "wait $pid; rc=$?; ",
+        "pkill -P $killer 2>/dev/null; ",
+        "kill $killer 2>/dev/null; ",
+        "wait $killer 2>/dev/null; ",
+        "if [ $rc -ge 128 ]; then echo TIMEOUT > '", ec_path, "'; else echo $rc > '", ec_path, "'; fi; } 2>/dev/null"]
+  let _ = shell runner
+  let ec_raw = if path_exists ec_path then str_trim (read_file ec_path) else "1"
+  let out = if path_exists out_path then read_file out_path else ""
+  let err = if path_exists err_path then read_file err_path else ""
+  (ec_raw, out, err)
+
+-- ----- Counter-block scanner -----------------------------------------------
+-- Returns either ("ok", block_text) or ("err", reason).
+
+find_counters_block out =
+  let n_open = count_occurrences COUNTERS_OPEN out 0
+  if n_open == 0 then ("err", "no_counters_block")
+  else if n_open > 1 then ("err", "duplicate_counters_block")
+  else
+    let i1 = str_find COUNTERS_OPEN out
+    let after_open_start = i1 + length (chars COUNTERS_OPEN)
+    -- Find the close. We need it *after* i1.
+    let total = length (chars out)
+    let tail_s = str_sub out after_open_start (total - after_open_start)
+    let i2 = str_find COUNTERS_CLOSE tail_s
+    if i2 < 0 then ("err", "no_counters_block")
+    else
+      let block = str_sub tail_s 0 i2
+      ("ok", block)
+
+count_occurrences needle hay start =
+  let i = str_find needle (str_sub hay start (length (chars hay) - start))
+  if i < 0 then 0
+  else 1 + count_occurrences needle hay (start + i + length (chars needle))
+
+-- Parse the block text into a list of (counter_name, value_str).
+-- Last occurrence wins.
+parse_counter_lines_block block =
+  let lines = split "\n" block
+  parse_counter_lines lines []
+
+parse_counter_lines lines acc =
+  if length lines == 0 then reverse acc
+  else
+    let line = str_trim (head lines)
+    if length (chars line) == 0 then parse_counter_lines (tail lines) acc
+    else if str_starts_with "#" line then parse_counter_lines (tail lines) acc
+    else if str_starts_with "{" line then
+      let r = parse_one_counter_obj line
+      let (ok, k, v) = r
+      if ok == 0 then parse_counter_lines (tail lines) acc
+      else
+        let updated = update_last_wins acc k v
+        parse_counter_lines (tail lines) updated
+    else parse_counter_lines (tail lines) acc
+
+-- Extract "counter" key and "value" key from a single JSON line.
+-- Robust to int OR float values: we extract the raw token between
+-- the colon-following-"value" and the next comma or }.
+parse_one_counter_obj line =
+  let kn = extract_json_string_field line "counter"
+  if length (chars kn) == 0 then (0, "", "")
+  else
+    let vv = extract_json_value_field line "value"
+    if length (chars vv) == 0 then (0, "", "")
+    else (1, kn, vv)
+
+-- Find "<key>": "<value>" and return the value (without quotes).
+-- If value is a non-string scalar (number/bool), return the raw token.
+extract_json_string_field line key =
+  let pat = cat ["\"", key, "\""]
+  let i = str_find pat line
+  if i < 0 then ""
+  else
+    let after_key = str_sub line (i + length (chars pat)) (length (chars line) - i - length (chars pat))
+    -- Skip whitespace + colon.
+    let j = str_find ":" after_key
+    if j < 0 then ""
+    else
+      let after_colon = str_sub after_key (j + 1) (length (chars after_key) - j - 1)
+      let trimmed = cs_to_string (str_ltrim_cs (chars after_colon))
+      if length (chars trimmed) == 0 then ""
+      else if head (chars trimmed) == "\"" then
+        -- String value — find closing quote.
+        let rest = str_sub trimmed 1 (length (chars trimmed) - 1)
+        let close_q = str_find "\"" rest
+        if close_q < 0 then ""
+        else str_sub rest 0 close_q
+      else ""
+
+extract_json_value_field line key =
+  let pat = cat ["\"", key, "\""]
+  let i = str_find pat line
+  if i < 0 then ""
+  else
+    let after_key = str_sub line (i + length (chars pat)) (length (chars line) - i - length (chars pat))
+    let j = str_find ":" after_key
+    if j < 0 then ""
+    else
+      let after_colon = str_sub after_key (j + 1) (length (chars after_key) - j - 1)
+      let trimmed = cs_to_string (str_ltrim_cs (chars after_colon))
+      if length (chars trimmed) == 0 then ""
+      else if head (chars trimmed) == "\"" then
+        let rest = str_sub trimmed 1 (length (chars trimmed) - 1)
+        let close_q = str_find "\"" rest
+        if close_q < 0 then ""
+        else str_sub rest 0 close_q
+      else
+        -- Numeric/bool/null — read until "," or "}" or whitespace.
+        read_scalar_token (chars trimmed) ""
+
+read_scalar_token cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    if c == "," then acc
+    else if c == "}" then acc
+    else if is_ws_char c then acc
+    else read_scalar_token (tail cs) (append acc c)
+
+update_last_wins assoc key new_val =
+  if length assoc == 0 then [(key, new_val)]
+  else
+    let (k, _v) = head assoc
+    if k == key then cons (key, new_val) (tail assoc)
+    else cons (head assoc) (update_last_wins (tail assoc) key new_val)
+
+-- ----- Verdict scanner -----------------------------------------------------
+-- Returns one of "PASS", "FALSIFIED", "INCONCLUSIVE", "NONE", "CONFLICT", "MALFORMED".
+
+find_verdict_token out =
+  let lines = split "\n" out
+  scan_verdicts lines "NONE"
+
+scan_verdicts lines acc =
+  if length lines == 0 then acc
+  else
+    let line = str_trim (head lines)
+    if str_starts_with VERDICT_SENTINEL line then
+      let rest = str_trim (str_sub line (length (chars VERDICT_SENTINEL)) (length (chars line) - length (chars VERDICT_SENTINEL)))
+      let canon = canonicalize_verdict rest
+      if canon == "BAD" then "MALFORMED"
+      else if acc == "NONE" then scan_verdicts (tail lines) canon
+      else if acc == canon then scan_verdicts (tail lines) acc
+      else "CONFLICT"
+    else scan_verdicts (tail lines) acc
+
+canonicalize_verdict s =
+  if s == "PASS" then "PASS"
+  else if s == "FALSIFIED" then "FALSIFIED"
+  else if s == "INCONCLUSIVE" then "INCONCLUSIVE"
+  else "BAD"
+
+-- ----- Decision tree -------------------------------------------------------
+-- Classifier returns one of:
+--   "TIMEOUT"            -> record INCONCLUSIVE, exit 6
+--   "BLOCK_ERR"          -> abort, exit 4 (counter block missing/dup)
+--   "VERDICT_NONE_FAIL"  -> record INCONCLUSIVE w/ exec_failed_<ec>, exit 3
+--   "VERDICT_NONE_OK"    -> abort, exit 4
+--   "VERDICT_CONFLICT"   -> abort, exit 4
+--   "VERDICT_MALFORMED"  -> abort, exit 4
+--   "COUNTER_MISSING"    -> record INCONCLUSIVE, exit 5
+--   "VERDICT_OK_FAIL"    -> record INCONCLUSIVE w/ exec_failed_<ec>, exit 3
+--   "HAPPY"              -> record original verdict, exit 0
+
+decide_and_record h goal hyp kill counters cmd parents flags opts ec out block_status verdict_status capture_dir timeout_s =
+  let is_timeout = str_eq3 0 0 0 ec "TIMEOUT" == 1
+  let is_exec_ok = str_eq3 0 0 0 ec "0" == 1
+  let (bok, block_or_err) = block_status
+  let block_is_err = str_eq3 0 0 0 bok "err" == 1
+  let pairs = if block_is_err then [] else parse_counter_lines_block block_or_err
+  let missing = missing_declared_counters counters pairs []
+  let class_tag = classify_outcome is_timeout block_is_err verdict_status (length missing) is_exec_ok
+  apply_decision class_tag h goal hyp kill counters cmd parents flags opts ec out block_or_err pairs missing capture_dir timeout_s verdict_status
+
+classify_outcome is_timeout block_is_err verdict_status missing_count is_exec_ok =
+  if is_timeout then "TIMEOUT"
+  else if block_is_err then "BLOCK_ERR"
+  else if verdict_status == "NONE" then
+    if is_exec_ok then "VERDICT_NONE_OK" else "VERDICT_NONE_FAIL"
+  else if verdict_status == "CONFLICT" then "VERDICT_CONFLICT"
+  else if verdict_status == "MALFORMED" then "VERDICT_MALFORMED"
+  else if missing_count > 0 then "COUNTER_MISSING"
+  else if is_exec_ok then "HAPPY"
+  else "VERDICT_OK_FAIL"
+
+apply_decision tag h goal hyp kill counters cmd parents flags opts ec out block_or_err pairs missing capture_dir timeout_s verdict_status =
+  if tag == "TIMEOUT" then
+    do_record h goal hyp kill counters cmd parents flags opts pairs missing "INCONCLUSIVE" (cat ["timeout_at_", show timeout_s, "s"]) capture_dir EXIT_TIMEOUT out
+  else if tag == "BLOCK_ERR" then abort_no_entry h out capture_dir block_or_err EXIT_NO_VERDICT
+  else if tag == "VERDICT_NONE_FAIL" then
+    do_record h goal hyp kill counters cmd parents flags opts pairs missing "INCONCLUSIVE" (cat ["exec_failed_", ec]) capture_dir EXIT_EXEC_FAILED out
+  else if tag == "VERDICT_NONE_OK" then abort_no_entry h out capture_dir "no_verdict_sentinel" EXIT_NO_VERDICT
+  else if tag == "VERDICT_CONFLICT" then abort_no_entry h out capture_dir "conflicting_verdicts" EXIT_NO_VERDICT
+  else if tag == "VERDICT_MALFORMED" then abort_no_entry h out capture_dir "malformed_verdict" EXIT_NO_VERDICT
+  else if tag == "COUNTER_MISSING" then
+    do_record h goal hyp kill counters cmd parents flags opts pairs missing "INCONCLUSIVE" (cat ["counter_missing:", join "," missing]) capture_dir EXIT_COUNTER_MISSING out
+  else if tag == "VERDICT_OK_FAIL" then
+    do_record h goal hyp kill counters cmd parents flags opts pairs missing "INCONCLUSIVE" (cat ["exec_failed_", ec]) capture_dir EXIT_EXEC_FAILED out
+  else
+    do_record h goal hyp kill counters cmd parents flags opts pairs missing verdict_status "OK" capture_dir EXIT_OK out
+
+abort_no_entry h out capture_dir reason code =
+  let _ = save_unrecorded out capture_dir
+  let _ = print (cat ["Reason: ", reason, " (no entry appended)"])
+  let _ = chain_close h
+  code
+
+missing_declared_counters declared pairs acc =
+  if length declared == 0 then reverse acc
+  else
+    let name = head declared
+    if pair_has_key pairs name then missing_declared_counters (tail declared) pairs acc
+    else missing_declared_counters (tail declared) pairs (cons name acc)
+
+pair_has_key pairs key =
+  if length pairs == 0 then false
+  else
+    let (k, _v) = head pairs
+    if k == key then true
+    else pair_has_key (tail pairs) key
+
+-- ===========================================================================
+-- Phase E..I: build entry, sign, append, gossip, print
+-- ===========================================================================
+
+do_record h goal hyp kill counters cmd parents flags opts pairs missing verdict_str runner_error capture_dir base_exit_code out =
+  let created_at = current_iso_utc 0
+  -- Phase E: entry_new (hypothesis flows in as the second arg; empty when
+  -- the --hypothesis flag was omitted or the interactive prompt was blank).
+  let base = entry_new goal hyp kill counters cmd created_at
+  if is_error base then
+    let _ = print (cat ["error: entry_new failed: ", err_msg base])
+    let _ = chain_close h
+    EXIT_GENERIC
+  else
+    let verdict_adt = verdict_from_string verdict_str
+    if is_error verdict_adt then
+      let _ = print (cat ["error: verdict_from_string: ", err_msg verdict_adt])
+      let _ = chain_close h
+      EXIT_GENERIC
+    else
+      let withr = entry_set_result base verdict_adt pairs
+      if is_error withr then
+        let _ = print (cat ["error: entry_set_result: ", err_msg withr])
+        let _ = chain_close h
+        EXIT_GENERIC
+      else
+        let withp = if length parents == 0 then withr else entry_set_parents withr parents
+        if is_error withp then
+          let _ = print (cat ["error: entry_set_parents: ", err_msg withp])
+          let _ = chain_close h
+          EXIT_GENERIC
+        else
+          phase_f_sign h withp counters cmd parents goal kill verdict_str runner_error capture_dir base_exit_code flags opts pairs
+
+-- ----- Phase F: sign -------------------------------------------------------
+
+phase_f_sign h entry counters cmd parents goal kill verdict_str runner_error capture_dir base_exit_code flags opts pairs =
+  let key_path = resolve_signing_key flags opts
+  if length (chars key_path) == 0 then
+    let _ = print "error: no signing key (set --key=<path> or RAIL_LAB_SIGNING_KEY)"
+    let _ = chain_close h
+    EXIT_SIGN_FAILED
+  else if path_exists key_path == false then
+    let _ = print (cat ["error: signing key not found: ", key_path])
+    let _ = chain_close h
+    EXIT_SIGN_FAILED
+  else
+    let pub_hex = derive_pubkey_hex key_path
+    if length (chars pub_hex) != 64 then
+      let _ = print (cat ["error: cannot derive pubkey hex (got len ", show (length (chars pub_hex)), ")"])
+      let _ = chain_close h
+      EXIT_SIGN_FAILED
+    else
+      let body = build_body_to_sign entry pub_hex
+      if is_error body then
+        let _ = print (cat ["error: canonical body: ", err_msg body])
+        let _ = chain_close h
+        EXIT_SIGN_FAILED
+      else
+        let sig_hex = sign_body_with_key key_path body
+        if length (chars sig_hex) != 128 then
+          let _ = print (cat ["error: openssl sign produced bad sig (len ", show (length (chars sig_hex)), ")"])
+          let _ = chain_close h
+          EXIT_SIGN_FAILED
+        else
+          let signed = entry_sign entry pub_hex sig_hex
+          if is_error signed then
+            let _ = print (cat ["error: entry_sign: ", err_msg signed])
+            let _ = chain_close h
+            EXIT_SIGN_FAILED
+          else
+            phase_g_append h signed capture_dir base_exit_code runner_error verdict_str flags opts
+
+resolve_signing_key flags opts =
+  let from_flag = get_opt opts "key" ""
+  if length (chars from_flag) > 0 then from_flag
+  else get_env "RAIL_LAB_SIGNING_KEY"
+
+-- Use the entry's canonical body, but with signer pre-injected (per
+-- entry.rail's contract: signer is bound into the digest BEFORE the sig
+-- is computed).
+build_body_to_sign entry pub_hex =
+  let with_signer = inject_signer entry pub_hex
+  entry_canonical_body with_signer
+
+inject_signer e pub_hex = match e
+  | Entry _id parents goal hyp kill cs cmd r pul wts created _sig _signer ->
+      Entry "" parents goal hyp kill cs cmd r pul wts created "" pub_hex
+
+-- Run openssl to sign the body bytes. Returns 128-char hex on success.
+sign_body_with_key key_path body =
+  let pid = shell_pid 0
+  let body_path = cat ["/tmp/rail_lab_signbody_", show pid, ".bin"]
+  let sig_path  = cat ["/tmp/rail_lab_signsig_", show pid, ".bin"]
+  let _ = write_file body_path body
+  let cmd = cat ["openssl pkeyutl -sign -inkey '", key_path,
+                 "' -rawin -in '", body_path,
+                 "' -out '", sig_path, "' 2>/dev/null && xxd -p -c 256 '",
+                 sig_path, "' | tr -d '\\n'"]
+  let hex_out = shell cmd
+  let _ = shell (cat ["rm -f '", body_path, "' '", sig_path, "'"])
+  str_trim hex_out
+
+derive_pubkey_hex key_path =
+  -- openssl pkey -pubout -outform DER yields:
+  --   302a300506032b6570032100<32-byte-key>
+  -- That prefix is 12 bytes / 24 hex chars. Strip and lowercase.
+  let cmd = cat ["openssl pkey -in '", key_path,
+                 "' -pubout -outform DER 2>/dev/null | xxd -p -c 256 | tr -d '\\n'"]
+  let der_hex = str_trim (shell cmd)
+  if length (chars der_hex) < 24 then ""
+  else
+    let candidate = str_sub der_hex 24 (length (chars der_hex) - 24)
+    if length (chars candidate) == 64 then candidate
+    else ""
+
+-- ----- Phase G: append -----------------------------------------------------
+
+phase_g_append h signed_entry capture_dir base_exit_code runner_error verdict_str flags opts =
+  let blob = entry_serialize signed_entry []
+  let (h2, id) = chain_append_h h blob
+  if is_error id then
+    let msg = err_msg id
+    let _ = print (cat ["error: chain_append: ", msg])
+    let _ = chain_close h2
+    if str_starts_with "chain:locked" msg then EXIT_CHAIN_LOCKED
+    else if str_starts_with "chain:no-lock" msg then EXIT_CHAIN_LOCKED
+    else EXIT_GENERIC
+  else
+    -- Save capture as recorded (best-effort).
+    let _ = move_capture_to_recorded capture_dir id
+    -- Phase H: gossip.
+    let gossip_result = phase_h_gossip h2 id flags opts
+    let (resp_count, threshold) = gossip_result
+    let required = parse_int_run (get_opt opts "require-witnesses" "0")
+    -- Phase I: report.
+    let _ = print "[OK] entry recorded"
+    let _ = print (cat ["  id:       ", id])
+    let _ = print (cat ["  verdict:  ", verdict_str])
+    let _ = print (cat ["  runner:   ", runner_error])
+    let _ = print (cat ["  gossip:   ", show resp_count, "/", show threshold, " witnesses"])
+    let _ = chain_close h2
+    if required > 0 && resp_count < required then EXIT_GOSSIP_REQUIRED
+    else base_exit_code
+
+move_capture_to_recorded capture_dir id =
+  -- Best-effort: move /tmp/rail_lab_run_<pid> to attest/runs/<id>/. Caller
+  -- doesn't depend on success.
+  let root = resolve_root ""
+  let runs_dir = cat [root, "/runs"]
+  let _ = mkdir_p runs_dir
+  let dst = cat [runs_dir, "/", id]
+  let _ = shell_rc (cat ["rm -rf '", dst, "' && mv '", capture_dir, "' '", dst, "' 2>/dev/null"])
+  0
+
+save_unrecorded out capture_dir =
+  let root = resolve_root ""
+  let dir = cat [root, "/runs_unrecorded"]
+  let _ = mkdir_p dir
+  let ts = current_iso_utc 0
+  let dst = cat [dir, "/", ts, "_", show (shell_pid 0)]
+  let _ = shell_rc (cat ["rm -rf '", dst, "' && mv '", capture_dir, "' '", dst, "' 2>/dev/null"])
+  let _ = print (cat ["capture saved at: ", dst])
+  0
+
+-- ----- Phase H: gossip -----------------------------------------------------
+
+phase_h_gossip h id flags opts =
+  if has_flag flags "no-gossip" then (0, 0)
+  else
+    let witness_path = get_opt opts "witnesses" ""
+    let hosts = parse_witness_file witness_path
+    if length hosts == 0 then (0, 0)
+    else
+      let result = chain_gossip_to_witnesses h id hosts
+      let count = if is_error result then 0 else length result
+      (count, length hosts)
+
+-- Parse a witnesses.toml-style file. Format: one host per line, optional
+-- `host = "<value>"` or bare `<value>`. Lines starting with `#` or blank
+-- lines are ignored. Quoted strings have outer quotes stripped.
+parse_witness_file path =
+  if length (chars path) == 0 then []
+  else if path_exists path == false then []
+  else
+    let raw = read_file path
+    let lines = split "\n" raw
+    parse_witness_lines lines []
+
+parse_witness_lines lines acc =
+  if length lines == 0 then reverse acc
+  else
+    let line = str_trim (head lines)
+    if length (chars line) == 0 then parse_witness_lines (tail lines) acc
+    else if str_starts_with "#" line then parse_witness_lines (tail lines) acc
+    else
+      let host = extract_host_value line
+      if length (chars host) == 0 then parse_witness_lines (tail lines) acc
+      else parse_witness_lines (tail lines) (cons host acc)
+
+extract_host_value line =
+  -- Accept either "host = value" or bare "value". Strip surrounding quotes.
+  let eq_idx = str_find "=" line
+  let candidate =
+    if eq_idx < 0 then str_trim line
+    else str_trim (str_sub line (eq_idx + 1) (length (chars line) - eq_idx - 1))
+  if length (chars candidate) == 0 then ""
+  else
+    let cs = chars candidate
+    if head cs == "\"" then
+      let inner = str_sub candidate 1 (length cs - 1)
+      let cs2 = chars inner
+      if length cs2 > 0 then
+        let last = str_sub inner (length cs2 - 1) 1
+        if last == "\"" then str_sub inner 0 (length cs2 - 1)
+        else inner
+      else inner
+    else candidate
+
+-- ===========================================================================
+-- Main / dispatch
+-- ===========================================================================
+
+main =
+  let av = args
+  let (flags, opts, pos) = parse_args av
+  if has_flag flags "help" then print_help_lines 0
+  else if has_flag flags "version" then print_version_lines 0
+  else if length pos == 0 then
+    let _ = print "error: no subcommand. try `put-goal \"<goal>\"`."
+    EXIT_GENERIC
+  else
+    let sub = head pos
+    let rest = tail pos
+    dispatch_sub sub flags opts rest
+
+dispatch_sub sub flags opts pos =
+  if sub == "put-goal" then cmd_put_goal flags opts pos
+  else if sub == "read" then cmd_read opts pos
+  else if sub == "search" then cmd_search opts pos
+  else if sub == "verify" then cmd_verify opts pos
+  else if sub == "rebuild-index" then cmd_rebuild_index opts
+  else
+    let _ = print (cat ["error: unknown subcommand: ", sub])
+    EXIT_GENERIC
+
+-- ===========================================================================
+-- End of run.rail
+-- ===========================================================================

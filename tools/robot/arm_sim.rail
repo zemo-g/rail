@@ -1,0 +1,215 @@
+-- tools/robot/arm_sim.rail
+--
+-- Robot-arm sim. Pure Rail. Interprets a script (list of Cmd from
+-- stdlib/robot_arm.rail) against a single-object world and reports
+-- final state on stdout as a single line the bench grader parses.
+--
+-- World model (v0, deliberately minimal):
+--   - 30x30x30 cm workspace
+--   - 0 or 1 object ("ball") at a known starting position (object_x,
+--     object_y, object_z, present_flag) baked into the bench prompt
+--   - 6-DOF position is ignored; end-effector tracks (x,y,z) + grip
+--
+-- End-effector state:
+--   ex, ey, ez   : integer position
+--   grip         : 0 = open, 1 = closed
+--   held         : 0 = empty, 1 = holding the ball
+--   obx, oby, obz: ball position (0,0,0 if no ball or after being placed)
+--   present      : 0 = ball not in world (consumed or none placed), 1 = present
+--   fault        : 0 = OK; non-zero codes documented below
+--   steps        : count of cmds executed successfully (before fault)
+--
+-- Fault codes:
+--   0 OK
+--   1 out_of_bounds       MoveTo target outside [0,30]^3
+--   2 grip_already_closed  SetGrip Close while grip already closed
+--   3 grip_already_open    SetGrip Open while grip already open
+--   4 grip_no_object       Close grip but no object within tolerance of effector
+--   5 release_no_object    Open grip but not currently holding anything
+--   6 wait_negative        Wait with ms < 0
+--   7 unknown_cmd          Defensive; shouldn't happen with type-safe Cmd
+--
+-- Grip pickup tolerance: position match (Manhattan distance <= 1 cm)
+-- between effector and ball position.
+--
+-- Library policy: this file IS executable but exposes its top-level
+-- functions so a grader can `import "tools/robot/arm_sim.rail"` and
+-- call `run_sim` directly. `main` is therefore a smoke harness; the
+-- grader wraps the LLM-emitted `script` with a different `main`.
+
+import "stdlib/robot_arm.rail"
+
+-- ---------------------------------------------------------------------
+-- State encoding: a 9-int list [ex, ey, ez, grip, held, obx, oby, obz, present, fault, steps]
+-- Indexing helpers (avoids tuple constructors which Rail doesn't have).
+-- ---------------------------------------------------------------------
+
+mk_state ex ey ez grip held obx oby obz present fault steps =
+  [ex, ey, ez, grip, held, obx, oby, obz, present, fault, steps]
+
+s_ex st       = head st
+s_ey st       = head (tail st)
+s_ez st       = head (tail (tail st))
+s_grip st     = head (tail (tail (tail st)))
+s_held st     = head (tail (tail (tail (tail st))))
+s_obx st      = head (tail (tail (tail (tail (tail st)))))
+s_oby st      = head (tail (tail (tail (tail (tail (tail st))))))
+s_obz st      = head (tail (tail (tail (tail (tail (tail (tail st)))))))
+s_present st  = head (tail (tail (tail (tail (tail (tail (tail (tail st))))))))
+s_fault st    = head (tail (tail (tail (tail (tail (tail (tail (tail (tail st)))))))))
+s_steps st    = head (tail (tail (tail (tail (tail (tail (tail (tail (tail (tail st))))))))))
+
+-- Initial state given a starting object position. If obx<0 (sentinel),
+-- no object is present.
+init_state obx oby obz =
+  if obx < 0 then mk_state 0 0 0 0 0 0 0 0 0 0 0
+  else mk_state 0 0 0 0 0 obx oby obz 1 0 0
+
+-- Full-state init: arm position, grip, held, ball position, presence.
+-- Used by the conversational REPL (tools/robot/talk.sh) which threads
+-- state across turns instead of starting fresh every time.
+init_state_full ax ay az grip held obx oby obz present =
+  mk_state ax ay az grip held obx oby obz present 0 0
+
+-- Helper: absolute value for distance check.
+abs_i n = if n < 0 then 0 - n else n
+
+manhattan ax ay az bx by bz =
+  (abs_i (ax - bx)) + (abs_i (ay - by)) + (abs_i (az - bz))
+
+-- ---------------------------------------------------------------------
+-- Step interpreter: apply one Cmd to current state, returning new state.
+-- ---------------------------------------------------------------------
+
+-- Apply MoveTo. If held, the ball moves with the effector.
+apply_move st x y z =
+  if in_bounds x y z then
+    if (s_held st) == 1 then
+      mk_state x y z (s_grip st) 1 x y z (s_present st) 0 ((s_steps st) + 1)
+    else
+      mk_state x y z (s_grip st) 0 (s_obx st) (s_oby st) (s_obz st) (s_present st) 0 ((s_steps st) + 1)
+  else
+    mk_state (s_ex st) (s_ey st) (s_ez st) (s_grip st) (s_held st)
+             (s_obx st) (s_oby st) (s_obz st) (s_present st) 1 (s_steps st)
+
+-- Apply SetGrip Close. Pick up ball if effector within tolerance AND
+-- ball present AND not already held. Otherwise fault.
+apply_grip_close st =
+  if (s_grip st) == 1 then
+    mk_state (s_ex st) (s_ey st) (s_ez st) 1 (s_held st)
+             (s_obx st) (s_oby st) (s_obz st) (s_present st) 2 (s_steps st)
+  else if (s_present st) == 0 then
+    mk_state (s_ex st) (s_ey st) (s_ez st) 1 0
+             (s_obx st) (s_oby st) (s_obz st) (s_present st) 4 (s_steps st)
+  else if (manhattan (s_ex st) (s_ey st) (s_ez st) (s_obx st) (s_oby st) (s_obz st)) > 1 then
+    mk_state (s_ex st) (s_ey st) (s_ez st) 1 0
+             (s_obx st) (s_oby st) (s_obz st) (s_present st) 4 (s_steps st)
+  else
+    mk_state (s_ex st) (s_ey st) (s_ez st) 1 1
+             (s_obx st) (s_oby st) (s_obz st) (s_present st) 0 ((s_steps st) + 1)
+
+-- Apply SetGrip Open. Release ball at current position if held; otherwise
+-- (already open) fault. Releasing while not holding is also fault.
+apply_grip_open st =
+  if (s_grip st) == 0 then
+    mk_state (s_ex st) (s_ey st) (s_ez st) 0 (s_held st)
+             (s_obx st) (s_oby st) (s_obz st) (s_present st) 3 (s_steps st)
+  else if (s_held st) == 0 then
+    -- grip was closed but holding nothing: just open it (no fault); useful
+    -- for "grip the air" scripts that happen to be on the path to a pickup
+    mk_state (s_ex st) (s_ey st) (s_ez st) 0 0
+             (s_obx st) (s_oby st) (s_obz st) (s_present st) 0 ((s_steps st) + 1)
+  else
+    -- holding the ball: release it at effector position
+    mk_state (s_ex st) (s_ey st) (s_ez st) 0 0
+             (s_ex st) (s_ey st) (s_ez st) (s_present st) 0 ((s_steps st) + 1)
+
+apply_wait st ms =
+  if ms < 0 then
+    mk_state (s_ex st) (s_ey st) (s_ez st) (s_grip st) (s_held st)
+             (s_obx st) (s_oby st) (s_obz st) (s_present st) 6 (s_steps st)
+  else
+    mk_state (s_ex st) (s_ey st) (s_ez st) (s_grip st) (s_held st)
+             (s_obx st) (s_oby st) (s_obz st) (s_present st) 0 ((s_steps st) + 1)
+
+-- Home is pure navigation: move to (0,0,0). Does NOT touch the grip
+-- (earlier draft auto-opened the grip; substrate scripts treated Home
+-- as a navigation primitive, which is the more intuitive reading).
+apply_home st = apply_move st 0 0 0
+
+-- Inner dispatch on Grip alone to avoid nested-constructor match patterns
+-- (the compiler has trouble distinguishing nullary inner constructors).
+apply_set_grip st g = match g
+  | GripClose -> apply_grip_close st
+  | GripOpen -> apply_grip_open st
+
+step_cmd st c = match c
+  | MoveTo x y z -> apply_move st x y z
+  | SetGrip g -> apply_set_grip st g
+  | Wait ms -> apply_wait st ms
+  | Home -> apply_home st
+
+-- ---------------------------------------------------------------------
+-- run_sim: thread state through the script, stopping at first fault.
+-- ---------------------------------------------------------------------
+
+run_sim_loop st cs =
+  if length cs == 0 then st
+  else if (s_fault st) > 0 then st
+  else run_sim_loop (step_cmd st (head cs)) (tail cs)
+
+run_sim_with_world script obx oby obz =
+  run_sim_loop (init_state obx oby obz) script
+
+run_sim script = run_sim_with_world script (0 - 1) 0 0
+
+-- Resume sim from an explicit prior state. Used by the conversational
+-- REPL so a sequence of user turns shares one world.
+run_sim_from_state script ax ay az grip held obx oby obz present =
+  run_sim_loop (init_state_full ax ay az grip held obx oby obz present) script
+
+-- ---------------------------------------------------------------------
+-- Output: single-line SIM_RESULT for grader parsing.
+-- ---------------------------------------------------------------------
+
+sim_result_line st =
+  cat [
+    "SIM_RESULT ex=", show (s_ex st),
+    " ey=", show (s_ey st),
+    " ez=", show (s_ez st),
+    " grip=", show (s_grip st),
+    " held=", show (s_held st),
+    " obx=", show (s_obx st),
+    " oby=", show (s_oby st),
+    " obz=", show (s_obz st),
+    " present=", show (s_present st),
+    " fault=", show (s_fault st),
+    " steps=", show (s_steps st)
+  ]
+
+print_sim st =
+  let _ = print (sim_result_line st)
+  0
+
+-- Emit a [CMDS] block listing each Cmd in execution order. Used by
+-- the REPL to log issued commands to /tmp/arm_commands.log; the
+-- physical-arm driver will read the same format.
+print_cmds cs =
+  let _ = print "[CMDS]"
+  let _ = print (script_str cs)
+  let _ = print "[/CMDS]"
+  0
+
+-- Goal-reach check: takes expected (gex, gey, gez, ggrip, gheld) and
+-- returns 1 if matches, 0 otherwise. fault==0 is mandatory.
+goal_reached st gex gey gez ggrip gheld =
+  if (s_fault st) > 0 then 0
+  else if (s_ex st) != gex then 0
+  else if (s_ey st) != gey then 0
+  else if (s_ez st) != gez then 0
+  else if (s_grip st) != ggrip then 0
+  else if (s_held st) != gheld then 0
+  else 1
+
+-- (No main: this file is a LIBRARY. See tools/robot/arm_sim_smoke.rail
+-- for the runnable smoke harness.)

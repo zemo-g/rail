@@ -1,0 +1,411 @@
+-- tools/lab/test_chain.rail — Acceptance tests for chain.rail.
+--
+-- Run: ./rail_native run tools/lab/test_chain.rail
+--
+-- Exit 0 + last-line `PASS` iff every test passes.
+--
+-- Each test gets a fresh chain root under /tmp so they are independent.
+
+import "tools/lab/chain.rail"
+
+-- ── Test harness ──────────────────────────────────────────────────────
+--
+-- Same first-3-untagged-int-param quirk as test_entry.rail: pad helper
+-- functions with leading dummy args so the actual operands land at
+-- slot 4+ (where they are tagged and string `==` compares contents).
+
+str_eq _d1 _d2 _d3 a b = if a == b then 1 else 0
+int_eq _d1 _d2 _d3 a b = if a == b then 1 else 0
+
+assert_true label cond = if cond then 1 else
+  let _ = print (cat ["FAIL: ", label])
+  0
+
+assert_eq_int label a b = if int_eq 0 0 0 a b == 1 then 1 else
+  let _ = print (cat ["FAIL: ", label, " expected=", show b, " got=", show a])
+  0
+
+assert_eq_str label a b = if str_eq 0 0 0 a b == 1 then 1 else
+  let _ = print (cat ["FAIL: ", label])
+  let _ = print (cat ["       expected=", b])
+  let _ = print (cat ["       got     =", a])
+  0
+
+assert_err label expected_code val =
+  if is_error val == false then
+    let _ = print (cat ["FAIL: ", label, " expected error ", expected_code, " got non-error"])
+    0
+  else
+    let msg = err_msg val
+    let n = length (chars expected_code)
+    let prefix = str_sub msg 0 n
+    if str_eq 0 0 0 prefix expected_code == 1 then 1
+    else
+      let _ = print (cat ["FAIL: ", label, " expected ", expected_code, " got ", msg])
+      0
+
+assert_ok label val =
+  if is_error val then
+    let _ = print (cat ["FAIL: ", label, " unexpected error: ", err_msg val])
+    0
+  else 1
+
+-- Hex fixtures (the same as test_entry.rail uses).
+PUB_HEX = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+SIG_HEX = "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+
+-- Build a unique chain root for each test invocation.
+mk_root tag =
+  let pid = shell "echo $$"
+  let p = parse_int_dec pid
+  let path = cat ["/tmp/rail_chain_test_", show p, "_", tag]
+  let _ = shell (cat ["rm -rf '", path, "'"])
+  path
+
+-- Build a signed entry with the given goal/hypothesis/parents/verdict.
+mk_entry goal hyp parents verdict =
+  let base = entry_new goal hyp "kill" ["loss"] "echo hi" "2026-05-15T12:00:00Z"
+  let r1 = if length parents == 0 then base else entry_set_parents base parents
+  let r2 = entry_set_result r1 verdict [("loss", "0.1")]
+  entry_sign r2 PUB_HEX SIG_HEX
+
+mk_entry_blob goal hyp parents verdict =
+  let e = mk_entry goal hyp parents verdict
+  if is_error e then e
+  else entry_serialize e []
+
+-- ── T-APPEND-GET: append, then chain_get returns byte-identical blob ──
+
+t_append_get _ =
+  let root = mk_root "append_get"
+  let h = chain_open root
+  if is_error h then
+    let _ = print (cat ["FAIL: T-APPEND-GET open: ", err_msg h])
+    0
+  else
+    let blob = mk_entry_blob "test goal one" "" [] Pass
+    if is_error blob then
+      let _ = print (cat ["FAIL: T-APPEND-GET build: ", err_msg blob])
+      let _ = chain_close h
+      0
+    else
+      let (h2, id) = chain_append_h h blob
+      if is_error id then
+        let _ = print (cat ["FAIL: T-APPEND-GET append: ", err_msg id])
+        let _ = chain_close h2
+        0
+      else
+        let got = chain_get h2 id
+        let p1 = assert_ok "T-APPEND-GET: get ok" got
+        let p2 = if p1 == 1 then assert_eq_str "T-APPEND-GET: round-trip blob" got blob else 0
+        let _ = chain_close h2
+        p1 * p2
+
+-- ── T-DUP: duplicate append refused ───────────────────────────────────
+
+t_dup _ =
+  let root = mk_root "dup"
+  let h = chain_open root
+  let blob = mk_entry_blob "dup goal" "" [] Pass
+  let (h2, id1) = chain_append_h h blob
+  let p1 = assert_ok "T-DUP: first append ok" id1
+  let (h3, id2) = chain_append_h h2 blob
+  let p2 = assert_err "T-DUP: second append errors duplicate-id" "chain:duplicate-id" id2
+  -- Confirm the log still has exactly ONE line.
+  let _ = chain_close h3
+  let log = read_file (cat [root, "/chain/log.jsonl"])
+  let nl_count = count_newlines (chars log) 0
+  let p3 = assert_eq_int "T-DUP: log line count is 1" nl_count 1
+  p1 * p2 * p3
+
+count_newlines cs acc =
+  if length cs == 0 then acc
+  else if head cs == "\n" then count_newlines (tail cs) (acc + 1)
+  else count_newlines (tail cs) acc
+
+-- ── T-PARENT-MISSING: appending with a non-existent parent → error ────
+
+t_parent_missing _ =
+  let root = mk_root "parent_missing"
+  let h = chain_open root
+  let fake_parent = "aa11111111111111111111111111111111111111111111111111111111111111"
+  let blob = mk_entry_blob "child goal" "" [fake_parent] Pass
+  let (h2, id) = chain_append_h h blob
+  let _ = chain_close h2
+  assert_err "T-PARENT-MISSING: dangling parent rejected" "chain:parent-missing" id
+
+-- ── T-PARENT-WALK: 3-entry parent chain ───────────────────────────────
+
+t_parent_walk _ =
+  let root = mk_root "parent_walk"
+  let h0 = chain_open root
+  let bA = mk_entry_blob "root A" "" [] Pass
+  let (h1, idA) = chain_append_h h0 bA
+  let bB = mk_entry_blob "node B" "" [idA] Pass
+  let (h2, idB) = chain_append_h h1 bB
+  let bC = mk_entry_blob "node C" "" [idB] Pass
+  let (h3, idC) = chain_append_h h2 bC
+  let walk = chain_walk_parents h3 idC 10
+  let p1 = assert_eq_int "T-PARENT-WALK: walk length is 3" (length walk) 3
+  let p2 = assert_eq_str "T-PARENT-WALK: start with idC" (head walk) idC
+  let p3 = assert_eq_str "T-PARENT-WALK: middle idB" (head (tail walk)) idB
+  let p4 = assert_eq_str "T-PARENT-WALK: end idA" (head (tail (tail walk))) idA
+  -- Children walk from A should include B and C.
+  let kids = chain_walk_children h3 idA 10
+  let p5 = assert_eq_int "T-PARENT-WALK: children depth 10 = 3" (length kids) 3
+  let _ = chain_close h3
+  p1 * p2 * p3 * p4 * p5
+
+-- ── T-SEARCH-GOAL: substring across multiple entries ──────────────────
+
+t_search_goal _ =
+  let root = mk_root "search_goal"
+  let h0 = chain_open root
+  let b1 = mk_entry_blob "rmsnorm tanh tweak A" "" [] Pass
+  let (h1, _id1) = chain_append_h h0 b1
+  let b2 = mk_entry_blob "try RMSNORM with cap" "" [] Pass
+  let (h2, _id2) = chain_append_h h1 b2
+  let b3 = mk_entry_blob "unrelated softmax change" "" [] Pass
+  let (h3, _id3) = chain_append_h h2 b3
+  let hits = chain_search_goal h3 "rmsnorm"
+  let p1 = assert_eq_int "T-SEARCH-GOAL: 2 hits for rmsnorm" (length hits) 2
+  let hits2 = chain_search_goal h3 "softmax"
+  let p2 = assert_eq_int "T-SEARCH-GOAL: 1 hit for softmax" (length hits2) 1
+  let hits3 = chain_search_goal h3 "nonexistent"
+  let p3 = assert_eq_int "T-SEARCH-GOAL: 0 hits for nonexistent" (length hits3) 0
+  let _ = chain_close h3
+  p1 * p2 * p3
+
+-- ── T-VERDICT-COUNT: N hypothesis children, K FALSIFIED ───────────────
+
+t_verdict_count _ =
+  let root = mk_root "verdict_count"
+  let h0 = chain_open root
+  -- Hypothesis "entry" H.
+  let bH = mk_entry_blob "hypothesis: this trick works" "tanh scaling" [] Inconclusive
+  let (h1, idH) = chain_append_h h0 bH
+  -- 3 falsifying children, 1 confirming.
+  let bF1 = mk_entry_blob "attempt 1 falsify" "" [idH] Falsified
+  let (h2, _) = chain_append_h h1 bF1
+  let bF2 = mk_entry_blob "attempt 2 falsify" "" [idH] Falsified
+  let (h3, _) = chain_append_h h2 bF2
+  let bF3 = mk_entry_blob "attempt 3 falsify" "" [idH] Falsified
+  let (h4, _) = chain_append_h h3 bF3
+  let bP1 = mk_entry_blob "attempt 4 pass" "" [idH] Pass
+  let (h5, _) = chain_append_h h4 bP1
+  let tally = chain_count_verdict_for_hypothesis h5 (HypById idH)
+  -- tally is [("FALSIFIED",f), ("INCONCLUSIVE",i), ("PASS",p)]
+  let (_t1, f_count) = head tally
+  let (_t2, i_count) = head (tail tally)
+  let (_t3, p_count) = head (tail (tail tally))
+  let p1 = assert_eq_int "T-VERDICT-COUNT: FALSIFIED == 3" f_count 3
+  let p2 = assert_eq_int "T-VERDICT-COUNT: PASS == 1" p_count 1
+  let p3 = assert_eq_int "T-VERDICT-COUNT: INCONCLUSIVE == 0" i_count 0
+  let _ = chain_close h5
+  p1 * p2 * p3
+
+-- ── T-INDEX-REBUILD: nuke index/, reopen, still works ─────────────────
+
+t_index_rebuild _ =
+  let root = mk_root "index_rebuild"
+  let h0 = chain_open root
+  let b1 = mk_entry_blob "alpha goal" "" [] Pass
+  let (h1, id1) = chain_append_h h0 b1
+  let b2 = mk_entry_blob "beta goal beta" "" [id1] Pass
+  let (h2, id2) = chain_append_h h1 b2
+  let _ = chain_close h2
+  -- Nuke index dir.
+  let _ = shell (cat ["rm -rf '", root, "/chain/index'"])
+  let h3 = chain_open root
+  let got1 = chain_get h3 id1
+  let p1 = assert_ok "T-INDEX-REBUILD: get after rebuild" got1
+  let p2 = if p1 == 1 then assert_eq_str "T-INDEX-REBUILD: blob preserved" got1 b1 else 0
+  let hits = chain_search_goal h3 "beta"
+  let p3 = assert_eq_int "T-INDEX-REBUILD: search still works (1 hit for beta)" (length hits) 1
+  let p4 = assert_eq_int "T-INDEX-REBUILD: entry count == 2" (chain_entry_count h3) 2
+  let _ = chain_close h3
+  p1 * p2 * p3 * p4
+
+-- ── T-ATOMIC: simulated mid-append failure ────────────────────────────
+--
+-- We cannot easily kill -9 mid-write from inside Rail. Instead we
+-- exercise the duplicate-id rejection path which already guarantees
+-- byte-identical log: a rejected append must NOT touch log.jsonl.
+-- The test records sha256(log) before + after a failing append and
+-- asserts equality. This proves the index-update-only-after-write-ok
+-- invariant in the same code path that "real" failures would take.
+
+t_atomic _ =
+  let root = mk_root "atomic"
+  let h0 = chain_open root
+  let b1 = mk_entry_blob "stable entry" "" [] Pass
+  let (h1, _id1) = chain_append_h h0 b1
+  let log_path = cat [root, "/chain/log.jsonl"]
+  let before = read_file log_path
+  let before_sha = sha256_hex before
+  -- Attempt to append the same blob → duplicate-id error.
+  let (h2, dup_err) = chain_append_h h1 b1
+  let p1 = assert_err "T-ATOMIC: dup attempt errors" "chain:duplicate-id" dup_err
+  let after = read_file log_path
+  let after_sha = sha256_hex after
+  let p2 = assert_eq_str "T-ATOMIC: log byte-identical post-failure" after_sha before_sha
+  -- Attempt to append with a dangling parent → parent-missing.
+  let bad = mk_entry_blob "bad child" "" ["bb22222222222222222222222222222222222222222222222222222222222222"] Pass
+  let (h3, bad_err) = chain_append_h h2 bad
+  let p3 = assert_err "T-ATOMIC: parent-missing errors" "chain:parent-missing" bad_err
+  let after2 = read_file log_path
+  let after2_sha = sha256_hex after2
+  let p4 = assert_eq_str "T-ATOMIC: log byte-identical after parent-missing" after2_sha before_sha
+  let _ = chain_close h3
+  p1 * p2 * p3 * p4
+
+-- ── T-LOCK: second writer blocked by first ────────────────────────────
+
+t_lock _ =
+  let root = mk_root "lock"
+  let h1 = chain_open root
+  let h2 = chain_open root
+  let p1 = assert_err "T-LOCK: second open errors locked" "chain:locked" h2
+  let _ = chain_close h1
+  p1
+
+-- ── T-VERIFY-LOG: stream-verify every line ────────────────────────────
+
+t_verify_log _ =
+  let root = mk_root "verify_log"
+  let h0 = chain_open root
+  let b1 = mk_entry_blob "v1" "" [] Pass
+  let (h1, _) = chain_append_h h0 b1
+  let b2 = mk_entry_blob "v2" "" [] Pass
+  let (h2, _) = chain_append_h h1 b2
+  let v = chain_verify_log h2
+  let _ = chain_close h2
+  if is_error v then
+    let _ = print (cat ["FAIL: T-VERIFY-LOG errored: ", err_msg v])
+    0
+  else assert_eq_int "T-VERIFY-LOG: returned 0" v 0
+
+-- ── T-COUNTERSIG: accept + dedup ──────────────────────────────────────
+
+t_countersig _ =
+  let root = mk_root "csig"
+  let h0 = chain_open root
+  let b1 = mk_entry_blob "cs goal" "" [] Pass
+  let (h1, id1) = chain_append_h h0 b1
+  let csig = cat ["{\"id\":\"", id1, "\",\"witness\":\"fleet0\",\"pk_fp\":\"x\",\"sig\":\"y\",\"pulse_id\":1,\"value_hex\":\"z\",\"witnessed_at\":1}"]
+  let r1 = chain_accept_witness_countersig h1 csig
+  let p1 = assert_eq_int "T-COUNTERSIG: first accept returns 1" r1 1
+  let r2 = chain_accept_witness_countersig h1 csig
+  let p2 = assert_eq_int "T-COUNTERSIG: second accept dedups to 0" r2 0
+  let lst = chain_countersigs_for h1 id1
+  let p3 = assert_eq_int "T-COUNTERSIG: one record for id" (length lst) 1
+  let _ = chain_close h1
+  p1 * p2 * p3
+
+-- ── T-SEARCH-HYP: needle in hypothesis only (goal does NOT contain it) ──
+--
+-- Path A widening (2026-05-16): chain_search_goal must also match the
+-- hypothesis field. Two entries whose goal does NOT contain the needle
+-- but whose hypothesis DOES must both be returned.
+
+t_search_hyp _ =
+  let root = mk_root "search_hyp"
+  let h0 = chain_open root
+  let b1 = mk_entry_blob "alpha goal one" "Spur lineage hypothesis" [] Pass
+  let (h1, id1) = chain_append_h h0 b1
+  let b2 = mk_entry_blob "beta goal two" "another Spur idea" [] Pass
+  let (h2, id2) = chain_append_h h1 b2
+  let b3 = mk_entry_blob "unrelated goal" "unrelated hypothesis" [] Pass
+  let (h3, _id3) = chain_append_h h2 b3
+  let hits = chain_search_goal h3 "spur"
+  let p1 = assert_eq_int "T-SEARCH-HYP: 2 hits for needle in hypothesis only" (length hits) 2
+  -- Confirm both ids are in the result (order is append-order = id1 then id2).
+  let p2 = assert_eq_str "T-SEARCH-HYP: first hit is id1" (head hits) id1
+  let p3 = assert_eq_str "T-SEARCH-HYP: second hit is id2" (head (tail hits)) id2
+  let _ = chain_close h3
+  p1 * p2 * p3
+
+-- ── T-SEARCH-COMBINED: one goal-only, one hyp-only, one neither ───────
+--
+-- A query that matches the goal of entry A, the hypothesis of entry B,
+-- and neither field of entry C must return [A, B] (in append order).
+
+t_search_combined _ =
+  let root = mk_root "search_combined"
+  let h0 = chain_open root
+  let bA = mk_entry_blob "fusion plasma run" "totally unrelated text" [] Pass
+  let (h1, idA) = chain_append_h h0 bA
+  let bB = mk_entry_blob "boring goal" "fusion confinement paper notes" [] Pass
+  let (h2, idB) = chain_append_h h1 bB
+  let bC = mk_entry_blob "boring other goal" "boring other hypothesis" [] Pass
+  let (h3, _idC) = chain_append_h h2 bC
+  let hits = chain_search_goal h3 "fusion"
+  let p1 = assert_eq_int "T-SEARCH-COMBINED: exactly 2 hits" (length hits) 2
+  let p2 = assert_eq_str "T-SEARCH-COMBINED: first hit is idA" (head hits) idA
+  let p3 = assert_eq_str "T-SEARCH-COMBINED: second hit is idB" (head (tail hits)) idB
+  let _ = chain_close h3
+  p1 * p2 * p3
+
+-- ── T-SEARCH-DEDUPE: needle matches both fields → result has id once ──
+--
+-- If both goal AND hypothesis contain the needle, the entry must
+-- appear exactly once in the result (not twice).
+
+t_search_dedupe _ =
+  let root = mk_root "search_dedupe"
+  let h0 = chain_open root
+  let bA = mk_entry_blob "Spur run alpha" "Spur freeze hypothesis" [] Pass
+  let (h1, idA) = chain_append_h h0 bA
+  let bB = mk_entry_blob "no match here" "no match either" [] Pass
+  let (h2, _idB) = chain_append_h h1 bB
+  let hits = chain_search_goal h2 "spur"
+  let p1 = assert_eq_int "T-SEARCH-DEDUPE: matching-both entry appears once" (length hits) 1
+  let p2 = assert_eq_str "T-SEARCH-DEDUPE: that one id is idA" (head hits) idA
+  let _ = chain_close h2
+  p1 * p2
+
+-- ── T-PREFIX: prefix lookup ───────────────────────────────────────────
+
+t_prefix _ =
+  let root = mk_root "prefix"
+  let h0 = chain_open root
+  let b1 = mk_entry_blob "p1" "" [] Pass
+  let (h1, id1) = chain_append_h h0 b1
+  let b2 = mk_entry_blob "p2" "" [] Pass
+  let (h2, _id2) = chain_append_h h1 b2
+  -- Unique 12-char prefix should resolve.
+  let pre = str_sub id1 0 12
+  let r = chain_lookup_prefix h2 pre
+  let p1 = assert_eq_str "T-PREFIX: prefix resolves to full id" r id1
+  let none = chain_lookup_prefix h2 "zz00deadbeef"
+  let p2 = assert_eq_str "T-PREFIX: missing prefix -> NONE" none "NONE"
+  let _ = chain_close h2
+  p1 * p2
+
+-- ── Runner ────────────────────────────────────────────────────────────
+
+main =
+  let r1 = t_append_get 0
+  let r2 = t_dup 0
+  let r3 = t_parent_missing 0
+  let r4 = t_parent_walk 0
+  let r5 = t_search_goal 0
+  let r6 = t_verdict_count 0
+  let r7 = t_index_rebuild 0
+  let r8 = t_atomic 0
+  let r9 = t_lock 0
+  let r10 = t_verify_log 0
+  let r11 = t_countersig 0
+  let r12 = t_search_hyp 0
+  let r13 = t_search_combined 0
+  let r14 = t_search_dedupe 0
+  let r15 = t_prefix 0
+  let total = r1 + r2 + r3 + r4 + r5 + r6 + r7 + r8 + r9 + r10 + r11 + r12 + r13 + r14 + r15
+  let n = 15
+  let _ = print (cat ["Tests passed: ", show total, " / ", show n])
+  if total == n then
+    let _ = print "PASS"
+    0
+  else
+    let _ = print "FAIL"
+    1

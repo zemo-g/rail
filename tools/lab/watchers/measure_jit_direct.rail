@@ -1,0 +1,115 @@
+-- measure_jit_direct.rail — pure-Rail timing of JIT v2 direct-call path.
+--
+-- Purpose:
+--   Measure the per-call wall-clock overhead of JIT v2's direct-call
+--   dispatch (`call_jit_direct` in jit/loader.rail), which routes through
+--   `libjit_call.dylib::jit_call(fn, arg) { return fn(arg); }` — a single
+--   indirect C function-pointer call.
+--
+--   This is the COMPETITOR to the v1 trampoline (measure_jit_trampoline.rail).
+--   The pair feeds the jit_v2_baseline.sh watcher, which computes the
+--   verdict against chain entry 8f60d09d's kill criterion:
+--     PASS if (trampoline_us_p50 - direct_us_p50) >= 40 us
+--     FALSIFIED otherwise.
+--
+-- Methodology (mirrors measure_jit_trampoline.rail exactly):
+--   - Same trivial IR fixture (op_const 42, op_ret).
+--   - emit_function -> make_executable: page is RX, code hot in i-cache.
+--   - K=200 outer batches x INNER=50 inner calls each = 10,000 calls.
+--   - Per-batch: sample wall clock (date +%s%N) before/after, compute
+--     per-call ns = (t1 - t0) / INNER.
+--   - Write 200 ns/call samples comma-separated to
+--     /tmp/rail_direct_samples.
+--   - The shell wrapper converts to us, sorts, picks p50/p90 indices.
+--
+-- Difference from trampoline measurement: line 65 calls
+-- `call_jit_direct` instead of `call_jit`. Everything else (page setup,
+-- heap, IR, batch shape, timing harness) is byte-identical so the delta
+-- attributes to dispatch overhead only.
+--
+-- Sanity range: a C function-pointer indirect call through dlopen-resolved
+-- symbol should be < 1 us; measurement-floor is dominated by the empty
+-- JITted body (loads heap, returns 42) + the foreign-call retag boundary
+-- (~ shell-out granularity / 50). Expect single-digit us per call;
+-- abort if outside [0.5, 500] us.
+
+import "jit/heap.rail"
+import "jit/emit.rail"
+import "jit/loader.rail"
+
+-- === wall-clock nanoseconds via shell =========================
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = char_to_int (head cs) - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+
+now_ns _ =
+  let s = shell "date +%s%N | tr -d '\\n'"
+  parse_int_acc (chars s) 0
+
+-- === build trivial IR: op_const dst=1, val=42 ; op_ret 1 ======
+build_const42 _ =
+  let ir = arr_new 8 0
+  let _ = ir_emit ir 0 op_const 1 42 0
+  let _ = ir_emit ir 1 op_ret 1 0 0
+  let blocks = arr_new 1 0
+  let _ = arr_set blocks 0 0
+  make_fn ir 2 2 blocks
+
+-- === inner call loop (this is what we time) ===================
+-- Calls call_jit_direct `inner` times against the already-mapped page.
+call_loop page arg inner =
+  if inner <= 0 then 0
+  else
+    let _ = call_jit_direct page arg
+    call_loop page arg (inner - 1)
+
+-- === one batch: time `inner` calls, return per-call ns avg ====
+batch_per_call_ns page inner =
+  let t0 = now_ns 0
+  let _ = call_loop page 0 inner
+  let t1 = now_ns 0
+  (t1 - t0) / inner
+
+-- === outer: run `k` batches, print comma-separated ns/call ====
+run_batches page k inner first =
+  if k <= 0 then 0
+  else
+    let ns = batch_per_call_ns page inner
+    let sep = if first == 1 then "" else ","
+    let _ = print_no_newline (cat [sep, show ns])
+    run_batches page (k - 1) inner 0
+
+print_no_newline s =
+  let _ = shell (cat ["printf '%s' '", s, "' >> /tmp/rail_direct_samples"])
+  0
+
+main =
+  -- Reset sample file.
+  let _ = shell "rm -f /tmp/rail_direct_samples"
+  let _ = shell "touch /tmp/rail_direct_samples"
+
+  -- Build & JIT once. Page stays mapped for the entire run.
+  let fn = build_const42 0
+  let heap = heap_alloc 0
+  let res = emit_function fn heap
+  let buf = emitted_buf res
+  let nbytes = emitted_size res
+  let page = make_executable buf nbytes
+
+  -- Warm-up: 50 calls to settle TLB/i-cache & resolve weak symbol.
+  let _ = call_loop page 0 50
+
+  -- 200 batches x 50 calls = 10,000 timed calls.
+  let _ = run_batches page 200 50 1
+
+  -- Cleanup.
+  let _ = free_jit page
+  let _ = heap_free heap
+
+  let _ = shell "echo '' >> /tmp/rail_direct_samples"
+  let _ = print "DONE"
+  0

@@ -1,0 +1,84 @@
+-- measure_jit_trampoline_v2.rail — pure-Rail timing of JIT v1 trampoline
+-- with the in-process gettimeofday(2) timer (microsecond resolution,
+-- ~10 ns/call cost). Replaces measure_jit_trampoline.rail's shell-out to
+-- `date +%s%N` which had a ~120us floor (see chain entry b999f843 and the
+-- /tmp/rail_floor_old_samples calibration).
+--
+-- Methodology identical to v1 of this file:
+--   - Build trivial IR (op_const 42 + op_ret).
+--   - emit_function -> make_executable: page RX, code hot in i-cache.
+--   - K=200 outer batches x INNER=50 inner calls = 10000 calls.
+--   - For each batch: bracket with time_us_now, compute per-call us.
+--   - Sample file: /tmp/rail_trampoline_samples_v2 (ns CSV, same convention
+--     as v1 so the shell wrapper's `infile/1000.0 = us` math works
+--     unchanged).
+--
+-- Floor of THIS harness on 50-iter empty batches: 0 us (verified by
+-- tools/lab/watchers/measure_new_harness_floor.rail variant A and the
+-- 50-iter calibration in /tmp/rail_floor_new_samples).
+
+import "jit/heap.rail"
+import "jit/emit.rail"
+import "jit/loader.rail"
+import "stdlib/time_us.rail"
+
+-- === build trivial IR: op_const dst=1, val=42 ; op_ret 1 ======
+build_const42 _ =
+  let ir = arr_new 8 0
+  let _ = ir_emit ir 0 op_const 1 42 0
+  let _ = ir_emit ir 1 op_ret 1 0 0
+  let blocks = arr_new 1 0
+  let _ = arr_set blocks 0 0
+  make_fn ir 2 2 blocks
+
+call_loop page arg inner =
+  if inner <= 0 then 0
+  else
+    let _ = call_jit page arg
+    call_loop page arg (inner - 1)
+
+-- Per-batch: in-process timer, returns ns/call (multiplied by 1000 from us
+-- so the existing shell percentile math `$1/1000.0` still yields us/call).
+batch_per_call_ns page tv inner =
+  let t0 = time_us_now_into tv
+  let _ = call_loop page 0 inner
+  let t1 = time_us_now_into tv
+  ((t1 - t0) * 1000) / inner
+
+run_batches page tv k inner first =
+  if k <= 0 then 0
+  else
+    let ns = batch_per_call_ns page tv inner
+    let sep = if first == 1 then "" else ","
+    let _ = print_no_newline (cat [sep, show ns])
+    run_batches page tv (k - 1) inner 0
+
+print_no_newline s =
+  let _ = shell (cat ["printf '%s' '", s, "' >> /tmp/rail_trampoline_samples_v2"])
+  0
+
+main =
+  let _ = shell "rm -f /tmp/rail_trampoline_samples_v2"
+  let _ = shell "touch /tmp/rail_trampoline_samples_v2"
+
+  let fn = build_const42 0
+  let heap = heap_alloc 0
+  let res = emit_function fn heap
+  let buf = emitted_buf res
+  let nbytes = emitted_size res
+  let page = make_executable buf nbytes
+
+  -- Preallocate the 16-byte timeval buffer once; reused for every sample.
+  let tv = malloc 16
+
+  -- Warm-up.
+  let _ = call_loop page 0 50
+
+  let _ = run_batches page tv 200 50 1
+
+  let _ = free_jit page
+  let _ = heap_free heap
+
+  let _ = shell "echo '' >> /tmp/rail_trampoline_samples_v2"
+  let _ = print "DONE"
+  0
