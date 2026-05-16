@@ -1,0 +1,413 @@
+-- tools/spurarm/corpus/synthesize_procedural.rail
+--
+-- Procedurally generate (NL, Rail-DSL-script) training pairs.
+--
+-- Strategy: we build both the script AND the natural-language prompt
+-- from compositional templates. Because we authored the script, we can
+-- run it through the sim directly (via run_sim_with_world from
+-- tools/robot/arm_sim.rail) and derive the `expected` final state.
+-- Every emitted pair is therefore constructively grader-valid at
+-- stages_passed = 4 -- no separate filter pass needed for fault==0
+-- outputs.
+--
+-- Output: JSONL file at <out_path>, one record per line, no inline
+-- newlines in any field (json_escape replaces them with \n literal).
+--
+-- Usage:
+--   ./rail_native run tools/spurarm/corpus/synthesize_procedural.rail <count> <out_path>
+
+import "stdlib/args.rail"
+import "tools/robot/arm_sim.rail"
+
+-- ---------------------------------------------------------------------
+-- Decimal parser. to_int is float->int only (memory rail_emit_gotchas).
+-- ---------------------------------------------------------------------
+
+digit_val ch =
+  if ch == "0" then 0
+  else if ch == "1" then 1
+  else if ch == "2" then 2
+  else if ch == "3" then 3
+  else if ch == "4" then 4
+  else if ch == "5" then 5
+  else if ch == "6" then 6
+  else if ch == "7" then 7
+  else if ch == "8" then 8
+  else if ch == "9" then 9
+  else 0 - 1
+
+parse_int_chars cs neg acc =
+  if length cs == 0 then (if neg then 0 - acc else acc)
+  else
+    let c = head cs
+    if c == "-" then parse_int_chars (tail cs) true acc
+    else
+      let dv = digit_val c
+      if dv < 0 then (if neg then 0 - acc else acc)
+      else parse_int_chars (tail cs) neg (acc * 10 + dv)
+
+-- ---------------------------------------------------------------------
+-- PRNG (LCG; deterministic per seed).
+-- ---------------------------------------------------------------------
+
+prand seed = ((seed * 1103515245) + 12345) % 2147483648
+
+list_at cs i =
+  if i <= 0 then head cs
+  else list_at (tail cs) (i - 1)
+
+-- ---------------------------------------------------------------------
+-- Coordinate pools.
+-- ---------------------------------------------------------------------
+
+named_names = ["A", "B", "C", "D"]
+named_coords =
+  [[10, 0, 5],
+   [10, 10, 5],
+   [20, 10, 5],
+   [20, 20, 5]]
+
+free_coords =
+  [[5, 5, 5],
+   [3, 7, 8],
+   [12, 3, 15],
+   [25, 5, 5],
+   [15, 15, 15],
+   [7, 12, 10],
+   [22, 18, 12],
+   [4, 20, 6],
+   [18, 8, 18],
+   [6, 25, 9],
+   [11, 2, 22],
+   [27, 14, 4],
+   [9, 9, 20],
+   [16, 6, 7],
+   [13, 22, 11],
+   [21, 4, 13],
+   [8, 17, 16],
+   [19, 11, 8],
+   [14, 27, 14],
+   [24, 9, 17]]
+
+-- ---------------------------------------------------------------------
+-- NL synonym pools (ASCII only).
+-- ---------------------------------------------------------------------
+
+verb_move = [
+  "Move to", "Go to", "Travel to", "Navigate to",
+  "Drive to", "Head to", "Proceed to", "Move the arm to"]
+
+verb_pickup = [
+  "Pick up", "Grab", "Retrieve", "Take", "Get", "Fetch"]
+
+verb_place = [
+  "place it at", "put it at", "drop it at", "set it down at",
+  "deposit it at", "release it at", "leave it at"]
+
+verb_hold_target = [
+  "hold it at", "carry it to", "bring it to", "move it to"]
+
+verb_home = [
+  "Return home", "Go home", "Return to home", "Move back to the origin",
+  "Travel back to the base", "Reset to home", "Bring the arm home",
+  "Go back to (0, 0, 0)"]
+
+-- ---------------------------------------------------------------------
+-- Coordinate rendering (NL).
+-- ---------------------------------------------------------------------
+
+show_coord_named name = cat ["point ", name]
+show_coord_xyz x y z = cat ["coordinates ", show x, ", ", show y, ", ", show z]
+
+render_coord_nl tag x y z name =
+  if tag == 1 then show_coord_xyz x y z
+  else if tag == 2 then cat ["the position (", show x, ", ", show y, ", ", show z, ")"]
+  else if length name > 0 then show_coord_named name
+  else show_coord_xyz x y z
+
+-- ---------------------------------------------------------------------
+-- DSL rendering (Rail script). Two surface forms; we mix.
+-- ---------------------------------------------------------------------
+
+render_move_to surf x y z =
+  if surf == 0 then cat ["MoveTo ", show x, " ", show y, " ", show z]
+  else cat ["move_to ", show x, " ", show y, " ", show z]
+
+render_grip_open surf =
+  if surf == 0 then "SetGrip GripOpen"
+  else "grip_open"
+
+render_grip_close surf =
+  if surf == 0 then "SetGrip GripClose"
+  else "grip_close"
+
+render_wait surf ms =
+  if surf == 0 then cat ["Wait ", show ms]
+  else cat ["wait_ms ", show ms]
+
+render_home surf =
+  if surf == 0 then "Home"
+  else "home_cmd"
+
+render_set_grip surf g = match g
+  | GripOpen -> render_grip_open surf
+  | GripClose -> render_grip_close surf
+
+render_cmd_line surf c = match c
+  | MoveTo x y z -> render_move_to surf x y z
+  | SetGrip g -> render_set_grip surf g
+  | Wait ms -> render_wait surf ms
+  | Home -> render_home surf
+
+render_cmd_lines surf cs =
+  if length cs == 0 then []
+  else cons (render_cmd_line surf (head cs)) (render_cmd_lines surf (tail cs))
+
+wrap_script lines =
+  cat ["script = [\n  ", join ",\n  " lines, "\n]"]
+
+-- ---------------------------------------------------------------------
+-- Cmd-list builders for sim.
+-- ---------------------------------------------------------------------
+
+cmds_move xyz = [MoveTo (head xyz) (head (tail xyz)) (head (tail (tail xyz)))]
+
+cmds_pick_place src tgt =
+  [MoveTo (head src) (head (tail src)) (head (tail (tail src))),
+   SetGrip GripClose,
+   MoveTo (head tgt) (head (tail tgt)) (head (tail (tail tgt))),
+   SetGrip GripOpen]
+
+cmds_pick_hold src tgt =
+  [MoveTo (head src) (head (tail src)) (head (tail (tail src))),
+   SetGrip GripClose,
+   MoveTo (head tgt) (head (tail tgt)) (head (tail (tail tgt)))]
+
+cmds_two_move a b =
+  [MoveTo (head a) (head (tail a)) (head (tail (tail a))),
+   MoveTo (head b) (head (tail b)) (head (tail (tail b)))]
+
+cmds_three_move a b c =
+  [MoveTo (head a) (head (tail a)) (head (tail (tail a))),
+   MoveTo (head b) (head (tail b)) (head (tail (tail b))),
+   MoveTo (head c) (head (tail c)) (head (tail (tail c)))]
+
+cmds_move_wait_move a ms b =
+  [MoveTo (head a) (head (tail a)) (head (tail (tail a))),
+   Wait ms,
+   MoveTo (head b) (head (tail b)) (head (tail (tail b)))]
+
+-- ---------------------------------------------------------------------
+-- JSON escaping.
+-- ---------------------------------------------------------------------
+
+esc_char c =
+  if c == "\\" then "\\\\"
+  else if c == "\"" then "\\\""
+  else if c == (char_from_int 10) then "\\n"
+  else if c == (char_from_int 13) then "\\r"
+  else if c == (char_from_int 9) then "\\t"
+  else c
+
+esc_loop cs acc =
+  if length cs == 0 then acc
+  else esc_loop (tail cs) (cat [acc, esc_char (head cs)])
+
+json_escape s = esc_loop (chars s) ""
+
+-- ---------------------------------------------------------------------
+-- Build one JSONL record. Returns "" if the script faulted in sim.
+-- ---------------------------------------------------------------------
+
+zpad5 n =
+  if n < 10 then cat ["0000", show n]
+  else if n < 100 then cat ["000", show n]
+  else if n < 1000 then cat ["00", show n]
+  else if n < 10000 then cat ["0", show n]
+  else show n
+
+build_record id_str nl script_text cmds obx oby obz =
+  let st = run_sim_with_world cmds obx oby obz
+  let gex = s_ex st
+  let gey = s_ey st
+  let gez = s_ez st
+  let ggrip = s_grip st
+  let gheld = s_held st
+  let fault = s_fault st
+  if fault != 0 then ""
+  else
+    cat [
+      "{\"id\":\"", id_str,
+      "\",\"nl\":\"", json_escape nl,
+      "\",\"script\":\"", json_escape script_text,
+      "\",\"world\":{\"obx\":", show obx, ",\"oby\":", show oby, ",\"obz\":", show obz, ",\"present\":", show (s_present st),
+      "},\"expected\":{\"gex\":", show gex, ",\"gey\":", show gey, ",\"gez\":", show gez, ",\"ggrip\":", show ggrip, ",\"gheld\":", show gheld,
+      "},\"source\":\"proc\",\"stages_passed\":4}"]
+
+-- ---------------------------------------------------------------------
+-- Template families.
+-- ---------------------------------------------------------------------
+
+gen_basic_move id_str seed =
+  let use_named = ((prand seed) % 2) == 0
+  let coord_idx_n = (prand (seed + 1)) % (length named_coords)
+  let coord_idx_f = (prand (seed + 2)) % (length free_coords)
+  let target = if use_named then list_at named_coords coord_idx_n else list_at free_coords coord_idx_f
+  let target_name = if use_named then list_at named_names coord_idx_n else ""
+  let verb_idx = (prand (seed + 3)) % (length verb_move)
+  let verb = list_at verb_move verb_idx
+  let coord_tag = (prand (seed + 4)) % 3
+  let coord_render = render_coord_nl coord_tag (head target) (head (tail target)) (head (tail (tail target))) target_name
+  let nl = cat [verb, " ", coord_render, "."]
+  let surf = (prand (seed + 5)) % 2
+  let cmds = cmds_move target
+  let lines = render_cmd_lines surf cmds
+  let script = wrap_script lines
+  build_record id_str nl script cmds (0 - 1) 0 0
+
+gen_basic_home id_str seed =
+  let verb_idx = (prand seed) % (length verb_home)
+  let nl = cat [list_at verb_home verb_idx, "."]
+  let surf = (prand (seed + 1)) % 2
+  let use_home = ((prand (seed + 2)) % 2) == 0
+  let cmds = if use_home then [Home] else [MoveTo 0 0 0]
+  let lines = render_cmd_lines surf cmds
+  let script = wrap_script lines
+  build_record id_str nl script cmds (0 - 1) 0 0
+
+gen_pick_place id_str seed =
+  let src_named = ((prand seed) % 2) == 0
+  let tgt_named = ((prand (seed + 1)) % 2) == 0
+  let src_idx = (prand (seed + 2)) % (length named_coords)
+  let src_idx_f = (prand (seed + 3)) % (length free_coords)
+  let src = if src_named then list_at named_coords src_idx else list_at free_coords src_idx_f
+  let src_name = if src_named then list_at named_names src_idx else ""
+  let tgt_idx = (prand (seed + 4)) % (length named_coords)
+  let tgt_idx_f = (prand (seed + 5)) % (length free_coords)
+  let tgt_raw = if tgt_named then list_at named_coords tgt_idx else list_at free_coords tgt_idx_f
+  let tgt_name_raw = if tgt_named then list_at named_names tgt_idx else ""
+  let same_x = (head src) == (head tgt_raw)
+  let same_y = (head (tail src)) == (head (tail tgt_raw))
+  let same_z = (head (tail (tail src))) == (head (tail (tail tgt_raw)))
+  let collision = if same_x then if same_y then same_z else false else false
+  let tgt = if collision then list_at free_coords ((tgt_idx_f + 1) % (length free_coords)) else tgt_raw
+  let tgt_name = if collision then "" else tgt_name_raw
+  let v_pick = list_at verb_pickup ((prand (seed + 6)) % (length verb_pickup))
+  let v_place = list_at verb_place ((prand (seed + 7)) % (length verb_place))
+  let coord_tag = (prand (seed + 8)) % 3
+  let src_nl = render_coord_nl coord_tag (head src) (head (tail src)) (head (tail (tail src))) src_name
+  let tgt_nl = render_coord_nl coord_tag (head tgt) (head (tail tgt)) (head (tail (tail tgt))) tgt_name
+  let nl = cat [v_pick, " the ball at ", src_nl, " and ", v_place, " ", tgt_nl, "."]
+  let surf = (prand (seed + 9)) % 2
+  let cmds = cmds_pick_place src tgt
+  let lines = render_cmd_lines surf cmds
+  let script = wrap_script lines
+  build_record id_str nl script cmds (head src) (head (tail src)) (head (tail (tail src)))
+
+gen_pick_hold id_str seed =
+  let src_idx = (prand seed) % (length named_coords)
+  let src = list_at named_coords src_idx
+  let src_name = list_at named_names src_idx
+  let tgt_named = ((prand (seed + 1)) % 2) == 0
+  let tgt_idx = (prand (seed + 2)) % (length named_coords)
+  let tgt_idx_f = (prand (seed + 3)) % (length free_coords)
+  let tgt_raw = if tgt_named then list_at named_coords tgt_idx else list_at free_coords tgt_idx_f
+  let tgt_name_raw = if tgt_named then list_at named_names tgt_idx else ""
+  let same_x = (head src) == (head tgt_raw)
+  let same_y = (head (tail src)) == (head (tail tgt_raw))
+  let same_z = (head (tail (tail src))) == (head (tail (tail tgt_raw)))
+  let collision = if same_x then if same_y then same_z else false else false
+  let tgt = if collision then list_at free_coords ((tgt_idx_f + 1) % (length free_coords)) else tgt_raw
+  let tgt_name = if collision then "" else tgt_name_raw
+  let v_pick = list_at verb_pickup ((prand (seed + 4)) % (length verb_pickup))
+  let v_hold = list_at verb_hold_target ((prand (seed + 5)) % (length verb_hold_target))
+  let coord_tag = (prand (seed + 6)) % 3
+  let src_nl = render_coord_nl coord_tag (head src) (head (tail src)) (head (tail (tail src))) src_name
+  let tgt_nl = render_coord_nl coord_tag (head tgt) (head (tail tgt)) (head (tail (tail tgt))) tgt_name
+  let nl = cat [v_pick, " the ball at ", src_nl, " and ", v_hold, " ", tgt_nl, "."]
+  let surf = (prand (seed + 7)) % 2
+  let cmds = cmds_pick_hold src tgt
+  let lines = render_cmd_lines surf cmds
+  let script = wrap_script lines
+  build_record id_str nl script cmds (head src) (head (tail src)) (head (tail (tail src)))
+
+gen_multi_step id_str seed =
+  let n_moves = 2 + ((prand seed) % 2)
+  let a_idx = (prand (seed + 1)) % (length named_coords)
+  let b_idx = (prand (seed + 2)) % (length named_coords)
+  let c_idx = (prand (seed + 3)) % (length named_coords)
+  let a = list_at named_coords a_idx
+  let b = list_at named_coords b_idx
+  let c = list_at named_coords c_idx
+  let a_name = list_at named_names a_idx
+  let b_name = list_at named_names b_idx
+  let c_name = list_at named_names c_idx
+  let use_wait = ((prand (seed + 4)) % 3) == 0
+  let surf = (prand (seed + 5)) % 2
+  let cmds_no_wait = if n_moves == 2 then cmds_two_move a b else cmds_three_move a b c
+  let cmds = if use_wait then cmds_move_wait_move a 1000 b else cmds_no_wait
+  let nl_no_wait =
+    if n_moves == 2 then cat ["Go to point ", a_name, ", then to point ", b_name, "."]
+    else cat ["Visit ", a_name, ", then ", b_name, ", then ", c_name, "."]
+  let nl = if use_wait then cat ["Move to point ", a_name, ", pause briefly, then proceed to point ", b_name, "."] else nl_no_wait
+  let lines = render_cmd_lines surf cmds
+  let script = wrap_script lines
+  build_record id_str nl script cmds (0 - 1) 0 0
+
+-- ---------------------------------------------------------------------
+-- Dispatcher.
+-- ---------------------------------------------------------------------
+
+gen_one i =
+  let seed = i * 6577 + 13
+  let fam = (prand seed) % 5
+  let id_str = cat ["proc:", zpad5 i]
+  if fam == 0 then gen_basic_move id_str (seed + 100)
+  else if fam == 1 then gen_basic_home id_str (seed + 100)
+  else if fam == 2 then gen_pick_place id_str (seed + 100)
+  else if fam == 3 then gen_pick_hold id_str (seed + 100)
+  else gen_multi_step id_str (seed + 100)
+
+-- ---------------------------------------------------------------------
+-- Buffered output. Accumulate ~1000 records per buffer, then append to
+-- file via shell. Avoids both:
+--   * shell-call-per-record (would be ~30k forks)
+--   * single-huge-string (arena allocator churn at 30k * ~500 bytes)
+-- ---------------------------------------------------------------------
+
+flush_buf out_path buf =
+  if length buf == 0 then 0
+  else
+    let tmp = "/tmp/spurarm_proc_buf.txt"
+    let body = join "\n" buf
+    let _ = write_file tmp body
+    let _ = shell (cat ["cat ", tmp, " >> ", out_path, " && printf '\\n' >> ", out_path])
+    0
+
+emit_chunk i n out_path buf bufN =
+  if i >= n then
+    let _ = flush_buf out_path buf in 0
+  else if bufN >= 500 then
+    let _ = flush_buf out_path buf in
+    emit_chunk i n out_path [] 0
+  else
+    let line = gen_one i
+    if length line == 0 then emit_chunk (i + 1) n out_path buf bufN
+    else emit_chunk (i + 1) n out_path (cons line buf) (bufN + 1)
+
+main =
+  let argv = args
+  let parsed = parse_args argv
+  let (_flags, _opts, pos) = parsed
+  if length pos < 2 then
+    let _ = print "usage: synthesize_procedural.rail <count> <out_path>"
+    1
+  else
+    let n_str = head pos
+    let out_path = head (tail pos)
+    let cs = chars n_str
+    let n = parse_int_chars cs false 0
+    let _ = shell (cat ["rm -f ", out_path, " && touch ", out_path])
+    let _ = emit_chunk 0 n out_path [] 0
+    let _ = print (cat ["proc.synth wrote up to ", show n, " records to ", out_path])
+    0
