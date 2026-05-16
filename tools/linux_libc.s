@@ -806,12 +806,36 @@ _fopen:
     ldp x29, x30, [sp], #16
     ret
 
+// _fwrite(ptr, size, nmemb, fd) -> bytes_written
+// Linux write(2) can return short under memory/pipe pressure. Looping until
+// count==0 (or error) is required for full-content delivery — the legacy
+// single-call version silently truncated .s output on Pi when the kernel
+// short-returned. Returns total bytes written.
 _fwrite:
-    mul x2, x1, x2
-    mov x1, x0
-    mov x0, x3
-    mov x8, #64           // write
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    mul x2, x1, x2        // x2 = size*nmemb = total bytes
+    mov x1, x0            // x1 = buf
+    mov x0, x3            // x0 = fd
+    str x0, [sp, #16]     // save fd
+    str xzr, [sp, #24]    // total_written = 0
+.Lfw_loop:
+    cbz x2, .Lfw_done
+    mov x8, #64           // SYS_write
     svc #0
+    tst x0, x0
+    b.mi .Lfw_done        // negative = -errno, return as-is
+    ldr x4, [sp, #24]
+    add x4, x4, x0
+    str x4, [sp, #24]
+    add x1, x1, x0        // buf += written
+    subs x2, x2, x0       // remaining -= written
+    b.eq .Lfw_done
+    ldr x0, [sp, #16]     // reload fd
+    b .Lfw_loop
+.Lfw_done:
+    ldr x0, [sp, #24]     // return total
+    ldp x29, x30, [sp], #32
     ret
 
 _fread:
