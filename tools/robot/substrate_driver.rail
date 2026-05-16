@@ -1,0 +1,154 @@
+-- tools/robot/substrate_driver.rail
+--
+-- Substrate driver for the robot-arm flywheel. For each prompt in
+-- tools/robot/bench_v0.txt, sends (spec + nl_prompt) to the local MLX
+-- server, writes the completion to /tmp/robot_completions/<id>.rail,
+-- then grades. Aggregates a 4-stage tally at the end.
+--
+-- Single-shot mode (one completion per prompt). For N>1 reranking,
+-- wrap this with tools/robot/substrate_driver_rerank.sh once the
+-- single-shot signal is honest.
+--
+-- Usage:
+--   ./rail_native run tools/robot/substrate_driver.rail [port]
+--   port defaults to 8082 (the MLX teacher per fleet.md).
+--
+-- Output: per-prompt GRADE line + TOTALS line. Same shape as
+-- tools/robot/grade_all.sh so chain-entry sentinel parsers can be
+-- shared.
+
+import "stdlib/list.rail"
+import "stdlib/llm.rail"
+
+bench_file = "tools/robot/bench_v0.txt"
+spec_file = "tools/robot/dsl_spec.txt"
+comp_dir = "/tmp/robot_completions"
+
+-- Default port; can be overridden by argv[0] after program name.
+default_port = "8082"
+
+is_comment_or_blank ln =
+  if length ln == 0 then true
+  else if (head (chars ln)) == "#" then true
+  else false
+
+-- Stream bench rows; emit a list of (id, prompt) pairs encoded as
+-- two-element string lists (Rail tuples are second-class).
+collect_pairs lines acc =
+  if length lines == 0 then reverse acc
+  else
+    let ln = head lines
+    if is_comment_or_blank ln then collect_pairs (tail lines) acc
+    else
+      let parts = str_split "|" ln
+      if length parts < 2 then collect_pairs (tail lines) acc
+      else collect_pairs (tail lines) (cons [head parts, head (tail parts)] acc)
+
+load_pairs =
+  let body = read_file bench_file
+  let lines = split (char_from_int 10) body
+  collect_pairs lines []
+
+-- Run llm_call, save to /tmp/robot_completions/<id>.rail
+gen_one port spec id prompt =
+  let resp = llm_call port spec prompt
+  let path = cat [comp_dir, "/", id, ".rail"]
+  let _ = write_file path resp
+  path
+
+-- Run grader on (id, completion_path), return the GRADE line.
+grade_one id comp_path =
+  let cmd = cat ["./rail_native run tools/robot/grader.rail ", id, " ", comp_path, " 2>/dev/null | grep '^GRADE '"]
+  shell cmd
+
+-- Tally stages from a list of GRADE lines.
+parse_stage gline =
+  let i = str_find "stage=" gline
+  if i < 0 then 0
+  else
+    let after = str_sub gline (i + 6) (length gline - i - 6)
+    let sp = str_find " " after
+    let s = if sp < 0 then after else str_sub after 0 sp
+    digit_or_zero s
+
+digit_or_zero s =
+  if length s == 0 then 0
+  else
+    let c = head (chars s)
+    if c == "0" then 0
+    else if c == "1" then 1
+    else if c == "2" then 2
+    else if c == "3" then 3
+    else if c == "4" then 4
+    else 0
+
+tally lines =
+  tally_loop lines 0 0 0 0 0
+
+tally_loop lines total c p r g =
+  if length lines == 0 then [total, c, p, r, g]
+  else
+    let gl = head lines
+    let s = parse_stage gl
+    let c2 = if s >= 1 then c + 1 else c
+    let p2 = if s >= 2 then p + 1 else p
+    let r2 = if s >= 3 then r + 1 else r
+    let g2 = if s >= 4 then g + 1 else g
+    tally_loop (tail lines) (total + 1) c2 p2 r2 g2
+
+-- Iterate pairs sequentially, emitting per-prompt GRADE lines.
+run_all port spec pairs =
+  run_loop port spec pairs []
+
+run_loop port spec pairs acc =
+  if length pairs == 0 then reverse acc
+  else
+    let pr = head pairs
+    let id = head pr
+    let prompt = head (tail pr)
+    let cp = gen_one port spec id prompt
+    let _ = 0
+    let grade_line = grade_one id cp
+    let _ = print grade_line
+    run_loop port spec (tail pairs) (cons grade_line acc)
+
+main =
+  let argv = args
+  let port = if length argv > 1 then head (tail argv) else default_port
+
+  -- Health-check the endpoint up front; abort with a clear message
+  -- rather than failing 20 times.
+  let probe = shell (cat ["curl -sS --max-time 3 http://localhost:", port, "/v1/models 2>/dev/null | head -c 20"])
+  if length probe == 0 then
+    let _ = print (cat ["ERROR: no substrate at localhost:", port, ". Start the MLX server then retry."])
+    let _ = print "  example: mlx_lm.server --host 10.42.0.2 --port 8082 --model <model_name>"
+    1
+  else
+    let _ = shell (cat ["mkdir -p ", comp_dir])
+    let spec = read_file spec_file
+    let pairs = load_pairs
+
+    let _ = print (cat ["Substrate driver starting. port=", port, " bench_rows=", show (length pairs)])
+    let grade_lines = run_all port spec pairs
+    let totals = tally grade_lines
+    let _ = print (cat [
+      "TOTALS: total=", show (head totals),
+      " compile=", show (head (tail totals)),
+      " parse=", show (head (tail (tail totals))),
+      " run=", show (head (tail (tail (tail totals)))),
+      " goal_reach=", show (head (tail (tail (tail (tail totals)))))
+    ])
+
+    -- Also emit a lab-chain sentinel block. So a watcher can ingest
+    -- this stdout and append a result to the chain entry 32487cda.
+    let _ = print "===RAIL_LAB_COUNTERS==="
+    let _ = print (cat ["{\"counter\": \"bench_size\", \"value\": ", show (head totals), "}"])
+    let _ = print (cat ["{\"counter\": \"substrate_compile_count\", \"value\": ", show (head (tail totals)), "}"])
+    let _ = print (cat ["{\"counter\": \"substrate_parse_count\", \"value\": ", show (head (tail (tail totals))), "}"])
+    let _ = print (cat ["{\"counter\": \"substrate_run_count\", \"value\": ", show (head (tail (tail (tail totals)))), "}"])
+    let _ = print (cat ["{\"counter\": \"substrate_goal_reach_count\", \"value\": ", show (head (tail (tail (tail (tail totals))))), "}"])
+    let _ = print "===END==="
+    let goal_reach_count = head (tail (tail (tail (tail totals))))
+    let verdict = if goal_reach_count >= 10 then "PASS" else if goal_reach_count >= 5 then "INCONCLUSIVE" else "FALSIFIED"
+    let _ = print (cat ["===VERDICT=== ", verdict])
+    0

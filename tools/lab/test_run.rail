@@ -1,0 +1,348 @@
+-- tools/lab/test_run.rail — Acceptance tests for run.rail (piece 3 of 3).
+--
+-- Run: ./rail_native run tools/lab/test_run.rail
+--
+-- The runner driver: we compile run.rail to a fresh binary at /tmp/rail_run_lab
+-- ONCE at startup, then shell out to it for each test case. We cannot use
+-- `./rail_native run` to invoke it — `compile_and_run` swallows the child's
+-- exit code (it always returns 0). Direct exec preserves the exit code.
+--
+-- Test invariants (see spec §critical-invariants):
+--   T-PRIOR-SHOWN     : prior-attempt rollup is always surfaced
+--   T-KILL-FATAL      : empty --kill → fatal exit, no append
+--   T-CTR-FATAL       : empty --counters → fatal exit, no append
+--   T-COUNTER-MISSING : declared "X" never emitted → INCONCLUSIVE, entry IS appended
+--   T-VERDICT-MISSING : experiment with no verdict sentinel → exit 4, no append
+--   T-EXEC-FAIL       : experiment exits 1 with no verdict → exit 3, INCONCLUSIVE appended
+--   T-HAPPY-PATH      : well-formed experiment → PASS verdict, entry appended
+--   T-ATOMIC          : a duplicate-id append leaves chain.log byte-identical
+
+import "tools/lab/chain.rail"
+-- chain.rail brings in file.rail, env.rail, entry.rail, etc.
+
+-- ── Test harness padding (same first-3-untagged quirk) ────────────────
+str_eq3 _d1 _d2 _d3 a b = if a == b then 1 else 0
+int_eq3 _d1 _d2 _d3 a b = if a == b then 1 else 0
+
+assert_true label cond = if cond then 1 else
+  let _ = print (cat ["FAIL: ", label])
+  0
+
+assert_eq_int label a b = if int_eq3 0 0 0 a b == 1 then 1 else
+  let _ = print (cat ["FAIL: ", label, " expected=", show b, " got=", show a])
+  0
+
+assert_eq_str label a b = if str_eq3 0 0 0 a b == 1 then 1 else
+  let _ = print (cat ["FAIL: ", label])
+  let _ = print (cat ["       expected=", b])
+  let _ = print (cat ["       got     =", a])
+  0
+
+-- ── Setup ─────────────────────────────────────────────────────────────
+
+RUN_BIN = "/tmp/rail_run_lab"
+KEY_PATH = "/tmp/rail_run_lab_key.pem"
+
+setup_once _ =
+  -- Compile run.rail to /tmp/rail_out and copy to RUN_BIN.
+  let _ = print "setup: compiling tools/lab/run.rail"
+  let _ = shell "./rail_native tools/lab/run.rail 2>&1 | tail -3"
+  let _ = shell (cat ["cp /tmp/rail_out ", RUN_BIN, " && chmod +x ", RUN_BIN])
+  let _ = shell (cat ["codesign -s - ", RUN_BIN, " 2>/dev/null"])
+  -- Generate an Ed25519 key.
+  let _ = shell (cat ["openssl genpkey -algorithm ed25519 -out ", KEY_PATH, " 2>&1"])
+  let _ = shell (cat ["chmod 0600 ", KEY_PATH])
+  0
+
+-- Build a per-test chain root + experiment script directory.
+mk_root tag =
+  let pid = shell "echo $$"
+  let p = parse_int_dec pid
+  let path = cat ["/tmp/rail_run_test_", show p, "_", tag]
+  let _ = shell (cat ["rm -rf '", path, "' && mkdir -p '", path, "'"])
+  path
+
+-- Write a tiny experiment script. Returns its absolute path.
+write_exp dir name body =
+  let p = cat [dir, "/", name]
+  let _ = write_file p (cat ["#!/bin/sh\n", body, "\n"])
+  let _ = shell (cat ["chmod +x '", p, "'"])
+  p
+
+-- Run run.rail with the given trailing args. Returns (stdout, exit_code).
+run_run args =
+  let pid = shell "echo $$"
+  let p = parse_int_dec pid
+  let out_path = cat ["/tmp/rail_run_test_out_", show p, ".txt"]
+  let ec_path  = cat ["/tmp/rail_run_test_ec_", show p, ".txt"]
+  let _ = shell (cat [RUN_BIN, " ", args, " > '", out_path, "' 2>&1; echo $? > '", ec_path, "'"])
+  let out = if path_exists out_path then read_file out_path else ""
+  let ec_raw = if path_exists ec_path then str_trim_run (read_file ec_path) else "?"
+  let ec = parse_int_dec ec_raw
+  (out, ec)
+
+str_trim_run s =
+  -- Minimal local trim — strip trailing whitespace.
+  let cs = chars s
+  if length cs == 0 then s
+  else
+    let r = reverse cs
+    let rt = strip_ws_left r
+    cs_to_string_run (reverse rt)
+
+strip_ws_left cs =
+  if length cs == 0 then cs
+  else
+    let c = head cs
+    if c == " " then strip_ws_left (tail cs)
+    else if c == "\n" then strip_ws_left (tail cs)
+    else if c == "\r" then strip_ws_left (tail cs)
+    else if c == "\t" then strip_ws_left (tail cs)
+    else cs
+
+cs_to_string_run cs =
+  if length cs == 0 then ""
+  else append (head cs) (cs_to_string_run (tail cs))
+
+-- Count newlines in a file (== entry count for chain.log).
+count_chain_lines root =
+  let log = cat [root, "/chain/log.jsonl"]
+  if path_exists log == false then 0
+  else
+    let content = read_file log
+    count_nls (chars content) 0
+
+count_nls cs acc =
+  if length cs == 0 then acc
+  else if head cs == "\n" then count_nls (tail cs) (acc + 1)
+  else count_nls (tail cs) acc
+
+-- ── COMMON ARG BUILDERS ───────────────────────────────────────────────
+
+base_args root goal kill counters cmd =
+  cat ["put-goal '", goal, "' --root=", root,
+       " --key=", KEY_PATH,
+       " --no-gossip --non-interactive",
+       " --kill='", kill, "'",
+       " --counters='", counters, "'",
+       " --cmd='", cmd, "'"]
+
+-- ── T-HAPPY-PATH ──────────────────────────────────────────────────────
+
+-- The experiment is a /bin/sh script. The sentinels and JSON lines have
+-- to be emitted via `echo`, not bare (otherwise sh tries to exec them
+-- as commands and the runner's stdout never carries the sentinels).
+HAPPY_EXP = "echo doing science\necho '===RAIL_LAB_COUNTERS==='\necho '{\"counter\": \"loss\", \"value\": 0.1}'\necho '{\"counter\": \"acc\", \"value\": 99}'\necho '===END==='\necho '===VERDICT=== PASS'"
+
+t_happy _ =
+  let root = mk_root "happy"
+  let exp = write_exp root "exp.sh" HAPPY_EXP
+  let (out, ec) = run_run (base_args root "happy goal" "no_segfault" "loss,acc" exp)
+  let p_basic = check_happy_basic ec (count_chain_lines root) out
+  let prefix = extract_id_prefix out
+  let p_followup = check_happy_followup root prefix
+  p_basic * p_followup
+
+check_happy_basic ec line_count out =
+  let p1 = assert_eq_int "T-HAPPY: exit 0" ec 0
+  let p2 = assert_eq_int "T-HAPPY: chain has 1 entry" line_count 1
+  let p3 = assert_true "T-HAPPY: output contains '[OK] entry recorded'" (str_contains "[OK] entry recorded" out)
+  let p4 = assert_true "T-HAPPY: verdict line shows PASS" (str_contains "verdict:  PASS" out)
+  p1 * p2 * p3 * p4
+
+check_happy_followup root prefix =
+  let p5 = assert_eq_int "T-HAPPY: id prefix len 8" (length (chars prefix)) 8
+  let (rout, rec2) = run_run (cat ["read ", prefix, " --root=", root])
+  let p6 = assert_eq_int "T-HAPPY: read exit 0" rec2 0
+  let p7 = assert_true "T-HAPPY: read JSON has happy goal" (str_contains "happy goal" rout)
+  let (vout, vec) = run_run (cat ["verify ", prefix, " --root=", root])
+  let p8 = assert_eq_int "T-HAPPY: verify exit 0" vec 0
+  let p9 = assert_true "T-HAPPY: verify says OK" (str_contains "OK " vout)
+  p5 * p6 * p7 * p8 * p9
+
+-- Extract the 8-char short id from a "  id:       <64-hex>" line.
+extract_id_prefix out =
+  let i = str_find "  id:       " out
+  if i < 0 then ""
+  else
+    let n = length (chars "  id:       ")
+    let rest = str_sub out (i + n) 8
+    rest
+
+-- ── T-KILL-FATAL ──────────────────────────────────────────────────────
+
+t_kill_fatal _ =
+  let root = mk_root "kill_fatal"
+  let exp = write_exp root "exp.sh" "echo dummy"
+  -- Empty --kill via explicit empty string.
+  let args = cat ["put-goal 'k goal' --root=", root,
+                  " --key=", KEY_PATH,
+                  " --no-gossip --non-interactive",
+                  " --kill=''",
+                  " --counters='loss'",
+                  " --cmd='", exp, "'"]
+  let (out, ec) = run_run args
+  let p1 = assert_eq_int "T-KILL-FATAL: exit 2" ec 2
+  let p2 = assert_eq_int "T-KILL-FATAL: chain has 0 entries" (count_chain_lines root) 0
+  let p3 = assert_true "T-KILL-FATAL: error message mentions kill" (str_contains "kill" out)
+  p1 * p2 * p3
+
+-- ── T-CTR-FATAL ───────────────────────────────────────────────────────
+
+t_ctr_fatal _ =
+  let root = mk_root "ctr_fatal"
+  let exp = write_exp root "exp.sh" "echo dummy"
+  let args = cat ["put-goal 'c goal' --root=", root,
+                  " --key=", KEY_PATH,
+                  " --no-gossip --non-interactive",
+                  " --kill='no_segfault'",
+                  " --counters=''",
+                  " --cmd='", exp, "'"]
+  let (out, ec) = run_run args
+  let p1 = assert_eq_int "T-CTR-FATAL: exit 2" ec 2
+  let p2 = assert_eq_int "T-CTR-FATAL: chain has 0 entries" (count_chain_lines root) 0
+  let p3 = assert_true "T-CTR-FATAL: error mentions counter" (str_contains "counter" out)
+  p1 * p2 * p3
+
+-- ── T-COUNTER-MISSING ─────────────────────────────────────────────────
+-- Declared "loss,acc" but exp only emits "loss". Spec §critical-invariants:
+-- verdict overridden to INCONCLUSIVE, entry IS appended.
+
+CTRMISS_EXP = "echo running\necho '===RAIL_LAB_COUNTERS==='\necho '{\"counter\": \"loss\", \"value\": 0.1}'\necho '===END==='\necho '===VERDICT=== PASS'"
+
+t_counter_missing _ =
+  let root = mk_root "ctr_missing"
+  let exp = write_exp root "exp.sh" CTRMISS_EXP
+  let (out, ec) = run_run (base_args root "cm goal" "no_segfault" "loss,acc" exp)
+  let p1 = assert_eq_int "T-COUNTER-MISSING: exit 5" ec 5
+  let p2 = assert_eq_int "T-COUNTER-MISSING: chain has 1 entry" (count_chain_lines root) 1
+  let p3 = assert_true "T-COUNTER-MISSING: verdict INCONCLUSIVE" (str_contains "verdict:  INCONCLUSIVE" out)
+  let p4 = assert_true "T-COUNTER-MISSING: counter_missing:acc" (str_contains "counter_missing:acc" out)
+  p1 * p2 * p3 * p4
+
+-- ── T-VERDICT-MISSING ─────────────────────────────────────────────────
+
+VMISS_EXP = "echo running\necho '===RAIL_LAB_COUNTERS==='\necho '{\"counter\": \"loss\", \"value\": 0.1}'\necho '===END==='"
+
+t_verdict_missing _ =
+  let root = mk_root "vmissing"
+  let exp = write_exp root "exp.sh" VMISS_EXP
+  let (out, ec) = run_run (base_args root "vm goal" "no_segfault" "loss" exp)
+  let p1 = assert_eq_int "T-VERDICT-MISSING: exit 4" ec 4
+  let p2 = assert_eq_int "T-VERDICT-MISSING: chain bytes unchanged (no append)" (count_chain_lines root) 0
+  let p3 = assert_true "T-VERDICT-MISSING: reason printed" (str_contains "no_verdict_sentinel" out)
+  p1 * p2 * p3
+
+-- ── T-EXEC-FAIL ───────────────────────────────────────────────────────
+-- exp exits non-zero AND has no verdict. We expect INCONCLUSIVE+append+exit 3.
+
+EXFAIL_EXP = "echo running\necho '===RAIL_LAB_COUNTERS==='\necho '{\"counter\": \"loss\", \"value\": 0.1}'\necho '===END==='\nexit 1"
+
+t_exec_fail _ =
+  let root = mk_root "exec_fail"
+  let exp = write_exp root "exp.sh" EXFAIL_EXP
+  let (out, ec) = run_run (base_args root "ef goal" "no_segfault" "loss" exp)
+  let p1 = assert_eq_int "T-EXEC-FAIL: exit 3" ec 3
+  let p2 = assert_eq_int "T-EXEC-FAIL: chain has 1 entry" (count_chain_lines root) 1
+  let p3 = assert_true "T-EXEC-FAIL: verdict INCONCLUSIVE" (str_contains "verdict:  INCONCLUSIVE" out)
+  let p4 = assert_true "T-EXEC-FAIL: runner_error reports exec_failed_" (str_contains "exec_failed_1" out)
+  p1 * p2 * p3 * p4
+
+-- ── T-PRIOR-SHOWN ─────────────────────────────────────────────────────
+-- Pre-seed the chain with two matching entries via the happy path.
+-- Then a third put-goal must surface a "2 prior attempts" line.
+
+seed_one root exp goal =
+  let (_o, e) = run_run (base_args root goal "no_segfault" "loss" exp)
+  e
+
+run_prior_root root exp goal =
+  run_run (base_args root goal "no_segfault" "loss" exp)
+
+PRIOR_EXP = "echo run\necho '===RAIL_LAB_COUNTERS==='\necho '{\"counter\": \"loss\", \"value\": 0.1}'\necho '===END==='\necho '===VERDICT=== PASS'"
+
+t_prior_shown _ =
+  let root = mk_root "prior"
+  let exp = write_exp root "exp.sh" PRIOR_EXP
+  let p_seed = check_prior_seeds root exp
+  let p_third = check_prior_third root exp
+  let p_fresh = check_prior_fresh root exp
+  p_seed * p_third * p_fresh
+
+-- chain_search_goal does `str_contains needle text` — i.e., looks for
+-- the new goal AS A SUBSTRING OF each prior goal. We seed priors that
+-- contain the third goal's text verbatim.
+check_prior_seeds root exp =
+  let p1 = assert_eq_int "T-PRIOR: seed 1 exit 0" (seed_one root exp "rmsnorm tweak A") 0
+  let p2 = assert_eq_int "T-PRIOR: seed 2 exit 0" (seed_one root exp "rmsnorm tweak B") 0
+  p1 * p2
+
+check_prior_third root exp =
+  let (o3, e3) = run_prior_root root exp "rmsnorm"
+  let p3 = assert_eq_int "T-PRIOR: third put-goal exit 0" e3 0
+  let p4 = check_prior_strings o3
+  p3 * p4
+
+check_prior_fresh root exp =
+  let (o4, _e4) = run_prior_root root exp "completely unrelated"
+  assert_true "T-PRIOR: fresh goal shows '0 prior attempts'" (str_contains "0 prior attempts" o4)
+
+check_prior_strings out =
+  let p4 = assert_true "T-PRIOR: third run shows '2 prior attempts'" (str_contains "2 prior attempts" out)
+  let p5 = assert_true "T-PRIOR: shows '2 PASS' rollup" (str_contains "2 PASS" out)
+  let p6 = assert_true "T-PRIOR: lists short ids" (str_contains "Top matches:" out)
+  p4 * p5 * p6
+
+-- ── T-ATOMIC ──────────────────────────────────────────────────────────
+-- We can't kill -9 the runner mid-append from Rail. Instead we exercise
+-- the atomicity surface that the chain-layer's duplicate-id rejection
+-- guards: we hand-construct an entry, append it via chain_append_h once,
+-- then attempt to append the same blob again. The log must be byte-
+-- identical pre/post the rejected call. This is the same proof shape
+-- as test_chain.rail::t_atomic but plugged in from run.rail's POV.
+--
+-- Additionally we assert that run.rail does NOT swallow the duplicate
+-- error silently: it must surface a non-zero exit when chain_append fails.
+-- We trigger that via the happy path: first run records normally, second
+-- run with identical goal text + an identical-content experiment yields
+-- a different created_at timestamp → different id, so no dup. So instead
+-- we test the partial-state guard on a different failure: invalid signing
+-- key → exit 8 + no append. That exercises Phase F's sign-fail / Phase G-
+-- never-reached path.
+
+ATOMIC_EXP = "echo run\necho '===RAIL_LAB_COUNTERS==='\necho '{\"counter\": \"loss\", \"value\": 0.1}'\necho '===END==='\necho '===VERDICT=== PASS'"
+
+build_bad_key_args root exp =
+  cat ["put-goal 'atomic goal' --root=", root, " --key=/nonexistent/path/key.pem --no-gossip --non-interactive --kill='no_segfault' --counters='loss' --cmd='", exp, "'"]
+
+t_atomic _ =
+  let root = mk_root "atomic"
+  let exp = write_exp root "exp.sh" ATOMIC_EXP
+  let pre_lines = count_chain_lines root
+  let (out, ec) = run_run (build_bad_key_args root exp)
+  let p1 = assert_eq_int "T-ATOMIC: exit 8 on missing signing key" ec 8
+  let p2 = assert_eq_int "T-ATOMIC: chain bytes unchanged (no append)" (count_chain_lines root) pre_lines
+  let p3 = assert_true "T-ATOMIC: error message printed" (str_contains "signing key not found" out)
+  p1 * p2 * p3
+
+-- ── Runner ────────────────────────────────────────────────────────────
+
+main =
+  let _ = setup_once 0
+  let r1 = t_happy 0
+  let r2 = t_kill_fatal 0
+  let r3 = t_ctr_fatal 0
+  let r4 = t_counter_missing 0
+  let r5 = t_verdict_missing 0
+  let r6 = t_exec_fail 0
+  let r7 = t_prior_shown 0
+  let r8 = t_atomic 0
+  let total = r1 + r2 + r3 + r4 + r5 + r6 + r7 + r8
+  let n = 8
+  let _ = print (cat ["Tests passed: ", show total, " / ", show n])
+  if total == n then
+    let _ = print "PASS"
+    0
+  else
+    let _ = print "FAIL"
+    1

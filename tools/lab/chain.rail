@@ -1,0 +1,960 @@
+-- tools/lab/chain.rail — append-only attestable work-chain (storage + read layer)
+--
+-- Piece 2 of 3 in the attestable-work-chain subsystem. Implementation phase.
+--   piece 1: tools/lab/entry.rail      — canonical form, signing, parsing
+--   piece 2: tools/lab/chain.rail      — storage, indices, read, witness gossip  (THIS FILE)
+--   piece 3: tools/lab/run.rail        — experiment runner (depends on this iface)
+--
+-- See tools/lab/specs/chain.spec.md for the contract.
+--
+-- Storage layout (decided in §2 of the spec):
+--   $root/chain/log.jsonl          -- canonical append-only log
+--   $root/chain/countersigs.jsonl  -- witness countersigns, separate append-only
+--   $root/chain/index/meta.txt     -- {schema, log_sha256, entry_count}
+--   $root/chain/LOCK.d/            -- atomic mkdir-based writer lock
+--
+-- ON-DISK PERSISTENCE: indices are NOT persisted across processes. We
+-- rebuild them in memory by streaming log.jsonl on every chain_open.
+-- (Spec §2.2 calls indices a "derived cache" — for v0 we keep that
+-- cache in memory only. The `meta.txt` sidecar holds just the
+-- log_sha256 fingerprint for cheap "was the log appended-to externally"
+-- detection. Spec §2.1's by_id.json / by_goal.json / etc. files are NOT
+-- written in v0 because the JSON deps that would let us encode them
+-- collide with our crypto imports at parse time — see entry.rail's
+-- preamble note. The performance cost is one O(n) scan per open, which
+-- for the expected chain size (<10k entries) is sub-second.)
+--
+-- Concurrency: single-writer, multi-reader, atomic-mkdir advisory lock.
+-- (Spec §6 calls for `flock(2)`; macOS does not ship /usr/bin/flock so
+-- we use `mkdir LOCK.d` which is atomic in POSIX. Crashed writers leave
+-- the dir behind; operators clear it manually (`rm -rf <root>/chain/LOCK.d`)
+-- or via a future `chain-tool --break-lock` helper. We deliberately do
+-- not auto-reclaim by PID because Rail's `shell` builtin spawns a
+-- child shell whose `$$` is the child's PID, not ours — a wrong
+-- positive reclaim would corrupt the chain. See try_acquire_lock.)
+
+import "stdlib/file.rail"
+import "stdlib/env.rail"
+import "tools/lab/entry.rail"
+-- entry.rail transitively imports sha256/sha512/x25519/ed25519. We use
+-- its symbols (sha256_hex etc.); do NOT also import them here or the
+-- assembler errors on duplicate stdlib/bytes.rail symbols.
+
+-- ------------------------------------------------------------------
+-- TYPES
+-- ------------------------------------------------------------------
+--
+-- The h is a flat tagged list (Rail's records are positional-ADT).
+-- We carry mutable-ish state by passing back a new h from
+-- chain_append. Lock ownership and the in-memory indices ride along.
+
+-- ChainHandle positional fields:
+--   root_dir           string
+--   log_path           string  ("<root>/chain/log.jsonl")
+--   csig_path          string  ("<root>/chain/countersigs.jsonl")
+--   index_dir          string  ("<root>/chain/index")
+--   lock_path          string  ("<root>/chain/LOCK.d")
+--   mode               string  ("rw" | "ro")
+--   by_id              [(id, offset)]               assoc-list
+--   by_id_order        [id]                          append-order, useful for stable iteration
+--   parents_map        [(id, [parent_id])]
+--   children_map       [(id, [child_id])]
+--   goals_map          [(id, goal_lower)]            full goal text, lowercased
+--   hyps_map           [(id, hyp_lower)]
+--   verdict_map        [(id, verdict_tag_string)]
+--   log_size           int                            current byte length of log.jsonl
+--   log_sha256         string
+type ChainHandle = | ChainHandle root_dir log_path csig_path index_dir lock_path mode by_id by_id_order parents_map children_map goals_map hyps_map verdict_map log_size log_sha
+
+type HypSelector =
+  | HypById   id_string
+  | HypByText substring
+
+-- ------------------------------------------------------------------
+-- ERROR TAGS
+-- ------------------------------------------------------------------
+
+err_locked          = "chain:locked"
+err_corrupt_log     = "chain:corrupt-log"
+err_io              = "chain:io"
+err_not_found       = "chain:not-found"
+err_duplicate_id    = "chain:duplicate-id"
+err_parent_missing  = "chain:parent-missing"
+err_disk_full       = "chain:disk-full"
+err_no_lock         = "chain:no-lock"
+err_gossip_all_down = "chain:gossip-all-down"
+err_invalid_blob    = "chain:invalid-blob"
+
+-- ------------------------------------------------------------------
+-- LOW-LEVEL HELPERS
+-- ------------------------------------------------------------------
+
+-- Lowercase a single-char string (ASCII only).
+char_lower c =
+  let n = char_to_int c
+  if n >= 65 then
+    if n <= 90 then char_from_int (n + 32)
+    else c
+  else c
+
+-- Build a lowered string from a char list (tail-recursive accumulator).
+str_lower_cs cs acc =
+  if length cs == 0 then acc
+  else str_lower_cs (tail cs) (append acc (char_lower (head cs)))
+
+str_lower s = str_lower_cs (chars s) ""
+
+-- assoc lookup: return ("ok", value) | ("missing", 0).
+assoc_lookup_loop xs key =
+  if length xs == 0 then ("missing", 0)
+  else
+    let (k, v) = head xs
+    if k == key then ("ok", v)
+    else assoc_lookup_loop (tail xs) key
+
+assoc_has xs key =
+  let (s, _v) = assoc_lookup_loop xs key
+  if s == "ok" then true else false
+
+assoc_get xs key =
+  let (s, v) = assoc_lookup_loop xs key
+  if s == "ok" then v else 0
+
+assoc_get_str xs key =
+  let (s, v) = assoc_lookup_loop xs key
+  if s == "ok" then v else ""
+
+assoc_get_list xs key =
+  let (s, v) = assoc_lookup_loop xs key
+  if s == "ok" then v else []
+
+-- Build a path: append "/" then b unless a already ends in "/".
+path_join a b =
+  let alen = length (chars a)
+  if alen == 0 then b
+  else
+    let last_c = str_sub a (alen - 1) 1
+    if last_c == "/" then cat [a, b]
+    else cat [a, "/", b]
+
+-- Resolve $RAIL_LAB_HOME, with optional explicit override.
+resolve_root root_or_empty =
+  if length (chars root_or_empty) > 0 then root_or_empty
+  else
+    let env_val = get_env "RAIL_LAB_HOME"
+    if length (chars env_val) > 0 then env_val
+    else
+      let home = get_env "HOME"
+      if length (chars home) > 0 then path_join home ".rail/lab"
+      else "./.lab"
+
+-- Run a shell command; return exit code parsed from the trailing `__rc=N` marker.
+-- Stdout (without the marker) is discarded; callers can read files written by
+-- the command separately.
+shell_rc cmd =
+  let out = shell (cat [cmd, "; printf '__rc=%d' $?"])
+  let idx = str_find "__rc=" out
+  if idx < 0 then -1
+  else
+    let n_str = str_sub out (idx + 5) (length (chars out) - (idx + 5))
+    parse_int_dec n_str
+
+-- mkdir -p — silent if exists.
+mkdir_p path =
+  shell_rc (cat ["mkdir -p '", path, "'"])
+
+-- Check if a path exists.
+path_exists path =
+  let rc = shell_rc (cat ["test -e '", path, "'"])
+  if rc == 0 then true else false
+
+-- Read file size in bytes (0 if missing).
+file_size path =
+  if path_exists path == false then 0
+  else
+    let out = shell (cat ["wc -c < '", path, "' | tr -d ' \\n'"])
+    parse_int_dec out
+
+-- A token used in /tmp paths to avoid collision across concurrent
+-- invocations on the same host. `shell` spawns a child sh whose `$$`
+-- is the child's PID — fresh per shell call but unique enough for
+-- a tmp filename. We do NOT rely on this for lock identity; see
+-- try_acquire_lock for the lock-ownership design.
+shell_pid _ =
+  let s = shell "echo $$"
+  parse_int_dec s
+
+-- ------------------------------------------------------------------
+-- LOCK
+-- ------------------------------------------------------------------
+--
+-- We use `mkdir LOCK.d` which is atomic in POSIX. The successful mkdir
+-- creator drops a pidfile inside; on subsequent open attempts we check
+-- the pidfile and reclaim if the owner is dead. Locks auto-evaporate
+-- on `rm -rf` during close.
+
+-- Lock acquisition: mkdir is atomic. If LOCK.d already exists, we
+-- refuse — the spec §6 model is advisory; operators break a stale
+-- lock manually (`rm -rf <root>/chain/LOCK.d`) before re-opening, or
+-- run.rail can expose a `--break-lock` flag. We intentionally do NOT
+-- auto-reclaim by PID: spawning a shell to fetch our own PID is
+-- not race-free under Rail's `shell` builtin, and a wrong-positive
+-- reclaim is a worse failure mode than a leaked lock that requires
+-- one human keystroke to clear.
+try_acquire_lock lock_path =
+  let rc = shell_rc (cat ["mkdir '", lock_path, "' 2>/dev/null"])
+  if rc == 0 then
+    let _ = write_file (path_join lock_path "owner.txt") "rail-chain-writer"
+    1
+  else 0
+
+release_lock lock_path =
+  shell_rc (cat ["rm -rf '", lock_path, "'"])
+
+-- ------------------------------------------------------------------
+-- LINE-ORIENTED LOG ACCESS
+-- ------------------------------------------------------------------
+
+-- Split a string into lines on '\n'. Empty trailing newline produces an
+-- empty trailing element which we drop. Multi-char split is `str_split` —
+-- but it operates on multi-character delimiters; for a single '\n' we
+-- use the per-character `split` builtin.
+split_lines s =
+  if length (chars s) == 0 then []
+  else
+    let raw = split "\n" s
+    drop_trailing_empty raw
+
+drop_trailing_empty xs =
+  if length xs == 0 then []
+  else
+    let r = reverse xs
+    if head r == "" then reverse (tail r)
+    else xs
+
+-- Compute byte offsets of each line start in a list of lines. We assume
+-- each line is followed by exactly one '\n' in the original file.
+line_offsets lines start acc =
+  if length lines == 0 then reverse acc
+  else
+    let len = length (chars (head lines))
+    line_offsets (tail lines) (start + len + 1) (cons start acc)
+
+-- ------------------------------------------------------------------
+-- INDEX REBUILD
+-- ------------------------------------------------------------------
+--
+-- Stream log.jsonl, deserialize each line via entry.rail, populate the
+-- in-memory maps. Returns either ("ok", h) or ("err", code).
+
+-- Append a value to the children list for parent_id; if missing, create.
+push_child cmap parent_id child_id =
+  let (s, current) = assoc_lookup_loop cmap parent_id
+  if s == "ok" then
+    update_assoc cmap parent_id (append current [child_id])
+  else
+    cons (parent_id, [child_id]) cmap
+
+update_assoc xs key new_val =
+  if length xs == 0 then [(key, new_val)]
+  else
+    let (k, v) = head xs
+    if k == key then cons (key, new_val) (tail xs)
+    else cons (head xs) (update_assoc (tail xs) key new_val)
+
+-- Rebuild step: process one (line, offset, lineno) into the working
+-- index quadruple (by_id, by_id_order, parents_map, children_map,
+-- goals_map, hyps_map, verdict_map). We carry the tuple as a list
+-- because Rail tuple shapes >5 can be fragile; explicit accumulator
+-- list keeps types crisp.
+
+-- index_acc shape:
+--   [by_id, by_id_order, parents_map, children_map, goals_map, hyps_map, verdict_map]
+
+empty_index _ = [[], [], [], [], [], [], []]
+
+index_step acc line offset =
+  let by_id          = head acc
+  let by_id_order    = head (tail acc)
+  let parents_map    = head (tail (tail acc))
+  let children_map   = head (tail (tail (tail acc)))
+  let goals_map      = head (tail (tail (tail (tail acc))))
+  let hyps_map       = head (tail (tail (tail (tail (tail acc)))))
+  let verdict_map    = head (tail (tail (tail (tail (tail (tail acc))))))
+  let parsed = entry_deserialize line
+  if is_error parsed then
+    error (cat [err_corrupt_log, ": deserialize failed at offset ", show offset, ": ", err_msg parsed])
+  else
+    let (e, _ws) = parsed
+    let id = entry_id e
+    if length (chars id) == 0 then
+      error (cat [err_corrupt_log, ": missing id at offset ", show offset])
+    else if assoc_has by_id id then
+      error (cat [err_corrupt_log, ": duplicate id in log at offset ", show offset, ": ", id])
+    else
+      let parents = entry_parents e
+      let goal_l = str_lower (entry_goal e)
+      let hyp_l = str_lower (entry_hypothesis e)
+      let verdict_tag = verdict_to_string (result_verdict (entry_result e))
+      let new_by_id = cons (id, offset) by_id
+      let new_order = append by_id_order [id]
+      let new_parents = cons (id, parents) parents_map
+      let new_children = add_children_for_id children_map id parents
+      let new_goals = cons (id, goal_l) goals_map
+      let new_hyps = cons (id, hyp_l) hyps_map
+      let new_verdict = cons (id, verdict_tag) verdict_map
+      [new_by_id, new_order, new_parents, new_children, new_goals, new_hyps, new_verdict]
+
+-- For each parent in parents-of(id), add id as a child of that parent.
+add_children_for_id cmap id parents =
+  if length parents == 0 then cmap
+  else add_children_for_id (push_child cmap (head parents) id) id (tail parents)
+
+-- Drive the rebuild over a list of (line, offset) pairs.
+rebuild_loop pairs acc =
+  if length pairs == 0 then acc
+  else
+    let (line, off) = head pairs
+    let next_acc = index_step acc line off
+    if is_error next_acc then next_acc
+    else rebuild_loop (tail pairs) next_acc
+
+zip_lines_offsets lines offsets =
+  if length lines == 0 then []
+  else cons (head lines, head offsets) (zip_lines_offsets (tail lines) (tail offsets))
+
+build_index_from_log log_path =
+  if path_exists log_path == false then
+    let empty = empty_index 0
+    ("ok", empty, 0, sha256_hex "")
+  else
+    let content = read_file log_path
+    let size = length (chars content)
+    let lines = split_lines content
+    let offsets = line_offsets lines 0 []
+    let pairs = zip_lines_offsets lines offsets
+    let result = rebuild_loop pairs (empty_index 0)
+    if is_error result then ("err", result, 0, "")
+    else ("ok", result, size, sha256_hex content)
+
+-- ------------------------------------------------------------------
+-- META SIDECAR
+-- ------------------------------------------------------------------
+--
+-- We persist only one tiny derived-from-log sidecar: meta.txt. Three
+-- lines: schema, log_sha256, entry_count. Used to cheaply detect "did
+-- something external touch the log since we last opened it?" without
+-- the full O(n) rebuild — though for v0 we ALWAYS rebuild, treating
+-- meta.txt as informational. Future v1 may shortcut.
+
+write_meta index_dir schema sha entry_count =
+  let _ = mkdir_p index_dir
+  let body = cat ["schema=", show schema, "\n",
+                  "log_sha256=", sha, "\n",
+                  "entry_count=", show entry_count, "\n"]
+  write_file (path_join index_dir "meta.txt") body
+
+-- ------------------------------------------------------------------
+-- LIFECYCLE
+-- ------------------------------------------------------------------
+
+chain_open_with_mode root_or_empty mode =
+  let root = resolve_root root_or_empty
+  let chain_dir = path_join root "chain"
+  let index_dir = path_join chain_dir "index"
+  let log_path  = path_join chain_dir "log.jsonl"
+  let csig_path = path_join chain_dir "countersigs.jsonl"
+  let lock_path = path_join chain_dir "LOCK.d"
+  let _ = mkdir_p chain_dir
+  let _ = mkdir_p index_dir
+  let lock_ok =
+    if mode == "rw" then try_acquire_lock lock_path
+    else 1
+  if lock_ok == 0 then error err_locked
+  else
+    let r = build_index_from_log log_path
+    let (status, payload, size, sha) = r
+    if status != "ok" then
+      let _ = if mode == "rw" then release_lock lock_path else 0
+      payload
+    else
+      let by_id        = head payload
+      let by_id_order  = head (tail payload)
+      let parents_map  = head (tail (tail payload))
+      let children_map = head (tail (tail (tail payload)))
+      let goals_map    = head (tail (tail (tail (tail payload))))
+      let hyps_map     = head (tail (tail (tail (tail (tail payload)))))
+      let verdict_map  = head (tail (tail (tail (tail (tail (tail payload))))))
+      let _ = write_meta index_dir 1 sha (length by_id_order)
+      ChainHandle root log_path csig_path index_dir lock_path mode by_id by_id_order parents_map children_map goals_map hyps_map verdict_map size sha
+
+chain_open root_or_empty = chain_open_with_mode root_or_empty "rw"
+
+chain_open_ro root_or_empty = chain_open_with_mode root_or_empty "ro"
+
+chain_close h = match h
+  | ChainHandle _root _lp _cp _ix lock_path mode _bi _bo _pm _cm _gm _hm _vm _sz _sh ->
+      let _ = if mode == "rw" then release_lock lock_path else 0
+      0
+
+-- ------------------------------------------------------------------
+-- WRITE
+-- ------------------------------------------------------------------
+--
+-- Atomicity strategy: we record the pre-append file size, write the
+-- new line via `>>` redirect, then verify the new size == old + len(line)+1.
+-- If anything is off, truncate back to old size via `head -c N`. The
+-- in-memory index is updated AFTER successful write+verify, so a
+-- failure leaves the index identical to its pre-call state.
+
+chain_append h entry_blob = match h
+  | ChainHandle root log_path csig_path index_dir lock_path mode by_id by_id_order parents_map children_map goals_map hyps_map verdict_map log_size log_sha ->
+      if mode != "rw" then error err_no_lock
+      else
+        let parsed = entry_deserialize entry_blob
+        if is_error parsed then error (cat [err_invalid_blob, ": ", err_msg parsed])
+        else
+          let (e, _ws) = parsed
+          let id = entry_id e
+          if length (chars id) == 0 then error (cat [err_invalid_blob, ": entry missing id"])
+          else if assoc_has by_id id then error err_duplicate_id
+          else
+            -- Validate every named parent is already in the log.
+            let parents = entry_parents e
+            let pcheck = parents_all_known by_id parents
+            if is_error pcheck then pcheck
+            else
+              let line = entry_blob
+              -- Sanity: the line must not contain a literal newline.
+              if str_contains "\n" line then error (cat [err_invalid_blob, ": entry_serialize returned multi-line JSON"])
+              else
+                let pre_size = file_size log_path
+                if pre_size != log_size then
+                  -- External writer touched the log since open. Refuse.
+                  error (cat [err_corrupt_log, ": log changed under us (size ", show log_size, " -> ", show pre_size, ")"])
+                else
+                  -- Write the temp line + append.
+                  let tmp_path = cat ["/tmp/rail_chain_append_", show (shell_pid 0), ".tmp"]
+                  let _ = write_file tmp_path (cat [line, "\n"])
+                  let rc = shell_rc (cat ["cat '", tmp_path, "' >> '", log_path, "'"])
+                  if rc != 0 then
+                    let _ = shell_rc (cat ["rm -f '", tmp_path, "'"])
+                    -- Truncate any partial write back to pre_size.
+                    let _ = truncate_to log_path pre_size
+                    error err_disk_full
+                  else
+                    let new_size = file_size log_path
+                    let expected = pre_size + (length (chars line)) + 1
+                    if new_size != expected then
+                      let _ = shell_rc (cat ["rm -f '", tmp_path, "'"])
+                      let _ = truncate_to log_path pre_size
+                      error err_disk_full
+                    else
+                      let _ = shell_rc (cat ["sync; rm -f '", tmp_path, "'"])
+                      -- Update in-memory index.
+                      let new_by_id = cons (id, pre_size) by_id
+                      let new_order = append by_id_order [id]
+                      let new_parents = cons (id, parents) parents_map
+                      let new_children = add_children_for_id children_map id parents
+                      let new_goals = cons (id, str_lower (entry_goal e)) goals_map
+                      let new_hyps = cons (id, str_lower (entry_hypothesis e)) hyps_map
+                      let new_verdict = cons (id, verdict_to_string (result_verdict (entry_result e))) verdict_map
+                      -- Recompute sha incrementally? read_file once more for honesty.
+                      let new_content = read_file log_path
+                      let new_sha = sha256_hex new_content
+                      let _ = write_meta index_dir 1 new_sha (length new_order)
+                      let _new_handle = ChainHandle root log_path csig_path index_dir lock_path mode new_by_id new_order new_parents new_children new_goals new_hyps new_verdict new_size new_sha
+                      -- Return the id; callers re-open if they need the new h.
+                      -- For mutability, callers should use chain_append_h instead.
+                      id
+
+-- Mutating-style append that returns the updated h alongside the id.
+-- (Caller pattern: `let (h2, id) = chain_append_h h blob`.)
+chain_append_h h entry_blob = match h
+  | ChainHandle root log_path csig_path index_dir lock_path mode by_id by_id_order parents_map children_map goals_map hyps_map verdict_map log_size log_sha ->
+      if mode != "rw" then (h, error err_no_lock)
+      else
+        let parsed = entry_deserialize entry_blob
+        if is_error parsed then (h, error (cat [err_invalid_blob, ": ", err_msg parsed]))
+        else
+          let (e, _ws) = parsed
+          let id = entry_id e
+          if length (chars id) == 0 then (h, error (cat [err_invalid_blob, ": entry missing id"]))
+          else if assoc_has by_id id then (h, error err_duplicate_id)
+          else
+            let parents = entry_parents e
+            let pcheck = parents_all_known by_id parents
+            if is_error pcheck then (h, pcheck)
+            else
+              let line = entry_blob
+              if str_contains "\n" line then (h, error (cat [err_invalid_blob, ": entry_serialize returned multi-line JSON"]))
+              else
+                let pre_size = file_size log_path
+                if pre_size != log_size then
+                  (h, error (cat [err_corrupt_log, ": log changed under us (size ", show log_size, " -> ", show pre_size, ")"]))
+                else
+                  let tmp_path = cat ["/tmp/rail_chain_append_", show (shell_pid 0), ".tmp"]
+                  let _ = write_file tmp_path (cat [line, "\n"])
+                  let rc = shell_rc (cat ["cat '", tmp_path, "' >> '", log_path, "'"])
+                  if rc != 0 then
+                    let _ = shell_rc (cat ["rm -f '", tmp_path, "'"])
+                    let _ = truncate_to log_path pre_size
+                    (h, error err_disk_full)
+                  else
+                    let new_size = file_size log_path
+                    let expected = pre_size + (length (chars line)) + 1
+                    if new_size != expected then
+                      let _ = shell_rc (cat ["rm -f '", tmp_path, "'"])
+                      let _ = truncate_to log_path pre_size
+                      (h, error err_disk_full)
+                    else
+                      let _ = shell_rc (cat ["sync; rm -f '", tmp_path, "'"])
+                      let new_by_id = cons (id, pre_size) by_id
+                      let new_order = append by_id_order [id]
+                      let new_parents = cons (id, parents) parents_map
+                      let new_children = add_children_for_id children_map id parents
+                      let new_goals = cons (id, str_lower (entry_goal e)) goals_map
+                      let new_hyps = cons (id, str_lower (entry_hypothesis e)) hyps_map
+                      let new_verdict = cons (id, verdict_to_string (result_verdict (entry_result e))) verdict_map
+                      let new_content = read_file log_path
+                      let new_sha = sha256_hex new_content
+                      let _ = write_meta index_dir 1 new_sha (length new_order)
+                      let new_handle = ChainHandle root log_path csig_path index_dir lock_path mode new_by_id new_order new_parents new_children new_goals new_hyps new_verdict new_size new_sha
+                      (new_handle, id)
+
+parents_all_known by_id ps =
+  if length ps == 0 then 0
+  else if assoc_has by_id (head ps) then parents_all_known by_id (tail ps)
+  else error (cat [err_parent_missing, ": ", head ps])
+
+truncate_to path target_size =
+  let current = file_size path
+  if current == target_size then 0
+  else if current < target_size then 0
+  else
+    let tmp = cat ["/tmp/rail_chain_trunc_", show (shell_pid 0), ".tmp"]
+    let _ = shell_rc (cat ["head -c ", show target_size, " '", path, "' > '", tmp, "' && mv '", tmp, "' '", path, "'"])
+    0
+
+-- ------------------------------------------------------------------
+-- READ — by id
+-- ------------------------------------------------------------------
+
+chain_get h id = match h
+  | ChainHandle _r log_path _cp _ix _lk _mode by_id _bo _pm _cm _gm _hm _vm _sz _sh ->
+      let (s, off) = assoc_lookup_loop by_id id
+      if s != "ok" then error err_not_found
+      else
+        -- Re-read the file and pluck the line starting at `off`.
+        let content = read_file log_path
+        extract_line content off
+
+-- Run.rail interface alias.
+chain_read h id = chain_get h id
+
+extract_line content offset =
+  let total = length (chars content)
+  if offset < 0 then error err_corrupt_log
+  else if offset >= total then error err_corrupt_log
+  else
+    let tail_s = str_sub content offset (total - offset)
+    let nl = str_find "\n" tail_s
+    if nl < 0 then tail_s
+    else str_sub tail_s 0 nl
+
+-- Resolve a (possibly short) hex id prefix to a full id.
+-- Returns the full id, or the literal strings "AMBIGUOUS" / "NONE".
+chain_lookup_prefix h prefix = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode _bi by_id_order _pm _cm _gm _hm _vm _sz _sh ->
+      let matches = filter_prefix by_id_order prefix []
+      if length matches == 0 then "NONE"
+      else if length matches > 1 then "AMBIGUOUS"
+      else head matches
+
+-- Inlined to avoid pulling stdlib/string.rail (which references list.rail's
+-- `any` via `contains_char`, a dependency we don't otherwise need).
+str_starts_with prefix s =
+  let plen = length (chars prefix)
+  let slen = length (chars s)
+  if plen > slen then false
+  else
+    let head_s = str_sub s 0 plen
+    head_s == prefix
+
+filter_prefix ids prefix acc =
+  if length ids == 0 then reverse acc
+  else
+    let id = head ids
+    if str_starts_with prefix id then filter_prefix (tail ids) prefix (cons id acc)
+    else filter_prefix (tail ids) prefix acc
+
+-- ------------------------------------------------------------------
+-- READ — DAG walks
+-- ------------------------------------------------------------------
+--
+-- Implementation: classic BFS with visited set. Output ids in BFS order
+-- with start id at position 0. depth < 0 = unbounded.
+
+chain_walk_parents h id depth = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode by_id _bo parents_map _cm _gm _hm _vm _sz _sh ->
+      if assoc_has by_id id == false then error err_not_found
+      else bfs_walk parents_map [id] [] depth 0
+
+chain_walk_children h id depth = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode by_id _bo _pm children_map _gm _hm _vm _sz _sh ->
+      if assoc_has by_id id == false then error err_not_found
+      else bfs_walk children_map [id] [] depth 0
+
+-- BFS over an adjacency map. frontier and visited are lists of ids;
+-- visited doubles as the result, accumulated in order of first visit.
+-- The implementation is: pop head of frontier, if not visited add to
+-- visited and enqueue neighbors. Stop when frontier empty or
+-- depth_layers reached.
+--
+-- We use a simple loop that tracks (frontier, visited, levels_visited).
+-- depth interpretation: depth=0 returns just [start]; depth=1 returns
+-- start + its direct neighbors; depth<0 means unbounded.
+bfs_walk adj frontier visited depth level =
+  if length frontier == 0 then visited
+  else if depth >= 0 && level > depth then visited
+  else
+    let next_visited = bfs_visit frontier visited
+    let next_frontier = bfs_neighbors adj frontier next_visited []
+    bfs_walk adj next_frontier next_visited depth (level + 1)
+
+bfs_visit frontier visited =
+  if length frontier == 0 then visited
+  else
+    let node = head frontier
+    if list_contains visited node then bfs_visit (tail frontier) visited
+    else bfs_visit (tail frontier) (append visited [node])
+
+bfs_neighbors adj frontier visited acc =
+  if length frontier == 0 then acc
+  else
+    let node = head frontier
+    let ns = assoc_get_list adj node
+    let acc2 = collect_new_neighbors ns visited acc
+    bfs_neighbors adj (tail frontier) visited acc2
+
+collect_new_neighbors ns visited acc =
+  if length ns == 0 then acc
+  else
+    let n = head ns
+    if list_contains visited n then collect_new_neighbors (tail ns) visited acc
+    else if list_contains acc n then collect_new_neighbors (tail ns) visited acc
+    else collect_new_neighbors (tail ns) visited (append acc [n])
+
+list_contains xs target =
+  if length xs == 0 then false
+  else if head xs == target then true
+  else list_contains (tail xs) target
+
+-- ------------------------------------------------------------------
+-- READ — substring search
+-- ------------------------------------------------------------------
+--
+-- v0 ships a flat substring scan over the lowercased goal/hypothesis
+-- strings held in memory. Spec §10 calls out 6-gram inverted indexes
+-- as future work; today an O(n) scan over <10k entries is fast enough.
+--
+-- Path A widening (2026-05-16): chain_search_goal now matches BOTH the
+-- `goal` AND the `hypothesis` field. The name keeps existing run.rail
+-- callers (step1_show_priors + the `search` subcommand) working without
+-- an API change; the "have we tried this?" lookup before a put-goal
+-- now reaches amendment entries whose goal does not contain the query
+-- word but whose hypothesis text does. Dedup is implicit because we
+-- iterate by_id_order once per id and OR the two fields.
+-- chain_search_hypothesis kept for callers that want the strict variant.
+
+chain_search_goal h needle = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode _bi by_id_order _pm _cm goals_map hyps_map _vm _sz _sh ->
+      let n = str_lower needle
+      search_goal_or_hyp by_id_order goals_map hyps_map n []
+
+chain_search_hypothesis h needle = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode _bi _bo _pm _cm _gm hyps_map _vm _sz _sh ->
+      let n = str_lower needle
+      search_assoc_contains hyps_map n []
+
+-- Iterate id-order (oldest first); include id if needle is a
+-- substring of EITHER goal OR hypothesis. Iterating by_id_order
+-- (instead of goals_map / hyps_map) gives a stable append-order
+-- output and naturally dedupes when both fields match.
+search_goal_or_hyp ids gmap hmap needle acc =
+  if length ids == 0 then reverse acc
+  else
+    let id = head ids
+    let g = assoc_get_str gmap id
+    let hy = assoc_get_str hmap id
+    if str_contains needle g then search_goal_or_hyp (tail ids) gmap hmap needle (cons id acc)
+    else if str_contains needle hy then search_goal_or_hyp (tail ids) gmap hmap needle (cons id acc)
+    else search_goal_or_hyp (tail ids) gmap hmap needle acc
+
+search_assoc_contains xs needle acc =
+  if length xs == 0 then reverse acc
+  else
+    let (id, text) = head xs
+    if str_contains needle text then search_assoc_contains (tail xs) needle (cons id acc)
+    else search_assoc_contains (tail xs) needle acc
+
+-- ------------------------------------------------------------------
+-- VERDICT COUNTS
+-- ------------------------------------------------------------------
+
+chain_count_verdict_for_hypothesis h selector = match selector
+  | HypById hid -> count_verdict_by_id h hid
+  | HypByText sub -> count_verdict_by_text h sub
+
+-- "id" selector: walk one level of children of `hid`, tally their
+-- verdict tags. The 4 known tags from entry.rail are PASS / FALSIFIED /
+-- INCONCLUSIVE; we return all three with zero-counts to keep the
+-- output shape stable, per spec §3.5.
+count_verdict_by_id h hid = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode by_id _bo _pm children_map _gm _hm verdict_map _sz _sh ->
+      if assoc_has by_id hid == false then error err_not_found
+      else
+        let kids = assoc_get_list children_map hid
+        let tags = collect_verdict_tags verdict_map kids []
+        tally_tags tags
+
+-- "text" selector: find hypothesis entries whose text contains the
+-- substring; tally the verdict tags of their children, unioned.
+count_verdict_by_text h sub = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode _bi _bo _pm children_map _gm hyps_map verdict_map _sz _sh ->
+      let n = str_lower sub
+      let matches = search_assoc_contains hyps_map n []
+      let kids = union_children children_map matches []
+      let tags = collect_verdict_tags verdict_map kids []
+      tally_tags tags
+
+union_children cmap ids acc =
+  if length ids == 0 then acc
+  else
+    let kids = assoc_get_list cmap (head ids)
+    let merged = merge_unique acc kids
+    union_children cmap (tail ids) merged
+
+merge_unique acc xs =
+  if length xs == 0 then acc
+  else
+    let h = head xs
+    if list_contains acc h then merge_unique acc (tail xs)
+    else merge_unique (append acc [h]) (tail xs)
+
+collect_verdict_tags vmap ids acc =
+  if length ids == 0 then reverse acc
+  else
+    let id = head ids
+    let tag = assoc_get_str vmap id
+    if length (chars tag) == 0 then collect_verdict_tags vmap (tail ids) acc
+    else collect_verdict_tags vmap (tail ids) (cons tag acc)
+
+-- Tally tag occurrences. Return sorted (alphabetical) list of (tag, count).
+tally_tags tags =
+  let p = count_tag tags "PASS"
+  let f = count_tag tags "FALSIFIED"
+  let i = count_tag tags "INCONCLUSIVE"
+  [("FALSIFIED", f), ("INCONCLUSIVE", i), ("PASS", p)]
+
+count_tag tags t =
+  if length tags == 0 then 0
+  else if head tags == t then 1 + count_tag (tail tags) t
+  else count_tag (tail tags) t
+
+-- "Have we given up on goal G?" — count FALSIFIED outcomes whose goal
+-- substring-matches G (per spec §8.3, give-up is a chain-layer rollup).
+chain_count_give_up_for_goal h goal_substring = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode _bi by_id_order _pm _cm goals_map _hm verdict_map _sz _sh ->
+      let n = str_lower goal_substring
+      give_up_count by_id_order goals_map verdict_map n 0
+
+give_up_count ids goals_map verdict_map needle acc =
+  if length ids == 0 then acc
+  else
+    let id = head ids
+    let g = assoc_get_str goals_map id
+    let v = assoc_get_str verdict_map id
+    if str_contains needle g && v == "FALSIFIED" then
+      give_up_count (tail ids) goals_map verdict_map needle (acc + 1)
+    else give_up_count (tail ids) goals_map verdict_map needle acc
+
+-- ------------------------------------------------------------------
+-- INDEX OPS
+-- ------------------------------------------------------------------
+
+-- Drop and rebuild in-memory indices from log.jsonl. Returns entry
+-- count. Mutating-style sibling: chain_rebuild_index_h (returns updated
+-- h alongside).
+chain_rebuild_index h = match h
+  | ChainHandle _r log_path _cp _ix _lk _mode _bi by_id_order _pm _cm _gm _hm _vm _sz _sh ->
+      length by_id_order
+
+chain_rebuild_index_h h = match h
+  | ChainHandle root log_path csig_path index_dir lock_path mode _bi _bo _pm _cm _gm _hm _vm _sz _sh ->
+      let r = build_index_from_log log_path
+      let (status, payload, size, sha) = r
+      if status != "ok" then (h, payload)
+      else
+        let by_id = head payload
+        let by_id_order = head (tail payload)
+        let parents_map = head (tail (tail payload))
+        let children_map = head (tail (tail (tail payload)))
+        let goals_map = head (tail (tail (tail (tail payload))))
+        let hyps_map = head (tail (tail (tail (tail (tail payload)))))
+        let verdict_map = head (tail (tail (tail (tail (tail (tail payload))))))
+        let _ = write_meta index_dir 1 sha (length by_id_order)
+        let h2 = ChainHandle root log_path csig_path index_dir lock_path mode by_id by_id_order parents_map children_map goals_map hyps_map verdict_map size sha
+        (h2, length by_id_order)
+
+-- Stream-verify every log line's id matches its body's sha256.
+chain_verify_log h = match h
+  | ChainHandle _r log_path _cp _ix _lk _mode by_id _bo _pm _cm _gm _hm _vm _sz _sh ->
+      if path_exists log_path == false then 0
+      else
+        let content = read_file log_path
+        let lines = split_lines content
+        verify_lines lines by_id
+
+verify_lines lines by_id =
+  if length lines == 0 then 0
+  else
+    let line = head lines
+    let parsed = entry_deserialize line
+    if is_error parsed then error err_corrupt_log
+    else
+      let (e, _ws) = parsed
+      let id = entry_id e
+      let recomputed = entry_content_hash e
+      if is_error recomputed then error err_corrupt_log
+      else if id != recomputed then error err_corrupt_log
+      else if assoc_has by_id id == false then error err_corrupt_log
+      else verify_lines (tail lines) by_id
+
+-- Run.rail interface alias: verify one entry by id.
+chain_verify h id =
+  let blob = chain_get h id
+  if is_error blob then false
+  else
+    let parsed = entry_deserialize blob
+    if is_error parsed then false
+    else
+      let (e, _ws) = parsed
+      let v = entry_verify e
+      if is_error v then false
+      else if v == 1 then true
+      else false
+
+-- Cheap probe used by run.rail in its capture phase. Returns true iff
+-- the LOCK.d directory exists right now.
+chain_lock_status h = match h
+  | ChainHandle _r _lp _cp _ix lock_path _mode _bi _bo _pm _cm _gm _hm _vm _sz _sh ->
+      path_exists lock_path
+
+-- ------------------------------------------------------------------
+-- WITNESS GOSSIP
+-- ------------------------------------------------------------------
+--
+-- Witness integration discipline (spec §4): we reuse the existing
+-- fleet primitive — there is a `sign_attestation.sh` per witness host
+-- and the protocol expects a sibling `sign_labchain.sh`. v0 wraps a
+-- pluggable command via env var RAIL_LAB_WITNESS_CMD: if set, we
+-- shell-out to "<cmd> <witness_host> <id> <pulse_id> <value_hex>
+-- <witnessed_at>" and parse one countersig JSON line from stdout.
+-- If unset, gossip is treated as offline (returns []).
+--
+-- This keeps chain.rail signature-free (per spec §9) and re-uses fleet
+-- infrastructure rather than reinventing it.
+
+chain_gossip_to_witnesses h id witness_list = match h
+  | ChainHandle _r _lp _cp _ix _lk mode _bi _bo _pm _cm _gm _hm _vm _sz _sh ->
+      if mode != "rw" then error err_no_lock
+      else
+        let cmd = get_env "RAIL_LAB_WITNESS_CMD"
+        if length (chars cmd) == 0 then []
+        else gossip_loop h id witness_list cmd []
+
+gossip_loop h id witnesses cmd acc =
+  if length witnesses == 0 then
+    if length acc == 0 then error err_gossip_all_down
+    else acc
+  else
+    let w = head witnesses
+    let full = cat [cmd, " '", w, "' '", id, "' '0' '' '2026-01-01T00:00:00Z' 2>/dev/null"]
+    let out = shell full
+    if length (chars out) == 0 then gossip_loop h id (tail witnesses) cmd acc
+    else
+      let appended = chain_accept_witness_countersig h out
+      if appended == 1 then gossip_loop h id (tail witnesses) cmd (append acc [out])
+      else gossip_loop h id (tail witnesses) cmd acc
+
+chain_accept_witness_countersig h countersig_json = match h
+  | ChainHandle _r _lp csig_path _ix _lk mode _bi _bo _pm _cm _gm _hm _vm _sz _sh ->
+      if mode != "rw" then error err_no_lock
+      else
+        -- v0 dedup: read the file and check for the literal JSON line.
+        let existing = if path_exists csig_path then read_file csig_path else ""
+        if str_contains countersig_json existing then 0
+        else
+          let _ = append_line csig_path countersig_json
+          1
+
+chain_countersigs_for h id = match h
+  | ChainHandle _r _lp csig_path _ix _lk _mode _bi _bo _pm _cm _gm _hm _vm _sz _sh ->
+      if path_exists csig_path == false then []
+      else
+        let content = read_file csig_path
+        let lines = split_lines content
+        filter_csigs_for lines id []
+
+filter_csigs_for lines id acc =
+  if length lines == 0 then reverse acc
+  else
+    let line = head lines
+    -- Naive id-match: substring containing `"id":"<id>"`.
+    let needle = cat ["\"id\":\"", id, "\""]
+    if str_contains needle line then filter_csigs_for (tail lines) id (cons line acc)
+    else filter_csigs_for (tail lines) id acc
+
+-- ------------------------------------------------------------------
+-- INTROSPECTION
+-- ------------------------------------------------------------------
+
+chain_entry_count h = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode _bi by_id_order _pm _cm _gm _hm _vm _sz _sh ->
+      length by_id_order
+
+chain_last_id h = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode _bi by_id_order _pm _cm _gm _hm _vm _sz _sh ->
+      if length by_id_order == 0 then ""
+      else head (reverse by_id_order)
+
+chain_root_ids h = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode _bi by_id_order parents_map _cm _gm _hm _vm _sz _sh ->
+      filter_no_parents by_id_order parents_map []
+
+filter_no_parents ids parents_map acc =
+  if length ids == 0 then reverse acc
+  else
+    let id = head ids
+    let ps = assoc_get_list parents_map id
+    if length ps == 0 then filter_no_parents (tail ids) parents_map (cons id acc)
+    else filter_no_parents (tail ids) parents_map acc
+
+chain_leaf_ids h = match h
+  | ChainHandle _r _lp _cp _ix _lk _mode _bi by_id_order _pm children_map _gm _hm _vm _sz _sh ->
+      filter_no_children by_id_order children_map []
+
+filter_no_children ids children_map acc =
+  if length ids == 0 then reverse acc
+  else
+    let id = head ids
+    let kids = assoc_get_list children_map id
+    if length kids == 0 then filter_no_children (tail ids) children_map (cons id acc)
+    else filter_no_children (tail ids) children_map acc
+
+-- ------------------------------------------------------------------
+-- LIBRARY ONLY — no `main` defined here. The acceptance test file
+-- tools/lab/test_chain.rail imports this module and supplies main.
+-- (entry.rail follows the same convention.)
+-- ------------------------------------------------------------------

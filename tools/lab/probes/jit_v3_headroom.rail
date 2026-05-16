@@ -1,0 +1,282 @@
+-- tools/lab/probes/jit_v3_headroom.rail — JIT v3 lowering-headroom probe.
+--
+-- PURE MEASUREMENT. NO new features. NO lowering changes. Read-only.
+--
+-- Reads the teacher-fix corpus at training/triples_v2.txt, samples up to
+-- N=300 FIXED-block sources (sampling: first N to keep order deterministic
+-- and result reproducible), runs jit/lower.rail::lower_source on each,
+-- tallies lower_hit vs fallback, classifies the top-3 fallback reasons,
+-- and emits the run.spec.md §4 sentinel block.
+--
+-- Why this corpus: tools/train/analyze_lower_hits.rail (the historical
+-- 32.4% / 764-of-2357 measurement cited in memory/jit_distill_integration_negligible.md)
+-- runs against the same file. Same corpus = operationally meaningful
+-- comparison. The chain entry b999f843 / d64b999f lineage establishes
+-- that grade.rail is on the JIT fast path, so the fallback rate IS the
+-- lever a v3 widening would target.
+--
+-- Counters emitted (per run.spec.md §4 wire format):
+--   total_grade_calls   N invocations of lower_source on the sampled corpus
+--   lower_hit_count     invocations returning ["ok", ...]
+--   fallback_count      invocations returning ["err", ...]
+--   lower_hit_rate_pct  100 * lower_hit_count / total_grade_calls (integer)
+--   top_3_fallback_ops  "class:N,class:N,class:N" — three most-common
+--                       fallback classes by frequency
+--   mean_grade_us       integer microseconds per call (total_us / N).
+--
+-- Verdict mapping (per the probe brief):
+--   lower_hit_rate_pct >= 85 → FALSIFIED (no v3 headroom)
+--   lower_hit_rate_pct <  50 → PASS      (real v3 headroom)
+--   50..84                   → INCONCLUSIVE
+--
+-- Run:
+--   ./rail_native run tools/lab/probes/jit_v3_headroom.rail
+
+import "jit/ir.rail"
+import "jit/lower.rail"
+import "stdlib/time_us.rail"
+
+corpus_path = "training/triples_v2.txt"
+sample_n    = 300
+
+-- =====================================================================
+-- Triple parsing (mirrors tools/train/analyze_lower_hits.rail to keep
+-- comparison with the historical 32.4% number apples-to-apples).
+-- =====================================================================
+
+-- Extract just the FIXED-block text from one triple chunk.
+extract_fixed chunk =
+  let f_off = str_find "<FIXED>\n" chunk
+  if f_off < 0 then ""
+  else
+    let start = f_off + 8
+    let total = length (chars chunk)
+    str_sub chunk start (total - start)
+
+-- =====================================================================
+-- Fallback classification.
+--
+-- The err message returned by lower_source is "lower: <free-form>".
+-- We classify by extracting a stable prefix that captures the v3-design-
+-- relevant signal:
+--   "lower: unbound variable foo"           -> "unbound_var:foo"
+--   "lower: unimplemented builtin filter"   -> "unimplemented:filter"
+--   "lower: unknown function foo"           -> "unknown_function:foo"
+--   "lower: unknown ast tag string"         -> "unknown_ast:string"
+--   "lower: HOF / non-variable head in call"-> "hof_nonvar_head"
+--   "lower: cannot use STR-typed expression…"->"type_mismatch"
+--   "lower: op_apply only supports 1-arg…"  -> "op_apply_arity"
+--   "lower: lambda call must have exactly 1 arg…" -> "lambda_arity"
+--   "lower: >4 arg call not supported in v1" -> "call_arity_gt4"
+--   "lower: unknown binary op X"            -> "unknown_binop:X"
+--   anything containing "vreg overflow"     -> "vreg_overflow"
+--   anything else                            -> "other"
+-- =====================================================================
+
+starts_with s prefix =
+  let n = length (chars prefix)
+  let m = length (chars s)
+  if m < n then 0
+  else if (str_sub s 0 n) == prefix then 1
+  else 0
+
+substr_contains s needle =
+  if str_find needle s < 0 then 0 else 1
+
+-- Take the first whitespace-delimited token starting at `start`.
+first_token_at s start =
+  let n = length (chars s)
+  first_token_loop s start n start
+
+first_token_loop s i n start =
+  if i >= n then str_sub s start (n - start)
+  else
+    let c = str_sub s i 1
+    if c == " " || c == "\n" || c == "\t" then str_sub s start (i - start)
+    else first_token_loop s (i + 1) n start
+
+classify_err msg =
+  -- Strip the "lower: " prefix if present so substring tests are cheap.
+  let body =
+    if starts_with msg "lower: " then str_sub msg 7 (length (chars msg) - 7)
+    else msg
+  if starts_with body "unbound variable " then
+    cat ["unbound_var:", first_token_at body 17]
+  else if starts_with body "unimplemented builtin " then
+    cat ["unimplemented:", first_token_at body 22]
+  else if starts_with body "unknown function " then
+    cat ["unknown_function:", first_token_at body 17]
+  else if starts_with body "unknown ast tag " then
+    cat ["unknown_ast:", first_token_at body 16]
+  else if starts_with body "unknown binary op " then
+    cat ["unknown_binop:", first_token_at body 18]
+  else if starts_with body "unknown float arith op " then
+    cat ["unknown_float_op:", first_token_at body 23]
+  else if starts_with body "HOF" then "hof_nonvar_head"
+  else if starts_with body "cannot use " then "type_mismatch"
+  else if starts_with body "op_apply" then "op_apply_arity"
+  else if starts_with body "lambda call" then "lambda_arity"
+  else if starts_with body ">4 arg call" then "call_arity_gt4"
+  else if substr_contains body "vreg overflow" then "vreg_overflow"
+  else if substr_contains body "instruction overflow" then "instr_overflow"
+  else if substr_contains body "block overflow" then "block_overflow"
+  else if substr_contains body "callee-save" then "callee_save_overflow"
+  else "other"
+
+-- =====================================================================
+-- Bucket tallies. Implemented as a parallel pair of mutable arrays:
+-- bucket_names[i] = class string, bucket_counts[i] = int. Linear scan
+-- on each fallback. Capacity capped at 64 distinct classes — way more
+-- than the lower.rail err surface admits today.
+-- =====================================================================
+
+mk_buckets _ =
+  let names  = arr_new 64 ""
+  let counts = arr_new 64 0
+  let meta   = arr_new 1 0  -- meta[0] = current number of distinct classes
+  let _ = arr_set meta 0 0
+  cons names (cons counts (cons meta []))
+
+bk_names  b = head b
+bk_counts b = head (tail b)
+bk_meta   b = head (tail (tail b))
+
+bucket_find_idx b cls i n =
+  if i >= n then 0 - 1
+  else if (arr_get (bk_names b) i) == cls then i
+  else bucket_find_idx b cls (i + 1) n
+
+bucket_add b cls =
+  let n = arr_get (bk_meta b) 0
+  let idx = bucket_find_idx b cls 0 n
+  if idx >= 0 then
+    let prev = arr_get (bk_counts b) idx
+    let _ = arr_set (bk_counts b) idx (prev + 1)
+    0
+  else if n >= 64 then 0  -- silently drop overflow; classification capped
+  else
+    let _ = arr_set (bk_names b) n cls
+    let _ = arr_set (bk_counts b) n 1
+    let _ = arr_set (bk_meta b) 0 (n + 1)
+    0
+
+-- =====================================================================
+-- Find top-3 classes by frequency (selection scan — O(3*64) = tiny).
+-- Returns "class:N,class:N,class:N" or fewer if <3 distinct classes.
+-- =====================================================================
+
+bk_find_max_excluding b excluded_mask =
+  let n = arr_get (bk_meta b) 0
+  bk_find_max_loop b excluded_mask 0 n (0 - 1) (0 - 1)
+
+bk_find_max_loop b excl_mask i n best_idx best_count =
+  if i >= n then best_idx
+  else
+    let skip = arr_get excl_mask i
+    if skip == 1 then bk_find_max_loop b excl_mask (i + 1) n best_idx best_count
+    else
+      let c = arr_get (bk_counts b) i
+      if c > best_count then bk_find_max_loop b excl_mask (i + 1) n i c
+      else bk_find_max_loop b excl_mask (i + 1) n best_idx best_count
+
+top3_string b =
+  let excl = arr_new 64 0
+  let i1 = bk_find_max_excluding b excl
+  if i1 < 0 then "none"
+  else
+    let _ = arr_set excl i1 1
+    let i2 = bk_find_max_excluding b excl
+    if i2 < 0 then
+      cat [arr_get (bk_names b) i1, ":", show (arr_get (bk_counts b) i1)]
+    else
+      let _ = arr_set excl i2 1
+      let i3 = bk_find_max_excluding b excl
+      if i3 < 0 then
+        cat [
+          arr_get (bk_names b) i1, ":", show (arr_get (bk_counts b) i1), ",",
+          arr_get (bk_names b) i2, ":", show (arr_get (bk_counts b) i2)
+        ]
+      else
+        cat [
+          arr_get (bk_names b) i1, ":", show (arr_get (bk_counts b) i1), ",",
+          arr_get (bk_names b) i2, ":", show (arr_get (bk_counts b) i2), ",",
+          arr_get (bk_names b) i3, ":", show (arr_get (bk_counts b) i3)
+        ]
+
+-- =====================================================================
+-- Main probe loop. Threaded as a tail-recursive walker over the chunks.
+-- Returns [hits, fallbacks, total_us, n_seen].
+-- =====================================================================
+
+probe_loop chunks remaining hits fb total_us seen b =
+  if remaining <= 0 then [hits, fb, total_us, seen]
+  else if length chunks == 0 then [hits, fb, total_us, seen]
+  else
+    let chunk = head chunks
+    let src = extract_fixed chunk
+    if length (chars src) == 0 then
+      probe_loop (tail chunks) remaining hits fb total_us seen b
+    else
+      let tv = malloc 16
+      let t0 = time_us_now_into tv
+      let r = lower_source src
+      let t1 = time_us_now_into tv
+      let dt = t1 - t0
+      let tag = head r
+      if tag == "ok" then
+        probe_loop (tail chunks) (remaining - 1) (hits + 1) fb (total_us + dt) (seen + 1) b
+      else
+        let msg = head (tail r)
+        let cls = classify_err msg
+        let _ = bucket_add b cls
+        probe_loop (tail chunks) (remaining - 1) hits (fb + 1) (total_us + dt) (seen + 1) b
+
+-- =====================================================================
+-- Verdict mapping.
+-- =====================================================================
+
+verdict_for_rate pct =
+  if pct >= 85 then "FALSIFIED"
+  else if pct < 50 then "PASS"
+  else "INCONCLUSIVE"
+
+-- =====================================================================
+-- Entry. Reads the corpus, runs the probe, emits the RAIL_LAB_COUNTERS
+-- block + ===VERDICT=== sentinel. Stdout is the wire format that
+-- tools/lab/run.rail reads.
+-- =====================================================================
+
+main =
+  let corpus = read_file corpus_path
+  let chunks = str_split "<END>\n\n" corpus
+  let b = mk_buckets 0
+  let r = probe_loop chunks sample_n 0 0 0 0 b
+  let hits      = head r
+  let fb        = head (tail r)
+  let total_us  = head (tail (tail r))
+  let n_seen    = head (tail (tail (tail r)))
+  let pct       = if n_seen <= 0 then 0 else (hits * 100) / n_seen
+  let mean_us   = if n_seen <= 0 then 0 else total_us / n_seen
+  let top3      = top3_string b
+  let verdict   = verdict_for_rate pct
+
+  -- Helpful context (read by humans / chain reviewers; NOT inside the
+  -- sentinel block).
+  let _ = print (cat ["[probe] sampled ", show n_seen, " FIXED blocks from ", corpus_path])
+  let _ = print (cat ["[probe] lower_hits=", show hits, " fallbacks=", show fb,
+                      " lower_hit_rate=", show pct, "%"])
+  let _ = print (cat ["[probe] mean_grade_us=", show mean_us])
+  let _ = print (cat ["[probe] top_3_fallback_ops=", top3])
+  let _ = print (cat ["[probe] verdict=", verdict])
+
+  -- Wire-format sentinel block (run.spec §4):
+  let _ = print "===RAIL_LAB_COUNTERS==="
+  let _ = print (cat ["{\"counter\": \"total_grade_calls\", \"value\": ", show n_seen, "}"])
+  let _ = print (cat ["{\"counter\": \"lower_hit_count\", \"value\": ", show hits, "}"])
+  let _ = print (cat ["{\"counter\": \"fallback_count\", \"value\": ", show fb, "}"])
+  let _ = print (cat ["{\"counter\": \"lower_hit_rate_pct\", \"value\": ", show pct, "}"])
+  let _ = print (cat ["{\"counter\": \"top_3_fallback_ops\", \"value\": \"", top3, "\"}"])
+  let _ = print (cat ["{\"counter\": \"mean_grade_us\", \"value\": ", show mean_us, "}"])
+  let _ = print "===END==="
+  let _ = print (cat ["===VERDICT=== ", verdict])
+  0
