@@ -8,7 +8,7 @@ inside the `test_main` function.
 ./rail_native test
 ```
 
-Expected: `116/116` on macOS ARM64. The count fluctuates only when
+Expected: `140/140` on macOS ARM64. The count fluctuates only when
 concurrent sessions collide on `/tmp/rail_out`; rerun to confirm.
 
 ## Self-hosting fixed point
@@ -22,7 +22,7 @@ diff rail_native /tmp/rail_self   # must be empty (fixed point)
 
 ## Test categories
 
-The 116 cases are grouped in `tools/compile.rail` under `test_main`:
+The 140 cases are grouped in `tools/compile.rail` under `test_main`:
 
 - parse / lex / error paths
 - ints, floats, mixed-float promotion
