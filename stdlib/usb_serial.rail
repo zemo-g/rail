@@ -1,0 +1,114 @@
+-- stdlib/usb_serial.rail
+--
+-- Pure-Rail USB-CDC serial port driver. macOS / BSD only for now.
+--
+-- Strategy:
+--   - Configure the port via `stty` shell-out before opening it
+--     (Option B in AGENT_D_maxarm.md -- no new termios FFI required).
+--   - Open the device file via POSIX `open()` to get a raw fd.
+--   - Read / write raw bytes via POSIX `read` / `write`.
+--   - Close via POSIX `close`.
+--
+-- A read returns up to max_bytes; may be shorter. A write returns
+-- the number of bytes actually written. The caller is responsible
+-- for retrying on short writes.
+--
+-- All byte payloads are exchanged as Rail strings (the bytes of the
+-- string ARE the bytes on the wire). For payloads containing 0x00
+-- the malloc-buffer path (serial_write_buf / serial_read_buf) must
+-- be used instead -- Rail string handling is NUL-terminated under
+-- some emit paths, so binary payloads with embedded 0x00 go through
+-- raw byte buffers.
+
+foreign open path flags mode -> int
+foreign close fd -> int
+foreign read fd buf nbytes -> int
+foreign write fd buf nbytes -> int
+foreign malloc size -> ptr
+foreign free p -> int
+foreign usleep us -> int
+
+-- open() flags (macOS / BSD values from /usr/include/sys/fcntl.h)
+-- O_RDWR=2, O_NOCTTY=0x20000=131072. Combined = 131074.
+-- ARM64 mov immediate limit means we can't emit 131074 directly;
+-- compute as a sum so the codegen path stays simple.
+o_rdonly = 0
+o_wronly = 1
+o_rdwr   = 2
+o_nonblock = 4
+-- O_NOCTTY = 0x20000. Build via shl 1 17 so constant folding doesn't
+-- bake it as a single immediate the seed compiler's emit_load_int
+-- mishandles (it would emit `mov x0, #131073` -- the tagged form of
+-- 65536 -- and fail assembly).
+o_noctty_hi = shl 1 17
+
+-- "Don't make this terminal the controlling tty for this process":
+-- O_NOCTTY. On macOS this is 0x20000.
+serial_open_flags = o_rdwr + o_noctty_hi
+
+-- Build the stty command to configure the port. macOS stty form:
+--   stty -f /dev/cu.usbserial-* <baud> cs8 -cstopb -parenb \
+--        -ixon -ixoff -crtscts raw min 0 time 5
+-- - cs8: 8 data bits
+-- - -cstopb: 1 stop bit
+-- - -parenb: no parity
+-- - -ixon -ixoff: no software flow control
+-- - -crtscts: no hardware flow control
+-- - raw: raw mode (no canonical line processing)
+-- - min 0 time 5: VMIN=0, VTIME=5 (50 ms inter-byte timeout on read)
+configure_port path baud =
+  let cmd = cat [
+    "stty -f ", path, " ", show baud,
+    " cs8 -cstopb -parenb -ixon -ixoff -crtscts",
+    " raw -echo -echoe -echok -echonl -icanon",
+    " -opost -onlcr",
+    " min 0 time 5"
+  ]
+  shell cmd
+
+-- Open the serial device.
+--
+-- Returns fd (>= 0) on success, -1 on failure.
+serial_open path baud =
+  let cfg = configure_port path baud
+  -- If stty failed (no device, no perms), bail before open.
+  if cfg != 0 then 0 - 1
+  else
+    let fd = open path serial_open_flags 0
+    -- The stty + open ordering matters: open() with O_NOCTTY can
+    -- reset some settings, so re-apply stty AFTER the open as well.
+    -- (Per BSD docs the second stty is the canonical path.)
+    let _ = configure_port path baud
+    fd
+
+serial_close fd = close fd
+
+-- Write a Rail string's bytes to the fd. Returns bytes written.
+-- For payloads with embedded 0x00, use serial_write_buf.
+serial_write fd s = write fd s (length s)
+
+-- Write a raw byte buffer (ptr + length) to the fd. Use this for
+-- frames containing 0x00 bytes (most MaxArm frames do not, but the
+-- AA / 55 header and data payloads are arbitrary).
+serial_write_buf fd buf nbytes = write fd buf nbytes
+
+-- Read up to max_bytes into a freshly malloc'd buffer. Returns
+-- (n_read, buf). Caller MUST free buf.
+serial_read_buf fd max_bytes =
+  let buf = malloc max_bytes
+  let n = read fd buf max_bytes
+  (n, buf)
+
+-- Drain the input buffer by reading up to drain_max bytes (one shot).
+-- Returns bytes drained. Useful after e-stop or when starting fresh.
+serial_drain fd drain_max =
+  let buf = malloc drain_max
+  let n = read fd buf drain_max
+  let _ = free buf
+  if n < 0 then 0 else n
+
+-- Sleep microseconds. Wraps usleep so callers don't need to FFI it.
+serial_sleep_us us = usleep us
+
+-- Sleep milliseconds.
+serial_sleep_ms ms = usleep (ms * 1000)

@@ -1,0 +1,199 @@
+-- tools/robot/coord_map.rail
+--
+-- DSL <-> MaxArm coordinate translation + reachability check ("IK"
+-- in our v0 sense -- the MaxArm firmware does the joint-level IK
+-- itself when given an XYZ via FUNC_SET_XYZ 0x03; we own the
+-- validate-before-send layer).
+--
+-- DSL frame (stdlib/robot_arm.rail):
+--   integer cm in a 30x30x30 cube
+--   x right, y forward (away from arm), z up
+--   (0,0,0) at arm base
+--
+-- MaxArm frame (per notes/maxarm_protocol.md):
+--   int16 millimeters
+--   origin at arm base, axes the same orientation as our DSL
+--   reach envelope: 290 mm radius, +187 mm up, -111 mm down
+--
+-- Mapping (pre-calibration, defaults):
+--   arm_mm.x = dsl.x * 10  + cx
+--   arm_mm.y = dsl.y * 10  + cy
+--   arm_mm.z = dsl.z * 10  + cz
+-- with (cx, cy, cz) coming from ~/.robot/maxarm_calib.txt; default 0.
+--
+-- Reverse:
+--   dsl.x = (arm_mm.x - cx) / 10  (integer divide, round nearest)
+--
+-- This file is a LIBRARY (no main). Run the 12-test IK unit suite
+-- via:
+--   ./rail_native run tools/robot/coord_map_test.rail
+-- (See that file for the test harness that imports this module.)
+
+-- (Intentionally no imports: this is a pure-IK utility. The DSL types
+-- live in stdlib/robot_arm.rail; we operate on raw int coords so the
+-- importing file can import that module exactly once via arm_sim.rail.)
+
+-- ---------------------------------------------------------------------
+-- Reach envelope (per notes/maxarm_protocol.md section 6).
+-- ---------------------------------------------------------------------
+
+reach_radius_mm = 290
+reach_up_mm     = 187
+reach_down_mm   = 0 - 111
+
+-- Conservative inner ring -- the spec says the geometry is reachable
+-- on the 29 cm boundary, but mechanical joint limits and the suction
+-- nozzle thickness mean we don't want to command exactly to the edge.
+-- 5 mm of slop keeps us off the singularity.
+reach_slop_mm = 5
+
+-- ---------------------------------------------------------------------
+-- DSL coord -> arm mm coord (uncalibrated).
+-- ---------------------------------------------------------------------
+
+dsl_to_mm_x dsl_x cx = dsl_x * 10 + cx
+dsl_to_mm_y dsl_y cy = dsl_y * 10 + cy
+dsl_to_mm_z dsl_z cz = dsl_z * 10 + cz
+
+-- ---------------------------------------------------------------------
+-- arm mm -> DSL (inverse). Integer-rounded.
+-- ---------------------------------------------------------------------
+
+-- round-to-nearest integer division: (n + 5) / 10 for positive n
+-- For negative n we adjust by -5 instead.
+round_div10 n =
+  if n >= 0 then (n + 5) / 10
+  else (0 - ((0 - n) + 5) / 10)
+
+mm_to_dsl_x x_mm cx = round_div10 (x_mm - cx)
+mm_to_dsl_y y_mm cy = round_div10 (y_mm - cy)
+mm_to_dsl_z z_mm cz = round_div10 (z_mm - cz)
+
+-- ---------------------------------------------------------------------
+-- Reachability check on arm mm coords. Returns 1 if reachable, 0 if
+-- not. The spec describes the envelope as a cylinder (radius 290 mm
+-- in the horizontal plane x 187 mm up x 111 mm down), so we check
+-- horizontal radius and vertical limits independently rather than as
+-- a single 3D sphere -- the sphere model is wrong (excludes valid
+-- arm reach near the table at full horizontal radius) and incorrectly
+-- failed our 20,20,5 named point. Integer-only check via squared
+-- comparison; no float / sqrt.
+-- ---------------------------------------------------------------------
+
+abs_mm n = if n < 0 then 0 - n else n
+
+squared_horiz_mm x y = x * x + y * y
+
+reachable_mm x y z =
+  let r_eff = reach_radius_mm - reach_slop_mm
+  if z > reach_up_mm then 0
+  else if z < reach_down_mm then 0
+  else if (squared_horiz_mm x y) > (r_eff * r_eff) then 0
+  else 1
+
+-- ---------------------------------------------------------------------
+-- IK proper. Returns a fault code (0 = OK) and the validated mm
+-- coordinates as a 4-element list [fault, mm_x, mm_y, mm_z].
+-- fault = 1 maps to arm_sim.rail's out_of_bounds code.
+-- ---------------------------------------------------------------------
+
+ik dsl_x dsl_y dsl_z cx cy cz =
+  let mx = dsl_to_mm_x dsl_x cx
+  let my = dsl_to_mm_y dsl_y cy
+  let mz = dsl_to_mm_z dsl_z cz
+  if (reachable_mm mx my mz) == 0 then [1, mx, my, mz]
+  else [0, mx, my, mz]
+
+-- Convenience: default calibration (no offset).
+ik_default dsl_x dsl_y dsl_z = ik dsl_x dsl_y dsl_z 0 0 0
+
+-- ---------------------------------------------------------------------
+-- "Forward kinematics" for our coord layer = the inverse mapping. The
+-- real arm does the joint-space FK in firmware; we mirror in the
+-- DSL-vs-mm layer for round-trip testing.
+-- ---------------------------------------------------------------------
+
+mm_to_dsl mx my mz cx cy cz =
+  [mm_to_dsl_x mx cx, mm_to_dsl_y my cy, mm_to_dsl_z mz cz]
+
+-- ---------------------------------------------------------------------
+-- Unit tests. 12 round-trip cases. Each:
+--   DSL (x, y, z) -> ik -> mm -> mm_to_dsl -> DSL'
+-- and we check that DSL' == DSL within +/- 1 cm.
+-- ---------------------------------------------------------------------
+
+cm_abs_i n = if n < 0 then 0 - n else n
+
+run_one_test name x y z cx cy cz =
+  let r = ik x y z cx cy cz
+  let fault = head r
+  let mx = head (tail r)
+  let my = head (tail (tail r))
+  let mz = head (tail (tail (tail r)))
+  let back = mm_to_dsl mx my mz cx cy cz
+  let bx = head back
+  let by = head (tail back)
+  let bz = head (tail (tail back))
+  let dx = cm_abs_i (bx - x)
+  let dy = cm_abs_i (by - y)
+  let dz = cm_abs_i (bz - z)
+  let ok = if fault != 0 then 0
+           else if dx > 1 then 0
+           else if dy > 1 then 0
+           else if dz > 1 then 0
+           else 1
+  let _ = print (cat [
+    "  ", name,
+    " dsl=(", show x, ",", show y, ",", show z, ")",
+    " mm=(", show mx, ",", show my, ",", show mz, ")",
+    " back=(", show bx, ",", show by, ",", show bz, ")",
+    " fault=", show fault,
+    " -> ", if ok == 1 then "PASS" else "FAIL"
+  ])
+  ok
+
+-- An out-of-reach test must FAIL the reachable check (fault=1).
+-- Returns 1 if the fault matched expectation, 0 otherwise.
+run_oob_test name x y z =
+  let r = ik_default x y z
+  let fault = head r
+  let ok = if fault == 1 then 1 else 0
+  let _ = print (cat [
+    "  ", name,
+    " dsl=(", show x, ",", show y, ",", show z, ")",
+    " expect fault=1, got fault=", show fault,
+    " -> ", if ok == 1 then "PASS" else "FAIL"
+  ])
+  ok
+
+run_all_tests _ =
+  let _ = print "[coord_map] IK round-trip tests:"
+  -- Tests 1-5: named-point round-trips, no calibration.
+  let t1 = run_one_test "t01 A         " 10  0  5 0 0 0
+  let t2 = run_one_test "t02 B         " 10 10  5 0 0 0
+  let t3 = run_one_test "t03 C         " 20 10  5 0 0 0
+  let t4 = run_one_test "t04 D         " 20 20  5 0 0 0
+  let t5 = run_one_test "t05 ORIGIN    "  0  0  0 0 0 0
+  -- Tests 6-8: edge of reach, all reachable (29 cm radius corner).
+  let t6 = run_one_test "t06 mid-air   " 15 10 15 0 0 0
+  let t7 = run_one_test "t07 max-up    "  0  0 18 0 0 0
+  let t8 = run_one_test "t08 base-arc  " 20  0  3 0 0 0
+  -- Tests 9-10: with non-zero calibration offsets.
+  let t9 = run_one_test "t09 calib-A   " 10  0  5 0 0 (0 - 20)
+  let t10 = run_one_test "t10 calib-orig"  0  0  0 (0 - 30) 50 0
+  -- Tests 11-12: out-of-reach (must report fault=1).
+  -- (30,30,30) cm corner = 519 mm radial: definitely outside.
+  let t11 = run_oob_test  "t11 oob-corner" 30 30 30
+  -- (0,0,30) cm = 300 mm up, but reach_up_mm = 187, so OOB on Z.
+  let t12 = run_oob_test  "t12 oob-high "  0  0 30
+  let total = t1 + t2 + t3 + t4 + t5 + t6 + t7 + t8 + t9 + t10 + t11 + t12
+  let _ = print (cat ["[coord_map] ", show total, "/12 tests passed"])
+  if total == 12 then
+    let _ = print "PASS"
+    0
+  else
+    let _ = print "FAIL"
+    1
+
+-- (No main: this file is a library. tools/robot/coord_map_test.rail
+-- imports it and runs the 12 IK round-trip tests.)
