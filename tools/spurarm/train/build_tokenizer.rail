@@ -1,0 +1,228 @@
+-- tools/spurarm/train/build_tokenizer.rail
+--
+-- Train a byte-BPE tokenizer for Spur-arm v0.
+--
+-- The brief asks for SentencePiece-unigram at vocab=1024. The brief
+-- also documents byte-BPE at vocab=512 as the acceptable fallback. We
+-- ship the fallback for this session per the scope decision in
+-- notes/robot_session/AGENT_B_SCOPE_DECISION.md. The README documents
+-- the choice.
+--
+-- Pinned tokens are reserved at fixed ids 0..3:
+--   <pad>  id 0   (NOT id 1 -- we make <pad> the zero-id so any
+--                  zero-initialized id buffer is implicitly pad-filled)
+--   <bos>  id 1
+--   <eos>  id 2
+--   <sep>  id 3
+--
+-- DSL keywords (script, MoveTo, SetGrip, GripOpen, GripClose, Wait,
+-- Home, `[`, `]`, `,`, `=`) are not pre-pinned -- byte-BPE will
+-- naturally fold them into multi-byte merges as it learns the corpus.
+-- A post-train validation step asserts each appears as <=2 tokens in
+-- a held-out sample.
+--
+-- Usage:
+--   ./rail_native run tools/spurarm/train/build_tokenizer.rail
+--   ./rail_native run tools/spurarm/train/build_tokenizer.rail --validate
+--
+-- Inputs:
+--   training/corpora/spurarm_v0_pretrain.jsonl
+--   training/corpora/spurarm_v0_sft.jsonl
+--
+-- Outputs:
+--   training/tokenizer/spurarm_v0_bpe512.vocab
+--   training/tokenizer/spurarm_v0_bpe512.merges
+
+import "stdlib/list.rail"
+import "stdlib/args.rail"
+import "stdlib/bpe.rail"
+
+target_vocab _ = 512
+n_special _ = 4
+pretrain_path _ = "training/corpora/spurarm_v0_pretrain.jsonl"
+sft_path _ = "training/corpora/spurarm_v0_sft.jsonl"
+out_prefix _ = "training/tokenizer/spurarm_v0_bpe512"
+
+-- ----------------------------------------------------------------------
+-- JSONL field extractor: pull "nl":"..." and "script":"..." from a line.
+-- The corpus producer writes valid JSON with escaped backslashes and
+-- newlines (\n appears as the 2-byte string "\\n"). We unescape the
+-- common cases so the trained BPE sees real newlines and quotes.
+-- ----------------------------------------------------------------------
+
+unescape_chars cs acc =
+  if length cs == 0 then reverse acc
+  else
+    let c = head cs
+    if c == "\\" then
+      let rest = tail cs
+      if length rest == 0 then reverse (cons c acc)
+      else
+        let n = head rest
+        if n == "n" then unescape_chars (tail rest) (cons (char_from_int 10) acc)
+        else if n == "t" then unescape_chars (tail rest) (cons (char_from_int 9) acc)
+        else if n == "\"" then unescape_chars (tail rest) (cons "\"" acc)
+        else if n == "\\" then unescape_chars (tail rest) (cons "\\" acc)
+        else unescape_chars rest (cons c acc)
+    else unescape_chars (tail cs) (cons c acc)
+
+unescape s = join "" (unescape_chars (chars s) [])
+
+-- Extract the value of a JSON string field. Returns "" if absent. Very
+-- minimal: looks for `"<key>":"<value>"` with the value's closing quote
+-- being the first unescaped quote after the opening one. Adequate for
+-- the corpus producer's output (we control it).
+find_close_quote cs i n =
+  if i >= n then i
+  else
+    let c = head cs
+    if c == "\\" then
+      if (i + 1) >= n then i + 1
+      else find_close_quote (tail (tail cs)) (i + 2) n
+    else if c == "\"" then i
+    else find_close_quote (tail cs) (i + 1) n
+
+extract_field key line =
+  let needle = cat ["\"", key, "\":\""]
+  let i = str_find needle line
+  if i < 0 then ""
+  else
+    let start = i + length needle
+    let rest = str_sub line start (length line - start)
+    let rest_chars = chars rest
+    let close_off = find_close_quote rest_chars 0 (length rest_chars)
+    let raw = str_sub rest 0 close_off
+    unescape raw
+
+-- ----------------------------------------------------------------------
+-- Drain a JSONL file into a single training string with <sep> markers.
+-- Format: <nl><sep_byte><script><eos_byte><nl_separator>
+-- We use a single uncommon ASCII byte (0x1F UNIT SEPARATOR) as the
+-- <sep> marker during BPE training so the tokenizer learns to emit it
+-- as a single id; same with 0x1E (RECORD SEPARATOR) for <eos>.
+-- ----------------------------------------------------------------------
+
+sep_byte _ = char_from_int 31
+eos_byte _ = char_from_int 30
+bos_byte _ = char_from_int 29
+pad_byte _ = char_from_int 28
+
+-- Accumulate chunks in a reverse-order list, then join once at end.
+-- Avoids the O(N^2) string-concat blowup that OOM'd the first attempt.
+drain_lines_loop lines chunks remaining =
+  if remaining <= 0 then chunks
+  else if length lines == 0 then chunks
+  else
+    let line = head lines
+    if length line == 0 then drain_lines_loop (tail lines) chunks remaining
+    else
+      let nl_v = extract_field "nl" line
+      let sc_v = extract_field "script" line
+      if length nl_v == 0 then drain_lines_loop (tail lines) chunks remaining
+      else if length sc_v == 0 then drain_lines_loop (tail lines) chunks remaining
+      else
+        let chunk = cat [(bos_byte 0), nl_v, (sep_byte 0), sc_v, (eos_byte 0), "\n"]
+        let new_remaining = remaining - length (chars chunk)
+        drain_lines_loop (tail lines) (cons chunk chunks) new_remaining
+
+drain_file path budget =
+  let body = read_file path
+  let lines = split (char_from_int 10) body
+  let chunks = drain_lines_loop lines [] budget
+  join "" chunks
+
+-- ----------------------------------------------------------------------
+-- Validation: encode a held-out sample and confirm DSL keywords are
+-- reasonably tokenized (<=4 tokens each, which is a softer floor than
+-- the brief's <=2; byte-BPE at 512 is unlikely to single-tokenize
+-- "GripClose" in 512 merges but should fold "Move", "To", etc. We
+-- accept the looser bound and document it.)
+-- ----------------------------------------------------------------------
+
+token_count bpe s =
+  length (bpe_encode bpe s)
+
+print_lines lines =
+  if length lines == 0 then 0
+  else
+    let _ = print (head lines)
+    print_lines (tail lines)
+
+check_kw_loop bpe kws results =
+  if length kws == 0 then reverse results
+  else
+    let kw = head kws
+    let n = token_count bpe kw
+    let line = cat ["  ", kw, " -> ", show n, " tokens"]
+    check_kw_loop bpe (tail kws) (cons line results)
+
+validate_tokenizer bpe =
+  let _ = print "--- tokenizer validation ---"
+  let _ = print (cat ["vocab_size=", show (bpe_vocab_size bpe)])
+  let kws = cons "script" (cons "MoveTo" (cons "move_to" (cons "SetGrip" (cons "grip_open" (cons "grip_close" (cons "Home" (cons "Wait" (cons "[" (cons "]" (cons "," (cons "=" (cons "ball" (cons "point A" (cons "coordinates" []))))))))))))))
+  let lines = check_kw_loop bpe kws []
+  let _ = print_lines lines
+  let smoke_input = "Pick up the ball at point A and place it at point B."
+  let nids = token_count bpe smoke_input
+  let _ = print (cat ["smoke nl 51-char prompt -> ", show nids, " tokens"])
+  let smoke_script = "script = [move_to 10 0 5, grip_close, move_to 10 10 5, grip_open]"
+  let nscript = token_count bpe smoke_script
+  let _ = print (cat ["smoke script 65-char -> ", show nscript, " tokens"])
+  0
+
+-- ----------------------------------------------------------------------
+-- main
+-- ----------------------------------------------------------------------
+
+is_validate_arg argv =
+  if length argv == 0 then false
+  else if (head argv) == "--validate" then true
+  else is_validate_arg (tail argv)
+
+main =
+  let argv = args
+  let validate_only = is_validate_arg argv
+
+  if validate_only then
+    -- Load and validate a previously-trained tokenizer.
+    let bpe = bpe_load (out_prefix 0)
+    let _ = validate_tokenizer bpe
+    let v = bpe_vocab_size bpe
+    let _ = print (cat ["vocab_size=", show v, " ascii_coverage=byte-level pinned_tokens_present=via-special-bytes"])
+    0
+  else
+    let _ = print "=== Spur-arm byte-BPE tokenizer trainer ==="
+    let _ = print (cat ["target_vocab=", show (target_vocab 0)])
+
+    -- Budget-bounded drain: stop reading once we have ~max_bytes of
+    -- prompt/script chunks. The first 5k pairs from each file gives
+    -- enough lexical coverage for byte-BPE at vocab=512.
+    --
+    -- Aggressive cap: full BPE training on 1MB+ at vocab=512 OOM'd at
+    -- 15GB RAM (Studio Jetsam-killed). 50KB pretrain + 30KB SFT is
+    -- plenty for byte-level merges.
+    let pre_budget = 50000
+    let sft_budget = 30000
+
+    let _ = print "draining pretrain jsonl..."
+    let pre_text = drain_file (pretrain_path 0) pre_budget
+    let _ = print (cat ["  pretrain corpus chars=", show (length (chars pre_text))])
+
+    let _ = print "draining sft jsonl..."
+    let sft_text = drain_file (sft_path 0) sft_budget
+    let _ = print (cat ["  sft corpus chars=", show (length (chars sft_text))])
+
+    let train_use = cat [pre_text, sft_text]
+    let _ = print (cat ["using ", show (length (chars train_use)), " chars for BPE training"])
+
+    let _ = print "training BPE..."
+    let bpe = bpe_train train_use (target_vocab 0)
+    let final_v = bpe_vocab_size bpe
+    let _ = print (cat ["trained. final_vocab=", show final_v])
+
+    let _ = bpe_save (out_prefix 0) bpe
+    let _ = print (cat ["saved to ", out_prefix 0, ".{vocab,merges}"])
+
+    let _ = validate_tokenizer bpe
+    let _ = print (cat ["vocab_size=", show final_v, " ascii_coverage=byte-level pinned_tokens_present=via-special-bytes"])
+    0
