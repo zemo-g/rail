@@ -20,13 +20,19 @@
 
 set -u
 
+# Force CPU fallback (worktree-local) and bigger arena.
+export RAIL_GPU_OFF=1
+export RAIL_ARENA_MB=4096
+
 SEEDS="42,77,100,200,314"
-PARALLEL=2
+PARALLEL=1
+PHASE="sft"
 
 for arg in "$@"; do
   case "$arg" in
     --seeds=*) SEEDS="${arg#--seeds=}" ;;
     --parallel=*) PARALLEL="${arg#--parallel=}" ;;
+    --phase=*) PHASE="${arg#--phase=}" ;;
     *) echo "unknown arg: $arg" ; exit 2 ;;
   esac
 done
@@ -39,15 +45,18 @@ LOG=/tmp/spurarm_ensemble_bench.log
 # Per-seed bench (sequential or N-at-a-time per Studio panic discipline).
 run_one_seed() {
   local seed="$1"
-  local prefix="training/checkpoints/spurarm-base-v0_seed${seed}_sft_final"
+  local prefix="training/checkpoints/spurarm-base-v0_seed${seed}_${PHASE}_final"
   local out="/tmp/spurarm_ensemble_${seed}.log"
   if [[ ! -f "${prefix}.committed" ]]; then
     echo "WARN: no ckpt for seed $seed (${prefix})" >&2
     : > "$out"
     return 0
   fi
+  # Clear stale generator binary so cached stub doesn't pollute.
+  rm -f /tmp/spurarm_gen_bin /tmp/spurarm_gen_bin.tag
   ./rail_native run tools/spurarm/train/bench_eval.rail \
     --prefix "$prefix" \
+    --max-gen 60 \
     > "$out" 2>&1
 }
 
@@ -66,13 +75,13 @@ for seed in "${SEED_ARR[@]}"; do
 done
 [[ "${#batch[@]}" -gt 0 ]] && wait "${batch[@]}"
 
-# Now read each seed's per-prompt grade and OR them. We approximate by
-# re-running the grader on each prompt for each seed; for the v0 script
-# we just take the max across seeds, since bench_eval doesn't emit
-# per-prompt detail in the current format. Improvement: emit per-prompt
-# detail and OR.
-#
-# Until the per-prompt JSON is wired in, ensemble = max single-shot.
+# Per-prompt OR: for each bench id, the prompt passes the ensemble if
+# ANY seed's bench_eval reported goal_reach=1. We rely on the
+# ===BENCH_EVAL_PER_PROMPT=== sentinel block emitted by bench_eval.rail.
+
+# Build per-prompt pass map across all seeds in awk.
+PROMPT_MAP=/tmp/spurarm_ensemble_prompt_map.txt
+: > "$PROMPT_MAP"
 
 max=0
 for seed in "${SEED_ARR[@]}"; do
@@ -81,14 +90,27 @@ for seed in "${SEED_ARR[@]}"; do
   s=$(grep -A1 BENCH_EVAL_RESULT "$out" | tail -1 \
       | sed -E 's/.*"passes": ([0-9]+).*/\1/')
   [[ -z "$s" || ! "$s" =~ ^[0-9]+$ ]] && s=0
-  echo "seed=$seed bench=$s/20" >> "$LOG"
-  if [[ "$s" -gt "$max" ]]; then
-    max=$s
+  echo "seed=$seed single_shot=$s/20" >> "$LOG"
+  [[ "$s" -gt "$max" ]] && max=$s
+
+  # Extract per-prompt JSON line and emit "id goal_reach" rows.
+  pp=$(grep -A1 BENCH_EVAL_PER_PROMPT "$out" | tail -1)
+  if [[ -n "$pp" ]]; then
+    # Parse: [{"id":"b01","goal_reach":1},...]
+    echo "$pp" | tr ',' '\n' | grep -oE '"id":"[^"]+","goal_reach":[01]' \
+      | sed -E 's/.*"id":"([^"]+)","goal_reach":([01])/\1 \2/' >> "$PROMPT_MAP"
   fi
 done
 
-echo "ensemble (max-across-seeds, fallback) = $max/20" | tee -a "$LOG"
+# OR per id.
+ENSEMBLE_PASS=0
+if [[ -s "$PROMPT_MAP" ]]; then
+  ENSEMBLE_PASS=$(awk '{m[$1] = m[$1] || $2} END {for (k in m) if (m[k] == 1) c++; print c+0}' "$PROMPT_MAP")
+fi
+
+echo "single-shot max-across-seeds = $max/20" | tee -a "$LOG"
+echo "ensemble (per-prompt OR) = $ENSEMBLE_PASS/20" | tee -a "$LOG"
 
 mkdir -p training/checkpoints
-echo "$max" > training/checkpoints/ensemble_bench_v0_result.txt
-echo "wrote training/checkpoints/ensemble_bench_v0_result.txt"
+echo "$ENSEMBLE_PASS" > training/checkpoints/ensemble_bench_v0_result.txt
+echo "wrote training/checkpoints/ensemble_bench_v0_result.txt = $ENSEMBLE_PASS"
