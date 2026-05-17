@@ -1,0 +1,318 @@
+-- tools/spurarm/corpus/gen_move_only.rail
+--
+-- DSL v0.1 movement-only corpus generator. Procedural (no LLM): every
+-- (prompt, script) pair is deterministically correct by construction.
+-- See notes/spurarm_stage7_readiness.md (Cap G' pivot 2026-05-17).
+--
+-- DSL surface for v0.1:
+--   - MoveTo x y z    (absolute, integer 0..30 each axis)
+--   - Home            (= MoveTo 0 0 0; pure navigation)
+-- Dropped from v0: SetGrip, GripOpen/Close, Wait, ball semantics.
+--
+-- Output JSONL records (one per line):
+--   {"id": "move:T#_K", "nl": "...", "script": "script = [ ... ]",
+--    "world": {"obx": -1, "oby": 0, "obz": 0, "present": 0},
+--    "expected": {"gex": X, "gey": Y, "gez": Z,
+--                 "ggrip": 0, "gheld": 0,
+--                 "gbx": 0, "gby": 0, "gbz": 0},
+--    "source": "proc-move", "stages_passed": 4}
+--
+-- Usage:
+--   ./rail_native run tools/spurarm/corpus/gen_move_only.rail \
+--     --out-pretrain training/corpora/spurarm_move_v0_pretrain.jsonl \
+--     --out-sft      training/corpora/spurarm_move_v0_sft.jsonl \
+--     --seed 42
+
+import "stdlib/list.rail"
+import "stdlib/args.rail"
+
+-- Named points -----------------------------------------------------------
+type Pt = | Pt name x y z
+
+named_points _ =
+  cons (Pt "A" 10 0 5) (
+  cons (Pt "B" 10 10 5) (
+  cons (Pt "C" 20 10 5) (
+  cons (Pt "D" 20 20 5) [])))
+
+pt_name p = match p | Pt n _ _ _ -> n
+pt_x p = match p | Pt _ x _ _ -> x
+pt_y p = match p | Pt _ _ y _ -> y
+pt_z p = match p | Pt _ _ _ z -> z
+
+-- A simple LCG for repeatable shuffling / coord sampling. We don't need
+-- cryptographic quality; we just want variation without sorting bias.
+lcg_next s = ((s * 1103515245) + 12345) % 2147483648
+lcg_int s lo hi =
+  let s2 = lcg_next s
+  let span = hi - lo + 1
+  let v = lo + (s2 % span)
+  (s2, v)
+
+-- ----------------------------------------------------------------------
+-- Prompt + script construction.
+-- ----------------------------------------------------------------------
+
+show_int n = show n
+
+build_moveto x y z = cat ["MoveTo ", show_int x, " ", show_int y, " ", show_int z]
+
+-- Wrap a list of Cmd strings into a Rail script literal.
+script_of cmds =
+  if length cmds == 0 then "script = []"
+  else if length cmds == 1 then cat ["script = [ ", head cmds, " ]"]
+  else
+    let body = join ", " cmds
+    cat ["script = [ ", body, " ]"]
+
+-- Build a single example JSONL record.
+make_record id_str nl_str script_str gex gey gez =
+  cat [
+    "{\"id\":\"", id_str, "\"",
+    ",\"nl\":\"", nl_str, "\"",
+    ",\"script\":\"", script_str, "\"",
+    ",\"world\":{\"obx\":-1,\"oby\":0,\"obz\":0,\"present\":0}",
+    ",\"expected\":{\"gex\":", show_int gex,
+    ",\"gey\":", show_int gey,
+    ",\"gez\":", show_int gez,
+    ",\"ggrip\":0,\"gheld\":0,\"gbx\":0,\"gby\":0,\"gbz\":0}",
+    ",\"source\":\"proc-move\",\"stages_passed\":4}"
+  ]
+
+-- ----------------------------------------------------------------------
+-- Template generators. Each returns a list of (nl, script, gex, gey, gez)
+-- tuples. We pass `seed` for the few randomized templates and ignore it
+-- for the pure-enumerative ones.
+-- ----------------------------------------------------------------------
+
+-- Phrasings for "single MoveTo to named point" templates.
+named_phrasings _ =
+  cons "Move to point P." (
+  cons "Go to point P." (
+  cons "Move the arm to point P." (
+  cons "Send the arm to point P." (
+  cons "Position the arm at point P." (
+  cons "Navigate to point P." (
+  cons "Go to P." []))))))
+
+phrasing_named name template =
+  let s = str_replace "P" name template
+  s
+
+named_move_examples _ =
+  named_move_for_phrasings (named_phrasings 0) (named_points 0) 0 []
+
+named_move_for_phrasings phrs pts pidx acc =
+  if length phrs == 0 then acc
+  else
+    let phr = head phrs
+    let new_acc = expand_phr_over_points phr pts pidx acc
+    named_move_for_phrasings (tail phrs) pts pidx new_acc
+
+expand_phr_over_points phr pts pidx acc =
+  if length pts == 0 then acc
+  else
+    let p = head pts
+    let nl = phrasing_named (pt_name p) phr
+    let sc = script_of (cons (build_moveto (pt_x p) (pt_y p) (pt_z p)) [])
+    expand_phr_over_points phr (tail pts) (pidx + 1) (cons (nl, sc, pt_x p, pt_y p, pt_z p) acc)
+
+-- Phrasings for coordinate moves.
+coord_phrasings _ =
+  cons "Move to coordinates X, Y, Z." (
+  cons "Go to coordinates X, Y, Z." (
+  cons "Move to position X, Y, Z." (
+  cons "Move the arm to X, Y, Z." (
+  cons "Go to (X, Y, Z)." (
+  cons "Place the arm at (X, Y, Z)." (
+  cons "Position the arm at X Y Z." []))))))
+
+coord_phrasing tpl x y z =
+  let s1 = str_replace "X" (show_int x) tpl
+  let s2 = str_replace "Y" (show_int y) s1
+  str_replace "Z" (show_int z) s2
+
+-- Enumerate coords at coarser grid + light random jitter for variety.
+coord_grid _ =
+  cons 0 (cons 3 (cons 5 (cons 7 (cons 10 (cons 13 (cons 15 (cons 18 (cons 20 (cons 23 (cons 25 (cons 28 (cons 30 [])))))))))))) -- 13 values
+
+-- Generate N random coords using LCG for diversity. Bias toward smaller
+-- coords to match bench distribution (most targets in 0-20 range).
+gen_random_coords s n acc =
+  if n <= 0 then (s, acc)
+  else
+    let (s1, x) = lcg_int s 0 30
+    let (s2, y) = lcg_int s1 0 30
+    let (s3, z) = lcg_int s2 0 25
+    gen_random_coords s3 (n - 1) (cons (x, y, z) acc)
+
+coord_examples_for_phr seed phr xyzs acc =
+  if length xyzs == 0 then acc
+  else
+    let xyz = head xyzs
+    let (x, y, z) = xyz
+    let nl = coord_phrasing phr x y z
+    let sc = script_of (cons (build_moveto x y z) [])
+    coord_examples_for_phr seed phr (tail xyzs) (cons (nl, sc, x, y, z) acc)
+
+coord_examples_loop phrs xyzs acc =
+  if length phrs == 0 then acc
+  else
+    let phr = head phrs
+    let new_acc = coord_examples_for_phr 0 phr xyzs acc
+    coord_examples_loop (tail phrs) xyzs new_acc
+
+coord_examples seed n_per =
+  let (s2, xyzs) = gen_random_coords seed n_per []
+  coord_examples_loop (coord_phrasings 0) xyzs []
+
+-- Home phrasings.
+home_phrasings _ =
+  cons "Return home." (
+  cons "Go home." (
+  cons "Return to home position." (
+  cons "Go back to origin." (
+  cons "Return the arm home." (
+  cons "Send the arm home." (
+  cons "Take the arm back to home." []))))))
+
+home_examples _ =
+  home_examples_loop (home_phrasings 0) []
+
+home_examples_loop phrs acc =
+  if length phrs == 0 then acc
+  else
+    let phr = head phrs
+    let sc = script_of (cons "Home" [])
+    home_examples_loop (tail phrs) (cons (phr, sc, 0, 0, 0) acc)
+
+-- Two-step chains: "Go to X, then to Y" / "Visit X then Y"
+chain2_phrasings _ =
+  cons "Go to point P1, then to point P2." (
+  cons "Visit P1, then P2." (
+  cons "Move to P1, then to P2." (
+  cons "Go to point P1 first, then to point P2." [])))
+
+phrasing_chain2 n1 n2 tpl =
+  let s1 = str_replace "P1" n1 tpl
+  str_replace "P2" n2 s1
+
+-- All ordered pairs of named points where p1 != p2.
+chain2_pairs _ =
+  chain2_pairs_outer (named_points 0) (named_points 0) []
+
+chain2_pairs_outer outer all acc =
+  if length outer == 0 then acc
+  else chain2_pairs_outer (tail outer) all (chain2_pairs_inner (head outer) all acc)
+
+chain2_pairs_inner p1 all acc =
+  if length all == 0 then acc
+  else
+    let p2 = head all
+    if (pt_name p1) == (pt_name p2) then chain2_pairs_inner p1 (tail all) acc
+    else chain2_pairs_inner p1 (tail all) (cons (p1, p2) acc)
+
+chain2_examples _ =
+  chain2_examples_loop (chain2_phrasings 0) (chain2_pairs 0) []
+
+chain2_examples_loop phrs pairs acc =
+  if length phrs == 0 then acc
+  else
+    let phr = head phrs
+    let new_acc = chain2_emit_for_phr phr pairs acc
+    chain2_examples_loop (tail phrs) pairs new_acc
+
+chain2_emit_for_phr phr pairs acc =
+  if length pairs == 0 then acc
+  else
+    let pair = head pairs
+    let (p1, p2) = pair
+    let nl = phrasing_chain2 (pt_name p1) (pt_name p2) phr
+    let cmds = cons (build_moveto (pt_x p1) (pt_y p1) (pt_z p1))
+               (cons (build_moveto (pt_x p2) (pt_y p2) (pt_z p2)) [])
+    let sc = script_of cmds
+    chain2_emit_for_phr phr (tail pairs) (cons (nl, sc, pt_x p2, pt_y p2, pt_z p2) acc)
+
+-- Move-then-home: "Go to X, then return home"
+move_home_phrasings _ =
+  cons "Go to point P, then return home." (
+  cons "Visit point P, then go home." (
+  cons "Move to P, then return to origin." (
+  cons "Move to point P and then back to home." [])))
+
+move_home_examples _ =
+  move_home_examples_loop (move_home_phrasings 0) (named_points 0) []
+
+move_home_examples_loop phrs pts acc =
+  if length phrs == 0 then acc
+  else
+    let phr = head phrs
+    let new_acc = move_home_emit_for_phr phr pts acc
+    move_home_examples_loop (tail phrs) pts new_acc
+
+move_home_emit_for_phr phr pts acc =
+  if length pts == 0 then acc
+  else
+    let p = head pts
+    let nl = phrasing_named (pt_name p) phr
+    let cmds = cons (build_moveto (pt_x p) (pt_y p) (pt_z p)) (cons "Home" [])
+    let sc = script_of cmds
+    move_home_emit_for_phr phr (tail pts) (cons (nl, sc, 0, 0, 0) acc)
+
+-- ----------------------------------------------------------------------
+-- Write JSONL output.
+-- ----------------------------------------------------------------------
+
+write_examples path tag examples =
+  write_examples_loop path tag examples 0 ""
+
+write_examples_loop path tag exs idx acc =
+  if length exs == 0 then
+    let _ = write_file path acc
+    idx
+  else
+    let ex = head exs
+    let (nl, sc, gex, gey, gez) = ex
+    let id_str = cat [tag, ":", show idx]
+    let rec = make_record id_str nl sc gex gey gez
+    write_examples_loop path tag (tail exs) (idx + 1) (cat [acc, rec, "\n"])
+
+-- Concatenate all template outputs.
+all_examples seed =
+  let a = named_move_examples 0
+  let b = coord_examples seed 80
+  let c = home_examples 0
+  let d = chain2_examples 0
+  let e = move_home_examples 0
+  append a (append b (append c (append d e)))
+
+main =
+  let argv = args
+  let parsed = parse_args argv
+  let (_flags, opts, _pos) = parsed
+  let out_pretrain = get_opt opts "out-pretrain" "training/corpora/spurarm_move_v0_pretrain.jsonl"
+  let out_sft = get_opt opts "out-sft" "training/corpora/spurarm_move_v0_sft.jsonl"
+  let out_eval = get_opt opts "out-eval" "training/corpora/spurarm_move_v0_eval.jsonl"
+  let seed = parse_int (get_opt opts "seed" "42")
+
+  let exs = all_examples seed
+  let n_total = length exs
+  let _ = print (cat ["generated total examples: ", show n_total])
+
+  -- 70 / 20 / 10 split.
+  let n_pre = (n_total * 7) / 10
+  let n_sft = (n_total * 2) / 10
+  let pretrain_exs = take n_pre exs
+  let rest = drop n_pre exs
+  let sft_exs = take n_sft rest
+  let eval_exs = drop n_sft rest
+
+  let np = write_examples out_pretrain "move-pre" pretrain_exs
+  let _ = print (cat ["wrote pretrain: ", out_pretrain, " (", show np, " rows)"])
+  let ns = write_examples out_sft "move-sft" sft_exs
+  let _ = print (cat ["wrote sft: ", out_sft, " (", show ns, " rows)"])
+  let ne = write_examples out_eval "move-eval" eval_exs
+  let _ = print (cat ["wrote eval: ", out_eval, " (", show ne, " rows)"])
+  0
+
+-- take/drop provided by stdlib/list.rail.
