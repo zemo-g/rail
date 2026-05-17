@@ -28,6 +28,7 @@ import "stdlib/transformer.rail"
 import "stdlib/optim.rail"
 import "stdlib/checkpoint.rail"
 import "stdlib/spurarm_model.rail"
+import "stdlib/sampling.rail"
 
 -- ----------------------------------------------------------------------
 -- Constants (must match train_spurarm.rail).
@@ -81,8 +82,8 @@ add_buf_inplace dst src n i =
 
 forward_inf x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff =
   let e = matmul x w_e
-  let ed = unwrap e
-  let _ = add_buf_inplace ed pe (seq * d) 0
+  -- Cap D (Stage 6): RoPE replaces additive sinusoidal-PE. Embedding
+  -- passes through; positional info via rope_apply on Q,K below.
   let x_pe = e
 
   let ln1_out = layernorm x_pe ln_g ln_b
@@ -90,6 +91,8 @@ forward_inf x w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff =
   let q = matmul ln1_out w_q
   let k = matmul ln1_out w_k
   let v = matmul ln1_out w_v
+  let _ = rope_apply q
+  let _ = rope_apply k
   let kt = tensor_transpose k
   let scores = matmul q kt
   let scale = 1.0 / sqrt (int_to_float d)
@@ -161,6 +164,58 @@ argmax_row probs row V =
   argmax_row_inner probs row V 1 0 (float_arr_get probs (row * V))
 
 -- ----------------------------------------------------------------------
+-- Cap F: no-repeat-3gram + min-gen EOS suppression.
+--
+-- Pre-probe (Stage 6) showed: model emits EOS as step-0 argmax (p=0.18)
+-- and cycles on whitespace tokens after. Cap F suppresses EOS until
+-- min_gen tokens generated and bans repeated 3-grams.
+-- ----------------------------------------------------------------------
+
+list_contains_int x xs =
+  if length xs == 0 then 0
+  else if head xs == x then 1
+  else list_contains_int x (tail xs)
+
+-- Walk ids[0..cur_len-3], find i where ids[i] == prev_id and ids[i+1] == last_id.
+-- Each match adds ids[i+2] to banned list.
+banned_scan ids cur_len prev_id last_id i acc =
+  if i + 2 >= cur_len then acc
+  else
+    let a = list_nth i ids
+    let b = list_nth (i + 1) ids
+    if a == prev_id then
+      if b == last_id then
+        let c = list_nth (i + 2) ids
+        if list_contains_int c acc == 1 then banned_scan ids cur_len prev_id last_id (i + 1) acc
+        else banned_scan ids cur_len prev_id last_id (i + 1) (cons c acc)
+      else banned_scan ids cur_len prev_id last_id (i + 1) acc
+    else banned_scan ids cur_len prev_id last_id (i + 1) acc
+
+compute_banned_set ids cur_len prev_id last_id =
+  if cur_len < 3 then []
+  else banned_scan ids cur_len prev_id last_id 0 []
+
+-- Argmax over row, skipping ids in banned_list, skipping eos when min_remain > 0.
+-- Returns (best_id, found_any). best_id = -1, found_any = 0 means all banned.
+argmax_row_filtered_inner probs row V j best_id best_val banned_list eos_tok min_remain =
+  if j >= V then best_id
+  else
+    let banned_eos = if j == eos_tok then min_remain > 0 else false
+    let banned_ng = list_contains_int j banned_list == 1
+    if banned_eos then argmax_row_filtered_inner probs row V (j + 1) best_id best_val banned_list eos_tok min_remain
+    else if banned_ng then argmax_row_filtered_inner probs row V (j + 1) best_id best_val banned_list eos_tok min_remain
+    else
+      let p = float_arr_get probs (row * V + j)
+      if p > best_val then argmax_row_filtered_inner probs row V (j + 1) j p banned_list eos_tok min_remain
+      else argmax_row_filtered_inner probs row V (j + 1) best_id best_val banned_list eos_tok min_remain
+
+-- Returns best non-banned id; falls back to plain argmax if everything banned.
+argmax_row_filtered probs row V banned_list eos_tok min_remain =
+  let best = argmax_row_filtered_inner probs row V 0 (0 - 1) (0.0 - 1.0) banned_list eos_tok min_remain
+  if best < 0 then argmax_row probs row V
+  else best
+
+-- ----------------------------------------------------------------------
 -- One-shot greedy decode. Each iteration:
 --   1. Fill x_data with current id list (zero-padded to seq).
 --   2. Run forward.
@@ -169,7 +224,7 @@ argmax_row probs row V =
 --   5. Else append id, continue.
 -- ----------------------------------------------------------------------
 
-decode_step ids cur_len weights pe seq V d d_ff x_data x_t =
+decode_step ids cur_len weights pe seq V d d_ff x_data x_t no_repeat_n min_remain =
   let w_e = list_nth 0 weights
   let w_q = list_nth 1 weights
   let w_k = list_nth 2 weights
@@ -183,21 +238,86 @@ decode_step ids cur_len weights pe seq V d d_ff x_data x_t =
   let probs_t = forward_inf x_t w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
   match probs_t
     | Tensor probs_data _ _ ->
-      argmax_row probs_data (cur_len - 1) V
+      if no_repeat_n <= 0 then
+        if min_remain <= 0 then argmax_row probs_data (cur_len - 1) V
+        else argmax_row_filtered probs_data (cur_len - 1) V [] (eos_id 0) min_remain
+      else
+        if cur_len < 2 then
+          if min_remain <= 0 then argmax_row probs_data (cur_len - 1) V
+          else argmax_row_filtered probs_data (cur_len - 1) V [] (eos_id 0) min_remain
+        else
+          let prev_id = list_nth (cur_len - 2) ids
+          let last_id = list_nth (cur_len - 1) ids
+          let banned = compute_banned_set ids cur_len prev_id last_id
+          argmax_row_filtered probs_data (cur_len - 1) V banned (eos_id 0) min_remain
 
 -- Greedy generation: build ids list step by step. ids starts with
 -- prompt+sep; we append until eos or max generated tokens.
 -- max_total caps cur_len so we don't overrun seq.
-generate_loop ids cur_len weights pe seq V d d_ff x_data x_t max_total gen_acc =
+-- no_repeat_n: 0 = off; >=3 = ban repeated n-grams of that order.
+-- min_gen: min generated tokens before EOS allowed.
+generate_loop ids cur_len weights pe seq V d d_ff x_data x_t max_total gen_acc no_repeat_n min_gen gen_count =
   if cur_len >= max_total then reverse gen_acc
   else
     let mk = arena_mark 0
-    let next_id = decode_step ids cur_len weights pe seq V d d_ff x_data x_t
+    let min_remain = if gen_count < min_gen then min_gen - gen_count else 0
+    let next_id = decode_step ids cur_len weights pe seq V d d_ff x_data x_t no_repeat_n min_remain
     let _ = arena_reset mk
     if next_id == (eos_id 0) then reverse gen_acc
     else
       let new_ids = append ids (cons next_id [])
-      generate_loop new_ids (cur_len + 1) weights pe seq V d d_ff x_data x_t max_total (cons next_id gen_acc)
+      generate_loop new_ids (cur_len + 1) weights pe seq V d d_ff x_data x_t max_total (cons next_id gen_acc) no_repeat_n min_gen (gen_count + 1)
+
+-- Sampling variant: top-k sampling using stdlib/sampling.rail. The
+-- `sample_state` float_arr is laid out as:
+--   slot 0: top_k (as float, cast to int on use)
+--   slot 1+i: uniform draw u_i for step i (pre-filled by fill_uniforms)
+-- `tmp_row` is a V-length scratch arr reused across steps to hold the
+-- copied probability row before sample_topk.
+
+copy_row_loop src offset dst V i =
+  if i >= V then 0
+  else
+    let _ = float_arr_set dst i (float_arr_get src (offset + i))
+    copy_row_loop src offset dst V (i + 1)
+
+-- Copy uniforms[0..n-1] into sample_state[1..n]. Slot 0 holds top_k.
+sample_state_copy_uniforms dst src n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set dst (i + 1) (float_arr_get src i)
+    sample_state_copy_uniforms dst src n (i + 1)
+
+decode_step_sample ids cur_len weights pe seq V d d_ff x_data x_t sample_state step tmp_row =
+  let w_e = list_nth 0 weights
+  let w_q = list_nth 1 weights
+  let w_k = list_nth 2 weights
+  let w_v = list_nth 3 weights
+  let w_o = list_nth 4 weights
+  let w_f1 = list_nth 5 weights
+  let w_f2 = list_nth 6 weights
+  let ln_g = list_nth 7 weights
+  let ln_b = list_nth 8 weights
+  let _ = build_input_array x_data ids seq V
+  let probs_t = forward_inf x_t w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
+  match probs_t
+    | Tensor probs_data _ _ ->
+      let top_k = float_to_int (float_arr_get sample_state 0)
+      let u = float_arr_get sample_state (step + 1)
+      let row_offset = (cur_len - 1) * V
+      let _ = copy_row_loop probs_data row_offset tmp_row V 0
+      sample_topk tmp_row V top_k u
+
+generate_loop_sample ids cur_len weights pe seq V d d_ff x_data x_t max_total gen_acc sample_state step tmp_row =
+  if cur_len >= max_total then reverse gen_acc
+  else
+    let mk = arena_mark 0
+    let next_id = decode_step_sample ids cur_len weights pe seq V d d_ff x_data x_t sample_state step tmp_row
+    let _ = arena_reset mk
+    if next_id == (eos_id 0) then reverse gen_acc
+    else
+      let new_ids = append ids (cons next_id [])
+      generate_loop_sample new_ids (cur_len + 1) weights pe seq V d d_ff x_data x_t max_total (cons next_id gen_acc) sample_state (step + 1) tmp_row
 
 -- ----------------------------------------------------------------------
 -- Build the prompt id sequence: <bos> + prompt_ids + <sep>.
@@ -244,10 +364,17 @@ build_weight_tensors V d d_ff =
   cons w_e (cons w_q (cons w_k (cons w_v (cons w_o (cons w_f1 (cons w_f2 (cons ln_g (cons ln_b []))))))))
 
 -- ----------------------------------------------------------------------
--- Fallback placeholder (used when ckpt missing).
+-- Fallback when ckpt is missing or model output is empty.
+--
+-- Returns a sentinel no-op script so the downstream grader pipeline has
+-- something to parse. Must NOT be a script that accidentally satisfies
+-- bench prompts whose expected end state matches the initial state --
+-- previously `script = [Home]` caused "fallback contamination" where
+-- b14, b19, b02 passed by emitting empty model output. See memory
+-- [[bench_v0_fallback_contamination]] for the audit.
 -- ----------------------------------------------------------------------
 
-emit_fallback _ = "script = [Home]\n"
+emit_fallback _ = "script = []\n"
 
 -- ----------------------------------------------------------------------
 -- Main
@@ -262,6 +389,11 @@ main =
   let prompt = get_opt opts "prompt" "Move the arm to home position."
   let max_gen_str = get_opt opts "max" "60"
   let max_gen = parse_int max_gen_str
+  let sample_mode = parse_int (get_opt opts "sample" "0")
+  let top_k = parse_int (get_opt opts "top-k" "10")
+  let seed = parse_int (get_opt opts "seed" "42")
+  let no_repeat_n = parse_int (get_opt opts "no-repeat-n" "0")
+  let min_gen = parse_int (get_opt opts "min-gen" "0")
 
   let seq = fixed_seq_len 0
   let d = spurarm_v0_d_model 0
@@ -290,7 +422,17 @@ main =
     else
       let max_total_raw = p_len + max_gen
       let max_total = if max_total_raw > seq then seq else max_total_raw
-      let gen_ids = generate_loop prompt_ids p_len weights pe seq V d d_ff x_data x_t max_total []
+      let gen_ids =
+        if sample_mode > 0 then
+          let n_unif = max_gen + 1
+          let uniforms = fill_uniforms n_unif seed
+          let sample_state = float_arr_new (n_unif + 1) 0.0
+          let _ = float_arr_set sample_state 0 (int_to_float top_k)
+          let _ = sample_state_copy_uniforms sample_state uniforms n_unif 0
+          let tmp_row = float_arr_new V 0.0
+          generate_loop_sample prompt_ids p_len weights pe seq V d d_ff x_data x_t max_total [] sample_state 0 tmp_row
+        else
+          generate_loop prompt_ids p_len weights pe seq V d d_ff x_data x_t max_total [] no_repeat_n min_gen 0
       let text = emit_generation bpe gen_ids
       let safe = if length text == 0 then (emit_fallback 0) else text
       let _ = print safe
