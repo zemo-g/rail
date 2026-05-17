@@ -23,6 +23,12 @@
 
 set -u
 
+# Force CPU fallback + bigger arena (Studio Metal stack is currently
+# broken; honored via the worktree-aware gpu_available fix landed
+# 2026-05-16). See gpu_available_hardcoded_worktree_path memory.
+export RAIL_GPU_OFF=1
+export RAIL_ARENA_MB=4096
+
 PHASE="pretrain"
 SEEDS="42,77,100,200,314"
 STEPS=""
@@ -87,8 +93,11 @@ for seed in "${SEED_ARR[@]}"; do
 
   bench_score=0
   if [[ "$EVAL_BENCH" == "1" ]]; then
+    # Clear stale generator binary so cached stub doesn't pollute.
+    rm -f /tmp/spurarm_gen_bin /tmp/spurarm_gen_bin.tag
     ./rail_native run tools/spurarm/train/bench_eval.rail \
       --prefix "$prefix" \
+      --max-gen 60 \
       --out /tmp/bench_eval_${seed}_${PHASE}.txt 2>&1 \
       | tee /tmp/bench_eval_${seed}_${PHASE}.log \
       | tail -10
