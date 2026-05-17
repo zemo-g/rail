@@ -1,0 +1,394 @@
+-- stdlib/rail_grammar.rail
+--
+-- Cap I (Stage 7): tolerant prefix validator for the Spur-arm DSL.
+--
+-- Given a string `text`, returns 1 if `text` is a valid PREFIX of some
+-- valid `script = [...]` Rail program, else 0. Used by generate.rail's
+-- grammar-walked decoder: for each candidate next token, simulate
+-- appending its decoded text and call this validator; mask any token
+-- whose extension is not a valid prefix.
+--
+-- DSL accepted (mirrors tools/robot/dsl_spec.txt + reference_scripts/):
+--
+--   script := WS* "script" WS* "=" WS* "[" WS* cmd_list WS* "]"
+--   cmd_list := /* empty */ | cmd (WS* "," WS* cmd)*
+--   cmd := move_to_cmd | set_grip_cmd | wait_cmd | home_cmd
+--   move_to_cmd := ("MoveTo" | "move_to") WS+ int WS+ int WS+ int
+--   set_grip_cmd := "SetGrip" WS+ grip
+--                 | "grip_open"
+--                 | "grip_close"
+--   grip := "GripOpen" | "GripClose"
+--   wait_cmd := ("Wait" | "wait_ms") WS+ int
+--   home_cmd := "Home" | "home_cmd"
+--   int := digit+
+--   WS := space | tab | newline | comma_in_args (after a Cmd)
+--
+-- A "valid prefix" is any string `s` such that there exists a `t` with
+-- `s ++ t` accepted by the grammar.
+--
+-- Note: no stdlib/list.rail import — we only use list builtins
+-- (cons/head/tail/length) which are available without import. Avoids
+-- a double-import symbol conflict when callers also import list.rail.
+
+-- ─────────────────────────────────────────────────────────────────────
+-- State machine. States are small integer codes. Bits of "what we
+-- expect next" carried in additional ints.
+--
+-- States (`st_` for clarity):
+--   0  st_init       — at start; expect WS or 's' (of "script")
+--   1  st_kw_script  — in the middle of typing "script" keyword
+--   2  st_after_kw   — typed "script"; expect WS or '='
+--   3  st_after_eq   — typed '='; expect WS or '['
+--   4  st_list_start — typed '['; expect WS, Cmd-letter, or ']'
+--   5  st_in_cmd_name — reading a Cmd identifier
+--   6  st_after_movecmd — just finished "MoveTo"/"move_to"; expect WS then int1
+--   7  st_in_int1    — reading int1 of MoveTo
+--   8  st_after_int1 — finished int1; expect WS then int2
+--   9  st_in_int2    — reading int2 of MoveTo
+--   10 st_after_int2 — finished int2; expect WS then int3
+--   11 st_in_int3    — reading int3 of MoveTo
+--   12 st_after_int3 — finished int3; expect WS, comma, or ']'
+--   13 st_after_setgrip — just finished "SetGrip"; expect WS then grip identifier
+--   14 st_in_grip_name — reading "GripOpen" or "GripClose"
+--   15 st_after_grip — finished grip arg; expect WS, comma, or ']'
+--   16 st_after_wait — finished "Wait"/"wait_ms"; expect WS then int
+--   17 st_in_wait_int — reading int of Wait
+--   18 st_after_wait_int — finished wait int; expect WS, comma, or ']'
+--   19 st_after_zero_arg_cmd — finished Home/grip_open/grip_close/home_cmd; expect WS, comma, or ']'
+--   20 st_after_comma — just saw comma; expect WS or next Cmd
+--   21 st_after_close — finished ']'; only WS / EOS allowed
+--   22 st_dead       — invalid prefix; absorbing
+--
+-- We also keep a small buffer of the "current identifier prefix" so
+-- that mid-identifier states (st_kw_script, st_in_cmd_name,
+-- st_in_grip_name) can validate that the running identifier is still
+-- a prefix of an allowed completion. We carry that as a Rail string
+-- alongside the state.
+
+st_init = 0
+st_kw_script = 1
+st_after_kw = 2
+st_after_eq = 3
+st_after_lb = 4
+st_list_start = 4
+st_in_cmd_name = 5
+st_after_movecmd = 6
+st_in_int1 = 7
+st_after_int1 = 8
+st_in_int2 = 9
+st_after_int2 = 10
+st_in_int3 = 11
+st_after_int3 = 12
+st_after_setgrip = 13
+st_in_grip_name = 14
+st_after_grip = 15
+st_after_wait = 16
+st_in_wait_int = 17
+st_after_wait_int = 18
+st_after_zero_arg = 19
+st_after_comma = 20
+st_after_close = 21
+st_dead = 22
+
+-- Helpers ---------------------------------------------------------------
+
+is_ws c = if c == " " then 1
+          else if c == "\n" then 1
+          else if c == "\t" then 1
+          else if c == "\r" then 1
+          else 0
+
+is_digit c = if c == "0" then 1
+             else if c == "1" then 1
+             else if c == "2" then 1
+             else if c == "3" then 1
+             else if c == "4" then 1
+             else if c == "5" then 1
+             else if c == "6" then 1
+             else if c == "7" then 1
+             else if c == "8" then 1
+             else if c == "9" then 1
+             else 0
+
+-- NB: Rail's string `>=`/`<=` does not do char-compare reliably; per
+-- stdlib/bpe.rail's bpe_digit_val convention we enumerate explicitly.
+
+is_lower c =
+  if c == "a" then 1 else if c == "b" then 1 else if c == "c" then 1
+  else if c == "d" then 1 else if c == "e" then 1 else if c == "f" then 1
+  else if c == "g" then 1 else if c == "h" then 1 else if c == "i" then 1
+  else if c == "j" then 1 else if c == "k" then 1 else if c == "l" then 1
+  else if c == "m" then 1 else if c == "n" then 1 else if c == "o" then 1
+  else if c == "p" then 1 else if c == "q" then 1 else if c == "r" then 1
+  else if c == "s" then 1 else if c == "t" then 1 else if c == "u" then 1
+  else if c == "v" then 1 else if c == "w" then 1 else if c == "x" then 1
+  else if c == "y" then 1 else if c == "z" then 1
+  else 0
+
+is_upper c =
+  if c == "A" then 1 else if c == "B" then 1 else if c == "C" then 1
+  else if c == "D" then 1 else if c == "E" then 1 else if c == "F" then 1
+  else if c == "G" then 1 else if c == "H" then 1 else if c == "I" then 1
+  else if c == "J" then 1 else if c == "K" then 1 else if c == "L" then 1
+  else if c == "M" then 1 else if c == "N" then 1 else if c == "O" then 1
+  else if c == "P" then 1 else if c == "Q" then 1 else if c == "R" then 1
+  else if c == "S" then 1 else if c == "T" then 1 else if c == "U" then 1
+  else if c == "V" then 1 else if c == "W" then 1 else if c == "X" then 1
+  else if c == "Y" then 1 else if c == "Z" then 1
+  else 0
+
+is_ident_cont c =
+  if is_digit c == 1 then 1
+  else if c == "_" then 1
+  else if is_lower c == 1 then 1
+  else if is_upper c == 1 then 1
+  else 0
+
+is_ident_start c =
+  if c == "_" then 1
+  else if is_lower c == 1 then 1
+  else if is_upper c == 1 then 1
+  else 0
+
+-- Returns 1 if the running string `s` is a prefix of `target`. Both
+-- args are strings.
+str_is_prefix_of s target =
+  let sl = length (chars s)
+  let tl = length (chars target)
+  if sl > tl then 0
+  else if sl == 0 then 1
+  else if (str_sub target 0 sl) == s then 1
+  else 0
+
+-- Returns 1 if `s` is a prefix of ANY of the candidate strings.
+any_prefix_of s cands =
+  if length cands == 0 then 0
+  else if str_is_prefix_of s (head cands) == 1 then 1
+  else any_prefix_of s (tail cands)
+
+-- ─────────────────────────────────────────────────────────────────────
+-- After completing an identifier, classify it and return the next state.
+-- Returns st_dead if the identifier is not a known DSL keyword/Cmd.
+-- ─────────────────────────────────────────────────────────────────────
+
+classify_cmd_ident s =
+  if s == "MoveTo" then st_after_movecmd
+  else if s == "move_to" then st_after_movecmd
+  else if s == "SetGrip" then st_after_setgrip
+  else if s == "grip_open" then st_after_zero_arg
+  else if s == "grip_close" then st_after_zero_arg
+  else if s == "Wait" then st_after_wait
+  else if s == "wait_ms" then st_after_wait
+  else if s == "Home" then st_after_zero_arg
+  else if s == "home_cmd" then st_after_zero_arg
+  else st_dead
+
+classify_grip_ident s =
+  if s == "GripOpen" then st_after_grip
+  else if s == "GripClose" then st_after_grip
+  else st_dead
+
+-- Valid prefixes of Cmd identifiers (so we accept mid-typing).
+cmd_ident_candidates _ =
+  cons "MoveTo" (
+  cons "move_to" (
+  cons "SetGrip" (
+  cons "grip_open" (
+  cons "grip_close" (
+  cons "Wait" (
+  cons "wait_ms" (
+  cons "Home" (
+  cons "home_cmd" []))))))))
+
+grip_ident_candidates _ =
+  cons "GripOpen" (
+  cons "GripClose" [])
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Step the (state, ident_buf) machine on one character. Returns
+-- (new_state, new_ident_buf). new_state == st_dead means reject.
+--
+-- We thread ident_buf as a Rail string. It is non-empty exactly when
+-- we are in one of the "mid-identifier" states (st_kw_script,
+-- st_in_cmd_name, st_in_grip_name).
+-- ─────────────────────────────────────────────────────────────────────
+
+-- Common close: after a value-bearing Cmd ends, what to do on next char.
+-- ws → stay; ',' → st_after_comma; ']' → st_after_close; else dead.
+step_after_value c =
+  if is_ws c == 1 then (st_after_int3, "")
+  else if c == "," then (st_after_comma, "")
+  else if c == "]" then (st_after_close, "")
+  else (st_dead, "")
+
+-- step_simple: like step_after_value but parameterized on the
+-- "stay" state (e.g. st_after_zero_arg) so it returns to it on ws.
+step_close_to stay_st c =
+  if is_ws c == 1 then (stay_st, "")
+  else if c == "," then (st_after_comma, "")
+  else if c == "]" then (st_after_close, "")
+  else (st_dead, "")
+
+-- ─────────────────────────────────────────────────────────────────────
+-- The main step function.
+-- ─────────────────────────────────────────────────────────────────────
+
+grammar_step state ident c =
+  if state == st_dead then (st_dead, "")
+  else if state == st_init then
+    if is_ws c == 1 then (st_init, "")
+    else if c == "s" then (st_kw_script, "s")
+    else (st_dead, "")
+
+  else if state == st_kw_script then
+    let new_ident = join "" (cons ident (cons c []))
+    if str_is_prefix_of new_ident "script" == 1 then
+      if new_ident == "script" then (st_after_kw, "")
+      else (st_kw_script, new_ident)
+    else (st_dead, "")
+
+  else if state == st_after_kw then
+    if is_ws c == 1 then (st_after_kw, "")
+    else if c == "=" then (st_after_eq, "")
+    else (st_dead, "")
+
+  else if state == st_after_eq then
+    if is_ws c == 1 then (st_after_eq, "")
+    else if c == "[" then (st_list_start, "")
+    else (st_dead, "")
+
+  else if state == st_list_start then
+    if is_ws c == 1 then (st_list_start, "")
+    else if c == "]" then (st_after_close, "")
+    else if is_ident_start c == 1 then
+      if any_prefix_of c (cmd_ident_candidates 0) == 1 then (st_in_cmd_name, c)
+      else (st_dead, "")
+    else (st_dead, "")
+
+  else if state == st_in_cmd_name then
+    if is_ident_cont c == 1 then
+      let new_ident = join "" (cons ident (cons c []))
+      if any_prefix_of new_ident (cmd_ident_candidates 0) == 1 then
+        (st_in_cmd_name, new_ident)
+      else (st_dead, "")
+    else
+      -- Identifier ended; classify and decide next state.
+      let next_st = classify_cmd_ident ident
+      if next_st == st_dead then (st_dead, "")
+      else
+        -- 'c' is the boundary char; re-feed it into the new state.
+        grammar_step next_st "" c
+
+  else if state == st_after_movecmd then
+    if is_ws c == 1 then (st_after_movecmd, "")
+    else if is_digit c == 1 then (st_in_int1, "")
+    else (st_dead, "")
+
+  else if state == st_in_int1 then
+    if is_digit c == 1 then (st_in_int1, "")
+    else if is_ws c == 1 then (st_after_int1, "")
+    else (st_dead, "")
+
+  else if state == st_after_int1 then
+    if is_ws c == 1 then (st_after_int1, "")
+    else if is_digit c == 1 then (st_in_int2, "")
+    else (st_dead, "")
+
+  else if state == st_in_int2 then
+    if is_digit c == 1 then (st_in_int2, "")
+    else if is_ws c == 1 then (st_after_int2, "")
+    else (st_dead, "")
+
+  else if state == st_after_int2 then
+    if is_ws c == 1 then (st_after_int2, "")
+    else if is_digit c == 1 then (st_in_int3, "")
+    else (st_dead, "")
+
+  else if state == st_in_int3 then
+    if is_digit c == 1 then (st_in_int3, "")
+    else if is_ws c == 1 then (st_after_int3, "")
+    else if c == "," then (st_after_comma, "")
+    else if c == "]" then (st_after_close, "")
+    else (st_dead, "")
+
+  else if state == st_after_int3 then step_close_to st_after_int3 c
+
+  else if state == st_after_setgrip then
+    if is_ws c == 1 then (st_after_setgrip, "")
+    else if is_ident_start c == 1 then
+      if any_prefix_of c (grip_ident_candidates 0) == 1 then (st_in_grip_name, c)
+      else (st_dead, "")
+    else (st_dead, "")
+
+  else if state == st_in_grip_name then
+    if is_ident_cont c == 1 then
+      let new_ident = join "" (cons ident (cons c []))
+      if any_prefix_of new_ident (grip_ident_candidates 0) == 1 then
+        (st_in_grip_name, new_ident)
+      else (st_dead, "")
+    else
+      let next_st = classify_grip_ident ident
+      if next_st == st_dead then (st_dead, "")
+      else grammar_step next_st "" c
+
+  else if state == st_after_grip then step_close_to st_after_grip c
+
+  else if state == st_after_wait then
+    if is_ws c == 1 then (st_after_wait, "")
+    else if is_digit c == 1 then (st_in_wait_int, "")
+    else (st_dead, "")
+
+  else if state == st_in_wait_int then
+    if is_digit c == 1 then (st_in_wait_int, "")
+    else if is_ws c == 1 then (st_after_wait_int, "")
+    else if c == "," then (st_after_comma, "")
+    else if c == "]" then (st_after_close, "")
+    else (st_dead, "")
+
+  else if state == st_after_wait_int then step_close_to st_after_wait_int c
+
+  else if state == st_after_zero_arg then step_close_to st_after_zero_arg c
+
+  else if state == st_after_comma then
+    if is_ws c == 1 then (st_after_comma, "")
+    else if is_ident_start c == 1 then
+      if any_prefix_of c (cmd_ident_candidates 0) == 1 then (st_in_cmd_name, c)
+      else (st_dead, "")
+    else (st_dead, "")
+
+  else if state == st_after_close then
+    -- After ']', only whitespace is accepted (we treat EOF separately).
+    if is_ws c == 1 then (st_after_close, "")
+    else (st_dead, "")
+
+  else (st_dead, "")
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Walk a full string char-by-char. Returns (final_state, final_ident).
+-- A `text` is a valid prefix iff final_state != st_dead.
+-- ─────────────────────────────────────────────────────────────────────
+
+walk_chars cs state ident =
+  if length cs == 0 then (state, ident)
+  else if state == st_dead then (st_dead, "")
+  else
+    let pair = grammar_step state ident (head cs)
+    let (ns, ni) = pair
+    walk_chars (tail cs) ns ni
+
+is_valid_prefix text =
+  let cs = chars text
+  let result = walk_chars cs st_init ""
+  let (final_st, _) = result
+  if final_st == st_dead then 0 else 1
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Convenience: a fully-typed script must end in st_after_close (and
+-- optionally trailing whitespace, which keeps state at st_after_close).
+-- ─────────────────────────────────────────────────────────────────────
+
+is_complete_script text =
+  let cs = chars text
+  let result = walk_chars cs st_init ""
+  let (final_st, _) = result
+  if final_st == st_after_close then 1 else 0

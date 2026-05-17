@@ -29,6 +29,7 @@ import "stdlib/optim.rail"
 import "stdlib/checkpoint.rail"
 import "stdlib/spurarm_model.rail"
 import "stdlib/sampling.rail"
+import "stdlib/rail_grammar.rail"
 
 -- ----------------------------------------------------------------------
 -- Constants (must match train_spurarm.rail).
@@ -216,6 +217,74 @@ argmax_row_filtered probs row V banned_list eos_tok min_remain =
   else best
 
 -- ----------------------------------------------------------------------
+-- Cap I (Stage 7): grammar-constrained decode.
+--
+-- For each candidate token, decode its text via BPE, concatenate to the
+-- generated-so-far text, and reject candidates whose extension is not a
+-- valid prefix of a complete Rail DSL script. EOS (id 2) is allowed only
+-- when the current text is already a complete script.
+--
+-- Falls back to plain argmax if grammar zeros out every candidate.
+-- ----------------------------------------------------------------------
+
+-- Pure-whitespace tokens (e.g. " ", "\n  ") let the model stall inside
+-- a list emitting newlines forever (grammar accepts them as decoration).
+-- Reject them so the decoder must pick a content-bearing token.
+is_pure_ws_char c =
+  if c == " " then 1
+  else if c == "\n" then 1
+  else if c == "\t" then 1
+  else if c == "\r" then 1
+  else 0
+
+is_pure_ws_chars cs =
+  if length cs == 0 then 1
+  else if is_pure_ws_char (head cs) == 0 then 0
+  else is_pure_ws_chars (tail cs)
+
+is_pure_whitespace s =
+  let cs = chars s
+  if length cs == 0 then 0
+  else is_pure_ws_chars cs
+
+-- token_grammar_allowed: strict_ws=1 rejects pure-whitespace tokens;
+-- strict_ws=0 allows them (used as a fallback so we don't dive into
+-- plain-argmax garbage when the strict pass empties).
+token_grammar_allowed bpe gen_text eos_tok tok_id strict_ws =
+  if tok_id == eos_tok then
+    if is_complete_script gen_text == 1 then 1 else 0
+  else
+    let decoded = bpe_decode bpe (cons tok_id [])
+    if strict_ws == 1 then
+      if is_pure_whitespace decoded == 1 then 0
+      else
+        let test_text = join "" (cons gen_text (cons decoded []))
+        is_valid_prefix test_text
+    else
+      let test_text = join "" (cons gen_text (cons decoded []))
+      is_valid_prefix test_text
+
+argmax_row_grammar_inner probs row V j best_id best_val bpe gen_text eos_tok strict_ws =
+  if j >= V then best_id
+  else
+    let allowed = token_grammar_allowed bpe gen_text eos_tok j strict_ws
+    if allowed == 0 then argmax_row_grammar_inner probs row V (j + 1) best_id best_val bpe gen_text eos_tok strict_ws
+    else
+      let p = float_arr_get probs (row * V + j)
+      if p > best_val then argmax_row_grammar_inner probs row V (j + 1) j p bpe gen_text eos_tok strict_ws
+      else argmax_row_grammar_inner probs row V (j + 1) best_id best_val bpe gen_text eos_tok strict_ws
+
+-- Two-pass: strict (no pure-ws) then relaxed (ws allowed). If both
+-- empty, return EOS to terminate cleanly rather than spew garbage.
+argmax_row_grammar probs row V bpe gen_text eos_tok =
+  let strict = argmax_row_grammar_inner probs row V 0 (0 - 1) (0.0 - 1.0) bpe gen_text eos_tok 1
+  if strict >= 0 then strict
+  else
+    let relaxed = argmax_row_grammar_inner probs row V 0 (0 - 1) (0.0 - 1.0) bpe gen_text eos_tok 0
+    if relaxed >= 0 then relaxed
+    else eos_tok
+
+-- ----------------------------------------------------------------------
 -- One-shot greedy decode. Each iteration:
 --   1. Fill x_data with current id list (zero-padded to seq).
 --   2. Run forward.
@@ -224,7 +293,7 @@ argmax_row_filtered probs row V banned_list eos_tok min_remain =
 --   5. Else append id, continue.
 -- ----------------------------------------------------------------------
 
-decode_step ids cur_len weights pe seq V d d_ff x_data x_t no_repeat_n min_remain =
+decode_step ids cur_len weights pe seq V d d_ff x_data x_t no_repeat_n min_remain grammar_on bpe gen_text =
   let w_e = list_nth 0 weights
   let w_q = list_nth 1 weights
   let w_k = list_nth 2 weights
@@ -238,7 +307,9 @@ decode_step ids cur_len weights pe seq V d d_ff x_data x_t no_repeat_n min_remai
   let probs_t = forward_inf x_t w_e w_q w_k w_v w_o w_f1 w_f2 ln_g ln_b pe seq V d d_ff
   match probs_t
     | Tensor probs_data _ _ ->
-      if no_repeat_n <= 0 then
+      if grammar_on > 0 then
+        argmax_row_grammar probs_data (cur_len - 1) V bpe gen_text (eos_id 0)
+      else if no_repeat_n <= 0 then
         if min_remain <= 0 then argmax_row probs_data (cur_len - 1) V
         else argmax_row_filtered probs_data (cur_len - 1) V [] (eos_id 0) min_remain
       else
@@ -256,17 +327,22 @@ decode_step ids cur_len weights pe seq V d d_ff x_data x_t no_repeat_n min_remai
 -- max_total caps cur_len so we don't overrun seq.
 -- no_repeat_n: 0 = off; >=3 = ban repeated n-grams of that order.
 -- min_gen: min generated tokens before EOS allowed.
-generate_loop ids cur_len weights pe seq V d d_ff x_data x_t max_total gen_acc no_repeat_n min_gen gen_count =
+-- grammar_on: 0 = off; >0 = grammar-walked decode (Cap I); overrides other filters.
+-- gen_text: running concatenation of decoded generated tokens for grammar input.
+generate_loop ids cur_len weights pe seq V d d_ff x_data x_t max_total gen_acc no_repeat_n min_gen gen_count grammar_on bpe gen_text =
   if cur_len >= max_total then reverse gen_acc
   else
     let mk = arena_mark 0
     let min_remain = if gen_count < min_gen then min_gen - gen_count else 0
-    let next_id = decode_step ids cur_len weights pe seq V d d_ff x_data x_t no_repeat_n min_remain
+    let next_id = decode_step ids cur_len weights pe seq V d d_ff x_data x_t no_repeat_n min_remain grammar_on bpe gen_text
     let _ = arena_reset mk
     if next_id == (eos_id 0) then reverse gen_acc
     else
       let new_ids = append ids (cons next_id [])
-      generate_loop new_ids (cur_len + 1) weights pe seq V d d_ff x_data x_t max_total (cons next_id gen_acc) no_repeat_n min_gen (gen_count + 1)
+      let next_text = if grammar_on > 0 then
+                        join "" (cons gen_text (cons (bpe_decode bpe (cons next_id [])) []))
+                      else gen_text
+      generate_loop new_ids (cur_len + 1) weights pe seq V d d_ff x_data x_t max_total (cons next_id gen_acc) no_repeat_n min_gen (gen_count + 1) grammar_on bpe next_text
 
 -- Sampling variant: top-k sampling using stdlib/sampling.rail. The
 -- `sample_state` float_arr is laid out as:
@@ -394,6 +470,7 @@ main =
   let seed = parse_int (get_opt opts "seed" "42")
   let no_repeat_n = parse_int (get_opt opts "no-repeat-n" "0")
   let min_gen = parse_int (get_opt opts "min-gen" "0")
+  let grammar_on = parse_int (get_opt opts "grammar" "0")
 
   let seq = fixed_seq_len 0
   let d = spurarm_v0_d_model 0
@@ -432,7 +509,7 @@ main =
           let tmp_row = float_arr_new V 0.0
           generate_loop_sample prompt_ids p_len weights pe seq V d d_ff x_data x_t max_total [] sample_state 0 tmp_row
         else
-          generate_loop prompt_ids p_len weights pe seq V d d_ff x_data x_t max_total [] no_repeat_n min_gen 0
+          generate_loop prompt_ids p_len weights pe seq V d d_ff x_data x_t max_total [] no_repeat_n min_gen 0 grammar_on bpe ""
       let text = emit_generation bpe gen_ids
       let safe = if length text == 0 then (emit_fallback 0) else text
       let _ = print safe
