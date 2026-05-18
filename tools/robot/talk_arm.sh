@@ -405,7 +405,9 @@ while true; do
   printf '> '
   if ! IFS= read -r user_msg; then
     echo ""
-    estop_now
+    # Do NOT auto-estop on EOF: leaves the arm relaxed (gravity drag).
+    # Caller wants the arm to hold the last commanded pose; use /estop
+    # explicitly when you want to relax.
     exit 0
   fi
   [ -z "$user_msg" ] && continue
@@ -491,6 +493,13 @@ EOT
   case "$resp" in
     *'```'*) ;;
     *) llm_script="$resp" ;;
+  esac
+
+  # If the substrate dropped the "script = " prefix and emitted a bare
+  # list like "[MoveTo ...]" prepend it so the wrapper compiles.
+  first_nonblank=$(printf '%s\n' "$llm_script" | sed -n '/[^[:space:]]/{p;q;}' | sed 's/^[[:space:]]*//')
+  case "$first_nonblank" in
+    \[*) llm_script="script = $llm_script" ;;
   esac
 
   update_last_object "$user_msg"
