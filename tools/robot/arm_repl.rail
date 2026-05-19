@@ -1,0 +1,263 @@
+-- tools/robot/arm_repl.rail
+--
+-- Interactive REPL for the MaxArm. Opens the serial port once, keeps
+-- it open across commands, prints a prompt, reads a line, dispatches.
+--
+-- Commands (case-insensitive):
+--   help, ?                  show this list
+--   pos                      read current firmware position (mm)
+--   home                     arm.go_home; servos re-engage
+--   move X Y Z               DSL frame, cm. x right, y forward, z up.
+--   left N / right N         DSL +/- x by N cm
+--   forward N / back N       DSL +/- y by N cm (forward = toward user)
+--   up N / down N            DSL +/- z by N cm
+--   grip / release           suction on / off
+--   wave                     run a centered mirror wave (mirror_wave script)
+--   relax                    teaching_mode -- arm goes limp, REPL stays
+--   quit / exit / q          relax + close + bye
+--
+-- Run:
+--   ./rail_native run tools/robot/arm_repl.rail
+
+import "tools/robot/arm_real.rail"
+
+-- ----- string -> int with optional leading minus ------------------
+
+cli_digits cs acc =
+  if length cs == 0 then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else cli_digits (tail cs) (acc * 10 + d)
+
+parse_int_signed s =
+  let cs = chars s
+  if length cs == 0 then 0
+  else if char_to_int (head cs) == 45 then
+    0 - (cli_digits (tail cs) 0)
+  else cli_digits cs 0
+
+-- ----- string predicates ------------------------------------------
+
+is_nonempty s = if length s == 0 then 0 else 1
+
+filter_nonempty xs =
+  if length xs == 0 then []
+  else
+    let h = head xs
+    if length h == 0 then filter_nonempty (tail xs)
+    else cons h (filter_nonempty (tail xs))
+
+-- Lowercase a string (ASCII only). `chars` returns 1-char strings,
+-- so we round-trip each byte through char_to_int / char_from_int.
+to_lower_one c =
+  let n = char_to_int c
+  if n >= 65 then
+    if n <= 90 then char_from_int (n + 32)
+    else c
+  else c
+
+to_lower_chars cs =
+  if length cs == 0 then []
+  else cons (to_lower_one (head cs)) (to_lower_chars (tail cs))
+
+to_lower s =
+  let cs = chars s
+  join "" (to_lower_chars cs)
+
+-- ----- prompt without newline -------------------------------------
+
+prompt_arm _ =
+  -- shell-based prompt would steal piped stdin; print newline-terminated
+  -- prompt instead. Looks slightly less polished but is robust.
+  let _ = print "arm>"
+  0
+
+-- ----- motion helpers ---------------------------------------------
+
+dsl_move fd dx dy dz dur =
+  let r = ik_default dx dy dz
+  let fault = head r
+  if fault != 0 then
+    let _ = print (cat ["  -- out of reach: DSL (", show dx, ",", show dy, ",", show dz, ")"])
+    0
+  else
+    let mx = head (tail r)
+    let my = head (tail (tail r))
+    let mz = head (tail (tail (tail r)))
+    let _ = send_set_xyz fd mx my mz dur
+    let _ = serial_sleep_ms (dur + 200)
+    let _ = print (cat [
+      "  -- DSL (", show dx, ",", show dy, ",", show dz,
+      ") = firmware (", show mx, ",", show my, ",", show mz, ")"
+    ])
+    1
+
+read_pos_print fd =
+  let r = read_arm_xyz fd
+  let ok = head r
+  if ok == 0 then
+    let _ = print "  -- no position response"
+    0
+  else
+    let x = head (tail r)
+    let y = head (tail (tail r))
+    let z = head (tail (tail (tail r)))
+    let _ = print (cat ["  -- firmware mm (", show x, ",", show y, ",", show z, ")"])
+    1
+
+-- "home" in REPL terms means a known-reachable DSL ready pose, NOT the
+-- raw firmware ORIGIN (which is at DSL z=21, above our 18cm IK ceiling
+-- so subsequent relative moves would all report out-of-reach).
+home_pose_x = 0
+home_pose_y = 16
+home_pose_z = 17
+
+home_arm fd =
+  let _ = dsl_move fd home_pose_x home_pose_y home_pose_z 1500
+  0
+
+relax_arm fd =
+  let _ = repl_write_line fd "arm.teaching_mode()"
+  let _ = serial_sleep_ms 200
+  let _ = repl_drain fd
+  let _ = print "  -- servos relaxed"
+  0
+
+wave_arm fd =
+  let _ = dsl_move fd 0 16 17 1000
+  let _ = dsl_move fd 12 16 17 600
+  let _ = dsl_move fd (0 - 12) 16 17 600
+  let _ = dsl_move fd 12 16 17 600
+  let _ = dsl_move fd (0 - 12) 16 17 600
+  let _ = dsl_move fd 0 16 17 600
+  0
+
+-- ----- help ---------------------------------------------------------
+
+help_text _ =
+  let _ = print "  commands:"
+  let _ = print "    help, ?              this list"
+  let _ = print "    pos                  read firmware mm position"
+  let _ = print "    home                 go to firmware home pose"
+  let _ = print "    move X Y Z           DSL cm: x right, y forward, z up"
+  let _ = print "    left N | right N     +/- DSL x"
+  let _ = print "    forward N | back N   +/- DSL y"
+  let _ = print "    up N | down N        +/- DSL z"
+  let _ = print "    grip | release       suction on / off"
+  let _ = print "    wave                 centered mirror wave"
+  let _ = print "    relax                teaching_mode (REPL stays)"
+  let _ = print "    quit | exit | q      relax + close + bye"
+  0
+
+-- ----- command dispatch -------------------------------------------
+-- exec_cmd returns a list [new_dx, new_dy, new_dz, quit_flag]
+--
+-- quit_flag = 1 means we are done.
+
+cli_state dx dy dz qf = [dx, dy, dz, qf]
+
+cmd_move fd dx dy dz args =
+  if length args < 3 then
+    let _ = print "  -- usage: move X Y Z"
+    cli_state dx dy dz 0
+  else
+    let nx = parse_int_signed (head args)
+    let ny = parse_int_signed (head (tail args))
+    let nz = parse_int_signed (head (tail (tail args)))
+    let ok = dsl_move fd nx ny nz 1000
+    if ok == 0 then cli_state dx dy dz 0
+    else cli_state nx ny nz 0
+
+cmd_axis fd dx dy dz axis sign args =
+  if length args < 1 then
+    let _ = print "  -- need an amount in cm"
+    cli_state dx dy dz 0
+  else
+    let n = parse_int_signed (head args)
+    let nx = if axis == 0 then dx + (sign * n) else dx
+    let ny = if axis == 1 then dy + (sign * n) else dy
+    let nz = if axis == 2 then dz + (sign * n) else dz
+    let ok = dsl_move fd nx ny nz 800
+    if ok == 0 then cli_state dx dy dz 0
+    else cli_state nx ny nz 0
+
+cmd_grip fd dx dy dz =
+  let _ = send_suction fd suction_pump_on
+  let _ = print "  -- suction on"
+  cli_state dx dy dz 0
+
+cmd_release fd dx dy dz =
+  let _ = send_suction fd suction_release
+  let _ = print "  -- suction off"
+  cli_state dx dy dz 0
+
+dispatch fd dx dy dz cmd args =
+  if cmd == "help" then let _ = help_text 0 in cli_state dx dy dz 0
+  else if cmd == "?" then let _ = help_text 0 in cli_state dx dy dz 0
+  else if cmd == "pos" then let _ = read_pos_print fd in cli_state dx dy dz 0
+  else if cmd == "home" then let _ = home_arm fd in cli_state 0 16 17 0
+  else if cmd == "wave" then let _ = wave_arm fd in cli_state 0 16 17 0
+  else if cmd == "relax" then let _ = relax_arm fd in cli_state dx dy dz 0
+  else if cmd == "move" then cmd_move fd dx dy dz args
+  else if cmd == "left" then cmd_axis fd dx dy dz 0 (0 - 1) args
+  else if cmd == "right" then cmd_axis fd dx dy dz 0 1 args
+  else if cmd == "forward" then cmd_axis fd dx dy dz 1 1 args
+  else if cmd == "fwd" then cmd_axis fd dx dy dz 1 1 args
+  else if cmd == "back" then cmd_axis fd dx dy dz 1 (0 - 1) args
+  else if cmd == "up" then cmd_axis fd dx dy dz 2 1 args
+  else if cmd == "down" then cmd_axis fd dx dy dz 2 (0 - 1) args
+  else if cmd == "grip" then cmd_grip fd dx dy dz
+  else if cmd == "release" then cmd_release fd dx dy dz
+  else if cmd == "ungrip" then cmd_release fd dx dy dz
+  else if cmd == "quit" then cli_state dx dy dz 1
+  else if cmd == "exit" then cli_state dx dy dz 1
+  else if cmd == "q" then cli_state dx dy dz 1
+  else
+    let _ = print (cat ["  -- unknown: '", cmd, "' (try 'help')"])
+    cli_state dx dy dz 0
+
+-- ----- main loop ---------------------------------------------------
+
+repl_loop fd dx dy dz =
+  let _ = prompt_arm 0
+  let line = read_line 0
+  if length line == 0 then
+    let _ = print ""
+    let _ = relax_arm fd
+    let _ = arm_close fd
+    let _ = print "[arm_repl] eof -- bye"
+    0
+  else
+    let lower = to_lower line
+    let raw_toks = split " " lower
+    let toks = filter_nonempty raw_toks
+    if length toks == 0 then repl_loop fd dx dy dz
+    else
+      let cmd = head toks
+      let args = tail toks
+      let st = dispatch fd dx dy dz cmd args
+      let nx = head st
+      let ny = head (tail st)
+      let nz = head (tail (tail st))
+      let qf = head (tail (tail (tail st)))
+      if qf == 1 then
+        let _ = relax_arm fd
+        let _ = arm_close fd
+        let _ = print "[arm_repl] bye"
+        0
+      else repl_loop fd nx ny nz
+
+main =
+  let path = "/dev/cu.usbserial-110"
+  let _ = print (cat ["[arm_repl] opening ", path])
+  let fd = arm_open path
+  if fd < 0 then
+    let _ = print (cat ["[arm_repl] open failed fd=", show fd])
+    1
+  else
+    let _ = print "[arm_repl] connected. type 'help' for commands; 'quit' to exit."
+    let _ = read_pos_print fd
+    repl_loop fd 0 16 17
