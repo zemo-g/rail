@@ -79,6 +79,24 @@ Coordinates are signed millimeters. ORIGIN is `(0, -163.0, 212.0)` mm
 on this unit (firmware will print this if asked). The firmware refuses
 any target with `sqrt(x*x+y*y) < 50` (too close) and clips z to 225.
 
+### Axis orientation (empirical 2026-05-18)
+
+The firmware's body frame is rotated/mirrored from the natural
+user-facing DSL frame. Verified against a unit sitting on a desk with
+the user seated directly in front:
+
+| Firmware axis | Direction | DSL flip in coord_map.rail |
+|---|---|---|
+| `+x` | **arm's right** = user's left | yes (sign flip) |
+| `+y` | **behind the base** (away from user) | yes (sign flip) |
+| `+z` | up | no |
+
+Falsification recipe: send `arm.set_position((200, -150, 150), 2000)`
+from neutral. Arm extends to the user's LEFT through ~35deg. Then
+inversely, send DSL `(15, 10, 15)` via `ik_default` + `send_set_xyz`
+(yielding firmware `(-150, -100, 150)`) -- arm moves to user's RIGHT,
+slightly forward and down. The pair are mirror images.
+
 ## 5. Response format
 
 Each command's response is one of:
