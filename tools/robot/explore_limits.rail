@@ -1,0 +1,208 @@
+-- tools/robot/explore_limits.rail
+--
+-- Scout for the MaxArm reach envelope. Walks outward from a known-safe
+-- center pose 20mm at a time in each of six directions, commands the
+-- step, reads back actual position, and declares "limit" when
+-- commanded and actual diverge by more than 25mm.
+--
+-- Returns to center between each axis so the arm never drifts into an
+-- unsafe pose. -z is capped tighter than the others so the gripper
+-- can't get pushed into the table.
+--
+-- Run (interactive output, don't pipe -- block-buffering will hide
+-- the per-step trace):
+--   ./rail_native tools/robot/explore_limits.rail
+--   /tmp/rail_out
+
+import "tools/robot/arm_real.rail"
+
+step_mm = 20
+divergence_threshold = 18    -- ~1 step of stall = limit (was 25; missed single stalls)
+default_max_steps = 25
+down_max_steps = 6           -- + min_z_floor_mm hard floor below
+min_z_floor_mm = 40          -- never command z below this; table-contact safety
+
+-- Center pose (firmware mm): 0 lateral, 150mm forward (toward user),
+-- 150mm up. Same pose mirror_wave/arm_repl use for home.
+center_x = 0
+center_y = 0 - 150
+center_z = 150
+
+-- 8 angles for the base-rotation probe, at radius 150 mm and z=150 mm.
+-- Angle convention: 0deg = forward (toward user, firmware -y); 90deg =
+-- user's left (firmware +x); etc. Coords pre-computed: 106 = round(150 * 0.7071).
+-- Format: [angle_deg, x_mm, y_mm]
+angle_probes = [
+  [0,   0,    0 - 150],
+  [45,  106,  0 - 106],
+  [90,  150,  0],
+  [135, 106,  106],
+  [180, 0,    150],
+  [225, 0 - 106, 106],
+  [270, 0 - 150, 0],
+  [315, 0 - 106, 0 - 106]
+]
+
+probe_z = 150
+
+abs_int n = if n < 0 then 0 - n else n
+
+probe_step fd tx ty tz =
+  let _ = send_set_xyz fd tx ty tz 800
+  let _ = serial_sleep_ms 1000
+  read_arm_xyz fd
+
+-- walk_axis: axis 0=x, 1=y, 2=z. step_dir = +1 or -1. Returns the
+-- last commanded value that was actually reached (within divergence
+-- threshold).
+walk_axis fd axis step_dir cap step_n last_reached =
+  if step_n > cap then
+    let _ = print (cat ["    cap reached after ", show cap, " steps; last reached=", show last_reached])
+    last_reached
+  else
+    let next_val = last_reached + (step_dir * step_mm)
+    -- Safety floor on -z: never command below min_z_floor_mm.
+    if axis == 2 then
+      if step_dir < 0 then
+        if next_val < min_z_floor_mm then
+          let _ = print (cat ["    z floor (", show min_z_floor_mm, "mm) reached; halting -z"])
+          last_reached
+        else walk_axis_step fd axis step_dir cap step_n last_reached next_val
+      else walk_axis_step fd axis step_dir cap step_n last_reached next_val
+    else walk_axis_step fd axis step_dir cap step_n last_reached next_val
+
+walk_axis_step fd axis step_dir cap step_n last_reached next_val =
+    let tx = if axis == 0 then next_val else center_x
+    let ty = if axis == 1 then next_val else center_y
+    let tz = if axis == 2 then next_val else center_z
+    let r = probe_step fd tx ty tz
+    let ok = head r
+    let ax = head (tail r)
+    let ay = head (tail (tail r))
+    let az = head (tail (tail (tail r)))
+    let actual_on_axis = if axis == 0 then ax else if axis == 1 then ay else az
+    let diff = abs_int (next_val - actual_on_axis)
+    if ok == 0 then
+      let _ = print (cat ["    step ", show step_n, ": no response; halting"])
+      last_reached
+    else if diff > divergence_threshold then
+      let _ = print (cat [
+        "    step ", show step_n,
+        ": target=", show next_val,
+        " actual=", show actual_on_axis,
+        " diff=", show diff, " mm  <- LIMIT"
+      ])
+      actual_on_axis
+    else
+      let _ = print (cat [
+        "    step ", show step_n,
+        ": target=", show next_val,
+        " actual=", show actual_on_axis,
+        " diff=", show diff, " mm"
+      ])
+      walk_axis fd axis step_dir cap (step_n + 1) next_val
+
+return_to_center fd =
+  let _ = send_set_xyz fd center_x center_y center_z 1200
+  let _ = serial_sleep_ms 1400
+  0
+
+-- Probe a single base angle. Returns 1 if the arm tracked the target
+-- within the divergence threshold, 0 if it could not.
+probe_angle fd entry =
+  let deg = head entry
+  let tx = head (tail entry)
+  let ty = head (tail (tail entry))
+  let r = probe_step fd tx ty probe_z
+  let ok = head r
+  let ax = head (tail r)
+  let ay = head (tail (tail r))
+  let dx = abs_int (tx - ax)
+  let dy = abs_int (ty - ay)
+  let reached = if ok == 0 then 0
+                else if dx > divergence_threshold then 0
+                else if dy > divergence_threshold then 0
+                else 1
+  let _ = print (cat [
+    "    ", show deg, "deg",
+    " target=(", show tx, ",", show ty, ")",
+    " actual=(", show ax, ",", show ay, ")",
+    if reached == 1 then "  reached" else "  REFUSED"
+  ])
+  reached
+
+probe_angles_loop fd entries reached_count =
+  if length entries == 0 then reached_count
+  else
+    let e = head entries
+    let r = probe_angle fd e
+    let _ = return_to_center fd
+    probe_angles_loop fd (tail entries) (reached_count + r)
+
+probe_360 fd =
+  let _ = print ""
+  let _ = print (cat ["  base 360-deg probe at radius=150mm, z=", show probe_z, "mm:"])
+  let n = probe_angles_loop fd angle_probes 0
+  let _ = print (cat ["    ", show n, "/8 angles reached"])
+  n
+
+main =
+  let path = "/dev/cu.usbserial-110"
+  let _ = print "[explore_limits] scout for MaxArm reach envelope"
+  let _ = print (cat ["  center pose (firmware mm): (", show center_x, ", ", show center_y, ", ", show center_z, ")"])
+  let _ = print (cat ["  step=", show step_mm, "mm  threshold=", show divergence_threshold, "mm"])
+  let _ = print ""
+  let fd = arm_open path
+  if fd < 0 then
+    let _ = print (cat ["[explore_limits] open failed fd=", show fd])
+    1
+  else
+    let _ = print "  going to center..."
+    let _ = return_to_center fd
+
+    let _ = print ""
+    let _ = print "  +x  (firmware +x = user's LEFT, arm's right):"
+    let max_x = walk_axis fd 0 1 default_max_steps 1 center_x
+    let _ = return_to_center fd
+
+    let _ = print ""
+    let _ = print "  -x  (firmware -x = user's RIGHT, arm's left):"
+    let min_x = walk_axis fd 0 (0 - 1) default_max_steps 1 center_x
+    let _ = return_to_center fd
+
+    let _ = print ""
+    let _ = print "  -y  (firmware -y = forward, toward user):"
+    let min_y = walk_axis fd 1 (0 - 1) default_max_steps 1 center_y
+    let _ = return_to_center fd
+
+    let _ = print ""
+    let _ = print "  +y  (firmware +y = back, away from user; firmware refuses sqrt(x^2+y^2)<50):"
+    let max_y = walk_axis fd 1 1 default_max_steps 1 center_y
+    let _ = return_to_center fd
+
+    let _ = print ""
+    let _ = print "  +z  (firmware +z = up; firmware clips z to 225):"
+    let max_z = walk_axis fd 2 1 default_max_steps 1 center_z
+    let _ = return_to_center fd
+
+    let _ = print ""
+    let _ = print "  -z  (firmware -z = down; capped early to protect table):"
+    let min_z = walk_axis fd 2 (0 - 1) down_max_steps 1 center_z
+    let _ = return_to_center fd
+
+    let angles_ok = probe_360 fd
+
+    let _ = print ""
+    let _ = print "[explore_limits] discovered envelope (firmware mm, conservative):"
+    let _ = print (cat ["  x in [", show min_x, ", ", show max_x, "] mm"])
+    let _ = print (cat ["  y in [", show min_y, ", ", show max_y, "] mm"])
+    let _ = print (cat ["  z in [", show min_z, ", ", show max_z, "] mm"])
+    let _ = print (cat ["  base 360deg reach: ", show angles_ok, "/8 cardinal+diag angles reachable at R=150mm"])
+    let _ = print ""
+    let _ = print "[explore_limits] current coord_map.rail assumes:"
+    let _ = print "  horizontal radius 290 mm, z in [-111, 187] mm, inner slop 5 mm"
+    let _ = print ""
+    let _ = arm_emergency_stop fd
+    let _ = arm_close fd
+    let _ = print "[explore_limits] servos relaxed; done"
+    0
