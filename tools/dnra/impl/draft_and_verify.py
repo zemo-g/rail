@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import re
 import sys
@@ -126,13 +127,23 @@ def parse_pair(content: str) -> dict | None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--topics", type=int, default=len(TOPICS))
+    ap.add_argument("--topics", type=int, default=None, help="Limit to first N topics (smoke). Default: all.")
+    ap.add_argument("--topics-module", default=None,
+                    help="Import TOPICS from this dotted module (e.g. tools.dnra.impl.topics_v0c). Default: builtin smoke list.")
     ap.add_argument("--out", default="tools/dnra/sets/corpus_d_v0b_verified.jsonl")
+    ap.add_argument("--append", action="store_true", help="Append PASS pairs to --out instead of overwriting.")
+    ap.add_argument("--id-prefix", default="V", help="Stable id prefix (e.g. V -> V-001).")
+    ap.add_argument("--id-start", type=int, default=1, help="First sequential id.")
     ap.add_argument("--temp", type=float, default=0.2)
     ap.add_argument("--max-tokens", type=int, default=600)
     args = ap.parse_args()
 
-    topics = TOPICS[: args.topics]
+    if args.topics_module:
+        mod = importlib.import_module(args.topics_module)
+        topics_src = mod.TOPICS  # type: ignore[attr-defined]
+    else:
+        topics_src = TOPICS
+    topics = topics_src if args.topics is None else topics_src[: args.topics]
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -141,8 +152,8 @@ def main():
     print(f"drafting + verifying {len(topics)} topics; model={MODEL}")
     print(f"output: {out_path}\n")
 
-    for i, (rfc_num, section, polarity) in enumerate(topics, start=1):
-        topic_id = f"V-{i:03d}"
+    for i, (rfc_num, section, polarity) in enumerate(topics, start=args.id_start):
+        topic_id = f"{args.id_prefix}-{i:03d}"
         print(f"  [{i}/{len(topics)}] {topic_id}  RFC {rfc_num} section {section}  polarity={polarity}")
         section_text = get_section(rfc_num, section)
         if section_text is None:
@@ -188,10 +199,12 @@ def main():
         print()
 
     if accepted:
-        with open(out_path, "w") as f:
+        mode = "a" if args.append else "w"
+        with open(out_path, mode) as f:
             for p in accepted:
                 f.write(json.dumps(p, separators=(",", ":")) + "\n")
-        print(f"wrote {len(accepted)} PASS pairs to {out_path}")
+        verb = "appended" if args.append else "wrote"
+        print(f"{verb} {len(accepted)} PASS pairs to {out_path}")
     else:
         print("no PASS pairs to write")
 
