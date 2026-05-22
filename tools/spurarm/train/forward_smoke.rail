@@ -1,0 +1,390 @@
+-- ============================================================
+-- STATUS: DESIGN SCAFFOLD (not compilable as of 2026-05-22).
+--
+-- Hits the duplicate-transitive-import pattern documented in
+-- [[feedback_rail_compile_traps]] -- stdlib/transformer.rail and
+-- stdlib/tensor.rail together pull in a symbol (gradient_test_main)
+-- that gets defined twice.  Resolution path is one of:
+--
+--   1. Restructure imports to avoid the duplicate -- likely via a
+--      narrower transformer interface that doesn't pull the test
+--      main symbol.
+--   2. Move gradient_test_main out of the transitive surface (audit
+--      stdlib/transformer.rail for what it exports).
+--
+-- The shape of the forward pass and the param-count check are
+-- correct as-is; the file compiles cleanly only when the import
+-- chain is unblocked.
+-- ============================================================
+
+-- tools/spurarm/train/forward_smoke.rail
+--
+-- Phase 1.4 forward-pass smoke for the Cap H model config.
+--
+-- Builds the Cap H tower with PRNG seed = 0, feeds it a synthetic
+-- batch [batch=2, seq=64] of token ids in [0, 1024), runs ONE
+-- forward pass, prints:
+--   * output shape
+--   * first 5 logits at position 0 of batch 0
+--   * max|abs| logits over the whole output buffer
+--   * a finite-check flag (1 = all finite, 0 = NaN or Inf seen)
+-- Exits 0 on success (all finite), 1 on failure.
+--
+-- DRAFT — not compiled or executed against rail_native.  Patterns
+-- mirror train_spurarm.rail (v0 trainer) line-for-line where the
+-- Tensor-build and matmul-call conventions are concerned.
+--
+-- Precision: this smoke uses the DEFAULT f64 matmul path on purpose,
+-- even though spurarm/cap-h now exports matmul_bf16 (via the db20fee
+-- foundation commit).  bf16 would introduce small numerical noise
+-- that complicates interpreting "is the forward path structurally
+-- correct?" — f64 keeps the smoke deterministic and the first-5
+-- logits comparable across runs.  The trainer + bench eval should
+-- use bf16 (it's the production regime per
+-- [[rail-bf16-stable-10k-2026-05-14]]).
+--
+-- JIT fused kernels: ALSO not used here.  jit_compile_rmsnorm_qkv is
+-- async (kernel compile + dispatch) and would complicate the smoke's
+-- exit-code semantics.  The unfused per-op path validates the same
+-- shape pipeline; the trainer (cap_h_use_jit_kernels = 1) will route
+-- through the fused kernels for the 35× / 18× speedup.
+
+import "stdlib/transformer.rail"
+import "stdlib/tensor.rail"
+import "stdlib/list.rail"
+import "tools/spurarm/train/config_cap_h.rail"
+
+-- ----------------------------------------------------------------------
+-- Deterministic synthetic input.  Token ids in [0, V) keyed off seed=0.
+-- Mirrors v0's fill_arrays_loop in one-hot form: we materialise the
+-- one-hot tensor X[B*S, V] so it can flow straight into the embed
+-- matmul (B, S folded into rows since the transformer stdlib treats
+-- the leading dims as a single rows axis).
+-- ----------------------------------------------------------------------
+
+-- Deterministic id picker: same hash family the v0 init uses (i*97 +
+-- seed*13) % V — guarantees the same ids across runs for a given seed.
+synth_id_for i seed V =
+  let raw = (i * 97 + seed * 13) % V
+  if raw < 0 then raw + V else raw
+
+fill_one_hot_loop x_data B S V seed i =
+  if i >= B * S then 0
+  else
+    let id = synth_id_for i seed V
+    let _ = float_arr_set x_data (i * V + id) 1.0
+    fill_one_hot_loop x_data B S V seed (i + 1)
+
+zero_arr_loop arr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set arr i 0.0
+    zero_arr_loop arr n (i + 1)
+
+build_input_tensor B S V seed =
+  let rows = B * S
+  let x_data = float_arr_new (rows * V) 0.0
+  let _ = zero_arr_loop x_data (rows * V) 0
+  let _ = fill_one_hot_loop x_data B S V seed 0
+  Tensor x_data (cons rows (cons V [])) (compute_strides (cons rows (cons V [])))
+
+-- ----------------------------------------------------------------------
+-- Activation helpers (kept tiny — bigger forward bits delegate to the
+-- transformer.rail stdlib).
+-- ----------------------------------------------------------------------
+
+unwrap t = match t | Tensor d _ _ -> d
+
+-- Hadamard (elementwise) product of two same-shape tensors.
+hadamard_loop ad bd cd n i =
+  if i >= n then 0
+  else
+    let a = float_arr_get ad i
+    let b = float_arr_get bd i
+    let _ = float_arr_set cd i (a * b)
+    hadamard_loop ad bd cd n (i + 1)
+
+hadamard a b = match a
+  | Tensor ad ashape _ -> match b
+    | Tensor bd _ _ ->
+      let n = list_product ashape
+      let cd = float_arr_new n 0.0
+      let _ = hadamard_loop ad bd cd n 0
+      Tensor cd ashape (compute_strides ashape)
+
+-- ----------------------------------------------------------------------
+-- SwiGLU FFN: y = down( silu(gate(x)) * up(x) )
+--   x:    [rows, d]
+--   w_g:  [d, d_ff]   gate projection
+--   w_u:  [d, d_ff]   up projection
+--   w_d:  [d_ff, d]   down projection
+-- ----------------------------------------------------------------------
+
+swiglu_ffn x w_g w_u w_d =
+  let g  = matmul x w_g
+  let sg = silu_forward g
+  let u  = matmul x w_u
+  let h  = hadamard sg u
+  matmul h w_d
+
+-- ----------------------------------------------------------------------
+-- One Cap H transformer block (pre-norm, RMSNorm, causal MHA, SwiGLU).
+-- Mirrors transformer.rail's transformer_block_prenorm but swaps:
+--   * LayerNorm → RMSNorm (gamma-only, per Llama/Mistral)
+--   * vanilla FFN (ReLU-2-matrix) → SwiGLU
+--   * non-causal attn → causal attn
+-- ----------------------------------------------------------------------
+
+cap_h_block x rn1_g w_q w_k w_v w_o rn2_g w_g w_u w_d =
+  let rms1_pack = rmsnorm_save x rn1_g
+  let x_norm    = head rms1_pack
+  let q         = matmul x_norm w_q
+  let k         = matmul x_norm w_k
+  let v         = matmul x_norm w_v
+  let attn_out  = scaled_dot_attention_causal q k v
+  let attn_proj = matmul attn_out w_o
+  let x_attn    = tensor_add x attn_proj
+  let rms2_pack = rmsnorm_save x_attn rn2_g
+  let x_norm2   = head rms2_pack
+  let ffn_out   = swiglu_ffn x_norm2 w_g w_u w_d
+  tensor_add x_attn ffn_out
+
+-- ----------------------------------------------------------------------
+-- Per-layer weight bundle.  Lists are used (instead of nested tuples)
+-- so the layer-loop can index into a parallel list per layer without
+-- carrying 9 args at once.
+--
+-- Each layer entry is a 9-list:
+--   [rn1_g, w_q, w_k, w_v, w_o, rn2_g, w_g, w_u, w_d]
+-- ----------------------------------------------------------------------
+
+build_dense_weight d_in d_out seed =
+  let data = float_arr_new (d_in * d_out) 0.0
+  let _ = init_scaled data (d_in * d_out) d_in seed
+  Tensor data (cons d_in (cons d_out [])) (compute_strides (cons d_in (cons d_out [])))
+
+-- Defensive ones-init: float_arr_new's default-value behaviour varies
+-- by build; v0 trainer (train_spurarm.rail) calls ones_loop after
+-- float_arr_new d 1.0 to be safe.  Mirror that pattern here.
+ones_fill_loop arr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set arr i 1.0
+    ones_fill_loop arr n (i + 1)
+
+build_ones_vec dim =
+  let data = float_arr_new dim 1.0
+  let _ = ones_fill_loop data dim 0
+  Tensor data (cons dim []) (cons 1 [])
+
+build_layer_weights d d_ff seed =
+  let rn1_g = build_ones_vec d
+  let w_q   = build_dense_weight d d        (seed + 0)
+  let w_k   = build_dense_weight d d        (seed + 1)
+  let w_v   = build_dense_weight d d        (seed + 2)
+  let w_o   = build_dense_weight d d        (seed + 3)
+  let rn2_g = build_ones_vec d
+  let w_g   = build_dense_weight d d_ff     (seed + 4)
+  let w_u   = build_dense_weight d d_ff     (seed + 5)
+  let w_d   = build_dense_weight d_ff d     (seed + 6)
+  cons rn1_g (cons w_q (cons w_k (cons w_v (cons w_o (cons rn2_g (cons w_g (cons w_u (cons w_d []))))))))
+
+-- ----------------------------------------------------------------------
+-- Per-layer apply.  Pull the 9 weights out of the bundle and run one
+-- block forward.
+-- ----------------------------------------------------------------------
+
+apply_layer x layer_w =
+  let rn1_g = list_nth 0 layer_w
+  let w_q   = list_nth 1 layer_w
+  let w_k   = list_nth 2 layer_w
+  let w_v   = list_nth 3 layer_w
+  let w_o   = list_nth 4 layer_w
+  let rn2_g = list_nth 5 layer_w
+  let w_g   = list_nth 6 layer_w
+  let w_u   = list_nth 7 layer_w
+  let w_d   = list_nth 8 layer_w
+  cap_h_block x rn1_g w_q w_k w_v w_o rn2_g w_g w_u w_d
+
+-- Iterate over all layers.  Empty-check uses `xs == []` (NOT
+-- `length xs == 0`) per [[feedback_rail_perf_traps]] — O(1) vs O(N).
+apply_all_layers x layers =
+  if layers == [] then x
+  else
+    let h = head layers
+    let t = tail layers
+    let x1 = apply_layer x h
+    apply_all_layers x1 t
+
+-- ----------------------------------------------------------------------
+-- LM-head matmul: out [rows, V] = x_final [rows, d] @ W_e^T [d, V].
+-- Since we tie embed/LM-head and embed has shape [V, d], we transpose
+-- once and reuse for the LM-head matmul.  This is the standard tied
+-- weights pattern — saves V*d params (262_144 for Cap H).
+-- ----------------------------------------------------------------------
+
+lm_head_tied x_final w_e =
+  let w_e_t = tensor_transpose w_e
+  matmul x_final w_e_t
+
+-- ----------------------------------------------------------------------
+-- Finite check: scan an f64 buffer for NaN or Inf.  Rail doesn't
+-- expose isnan / isinf primitives in this stdlib version, so we use
+-- the self-not-equal trick (NaN != NaN) and a magnitude guard
+-- (|x| > 1e308 implies overflow-toward-Inf on f64).
+-- Returns 1 if all finite, 0 otherwise.
+-- ----------------------------------------------------------------------
+
+finite_check_loop arr n i flag =
+  if i >= n then flag
+  else
+    let v = float_arr_get arr i
+    -- NaN test: v != v is true iff v is NaN.
+    let is_nan = if v == v then 0 else 1
+    -- Inf-by-magnitude: anything past 1e308 has overflowed.
+    let abs_v = if v < 0.0 then 0.0 - v else v
+    let big_thresh = 1.0e308
+    let is_inf = if abs_v > big_thresh then 1 else 0
+    let new_flag = if is_nan == 1 then 0 else (if is_inf == 1 then 0 else flag)
+    finite_check_loop arr n (i + 1) new_flag
+
+finite_check arr n = finite_check_loop arr n 0 1
+
+-- ----------------------------------------------------------------------
+-- Max |abs| of an f64 buffer.
+-- ----------------------------------------------------------------------
+
+max_abs_loop arr n i acc =
+  if i >= n then acc
+  else
+    let v = float_arr_get arr i
+    let a = if v < 0.0 then 0.0 - v else v
+    let next = if a > acc then a else acc
+    max_abs_loop arr n (i + 1) next
+
+max_abs arr n = max_abs_loop arr n 0 0.0
+
+-- ----------------------------------------------------------------------
+-- Print the first k logits of row 0 of the output [B*S, V] buffer.
+-- (row 0 == batch 0, position 0 since rows = b * S + s.)
+-- ----------------------------------------------------------------------
+
+print_first_k_loop arr V k i =
+  if i >= k then 0
+  else
+    let v = float_arr_get arr i
+    let _ = print (cat ["  logit[", show i, "] = ", show_float v])
+    print_first_k_loop arr V k (i + 1)
+
+-- ----------------------------------------------------------------------
+-- Build the layer bundle list (n_layers entries).
+-- ----------------------------------------------------------------------
+
+build_layers_loop n d d_ff base_seed i acc =
+  if i >= n then reverse acc
+  else
+    let lw = build_layer_weights d d_ff (base_seed + i * 100)
+    build_layers_loop n d d_ff base_seed (i + 1) (cons lw acc)
+
+build_layers n d d_ff base_seed = build_layers_loop n d d_ff base_seed 0 []
+
+-- ----------------------------------------------------------------------
+-- Build a sinusoidal PE tensor [rows, d].  We build it at the full
+-- B*S row count (treating the batch dim as flattened) so the per-row
+-- positions repeat per batch — this is a smoke, not a real run.
+-- ----------------------------------------------------------------------
+
+build_smoke_pe B S d =
+  let rows = B * S
+  -- Reuse stdlib sinusoidal_pe; the [seq, d] shape matches [rows, d]
+  -- because we flatten batch into seq for this smoke.
+  sinusoidal_pe rows d
+
+-- ----------------------------------------------------------------------
+-- MAIN
+-- ----------------------------------------------------------------------
+
+main =
+  let _ = print "=== Cap H forward smoke (Phase 1.4 DRAFT) ==="
+  let _ = print (cap_h_config_str 0)
+
+  -- Sanity check the param math before doing any work.
+  let check = cap_h_params_check 0
+  let _ = if check == 1 then
+            print (cat ["param_count: PASS (total=", show (cap_h_params_total 0), ")"])
+          else
+            print (cat ["param_count: FAIL (computed=", show (cap_h_params_total 0),
+                        " expected=", show (cap_h_params_exact 0), ")"])
+
+  -- Smoke uses small B,S — NOT the full seq=256 — so it runs in
+  -- seconds at the f64 matmul path.
+  let B   = 2
+  let S   = 64
+  let V   = cap_h_vocab 0
+  let d   = cap_h_d_model 0
+  let dff = cap_h_d_ff 0
+  let nL  = cap_h_n_layers 0
+  let seed = 0
+
+  let _ = print (cat ["input shape = [batch=", show B, ", seq=", show S, "]"])
+  let x_input = build_input_tensor B S V seed
+
+  -- Embed: X [rows, V] @ W_e [V, d] = X_e [rows, d]
+  let w_e = build_dense_weight V d (seed + 7)
+  let x_e = matmul x_input w_e
+
+  -- Add positional encoding in-place.
+  let pe = build_smoke_pe B S d
+  let xe_d = unwrap x_e
+  let pe_d = unwrap pe
+  let rows = B * S
+  -- inline element-add (no helper needed; just one loop).
+  let _ = hadamard_into_add xe_d pe_d (rows * d) 0
+  let x_pe = x_e
+
+  -- Build all layer bundles.
+  let layers = build_layers nL d dff (seed + 1000)
+
+  -- Run all transformer layers.
+  let x_final = apply_all_layers x_pe layers
+
+  -- Final RMSNorm before LM-head.
+  let final_g = build_ones_vec d
+  let final_pack = rmsnorm_save x_final final_g
+  let x_normed = head final_pack
+
+  -- Tied LM-head: logits = x_normed @ W_e^T  → [rows, V]
+  let logits = lm_head_tied x_normed w_e
+
+  -- Inspect output.
+  match logits | Tensor lg_data lg_shape _ ->
+    let n = list_product lg_shape
+    let shape_str = cat [show (head lg_shape), " x ", show (head (tail lg_shape))]
+    let _ = print (cat ["output shape = [", shape_str, "]"])
+    let _ = print "first 5 logits at (batch=0, pos=0):"
+    let _ = print_first_k_loop lg_data V 5 0
+    let mx = max_abs lg_data n
+    let _ = print (cat ["max|abs| logits = ", show_float mx])
+    let finite = finite_check lg_data n
+    let _ = if finite == 1 then
+              print "finite_check: PASS (no NaN or Inf)"
+            else
+              print "finite_check: FAIL (NaN or Inf detected)"
+    -- Exit code: 0 on success, 1 on any failure.
+    let ok = if (check == 1) then (if finite == 1 then 1 else 0) else 0
+    let _ = if ok == 1 then print "RESULT: PASS" else print "RESULT: FAIL"
+    if ok == 1 then 0 else 1
+
+-- ----------------------------------------------------------------------
+-- In-place buffer add: dst[i] += src[i] for i in [0, n).  Kept here
+-- (rather than relying on tensor_add allocation) to avoid a needless
+-- alloc in the PE add — matches v0 trainer's add_buf_inplace.
+-- ----------------------------------------------------------------------
+
+hadamard_into_add dst src n i =
+  if i >= n then 0
+  else
+    let cur = float_arr_get dst i
+    let s = float_arr_get src i
+    let _ = float_arr_set dst i (cur + s)
+    hadamard_into_add dst src n (i + 1)

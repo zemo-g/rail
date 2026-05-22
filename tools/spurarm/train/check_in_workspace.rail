@@ -1,0 +1,468 @@
+-- ============================================================
+-- STATUS: DESIGN SCAFFOLD (not compilable as of 2026-05-22).
+--
+-- This file documents the bench_in_workspace checker contract in
+-- Rail-style code. It is NOT yet a compiling target. Two blockers
+-- to be resolved when this is promoted to the active build:
+--
+--   1. IMPORT CONFLICT.  Importing both stdlib/json.rail AND
+--      tools/robot/arm_sim.rail together triggers the parser
+--      pathology documented in [[feedback_rail_compile_traps]].
+--      Resolution: drop one. Grader.rail's pattern is to drop
+--      both and parse the dump manually (only stdlib/list.rail
+--      and stdlib/args.rail are imported). Recommended for v1.
+--
+--   2. OPEN HELPERS.  The functions listed in the Open helpers
+--      block at the bottom of the file are stubs that need to be
+--      implemented. They are mostly straightforward (list-walking,
+--      string ops) and can be ported from grader.rail patterns.
+--
+-- Once both are addressed this file should pass
+--   ./rail_native tools/spurarm/train/check_in_workspace.rail
+-- and integrate with bench_eval.rail per the README.
+-- ============================================================
+
+-- /tmp/spurarm_bench/check_in_workspace.rail
+--
+-- DESIGN-ONLY scaffold for the bench_in_workspace Phase-1 checker.
+-- Does NOT compile against the live trainer yet. Patterns mirror
+-- tools/robot/grader.rail (4-stage discipline) and reuse coord_map's
+-- reachability primitives so the contract is intentionally compatible.
+--
+-- Contract:
+--   check_in_workspace(prompt_id, generated_script_path, expected_jsonl_path)
+--     -> 1 if pass, 0 if fail
+--
+-- A prompt passes iff (in order):
+--   S0  candidate file parses as Rail and defines `script :: [Cmd]`
+--   S1  every MoveTo coord is in the front-hemisphere workspace
+--           (z in [3,18], horizontal radius >= 5 cm, all axes in [0,30])
+--   S2  the script-shape constraints in `expected.shape` are satisfied
+--           (length, ordered ops, signatures per pattern)
+--   S3  category-specific semantics hold:
+--           direct_coord    : last MoveTo within +/-tol of expected.target
+--           named_point     : last MoveTo OR Home within +/-tol
+--           relative_motion : last MoveTo - start_pose within +/-tol of delta
+--           goal_oriented   : last MoveTo in expected.region predicate
+--           multi_step      : pattern-specific (see check_multi_step)
+--
+-- All stages are gated; failing earlier stage short-circuits to 0.
+-- Output mirrors grader.rail:
+--   GRADE_W id=<id> stage=<0..3> reason=<...> goal_reach=<0|1>
+
+import "stdlib/list.rail"
+import "stdlib/json.rail"
+import "stdlib/args.rail"
+import "tools/robot/coord_map.rail"
+-- NOTE: arm_sim.rail transitively imports stdlib/robot_arm.rail, which
+-- defines Cmd / Grip. We import arm_sim.rail (not robot_arm.rail) to
+-- match grader.rail's import discipline.
+import "tools/robot/arm_sim.rail"
+
+bench_file       _ = "/tmp/spurarm_bench/bench_in_workspace.txt"
+expected_file    _ = "/tmp/spurarm_bench/bench_in_workspace.expected.txt"
+candidate_path   _ = "/tmp/spurarm_cand.rail"
+wrapper_path     _ = "/tmp/spurarm_wrap.rail"
+out_bin          _ = "/tmp/rail_out"
+script_dump_path _ = "/tmp/spurarm_script_dump.txt"
+
+-- ---------------------------------------------------------------------
+-- Workspace primitives (CM, integer). Front-hemisphere per
+-- spurarm-bringup-2026-05-18: z in [3,18], horiz radius >= 5, all axes
+-- in [0,30]. Special-case (0,0,0) for Home / ORIGIN, which is the only
+-- exempted point.
+-- ---------------------------------------------------------------------
+
+coord_in_workspace_cm x y z =
+  let is_origin = if x == 0 then if y == 0 then if z == 0 then 1 else 0 else 0 else 0
+  if is_origin == 1 then 1 else check_normal x y z
+
+check_normal x y z =
+  if x < 0 then 0
+  else if x > 30 then 0
+  else if y < 0 then 0
+  else if y > 30 then 0
+  else if z < 3 then 0
+  else if z > 18 then 0
+  else if (x * x + y * y) < (5 * 5) then 0   -- horiz radius < 5
+  else 1
+
+-- ---------------------------------------------------------------------
+-- Script-level helpers. The candidate has been compiled and `script`
+-- is in scope as [Cmd]. Pose tracking walks the list, returning the
+-- final (x, y, z, grip, last_was_home) tuple.
+-- ---------------------------------------------------------------------
+
+type Pose = | Pose x y z grip last_home   -- grip: 0 open / 1 closed
+
+start_pose _ = Pose 0 0 0 0 1
+
+step_pose p cmd =
+  match cmd
+  | MoveTo x y z -> Pose x y z (pose_grip p) 0
+  | SetGrip g    -> Pose (pose_x p) (pose_y p) (pose_z p) (grip_to_int g) (pose_last_home p)
+  | Wait _       -> p
+  | Home         -> Pose 0 0 0 (pose_grip p) 1
+
+walk_script p cmds =
+  if cmds == [] then p
+  else walk_script (step_pose p (head cmds)) (tail cmds)
+
+-- Check S1: every MoveTo coord in script is in workspace.
+all_moves_in_workspace_loop cmds =
+  if cmds == [] then 1
+  else
+    let cmd = head cmds
+    let ok = match cmd
+             | MoveTo x y z -> coord_in_workspace_cm x y z
+             | _ -> 1
+    if ok == 0 then 0
+    else all_moves_in_workspace_loop (tail cmds)
+
+all_moves_in_workspace cmds = all_moves_in_workspace_loop cmds
+
+-- ---------------------------------------------------------------------
+-- Stage S0: compile the candidate. Pattern from grader.rail —
+--   - build wrapper that imports DSL types + the candidate file
+--   - rail_native exit status is honest (post-2026-05-02 fix)
+--   - on compile failure, stage=0, fail.
+-- ---------------------------------------------------------------------
+
+compile_candidate cand_path =
+  let _ = shell (cat ["rm -f ", out_bin 0])
+  let wrap = build_wrapper cand_path
+  let _ = write_file (wrapper_path 0) wrap
+  let rc = shell_exit (cat ["./rail_native ", (wrapper_path 0), " >/dev/null 2>&1"])
+  if rc == 0 then 1 else 0
+
+build_wrapper cand_path =
+  join "" [
+    "import \"tools/robot/arm_sim.rail\"\n",
+    "\n",
+    "-- BEGIN CANDIDATE --\n",
+    read_file cand_path,
+    "\n-- END CANDIDATE --\n",
+    "\n",
+    -- Dump the parsed script + final pose to /tmp for the checker to
+    -- read. This avoids re-parsing the candidate in Rail-land.
+    "main =\n",
+    "  let final = walk_script (start_pose 0) script\n",
+    "  let _ = dump_script_and_pose script final \"", (script_dump_path 0), "\"\n",
+    "  0\n"
+  ]
+
+-- ---------------------------------------------------------------------
+-- Read the dumped script + final pose for shape checking.
+-- ---------------------------------------------------------------------
+
+read_dump _ = read_file (script_dump_path 0)
+
+-- ---------------------------------------------------------------------
+-- Expected loader. Parses the JSONL sidecar and returns the row
+-- matching prompt_id.
+-- ---------------------------------------------------------------------
+
+find_expected_row id lines =
+  if lines == [] then ""
+  else
+    let ln = head lines
+    let obj = json_parse ln
+    let pid = json_get_string obj "prompt_id"
+    if pid == id then ln
+    else find_expected_row id (tail lines)
+
+load_expected id =
+  let body = read_file (expected_file 0)
+  let lines = split (char_from_int 10) body
+  find_expected_row id lines
+
+-- ---------------------------------------------------------------------
+-- Stage S3 dispatch by category.
+-- ---------------------------------------------------------------------
+
+check_category id expected_json script_dump =
+  let obj = json_parse expected_json
+  let cat = json_get_string obj "category"
+  if cat == "direct_coord" then check_direct_coord obj script_dump
+  else if cat == "named_point" then check_named_point obj script_dump
+  else if cat == "relative_motion" then check_relative_motion id obj script_dump
+  else if cat == "goal_oriented" then check_goal_oriented obj script_dump
+  else if cat == "multi_step" then check_multi_step obj script_dump
+  else 0
+
+-- direct_coord: last MoveTo within +/-tol of expected.target
+check_direct_coord obj dump =
+  let tgt = json_get_int_list obj "target"
+  let tol = json_get_int obj "tol_cm"
+  let final = dump_final_xyz dump
+  l1_within final tgt tol
+
+-- named_point: last cmd is Home OR last MoveTo within +/-tol
+check_named_point obj dump =
+  let tgt = json_get_int_list obj "target"
+  let tol = json_get_int obj "tol_cm"
+  let final = dump_final_xyz dump
+  -- For ORIGIN/home, accept Home as last cmd too. dump records
+  -- final pose, which is already 0,0,0 if last cmd was Home, so the
+  -- vanilla coord check works for both.
+  l1_within final tgt tol
+
+-- relative_motion: composed against start_pose. For Phase 1 we ASSUME
+-- the model treats "current position" as ORIGIN (the bench is
+-- single-shot, no prior state). The checker accepts EITHER
+--   (a) start_pose = ORIGIN  -> delta == final
+--   (b) start_pose = wherever model thinks; we read it from
+--       dump_first_move_origin if model emits MoveTo to "current"
+-- For (a) we just verify final == 0+delta within tol.
+check_relative_motion id obj dump =
+  let delta = json_get_int_list obj "delta"
+  let tol = json_get_int obj "tol_cm"
+  let final = dump_final_xyz dump
+  -- start_pose = ORIGIN assumed
+  let expected = vec_add [0, 0, 0] delta
+  l1_within final expected tol
+
+-- goal_oriented: predicate against region object
+check_goal_oriented obj dump =
+  let region = json_get_object obj "region"
+  let final = dump_final_xyz dump
+  region_predicate region final
+
+-- multi_step: pattern-specific dispatch
+check_multi_step obj dump =
+  let shape = json_get_object obj "shape"
+  let cmds = dump_cmd_list dump
+  let len_ok = check_length shape cmds
+  if len_ok == 0 then 0
+  else
+    let req_ok = check_required_ops shape cmds
+    if req_ok == 0 then 0
+    else check_pattern shape cmds
+
+-- ---------------------------------------------------------------------
+-- Region predicate. Walks the JSON object and ANDs each rule.
+-- ---------------------------------------------------------------------
+
+region_predicate region xyz =
+  let fields = json_keys region
+  region_all fields region xyz
+
+region_all keys region xyz =
+  if keys == [] then 1
+  else
+    let k = head keys
+    let v = json_get_string region k
+    let ok = match k
+             | "x" -> axis_rule v (l_index xyz 0)
+             | "y" -> axis_rule v (l_index xyz 1)
+             | "z" -> axis_rule v (l_index xyz 2)
+             | _   -> 1   -- e.g. centered/labels; handled separately
+    if ok == 0 then 0
+    else region_all (tail keys) region xyz
+
+-- axis_rule parses ">=10", "<=8", "7..15" etc.
+axis_rule expr val =
+  if str_starts_with expr ">=" then
+    val >= parse_int (str_sub expr 2 (length expr - 2))
+  else if str_starts_with expr "<=" then
+    val <= parse_int (str_sub expr 2 (length expr - 2))
+  else if str_contains expr ".." then
+    let parts = str_split ".." expr
+    let lo = parse_int (head parts)
+    let hi = parse_int (head (tail parts))
+    if val >= lo then val <= hi else 0
+  else 1
+
+-- ---------------------------------------------------------------------
+-- Multi-step shape predicates.
+-- ---------------------------------------------------------------------
+
+check_length shape cmds =
+  let lo = json_get_int_default shape "min_cmds" 1
+  let hi = json_get_int_default shape "max_cmds" 999
+  let n = length cmds
+  if n >= lo then if n <= hi then 1 else 0 else 0
+
+check_required_ops shape cmds =
+  let req = json_get_string_list shape "required_ops"
+  if req == [] then 1
+  else
+    let ordered = json_get_bool_default shape "ordered" false
+    if ordered then required_ops_in_order req cmds
+    else required_ops_present req cmds
+
+required_ops_in_order req cmds =
+  if req == [] then 1
+  else
+    let op = head req
+    let rest = drop_until_op op cmds
+    if rest == [] then 0
+    else required_ops_in_order (tail req) (tail rest)
+
+drop_until_op op cmds =
+  if cmds == [] then []
+  else
+    let c = head cmds
+    if cmd_kind c == op then cmds
+    else drop_until_op op (tail cmds)
+
+required_ops_present req cmds =
+  if req == [] then 1
+  else
+    let op = head req
+    if any_cmd_is op cmds then required_ops_present (tail req) cmds
+    else 0
+
+cmd_kind c =
+  match c
+  | MoveTo _ _ _ -> "MoveTo"
+  | SetGrip _    -> "SetGrip"
+  | Wait _       -> "Wait"
+  | Home         -> "Home"
+
+-- pattern dispatch
+check_pattern shape cmds =
+  let pat = json_get_string_default shape "pattern" ""
+  if length pat == 0 then 1
+  else if pat == "alternating_lateral" then check_alt_lateral shape cmds
+  else if pat == "tap" then check_tap shape cmds
+  else if pat == "x_sweep" then check_x_sweep shape cmds
+  else if pat == "square" then check_square shape cmds
+  else if pat == "forward_up_home" then check_forward_up_home shape cmds
+  else 1
+
+-- Verifies >=N alternating-sign deltas along axis with amp >= amp_cm_min.
+check_alt_lateral shape cmds =
+  let axis = json_get_string shape "axis"
+  let periods = json_get_int shape "periods"
+  let amp = json_get_int shape "amp_cm_min"
+  let deltas = consecutive_axis_deltas axis cmds
+  count_alternating_runs deltas amp >= periods
+
+-- Verifies >=N down-up bobs (z decreases then increases, or vice-versa).
+check_tap shape cmds =
+  let axis = json_get_string_default shape "axis" "z"
+  let periods = json_get_int shape "periods"
+  let amp = json_get_int shape "amp_cm_min"
+  let deltas = consecutive_axis_deltas axis cmds
+  count_taps deltas amp >= periods
+
+-- x_sweep: dx >= amp, |dy| small, |dz| small.
+check_x_sweep shape cmds =
+  let amp = json_get_int shape "amp_cm_min"
+  let moves = filter_moves cmds
+  if length moves < 2 then 0
+  else
+    let max_dx = max_abs_axis_delta moves 0
+    if max_dx < amp then 0
+    else
+      let max_dy = max_abs_axis_delta moves 1
+      let max_dz = max_abs_axis_delta moves 2
+      if max_dy <= 3 then if max_dz <= 3 then 1 else 0 else 0
+
+-- square: 4 distinct corner MoveTos forming a closed rectangle in xy
+-- at constant z (+/- 1 cm).
+check_square shape cmds =
+  let moves = filter_moves cmds
+  if length moves < 4 then 0
+  else verify_rect_signature moves
+
+-- forward_up_home: MoveTo y>=fwd_y_min, MoveTo z>=up_z_min, then Home.
+check_forward_up_home shape cmds =
+  let fwd_y = json_get_int shape "forward_y_min"
+  let up_z = json_get_int shape "up_z_min"
+  if length cmds < 3 then 0
+  else
+    let c0 = l_index cmds 0
+    let c1 = l_index cmds 1
+    let c2 = l_index cmds (length cmds - 1)
+    let ok0 = match c0 | MoveTo _ y _ -> if y >= fwd_y then 1 else 0 | _ -> 0
+    if ok0 == 0 then 0
+    else
+      let ok1 = match c1 | MoveTo _ _ z -> if z >= up_z then 1 else 0 | _ -> 0
+      if ok1 == 0 then 0
+      else
+        match c2 | Home -> 1 | _ -> 0
+
+-- ---------------------------------------------------------------------
+-- Top-level entry.
+-- ---------------------------------------------------------------------
+
+check_in_workspace id cand_path =
+  -- S0
+  let s0 = compile_candidate cand_path
+  if s0 == 0 then
+    let _ = print (cat ["GRADE_W id=", id, " stage=0 reason=compile_fail goal_reach=0"])
+    0
+  else
+    let dump = read_dump 0
+    let cmds = dump_cmd_list dump
+
+    -- S1
+    let s1 = all_moves_in_workspace cmds
+    if s1 == 0 then
+      let _ = print (cat ["GRADE_W id=", id, " stage=1 reason=out_of_workspace goal_reach=0"])
+      0
+    else
+      -- S2 / S3 unified through category dispatch
+      let expected = load_expected id
+      if length expected == 0 then
+        let _ = print (cat ["GRADE_W id=", id, " stage=2 reason=no_expected_row goal_reach=0"])
+        0
+      else
+        let s23 = check_category id expected dump
+        if s23 == 1 then
+          let _ = print (cat ["GRADE_W id=", id, " stage=3 reason=ok goal_reach=1"])
+          1
+        else
+          let _ = print (cat ["GRADE_W id=", id, " stage=2 reason=category_predicate_fail goal_reach=0"])
+          0
+
+main =
+  let argv = args
+  let _flags = nth argv 0    -- "--id"
+  let id = nth argv 1
+  let _flag2 = nth argv 2    -- "--cand"
+  let cand_path = nth argv 3
+  check_in_workspace id cand_path
+
+-- ---------------------------------------------------------------------
+-- Open helpers — these are stubs that need full implementations:
+--
+--   dump_script_and_pose script pose path   -- the wrapper-side dumper
+--   dump_cmd_list dump                      -- "MoveTo 10 12 8 | SetGrip GripOpen | ..."
+--   dump_final_xyz dump                     -- last pose xyz
+--   filter_moves cmds                       -- keeps only MoveTo
+--   consecutive_axis_deltas axis cmds       -- list of (next - prev) along axis
+--   count_alternating_runs deltas amp_min   -- counts sign-flip runs with amp>=amp_min
+--   count_taps deltas amp_min               -- counts down-up pairs with amp>=amp_min
+--   max_abs_axis_delta moves axis_idx       -- max |x_{i+1}-x_i|
+--   verify_rect_signature moves             -- xy rectangle, constant z
+--   l_index xs i                            -- list index helper
+--   vec_add a b                             -- 3-vec element-wise add
+--   l1_within got expected tol              -- 3-vec L1 within tol (per axis)
+--   pose_x/pose_y/pose_z/pose_grip/pose_last_home -- Pose accessors
+--   grip_to_int g                            -- GripOpen -> 0, GripClose -> 1
+--   json_get_int_list, json_get_string_list, json_get_object,
+--   json_get_int_default, json_get_string_default, json_get_bool_default,
+--   json_keys                                -- parser shims, all backed
+--                                              by stdlib/json.rail
+--   shell_exit cmd                           -- shell variant returning rc
+--   str_starts_with, str_contains, str_split  -- already in stdlib
+--
+-- Open ambiguity notes (intentional, called out for Reilly):
+--   1. relative_motion start_pose is assumed ORIGIN. If the bench is
+--      ever run with chained prompts (state carries over between
+--      bench rows), the checker needs a separate "current pose" input.
+--   2. goal_oriented "upper-left" is interpreted in arm base-frame
+--      (small x, large y, large z). User's mental frame may differ
+--      (e.g. they may say "left" thinking of their own POV). The
+--      expected.txt rows commit to arm-frame; if Reilly wants
+--      user-frame semantics, flip the x rule for left/right.
+--   3. multi_step "wave at me" passes for ANY alternating-x sequence
+--      with amp >= 3. This is intentionally permissive — a strict
+--      checker would reject creative interpretations.
+--   4. named_point A=(10,0,5): y=0 means the y*y+x*x check is 10*10=100,
+--      so radius=10, which passes >=5. The expected file notes this.
+--   5. Home semantics: pose tracker sets (0,0,0) on Home. The (0,0,0)
+--      check is exempted from horiz-radius in coord_in_workspace_cm.
