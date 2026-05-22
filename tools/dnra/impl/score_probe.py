@@ -1,22 +1,35 @@
 #!/usr/bin/env python3
-"""DNRA probe edit-distance scorer.
+"""DNRA probe edit-distance scorer (hardened).
 
 Pairwise normalized Levenshtein edit-distance between two probe response
-files. Used for the D-vs-base pre-gate (FINETUNE_DEDUCTIVE Section 4.3)
-and -- when three trained panelists exist -- the D-E-A separation test.
+files PLUS two quality checks that catch the failure modes a raw
+edit-distance gate cannot see:
+
+  1. LENGTH-RATIO check.  If trained mean response length is < 50% of
+     base, the model is collapsing to empty-emit (it learned <|eot_id|>
+     follows ~N chars in training and emits it early on OOD prompts).
+     Edit-distance vs a ~1200-char base then trivially exceeds 0.5
+     even though the trained model is producing nothing.
+  2. SPURIOUS-CITE check.  If the trained model emits 'Cite:' on
+     prompts where the base never does, AND the rate is >= 70%, the
+     model has learned the citation surface pattern and is pasting it
+     onto unrelated content (FINETUNE_DEDUCTIVE Section 6.1 risk -
+     hallucinated citations).  This is observed-from-smoke: a 19-pair
+     overfit LoRA cited 25 of 30 OOD prompts versus 0 from base.
+
+Both checks default to WARNING.  With --strict they flip the final
+verdict to QUALITY COLLAPSE regardless of edit-distance.
 
 Usage:
     python3 tools/dnra/impl/score_probe.py \\
         --a tools/dnra/sets/probe_responses_base.jsonl \\
-        --b tools/dnra/sets/probe_responses_d_v0_trained.jsonl
+        --b tools/dnra/sets/probe_responses_d_v0_trained.jsonl \\
+        [--strict]
 
-Output (stdout):
-    Per-prompt edit-distance table (id, domain, distance).
-    Aggregate: mean / median / min / max across the 30 prompts.
-    Gate verdict against the 0.25 (collapse) and 0.35 (productive) thresholds.
-
-Exit code: 0 if mean >= 0.35 (productive), 1 if 0.25 <= mean < 0.35
-(inconclusive), 2 if mean < 0.25 (mode collapse).
+Exit codes:
+    0 = PRODUCTIVE (edit >= 0.35) AND no quality flag in --strict mode
+    1 = INCONCLUSIVE (0.25 <= edit < 0.35)
+    2 = MODE COLLAPSE (edit < 0.25) OR --strict + quality flag
 
 No external deps. Levenshtein hand-rolled to keep this script portable.
 """
@@ -29,6 +42,9 @@ from pathlib import Path
 
 COLLAPSE_THRESHOLD = 0.25
 PRODUCTIVE_THRESHOLD = 0.35
+LENGTH_RATIO_FLOOR = 0.50      # trained mean / base mean must be >= this
+SPURIOUS_CITE_CEILING = 0.70   # rate of base-no-cite-but-trained-cites
+CITE_MARKER = "Cite:"          # the convention used in D corpus targets
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -73,11 +89,48 @@ def load_responses(path: Path) -> dict[str, dict]:
     return out
 
 
+def quality_checks(a_recs, b_recs, shared, a_tag, b_tag):
+    """Return (length_ratio, spurious_cite_rate, flags_list).
+
+    `flags_list` is a list of human-readable strings describing any
+    quality concerns; empty list = clean.
+    """
+    flags = []
+    a_lens = [len(a_recs[pid]["response"]) for pid in shared]
+    b_lens = [len(b_recs[pid]["response"]) for pid in shared]
+    a_mean = statistics.mean(a_lens) if a_lens else 0
+    b_mean = statistics.mean(b_lens) if b_lens else 0
+    length_ratio = (b_mean / a_mean) if a_mean > 0 else 0.0
+    if length_ratio < LENGTH_RATIO_FLOOR:
+        flags.append(
+            f"LENGTH COLLAPSE: {b_tag} mean {b_mean:.0f} chars vs {a_tag} mean "
+            f"{a_mean:.0f} chars (ratio {length_ratio:.2f} < {LENGTH_RATIO_FLOOR:.2f}). "
+            f"Likely empty-emit -- model learned to stop early on OOD prompts."
+        )
+
+    spurious = 0
+    for pid in shared:
+        a_cites = CITE_MARKER in a_recs[pid]["response"]
+        b_cites = CITE_MARKER in b_recs[pid]["response"]
+        if (not a_cites) and b_cites:
+            spurious += 1
+    spurious_rate = spurious / len(shared) if shared else 0.0
+    if spurious_rate >= SPURIOUS_CITE_CEILING:
+        flags.append(
+            f"CITATION FABRICATION: {b_tag} emits '{CITE_MARKER}' on "
+            f"{spurious}/{len(shared)} prompts where {a_tag} does not "
+            f"(rate {spurious_rate:.0%} >= {SPURIOUS_CITE_CEILING:.0%}). "
+            f"Likely learned-template paste onto unrelated content."
+        )
+    return length_ratio, spurious_rate, flags
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--a", required=True, help="First probe responses JSONL (e.g. base)")
     ap.add_argument("--b", required=True, help="Second probe responses JSONL (e.g. d_v0_trained)")
     ap.add_argument("--quiet", action="store_true", help="Suppress per-prompt table")
+    ap.add_argument("--strict", action="store_true", help="Quality flags hard-fail the verdict (else they only warn)")
     args = ap.parse_args()
 
     a_path, b_path = Path(args.a), Path(args.b)
@@ -123,10 +176,27 @@ def main():
     for dom in sorted(by_domain):
         ds = by_domain[dom]
         print(f"  domain={dom:<10} mean={statistics.mean(ds):.3f}  n={len(ds)}")
+    # Quality checks (length-ratio + spurious-cite) layered on top of edit-distance.
+    length_ratio, spurious_rate, q_flags = quality_checks(a_recs, b_recs, shared, a_tag, b_tag)
+    print(f"quality:    length_ratio={length_ratio:.3f}  (floor {LENGTH_RATIO_FLOOR:.2f})  "
+          f"spurious_cite_rate={spurious_rate:.0%}  (ceiling {SPURIOUS_CITE_CEILING:.0%})")
+    if q_flags:
+        for f in q_flags:
+            print(f"  WARN: {f}")
+    else:
+        print("  quality: clean")
+
     print()
     print(f"thresholds: < {COLLAPSE_THRESHOLD:.2f} = mode collapse,  >= {PRODUCTIVE_THRESHOLD:.2f} = productive")
+    # Apply strict-mode quality override BEFORE the edit-distance verdict.
+    if args.strict and q_flags:
+        print(f"VERDICT: QUALITY COLLAPSE  ({len(q_flags)} quality flag(s); --strict promoted to fail)")
+        return 2
     if mean_d >= PRODUCTIVE_THRESHOLD:
-        print(f"VERDICT: PRODUCTIVE  (mean {mean_d:.3f} >= {PRODUCTIVE_THRESHOLD:.2f})")
+        verdict = "PRODUCTIVE"
+        if q_flags:
+            verdict += " (with quality WARNINGS; pass --strict to fail on them)"
+        print(f"VERDICT: {verdict}  (mean {mean_d:.3f} >= {PRODUCTIVE_THRESHOLD:.2f})")
         return 0
     if mean_d >= COLLAPSE_THRESHOLD:
         print(f"VERDICT: INCONCLUSIVE  ({COLLAPSE_THRESHOLD:.2f} <= mean {mean_d:.3f} < {PRODUCTIVE_THRESHOLD:.2f})")
