@@ -33,7 +33,7 @@ The schema deliberately mirrors `~/projects/rail/tools/lab/` (the `/lab` Ed25519
 
   "triage": {
     "path": "fast|deliberate",
-    "reason": "<convener's short justification>",
+    "reason": "R0_trivial|R1_rail_compiler_oracle|R2_rail_invariant_or_specialist|R3_reasoning|R4_open_ended|R5_fallback",
     "selected_panel": ["deductive", "empirical", "adversarial"]
   },
 
@@ -136,6 +136,10 @@ Any failure → chain is invalid → reject subsequent appends until reconciled.
 - `category` is the Convener routing primitive — used to decide deliberate-vs-fast and which panel.
 - `has_oracle` flags whether outcome resolution can be auto-scored. Determines training-data viability for the meta-cognition layer.
 - `complexity_hint` is Convener's pre-deliberation estimate; ground truth comes from outcomes.
+
+### `triage.reason`
+- Drawn from a **closed terminal-label set** defined by `design/CONVENER.v0.spec.md`: `R0_trivial`, `R1_rail_compiler_oracle`, `R2_rail_invariant_or_specialist`, `R3_reasoning`, `R4_open_ended`, `R5_fallback`. Auditability invariant — the Convener's behavior is `grep`-able across the chain.
+- Free-form `reason` strings are rejected by the acceptance harness (`impl/test_convener.rail`).
 
 ### `panel[*].position` and `panel[*].rail_claim`
 - `position` is the panelist's prose claim.
