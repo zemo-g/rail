@@ -63,7 +63,7 @@ SYSTEM = (
 )
 
 
-def build_user_msg(rfc_num: int, section: str, section_text: str) -> str:
+def build_user_msg_keep(rfc_num: int, section: str, section_text: str) -> str:
     return (
         f"Source: RFC {rfc_num} section {section}\n"
         f"Section text:\n<<<\n{section_text}\n>>>\n\n"
@@ -83,12 +83,46 @@ def build_user_msg(rfc_num: int, section: str, section_text: str) -> str:
     )
 
 
-def call_llm(rfc_num: int, section: str, section_text: str, temp: float, max_tokens: int) -> str:
+def build_user_msg_invert(rfc_num: int, section: str, section_text: str) -> str:
+    return (
+        f"Source: RFC {rfc_num} section {section}\n"
+        f"Section text:\n<<<\n{section_text}\n>>>\n\n"
+        "Construct ONE (prompt, target) pair that TRAINS THE READER TO "
+        "DISTINGUISH RECOMMENDATION FROM REQUIREMENT. Specifically:\n\n"
+        "1. prompt: phrase the question as if a stronger/affirmative reading "
+        "   is expected (e.g. 'Does the spec REQUIRE...', 'Must implementations "
+        "   always...', 'Is X mandatory...'). The phrasing should match a "
+        "   common-but-incorrect lay reading of the section.\n"
+        "2. target: OPEN with a corrective No / Not exactly / Not strictly. "
+        "   Then quote the load-bearing clause VERBATIM in DOUBLE quotes; "
+        "   the clause MUST contain the actual modal verb the section uses "
+        "   (SHOULD, MAY, RECOMMENDED, etc.) -- exactly as it appears. Then "
+        "   derive in 1-3 short sentences why the prompt's stronger reading "
+        "   is wrong (point at the verb). End with "
+        "   'Cite: RFC <num> section <section>'.\n"
+        "3. The quote MUST be a contiguous substring of the section text. "
+        "   Do NOT paraphrase inside the quotation.\n"
+        "4. If the section's strongest modal verb is itself MUST or SHALL "
+        "   (i.e. the section IS a hard requirement and there is nothing "
+        "   honest to invert), output the JSON {\"prompt\": \"\", \"target\": \"\"} "
+        "   so the loop will reject it.\n"
+        "5. Output strict JSON of the form: "
+        '{"prompt": "...", "target": "..."}\n'
+        "Output JSON now."
+    )
+
+
+def call_llm(rfc_num: int, section: str, section_text: str, polarity: str,
+             temp: float, max_tokens: int) -> str:
+    if polarity == "invert":
+        user_msg = build_user_msg_invert(rfc_num, section, section_text)
+    else:
+        user_msg = build_user_msg_keep(rfc_num, section, section_text)
     body = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": build_user_msg(rfc_num, section, section_text)},
+            {"role": "user", "content": user_msg},
         ],
         "max_tokens": max_tokens,
         "temperature": temp,
@@ -163,7 +197,7 @@ def main():
 
         t0 = time.time()
         try:
-            raw = call_llm(rfc_num, section, section_text, args.temp, args.max_tokens)
+            raw = call_llm(rfc_num, section, section_text, polarity, args.temp, args.max_tokens)
         except Exception as e:
             print(f"      SKIP: LLM call failed: {e}")
             counters["SKIP_LLM"] = counters.get("SKIP_LLM", 0) + 1
@@ -174,6 +208,12 @@ def main():
         if parsed is None:
             print(f"      SKIP: could not parse JSON pair from model output (raw head: {raw[:80]!r})")
             counters["SKIP_PARSE"] = counters.get("SKIP_PARSE", 0) + 1
+            continue
+        # Empty-pair sentinel for invert polarity: the model refuses when
+        # the section has no honest inversion (e.g. pure MUST clauses).
+        if not parsed.get("prompt") or not parsed.get("target"):
+            print(f"      SKIP: model returned empty pair (no honest inversion for this section)")
+            counters["SKIP_EMPTY"] = counters.get("SKIP_EMPTY", 0) + 1
             continue
 
         pair = {

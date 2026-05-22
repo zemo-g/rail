@@ -36,10 +36,21 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 from tools.dnra.impl.sources.rfc import get_section as rfc_get_section  # type: ignore[import-not-found]  # noqa: E402
+from tools.dnra.impl.sources.posix import get_section as posix_get_section  # type: ignore[import-not-found]  # noqa: E402
 
 
 QUOTED_SPAN = re.compile(r"'([^']{15,})'|\"([^\"]{15,})\"")
 WHITESPACE = re.compile(r"\s+")
+
+# Recognized POSIX-page section headers; used to detect whether the
+# curator's `section` field carries an explicit section name (e.g.
+# "DESCRIPTION", "ERRORS") or just the function name.
+POSIX_SECTIONS = (
+    "NAME", "SYNOPSIS", "DESCRIPTION", "RETURN VALUE", "ERRORS",
+    "EXAMPLES", "APPLICATION USAGE", "RATIONALE", "FUTURE DIRECTIONS",
+    "SEE ALSO", "CHANGE HISTORY",
+)
+POSIX_PATTERN = re.compile(r"\bPOSIX(?:\.1-\d{4})?\b", re.IGNORECASE)
 
 
 def _normalize(s: str) -> str:
@@ -82,6 +93,35 @@ def resolve_source(source: str, section: str) -> tuple[str | None, str]:
             return None, "rfc"
         text = rfc_get_section(rfc_num, sec_m.group(1))
         return text, "rfc"
+
+    if POSIX_PATTERN.search(source):
+        # Curator's section convention: "System Interfaces / close",
+        # "System Interfaces / fork / ERRORS", or sometimes just
+        # "close".  Split on '/', strip each chunk, then:
+        #   - the rightmost chunk that matches a known POSIX section
+        #     name (case-insensitive) is the section header to fetch;
+        #   - the chunk immediately to its left (or, if no explicit
+        #     section name is given, the rightmost chunk) is treated
+        #     as the function name.
+        chunks = [c.strip() for c in section.split("/") if c.strip()]
+        if not chunks:
+            return None, "posix"
+        sec_name = "DESCRIPTION"
+        func_chunks = chunks
+        if chunks[-1].upper() in POSIX_SECTIONS:
+            sec_name = chunks[-1].upper()
+            func_chunks = chunks[:-1]
+        if not func_chunks:
+            return None, "posix"
+        # The function name is the rightmost remaining chunk.  Strip
+        # any trailing manpage suffix like "(2)" or "()" defensively.
+        func = func_chunks[-1]
+        func = re.sub(r"\s*\(\d*\)\s*$", "", func).strip()
+        if not func:
+            return None, "posix"
+        text = posix_get_section(func, sec_name)
+        return text, "posix"
+
     return None, "unsupported"
 
 
