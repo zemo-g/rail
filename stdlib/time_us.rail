@@ -1,0 +1,67 @@
+-- stdlib/time_us.rail — microsecond-resolution in-process wall clock.
+--
+-- Why this exists:
+--   stdlib/time.rail's `now` calls `time(2)`, which is 1-second resolution.
+--   The JIT v2 measurement harness needs sub-millisecond precision but was
+--   shelling out to `date +%s%N`, which has ~120us round-trip cost on macOS
+--   (chain entry b999f843 partial-falsification root cause).
+--
+--   This module exposes `time_us_now -> int` returning microseconds since
+--   the Unix epoch (mod 2^63 — safe for delta arithmetic for ~292,000 years).
+--   It calls `gettimeofday(2)` via FFI, which on macOS is commpage-backed
+--   (~10ns/call — see /tmp/probe_gtod_perf benchmark in chain investigation).
+--
+-- Pure Rail discipline (memory/feedback_no_c_in_rail_work.md):
+--   No new .c bridge. `gettimeofday` is a libc symbol the linker already
+--   resolves. The struct layout below is verified for macOS Apple Silicon:
+--     offset 0..7 : tv_sec  (time_t = int64)
+--     offset 8..11: tv_usec (suseconds_t = int32)
+--     offset 12..15: pad
+--   sizeof(struct timeval) = 16.
+--
+-- Pointer-arg ABI: per the foreign-call convention in compile.rail
+-- (`untag_args` at line 1711), int args get untagged before the call; raw
+-- `malloc`-returned ptrs are passed unchanged. So `gettimeofday tv 0` passes
+-- the buffer ptr raw in x0 and 0 (tagged) -> 0 (untagged) in x1.
+
+foreign gettimeofday tv tz -> int
+foreign malloc size -> ptr
+
+-- Statically allocate one 16-byte timeval buffer at module init time so we
+-- don't malloc per-call. Functions in Rail are bindings — this happens once
+-- at first reference.
+--
+-- NOTE: Rail's nullary-binding semantic re-evaluates on each reference per
+-- memory/rail_quirks.md ("nullary bindings re-evaluate"). To avoid an alloc
+-- per call, we pass the buffer in as an explicit arg from the caller's main
+-- after one initial alloc, OR we alloc lazily inside time_us_now and accept
+-- the per-call malloc cost. malloc is ~50ns on macOS — still well under our
+-- 10us target. Going with the per-call malloc path for API simplicity;
+-- callers needing a tighter loop can use time_us_now_into with a preallocated
+-- 16-byte buffer.
+
+time_us_now_into tv =
+  let _ = gettimeofday tv 0
+  let s0 = byte_at tv 0
+  let s1 = byte_at tv 1
+  let s2 = byte_at tv 2
+  let s3 = byte_at tv 3
+  let s4 = byte_at tv 4
+  let s5 = byte_at tv 5
+  let s6 = byte_at tv 6
+  let s7 = byte_at tv 7
+  let lo32_sec = bit_or s0 (bit_or (shl s1 8) (bit_or (shl s2 16) (shl s3 24)))
+  let hi32_sec = bit_or s4 (bit_or (shl s5 8) (bit_or (shl s6 16) (shl s7 24)))
+  let sec = bit_or lo32_sec (shl hi32_sec 32)
+  let u0 = byte_at tv 8
+  let u1 = byte_at tv 9
+  let u2 = byte_at tv 10
+  let u3 = byte_at tv 11
+  let usec = bit_or u0 (bit_or (shl u1 8) (bit_or (shl u2 16) (shl u3 24)))
+  sec * 1000000 + usec
+
+-- Convenience: alloc-per-call. For inner-loop timing, prefer
+-- time_us_now_into with a preallocated buffer.
+time_us_now _ =
+  let tv = malloc 16
+  time_us_now_into tv
