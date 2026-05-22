@@ -409,3 +409,42 @@ This is "peer panelist → triggered specialist" — closer to Convener-routing-
 - **R-X1: Complete the synthetic_triage curation** (30 more cases). Still deferred / multi-session.
 - **R-X3: Stand up the MLX-LoRA training pipeline scaffold in `~/projects/rail-training/`.** Required before any D LoRA can train.
 - **R-X4: Open T7 (arbiter v1)**. Still deferred-pending.
+
+- **2026-05-22 21:30 UTC — D corpus v0.a + smoke-train loop CLOSED.** Five commits this sub-session:
+    - `480c1a7` — `sets/corpus_d_v0a.jsonl` (19 hand-verified cite-then-derive pairs across 14 source documents) + `impl/gen_corpus_d.py` (generator with assertions at emit) + `impl/qc_corpus_d.py` (discipline gate) + `impl/corpus_to_mlx.py` (chat-template converter).  Production target 1.5-3k pairs; this 19 is the format-validation slice.
+    - `835a47b` — `sets/lora_d_v0a/{train,valid,test}.jsonl` (15/1/3 split, Llama 3.2 chat-template) + recursive `!tools/dnra/sets/**/*.jsonl` whitelist in `.gitignore`.
+    - **Smoke LoRA train** (uncommitted adapter at `~/projects/rail-training/adapters/d_v0a_smoke/adapters.safetensors`): 100 iters, batch_size=1, lr=1e-4, ~17s wall, 5.636M trainable params (0.456% of 1.236B). Train loss 2.91 -> 0.22, val loss 3.33 -> 4.40 (INCREASING = overfit, exactly as designed for a 19-pair slice).
+    - `a05bd77` — `sets/probe_responses_d_v0a_smoke.jsonl` (30 probe responses with the trained adapter) + the load-bearing finding below.
+
+**FINDING (architecture-relevant, surfaced 21:30 UTC):**
+
+Naive edit-distance reports `mean 0.869, VERDICT: PRODUCTIVE` -- the gate thinks the LoRA succeeded.  Inspection reveals it did NOT.  Two distinct failure modes that the scorer can't tell apart, both yielding high edit-distance:
+
+1. **Empty-emit collapse.** 6 of 30 trained responses are <50 chars (P-002 is literally `''`).  The LoRA learned that `<|eot_id|>` follows ~450 chars in training and emits it immediately on out-of-distribution prompts.  Edit-distance vs ~1200-char base = ~1.0.
+2. **Hallucinated-citation gibberish.** Non-empty trained responses paste the `Cite:` surface pattern onto unrelated content.  P-016 (virtual memory question) gets `Cite: ISO/IEC 9899:2019 4.9/3 ... Box and friends ...`.  This is the FINETUNE_DEDUCTIVE §6.1 risk -- citation fabrication -- now observed at smoke scale.
+
+The edit-distance gate as currently specified CANNOT distinguish productive style divergence from quality collapse.  Both look like high distance.  Gate must be augmented with at least: (a) min trained:base response-length ratio (hard floor ~0.5), (b) spurious-Cite detector (count of prompts where trained response cites but base does not).  Tracked as ticket #13.
+
+**Production expectation (with hardened gate):** 1500 iters / 1500 pairs ~= 1 epoch (single pass), no overfit, response lengths similar to base, real Cite-pattern shift only on prompts that warrant a citation.  The smoke run is design-overfit; gate hardening is the gating fix.
+
+**Pipeline status post-smoke:**
+
+| Component | State | Note |
+|---|---|---|
+| 30 probe prompts | DONE | `sets/probe_v0.jsonl` |
+| MLX runner | DONE | tested base + adapter modes |
+| Edit-distance scorer | **NEEDS HARDENING** | ticket #13 |
+| Base baseline | DONE | `sets/probe_responses_base.jsonl` |
+| Smoke adapter | DONE | overfit-as-designed, useful negative data |
+| Smoke-trained probe | DONE | `sets/probe_responses_d_v0a_smoke.jsonl` |
+| Real D-LoRA corpus | **AT v0.a (19/1500-3000)** | corpus build is multi-session |
+| Real D-LoRA training | BLOCKED on corpus + hardened gate | |
+| Verdict | BLOCKED on above | |
+
+**Next-session options after this sub-session:**
+- **R-X3b: Implement gate hardening (ticket #13).** Add response-length ratio + spurious-Cite detector to score_probe.py. <30 min of work. Then re-score the smoke artifacts; expect the hardened gate to flag the smoke run as QUALITY COLLAPSE rather than productive.  Validates the hardening.
+- **R-X3c: Scale the corpus v0.a -> v0.b** (target +50 pairs to ~70).  Multi-session curation.  Same discipline: 2/doc cap, half-inverted, every target cites.  Potentially agent-batchable IF citation verification is automated (a separate ticket).
+- **R-X1: Complete the synthetic_triage curation** (30 more cases).  Still deferred.
+- **R-X3 (full): MLX-LoRA pipeline scaffold in `~/projects/rail-training/`.**  Already partially exercised via the smoke train; full scaffold = config files + helpers + per-run notebooks.
+
+**Updated branch state:** `release-v5.1.0` is **11 DNRA commits ahead of origin/master**. Push deferred.
