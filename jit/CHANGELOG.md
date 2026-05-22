@@ -6,6 +6,28 @@ or jump to the stage tag for the relevant chunk.
 
 ---
 
+## Lab measurement (2026-05-16 — JIT v3 stub-lower join+fold kill-criterion FALSIFIED)
+
+- **Targeted experiment.** Chain entry `8d8e809e` measured baseline lower_hit_rate=72% (217/300) with top-3 fallbacks `other:48, unknown_function:join:22, unknown_function:fold:13`. This entry tests whether stub-lowering the two named stdlib HOFs lifts the rate past 85% (retiring v3 framing) or stalls (sharpening to the `other:48` bucket).
+- **Premise check.** `join` and `fold` are compiler-level builtins in `tools/compile.rail` (lines 1190, 1199 — handled directly, NOT stdlib-defined). They surface as `unknown_function:*` in `jit/lower.rail::lower_call_resolved` (line 1211) because `is_builtin` doesn't list them and the FIXED-block registry doesn't define them. Premise confirmed: stub-lowering will lift the metric.
+- **Implementation.** `jit/lower.rail`: added `fold` and `join` to `is_builtin`; added `lower_builtin_fold_stub` (3-arg arity guard) and `lower_builtin_join_stub` (2-arg arity guard). Both emit `op_const 0` placeholder. Args are intentionally NOT lowered (avoids second-order failures on `chars`/`reverse`/`map` inside `join "" (reverse (chars s))`). Stub semantics are documented inline + at the test fixtures.
+- **Fixtures.** `jit/test_lower.rail` +8 (sf1-sf3 fold, sj1-sj3 join, sf_neg + sj_neg arity rejection). Locked in stub semantics: tests assert `fold/join` return 0.
+- **Runner.** `tools/lab/watchers/jit_v3_stub_lower.sh` — re-runs the same probe, parses the new top-3 string, emits delta + per-bucket fallback counts. Strips the probe's inner sentinel block so run.rail sees exactly one counter block.
+- **Measured.** before=72, after=84, delta=+12pp, join_fb=0, fold_fb=0, other_fb=48, mean_us=44. **Best-case arithmetic prediction (72 + 35/300 = 84%) held empirically — no programs second-order-failed when join/fold were lifted, but the ceiling falls 1pp short of the 85% kill threshold.**
+- **Verdict.** FALSIFIED (chain entry `0d48105b`, parent `8d8e809e`). v3 full-lowering framing is NOT retired by attrition. The `other:48` bucket is now the named question and needs its own classifier-decomposition probe before any v3 work proceeds.
+- **Floors held.** test_lower ALL PASS (+8 stubs), test_capture ALL PASS, test_enc ENC OK, test_opt 29/0, test_print PRINT OK, test_codegen ALL PASS, parity OK, 140/140. Lab suite 22+15+8 = 45/45.
+
+## Lab measurement (2026-05-16 — JIT v2 direct-call kill-criterion FALSIFIED)
+
+- **No-impl exit lane.** v2 direct-call path (`call_jit_direct` in `jit/loader.rail:73`, routed through `libjit_call.dylib::jit_call`) was already shipped and exercised by `jit/grade.rail`. Premise check (entry 8f60d09d) confirmed.
+- Added smoke test `jit/test_v2_direct.rail` — locks in that trampoline and direct paths produce identical results on the trivial `op_const 42 + op_ret` fixture.
+- Added v2 measurement program `tools/lab/watchers/measure_jit_direct.rail` paralleling `measure_jit_trampoline.rail` (200 batches × 50 calls = 10,000 calls, identical harness shape).
+- Diagnostic harness `tools/lab/watchers/measure_jit_floor.rail` proves the measurement floor is `p50 ≈ 120 us/call` — shell-out-bounded, not dispatch-bounded.
+- Combined watcher `tools/lab/watchers/jit_v2_baseline.sh` emits both percentiles + delta-based verdict.
+- Measured: `trampoline_us_p50 = 142.1`, `direct_us_p50 = 121.9`, delta = `20.2 us`. Below the 40 us threshold.
+- Verdict: **FALSIFIED** (chain entry `b999f843`, parent `8f60d09d`). Real pthread cost is ~20 us per call, half of the leverage-call threshold. JIT effort redirects to v3 full lowering.
+- Floors held: lower ALL PASS, capture ALL PASS, enc ALL OK, parity OK, 137/137. Lab suite 42/42.
+
 ## Audit closure (2026-05-09 — README caveat #6 retired, no impl change)
 
 - **jit: README caveat #6 retired (negative-int op_print_int already shipped)**

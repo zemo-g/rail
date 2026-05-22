@@ -1,0 +1,221 @@
+-- stdlib/jit_emit.rail — Phase 2.5 + 2.9 (v1.5) of trace+JIT plan
+-- (rail-jit-fused-kernels-plan).
+--
+-- Consumes FuseMatch records from stdlib/jit_match.rail and emits the
+-- corresponding Metal Shading Language kernel source as a Rail string.
+--
+-- Phase 2.5 (v5.1.0): generic-shape stubs — buffer-constant SEQ/D
+-- shapes read at dispatch time.  Kept for backward-compat with the
+-- existing jit_compile_rmsnorm_qkv / _silu_hadamard entry points.
+--
+-- Phase 2.9 v1.5 (v5.2 target): shape-specialized emitters.  Shapes
+-- are extracted from the matched JitNodes' .shape field and baked
+-- into the MSL as top-level `constant uint` declarations.  Metal's
+-- compiler can now fully unroll the inner D-loops and constant-fold
+-- index arithmetic.  Each unique (SEQ, D) or N produces a unique MSL
+-- string and (if compiled) a unique pipeline state.
+
+import "stdlib/jit_match.rail"
+
+-- ───────────────────────────────────────────────────────────────────────
+-- Generic-shape emitters (Phase 2.5).  Kept for v5.1.0 callers and for
+-- the byte-verification fixtures.
+-- ───────────────────────────────────────────────────────────────────────
+emit_msl_rmsnorm_qkv _ =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "kernel void fused_rmsnorm_qkv(\n",
+       "    device const float *X    [[buffer(0)]],\n",
+       "    device const float *G    [[buffer(1)]],\n",
+       "    device const float *WQ   [[buffer(2)]],\n",
+       "    device const float *WK   [[buffer(3)]],\n",
+       "    device const float *WV   [[buffer(4)]],\n",
+       "    device float       *Q    [[buffer(5)]],\n",
+       "    device float       *K    [[buffer(6)]],\n",
+       "    device float       *V    [[buffer(7)]],\n",
+       "    constant uint      &SEQ  [[buffer(8)]],\n",
+       "    constant uint      &D    [[buffer(9)]],\n",
+       "    device float       *R    [[buffer(10)]],\n",
+       "    device float       *LN1  [[buffer(11)]],\n",
+       "    uint  row     [[threadgroup_position_in_grid]],\n",
+       "    uint  tid     [[thread_position_in_threadgroup]],\n",
+       "    uint  tg_size [[threads_per_threadgroup]])\n",
+       "{\n",
+       "    threadgroup float partial[64];\n",
+       "    threadgroup float xnorm[256];\n",
+       "    threadgroup float rstd_shared;\n",
+       "    uint base = row * D;\n",
+       "    float s = 0.0f;\n",
+       "    for (uint j = tid; j < D; j += tg_size) {\n",
+       "        float v = X[base + j];\n",
+       "        xnorm[j] = v;\n",
+       "        s += v * v;\n",
+       "    }\n",
+       "    partial[tid] = s;\n",
+       "    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+       "    for (uint off = tg_size >> 1; off > 0; off >>= 1) {\n",
+       "        if (tid < off) partial[tid] += partial[tid + off];\n",
+       "        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+       "    }\n",
+       "    if (tid == 0) {\n",
+       "        float mean_sq = partial[0] / float(D);\n",
+       "        rstd_shared = 1.0f / sqrt(mean_sq + 1.0e-5f);\n",
+       "        R[row] = rstd_shared;\n",
+       "    }\n",
+       "    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+       "    float rstd = rstd_shared;\n",
+       "    for (uint j = tid; j < D; j += tg_size) {\n",
+       "        float xn = xnorm[j] * rstd * G[j];\n",
+       "        xnorm[j] = xn;\n",
+       "        LN1[base + j] = xn;\n",
+       "    }\n",
+       "    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+       "    for (uint c = tid; c < D; c += tg_size) {\n",
+       "        float qsum = 0.0f, ksum = 0.0f, vsum = 0.0f;\n",
+       "        for (uint j = 0; j < D; j++) {\n",
+       "            float xn = xnorm[j];\n",
+       "            qsum += xn * WQ[j * D + c];\n",
+       "            ksum += xn * WK[j * D + c];\n",
+       "            vsum += xn * WV[j * D + c];\n",
+       "        }\n",
+       "        Q[base + c] = qsum;\n",
+       "        K[base + c] = ksum;\n",
+       "        V[base + c] = vsum;\n",
+       "    }\n",
+       "}\n"]
+
+emit_msl_silu_hadamard _ =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "kernel void fused_silu_hadamard(\n",
+       "    device const float *G   [[buffer(0)]],\n",  -- gate input
+       "    device const float *U   [[buffer(1)]],\n",  -- up input
+       "    device float       *O   [[buffer(2)]],\n",  -- output (h_act)
+       "    constant uint      &N   [[buffer(3)]],\n",
+       "    device float       *S   [[buffer(4)]],\n",  -- sigmoid(G), kept for backward
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= N) return;\n",
+       "    float g = G[gid];\n",
+       "    float u = U[gid];\n",
+       "    float sig = 1.0f / (1.0f + exp(-g));\n",
+       "    S[gid] = sig;\n",
+       "    O[gid] = g * sig * u;\n",
+       "}\n"]
+
+-- ───────────────────────────────────────────────────────────────────────
+-- Phase 2.9 v1.5 — shape-specialized emitters.  Each call returns MSL
+-- where the dimensions are top-level `constant uint` declarations
+-- instead of buffer arguments.  Metal can fully unroll the D-loops.
+-- Different (SEQ, D) produces different bytes, validated in the
+-- jit_emit_shaped_smoke fuzz check.
+-- ───────────────────────────────────────────────────────────────────────
+emit_msl_rmsnorm_qkv_shaped seq d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint SEQ = ", show seq, ";\n",
+       "constant uint D = ",   show d,   ";\n\n",
+       "kernel void fused_rmsnorm_qkv(\n",
+       "    device const float *X    [[buffer(0)]],\n",
+       "    device const float *G    [[buffer(1)]],\n",
+       "    device const float *WQ   [[buffer(2)]],\n",
+       "    device const float *WK   [[buffer(3)]],\n",
+       "    device const float *WV   [[buffer(4)]],\n",
+       "    device float       *Q    [[buffer(5)]],\n",
+       "    device float       *K    [[buffer(6)]],\n",
+       "    device float       *V    [[buffer(7)]],\n",
+       "    device float       *R    [[buffer(10)]],\n",
+       "    device float       *LN1  [[buffer(11)]],\n",
+       "    uint  row     [[threadgroup_position_in_grid]],\n",
+       "    uint  tid     [[thread_position_in_threadgroup]],\n",
+       "    uint  tg_size [[threads_per_threadgroup]])\n",
+       "{\n",
+       "    threadgroup float partial[64];\n",
+       "    threadgroup float xnorm[256];\n",
+       "    threadgroup float rstd_shared;\n",
+       "    uint base = row * D;\n",
+       "    float s = 0.0f;\n",
+       "    for (uint j = tid; j < D; j += tg_size) {\n",
+       "        float v = X[base + j];\n",
+       "        xnorm[j] = v;\n",
+       "        s += v * v;\n",
+       "    }\n",
+       "    partial[tid] = s;\n",
+       "    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+       "    for (uint off = tg_size >> 1; off > 0; off >>= 1) {\n",
+       "        if (tid < off) partial[tid] += partial[tid + off];\n",
+       "        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+       "    }\n",
+       "    if (tid == 0) {\n",
+       "        float mean_sq = partial[0] / float(D);\n",
+       "        rstd_shared = 1.0f / sqrt(mean_sq + 1.0e-5f);\n",
+       "        R[row] = rstd_shared;\n",
+       "    }\n",
+       "    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+       "    float rstd = rstd_shared;\n",
+       "    for (uint j = tid; j < D; j += tg_size) {\n",
+       "        float xn = xnorm[j] * rstd * G[j];\n",
+       "        xnorm[j] = xn;\n",
+       "        LN1[base + j] = xn;\n",
+       "    }\n",
+       "    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+       "    for (uint c = tid; c < D; c += tg_size) {\n",
+       "        float qsum = 0.0f, ksum = 0.0f, vsum = 0.0f;\n",
+       "        for (uint j = 0; j < D; j++) {\n",
+       "            float xn = xnorm[j];\n",
+       "            qsum += xn * WQ[j * D + c];\n",
+       "            ksum += xn * WK[j * D + c];\n",
+       "            vsum += xn * WV[j * D + c];\n",
+       "        }\n",
+       "        Q[base + c] = qsum;\n",
+       "        K[base + c] = ksum;\n",
+       "        V[base + c] = vsum;\n",
+       "    }\n",
+       "}\n"]
+
+emit_msl_silu_hadamard_shaped n =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint N = ", show n, ";\n\n",
+       "kernel void fused_silu_hadamard(\n",
+       "    device const float *G   [[buffer(0)]],\n",
+       "    device const float *U   [[buffer(1)]],\n",
+       "    device float       *O   [[buffer(2)]],\n",
+       "    device float       *S   [[buffer(4)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= N) return;\n",
+       "    float g = G[gid];\n",
+       "    float u = U[gid];\n",
+       "    float sig = 1.0f / (1.0f + exp(-g));\n",
+       "    S[gid] = sig;\n",
+       "    O[gid] = g * sig * u;\n",
+       "}\n"]
+
+-- ───────────────────────────────────────────────────────────────────────
+-- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
+-- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
+-- its N = seq * d_ff.
+-- ───────────────────────────────────────────────────────────────────────
+node_seq node = head (node_shape node)
+node_d   node = head (tail (node_shape node))
+node_n   node = (head (node_shape node)) * (head (tail (node_shape node)))
+
+-- ───────────────────────────────────────────────────────────────────────
+-- Pattern dispatch — Phase 2.5 generic stubs.
+-- ───────────────────────────────────────────────────────────────────────
+emit_msl_for_match _ m = match m
+  | FuseRmsQKV _ _ _ _ -> emit_msl_rmsnorm_qkv 0
+  | FuseSiluHad _ _    -> emit_msl_silu_hadamard 0
+
+-- ───────────────────────────────────────────────────────────────────────
+-- Phase 2.9 v1.5 — shape-aware dispatch.  Looks up the matched node's
+-- shape and emits specialized MSL.
+-- ───────────────────────────────────────────────────────────────────────
+emit_msl_for_match_shaped tape m = match m
+  | FuseRmsQKV rms_idx _ _ _ ->
+    let rms_node = jit_tape_get tape rms_idx
+    emit_msl_rmsnorm_qkv_shaped (node_seq rms_node) (node_d rms_node)
+  | FuseSiluHad silu_idx _ ->
+    let silu_node = jit_tape_get tape silu_idx
+    emit_msl_silu_hadamard_shaped (node_n silu_node)

@@ -914,3 +914,133 @@ kernel void tensor_softmax_f16(
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════
+// Transformer fused ops (added 2026-05-14)
+// CPU-equivalent in stdlib/transformer.rail:
+//   rms_rows_save / rope_row_pairs / silu_fwd_loop
+// Inputs/outputs are float (f32) as throughout this lib;
+// host-side f64↔f32 staging is done in tensor_gpu_lib.m wrappers.
+// ═══════════════════════════════════════════════════════════
+
+// One threadgroup per row; 64 threads cooperatively reduce sum(x²),
+// then each thread writes y[col] = x[col] * rstd * gamma[col].
+kernel void rmsnorm_save(
+    device const float *X      [[buffer(0)]],
+    device float       *Y      [[buffer(1)]],
+    device const float *G      [[buffer(2)]],
+    device float       *RSTD   [[buffer(3)]],
+    constant uint      &DIM    [[buffer(4)]],
+    constant float     &EPS    [[buffer(5)]],
+    uint  row     [[threadgroup_position_in_grid]],
+    uint  tid     [[thread_position_in_threadgroup]],
+    uint  tg_size [[threads_per_threadgroup]])
+{
+    uint base = row * DIM;
+    threadgroup float partial[64];
+    float s = 0.0f;
+    for (uint j = tid; j < DIM; j += tg_size) {
+        float v = X[base + j];
+        s += v * v;
+    }
+    partial[tid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // tree reduce
+    for (uint off = tg_size >> 1; off > 0; off >>= 1) {
+        if (tid < off) partial[tid] += partial[tid + off];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float rstd_shared;
+    if (tid == 0) {
+        float mean_sq = partial[0] / float(DIM);
+        rstd_shared = 1.0f / sqrt(mean_sq + EPS);
+        RSTD[row] = rstd_shared;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rstd = rstd_shared;
+    for (uint j = tid; j < DIM; j += tg_size) {
+        Y[base + j] = X[base + j] * rstd * G[j];
+    }
+}
+
+// In-place RoPE: rotates pair (x[base+2j], x[base+2j+1]) by angle = pos * 10000^(-2j/d).
+// Sign = +1 forward, -1 inverse.  Grid: (seq × d/2) threads.
+kernel void rope_apply(
+    device float       *X      [[buffer(0)]],
+    constant uint      &SEQ    [[buffer(1)]],
+    constant uint      &D      [[buffer(2)]],
+    constant float     &SIGN   [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint p = gid.y;
+    uint j = gid.x;
+    uint half_d = D >> 1;
+    if (p >= SEQ || j >= half_d) return;
+
+    float theta_exp = -2.0f * float(j) / float(D);
+    float theta = pow(10000.0f, theta_exp);
+    float angle = float(p) * theta;
+    float c = cos(angle);
+    float s = sin(angle) * SIGN;
+
+    uint i0 = p * D + 2u * j;
+    uint i1 = i0 + 1u;
+    float x0 = X[i0];
+    float x1 = X[i1];
+    X[i0] = x0 * c - x1 * s;
+    X[i1] = x0 * s + x1 * c;
+}
+
+// SiLU forward: y = x * σ(x), also writes σ(x) into SIG for backward reuse.
+kernel void silu_fwd(
+    device const float *X      [[buffer(0)]],
+    device float       *Y      [[buffer(1)]],
+    device float       *SIG    [[buffer(2)]],
+    constant uint      &N      [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= N) return;
+    float x = X[gid];
+    float s = 1.0f / (1.0f + exp(-x));
+    SIG[gid] = s;
+    Y[gid]   = x * s;
+}
+
+// ═══════════════════════════════════════════════════════════
+// bfloat16 matmul (added 2026-05-14)
+// Same shape as matmul_f16 but uses Apple Metal's `bfloat` type
+// (1+8+7 bits: f32 exponent range, half the mantissa).  fp16
+// blows up at step ~2759 because activations overflow f16's
+// 65,504 ceiling.  bf16's max is ~3.4e38 (same as f32) → that
+// overflow simply can't happen.  Memory savings vs f32 stay 2×.
+// Accumulator stays fp32 to avoid reduction drift.
+// ═══════════════════════════════════════════════════════════
+
+kernel void matmul_bf16(
+    device const bfloat *A [[buffer(0)]],
+    device const bfloat *B [[buffer(1)]],
+    device bfloat *C [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    constant uint &K [[buffer(4)]],
+    constant uint &N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint row = gid.y; uint col = gid.x;
+    threadgroup bfloat As[TILE][TILE];
+    threadgroup bfloat Bs[TILE][TILE];
+    float sum = 0.0f;
+    uint numTiles = (K + TILE - 1) / TILE;
+    for (uint t = 0; t < numTiles; t++) {
+        uint aCol = t * TILE + lid.x;
+        uint bRow = t * TILE + lid.y;
+        As[lid.y][lid.x] = (row < M && aCol < K) ? A[row * K + aCol] : bfloat(0.0f);
+        Bs[lid.y][lid.x] = (bRow < K && col < N) ? B[bRow * N + col] : bfloat(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < TILE; i++) sum += float(As[lid.y][i]) * float(Bs[i][lid.x]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < M && col < N) C[row * N + col] = bfloat(sum);
+}
