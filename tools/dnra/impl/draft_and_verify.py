@@ -37,8 +37,25 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
-from tools.dnra.impl.sources.rfc import get_section  # type: ignore[import-not-found]
+from tools.dnra.impl.sources.rfc import get_section as rfc_get_section  # type: ignore[import-not-found]
+from tools.dnra.impl.sources.posix import get_section as posix_get_section  # type: ignore[import-not-found]
 from tools.dnra.impl.verify_citation import verify_pair  # type: ignore[import-not-found]
+
+
+def fetch_for_topic(ident, section: str) -> tuple[str, str | None]:
+    """Return (source_string, section_text-or-None) for the given topic.
+
+    Polymorphic on the identifier: int -> RFC, str -> POSIX function.
+    """
+    if isinstance(ident, int):
+        return f"RFC {ident}", rfc_get_section(ident, section)
+    return "POSIX.1-2017", posix_get_section(ident, section)
+
+
+def topic_label(ident, section: str) -> str:
+    if isinstance(ident, int):
+        return f"RFC {ident} section {section}"
+    return f"POSIX function {ident} section {section}"
 
 
 LLM_URL = "http://localhost:8082/v1/chat/completions"
@@ -63,17 +80,25 @@ SYSTEM = (
 )
 
 
-def build_user_msg_keep(rfc_num: int, section: str, section_text: str) -> str:
+def _cite_phrase(ident, section: str) -> str:
+    if isinstance(ident, int):
+        return f"Cite: RFC {ident} section {section}"
+    return f"Cite: POSIX.1-2017 {ident}() section {section}"
+
+
+def build_user_msg_keep(ident, section: str, section_text: str) -> str:
+    src_line = topic_label(ident, section)
+    cite_phrase = _cite_phrase(ident, section)
     return (
-        f"Source: RFC {rfc_num} section {section}\n"
+        f"Source: {src_line}\n"
         f"Section text:\n<<<\n{section_text}\n>>>\n\n"
         "Construct ONE (prompt, target) pair satisfying ALL of these rules:\n"
         "1. prompt: a clear, single-sentence question whose answer is "
         "   determined by the section text above.\n"
         "2. target: open with Yes / No / or a short claim, then quote the "
         "   load-bearing clause VERBATIM from the section text in DOUBLE "
-        "   quotes, then derive the conclusion in one to three short "
-        "   sentences. End with 'Cite: RFC <num> section <section>'.\n"
+        f"   quotes, then derive the conclusion in one to three short "
+        f"   sentences. End with '{cite_phrase}'.\n"
         "3. The verbatim quote MUST be a contiguous substring of the "
         "   section text. Do NOT insert ellipses or paraphrase inside the "
         "   quoted span.\n"
@@ -83,9 +108,11 @@ def build_user_msg_keep(rfc_num: int, section: str, section_text: str) -> str:
     )
 
 
-def build_user_msg_invert(rfc_num: int, section: str, section_text: str) -> str:
+def build_user_msg_invert(ident, section: str, section_text: str) -> str:
+    src_line = topic_label(ident, section)
+    cite_phrase = _cite_phrase(ident, section)
     return (
-        f"Source: RFC {rfc_num} section {section}\n"
+        f"Source: {src_line}\n"
         f"Section text:\n<<<\n{section_text}\n>>>\n\n"
         "Construct ONE (prompt, target) pair that TRAINS THE READER TO "
         "DISTINGUISH RECOMMENDATION FROM REQUIREMENT. Specifically:\n\n"
@@ -99,7 +126,7 @@ def build_user_msg_invert(rfc_num: int, section: str, section_text: str) -> str:
         "   (SHOULD, MAY, RECOMMENDED, etc.) -- exactly as it appears. Then "
         "   derive in 1-3 short sentences why the prompt's stronger reading "
         "   is wrong (point at the verb). End with "
-        "   'Cite: RFC <num> section <section>'.\n"
+        f"   '{cite_phrase}'.\n"
         "3. The quote MUST be a contiguous substring of the section text. "
         "   Do NOT paraphrase inside the quotation.\n"
         "4. If the section's strongest modal verb is itself MUST or SHALL "
@@ -112,12 +139,12 @@ def build_user_msg_invert(rfc_num: int, section: str, section_text: str) -> str:
     )
 
 
-def call_llm(rfc_num: int, section: str, section_text: str, polarity: str,
+def call_llm(ident, section: str, section_text: str, polarity: str,
              temp: float, max_tokens: int) -> str:
     if polarity == "invert":
-        user_msg = build_user_msg_invert(rfc_num, section, section_text)
+        user_msg = build_user_msg_invert(ident, section, section_text)
     else:
-        user_msg = build_user_msg_keep(rfc_num, section, section_text)
+        user_msg = build_user_msg_keep(ident, section, section_text)
     body = {
         "model": MODEL,
         "messages": [
@@ -181,15 +208,23 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    accepted = []
+    accepted_count = 0
     counters: dict[str, int] = {}
     print(f"drafting + verifying {len(topics)} topics; model={MODEL}")
     print(f"output: {out_path}\n")
+    # Open the output file once and write each PASS pair as it lands,
+    # so a long batch streams progress (and survives an early kill).
+    out_mode = "a" if args.append else "w"
+    out_fh = open(out_path, out_mode)
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        pass  # not a TextIO with reconfigure (rare; ignore)
 
-    for i, (rfc_num, section, polarity) in enumerate(topics, start=args.id_start):
+    for i, (ident, section, polarity) in enumerate(topics, start=args.id_start):
         topic_id = f"{args.id_prefix}-{i:03d}"
-        print(f"  [{i}/{len(topics)}] {topic_id}  RFC {rfc_num} section {section}  polarity={polarity}")
-        section_text = get_section(rfc_num, section)
+        print(f"  [{i}/{len(topics)}] {topic_id}  {topic_label(ident, section)}  polarity={polarity}")
+        source_str, section_text = fetch_for_topic(ident, section)
         if section_text is None:
             print(f"      SKIP: section fetch returned None")
             counters["SKIP_FETCH"] = counters.get("SKIP_FETCH", 0) + 1
@@ -197,7 +232,7 @@ def main():
 
         t0 = time.time()
         try:
-            raw = call_llm(rfc_num, section, section_text, polarity, args.temp, args.max_tokens)
+            raw = call_llm(ident, section, section_text, polarity, args.temp, args.max_tokens)
         except Exception as e:
             print(f"      SKIP: LLM call failed: {e}")
             counters["SKIP_LLM"] = counters.get("SKIP_LLM", 0) + 1
@@ -216,10 +251,18 @@ def main():
             counters["SKIP_EMPTY"] = counters.get("SKIP_EMPTY", 0) + 1
             continue
 
+        # For POSIX topics, the verifier expects the function name to live
+        # inside the `section` field (e.g. "close / DESCRIPTION") so that
+        # resolve_source can route to the right function page.  For RFC
+        # topics the section number alone is already enough.
+        if isinstance(ident, str):
+            stored_section = f"{ident} / {section}"
+        else:
+            stored_section = section
         pair = {
             "id": topic_id,
-            "source": f"RFC {rfc_num}",
-            "section": section,
+            "source": source_str,
+            "section": stored_section,
             "polarity": polarity,
             "prompt": parsed["prompt"],
             "target": parsed["target"],
@@ -228,7 +271,9 @@ def main():
         counters[verdict["status"]] = counters.get(verdict["status"], 0) + 1
         print(f"      gen={elapsed}ms  verdict={verdict['status']}  {verdict['notes']}")
         if verdict["status"] == "PASS":
-            accepted.append(pair)
+            out_fh.write(json.dumps(pair, separators=(",", ":")) + "\n")
+            out_fh.flush()
+            accepted_count += 1
         # Stream first 2 results in full so the user can spot-check.
         if i <= 2:
             print(f"      --- prompt ---")
@@ -238,15 +283,9 @@ def main():
                 print("      " + line)
         print()
 
-    if accepted:
-        mode = "a" if args.append else "w"
-        with open(out_path, mode) as f:
-            for p in accepted:
-                f.write(json.dumps(p, separators=(",", ":")) + "\n")
-        verb = "appended" if args.append else "wrote"
-        print(f"{verb} {len(accepted)} PASS pairs to {out_path}")
-    else:
-        print("no PASS pairs to write")
+    out_fh.close()
+    verb = "appended" if args.append else "wrote"
+    print(f"{verb} {accepted_count} PASS pair(s) to {out_path}")
 
     print()
     print("==== run summary ====")
