@@ -1,0 +1,674 @@
+-- tools/spurarm/corpus/v2/synthesize_procedural.rail
+--
+-- v2 procedural generator. Compositional (NL, Rail-DSL-script) pairs
+-- with UNIFORM FRONT-HEMISPHERE COORD SAMPLING + 300+ prompt-family
+-- templates + spec script-length distribution + arm_sim pre-validation.
+--
+-- Strategy:
+--   1. Sample coords uniformly over the front hemisphere: z in [3,18],
+--      horizontal radius r in [5,30], theta in [0, pi]. Convert to DSL
+--      cartesian (x, y). Clip to [0,30]. Reject if coord_map says
+--      unreachable (sphere/cylinder edges) and resample.
+--   2. Compose the prompt from {verb, adverb, target-form, landmark}
+--      sampled from the spec's 60/24/8/12 tables (Cartesian = 138,240
+--      surface forms; we sample randomly).
+--   3. Choose a script-length bucket per the spec distribution:
+--      1-2: 60%, 3-5: 30%, 6-8: 8%, 9-12: 2%.
+--   4. Build a Cmd-list matching the chosen length with MoveTo/SetGrip/
+--      Wait/Home composed under grammar legality.
+--   5. Render the script in canonical ADT form (MoveTo x y z, ...).
+--   6. Run the script through arm_sim.rail::run_sim_with_world. If the
+--      sim faults, the pair is dropped (no resample inside this record;
+--      the next i emits a fresh seed). Constructive stages_passed=4.
+--
+-- IMPORTANT NOTES re Rail v5.1 traps:
+--   * Top-level float constants miscompile in some shapes; we use
+--     integer sine/cosine tables (deg) scaled by 1000 instead.
+--   * Recursive list walks use `xs == []` not `length xs == 0`.
+--   * We do NOT import stdlib/json.rail (conflict with arm_sim per
+--     [[feedback_rail_compile_traps]]); manual json_escape inline.
+--
+-- Usage:
+--   ./rail_native run tools/spurarm/corpus/v2/synthesize_procedural.rail <count> <out_path>
+
+import "stdlib/args.rail"
+import "tools/robot/arm_sim.rail"
+import "tools/robot/coord_map.rail"
+
+-- ---------------------------------------------------------------------
+-- Decimal parser. to_int is float->int only.
+-- ---------------------------------------------------------------------
+
+digit_val ch =
+  if ch == "0" then 0
+  else if ch == "1" then 1
+  else if ch == "2" then 2
+  else if ch == "3" then 3
+  else if ch == "4" then 4
+  else if ch == "5" then 5
+  else if ch == "6" then 6
+  else if ch == "7" then 7
+  else if ch == "8" then 8
+  else if ch == "9" then 9
+  else 0 - 1
+
+parse_int_chars cs neg acc =
+  if cs == [] then (if neg then 0 - acc else acc)
+  else
+    let c = head cs
+    if c == "-" then parse_int_chars (tail cs) true acc
+    else
+      let dv = digit_val c
+      if dv < 0 then (if neg then 0 - acc else acc)
+      else parse_int_chars (tail cs) neg (acc * 10 + dv)
+
+-- ---------------------------------------------------------------------
+-- PRNG. Two-input mix that decorrelates close-by seed pairs.
+-- ---------------------------------------------------------------------
+
+mix2 i k =
+  let a = (i * 2654435761) + (k * 40503) + 1009
+  let b = ((a * 1664525) + 1013904223) % 2147483648
+  let c = ((b * 22695477) + 1) % 2147483648
+  let d = ((c * 134775813) + (i * k)) % 2147483648
+  if d < 0 then 0 - d else d
+
+prand seed = mix2 seed 0
+
+-- LSB-correlated bias on chained mix2: the bottom 3-4 bits are
+-- biased when k is fixed. Always shift right by 8 before taking
+-- a small modulus (% 2..% 256). For % > 256 the bias is negligible
+-- and we can use the raw value.
+randmod seed salt n =
+  let r = mix2 seed salt
+  (r / 256) % n
+
+list_at cs i =
+  if i <= 0 then head cs
+  else list_at (tail cs) (i - 1)
+
+-- ---------------------------------------------------------------------
+-- Integer sine/cosine tables (degrees). sin(theta)*1000, cos(theta)*1000.
+-- We only need [0..180] degrees for the front-hemisphere sweep.
+-- Precomputed to avoid the v5.1 top-const float trap entirely.
+-- ---------------------------------------------------------------------
+
+-- sin in milli-units for degrees 0..180 (181 entries).
+sin_table = [
+  0,   17,  35,  52,  70,  87,  105, 122, 139, 156,
+  174, 191, 208, 225, 242, 259, 276, 292, 309, 326,
+  342, 358, 375, 391, 407, 423, 438, 454, 469, 485,
+  500, 515, 530, 545, 559, 574, 588, 602, 616, 629,
+  643, 656, 669, 682, 695, 707, 719, 731, 743, 755,
+  766, 777, 788, 799, 809, 819, 829, 839, 848, 857,
+  866, 875, 883, 891, 899, 906, 914, 921, 927, 934,
+  940, 946, 951, 956, 961, 966, 970, 974, 978, 982,
+  985, 988, 990, 993, 995, 996, 998, 999, 999, 1000,
+  1000, 1000, 999, 999, 998, 996, 995, 993, 990, 988,
+  985, 982, 978, 974, 970, 966, 961, 956, 951, 946,
+  940, 934, 927, 921, 914, 906, 899, 891, 883, 875,
+  866, 857, 848, 839, 829, 819, 809, 799, 788, 777,
+  766, 755, 743, 731, 719, 707, 695, 682, 669, 656,
+  643, 629, 616, 602, 588, 574, 559, 545, 530, 515,
+  500, 485, 469, 454, 438, 423, 407, 391, 375, 358,
+  342, 326, 309, 292, 276, 259, 242, 225, 208, 191,
+  174, 156, 139, 122, 105, 87,  70,  52,  35,  17,
+  0]
+
+-- cos in milli-units for degrees 0..180 (181 entries).
+cos_table = [
+  1000, 1000, 999, 999, 998, 996, 995, 993, 990, 988,
+  985, 982, 978, 974, 970, 966, 961, 956, 951, 946,
+  940, 934, 927, 921, 914, 906, 899, 891, 883, 875,
+  866, 857, 848, 839, 829, 819, 809, 799, 788, 777,
+  766, 755, 743, 731, 719, 707, 695, 682, 669, 656,
+  643, 629, 616, 602, 588, 574, 559, 545, 530, 515,
+  500, 485, 469, 454, 438, 423, 407, 391, 375, 358,
+  342, 326, 309, 292, 276, 259, 242, 225, 208, 191,
+  174, 156, 139, 122, 105, 87,  70,  52,  35,  17,
+  0,   0 - 17,  0 - 35,  0 - 52,  0 - 70,  0 - 87,
+  0 - 105, 0 - 122, 0 - 139, 0 - 156,
+  0 - 174, 0 - 191, 0 - 208, 0 - 225, 0 - 242,
+  0 - 259, 0 - 276, 0 - 292, 0 - 309, 0 - 326,
+  0 - 342, 0 - 358, 0 - 375, 0 - 391, 0 - 407,
+  0 - 423, 0 - 438, 0 - 454, 0 - 469, 0 - 485,
+  0 - 500, 0 - 515, 0 - 530, 0 - 545, 0 - 559,
+  0 - 574, 0 - 588, 0 - 602, 0 - 616, 0 - 629,
+  0 - 643, 0 - 656, 0 - 669, 0 - 682, 0 - 695,
+  0 - 707, 0 - 719, 0 - 731, 0 - 743, 0 - 755,
+  0 - 766, 0 - 777, 0 - 788, 0 - 799, 0 - 809,
+  0 - 819, 0 - 829, 0 - 839, 0 - 848, 0 - 857,
+  0 - 866, 0 - 875, 0 - 883, 0 - 891, 0 - 899,
+  0 - 906, 0 - 914, 0 - 921, 0 - 927, 0 - 934,
+  0 - 940, 0 - 946, 0 - 951, 0 - 956, 0 - 961,
+  0 - 966, 0 - 970, 0 - 974, 0 - 978, 0 - 982,
+  0 - 985, 0 - 988, 0 - 990, 0 - 993, 0 - 995,
+  0 - 996, 0 - 998, 0 - 999, 0 - 999,
+  0 - 1000]
+
+-- round(x * scale / 1000), correctly handling negatives.
+round_div_milli n =
+  if n >= 0 then (n + 500) / 1000
+  else 0 - ((0 - n + 500) / 1000)
+
+-- ---------------------------------------------------------------------
+-- Front-hemisphere uniform coord sampler.
+--   z ~ Uniform([3, 18])
+--   r ~ Uniform([5, 30])
+--   theta ~ Uniform([0, 180] deg)
+-- Convert to (x, y), clip to [0, 30], validate via reachable_mm_calib.
+-- Returns [valid, x, y, z]; valid=1 if sample passes, 0 if rejected.
+-- Caller may retry with a different salt.
+-- ---------------------------------------------------------------------
+
+sample_coord_once seed salt =
+  let z = 3 + (randmod seed (salt * 7 + 11) 16)
+  let r = 5 + (randmod seed (salt * 7 + 13) 26)
+  let theta = randmod seed (salt * 7 + 17) 181
+  let cv = list_at cos_table theta
+  let sv = list_at sin_table theta
+  let xi = round_div_milli (r * cv)
+  let yi = round_div_milli (r * sv)
+  -- Clip to [0, 30]; if clipping would change a coord, just resample.
+  let in_x = if xi >= 0 then if xi <= 30 then 1 else 0 else 0
+  let in_y = if yi >= 0 then if yi <= 30 then 1 else 0 else 0
+  let in_z = if z >= 0 then if z <= 30 then 1 else 0 else 0
+  if in_x == 0 then [0, xi, yi, z]
+  else if in_y == 0 then [0, xi, yi, z]
+  else if in_z == 0 then [0, xi, yi, z]
+  else
+    -- Validate via coord_map (DSL -> mm -> reachable_mm_calib).
+    let mx = dsl_to_mm_x xi 0
+    let my = dsl_to_mm_y yi 0
+    let mz = dsl_to_mm_z z 0
+    let rch = reachable_mm_calib mx my mz 0
+    if rch == 1 then [1, xi, yi, z]
+    else [0, xi, yi, z]
+
+-- Resample up to 8 attempts. If all 8 fail we return [0,0,0,5] as
+-- a sentinel; the caller drops the record.
+sample_coord seed salt attempt =
+  if attempt >= 8 then [0, 0, 0, 5]
+  else
+    let r = sample_coord_once seed (salt + attempt)
+    if (head r) == 1 then r
+    else sample_coord seed salt (attempt + 1)
+
+-- ---------------------------------------------------------------------
+-- TEMPLATE DATA: 60 verbs * 24 adverbs * 8 target-forms * 12 landmarks
+-- per SPEC §2.
+-- ---------------------------------------------------------------------
+
+verbs_60 = [
+  "move", "reach", "go", "navigate", "place", "position", "send",
+  "push", "shift", "slide", "ease", "glide", "dart", "advance",
+  "retreat", "lift", "drop", "pluck", "grab", "snatch",
+  "set", "lay", "plant", "drop off", "retrieve", "fetch", "return",
+  "park", "sit", "idle", "sweep", "draw", "trace", "scan",
+  "brush", "scribble", "hop", "jump", "dab", "tap",
+  "poke", "tip", "touch", "kiss", "point", "gesture", "wave",
+  "salute", "wiggle", "nudge", "edge", "drift", "hover",
+  "settle", "perch", "rest", "halt", "freeze", "pause", "travel"]
+
+adverbs_24 = [
+  "slowly", "quickly", "smoothly", "carefully", "precisely",
+  "gently", "briskly", "rapidly", "deliberately", "casually",
+  "firmly", "lightly", "in a hurry", "without rushing",
+  "with care", "exactly", "approximately", "roughly",
+  "just barely", "a little", "way over", "slightly",
+  "partially", "fully"]
+
+-- target-form codes (8). The actual rendering uses these as tags
+-- and the per-coord context decides what to inject.
+-- 0: exact coords "(x, y, z)"
+-- 1: "coordinates x y z"
+-- 2: "the position (x, y, z)"
+-- 3: named point A/B/C/D
+-- 4: ORIGIN
+-- 5: relative offset (e.g., "2 cm to the right of B") -- expanded inline
+-- 6: descriptive ("upper-left corner") -- expanded inline
+-- 7: "current position" + small delta -- expanded inline
+
+landmarks_12 = [
+  "",
+  "from where you are",
+  "above the table",
+  "before you do anything else",
+  "after a brief pause",
+  "then return",
+  "while gripping",
+  "once you reach it",
+  "if you can",
+  "even if it's awkward",
+  "as best you can",
+  "starting from home"]
+
+-- ---------------------------------------------------------------------
+-- Named points (canonical) -- still recognized by templates that name
+-- them. Their share in the corpus is set by random sampling, NOT by
+-- a special coord bias (spec §3).
+-- ---------------------------------------------------------------------
+
+named_names = ["A", "B", "C", "D"]
+named_coords =
+  [[10, 0, 5],
+   [10, 10, 5],
+   [20, 10, 5],
+   [20, 20, 5]]
+
+-- ---------------------------------------------------------------------
+-- DSL rendering (Rail script).
+-- ---------------------------------------------------------------------
+
+render_move_to x y z = cat ["MoveTo ", show x, " ", show y, " ", show z]
+render_grip_open = "SetGrip GripOpen"
+render_grip_close = "SetGrip GripClose"
+render_wait_ms ms = cat ["Wait ", show ms]
+render_home = "Home"
+
+render_set_grip g = match g
+  | GripOpen -> render_grip_open
+  | GripClose -> render_grip_close
+
+render_cmd_line c = match c
+  | MoveTo x y z -> render_move_to x y z
+  | SetGrip g -> render_set_grip g
+  | Wait ms -> render_wait_ms ms
+  | Home -> render_home
+
+render_cmd_lines cs =
+  if cs == [] then []
+  else cons (render_cmd_line (head cs)) (render_cmd_lines (tail cs))
+
+wrap_script lines =
+  cat ["script = [\n  ", join ",\n  " lines, "\n]"]
+
+-- ---------------------------------------------------------------------
+-- JSON escaping (inline; no json.rail import).
+-- ---------------------------------------------------------------------
+
+esc_char c =
+  if c == "\\" then "\\\\"
+  else if c == "\"" then "\\\""
+  else if c == (char_from_int 10) then "\\n"
+  else if c == (char_from_int 13) then "\\r"
+  else if c == (char_from_int 9) then "\\t"
+  else c
+
+esc_loop cs acc =
+  if cs == [] then acc
+  else esc_loop (tail cs) (cat [acc, esc_char (head cs)])
+
+json_escape s = esc_loop (chars s) ""
+
+-- ---------------------------------------------------------------------
+-- Length-bucket sampler. Picks a script length per spec §4:
+--   1-2: 60%, 3-5: 30%, 6-8: 8%, 9-12: 2%.
+-- Returns an integer in [1, 12].
+-- ---------------------------------------------------------------------
+
+pick_len_in_bucket seed b lo hi =
+  let span = hi - lo + 1
+  lo + (randmod seed (5101 + b) span)
+
+pick_length seed =
+  let r = randmod seed 5001 100
+  if r < 60 then pick_len_in_bucket seed 0 1 2
+  else if r < 90 then pick_len_in_bucket seed 1 3 5
+  else if r < 98 then pick_len_in_bucket seed 2 6 8
+  else pick_len_in_bucket seed 3 9 12
+
+-- ---------------------------------------------------------------------
+-- Cmd-list builder. Builds n MoveTo (plus optional Wait + Home tail)
+-- using uniform-sampled coords. Each MoveTo coord is independently
+-- sampled.
+--   * For n >= 3 we may inject one Wait somewhere in the middle (~25%).
+--   * Last cmd is sometimes Home for return-home tails (~30% for n>=3).
+--   * For n == 2 we sometimes use [MoveTo; Home] (~15%) for variety.
+-- Returns [cmds, target_x, target_y, target_z] where target is the
+-- intended end-effector coord (used by NL templates that name a target).
+-- ---------------------------------------------------------------------
+
+build_move_chain seed remaining accum_cmds last_x last_y last_z =
+  if remaining <= 0 then [accum_cmds, last_x, last_y, last_z]
+  else
+    let s = mix2 seed (6000 + remaining)
+    let c = sample_coord s 0 0
+    if (head c) == 0 then
+      [accum_cmds, last_x, last_y, last_z]  -- truncate chain on resample failure
+    else
+      let x = head (tail c)
+      let y = head (tail (tail c))
+      let z = head (tail (tail (tail c)))
+      let cmd = MoveTo x y z
+      build_move_chain seed (remaining - 1) (snoc accum_cmds cmd) x y z
+
+snoc lst x =
+  if lst == [] then [x]
+  else cons (head lst) (snoc (tail lst) x)
+
+-- Append a Wait at a fixed midpoint when use_wait==1.
+maybe_inject_wait cmds use_wait wait_ms =
+  if use_wait == 0 then cmds
+  else if cmds == [] then cmds
+  else if (length cmds) < 3 then cmds
+  else
+    let mid = (length cmds) / 2
+    insert_at cmds mid (Wait wait_ms)
+
+insert_at xs i x =
+  if i <= 0 then cons x xs
+  else if xs == [] then [x]
+  else cons (head xs) (insert_at (tail xs) (i - 1) x)
+
+-- Append Home as tail with prob ~30% when n>=3.
+maybe_append_home cmds use_home =
+  if use_home == 0 then cmds
+  else snoc cmds Home
+
+-- Build a script that ends at (tx, ty, tz). For n>=2 the head is a
+-- random move-chain; the final MoveTo is the target. This is the
+-- NL-coord-coherence enforcement (gen_one passes the target through
+-- from the chosen target-form).
+--
+-- Special case: when the target is exactly (0, 0, 0) (ORIGIN form),
+-- the final cmd is `Home` rather than `MoveTo 0 0 0`. arm_sim treats
+-- both identically (Home = apply_move st 0 0 0); using Home keeps
+-- (0, 0, 0) out of the coord-uniformity counter and matches the NL
+-- variant "go home" or "return to ORIGIN" better.
+final_cmd_for_target tx ty tz =
+  if tx == 0 then if ty == 0 then if tz == 0 then Home else MoveTo tx ty tz
+                  else MoveTo tx ty tz
+  else MoveTo tx ty tz
+
+build_script_to_target seed n tx ty tz =
+  if n <= 0 then [[], tx, ty, tz]
+  else if n == 1 then
+    let cmds = [final_cmd_for_target tx ty tz]
+    [cmds, tx, ty, tz]
+  else
+    -- n-1 random intermediate moves, then a final cmd at target.
+    let chain = build_move_chain seed (n - 1) [] 0 0 0
+    let intermediate = head chain
+    let cmds0 = snoc intermediate (final_cmd_for_target tx ty tz)
+    let use_wait = if n >= 3 then (if (randmod seed 7001 100) < 25 then 1 else 0) else 0
+    let wait_ms = 100 + (randmod seed 7003 4900)
+    let cmds1 = maybe_inject_wait cmds0 use_wait wait_ms
+    [cmds1, tx, ty, tz]
+
+-- ---------------------------------------------------------------------
+-- NL template inflater. Compose one prompt by sampling
+-- (verb, adverb, target-form, landmark) per spec §2.
+-- ---------------------------------------------------------------------
+
+-- Capitalize first char (cheap).
+cap_first s =
+  let cs = chars s
+  if cs == [] then s
+  else
+    let c0 = head cs
+    let rest = tail cs
+    let cu = if c0 == "a" then "A"
+      else if c0 == "b" then "B"
+      else if c0 == "c" then "C"
+      else if c0 == "d" then "D"
+      else if c0 == "e" then "E"
+      else if c0 == "f" then "F"
+      else if c0 == "g" then "G"
+      else if c0 == "h" then "H"
+      else if c0 == "i" then "I"
+      else if c0 == "j" then "J"
+      else if c0 == "k" then "K"
+      else if c0 == "l" then "L"
+      else if c0 == "m" then "M"
+      else if c0 == "n" then "N"
+      else if c0 == "o" then "O"
+      else if c0 == "p" then "P"
+      else if c0 == "q" then "Q"
+      else if c0 == "r" then "R"
+      else if c0 == "s" then "S"
+      else if c0 == "t" then "T"
+      else if c0 == "u" then "U"
+      else if c0 == "v" then "V"
+      else if c0 == "w" then "W"
+      else if c0 == "x" then "X"
+      else if c0 == "y" then "Y"
+      else if c0 == "z" then "Z"
+      else c0
+    let rest_str = from_chars rest
+    cat [cu, rest_str]
+
+from_chars cs =
+  if cs == [] then ""
+  else cat [head cs, from_chars (tail cs)]
+
+-- ---------------------------------------------------------------------
+-- Target picker. Returns [tx, ty, tz, named_idx, form, descriptor_idx]
+-- where (tx, ty, tz) is the concrete final coord and (named_idx,
+-- descriptor_idx) feed render_target_form so the NL matches.
+--
+-- Forms:
+--   0/1/2  exact coords            sampler-uniform front-hemisphere
+--   3      named point A/B/C/D     coord = named_coords[idx]
+--   4      ORIGIN                  coord = (0, 0, 0)
+--   5      named + offset          coord = named + signed offset (validated)
+--   6      descriptive             coord = sampler-uniform (description loose)
+--   7      current pos + delta     coord = sampler-uniform
+--
+-- If a form would produce an unreachable coord (form 5 mostly), we fall
+-- back to a sampler-uniform coord and downgrade the form to 0.
+-- ---------------------------------------------------------------------
+
+clip30 n =
+  if n < 0 then 0
+  else if n > 30 then 30
+  else n
+
+-- dir 0/1: shift x by +/-off. dir 2/3: shift y by +/-off. z unchanged.
+-- Returns [1, tx, ty, tz] iff the shifted coord (a) needs no clipping and
+-- (b) is reachable. If clipping would change anything OR reachability
+-- fails, returns [0, ...] -- caller falls back.
+try_offset_target nx ny nz dir off =
+  let tx1 = if dir == 0 then nx + off
+    else if dir == 1 then nx - off
+    else nx
+  let ty1 = if dir == 2 then ny + off
+    else if dir == 3 then ny - off
+    else ny
+  -- Reject if a clip would distort the intended offset.
+  let needs_clip = if tx1 < 0 then 1
+    else if tx1 > 30 then 1
+    else if ty1 < 0 then 1
+    else if ty1 > 30 then 1
+    else 0
+  if needs_clip == 1 then [0, nx, ny, nz]
+  else
+    let tx = tx1
+    let ty = ty1
+    let tz = nz
+    let mx = dsl_to_mm_x tx 0
+    let my = dsl_to_mm_y ty 0
+    let mz = dsl_to_mm_z tz 0
+    let rch = reachable_mm_calib mx my mz 0
+    if rch == 1 then [1, tx, ty, tz]
+    else [0, tx, ty, tz]
+
+pick_target seed form =
+  let nidx = randmod seed 8201 4
+  if form == 3 then
+    let p = list_at named_coords nidx
+    [head p, head (tail p), head (tail (tail p)), nidx, 3, 0]
+  else if form == 4 then
+    [0, 0, 0, 0, 4, 0]
+  else if form == 5 then
+    let base = list_at named_coords nidx
+    let bx = head base
+    let by = head (tail base)
+    let bz = head (tail (tail base))
+    let dir = randmod seed 8203 4
+    let off = 1 + (randmod seed 8205 5)
+    let r = try_offset_target bx by bz dir off
+    if (head r) == 1 then
+      [head (tail r), head (tail (tail r)), head (tail (tail (tail r))), nidx, 5, dir * 10 + off]
+    else
+      -- Fall back to a sampled coord, downgrade to form 0.
+      let s = sample_coord seed 0 0
+      if (head s) == 1 then
+        [head (tail s), head (tail (tail s)), head (tail (tail (tail s))), nidx, 0, 0]
+      else [10, 0, 5, 0, 3, 0]
+  else
+    -- Forms 0, 1, 2, 6, 7: sampler-uniform.
+    let s = sample_coord seed 0 0
+    if (head s) == 1 then
+      [head (tail s), head (tail (tail s)), head (tail (tail (tail s))), nidx, form, 0]
+    else
+      -- Hard fallback to named point A.
+      [10, 0, 5, 0, 3, 0]
+
+-- Render target phrase given form, the chosen coord, and a descriptor
+-- payload (only used by forms 5 + 6).
+render_target_form form x y z named_idx desc =
+  if form == 0 then cat ["(", show x, ", ", show y, ", ", show z, ")"]
+  else if form == 1 then cat ["coordinates ", show x, " ", show y, " ", show z]
+  else if form == 2 then cat ["the position (", show x, ", ", show y, ", ", show z, ")"]
+  else if form == 3 then cat ["point ", list_at named_names (named_idx % 4)]
+  else if form == 4 then "ORIGIN"
+  else if form == 5 then
+    let dir = desc / 10
+    let off = desc % 10
+    -- dir 2 (+y): in DSL is "away from user / into the workspace" = forward
+    -- dir 3 (-y): in DSL is "toward user" = back / near
+    let dir_word = if dir == 0 then "right"
+      else if dir == 1 then "left"
+      else if dir == 2 then "forward"
+      else "back"
+    cat [show off, " cm to the ", dir_word, " of point ", list_at named_names (named_idx % 4)]
+  else if form == 6 then
+    -- Descriptive: "upper-left corner", "the far edge", etc.
+    let d_idx = randmod (x + y * 31 + z * 97) 8101 6
+    if d_idx == 0 then "the upper-left corner"
+    else if d_idx == 1 then "the upper-right corner"
+    else if d_idx == 2 then "the front edge"
+    else if d_idx == 3 then "the back-left area"
+    else if d_idx == 4 then "the middle of the workspace"
+    else "the far edge"
+  else
+    -- form 7: current position + delta (rendered abstractly).
+    cat ["a small step from your current position toward (", show x, ", ", show y, ", ", show z, ")"]
+
+render_prompt seed cmds tx ty tz form named_idx desc =
+  let v_idx = randmod seed 9001 60
+  let a_idx = randmod seed 9003 24
+  let l_idx = randmod seed 9007 12
+  let verb = list_at verbs_60 v_idx
+  let adverb = list_at adverbs_24 a_idx
+  let landmark = list_at landmarks_12 l_idx
+  let n = length cmds
+  let target_phrase = render_target_form form tx ty tz named_idx desc
+  -- Compose the surface form. Vary structure based on bucket / cmd
+  -- count so multi-step scripts get multi-clause prompts.
+  let structure = randmod seed 9101 4
+  let head_part =
+    if structure == 0 then cat [cap_first verb, " ", adverb, " to ", target_phrase]
+    else if structure == 1 then cat [cap_first verb, " to ", target_phrase, " ", adverb]
+    else if structure == 2 then cat [cap_first adverb, ", ", verb, " to ", target_phrase]
+    else cat ["Please ", verb, " to ", target_phrase, " ", adverb]
+  let multi_tail = if n >= 3 then " and follow the planned path" else ""
+  let landmark_tail = if length landmark == 0 then "" else cat [", ", landmark]
+  cat [head_part, multi_tail, landmark_tail, "."]
+
+-- ---------------------------------------------------------------------
+-- Build one JSONL record. Returns "" if the script faulted in sim.
+-- ---------------------------------------------------------------------
+
+zpad6 n =
+  if n < 10 then cat ["00000", show n]
+  else if n < 100 then cat ["0000", show n]
+  else if n < 1000 then cat ["000", show n]
+  else if n < 10000 then cat ["00", show n]
+  else if n < 100000 then cat ["0", show n]
+  else show n
+
+build_record id_str nl script_text cmds =
+  let st = run_sim_with_world cmds (0 - 1) 0 0
+  let gex = s_ex st
+  let gey = s_ey st
+  let gez = s_ez st
+  let ggrip = s_grip st
+  let gheld = s_held st
+  let fault = s_fault st
+  if fault != 0 then ""
+  else
+    cat [
+      "{\"id\":\"", id_str,
+      "\",\"nl\":\"", json_escape nl,
+      "\",\"script\":\"", json_escape script_text,
+      "\",\"world\":{\"obx\":-1,\"oby\":0,\"obz\":0,\"present\":", show (s_present st),
+      "},\"expected\":{\"gex\":", show gex, ",\"gey\":", show gey, ",\"gez\":", show gez, ",\"ggrip\":", show ggrip, ",\"gheld\":", show gheld,
+      "},\"source\":\"proc_v2\",\"stages_passed\":4}"]
+
+-- ---------------------------------------------------------------------
+-- Per-i generator. Decides length, builds script, builds NL, emits.
+-- ---------------------------------------------------------------------
+
+gen_one i =
+  let id_str = cat ["proc_v2:", zpad6 i]
+  let s = mix2 i 999
+  let n = pick_length s
+  let f_idx = randmod s 9005 8
+  let tgt = pick_target s f_idx
+  let tx = head tgt
+  let ty = head (tail tgt)
+  let tz = head (tail (tail tgt))
+  let named_idx = head (tail (tail (tail tgt)))
+  let final_form = head (tail (tail (tail (tail tgt))))
+  let desc = head (tail (tail (tail (tail (tail tgt)))))
+  let sc = build_script_to_target s n tx ty tz
+  let cmds = head sc
+  if cmds == [] then ""
+  else
+    let lines = render_cmd_lines cmds
+    let script_text = wrap_script lines
+    let nl = render_prompt s cmds tx ty tz final_form named_idx desc
+    build_record id_str nl script_text cmds
+
+-- ---------------------------------------------------------------------
+-- Buffered output. ~500 records per flush.
+-- ---------------------------------------------------------------------
+
+flush_buf out_path buf =
+  if buf == [] then 0
+  else
+    let tmp = "/tmp/spurarm_proc_v2_buf.txt"
+    let body = join "\n" buf
+    let _ = write_file tmp body
+    let _ = shell (cat ["cat ", tmp, " >> ", out_path, " && printf '\\n' >> ", out_path])
+    0
+
+emit_chunk i n out_path buf bufN =
+  if i >= n then
+    let _ = flush_buf out_path buf in 0
+  else if bufN >= 500 then
+    let _ = flush_buf out_path buf in
+    emit_chunk i n out_path [] 0
+  else
+    let line = gen_one i
+    if length line == 0 then emit_chunk (i + 1) n out_path buf bufN
+    else emit_chunk (i + 1) n out_path (cons line buf) (bufN + 1)
+
+main =
+  let argv = args
+  let parsed = parse_args argv
+  let (_flags, _opts, pos) = parsed
+  if length pos < 2 then
+    let _ = print "usage: synthesize_procedural.rail <count> <out_path>"
+    1
+  else
+    let n_str = head pos
+    let out_path = head (tail pos)
+    let cs = chars n_str
+    let n = parse_int_chars cs false 0
+    let _ = shell (cat ["rm -f ", out_path, " && touch ", out_path])
+    let _ = emit_chunk 0 n out_path [] 0
+    let _ = print (cat ["proc_v2.synth wrote up to ", show n, " records to ", out_path])
+    0
