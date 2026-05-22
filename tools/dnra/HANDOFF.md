@@ -448,3 +448,16 @@ The edit-distance gate as currently specified CANNOT distinguish productive styl
 - **R-X3 (full): MLX-LoRA pipeline scaffold in `~/projects/rail-training/`.**  Already partially exercised via the smoke train; full scaffold = config files + helpers + per-run notebooks.
 
 **Updated branch state:** `release-v5.1.0` is **11 DNRA commits ahead of origin/master**. Push deferred.
+
+- **2026-05-22 21:35 UTC — Ticket #13 (gate hardening) CLOSED.** Commit `3b3f5cd`. Augmented `impl/score_probe.py` with two quality checks layered on top of edit-distance:
+    - LENGTH_RATIO_FLOOR = 0.50 — trained:base mean response length. Catches empty-emit collapse.
+    - SPURIOUS_CITE_CEILING = 0.70 — rate of prompts where trained cites `Cite:` but base does not. Catches citation-fabrication.
+    - Default behavior is WARN; `--strict` promotes either flag to `QUALITY COLLAPSE` exit 2 BEFORE the edit-distance verdict computes.
+- **Validation:**
+    - base vs smoke-trained-D `--strict` → QUALITY COLLAPSE (both flags fire — length 0.268, spurious 83%). The smoke is correctly classified as failure now.
+    - base vs smoke-trained-D default → `PRODUCTIVE (with quality WARNINGS)`. Backward-compatible; warns printed prominently.
+    - base vs base `--strict` → MODE COLLAPSE on edit-distance, quality clean (length 1.000, spurious 0%). No false flagging.
+
+**Gate is now load-bearing.** A production-scale training run that returns `PRODUCTIVE` under `--strict` will have actually shifted style in a quality-preserving way, not just produced different-shaped garbage.
+
+**Branch state:** **13 DNRA commits ahead of origin/master**. Push still deferred.
