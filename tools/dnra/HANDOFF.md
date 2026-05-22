@@ -337,3 +337,50 @@ This is "peer panelist → triggered specialist" — closer to Convener-routing-
 - Alternative milestone: add the **Convener** (T6 in the original roadmap — never opened as a ticket). Currently deterministic placeholder; would route question.category to fast vs deliberate paths and choose the panel composition.
 
 **Session stopping point — 2026-05-22 17:55 UTC.** T5 shipped end-to-end (3 versions in one pass). 7/7 acceptance. Substrate production-shaped for POC; finetune gate unblocked. Resume on finetune or Convener.
+
+- **2026-05-22 — multi-front design pass + T6 Convener v0 shipped.** Four sub-agents dispatched in parallel produced scoping specs for the next phase (committed in `ed8b161`):
+    - `design/CONVENER.v0.spec.md` — deterministic 5-branch router (R0..R5) keyed on category + complexity_hint + cheap substring matching over question.text. Encodes T4 findings: D mandatory (lost_alone=0), A gated out on convention questions (14/40 lost_alone), E gated in on runtime / impl-defined markers.
+    - `design/FINETUNE_DEDUCTIVE.md` (448 lines) — 1.5-3k pairs "cite then derive", LoRA r=16/a=32 attn-only, ~1500 steps, ~2-4h on Mini. **Hard pre-gate**: D-vs-base edit-distance >= 0.25 on a 30-prompt probe BEFORE training E and A. Below threshold, multi-panel plan is dead.
+    - `design/FINETUNE_EMPIRICAL.md` (262 lines) — 3-5k pairs observation-leading, 35% spec-silent material to force off D's attractor.
+    - `design/FINETUNE_ADVERSARIAL.md` (334 lines) — 2-4k pairs with structured `{where_break, mechanism, applies_to_prompt, prediction}`; 35-40% pairs marked "real break but doesn't apply" to teach LOCATING breaks, not disagreeing.
+
+**User decisions locked this turn:**
+- **Q-C1 resolved**: regex-on-text for v0 ships now; explicit `runtime_observable` SCHEMA field promoted to v1.
+- Sequencing implication from D's pre-gate: the 3 LoRAs cannot be trained in parallel — D first, edit-distance probe, then E + A.
+
+**T6 Convener v0 — IMPLEMENTED + PASSING.**
+
+| File | Lines | Purpose |
+|---|---|---|
+| `impl/convener.rail` | 144 | Library: triage_for_line + decide_triage + helpers. No main. Pulls stdlib/file.rail transitively. |
+| `impl/test_convener.rail` | 87 | Acceptance harness. Scales gates with set size (85% path, 80% panel). |
+| `impl/gen_synthetic_triage.py` | 245 | Curation generator. Emits **compact** JSON (`separators=(",",":")`) so Rail marker-split extractors hit. |
+| `sets/synthetic_triage.jsonl` | 10 | v0.a spike (R0 x2, R1 x2, R2 x2, R3 x3, R4 x1). Each record carries `intended` + `wasteful_counter` + rationale. |
+| `spec/SCHEMA.md` | (touched) | `triage.reason` now documented as closed terminal-label set. |
+
+**Acceptance: 10/10 path · 10/10 panel · 0 empty panels · 0 unknown reasons · 0 fast+multi cases.**
+
+**Honest caveat (same shape as arbiter's 20/20):** I am both the rule author and the v0.a curator. 10/10 is the synthetic ceiling — it proves the Rail impl matches the spec, not that the rule generalizes. v0.b/v0.c curation (remaining 30 cases) is the real test, and should ideally be done by a different curator or against questions drawn from outside the curator's design awareness.
+
+**Gotcha earned this session (not in Rail CLAUDE.md):**
+6. **Python's default `json.dumps` inserts spaces** after `:` and `,`. Rail marker-split extractors looking for `"key":"value"` substrings then fail silently — every record routes to R5_fallback. Fix: `json.dumps(r, separators=(",",":"))`. Confirmed: the falsification + synthetic_disagreements sets either use compact form by accident or have less strict extractors; this is the first case where it mattered.
+7. **Local function definitions via `let f x y = ...` inside `main`** are rejected by the Rail parser ("unexpected 'eq' '=' in expression"). Move helpers to top level.
+8. **Transitive imports collide if you also import directly.** convener.rail imports stdlib/file.rail; test_convener.rail importing both produces duplicate-symbol link errors. Always rely on transitive imports from the closest library.
+
+**T6 close — what shipped vs what remains:**
+
+| Item | State | Note |
+|---|---|---|
+| `impl/convener.rail` | DONE | Library + closed-reason set + canonical panel order |
+| `impl/test_convener.rail` | DONE | Self-scaling gates (production: 34/40 path, 32/40 panel; spike: 9/10 path, 8/10 panel) |
+| `sets/synthetic_triage.jsonl` v0.a | DONE | 10/10 PASS |
+| `sets/synthetic_triage.jsonl` v0.b/c | **DEFERRED** | 30 cases. Spec says ~10 min per honest case = ~5 hours. Multi-session curation work; should be done by a different curator or via blind-question harvesting if possible. |
+| `spec/SCHEMA.md` triage.reason note | DONE | Closed terminal-label set documented |
+
+**Next session pickup options (user choice):**
+- **R-X1: Complete the synthetic_triage curation** (30 more cases per the spec distribution). Multi-session work. Surfacing curator-bias problems before the rule goes live.
+- **R-X2: Stand up the D-vs-base probe before any finetune.** Per FINETUNE_DEDUCTIVE's pre-gate, this is the cheapest "is multi-panel plausible?" experiment. ~2 hours including writing the 30 probe prompts.
+- **R-X3: Stand up the MLX-LoRA training pipeline scaffold in ~/projects/rail-training/.** Pipeline-first approach; corpus + training runs slot in once it exists.
+- **R-X4: Open T7 (the arbiter v1 with lost-alone-rate confidence discount)**, deferred-but-pending per the original handoff.
+
+**Session stopping point — 2026-05-22 (later).** Convener v0 implemented + passing on the spike. Multi-front design phase closed. 4 parallel agent deliverables landed. Next sub-session likely R-X2 (cheapest falsification of the finetune-gate viability).

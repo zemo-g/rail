@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+# Hand-curated v0.a synthetic triage spike for the DNRA Convener.
+# 10 cases mirror the falsification v0.a flow: small spike to validate format,
+# remaining 30 deferred to multi-session curation (v0.b + v0.c).
+#
+# Discipline: question written FIRST, intended routing chosen by mentally
+# walking the rule, wasteful_counter chosen to highlight the cost of the
+# wrong call. Single curator + rule author -> synthetic ceiling risk noted
+# in HANDOFF.
+
+import json
+
+records = [
+    # ── R0 trivial (2 cases) ──────────────────────────────────────
+    {
+        "id": "T-001",
+        "question": {
+            "text": "What is 2 + 2?",
+            "features": {
+                "category": "reasoning",
+                "complexity_hint": "trivial",
+                "has_oracle": True,
+                "oracle_kind": "user",
+            },
+        },
+        "intended": {
+            "path": "fast",
+            "selected_panel": ["deductive"],
+            "rationale": "Trivial arithmetic. One panelist suffices; deliberation adds zero signal.",
+        },
+        "wasteful_counter": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "empirical", "adversarial"],
+            "rationale": "Spinning up 3 panelists for 2+2 burns compute. A has nothing to attack.",
+        },
+    },
+    {
+        "id": "T-002",
+        "question": {
+            "text": "What does head [] return in Rail?",
+            "features": {
+                "category": "rail_code",
+                "complexity_hint": "trivial",
+                "has_oracle": True,
+                "oracle_kind": "compiler",
+            },
+        },
+        "intended": {
+            "path": "fast",
+            "selected_panel": ["deductive"],
+            "rationale": "Runtime-safety invariant is documented (returns 0). D reads the spec, no need to convene.",
+        },
+        "wasteful_counter": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "adversarial"],
+            "rationale": "A has no edge to find on a defined safety guarantee. Convening drags a known-correct answer through noise.",
+        },
+    },
+    # ── R1 rail_code + compiler oracle (1 plain, 1 +E) ────────────
+    {
+        "id": "T-003",
+        "question": {
+            "text": "Does length xs == 0 trigger the documented O(N) length-vs-equals perf trap?",
+            "features": {
+                "category": "rail_code",
+                "complexity_hint": "medium",
+                "has_oracle": True,
+                "oracle_kind": "compiler",
+            },
+        },
+        "intended": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "adversarial"],
+            "rationale": "Rail-code question with compiler oracle and no runtime-symptom keywords. D reads docs, A probes for edge cases the docs do not cover. E adds nothing without a runtime symptom to chase.",
+        },
+        "wasteful_counter": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "empirical", "adversarial"],
+            "rationale": "Forcing E to run a benchmark when D can cite the docs and A handles edge cases burns a panelist on a known issue.",
+        },
+    },
+    {
+        "id": "T-004",
+        "question": {
+            "text": "Why does filter with a lambda segfault on a list of 500 items in Rail?",
+            "features": {
+                "category": "rail_code",
+                "complexity_hint": "medium",
+                "has_oracle": True,
+                "oracle_kind": "compiler",
+            },
+        },
+        "intended": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "empirical", "adversarial"],
+            "rationale": "Runtime-symptom keyword (segfault) triggers E gating IN. D reads the documented quirk, E runs the case, A pushes on edges. All three contribute.",
+        },
+        "wasteful_counter": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "adversarial"],
+            "rationale": "Dropping E on a runtime-symptom question loses the panelist whose niche is empirical reproduction. Spec-only D answer misses heap-pressure variants E would catch.",
+        },
+    },
+    # ── R2 rail_code (no compiler oracle) (1 D-only, 1 +A) ────────
+    {
+        "id": "T-005",
+        "question": {
+            "text": "Does map preserve list order in Rail?",
+            "features": {
+                "category": "rail_code",
+                "complexity_hint": "medium",
+                "has_oracle": True,
+                "oracle_kind": "user",
+            },
+        },
+        "intended": {
+            "path": "deliberate",
+            "selected_panel": ["deductive"],
+            "rationale": "Documented invariant (map preserves order). No runtime-symptom or numeric-edge markers in the question. A on convention questions lost-alone 14/40 in T4 -- gating it OUT here matches the data.",
+        },
+        "wasteful_counter": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "adversarial"],
+            "rationale": "Including A on a clean convention question invites a wrong-alone dissent that adds noise; A's lost-alone rate dominates this category.",
+        },
+    },
+    {
+        "id": "T-006",
+        "question": {
+            "text": "What happens when Rail integer multiplication overflows 63 bits in user code?",
+            "features": {
+                "category": "rail_code",
+                "complexity_hint": "medium",
+                "has_oracle": True,
+                "oracle_kind": "user",
+            },
+        },
+        "intended": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "adversarial"],
+            "rationale": "Numeric-edge marker (overflow) gates A IN. A's documented unique-win territory is exactly numeric-edge cases (F-004 fib, F-032 sqrt). D reads the docs; A probes the silent-wrap behavior the docs may understate.",
+        },
+        "wasteful_counter": {
+            "path": "deliberate",
+            "selected_panel": ["deductive"],
+            "rationale": "D-only on a numeric-edge question loses the panelist whose niche this is. Risks shipping the documented answer when the implementation-defined corner is the real story.",
+        },
+    },
+    # ── R3 reasoning (2 drop-A, 1 full) ───────────────────────────
+    {
+        "id": "T-007",
+        "question": {
+            "text": "By definition, what makes a function tail-recursive?",
+            "features": {
+                "category": "reasoning",
+                "complexity_hint": "medium",
+                "has_oracle": True,
+                "oracle_kind": "user",
+            },
+        },
+        "intended": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "empirical"],
+            "rationale": "Documented-fact framing (by definition) drops A. There is no edge to find in a definitional question; A would lost-alone on the formal answer.",
+        },
+        "wasteful_counter": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "empirical", "adversarial"],
+            "rationale": "Convening A on a definition adds a contrarian voice with nothing real to push on. Lost-alone risk dominates.",
+        },
+    },
+    {
+        "id": "T-008",
+        "question": {
+            "text": "What does the Rail spec say about pattern match exhaustiveness?",
+            "features": {
+                "category": "reasoning",
+                "complexity_hint": "medium",
+                "has_oracle": True,
+                "oracle_kind": "user",
+            },
+        },
+        "intended": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "empirical"],
+            "rationale": "Spec-framing keyword (spec) drops A. D is the spec-literacy mode; E verifies the behavior; A's edge-hunting is not the right energy on a spec-recitation question.",
+        },
+        "wasteful_counter": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "empirical", "adversarial"],
+            "rationale": "A burns cycles arguing against a literal spec quotation. Empirically a high-lost-alone configuration on R3 in T4 data.",
+        },
+    },
+    {
+        "id": "T-009",
+        "question": {
+            "text": "Why might a panel of three reasoners outperform a single model?",
+            "features": {
+                "category": "reasoning",
+                "complexity_hint": "medium",
+                "has_oracle": False,
+                "oracle_kind": "none",
+            },
+        },
+        "intended": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "empirical", "adversarial"],
+            "rationale": "Exploratory reasoning, no documented-fact framing. Full panel is the default; A's pushback is load-bearing for an architectural-claim question.",
+        },
+        "wasteful_counter": {
+            "path": "fast",
+            "selected_panel": ["deductive"],
+            "rationale": "Fast-pathing an architectural-claim question to one panelist defeats the point of having a panel. D-alone would produce a plausible-sounding answer with no internal disagreement check.",
+        },
+    },
+    # ── R4 open_ended (1 case) ────────────────────────────────────
+    {
+        "id": "T-010",
+        "question": {
+            "text": "What should DNRA build next after the Convener ships?",
+            "features": {
+                "category": "open_ended",
+                "complexity_hint": "medium",
+                "has_oracle": False,
+                "oracle_kind": "none",
+            },
+        },
+        "intended": {
+            "path": "deliberate",
+            "selected_panel": ["deductive", "empirical", "adversarial"],
+            "rationale": "Open-ended, no oracle. Full panel by default; outcome layer cannot auto-score so the chain just records the disagreement geometry for later review.",
+        },
+        "wasteful_counter": {
+            "path": "fast",
+            "selected_panel": ["deductive"],
+            "rationale": "Fast-pathing an open-ended question discards the structural-disagreement signal that is the whole point of running this category through DNRA.",
+        },
+    },
+]
+
+with open("tools/dnra/sets/synthetic_triage.jsonl", "w") as f:
+    for r in records:
+        # Compact form (no whitespace after `:` or `,`) so the Rail marker-split
+        # extractors match `"key":"value"` exactly. Default json.dumps inserts
+        # spaces which break the marker.
+        f.write(json.dumps(r, separators=(",", ":")) + "\n")
+print(f"wrote {len(records)} records to tools/dnra/sets/synthetic_triage.jsonl")
