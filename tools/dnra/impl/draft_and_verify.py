@@ -1,0 +1,207 @@
+#!/opt/homebrew/bin/python3.11
+"""122B-drafted cite-then-derive pair generator with citation verification.
+
+Each topic is a (rfc_num, section) tuple.  The script:
+  1. Fetches the section text via impl/sources/rfc.py (cache-backed).
+  2. Builds a RAG-style prompt that gives the 122B the actual section
+     text inline, then asks it to construct a (prompt, target) pair
+     that QUOTES VERBATIM from the section.
+  3. POSTs to the Studio 122B via the SSH tunnel at localhost:8082.
+  4. Parses JSON out of the model's reply.
+  5. Verifies the pair via impl/verify_citation.py.
+  6. PASS pairs append to sets/corpus_d_v0b_verified.jsonl with a stable
+     id assigned in order.  FAIL pairs are logged but not kept.
+
+The point of the RAG-feed (vs. cold drafting from training-data recall)
+is to remove the model's incentive to fabricate.  The verifier still
+runs as the final gate -- belt + suspenders.
+
+Usage:
+    /opt/homebrew/bin/python3.11 tools/dnra/impl/draft_and_verify.py
+        [--topics N]   limit to first N topics (smoke)
+        [--out PATH]   default sets/corpus_d_v0b_verified.jsonl
+        [--temp T]     default 0.2
+        [--max-tokens N] default 600
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO))
+from tools.dnra.impl.sources.rfc import get_section  # type: ignore[import-not-found]
+from tools.dnra.impl.verify_citation import verify_pair  # type: ignore[import-not-found]
+
+
+LLM_URL = "http://localhost:8082/v1/chat/completions"
+MODEL = "mlx-community/Qwen3.5-122B-A10B-heretic-v2-2.34bit-msq"
+
+# (rfc_num, section, polarity) -- v0 keeps polarity=='keep' to validate
+# the loop before adding the harder invert-the-obvious-answer variant.
+TOPICS: list[tuple[int, str, str]] = [
+    (8259, "3", "keep"),       # JSON Values
+    (8259, "5", "keep"),       # JSON Arrays
+    (7540, "6.5", "keep"),     # HTTP/2 SETTINGS
+    (7540, "8.2", "keep"),     # HTTP/2 Server Push
+    (8446, "4.4.2", "keep"),   # TLS 1.3 CertificateVerify
+    (8446, "5.1", "keep"),     # TLS 1.3 Record layer
+]
+
+
+SYSTEM = (
+    "You construct a single (prompt, target) training pair for a 'cite-then-derive' reasoning "
+    "model. You MUST quote the load-bearing clause verbatim from the supplied section text, "
+    "with the quotation enclosed in double quotes. Output strict JSON only. No commentary."
+)
+
+
+def build_user_msg(rfc_num: int, section: str, section_text: str) -> str:
+    return (
+        f"Source: RFC {rfc_num} section {section}\n"
+        f"Section text:\n<<<\n{section_text}\n>>>\n\n"
+        "Construct ONE (prompt, target) pair satisfying ALL of these rules:\n"
+        "1. prompt: a clear, single-sentence question whose answer is "
+        "   determined by the section text above.\n"
+        "2. target: open with Yes / No / or a short claim, then quote the "
+        "   load-bearing clause VERBATIM from the section text in DOUBLE "
+        "   quotes, then derive the conclusion in one to three short "
+        "   sentences. End with 'Cite: RFC <num> section <section>'.\n"
+        "3. The verbatim quote MUST be a contiguous substring of the "
+        "   section text. Do NOT insert ellipses or paraphrase inside the "
+        "   quoted span.\n"
+        "4. Output strict JSON of the form: "
+        '{"prompt": "...", "target": "..."}\n'
+        "Output JSON now."
+    )
+
+
+def call_llm(rfc_num: int, section: str, section_text: str, temp: float, max_tokens: int) -> str:
+    body = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": build_user_msg(rfc_num, section, section_text)},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temp,
+    }
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        LLM_URL, data=data, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=300) as r:
+        resp = json.loads(r.read())
+    return resp["choices"][0]["message"]["content"]
+
+
+JSON_OBJ = re.compile(r"\{[\s\S]*\}")
+
+
+def parse_pair(content: str) -> dict | None:
+    """Pull the first {...} block from the model output and parse it."""
+    m = JSON_OBJ.search(content)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        # Some models emit trailing commas or bare control chars; try a
+        # tolerant single-line eval as a fallback.
+        try:
+            cleaned = re.sub(r",\s*}", "}", m.group(0))
+            obj = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(obj, dict) or "prompt" not in obj or "target" not in obj:
+        return None
+    return obj
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--topics", type=int, default=len(TOPICS))
+    ap.add_argument("--out", default="tools/dnra/sets/corpus_d_v0b_verified.jsonl")
+    ap.add_argument("--temp", type=float, default=0.2)
+    ap.add_argument("--max-tokens", type=int, default=600)
+    args = ap.parse_args()
+
+    topics = TOPICS[: args.topics]
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    accepted = []
+    counters: dict[str, int] = {}
+    print(f"drafting + verifying {len(topics)} topics; model={MODEL}")
+    print(f"output: {out_path}\n")
+
+    for i, (rfc_num, section, polarity) in enumerate(topics, start=1):
+        topic_id = f"V-{i:03d}"
+        print(f"  [{i}/{len(topics)}] {topic_id}  RFC {rfc_num} section {section}  polarity={polarity}")
+        section_text = get_section(rfc_num, section)
+        if section_text is None:
+            print(f"      SKIP: section fetch returned None")
+            counters["SKIP_FETCH"] = counters.get("SKIP_FETCH", 0) + 1
+            continue
+
+        t0 = time.time()
+        try:
+            raw = call_llm(rfc_num, section, section_text, args.temp, args.max_tokens)
+        except Exception as e:
+            print(f"      SKIP: LLM call failed: {e}")
+            counters["SKIP_LLM"] = counters.get("SKIP_LLM", 0) + 1
+            continue
+        elapsed = int((time.time() - t0) * 1000)
+
+        parsed = parse_pair(raw)
+        if parsed is None:
+            print(f"      SKIP: could not parse JSON pair from model output (raw head: {raw[:80]!r})")
+            counters["SKIP_PARSE"] = counters.get("SKIP_PARSE", 0) + 1
+            continue
+
+        pair = {
+            "id": topic_id,
+            "source": f"RFC {rfc_num}",
+            "section": section,
+            "polarity": polarity,
+            "prompt": parsed["prompt"],
+            "target": parsed["target"],
+        }
+        verdict = verify_pair(pair)
+        counters[verdict["status"]] = counters.get(verdict["status"], 0) + 1
+        print(f"      gen={elapsed}ms  verdict={verdict['status']}  {verdict['notes']}")
+        if verdict["status"] == "PASS":
+            accepted.append(pair)
+        # Stream first 2 results in full so the user can spot-check.
+        if i <= 2:
+            print(f"      --- prompt ---")
+            print("      " + parsed["prompt"])
+            print(f"      --- target ---")
+            for line in parsed["target"].split("\n"):
+                print("      " + line)
+        print()
+
+    if accepted:
+        with open(out_path, "w") as f:
+            for p in accepted:
+                f.write(json.dumps(p, separators=(",", ":")) + "\n")
+        print(f"wrote {len(accepted)} PASS pairs to {out_path}")
+    else:
+        print("no PASS pairs to write")
+
+    print()
+    print("==== run summary ====")
+    print(f"  topics tried: {len(topics)}")
+    for status, n in sorted(counters.items()):
+        print(f"  {status:<12} {n}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
