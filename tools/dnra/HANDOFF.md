@@ -384,3 +384,28 @@ This is "peer panelist → triggered specialist" — closer to Convener-routing-
 - **R-X4: Open T7 (the arbiter v1 with lost-alone-rate confidence discount)**, deferred-but-pending per the original handoff.
 
 **Session stopping point — 2026-05-22 (later).** Convener v0 implemented + passing on the spike. Multi-front design phase closed. 4 parallel agent deliverables landed. Next sub-session likely R-X2 (cheapest falsification of the finetune-gate viability).
+
+- **2026-05-22 18:30 UTC — R-X2 (D-vs-base probe) tooled end-to-end.** Two commits:
+    - `9914230` — `sets/probe_v0.jsonl` (30 deliberately mode-ambiguous prompts: 10 Rail / 10 general CS / 10 reasoning), `impl/gen_probe_set.py`, `impl/run_probe.py` (MLX runner with `--dry-run` mode that writes stubs to `/tmp/` so it doesn't pollute the committed set dir).
+    - `272fb56` — `impl/score_probe.py` (pairwise normalized Levenshtein, hand-rolled, no external deps). Reports mean / median / min / max overall + per-domain mean. Verdict against the 0.25 (collapse) and 0.35 (productive) thresholds; exit 0 / 1 / 2 for productive / inconclusive / collapse.
+
+**R-X2 pipeline status:**
+
+| Step | State | Note |
+|---|---|---|
+| 30 probe prompts curated | DONE | `sets/probe_v0.jsonl` |
+| Probe runner (MLX) | DONE | Dry-run validated; real run blocked on Llama 3.2 1B download |
+| Edit-distance scorer | DONE | Smoke-tested with synthetic data (collapse + productive cases) |
+| Run base probe | **BLOCKED** | Needs Llama 3.2 1B-Instruct download (~1GB; user OK) |
+| Train D LoRA | **BLOCKED** | Needs corpus (not yet built) + training pipeline (R-X3) |
+| Run trained-D probe | BLOCKED on above | |
+| Verdict | BLOCKED on above | |
+
+**Gotcha — surfaced this turn, not yet in the gotcha list:**
+9. **`mlx_lm` lives in `/opt/homebrew/bin/python3.11`, NOT in the default `python3`.** The CLI `/opt/homebrew/bin/mlx_lm.generate` works directly, but `python3 -c "import mlx_lm"` fails. Always invoke via `/opt/homebrew/bin/python3.11` for MLX scripts. Documented in `impl/run_probe.py` header.
+
+**Updated next-session options:**
+- **R-X2a: Authorize the 1B model download + run the base probe.** ~5 min download, ~3-5 min generation. Banks the "before" baseline for the eventual D-vs-trained-D comparison. Self-contained, no further dependencies.
+- **R-X1: Complete the synthetic_triage curation** (30 more cases). Still deferred / multi-session.
+- **R-X3: Stand up the MLX-LoRA training pipeline scaffold in `~/projects/rail-training/`.** Required before any D LoRA can train.
+- **R-X4: Open T7 (arbiter v1)**. Still deferred-pending.
