@@ -1,0 +1,184 @@
+-- tools/spurarm/train/config_cap_h.rail
+--
+-- Cap H model configuration — Phase 1.4 of the spurarm embodiment
+-- roadmap.  Single source of truth for shape constants used by the
+-- Cap H trainer, eval harness, bench grader, and ckpt card.
+--
+-- The "Cap H" config is the linguistic-embodiment scale: ~14.7M params,
+-- 6 transformer layers, all-bf16 forward+backward except embed and
+-- LM-head (kept f64 because those touch the vocab dim where precision
+-- matters most for cross-entropy).  Embed and LM-head are TIED — i.e.
+-- the lm-head matmul reuses the embedding weights as W^T (saves V*d
+-- params and is the standard small-LM convention).
+--
+-- Reference: ~/.claude/projects/-Users-ledaticempire/memory/
+--            spurarm-embodiment-roadmap.md  §1.4
+--
+-- Companion reading (read before editing):
+--   - rail-bf16-stable-10k-2026-05-14.md  (bf16 default rationale)
+--   - rail-jit-fused-kernels-plan.md       (rmsnorm+QKV 35×, silu+hadamard 18×)
+--   - notes/robot_session/AGENT_B_SCOPE_DECISION.md  (v0's narrowing)
+--
+-- NOT bundled here (handled at callsite):
+--   * model weight allocation  → train_spurarm_cap_h.rail
+--   * Adam state allocation     → train_spurarm_cap_h.rail
+--   * tokenizer load            → tokenize_corpus.rail
+--
+-- This file ONLY exports config constants + the param-count assertion
+-- helpers.  Keeping config + execution separate so the watcher, bench
+-- grader, and ckpt card can all read the same numbers without booting
+-- a trainer.
+
+-- ----------------------------------------------------------------------
+-- Frozen Cap H constants (do NOT change without escalating to roadmap
+-- §1.4 and updating param_count.md in lockstep).
+--
+-- Rationale per constant:
+--   d_model = 256    — roadmap §1.4 canonical.
+--   n_layers = 6     — vs v0's 1; the depth bump is the whole point.
+--   n_heads = 8      — head_dim = 256/8 = 32; common transformer setup.
+--   d_ff = 2816      — sized to hit the 14.7M target with d=256.
+--                      Standard SwiGLU "8/3 d" gives d_ff~683 which is
+--                      far below target; 2816 is the next multiple of
+--                      64 above the closed-form solution at d=256.
+--                      See param_count.md for the algebra.
+--   vocab = 1024     — tokenizer v2 (per spurarm roadmap §1.3).
+--   seq_len = 256    — roadmap spec target.  v0 used 96 as a workaround;
+--                      Cap H reverses that.
+--
+-- All called as `f 0` because Rail nullary bindings re-evaluate per
+-- call AND because [[feedback_rail_perf_traps]] notes top-level float
+-- constants miscompile under top-const binary-op — keeping these as
+-- nullary functions returning ints sidesteps the trap entirely.
+-- Floats are produced by *_f variants at the very head of each
+-- consumer function, shadowed via `let` (see EMBED_F64_EPS_F below).
+-- ----------------------------------------------------------------------
+
+cap_h_d_model     _ = 256
+cap_h_n_layers    _ = 6
+cap_h_n_heads     _ = 8
+cap_h_head_dim    _ = 32        -- d_model / n_heads
+cap_h_n_kv_heads  _ = 8         -- = n_heads (vanilla MHA, no GQA)
+cap_h_d_ff        _ = 2816      -- SwiGLU hidden width; closes the gap
+                                -- to the 14.7M target with d_model=256
+cap_h_vocab       _ = 1024
+cap_h_seq_len     _ = 256
+cap_h_max_seq_len _ = 256
+
+-- Tied LM-head: the LM-head matmul reuses the embed weights as W^T.
+-- If you flip this to 0, param count rises by V*d = 262_144.
+cap_h_tied_lm_head _ = 1
+
+-- Special token ids (must match tokenizer v2 reserved IDs).
+cap_h_pad_id _ = 0
+cap_h_bos_id _ = 1
+cap_h_eos_id _ = 2
+cap_h_sep_id _ = 3
+
+-- Precision regime per [[rail-bf16-stable-10k-2026-05-14]] default:
+--   * forward + backward matmuls: bf16
+--   * embed scatter / LM-head matmul: f64 (vocab-dim precision)
+--   * accumulator inside the matmul kernel: fp32 (per matmul_bf16
+--     contract; see rail-bf16-stable-10k-2026-05-14.md §"Why bf16").
+--
+-- The actual dtype gating is implemented in the trainer's matmul
+-- choice (matmul_bf16 vs the f64 default).  This file just declares
+-- the policy so the watcher + ckpt card agree.
+--
+-- Availability: bf16 + JIT fused kernels landed on spurarm/cap-h in
+-- commit `db20fee` (foundation, 2026-05-22) — `stdlib/tensor.rail`
+-- exports both matmul_bf16 and tgl_matmul_bf16, and the JIT modules
+-- (jit.rail / jit_emit.rail / jit_match.rail / jit_node.rail /
+-- jit_tape.rail) are present.  No backport pending.
+cap_h_precision_default _ = "bf16"
+cap_h_precision_embed   _ = "f64"
+cap_h_precision_lm_head _ = "f64"
+
+-- JIT fused-kernel hookup per [[rail-jit-fused-kernels-plan]] Phase 1:
+--   * rmsnorm+QKV: 35× faster than per-op (rmsnorm + 3 matmuls collapse)
+--   * silu+hadamard: 18× faster (SwiGLU gate * up branch)
+-- Both kernels are available on spurarm/cap-h via db20fee.  Flag is ON
+-- by default for the trainer; the forward smoke leaves it OFF to keep
+-- the per-op shape verification deterministic (JIT compile is async
+-- and would complicate the smoke's exit-code semantics).
+cap_h_use_jit_kernels _ = 1
+
+-- ----------------------------------------------------------------------
+-- Parameter count (exact, derived from the constants above).
+--
+-- Breakdown (see param_count.md for the closed-form derivation):
+--
+--   embed             = V * d                    = 262_144
+--   per layer attn    = 4 * d * d                = 262_144
+--   per layer FFN     = 3 * d * d_ff (SwiGLU)    = 2_162_688
+--   per layer RMSnorm = 2 * d                    = 512
+--   per layer total   = 2_425_344
+--   layers (×6)       = 14_552_064
+--   final RMSnorm     = d                        = 256
+--   LM-head           = 0  (tied with embed)
+--   total             = 14_814_464  (~14.81M, +0.78% of 14.7M target)
+--
+-- If the tied LM-head flag flips OFF, add V*d = 262_144 → 15_076_608
+-- (~14.6% above target — DO NOT do this without escalation).
+-- ----------------------------------------------------------------------
+
+cap_h_params_exact _ = 14814464
+
+-- Pretty-print the config (mirrors spurarm_v0_config_str's pattern).
+cap_h_config_str _ =
+  cat [
+    "Cap H: d_model=",     show (cap_h_d_model 0),
+    " n_layers=",          show (cap_h_n_layers 0),
+    " n_heads=",           show (cap_h_n_heads 0),
+    " head_dim=",          show (cap_h_head_dim 0),
+    " d_ff=",              show (cap_h_d_ff 0),
+    " V=",                 show (cap_h_vocab 0),
+    " seq=",               show (cap_h_seq_len 0),
+    " tied_lm=",           show (cap_h_tied_lm_head 0),
+    " precision=",         (cap_h_precision_default 0),
+    " params=",            show (cap_h_params_exact 0)
+  ]
+
+-- ----------------------------------------------------------------------
+-- Param-count breakdown printer (for ckpt_card + watcher cross-check).
+-- Pure integer arithmetic — no top-level float constants involved,
+-- side-stepping the top-const binary-op trap.
+-- ----------------------------------------------------------------------
+
+cap_h_params_embed _ = (cap_h_vocab 0) * (cap_h_d_model 0)
+
+cap_h_params_attn_per_layer _ =
+  let d = cap_h_d_model 0
+  4 * d * d
+
+cap_h_params_ffn_per_layer _ =
+  let d = cap_h_d_model 0
+  let f = cap_h_d_ff 0
+  3 * d * f                       -- SwiGLU: gate + up + down
+
+cap_h_params_norm_per_layer _ = 2 * (cap_h_d_model 0)
+
+cap_h_params_per_layer _ =
+  (cap_h_params_attn_per_layer 0) +
+  (cap_h_params_ffn_per_layer 0) +
+  (cap_h_params_norm_per_layer 0)
+
+cap_h_params_final_norm _ = cap_h_d_model 0
+
+cap_h_params_lm_head _ =
+  if (cap_h_tied_lm_head 0) == 1 then 0
+  else (cap_h_vocab 0) * (cap_h_d_model 0)
+
+cap_h_params_total _ =
+  (cap_h_params_embed 0) +
+  (cap_h_n_layers 0) * (cap_h_params_per_layer 0) +
+  (cap_h_params_final_norm 0) +
+  (cap_h_params_lm_head 0)
+
+-- ----------------------------------------------------------------------
+-- Param-count assertion.  Returns 1 if the computed total matches the
+-- frozen cap_h_params_exact, else 0.  Callers should print/abort.
+-- Useful as a defensive check after changing any constant above.
+-- ----------------------------------------------------------------------
+cap_h_params_check _ =
+  if (cap_h_params_total 0) == (cap_h_params_exact 0) then 1 else 0
