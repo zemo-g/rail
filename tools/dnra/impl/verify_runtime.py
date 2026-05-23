@@ -78,6 +78,22 @@ def parse_cite(cite_text: str) -> tuple[str, str]:
         if func:
             return "POSIX.1-2017", f"{func} / {section.upper()}"
         return "POSIX.1-2017", cite_text
+    # Python docs.  Cite shapes observed in the wild:
+    #   'docs.python.org section library/time#time.sleep'
+    #   'Python glossary section term-global-interpreter-lock'
+    #   'Python data model section object.__hash__'
+    py_m = re.search(
+        r"(docs\.python\.org|Python\s+(?:docs|language\s+reference|data\s+model|stdtypes|glossary|library|reference))",
+        cite_text,
+        re.IGNORECASE,
+    )
+    if py_m:
+        source = py_m.group(1)
+        rest = cite_text[py_m.end():].strip()
+        # strip optional ' section ' prefix
+        rest = re.sub(r"^\s*section\s+", "", rest, flags=re.IGNORECASE).strip()
+        return source, rest
+
     # Rail local docs (unverifiable at v0 -- no fetcher yet)
     if "CLAUDE.md" in cite_text or "HANDOFF" in cite_text or "rail/" in cite_text:
         sec_m = re.search(r"section\s+(.+)", cite_text, re.IGNORECASE)

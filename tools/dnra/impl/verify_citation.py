@@ -37,6 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 from tools.dnra.impl.sources.rfc import get_section as rfc_get_section  # type: ignore[import-not-found]  # noqa: E402
 from tools.dnra.impl.sources.posix import get_section as posix_get_section  # type: ignore[import-not-found]  # noqa: E402
+from tools.dnra.impl.sources.python_docs import get_section as pydoc_get_section  # type: ignore[import-not-found]  # noqa: E402
 
 
 QUOTED_SPAN = re.compile(r"'([^']{15,})'|\"([^\"]{15,})\"")
@@ -51,6 +52,10 @@ POSIX_SECTIONS = (
     "SEE ALSO", "CHANGE HISTORY",
 )
 POSIX_PATTERN = re.compile(r"\bPOSIX(?:\.1-\d{4})?\b", re.IGNORECASE)
+PYTHON_PATTERN = re.compile(
+    r"\b(?:docs\.python\.org|Python\s+(?:docs|language\s+reference|data\s+model|stdtypes|glossary|library|reference))\b",
+    re.IGNORECASE,
+)
 
 
 def _normalize(s: str) -> str:
@@ -121,6 +126,33 @@ def resolve_source(source: str, section: str) -> tuple[str | None, str]:
             return None, "posix"
         text = posix_get_section(func, sec_name)
         return text, "posix"
+
+    # Python docs.  Source variants accepted:
+    #   "docs.python.org" / "Python docs" / "Python language reference" /
+    #   "Python data model" / "Python stdtypes" / "Python glossary"
+    # Section field formats:
+    #   "library/time#time.sleep"
+    #   "library/time / time.sleep"
+    #   "library/stdtypes / dict"
+    #   "term-global-interpreter-lock"  (page defaults to "glossary")
+    if PYTHON_PATTERN.search(source):
+        sec = section.strip()
+        if "#" in sec:
+            page, ident = sec.split("#", 1)
+        elif "/" in sec:
+            parts = [p.strip() for p in sec.split("/") if p.strip()]
+            if len(parts) == 1:
+                page, ident = "glossary", parts[0]
+            elif len(parts) == 2:
+                page, ident = parts[0], parts[1]
+            else:
+                # 3+ chunks -> last is identifier, rest is page slug
+                page = "/".join(parts[:-1])
+                ident = parts[-1]
+        else:
+            page, ident = "glossary", sec
+        text = pydoc_get_section(page.strip(), ident.strip())
+        return text, "python"
 
     return None, "unsupported"
 
