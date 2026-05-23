@@ -73,6 +73,22 @@ PYTHON_HINTS: list[tuple[str, str, re.Pattern]] = [
      re.compile(r"\bdict\s+(?:order|insertion)\b|\bordered\s+dict\b", re.IGNORECASE)),
 ]
 
+# Rail-local doc hints: regex -> (doc_alias, section_header).  doc_alias
+# matches DEFAULT_FILES in impl/sources/rail_local.py.
+RAIL_HINTS: list[tuple[str, str, re.Pattern]] = [
+    ("CLAUDE.md", "Runtime Safety",
+     re.compile(r"\bhead\s*\[\s*\]|\btail\s*\[\s*\]|\b(?:head|tail)\b.*\bnon-list\b|\bnon-list\b.*\b(?:head|tail)\b",
+                re.IGNORECASE)),
+    ("CLAUDE.md", "Known Compiler Limitations",
+     re.compile(r"\bstr_split\b|\b(?:Rail's\s+)?split\b.*\b(?:multi.character|character|delimiter)\b|\bdelimiter\b.*\bsplit\b|\bto_int\b",
+                re.IGNORECASE)),
+    ("CLAUDE.md", "Rail Compiler",
+     re.compile(r"\bbump\s+allocator\b|\barena\b|\bRail\s+GC\b|\bRail's\s+GC\b|\beffect\s+handlers?\b|\bRail's\s+(?:runtime|allocator)\b|\b(?:GC|garbage\s+collection)\b.*\bRail\b|\bRail\b.*\b(?:GC|garbage\s+collection)\b",
+                re.IGNORECASE)),
+    ("CLAUDE.md", "Rail Syntax Quick Reference",
+     re.compile(r"\bRail'?s?\s+(?:fold|foldl|map|filter|pattern\s+match)\b", re.IGNORECASE)),
+]
+
 # Reasoning-style framings that signal a NO-CITE response.  Lifted from
 # the corpus_d_balance NC bucket -- these are the kinds of questions
 # where a citation would be cargo-culting.
@@ -118,6 +134,20 @@ def classify(prompt: str) -> dict:
     # match the bare POSIX regex too, but the Python docs are the
     # authoritative source for Python questions.
     if python_matched:
+        sources = [s for s in sources if s[0] != "posix"]
+
+    # 5. Rail-local doc hints.
+    rail_matched = False
+    for doc, section, pat in RAIL_HINTS:
+        if pat.search(prompt):
+            key = ("rail_local", f"{doc}#{section}")
+            if key not in sources:
+                sources.append(key)
+            rail_matched = True
+    # If a Rail-local doc matched, drop POSIX matches too -- Rail
+    # questions referring to Rail's `fold`, `map`, etc. accidentally
+    # trip the POSIX function regex via `read` / `write` / etc.
+    if rail_matched:
         sources = [s for s in sources if s[0] != "posix"]
 
     # 4. Decide needs_cite.

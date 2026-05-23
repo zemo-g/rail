@@ -38,6 +38,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from tools.dnra.impl.sources.rfc import get_section as rfc_get_section  # type: ignore[import-not-found]  # noqa: E402
 from tools.dnra.impl.sources.posix import get_section as posix_get_section  # type: ignore[import-not-found]  # noqa: E402
 from tools.dnra.impl.sources.python_docs import get_section as pydoc_get_section  # type: ignore[import-not-found]  # noqa: E402
+from tools.dnra.impl.sources.rail_local import get_section as rail_local_get_section  # type: ignore[import-not-found]  # noqa: E402
 
 
 QUOTED_SPAN = re.compile(r"'([^']{15,})'|\"([^\"]{15,})\"")
@@ -54,6 +55,10 @@ POSIX_SECTIONS = (
 POSIX_PATTERN = re.compile(r"\bPOSIX(?:\.1-\d{4})?\b", re.IGNORECASE)
 PYTHON_PATTERN = re.compile(
     r"\b(?:docs\.python\.org|Python\s+(?:docs|language\s+reference|data\s+model|stdtypes|glossary|library|reference))\b",
+    re.IGNORECASE,
+)
+RAIL_LOCAL_PATTERN = re.compile(
+    r"\b(?:Rail\s+CLAUDE\.md|Rail\s+HANDOFF|CLAUDE\.md|HANDOFF\.md|rail/CLAUDE|rail/HANDOFF)\b",
     re.IGNORECASE,
 )
 
@@ -153,6 +158,23 @@ def resolve_source(source: str, section: str) -> tuple[str | None, str]:
             page, ident = "glossary", sec
         text = pydoc_get_section(page.strip(), ident.strip())
         return text, "python"
+
+    # Rail local docs.  Section field forms:
+    #   "Output Discipline"
+    #   "CLAUDE.md / Output Discipline"
+    #   "Known Compiler Limitations"
+    if RAIL_LOCAL_PATTERN.search(source):
+        # If section has "doc / section", split.  Else assume the
+        # source identifies the doc and section is just a header name.
+        if "/" in section:
+            parts = [p.strip() for p in section.split("/") if p.strip()]
+            doc, sec_name = parts[0], "/".join(parts[1:])
+        elif "#" in section:
+            doc, sec_name = section.split("#", 1)
+        else:
+            doc, sec_name = source, section.strip()
+        text = rail_local_get_section(doc, sec_name)
+        return text, "rail_local"
 
     return None, "unsupported"
 
