@@ -42,9 +42,12 @@ from pathlib import Path
 
 COLLAPSE_THRESHOLD = 0.25
 PRODUCTIVE_THRESHOLD = 0.35
-LENGTH_RATIO_FLOOR = 0.50      # trained mean / base mean must be >= this
-SPURIOUS_CITE_CEILING = 0.70   # rate of base-no-cite-but-trained-cites
-CITE_MARKER = "Cite:"          # the convention used in D corpus targets
+LENGTH_RATIO_FLOOR = 0.50          # trained mean / base mean must be >= this
+SPURIOUS_CITE_CEILING = 0.70       # rate of base-no-cite-but-trained-cites
+FABRICATION_RATE_CEILING = 0.30    # of cites emitted, <= 30% may be fabricated
+GROUNDING_FLOOR = 0.20             # of verifiable cite attempts, >= 20% must ground
+GROUNDING_MIN_SAMPLE = 10          # below this many verifiable cites, skip the floor
+CITE_MARKER = "Cite:"              # the convention used in D corpus targets
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -90,10 +93,17 @@ def load_responses(path: Path) -> dict[str, dict]:
 
 
 def quality_checks(a_recs, b_recs, shared, a_tag, b_tag):
-    """Return (length_ratio, spurious_cite_rate, flags_list).
+    """Return (length_ratio, spurious_cite_rate, fabrication_rate, flags_list).
 
     `flags_list` is a list of human-readable strings describing any
     quality concerns; empty list = clean.
+
+    The fabrication_rate check runs the runtime citation verifier
+    (impl/verify_runtime) over the B-side responses: counts grounded
+    vs fabricated Cite: markers against the actual cited RFC / POSIX
+    section text.  A trained model that emits cites which DON'T ground
+    is hallucinating regardless of how the edit-distance / length /
+    spurious-cite numbers look.
     """
     flags = []
     a_lens = [len(a_recs[pid]["response"]) for pid in shared]
@@ -117,12 +127,50 @@ def quality_checks(a_recs, b_recs, shared, a_tag, b_tag):
     spurious_rate = spurious / len(shared) if shared else 0.0
     if spurious_rate >= SPURIOUS_CITE_CEILING:
         flags.append(
-            f"CITATION FABRICATION: {b_tag} emits '{CITE_MARKER}' on "
+            f"CITATION OVER-EMISSION: {b_tag} emits '{CITE_MARKER}' on "
             f"{spurious}/{len(shared)} prompts where {a_tag} does not "
             f"(rate {spurious_rate:.0%} >= {SPURIOUS_CITE_CEILING:.0%}). "
             f"Likely learned-template paste onto unrelated content."
         )
-    return length_ratio, spurious_rate, flags
+
+    # Runtime citation verifier: ground each Cite: against actual source.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+        from tools.dnra.impl.verify_runtime import verify_response  # type: ignore[import-not-found]
+        total = grounded = fabricated = verifiable = 0
+        for pid in shared:
+            stats = verify_response(b_recs[pid])
+            total += stats["n_cites"]
+            for cv in stats["cite_verdicts"]:
+                s = cv["status"]
+                if s == "PASS":
+                    grounded += 1
+                    verifiable += 1
+                elif s in ("FAIL", "FETCH_FAIL"):
+                    fabricated += 1
+                    verifiable += 1
+                elif s == "NO_CLAIM":
+                    verifiable += 1
+        fabrication_rate = fabricated / total if total > 0 else 0.0
+        grounding_rate = grounded / verifiable if verifiable > 0 else 0.0
+        if total > 0 and fabrication_rate > FABRICATION_RATE_CEILING:
+            flags.append(
+                f"CITATION FABRICATION: {b_tag} emits {fabricated} fabricated "
+                f"cites out of {total} total (rate {fabrication_rate:.0%} > "
+                f"{FABRICATION_RATE_CEILING:.0%}). Hallucinating sections."
+            )
+        if verifiable >= GROUNDING_MIN_SAMPLE and grounding_rate < GROUNDING_FLOOR:
+            flags.append(
+                f"NO GROUNDED CITATIONS: {b_tag} emits {verifiable} verifiable "
+                f"cite attempts but only {grounded} ({grounding_rate:.0%}) "
+                f"actually ground in the cited source. Floor {GROUNDING_FLOOR:.0%}. "
+                f"Model is producing the Cite: surface format without "
+                f"the underlying semantic competence."
+            )
+    except Exception as e:
+        fabrication_rate = 0.0
+        flags.append(f"RUNTIME-VERIFIER ERROR: {e!r}")
+    return length_ratio, spurious_rate, fabrication_rate, flags
 
 
 def main():
@@ -176,10 +224,11 @@ def main():
     for dom in sorted(by_domain):
         ds = by_domain[dom]
         print(f"  domain={dom:<10} mean={statistics.mean(ds):.3f}  n={len(ds)}")
-    # Quality checks (length-ratio + spurious-cite) layered on top of edit-distance.
-    length_ratio, spurious_rate, q_flags = quality_checks(a_recs, b_recs, shared, a_tag, b_tag)
+    # Quality checks (length-ratio + spurious-cite + fabrication) layered on top of edit-distance.
+    length_ratio, spurious_rate, fabrication_rate, q_flags = quality_checks(a_recs, b_recs, shared, a_tag, b_tag)
     print(f"quality:    length_ratio={length_ratio:.3f}  (floor {LENGTH_RATIO_FLOOR:.2f})  "
-          f"spurious_cite_rate={spurious_rate:.0%}  (ceiling {SPURIOUS_CITE_CEILING:.0%})")
+          f"spurious_cite_rate={spurious_rate:.0%}  (ceiling {SPURIOUS_CITE_CEILING:.0%})  "
+          f"fabrication_rate={fabrication_rate:.0%}  (ceiling {FABRICATION_RATE_CEILING:.0%})")
     if q_flags:
         for f in q_flags:
             print(f"  WARN: {f}")
