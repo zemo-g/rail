@@ -55,6 +55,24 @@ TOPIC_HINTS: list[tuple[int, re.Pattern]] = [
     (5321, re.compile(r"\bSMTP\b", re.IGNORECASE)),
 ]
 
+# Python docs hints: each entry maps a prompt-regex to a
+# (page, identifier) pair the python_docs fetcher understands.
+# Order matters: more specific patterns first.
+PYTHON_HINTS: list[tuple[str, str, re.Pattern]] = [
+    ("library/time",          "time.sleep",
+     re.compile(r"\btime\.sleep\b", re.IGNORECASE)),
+    ("glossary",              "term-global-interpreter-lock",
+     re.compile(r"\bGIL\b|\bglobal interpreter lock\b", re.IGNORECASE)),
+    ("reference/datamodel",   "object.__hash__",
+     re.compile(r"\bobject\.__hash__\b|\b__hash__\b", re.IGNORECASE)),
+    ("reference/datamodel",   "object.__eq__",
+     re.compile(r"\b__eq__\b|\bobject identity\b|\bis\s+operator\b", re.IGNORECASE)),
+    ("library/stdtypes",      "truth",
+     re.compile(r"\btruth\s*(?:value|testing)\b|\bbool\(\s*['\"]False['\"]?", re.IGNORECASE)),
+    ("library/stdtypes",      "typesseq",
+     re.compile(r"\bdict\s+(?:order|insertion)\b|\bordered\s+dict\b", re.IGNORECASE)),
+]
+
 # Reasoning-style framings that signal a NO-CITE response.  Lifted from
 # the corpus_d_balance NC bucket -- these are the kinds of questions
 # where a citation would be cargo-culting.
@@ -85,6 +103,22 @@ def classify(prompt: str) -> dict:
     for rfc_num, pat in TOPIC_HINTS:
         if pat.search(prompt) and ("rfc", rfc_num) not in sources:
             sources.append(("rfc", rfc_num))
+
+    # 4. Python-docs hints (page#identifier encoded in the ident slot).
+    python_matched = False
+    for page, ident, pat in PYTHON_HINTS:
+        if pat.search(prompt):
+            key = ("python", f"{page}#{ident}")
+            if key not in sources:
+                sources.append(key)
+            python_matched = True
+
+    # If a Python-specific source matched, drop any POSIX function
+    # matches.  Python-namespaced functions (time.sleep, threading.Lock)
+    # match the bare POSIX regex too, but the Python docs are the
+    # authoritative source for Python questions.
+    if python_matched:
+        sources = [s for s in sources if s[0] != "posix"]
 
     # 4. Decide needs_cite.
     if sources:

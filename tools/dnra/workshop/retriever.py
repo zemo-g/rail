@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 from tools.dnra.impl.sources.rfc import fetch_rfc  # type: ignore[import-not-found]
 from tools.dnra.impl.sources.posix import get_section as posix_get_section  # type: ignore[import-not-found]
+from tools.dnra.impl.sources.python_docs import get_section as pydoc_get_section  # type: ignore[import-not-found]
 
 
 # Match RFC section headers at column 0.  Mirrors impl/sources/rfc.py.
@@ -114,6 +115,23 @@ def _retrieve_posix(func_name: str) -> dict | None:
     }
 
 
+def _retrieve_python(spec: str) -> dict | None:
+    """spec is 'page#identifier', e.g. 'library/time#time.sleep'."""
+    if "#" not in spec:
+        return None
+    page, ident = spec.split("#", 1)
+    body = pydoc_get_section(page, ident)
+    if not body:
+        return None
+    return {
+        "source": "docs.python.org",
+        "section": spec,
+        "text": body[:6000],
+        "score": 1,
+        "fallback": False,
+    }
+
+
 def retrieve(source_candidates: list[tuple[str, object]], prompt: str) -> dict | None:
     """Return the best retrieved section across all candidates, or None."""
     best = None
@@ -123,6 +141,8 @@ def retrieve(source_candidates: list[tuple[str, object]], prompt: str) -> dict |
             r = _retrieve_rfc(int(ident), prompt)
         elif kind == "posix":
             r = _retrieve_posix(str(ident))
+        elif kind == "python":
+            r = _retrieve_python(str(ident))
         else:
             r = None
         if r is None:
