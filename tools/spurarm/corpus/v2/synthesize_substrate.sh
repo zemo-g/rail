@@ -31,6 +31,7 @@ MAX="${4:-2000}"
 PORT="${PORT:-8082}"
 MAX_TOKENS="${MAX_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.9}"
+MODEL="${MODEL:-mlx-community/Qwen3.5-122B-A10B-heretic-v2-2.34bit-msq}"
 SUBSTRATE_TARGET="${SUBSTRATE_TARGET:-12000}"
 REJECT_LOG="${REJECT_LOG:-/tmp/spurarm_v2_pipeline/substrate_rejects.jsonl}"
 
@@ -101,7 +102,7 @@ while IFS= read -r seed_line; do
 
   user_prompt="Rephrase this instruction in $N distinct alternative phrasings:\n\n$nl"
 
-  resp=$(MAX_TOKENS="$MAX_TOKENS" TEMPERATURE="$TEMPERATURE" PORT="$PORT" \
+  resp=$(MAX_TOKENS="$MAX_TOKENS" TEMPERATURE="$TEMPERATURE" PORT="$PORT" MODEL="$MODEL" \
     sh tools/robot/call_substrate.sh "$SYS_FILE" "$user_prompt" 2>/dev/null || true)
   if [ -z "$resp" ]; then
     rejected=$((rejected + 1))

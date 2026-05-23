@@ -72,12 +72,12 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 # Substrate probe: REQUIRED unless explicitly skipped.
 if [ "$SKIP_SUBSTRATE" = "0" ]; then
-  if ! curl -sS --max-time 3 "http://localhost:$PORT/v1/models" 2>/dev/null | grep -q '"id"'; then
+  if ! curl -sS --max-time 30 "http://localhost:$PORT/v1/models" 2>/dev/null | grep -q '"id"'; then
     echo "ERROR: no substrate at localhost:$PORT. Set SKIP_SUBSTRATE=1 to bypass." >&2
     echo "  (Substrate is required for v2 unless skipping; SPEC §9d.)"
     exit 2
   fi
-  model_id=$(curl -sS --max-time 3 "http://localhost:$PORT/v1/models" 2>/dev/null \
+  model_id=$(curl -sS --max-time 30 "http://localhost:$PORT/v1/models" 2>/dev/null \
     | jq -r '.data[0].id // .data.id // "unknown"')
   echo "substrate up at :$PORT model=$model_id"
 else
@@ -155,6 +155,13 @@ if [ "$SKIP_SUBSTRATE" = "0" ]; then
   head -2000 "$PROC_OUT" >> "$TMP_SEED_POOL" || true
   SUBSTRATE_TARGET="$SUBSTRATE_TARGET" PORT="$PORT" \
     sh tools/spurarm/corpus/v2/synthesize_substrate.sh "$TMP_SEED_POOL" "$SUB_OUT" 6 2500 || true
+elif [ "$SKIP_SUBSTRATE" = "reuse" ]; then
+  # Preserve existing SUB_OUT (resumable run after a prior partial pipeline).
+  if [ -s "$SUB_OUT" ]; then
+    echo "substrate reused (SKIP_SUBSTRATE=reuse): $(wc -l < "$SUB_OUT" | tr -d ' ') lines from prior run preserved"
+  else
+    echo "substrate reuse requested but $SUB_OUT is empty; treating as skipped"
+  fi
 else
   : > "$SUB_OUT"
   echo "substrate skipped (SKIP_SUBSTRATE=1)"
