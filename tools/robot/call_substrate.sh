@@ -23,6 +23,7 @@ PORT="${PORT:-8082}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
 TEMPERATURE="${TEMPERATURE:-0.3}"
 ENABLE_THINKING="${ENABLE_THINKING:-false}"
+MODEL="${MODEL:-}"
 
 sys_file="$1"
 user_prompt="$2"
@@ -34,6 +35,7 @@ payload=$(jq -n \
   --argjson max "$MAX_TOKENS" \
   --argjson temp "$TEMPERATURE" \
   --argjson thinking "$ENABLE_THINKING" \
+  --arg model "$MODEL" \
   '{
     messages: [
       {role: "system", content: $sys},
@@ -42,7 +44,7 @@ payload=$(jq -n \
     max_tokens: $max,
     temperature: $temp,
     chat_template_kwargs: {enable_thinking: $thinking}
-  }')
+  } | if $model != "" then . + {model: $model} else . end')
 
 # POST and extract content. Keep reasoning OUT (we don't want it in
 # the candidate file even when thinking is on).
