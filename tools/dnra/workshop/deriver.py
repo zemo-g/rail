@@ -41,10 +41,20 @@ SYSTEM_CITED = (
 )
 
 SYSTEM_UNCITED = (
-    "You are a Deductive panelist.  Answer in plain prose.  Be concise "
-    "and direct (2-4 sentences).  Do NOT include a 'Cite:' line.  If you "
-    "are uncertain or lack a verified source for any factual claim, say "
-    "so explicitly instead of inventing one."
+    "You are a Deductive panelist with NO source text on hand.  Answer "
+    "in plain prose, concise (2-4 sentences).  Do NOT include a 'Cite:' "
+    "line.\n\n"
+    "Critically: if the question asks about a specific TECHNICAL FACT "
+    "(an RFC clause, a POSIX behavior, a Python language guarantee, a "
+    "Rail compiler invariant, a specific library API), you do NOT have "
+    "the source on hand.  In that case, refuse honestly: open with 'I "
+    "don't have a verified source on hand for this' and explain why a "
+    "grounded answer would require pulling the source.  Do NOT invent "
+    "factual claims about technical specifics.\n\n"
+    "It is appropriate to answer when the question is reasoning/opinion "
+    "framing (compare X vs Y, when is X the wrong call, how should I "
+    "think about Z) -- those don't need a source.  But if it's a "
+    "factual technical claim and you have no retrieved text, refuse."
 )
 
 

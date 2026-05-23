@@ -94,10 +94,26 @@ def parse_cite(cite_text: str) -> tuple[str, str]:
         rest = re.sub(r"^\s*section\s+", "", rest, flags=re.IGNORECASE).strip()
         return source, rest
 
-    # Rail local docs (unverifiable at v0 -- no fetcher yet)
+    # Rail local docs.  Cite shape:
+    #   'Rail CLAUDE.md section Runtime Safety'
+    #   'Rail CLAUDE.md Runtime Safety'
+    #   '~/projects/rail/CLAUDE.md section ...'
     if "CLAUDE.md" in cite_text or "HANDOFF" in cite_text or "rail/" in cite_text:
+        # Extract doc identifier (everything before "section " if present).
         sec_m = re.search(r"section\s+(.+)", cite_text, re.IGNORECASE)
-        return "Rail CLAUDE.md", sec_m.group(1).strip() if sec_m else cite_text
+        if sec_m:
+            section = sec_m.group(1).strip()
+            doc_part = cite_text[:sec_m.start()].strip()
+        else:
+            # No 'section' delimiter -- best-effort
+            section = cite_text
+            doc_part = "CLAUDE.md"
+        # Pick a doc string the verifier's resolve_source will route.
+        if "HANDOFF" in doc_part:
+            source = "Rail HANDOFF.md"
+        else:
+            source = "Rail CLAUDE.md"
+        return source, section
     # Anything else
     return cite_text, ""
 

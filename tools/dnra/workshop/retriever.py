@@ -25,6 +25,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from tools.dnra.impl.sources.rfc import fetch_rfc  # type: ignore[import-not-found]
 from tools.dnra.impl.sources.posix import get_section as posix_get_section  # type: ignore[import-not-found]
 from tools.dnra.impl.sources.python_docs import get_section as pydoc_get_section  # type: ignore[import-not-found]
+from tools.dnra.impl.sources.rail_local import get_section as rail_local_get_section  # type: ignore[import-not-found]
 
 
 # Match RFC section headers at column 0.  Mirrors impl/sources/rfc.py.
@@ -132,6 +133,23 @@ def _retrieve_python(spec: str) -> dict | None:
     }
 
 
+def _retrieve_rail(spec: str) -> dict | None:
+    """spec is 'doc#section', e.g. 'CLAUDE.md#Runtime Safety'."""
+    if "#" not in spec:
+        return None
+    doc, sec = spec.split("#", 1)
+    body = rail_local_get_section(doc, sec)
+    if not body:
+        return None
+    return {
+        "source": f"Rail {doc}",
+        "section": sec,
+        "text": body[:6000],
+        "score": 1,
+        "fallback": False,
+    }
+
+
 def retrieve(source_candidates: list[tuple[str, object]], prompt: str) -> dict | None:
     """Return the best retrieved section across all candidates, or None."""
     best = None
@@ -143,6 +161,8 @@ def retrieve(source_candidates: list[tuple[str, object]], prompt: str) -> dict |
             r = _retrieve_posix(str(ident))
         elif kind == "python":
             r = _retrieve_python(str(ident))
+        elif kind == "rail_local":
+            r = _retrieve_rail(str(ident))
         else:
             r = None
         if r is None:
