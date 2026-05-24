@@ -48,6 +48,29 @@ SYSTEM_CITED = (
     "  - Do not cite anything outside the supplied section."
 )
 
+SYSTEM_EMPIRICAL = (
+    "You are an Empirical panelist.  You will receive a user question "
+    "AND the verbatim text of one section of an authoritative source.  "
+    "Where the Deductive panelist quotes the source's general invariant, "
+    "you target the OBSERVABLE BEHAVIOR clause -- the part of the section "
+    "that describes what HAPPENS when the operation runs.  Look for "
+    "'shall fail if', 'shall return', 'shall set errno to', 'on success "
+    "returns', 'the function returns', 'when X then Y', etc.\n\n"
+    "Answer by (a) opening with 'Observed:' or 'In practice:' (NOT 'Yes' "
+    "or 'No' -- those are Deductive openers), (b) quoting the OBSERVED-"
+    "BEHAVIOR clause VERBATIM in double quotes, (c) framing your "
+    "derivation as 'this means an implementation running this would see "
+    "X' / 'callers observe Y' style -- 1-3 sentences, and (d) ending with "
+    "'Cite: <source> section <section>'.\n\n"
+    "Quotation rules (same as Deductive): single contiguous substring, no "
+    "ellipses, no splicing across paragraphs.  Markdown markers may be "
+    "dropped.  Do not cite anything outside the supplied section.\n\n"
+    "If the supplied section text has no observable-behavior clause "
+    "(it's pure prose / framing), return: "
+    '{"prompt":"","target":""} and let the orchestrator route uncited.'
+)
+
+
 SYSTEM_UNCITED = (
     "You are a Deductive panelist with NO source text on hand.  Answer "
     "in plain prose, concise (2-4 sentences).  Do NOT include a 'Cite:' "
@@ -73,6 +96,40 @@ def _post(url: str, body: dict, timeout: int = 180) -> dict:
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
+
+
+def derive_empirical(
+    prompt: str,
+    retrieved: dict,
+    *,
+    endpoint: str = LLM_URL_DEFAULT,
+    model: str = MODEL_DEFAULT,
+    max_tokens: int = 400,
+    temperature: float = 0.2,
+) -> str:
+    """Empirical-flavored RAG derivation over the same retrieved section.
+
+    Emits 'Observed: ...' + verbatim quote of the observable-behavior clause
+    + derivation framed as runtime observation + Cite line.
+    """
+    user_msg = (
+        f"Question: {prompt}\n\n"
+        f"Source: {retrieved['source']} section {retrieved['section']}\n"
+        f"Section text:\n<<<\n{retrieved['text']}\n>>>\n\n"
+        f"Construct your Empirical answer per the system instructions.  "
+        f"The Cite line must read exactly 'Cite: {retrieved['source']} "
+        f"section {retrieved['section']}'."
+    )
+    resp = _post(endpoint, {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_EMPIRICAL},
+            {"role": "user", "content": user_msg},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    })
+    return resp["choices"][0]["message"]["content"]
 
 
 def derive_cited(
