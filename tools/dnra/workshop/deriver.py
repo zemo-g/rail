@@ -35,9 +35,17 @@ SYSTEM_CITED = (
     "(b) quoting the load-bearing clause from the supplied section text "
     "VERBATIM (in double quotes), (c) deriving the conclusion in 1-3 short "
     "sentences, and (d) ending with a single 'Cite:' line whose source and "
-    "section match the supplied section's header.  The quoted clause MUST "
-    "be a contiguous substring of the supplied text.  Do not paraphrase "
-    "inside the quotation.  Do not cite anything else."
+    "section match the supplied section's header.\n\n"
+    "Quotation rules (CRITICAL):\n"
+    "  - The quoted clause MUST be a single contiguous substring of the "
+    "supplied text.  Do NOT insert '...' ellipses inside the quote.  Do "
+    "NOT splice across paragraphs or bullets.\n"
+    "  - If you must shorten, pick a single sentence or phrase that "
+    "already appears verbatim.  A shorter precise quote beats a longer "
+    "stitched one.\n"
+    "  - You may drop markdown markers like **bold** when quoting -- the "
+    "verifier ignores those.\n"
+    "  - Do not cite anything outside the supplied section."
 )
 
 SYSTEM_UNCITED = (
