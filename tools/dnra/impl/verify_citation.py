@@ -43,6 +43,9 @@ from tools.dnra.impl.sources.rail_local import get_section as rail_local_get_sec
 
 QUOTED_SPAN = re.compile(r"'([^']{15,})'|\"([^\"]{15,})\"")
 WHITESPACE = re.compile(r"\s+")
+# Markdown formatting markers stripped before substring match.  A model
+# is allowed to quote `Allocator:` even if the source has `**Allocator**:`.
+MARKDOWN_MARKERS = re.compile(r"[*_`]+")
 
 # Recognized POSIX-page section headers; used to detect whether the
 # curator's `section` field carries an explicit section name (e.g.
@@ -64,6 +67,12 @@ RAIL_LOCAL_PATTERN = re.compile(
 
 
 def _normalize(s: str) -> str:
+    """Whitespace-collapse + lowercase + strip markdown bold/italic/code markers.
+
+    The verifier is checking semantic substring containment, not exact
+    presentation.  A quote that drops the source's `**foo**` markdown
+    bolding still grounds in the same content."""
+    s = MARKDOWN_MARKERS.sub("", s)
     return WHITESPACE.sub(" ", s).strip().lower()
 
 

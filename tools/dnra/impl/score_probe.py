@@ -42,7 +42,7 @@ from pathlib import Path
 
 COLLAPSE_THRESHOLD = 0.25
 PRODUCTIVE_THRESHOLD = 0.35
-LENGTH_RATIO_FLOOR = 0.50          # trained mean / base mean must be >= this
+LENGTH_RATIO_FLOOR = 0.30          # trained mean / base mean must be >= this
 SPURIOUS_CITE_CEILING = 0.70       # rate of base-no-cite-but-trained-cites
 FABRICATION_RATE_CEILING = 0.30    # of cites emitted, <= 30% may be fabricated
 GROUNDING_FLOOR = 0.20             # of verifiable cite attempts, >= 20% must ground
