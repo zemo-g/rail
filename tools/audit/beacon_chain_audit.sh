@@ -15,15 +15,17 @@ set -u
 
 N=200
 QUIET=0
+LAB_MODE=0
 PI=zemog@100.87.231.45
 LOG='$HOME/.ledatic/witness/log.jsonl'  # quoted: $HOME expands on Pi, not locally
 MAX_GAP=1000
 
 while (( $# )); do
   case "$1" in
-    -n) N="$2"; shift 2 ;;
-    -q) QUIET=1; shift ;;
-    *)  echo "unknown arg: $1" >&2; exit 2 ;;
+    -n)    N="$2"; shift 2 ;;
+    -q)    QUIET=1; shift ;;
+    --lab) LAB_MODE=1; QUIET=1; shift ;;
+    *)     echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
@@ -111,6 +113,25 @@ fail=0
 (( monotone_fail > 0 )) && fail=1
 (( linkage_fail > 0 )) && fail=1
 (( max_gap > MAX_GAP )) && { echo "GAP_OVER_THRESHOLD max_gap=$max_gap > $MAX_GAP"; fail=1; }
+
+if (( LAB_MODE == 1 )); then
+  echo "===RAIL_LAB_COUNTERS==="
+  echo "{\"counter\": \"records_walked\", \"value\": $records}"
+  echo "{\"counter\": \"gap_min\", \"value\": $min_gap}"
+  echo "{\"counter\": \"gap_max\", \"value\": $max_gap}"
+  echo "{\"counter\": \"gap_mean\", \"value\": $mean_gap}"
+  echo "{\"counter\": \"monotone_fail\", \"value\": $monotone_fail}"
+  echo "{\"counter\": \"linkage_checked\", \"value\": $linkage_checked}"
+  echo "{\"counter\": \"linkage_fail\", \"value\": $linkage_fail}"
+  echo "===END==="
+  if (( fail == 0 )); then
+    echo "===VERDICT=== PASS"
+    exit 0
+  else
+    echo "===VERDICT=== FALSIFIED"
+    exit 1
+  fi
+fi
 
 if (( fail == 0 )); then
   echo "VERDICT=PASS"

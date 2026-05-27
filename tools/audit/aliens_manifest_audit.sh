@@ -11,7 +11,14 @@
 set -u
 
 QUIET=0
-[[ "${1:-}" == "-q" ]] && QUIET=1
+LAB_MODE=0
+while (( $# )); do
+  case "$1" in
+    -q)    QUIET=1; shift ;;
+    --lab) LAB_MODE=1; QUIET=1; shift ;;
+    *)     echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
 
 BASE="${LEDATIC_BASE:-https://ledatic.org}"
 MANIFEST_PATH="${MANIFEST_PATH:-/pursue/manifest.jsonl}"
@@ -87,6 +94,25 @@ rm -f "$tmp"
 echo
 echo "=== SUMMARY ==="
 echo "sampled: $local_path"
+
+if (( LAB_MODE == 1 )); then
+  size_match=$([[ "$size_actual" == "$size_claimed" ]] && echo 1 || echo 0)
+  sha_match=$([[ "$sha_actual" == "$sha_claimed" ]] && echo 1 || echo 0)
+  echo "===RAIL_LAB_COUNTERS==="
+  echo "{\"counter\": \"size_match\", \"value\": $size_match}"
+  echo "{\"counter\": \"sha_match\", \"value\": $sha_match}"
+  echo "{\"counter\": \"sampled_size_bytes\", \"value\": ${size_claimed:-0}}"
+  echo "{\"counter\": \"manifest_records\", \"value\": ${records:-0}}"
+  echo "===END==="
+  if (( fail == 0 )); then
+    echo "===VERDICT=== PASS"
+    exit 0
+  else
+    echo "===VERDICT=== FALSIFIED"
+    exit 1
+  fi
+fi
+
 if (( fail == 0 )); then
   echo "VERDICT=PASS — sampled record matches manifest (size + sha256)"
   exit 0

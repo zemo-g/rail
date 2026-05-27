@@ -17,7 +17,14 @@
 set -u
 
 QUIET=0
-[[ "${1:-}" == "-q" ]] && QUIET=1
+LAB_MODE=0
+while (( $# )); do
+  case "$1" in
+    -q)    QUIET=1; shift ;;
+    --lab) LAB_MODE=1; QUIET=1; shift ;;
+    *)     echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
 
 ARM_DIR="${LEDATIC_ARM_DIR:-${HOME}/projects/ledatic-arm}"
 CHAIN="${LEDATIC_ARM_CHAIN:-${HOME}/.ledatic-arm/chain/armsim_chain.jsonl}"
@@ -97,6 +104,23 @@ echo
 # ---- 4. Verdict + summary -------------------------------------------------
 echo "=== SUMMARY ==="
 echo "tuple_size=${#TUPLE_FIELDS[@]} present=${#present[@]} missing=${#missing[@]}"
+
+if (( LAB_MODE == 1 )); then
+  echo "===RAIL_LAB_COUNTERS==="
+  echo "{\"counter\": \"tuple_size\", \"value\": ${#TUPLE_FIELDS[@]}}"
+  echo "{\"counter\": \"present\", \"value\": ${#present[@]}}"
+  echo "{\"counter\": \"missing\", \"value\": ${#missing[@]}}"
+  echo "{\"counter\": \"chain_records\", \"value\": $total}"
+  echo "===END==="
+  if (( ${#missing[@]} == 0 )); then
+    echo "===VERDICT=== PASS"
+    exit 0
+  else
+    echo "===VERDICT=== FALSIFIED"
+    exit 1
+  fi
+fi
+
 if (( ${#missing[@]} == 0 )); then
   echo "VERDICT=PASS — README tuple matches substrate"
   exit 0
