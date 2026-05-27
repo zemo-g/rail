@@ -11,7 +11,14 @@
 set -u
 
 QUIET=0
-[[ "${1:-}" == "-q" ]] && QUIET=1
+LAB_MODE=0
+while (( $# )); do
+  case "$1" in
+    -q)    QUIET=1; shift ;;
+    --lab) LAB_MODE=1; QUIET=1; shift ;;
+    *)     echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
 
 BASE="${LEDATIC_BASE:-https://ledatic.org}"
 VAULT="${HOME}/ledatic-clients/dda/reports"
@@ -197,6 +204,23 @@ echo "rows=$row_count total_briefs=$total_briefs sidecars_checked=$sidecars_chec
 if (( total_fail > 0 )); then
   printf 'FAILING_CLASSES='
   IFS=,; echo "${failing[*]}"
+fi
+
+if (( LAB_MODE == 1 )); then
+  echo "===RAIL_LAB_COUNTERS==="
+  echo "{\"counter\": \"classes_pass\", \"value\": $total_pass}"
+  echo "{\"counter\": \"classes_fail\", \"value\": $total_fail}"
+  echo "{\"counter\": \"rows\", \"value\": ${row_count:-0}}"
+  echo "{\"counter\": \"total_briefs\", \"value\": ${total_briefs:-0}}"
+  echo "{\"counter\": \"sidecars_checked\", \"value\": ${sidecars_checked:-0}}"
+  echo "===END==="
+  if (( total_fail == 0 )); then
+    echo "===VERDICT=== PASS"
+    exit 0
+  else
+    echo "===VERDICT=== FALSIFIED"
+    exit 1
+  fi
 fi
 
 [[ $total_fail -eq 0 ]] && exit 0 || exit 1

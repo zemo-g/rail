@@ -12,10 +12,17 @@
 set -u
 
 QUIET=0
+LAB_MODE=0
 HALT_COMMIT="${HALT_COMMIT:-b916f67}"
 COMPOUND_DIR="${COMPOUND_DIR:-${HOME}/projects/compound}"
 
-[[ "${1:-}" == "-q" ]] && QUIET=1
+while (( $# )); do
+  case "$1" in
+    -q)    QUIET=1; shift ;;
+    --lab) LAB_MODE=1; QUIET=1; shift ;;
+    *)     echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
 
 log()    { (( QUIET )) || echo "  $*"; }
 header() { (( QUIET )) || echo "--- $* ---"; }
@@ -148,6 +155,26 @@ echo "PASS=$total_pass FAIL=$total_fail"
 if (( total_fail > 0 )); then
   printf 'FAILING_CLASSES='
   IFS=,; echo "${failing[*]}"
+fi
+
+if (( LAB_MODE == 1 )); then
+  echo "===RAIL_LAB_COUNTERS==="
+  echo "{\"counter\": \"classes_pass\", \"value\": $total_pass}"
+  echo "{\"counter\": \"classes_fail\", \"value\": $total_fail}"
+  echo "{\"counter\": \"records_under_tight\", \"value\": ${tight_count:-0}}"
+  echo "{\"counter\": \"tight_accepts\", \"value\": ${tight_accepts:-0}}"
+  echo "{\"counter\": \"total_records\", \"value\": ${actual_records:-0}}"
+  echo "===END==="
+  if (( total_fail == 0 )); then
+    echo "===VERDICT=== PASS"
+    exit 0
+  else
+    echo "===VERDICT=== FALSIFIED"
+    exit 1
+  fi
+fi
+
+if (( total_fail > 0 )); then
   echo "VERDICT=FALSIFIED — compound halt provenance is not fully verifiable"
   exit 1
 else
