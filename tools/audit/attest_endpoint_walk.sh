@@ -110,7 +110,16 @@ class_fleet() {
     log "FAIL: no asof_unix"; verdict fleet FAIL; return
   fi
   age=$(( NOW - asof ))
-  pi_alive_pub=$(grep -A2 '"name":"pi"' <<<"$payload" | grep -oE '"alive":(true|false)' | head -1)
+  # JSON keys are alphabetical: alive,host,name,uptime — so alive appears
+  # BEFORE name. Use python to pluck the pi node's alive deterministically.
+  pi_alive_pub=$(python3 -c "
+import sys, json
+d=json.loads('''$payload''')
+for n in d.get('nodes', []):
+    if n.get('name')=='pi':
+        print('true' if n.get('alive') else 'false')
+        break
+" 2>/dev/null)
   log "status age: ${age}s; pi: ${pi_alive_pub}"
   if (( age > 300 )); then
     log "FAIL: status stale (${age}s > 300s)"; verdict fleet FAIL; return
