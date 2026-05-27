@@ -13,7 +13,14 @@
 set -u
 
 QUIET=0
-[[ "${1:-}" == "-q" ]] && QUIET=1
+LAB_MODE=0
+while (( $# )); do
+  case "$1" in
+    -q)    QUIET=1; shift ;;
+    --lab) LAB_MODE=1; QUIET=1; shift ;;   # emit run.rail-compatible sentinels
+    *)     echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
 
 CLAUDE_MD="${CLAUDE_MD:-${HOME}/CLAUDE.md}"
 AGENTS_DIR="${HOME}/Library/LaunchAgents"
@@ -128,6 +135,23 @@ fi
 if (( ${#bad_paths[@]} > 0 )); then
   echo "BAD_PATHS:"
   for bp in "${bad_paths[@]}"; do echo "  $bp"; done
+fi
+
+if (( LAB_MODE == 1 )); then
+  echo "===RAIL_LAB_COUNTERS==="
+  echo "{\"counter\": \"claimed\", \"value\": $total}"
+  echo "{\"counter\": \"ok\", \"value\": $ok}"
+  echo "{\"counter\": \"drifted\", \"value\": $((total - ok))}"
+  echo "{\"counter\": \"not_loaded_count\", \"value\": ${#not_loaded[@]}}"
+  echo "{\"counter\": \"disabled_plist_count\", \"value\": ${#disabled_plist[@]}}"
+  echo "===END==="
+  if (( ok == total )); then
+    echo "===VERDICT=== PASS"
+    exit 0
+  else
+    echo "===VERDICT=== FALSIFIED"
+    exit 1
+  fi
 fi
 
 if (( ok == total )); then
