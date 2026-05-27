@@ -29,7 +29,7 @@ claimed=$(awk '
   /^\*\*Currently running/ { in_block=1; next }
   in_block && /^\*\*/ { in_block=0 }
   in_block { print }
-' "$CLAUDE_MD" | grep -oE 'com\.ledatic\.[a-z_-]+' | sort -u)
+' "$CLAUDE_MD" | grep -oE 'com\.ledatic\.[a-z_-]*[a-z0-9]' | sort -u)
 
 if [[ -z "$claimed" ]]; then
   echo "FATAL: no claimed-running services found in $CLAUDE_MD"
