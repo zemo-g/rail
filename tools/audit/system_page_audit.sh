@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# tools/audit/system_page_audit.sh
+#
+# /system page substrate audit — Phase 1 of docs/plans/SYSTEM_PAGE_AUDIT.md.
+#
+# Covers static substrate-dependent strings in ledatic.org/system. The
+# live JS-fetched values are covered by tools/audit/attest_endpoint_walk.sh.
+#
+# Phase 1 classes: rail_version, test_count.
+# Phase 2 classes (TODO): stdlib_count, compiler_loc, function_count,
+#                        pk_fingerprint, verifier_paths.
+#
+# Exit 0 if all PASS, 1 if any FAIL, 2 on probe error.
+
+set -u
+
+QUIET=0
+[[ "${1:-}" == "-q" ]] && QUIET=1
+
+BASE="${LEDATIC_BASE:-https://ledatic.org}"
+RAIL_DIR="${HOME}/projects/rail"
+PAGE=/tmp/system_audit.html
+
+total_pass=0
+total_fail=0
+failing=()
+
+log()    { (( QUIET )) || echo "  $*"; }
+header() { (( QUIET )) || echo "--- $* ---"; }
+verdict() {
+  local class=$1 result=$2
+  if [[ "$result" == "PASS" ]]; then
+    total_pass=$((total_pass + 1))
+    (( QUIET )) || echo "CLASS=$class VERDICT=PASS"
+  else
+    total_fail=$((total_fail + 1))
+    failing+=("$class")
+    echo "CLASS=$class VERDICT=FAIL"
+  fi
+}
+
+curl -sf "$BASE/system" -o "$PAGE" || { echo "FATAL: could not fetch /system"; exit 2; }
+
+# ============================================================================
+# CLASS: rail_version — header version matches latest git tag
+# ============================================================================
+class_rail_version() {
+  local page_ver tag_ver
+  # Header reads e.g. "RAIL v5.1.0 · 141/141"
+  page_ver=$(grep -oE 'RAIL v[0-9]+\.[0-9]+\.[0-9]+' "$PAGE" | head -1 | awk '{print $2}')
+  tag_ver=$(cd "$RAIL_DIR" && git tag --list 'v*' | sort -V | tail -1)
+  log "page: $page_ver  substrate: $tag_ver"
+  if [[ "$page_ver" == "$tag_ver" ]]; then
+    verdict rail_version PASS
+  else
+    log "FAIL: header version $page_ver != latest tag $tag_ver"
+    verdict rail_version FAIL
+  fi
+}
+
+# ============================================================================
+# CLASS: test_count — header X/Y matches actual test run
+# ============================================================================
+class_test_count() {
+  local page_count truth_count
+  # Header reads "RAIL v5.1.0 · 141/141"
+  page_count=$(grep -oE '[0-9]+/[0-9]+' "$PAGE" | head -1)
+  truth_count=$(cd "$RAIL_DIR" && ./rail_native test 2>&1 | tail -1 | grep -oE '[0-9]+/[0-9]+' | head -1)
+  log "page: $page_count  substrate: $truth_count"
+  if [[ "$page_count" == "$truth_count" ]]; then
+    verdict test_count PASS
+  else
+    log "FAIL: page $page_count != substrate $truth_count"
+    verdict test_count FAIL
+  fi
+}
+
+# ============================================================================
+# RUN
+# ============================================================================
+(( QUIET )) || echo "=== SYSTEM PAGE AUDIT — $(date -u +%FT%TZ) ==="
+(( QUIET )) || echo "base: $BASE"
+(( QUIET )) || echo
+
+header rail_version;  class_rail_version
+header test_count;    class_test_count
+
+echo
+echo "=== SUMMARY ==="
+echo "PASS=$total_pass FAIL=$total_fail"
+if (( total_fail > 0 )); then
+  printf 'FAILING_CLASSES='
+  IFS=,; echo "${failing[*]}"
+fi
+
+[[ $total_fail -eq 0 ]] && exit 0 || exit 1
