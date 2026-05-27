@@ -1,0 +1,115 @@
+-- jit_emit_shaped_smoke.rail — Phase 2.9 v1.5 smoke.
+--
+-- Validates that emit_msl_for_match_shaped:
+--   1. Produces DIFFERENT MSL bytes for DAGs with different shapes
+--      (proves the emitter is DAG-shape-driven, not a constant).
+--   2. The emitted MSL contains the right baked dimensions
+--      ("constant uint D = <d>" etc.).
+--   3. The shape comes from the JitNode's .shape field — change the
+--      tape's shape, get different MSL.
+
+import "stdlib/jit_emit.rail"
+
+push tape node =
+  let r = jit_tape_push tape node
+  cons (head r) (cons (head (tail r)) [])
+
+push_tape p = head p
+push_idx p = head (tail p)
+
+-- Build a 4-node QKV-shape DAG: leaf x, leaf g, rmsnorm, 3× matmul.
+-- Plus 4-node SwiGLU-shape DAG: leaf h_gate, silu, leaf h_up, hadamard.
+-- Pattern parameterized over (seq, d, d_ff).
+build_dag seq d d_ff =
+  let t = jit_tape_new 0
+  let r0 = push t  (JitNode "leaf"    (cons seq (cons d []))    "f32" [])
+  let t0 = push_tape r0
+  let i_x = push_idx r0
+  let r1 = push t0 (JitNode "leaf"    (cons d [])               "f32" [])
+  let t1 = push_tape r1
+  let i_g = push_idx r1
+  let r2 = push t1 (JitNode "rmsnorm" (cons seq (cons d []))    "f32" (cons i_x (cons i_g [])))
+  let t2 = push_tape r2
+  let i_rms = push_idx r2
+  let r3 = push t2 (JitNode "leaf"    (cons d (cons d []))      "f32" [])
+  let t3 = push_tape r3
+  let i_wq = push_idx r3
+  let r4 = push t3 (JitNode "leaf"    (cons d (cons d []))      "f32" [])
+  let t4 = push_tape r4
+  let i_wk = push_idx r4
+  let r5 = push t4 (JitNode "leaf"    (cons d (cons d []))      "f32" [])
+  let t5 = push_tape r5
+  let i_wv = push_idx r5
+  let r6 = push t5 (JitNode "matmul"  (cons seq (cons d []))    "f32" (cons i_rms (cons i_wq [])))
+  let t6 = push_tape r6
+  let r7 = push t6 (JitNode "matmul"  (cons seq (cons d []))    "f32" (cons i_rms (cons i_wk [])))
+  let t7 = push_tape r7
+  let r8 = push t7 (JitNode "matmul"  (cons seq (cons d []))    "f32" (cons i_rms (cons i_wv [])))
+  let t8 = push_tape r8
+  let r9 = push t8 (JitNode "leaf"    (cons seq (cons d_ff [])) "f32" [])
+  let t9 = push_tape r9
+  let i_hg = push_idx r9
+  let rA = push t9 (JitNode "silu"    (cons seq (cons d_ff [])) "f32" (cons i_hg []))
+  let tA = push_tape rA
+  let i_silu = push_idx rA
+  let rB = push tA (JitNode "leaf"    (cons seq (cons d_ff [])) "f32" [])
+  let tB = push_tape rB
+  let rC = push tB (JitNode "hadamard" (cons seq (cons d_ff [])) "f32" (cons i_silu (cons (push_idx rB) [])))
+  let tC = push_tape rC
+  tC
+
+main =
+  let _ = print "=== Phase 2.9 v1.5 — shape-specialized emitter smoke ==="
+
+  -- Shape A: seq=16, d=64, d_ff=192 (N=3072)
+  let tA = build_dag 16 64 192
+  let mA = walk_tape tA
+  let mA0 = jit_nth 0 mA
+  let mA1 = jit_nth 1 mA
+  let sA_rms  = emit_msl_for_match_shaped tA mA0
+  let sA_silu = emit_msl_for_match_shaped tA mA1
+
+  -- Shape B: seq=32, d=128, d_ff=384 (N=12288)
+  let tB = build_dag 32 128 384
+  let mB = walk_tape tB
+  let mB0 = jit_nth 0 mB
+  let mB1 = jit_nth 1 mB
+  let sB_rms  = emit_msl_for_match_shaped tB mB0
+  let sB_silu = emit_msl_for_match_shaped tB mB1
+
+  let lA_rms  = length (chars sA_rms)
+  let lB_rms  = length (chars sB_rms)
+  let lA_silu = length (chars sA_silu)
+  let lB_silu = length (chars sB_silu)
+  let _ = print (cat ["[len] A rmsnorm_qkv=", show lA_rms, "  B rmsnorm_qkv=", show lB_rms])
+  let _ = print (cat ["[len] A silu_had  =", show lA_silu, "  B silu_had  =", show lB_silu])
+
+  -- Assertion 1: A's MSL != B's MSL for both patterns.
+  let diff_rms  = if sA_rms == sB_rms   then 0 else 1
+  let diff_silu = if sA_silu == sB_silu then 0 else 1
+  let _ = print (cat ["[assert] rmsnorm_qkv MSL differs across shapes: ", if diff_rms == 1 then "OK" else "FAIL"])
+  let _ = print (cat ["[assert] silu_hadamard MSL differs across shapes: ", if diff_silu == 1 then "OK" else "FAIL"])
+
+  -- Assertion 2: baked-in constants are correct.
+  let has_d64    = if str_contains "constant uint D = 64"   sA_rms  then 1 else 0
+  let has_d128   = if str_contains "constant uint D = 128"  sB_rms  then 1 else 0
+  let has_n3072  = if str_contains "constant uint N = 3072" sA_silu then 1 else 0
+  let has_n12288 = if str_contains "constant uint N = 12288" sB_silu then 1 else 0
+  let _ = print (cat ["[assert] A rmsnorm has 'D = 64':    ", if has_d64    == 1 then "OK" else "FAIL"])
+  let _ = print (cat ["[assert] B rmsnorm has 'D = 128':   ", if has_d128   == 1 then "OK" else "FAIL"])
+  let _ = print (cat ["[assert] A silu has 'N = 3072':     ", if has_n3072  == 1 then "OK" else "FAIL"])
+  let _ = print (cat ["[assert] B silu has 'N = 12288':    ", if has_n12288 == 1 then "OK" else "FAIL"])
+
+  -- Assertion 3: buffer-constant SEQ/D declarations are REMOVED from
+  -- the shaped MSL (since they're baked at top level now).
+  let no_buf_seq = if str_contains "&SEQ" sA_rms then 0 else 1
+  let no_buf_d   = if str_contains "&D"   sA_rms then 0 else 1
+  let no_buf_n   = if str_contains "&N"   sA_silu then 0 else 1
+  let _ = print (cat ["[assert] no &SEQ buffer arg in shaped rms: ", if no_buf_seq == 1 then "OK" else "FAIL"])
+  let _ = print (cat ["[assert] no &D buffer arg in shaped rms:   ", if no_buf_d   == 1 then "OK" else "FAIL"])
+  let _ = print (cat ["[assert] no &N buffer arg in shaped silu:  ", if no_buf_n   == 1 then "OK" else "FAIL"])
+
+  let total = diff_rms + diff_silu + has_d64 + has_d128 + has_n3072 + has_n12288 + no_buf_seq + no_buf_d + no_buf_n
+  let _ = if total == 9 then print "\n=== PHASE 2.9 v1.5 — GREEN: shape-specialized emitter is DAG-shape-driven ==="
+          else print (cat ["\n=== FAIL — ", show total, "/9 assertions passed ==="])
+  0

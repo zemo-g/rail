@@ -1,0 +1,128 @@
+-- jit_shaped_dispatch_smoke.rail — Phase 2.10 final.
+--
+-- Compiles + dispatches the SHAPE-SPECIALIZED kernel emitted by
+-- jit_emit.rail's *_shaped path, and compares outputs to the per-op
+-- CPU reference.  This is the bench-validation gate for Phase 2.9 v1.5:
+-- shape-baked MSL must produce numerically equivalent outputs to the
+-- generic MSL we shipped in v5.1.0.
+
+import "stdlib/transformer.rail"
+import "stdlib/jit.rail"
+
+fill_seq arr n i =
+  if i >= n then 0
+  else
+    let v = (int_to_float (i % 13)) * 0.1 - 0.6
+    let _ = float_arr_set arr i v
+    fill_seq arr n (i + 1)
+
+max_diff_loop a b n i acc =
+  if i >= n then acc
+  else
+    let d = (float_arr_get a i) - (float_arr_get b i)
+    let ad = if d < 0.0 then 0.0 - d else d
+    let na = if ad > acc then ad else acc
+    max_diff_loop a b n (i + 1) na
+
+max_diff a b n = max_diff_loop a b n 0 0.0
+
+unwrap_d t = match t | Tensor d _ _ -> d
+
+mk_tensor data shape =
+  Tensor data shape (compute_strides shape)
+
+block_split src src_off dst n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set dst i (float_arr_get src (src_off + i))
+    block_split src src_off dst n (i + 1)
+
+cpu_hadamard arr_a arr_b arr_out n_total i =
+  if i >= n_total then 0
+  else
+    let _ = float_arr_set arr_out i ((float_arr_get arr_a i) * (float_arr_get arr_b i))
+    cpu_hadamard arr_a arr_b arr_out n_total (i + 1)
+
+main =
+  let _ = print "=== Phase 2.10 final — shape-specialized dispatch smoke ==="
+  let seq = 16
+  let d = 64
+  let d_ff = 3 * d
+  let total = seq * d
+
+  -- Inputs
+  let x_d = float_arr_new total 0.0
+  let _ = fill_seq x_d total 0
+  let g1_d = float_arr_new d 1.0
+  let _ = fill_seq g1_d d 7
+  let wq_d = float_arr_new (d * d) 0.0
+  let _ = fill_seq wq_d (d * d) 13
+  let wk_d = float_arr_new (d * d) 0.0
+  let _ = fill_seq wk_d (d * d) 23
+  let wv_d = float_arr_new (d * d) 0.0
+  let _ = fill_seq wv_d (d * d) 31
+
+  -- CPU reference via per-op chain
+  let xT = mk_tensor x_d (cons seq (cons d []))
+  let g1T = mk_tensor g1_d (cons d [])
+  let wqT = mk_tensor wq_d (cons d (cons d []))
+  let wkT = mk_tensor wk_d (cons d (cons d []))
+  let wvT = mk_tensor wv_d (cons d (cons d []))
+  let pack1 = rmsnorm_save xT g1T
+  let ln1_unf = head pack1
+  let q_unf = matmul ln1_unf wqT
+  let k_unf = matmul ln1_unf wkT
+  let v_unf = matmul ln1_unf wvT
+
+  -- Shape-specialized JIT compile + dispatch
+  let _ = print (cat ["[shaped] compile rmsnorm+QKV with SEQ=", show seq, " D=", show d])
+  let kid = jit_compile_rmsnorm_qkv_shaped seq d
+  let _ = print (cat ["[shaped] kid=", show kid])
+  let qkv_buf = float_arr_new (4 * total + seq) 0.0
+  let _ = jit_run_rmsnorm_qkv kid x_d g1_d wq_d wk_d wv_d qkv_buf seq d
+
+  let q_jit = float_arr_new total 0.0
+  let k_jit = float_arr_new total 0.0
+  let v_jit = float_arr_new total 0.0
+  let _ = block_split qkv_buf 0           q_jit total 0
+  let _ = block_split qkv_buf total       k_jit total 0
+  let _ = block_split qkv_buf (2 * total) v_jit total 0
+
+  let dq = max_diff (unwrap_d q_unf) q_jit total
+  let dk = max_diff (unwrap_d k_unf) k_jit total
+  let dv = max_diff (unwrap_d v_unf) v_jit total
+  let _ = print (cat ["[shaped rms+QKV] diff Q=", show_float dq, " K=", show_float dk, " V=", show_float dv])
+
+  -- Shape-specialized silu+hadamard
+  let hN = seq * d_ff
+  let hg_d = float_arr_new hN 0.0
+  let _ = fill_seq hg_d hN 99
+  let hu_d = float_arr_new hN 0.0
+  let _ = fill_seq hu_d hN 199
+
+  let _ = print (cat ["[shaped] compile silu+hadamard with N=", show hN])
+  let kid2 = jit_compile_silu_hadamard_shaped hN
+  let h_pack = float_arr_new (2 * hN) 0.0
+  let _ = jit_run_silu_hadamard kid2 hg_d hu_d h_pack hN
+
+  let h_ref = float_arr_new hN 0.0
+  let sig_ref = float_arr_new hN 0.0
+  let _ = silu_fwd_loop hg_d h_ref sig_ref hN 0
+  -- h_act_ref = silu(g) * u
+  let hadref = float_arr_new hN 0.0
+  let _ = cpu_hadamard h_ref hu_d hadref hN 0
+
+  let h_jit = float_arr_new hN 0.0
+  let sig_jit = float_arr_new hN 0.0
+  let _ = block_split h_pack 0  h_jit  hN 0
+  let _ = block_split h_pack hN sig_jit hN 0
+
+  let dh = max_diff hadref h_jit hN
+  let ds = max_diff sig_ref sig_jit hN
+  let _ = print (cat ["[shaped silu+had] diff h_act=", show_float dh, " sig=", show_float ds])
+
+  let thresh = 0.001
+  let pass = if dq < thresh then if dk < thresh then if dv < thresh then if dh < thresh then if ds < thresh then 1 else 0 else 0 else 0 else 0 else 0
+  let _ = if pass == 1 then print "\n=== PHASE 2.10 final — GREEN: shape-specialized MSL compiles + dispatches + matches CPU reference ==="
+          else print "\n=== FAIL — shape-specialized output diverged from CPU reference ==="
+  0
