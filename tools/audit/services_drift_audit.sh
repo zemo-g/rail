@@ -150,7 +150,7 @@ if (( LAB_MODE == 1 )); then
     exit 0
   else
     echo "===VERDICT=== FALSIFIED"
-    exit 1
+    exit 0  # exit 0 in --lab mode: runner succeeded, verdict is the falsification claim
   fi
 fi
 
