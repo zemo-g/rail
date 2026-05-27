@@ -44,14 +44,17 @@ header() { (( QUIET )) || echo "--- $* ---"; }
 (( QUIET )) || echo
 
 # ---- 1. Extract tuple fields from README ---------------------------------
-# Looking for: `(state, action, model_hash, kernel_hash, beacon_pulse)`
+# Find the per-pose record tuple. README format evolved:
+#   v1 (aspirational): (state, action, model_hash, kernel_hash, beacon_pulse)
+#   v2 (substrate):    (t, kind, params, state, prev_sha, sha)
+# Match either by looking for a parenthesized list containing 'state'.
 header "tuple extraction"
-tuple_line=$(grep -E '\(state, action,' "$README" | head -1)
+tuple_line=$(grep -E '`\([^)]*\bstate\b[^)]*\)`' "$README" | head -1)
 if [[ -z "$tuple_line" ]]; then
-  echo "FATAL: tuple line not found in README"; exit 2
+  echo "FATAL: per-pose tuple line not found in README"; exit 2
 fi
 log "claim line: $(echo "$tuple_line" | sed 's/^[[:space:]]*//')"
-tuple_raw=$(echo "$tuple_line" | grep -oE '\(state[^)]*\)' | head -1)
+tuple_raw=$(echo "$tuple_line" | grep -oE '\([^)]*\bstate\b[^)]*\)' | head -1)
 # Strip parens, split on comma, trim whitespace
 TUPLE_FIELDS=()
 IFS=',' read -ra parts <<<"${tuple_raw#(}"
