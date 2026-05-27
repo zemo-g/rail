@@ -214,9 +214,11 @@ class_static() {
 # ============================================================================
 class_pages() {
   local html missing=""
-  for page in system ot case-campaign-intel; do
+  # Pages required to have a live-data widget. /case-campaign-intel
+  # was historically claimed to have one in memory, but it's actually
+  # a static marketing page — confirmed 2026-05-27, no widget ever built.
+  for page in system ot; do
     html=$(curl -sf "$BASE/$page")
-    # Look for any _shared/*-{live,attest,cite}.js reference (absolute or relative)
     if ! grep -qE '/?_shared/[a-z-]+-(live|attest|cite)\.js' <<<"$html"; then
       missing+=" $page"
     fi
