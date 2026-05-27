@@ -156,7 +156,14 @@ fi
 
 # ============================================================================
 # CLASS: vault_coverage — local weeks vs index weeks
+#
+# Documented exclusions — weeks that exist in vault but predate the
+# attestation tooling. No retroactive attestation is possible without
+# synthesizing evidence (which would violate
+# [[feedback_no_synthetic_evidence]]).
 # ============================================================================
+PRE_ATTEST_WEEKS="POC-W01"  # qwen3.5-27b + untagged — engagement-launch week, no sidecars existed
+
 header vault_coverage
 if [[ -d "$VAULT" ]]; then
   index_weeks=$(python3 -c "
@@ -168,11 +175,13 @@ print('\n'.join(sorted(weeks)))")
   vault_weeks=$(find "$VAULT" -maxdepth 3 -type d -name 'POC-*' 2>/dev/null | xargs -I{} basename {} 2>/dev/null | sort -u)
   log "index weeks: $(echo $index_weeks | tr '\n' ' ')"
   log "vault weeks: $(echo $vault_weeks | tr '\n' ' ')"
-  missing_in_index=$(comm -23 <(echo "$vault_weeks") <(echo "$index_weeks") 2>/dev/null)
+  log "pre-attest exclusions: $PRE_ATTEST_WEEKS"
+  # Subtract excluded weeks from "missing"
+  missing_in_index=$(comm -23 <(echo "$vault_weeks") <(echo "$index_weeks") 2>/dev/null | grep -v -F "$PRE_ATTEST_WEEKS" || true)
   if [[ -z "$missing_in_index" ]]; then
     verdict vault_coverage PASS
   else
-    log "FAIL: weeks present in vault but not in index: $(echo $missing_in_index | tr '\n' ' ')"
+    log "FAIL: weeks present in vault but not in index (and not in pre-attest exclusion): $(echo $missing_in_index | tr '\n' ' ')"
     verdict vault_coverage FAIL
   fi
 else
