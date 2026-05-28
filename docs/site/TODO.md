@@ -31,4 +31,4 @@ Per the "honest backlog" discipline, here is what didn't make v0 and why.
 
 ## v0+1: auto-deploy shipped 2026-05-12
 
-The site at https://ledatic.org/rail/docs/ is now auto-deployed by a post-receive hook on Mini's bare rail repo: changes under `docs/site/` pushed to the `next` branch rebuild HTML and upload to Cloudflare KV without manual intervention. See `notes/auto_deploy_hook.md` for the topology, allowlist, and rollback path.
+The site at https://ledatic.org/rail/docs/ is now auto-deployed by a post-receive hook on the bare rail repo: changes under `docs/site/` pushed to the `next` branch rebuild HTML and upload to Cloudflare KV without manual intervention.
