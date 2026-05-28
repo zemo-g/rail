@@ -23,11 +23,14 @@ via Cloudflare KV.
 ## Cutting a release
 
 Assumes you're on the tag commit (or the working tree matches it byte-for-byte
-for both `rail_native` and `tools/compile.rail`).
+for both `rail_native` and `tools/compile.rail`). Set `SIGNER_IP` to your
+fleet0 witness's address first — it's a private fleet host, not committed here:
 
 ```bash
+export SIGNER_IP=<your-fleet0-witness-ip>
+
 # 1. Pi witness must be live
-curl -sf --max-time 5 http://100.87.231.45:9102/health
+curl -sf --max-time 5 "http://$SIGNER_IP:9102/health"
 # → {"ok": true, "name": "fleet0"}
 
 # 2. Attest + emit index
@@ -69,11 +72,11 @@ on every release.
 
 ### #2 — `~/.ledatic/witness/signer_url` format
 
-The file contains a full URL (`http://100.87.231.45:9102/sign`).
+The file contains a full URL (`http://$SIGNER_IP:9102/sign`).
 `attest.rail` expects a bare IP — `hc_connect_tcp` can't parse a URL as
 IPv4 dotted-quad — and silently fails when the file holds a URL.
 
-**Workaround:** `SIGNER_IP=100.87.231.45 bash tools/attest/attest_release.sh vX.Y.Z`.
+**Workaround:** `SIGNER_IP=<your-fleet0-witness-ip> bash tools/attest/attest_release.sh vX.Y.Z`.
 
 **Real fix (TODO):** either standardize the file to bare IP, or teach
 attest.rail to parse URLs.
@@ -131,9 +134,9 @@ mkdir -p releases/$TAG
 git show "$TAG":rail_native        > releases/$TAG/rail_native
 chmod +x releases/$TAG/rail_native
 git show "$TAG":tools/compile.rail > releases/$TAG/compile.rail
-SIGNER_IP=100.87.231.45 ./rail_native run tools/attest/attest.rail \
+SIGNER_IP=<your-fleet0-witness-ip> ./rail_native run tools/attest/attest.rail \
   releases/$TAG/rail_native      releases/$TAG/rail_native.attestation.json
-SIGNER_IP=100.87.231.45 ./rail_native run tools/attest/attest.rail \
+SIGNER_IP=<your-fleet0-witness-ip> ./rail_native run tools/attest/attest.rail \
   releases/$TAG/compile.rail     releases/$TAG/compile.rail.attestation.json
 COMMIT=$(git rev-parse "$TAG^{commit}")
 SHORT=$(git rev-parse --short "$TAG^{commit}")

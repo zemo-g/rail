@@ -16,7 +16,9 @@ set -u
 N=200
 QUIET=0
 LAB_MODE=0
-PI=zemog@100.87.231.45
+# Pi witness SSH target — private fleet host, kept out of the public tree.
+# Set FLEET_PI_SSH, or put `user@host` in ~/.fleet/pi_ssh.
+PI="${FLEET_PI_SSH:-$(cat "$HOME/.fleet/pi_ssh" 2>/dev/null || true)}"
 LOG='$HOME/.ledatic/witness/log.jsonl'  # quoted: $HOME expands on Pi, not locally
 MAX_GAP=1000
 
@@ -31,6 +33,11 @@ done
 
 log()    { (( QUIET )) || echo "  $*"; }
 header() { (( QUIET )) || echo "--- $* ---"; }
+
+if [[ -z "${PI:-}" ]]; then
+  echo "FATAL: no Pi witness host. Set FLEET_PI_SSH or ~/.fleet/pi_ssh (form: user@host)." >&2
+  exit 2
+fi
 
 SAMPLE=/tmp/beacon_audit_sample.jsonl
 ssh -o ConnectTimeout=5 "$PI" "tail -n $N $LOG" > "$SAMPLE" 2>/dev/null \
