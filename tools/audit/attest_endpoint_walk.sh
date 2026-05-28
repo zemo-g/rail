@@ -27,6 +27,10 @@ done
 BASE="${LEDATIC_BASE:-https://ledatic.org}"
 NOW=$(date -u +%s)
 RAIL_DIR="${HOME}/projects/rail"
+# Pi witness host — private fleet address, kept out of the public tree.
+# Optional: only used for a local cross-check of the public 'pi alive' badge.
+# Set FLEET_PI_HOST, or put the bare host in ~/.fleet/pi_host.
+FLEET_PI_HOST="${FLEET_PI_HOST:-$(cat "$HOME/.fleet/pi_host" 2>/dev/null || true)}"
 
 total_pass=0
 total_fail=0
@@ -134,8 +138,10 @@ for n in d.get('nodes', []):
   token=$(cat ~/.fleet/token 2>/dev/null || true)
   if [[ -z "$token" ]]; then
     log "WARN: no ~/.fleet/token; can't cross-check pi"
+  elif [[ -z "$FLEET_PI_HOST" ]]; then
+    log "no FLEET_PI_HOST; skipping local pi cross-check"
   else
-    pi_health_local=$(curl -sf --max-time 3 -H "X-Fleet-Token: $token" http://100.87.231.45:9101/health 2>/dev/null || echo "")
+    pi_health_local=$(curl -sf --max-time 3 -H "X-Fleet-Token: $token" "http://$FLEET_PI_HOST:9101/health" 2>/dev/null || echo "")
     log "our pi probe: ${pi_health_local:-(unreachable)}"
     if [[ -n "$pi_health_local" && "$pi_alive_pub" != *"true"* ]]; then
       log "FAIL: pi reachable from us but status says alive:false"
