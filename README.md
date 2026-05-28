@@ -64,7 +64,7 @@ Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, We
 ### 1. Compiles itself, byte-identical
 
 ```
-./rail_native self                    -- ~6,719 lines of Rail →
+./rail_native self                    -- ~7,050 lines of Rail →
                                       --   a ~1.0 MB ARM64 binary
 cp /tmp/rail_self ./rail_native       -- cycle 1: install gen1
 ./rail_native self                    -- cycle 2: that binary compiles
