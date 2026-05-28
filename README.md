@@ -6,11 +6,11 @@
 </p>
 
 <p align="center">
-  <a href="#releases"><img src="https://img.shields.io/badge/v5.0.0-Self--hosted%20toolchain-ff5500?style=for-the-badge" alt="v5.0.0"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/v5.1.0-Emits%20its%20own%20GPU%20kernels-ff5500?style=for-the-badge" alt="v5.1.0"></a>
 </p>
 
 <p align="center">
-  <a href="#install"><img src="https://img.shields.io/badge/tests-140%2F140-brightgreen" alt="tests 140/140"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/tests-141%2F141-brightgreen" alt="tests 141/141"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
   <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
@@ -29,12 +29,12 @@
 
 ---
 
-Rail compiles itself. The compiler — ~6,000+ lines of Rail — produces a ~1.0 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. The TLS 1.3 client is also Rail: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat. As of **v4.0.0**, the substrate is mature on two backends with full same-bug-class parity, ships its own JIT in pure Rail, and a frontier model + 1 KB Rail spec compiles 30/30 on a held-out hard-bench — publicly reproducible.
+Rail compiles itself. The compiler — ~6,000+ lines of Rail — produces a ~1.0 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. The TLS 1.3 client is also Rail: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat. As of **v5.1.0**, the toolchain is self-hosted to the metal: Rail emits its own aarch64 Linux ELF binaries — no `as`, no `ld` in the path — and emits its own GPU kernels, generating Metal Shading Language from an op-DAG and JIT-compiling it at runtime (35× fused rmsnorm+QKV, 18× fused silu+hadamard). A frontier model + 1 KB Rail spec still compiles 30/30 on a held-out hard-bench — publicly reproducible.
 
 ```
 ./rail_native self && cp /tmp/rail_self ./rail_native  # cycle 1
 ./rail_native self && cmp rail_native /tmp/rail_self   # cycle 2 — byte-identical
-./rail_native test                                     # 140/140
+./rail_native test                                     # 141/141
 ```
 
 ## Quick start
@@ -166,6 +166,16 @@ Tail-recursive loops match C `-O2` (5 instructions per iteration). The full arch
 
 ## Releases
 
+### v5.1.0 — 2026-05-15 — *Rail emits its own GPU kernels*
+
+Rail's JIT generates Metal Shading Language from its own op-DAG, compiles it at runtime via `newLibraryWithSource:`, and dispatches the kernel — so every GPU kernel the training stack runs is emitted by an attested Rail binary.
+
+- **Self-emitted GPU kernels.** A DAG matcher walks the op tape, an MSL emitter writes the kernel source, and the JIT compiles + caches it. Two hand-fused kernels land alongside: rmsnorm+QKV (**35×** over the per-op chain) and silu+hadamard (**18×**).
+- **bf16 numerics regime.** bf16 has f32's exponent range, sidestepping fp16's step-2759 NaN cliff — unlocking stable 10k-step training at ~40% under the f64 baseline.
+- **Compiler core untouched.** The release adds stdlib + foreign decls + Metal sources; the 2-pass byte-identical self-bootstrap is unchanged.
+
+The v5 line opens with **v5.0.0** (2026-05-14) — the self-hosted toolchain: Rail emits aarch64 Linux ELF via a pure-Rail encoder + assembler + static linker + ELF writer, with no `as` or `ld` in the path for the supported subset. **v5.0.1** and **v5.0.2** (both 2026-05-15) follow as patches — codegen tightening + attestation backfill, then the first release attested end-to-end through the Rail substrate (no `curl`, `shasum`, or Python).
+
 ### v4.0.0 — 2026-05-13 — *Substrate maturity*
 
 A major-version bump positioning Rail as a substrate, not a model. 216 commits since v3.11.0 across concurrency, JIT, dual-backend parity, attested provenance, and 30/30 hard-bench reproducibility.
@@ -218,6 +228,9 @@ Native floats in ARM64 d-registers, effect handlers via setjmp/longjmp, GC in as
 
 | Version | Date | Headline |
 |---|---|---|
+| **v5.1.0** | 2026-05-15 | Rail emits its own GPU kernels — MSL from op-DAG, JIT-compiled fused Metal (35× rmsnorm+QKV, 18× silu+hadamard) + bf16 regime |
+| **v5.0.2** | 2026-05-15 | First release attested end-to-end through Rail — shell escape hatches retired |
+| **v5.0.1** | 2026-05-15 | Attestation hygiene + ARM64 codegen tightening |
 | **v5.0.0** | 2026-05-14 | Self-hosted toolchain — Rail emits aarch64 Linux ELF binaries via pure-Rail encoder + assembler + static linker + ELF writer. `as` / `ld` no longer in the build path for the supported subset. |
 | **v4.1.0** | 2026-05-13 | Repo hygiene + leak-guard CI |
 | **v4.0.1** | 2026-05-13 | Public-surface sanitization (no behavior change) |

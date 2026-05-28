@@ -17,11 +17,9 @@ cleanup candidate.
 | `editors/` | Editor integrations (VS Code). |
 | `tree-sitter-rail/` | Tree-sitter grammar for syntax highlighting. |
 | `jit/` | v0 JIT implementation — ARM64 emitter, codebuf manager, FFI trampolines, intermediate-rep fixtures. Used by `stdlib/jit*.rail`. |
-| `notes/` | Working notes from investigations — bootstrap audits, feasibility studies, x86 conformance, milestone audits. Mixed lab-notebook + reference. Future cleanup candidate (`docs/archive/`-style triage). |
-| `training/` | Published training checkpoints (`checkpoints_published/`). Training infra itself lives in the private `rail-training` repo. |
-| `models/` | Trained model artifacts (`spur/` — Spur self-improving generator weights). |
-| `releases/` | One subdirectory per tagged release (47 entries) holding the released `rail_native` binary + source + attestation JSONs. Published to `ledatic.org/releases/`. |
-| `builds/` | One subdirectory per attested intermediate build (47 entries). Same shape as `releases/` but for non-tagged commits. |
+| `notes/` | Durable technical references — bootstrap-convergence audit, v5 feasibility, x86 conformance classification, and the `v5_macho_ref/` Mach-O layout bundle used by the self-hosted emitter. |
+| `releases/` | One subdirectory per tagged release (47 entries) holding the Ed25519 attestation JSONs + `index.json`. The signed bytes (`rail_native` + `compile.rail`) are recoverable from each git tag, so HEAD keeps only the proof. Published to `ledatic.org/releases/`. |
+| `builds/` | One subdirectory per attested intermediate build (14 entries) — `result.json` + its attestation, no binary. The build-time analogue of `releases/`, for non-tagged commits. |
 | `selfhost/` | Self-host fixed-point attestation artifacts — proof that a given `rail_native` 2-pass-compiles itself byte-identically. |
 | `archive/` | **Gitignored.** Local-only retention for stale artifacts moved out of the public tree. |
 
@@ -55,5 +53,4 @@ cleanup candidate.
 ## Known cleanup candidates
 
 These don't earn their lines yet:
-- `notes/` mixes dated session notes with reference material. Triage pending — same pattern as `docs/` got.
 - `rail_native` / `rail_native_llm` / `rail_safe` at root → consolidate into `bin/` with checksums. Tracked as a separate task (high blast-radius: every plist, script, and CI ref needs sweeping).

@@ -112,6 +112,63 @@ JIT pipeline above is the load-bearing thesis.  See
   stdlib + foreign decls + Metal sources; the compiler core is
   untouched).
 
+## v5.0.2 — 2026-05-15 — Attestation pipeline goes fully pure-Rail
+
+Patch release. The first Rail release attested end-to-end through the
+Rail substrate — no `curl`, no `shasum`, no Python anywhere in the
+attestation path.
+
+### Fixes
+
+- **`stdlib/file.rail`: `foreign fopen path mode -> int`** (`084791f`).
+  `fopen` returns a file descriptor, not a `FILE*`. Declaring it as
+  `ptr` bypassed Rail's tagging and tripped a polymorphic untag for odd
+  fds (3 → 1, i.e. stdout). Corrected the foreign return type.
+- **runtime `_fopen`: unwrap path + mode before `open(2)`** (`95d81de`).
+  Wrapped Rail strings carry their `ptr` at the heap header, so `open()`
+  saw byte `0x09` (the header tag) as the path. `_fopen` now calls
+  `_str_unwrap`, matching the existing `_rail_read_file` contract.
+  Closes the argv-vs-literal path bug.
+
+### Attestation
+
+- **`tools/attest/`: shell escape hatches retired** (`bbda5dd`).
+  `attest.sh`, `sign_attestation.sh`, and `publish.sh` deleted.
+  `release_index.rail` replaces the Python heredoc in
+  `attest_release.sh`. `attest.rail` + `publish.rail` are now canonical.
+
+### Stability
+
+- New seed `rail_native` (`3b89d0f5`) is at the 2-pass byte-identical
+  fixed point.
+
+## v5.0.1 — 2026-05-15 — Attestation hygiene + codegen tightening
+
+Patch release. No new features.
+
+### Codegen
+
+- **`arm64`: close the half-applied compile-fixes patch.** `emit_x1`
+  large-immediate path, `emit_x1` global-`V` fallback, `O`-handler RHS
+  exclusion, and `?`-handler global-`V` exclusion. Self-compile fixed
+  point and test suite unchanged from the v5.0.0 baseline.
+
+### Attestation
+
+- **Backfill v4.0.0 / v4.0.1 / v4.1.0 release attestations** —
+  previously tagged-but-unattested.
+- **`.gitignore`: whitelist `releases/**/rail_native.attestation.json`**
+  so a new release can't silently lose that file to the `rail_native.*`
+  wildcard rule.
+- **`docs/RELEASES.md`** — operational release runbook + 6 known gotchas.
+
+### Known limitation
+
+- `attest.rail` still blocked on the `ftell` FFI bug, so attestation in
+  this release (including this release's own artifacts) still uses the
+  documented `tools/attest/attest.sh` shell escape hatch. Closed in
+  v5.0.2.
+
 ## v5.0.0 — 2026-05-14 — Self-hosted toolchain (Linux ELF substrate)
 
 Major release.  Rail produces its own aarch64 Linux ELF binaries —
