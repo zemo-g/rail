@@ -1,0 +1,248 @@
+-- tools/verify_sdk/sdk.rail — Ledatic verifiability SDK (unified CLI).
+--
+-- One binary, four subcommands:
+--   keygen [key.hex]              generate a local Ed25519 key (refuses to clobber)
+--   pubkey [key.hex]              print the public key (hex) for a key file
+--   sign   <artifact> [out] [key] sign an artifact -> receipt.json (auto-creates key)
+--   verify <artifact> <receipt>   verify a receipt OFFLINE (exit 0 ok / 5 digest / 6 sig)
+--
+-- Trust model (A): the CALLER holds the signing key. The only thing pulled
+-- from Ledatic is a fresh entropy-beacon pulse per artifact — that pulse is
+-- the supply, not a gateway the artifact passes through. Verification is
+-- fully offline: no server, no trust in Ledatic, the receipt stands alone.
+--
+-- key:    $LEDATIC_SDK_KEY or ~/.ledatic/sdk/key.hex (0600)
+-- beacon: $LEDATIC_BEACON_URL or https://ledatic.org/entropy/pulse
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/json.rail"
+import "stdlib/env.rail"
+import "stdlib/file.rail"
+
+beacon_url_default _ = "https://ledatic.org/entropy/pulse"
+default_key _ = env_or "LEDATIC_SDK_KEY" (cat [getenv "HOME", "/.ledatic/sdk/key.hex"])
+
+env_or key fallback =
+  let v = getenv key
+  if length (chars v) == 0 then fallback else v
+
+-- ── arg helpers ───────────────────────────────────────────────────────
+drop_n n xs = if n == 0 then xs else if xs == [] then xs else drop_n (n - 1) (tail xs)
+arg_or xs n dflt = let r = drop_n n xs in if r == [] then dflt else head r
+
+-- ── trim trailing whitespace/newlines ────────────────────────────────
+trim_trailing s = join "" (reverse (drop_ws (reverse (chars s))))
+
+drop_ws cs =
+  if cs == [] then cs
+  else
+    let c = head cs
+    if c == "\n" then drop_ws (tail cs)
+    else if c == "\r" then drop_ws (tail cs)
+    else if c == " " then drop_ws (tail cs)
+    else if c == "\t" then drop_ws (tail cs)
+    else cs
+
+-- ── SHA-256 over a file's raw bytes (binary-safe via read_file_bytes) ─
+sha256_hex_file path =
+  let bytes = read_file_bytes path
+  let n = arr_len bytes
+  let h = sha256_h_init 0
+  let k_tbl = sha256_k_table 0
+  let state = arr_new 8 0
+  let end = sha_process_from bytes n h state k_tbl 0
+  let _ = sha_final_block bytes n h state k_tbl end
+  let out = arr_new 32 0
+  let _ = be32_write out 0 (arr_get h 0)
+  let _ = be32_write out 4 (arr_get h 1)
+  let _ = be32_write out 8 (arr_get h 2)
+  let _ = be32_write out 12 (arr_get h 3)
+  let _ = be32_write out 16 (arr_get h 4)
+  let _ = be32_write out 20 (arr_get h 5)
+  let _ = be32_write out 24 (arr_get h 6)
+  let _ = be32_write out 28 (arr_get h 7)
+  bytes_to_hex out 32
+
+file_size_bytes path = arr_len (read_file_bytes path)
+
+basename path = basename_last (str_split "/" path) ""
+basename_last parts last =
+  if parts == [] then last
+  else basename_last (tail parts) (head parts)
+
+-- ── Key helpers ───────────────────────────────────────────────────────
+pk_hex_of_seed seed_hex =
+  let seed = hex_to_bytes seed_hex
+  bytes_to_hex (ed25519_pk_from_sk seed) 32
+
+do_gen_key path =
+  let _ = shell (cat ["mkdir -p \"$(dirname '", path, "')\" && head -c 32 /dev/urandom | xxd -p -c 32 > '", path, "' && chmod 600 '", path, "'"])
+  trim_trailing (read_file path)
+
+ensure_key_hex path =
+  let cur = trim_trailing (read_file path)
+  if length (chars cur) == 64 then cur
+  else do_gen_key path
+
+-- ── Beacon fetch (v0: shell-curl; harden to pure-Rail https in v1) ────
+fetch_beacon url =
+  let raw = shell (cat ["curl -s --max-time 6 '", url, "'"])
+  let p = parse_json raw
+  let pid = show (json_int (json_get p "pulse_id"))
+  let vhex = json_str (json_get p "value_hex")
+  let ts = json_str (json_get p "timestamp_utc")
+  (pid, vhex, ts)
+
+-- ── Canonical signed message (binds artifact + beacon + time) ─────────
+build_message digest pulse_id value_hex created_at =
+  cat ["ledatic-receipt|v1|", digest, "|", pulse_id, "|", value_hex, "|", created_at]
+
+-- ── Receipt JSON ──────────────────────────────────────────────────────
+build_receipt name size digest pulse_id value_hex beacon_ts beacon_url pubkey_hex pk_fp sig_hex created_at =
+  cat [
+    "{\n",
+    "  \"kind\": \"ledatic.receipt\",\n",
+    "  \"version\": 1,\n",
+    "  \"artifact\": {\n",
+    "    \"name\": \"", name, "\",\n",
+    "    \"size_bytes\": ", show size, ",\n",
+    "    \"sha256\": \"", digest, "\"\n",
+    "  },\n",
+    "  \"beacon\": {\n",
+    "    \"url\": \"", beacon_url, "\",\n",
+    "    \"pulse_id\": ", pulse_id, ",\n",
+    "    \"value_hex\": \"", value_hex, "\",\n",
+    "    \"timestamp_utc\": \"", beacon_ts, "\"\n",
+    "  },\n",
+    "  \"signer\": {\n",
+    "    \"alg\": \"ed25519\",\n",
+    "    \"pubkey_hex\": \"", pubkey_hex, "\",\n",
+    "    \"pk_fp\": \"", pk_fp, "\"\n",
+    "  },\n",
+    "  \"sig\": \"", sig_hex, "\",\n",
+    "  \"created_at\": ", created_at, "\n",
+    "}\n"
+  ]
+
+now_unix _ = trim_trailing (shell "date -u +%s")
+
+-- ── Subcommand: keygen ────────────────────────────────────────────────
+cmd_keygen key_path =
+  let existing = trim_trailing (read_file key_path)
+  if length (chars existing) == 64 then
+    let _ = print (cat ["refusing: key already exists at ", key_path])
+    let _ = print "  (delete it yourself to rotate — rotating invalidates every receipt signed with the old key)"
+    1
+  else
+    let seed_hex = do_gen_key key_path
+    if length (chars seed_hex) != 64 then
+      let _ = print (cat ["keygen failed: ", key_path])
+      7
+    else
+      let pk_hex = pk_hex_of_seed seed_hex
+      let _ = print (cat ["key:    ", key_path])
+      let _ = print (cat ["pubkey: ", pk_hex])
+      let _ = print (cat ["pk_fp:  ", str_sub pk_hex 0 16])
+      0
+
+-- ── Subcommand: pubkey ────────────────────────────────────────────────
+cmd_pubkey key_path =
+  let seed_hex = trim_trailing (read_file key_path)
+  if length (chars seed_hex) != 64 then
+    let _ = print (cat ["no key at ", key_path, " (run: sdk keygen)"])
+    1
+  else
+    let _ = print (pk_hex_of_seed seed_hex)
+    0
+
+-- ── Subcommand: sign ──────────────────────────────────────────────────
+cmd_sign artifact out key_path beacon_url =
+  let digest = sha256_hex_file artifact
+  let size = file_size_bytes artifact
+  let (pulse_id, value_hex, beacon_ts) = fetch_beacon beacon_url
+  if length (chars value_hex) == 0 then
+    let _ = print (cat ["beacon unreachable: ", beacon_url])
+    4
+  else cmd_sign2 artifact out key_path beacon_url digest size pulse_id value_hex beacon_ts
+
+cmd_sign2 artifact out key_path beacon_url digest size pulse_id value_hex beacon_ts =
+  let seed_hex = ensure_key_hex key_path
+  if length (chars seed_hex) != 64 then
+    let _ = print (cat ["could not load/create key: ", key_path])
+    7
+  else
+    let seed = hex_to_bytes seed_hex
+    let pubkey_hex = bytes_to_hex (ed25519_pk_from_sk seed) 32
+    let pk_fp = str_sub pubkey_hex 0 16
+    let created_at = now_unix 0
+    let msg = build_message digest pulse_id value_hex created_at
+    let sig_hex = bytes_to_hex (ed25519_sign seed (string_to_bytes msg) (string_length_bytes msg)) 64
+    let body = build_receipt (basename artifact) size digest pulse_id value_hex beacon_ts beacon_url pubkey_hex pk_fp sig_hex created_at
+    let _ = write_file out body
+    let _ = print (cat ["receipt: ", out, "  pk_fp=", pk_fp, "  pulse_id=", pulse_id])
+    0
+
+-- ── Subcommand: verify (offline) ──────────────────────────────────────
+cmd_verify artifact receipt_path =
+  let r = parse_json (read_file receipt_path)
+  let artifact_obj = json_get r "artifact"
+  let want_digest = json_str (json_get artifact_obj "sha256")
+  let name = json_str (json_get artifact_obj "name")
+  let beacon = json_get r "beacon"
+  let pulse_id = show (json_int (json_get beacon "pulse_id"))
+  let value_hex = json_str (json_get beacon "value_hex")
+  let signer = json_get r "signer"
+  let pubkey_hex = json_str (json_get signer "pubkey_hex")
+  let pk_fp = json_str (json_get signer "pk_fp")
+  let sig_hex = json_str (json_get r "sig")
+  let created_at = show (json_int (json_get r "created_at"))
+  let have_digest = sha256_hex_file artifact
+  if have_digest != want_digest then
+    let _ = print (cat ["BAD  digest mismatch: file=", have_digest, " receipt=", want_digest])
+    5
+  else
+    let msg = build_message want_digest pulse_id value_hex created_at
+    let ok = ed25519_verify (hex_to_bytes pubkey_hex) (string_to_bytes msg) (string_length_bytes msg) (hex_to_bytes sig_hex)
+    if ok == 1 then
+      let _ = print (cat ["ok   artifact=", name, "  pulse_id=", pulse_id, "  pk_fp=", pk_fp])
+      0
+    else
+      let _ = print "BAD  signature"
+      6
+
+-- ── Usage ─────────────────────────────────────────────────────────────
+usage _ =
+  let _ = print "Ledatic verifiability SDK"
+  let _ = print "  sdk keygen [key.hex]              generate a local Ed25519 key (refuses to clobber)"
+  let _ = print "  sdk pubkey [key.hex]              print the public key (hex) for a key file"
+  let _ = print "  sdk sign   <artifact> [out] [key] sign an artifact -> receipt.json"
+  let _ = print "  sdk verify <artifact> <receipt>   verify a receipt offline (0 ok / 5 digest / 6 sig)"
+  let _ = print "key:    $LEDATIC_SDK_KEY or ~/.ledatic/sdk/key.hex"
+  let _ = print "beacon: $LEDATIC_BEACON_URL or https://ledatic.org/entropy/pulse"
+  0
+
+-- ── Dispatch ──────────────────────────────────────────────────────────
+main =
+  let a = tail args
+  if length a < 1 then usage 0
+  else
+    let cmd = head a
+    let rest = tail a
+    if cmd == "keygen" then cmd_keygen (arg_or rest 0 (default_key 0))
+    else if cmd == "pubkey" then cmd_pubkey (arg_or rest 0 (default_key 0))
+    else if cmd == "sign" then
+      if length rest < 1 then usage 0
+      else
+        let artifact = head rest
+        let out = arg_or rest 1 (cat [artifact, ".receipt.json"])
+        let key_path = arg_or rest 2 (default_key 0)
+        cmd_sign artifact out key_path (env_or "LEDATIC_BEACON_URL" (beacon_url_default 0))
+    else if cmd == "verify" then
+      if length rest < 2 then usage 0
+      else cmd_verify (head rest) (head (tail rest))
+    else usage 0
