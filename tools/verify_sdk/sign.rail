@@ -1,0 +1,169 @@
+-- tools/verify_sdk/sign.rail — Ledatic verifiability SDK: sign any artifact.
+--
+-- Produces a self-contained, offline-verifiable receipt that binds an
+-- artifact's SHA-256 to a live Ledatic entropy-beacon pulse, signed with a
+-- LOCAL Ed25519 key. No Pi, no Tailscale, no Ledatic-internal token — this
+-- is the external SDK kernel. (cf. tools/attest/attest.rail, which signs via
+-- the internal Pi witness over Tailscale; this is the same crypto, but the
+-- key lives with the caller so an outside party can sign on their own box.)
+--
+-- The beacon binding is what makes a receipt tamper-evident in TIME: the
+-- pulse is a public append-only hash chain, so a receipt cannot be backdated
+-- earlier than the pulse it cites.
+--
+-- Usage:
+--   ./rail_native run tools/verify_sdk/sign.rail <artifact> [receipt_out] [key_hex_path]
+--   key:    $LEDATIC_SDK_KEY or ~/.ledatic/sdk/key.hex (auto-created, 0600)
+--   beacon: $LEDATIC_BEACON_URL or https://ledatic.org/entropy/pulse
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/json.rail"
+import "stdlib/env.rail"
+import "stdlib/file.rail"
+
+beacon_url_default _ = "https://ledatic.org/entropy/pulse"
+key_path_default _ = cat [getenv "HOME", "/.ledatic/sdk/key.hex"]
+
+env_or key fallback =
+  let v = getenv key
+  if length (chars v) == 0 then fallback else v
+
+-- ── trim trailing whitespace/newlines ────────────────────────────────
+trim_trailing s = join "" (reverse (drop_ws (reverse (chars s))))
+
+drop_ws cs =
+  if cs == [] then cs
+  else
+    let c = head cs
+    if c == "\n" then drop_ws (tail cs)
+    else if c == "\r" then drop_ws (tail cs)
+    else if c == " " then drop_ws (tail cs)
+    else if c == "\t" then drop_ws (tail cs)
+    else cs
+
+-- ── SHA-256 over a file's raw bytes (binary-safe via read_file_bytes) ─
+sha256_hex_file path =
+  let bytes = read_file_bytes path
+  let n = arr_len bytes
+  let h = sha256_h_init 0
+  let k_tbl = sha256_k_table 0
+  let state = arr_new 8 0
+  let end = sha_process_from bytes n h state k_tbl 0
+  let _ = sha_final_block bytes n h state k_tbl end
+  let out = arr_new 32 0
+  let _ = be32_write out 0 (arr_get h 0)
+  let _ = be32_write out 4 (arr_get h 1)
+  let _ = be32_write out 8 (arr_get h 2)
+  let _ = be32_write out 12 (arr_get h 3)
+  let _ = be32_write out 16 (arr_get h 4)
+  let _ = be32_write out 20 (arr_get h 5)
+  let _ = be32_write out 24 (arr_get h 6)
+  let _ = be32_write out 28 (arr_get h 7)
+  bytes_to_hex out 32
+
+file_size_bytes path = arr_len (read_file_bytes path)
+
+basename path = basename_last (str_split "/" path) ""
+basename_last parts last =
+  if parts == [] then last
+  else basename_last (tail parts) (head parts)
+
+-- ── Beacon fetch (v0: shell-curl; harden to pure-Rail https in v1) ────
+fetch_beacon url =
+  let raw = shell (cat ["curl -s --max-time 6 '", url, "'"])
+  let p = parse_json raw
+  let pid = show (json_int (json_get p "pulse_id"))
+  let vhex = json_str (json_get p "value_hex")
+  let ts = json_str (json_get p "timestamp_utc")
+  (pid, vhex, ts)
+
+-- ── Local Ed25519 key: load 32-byte seed from hex file, else create ───
+ensure_key_hex path =
+  let cur = trim_trailing (read_file path)
+  if length (chars cur) == 64 then cur
+  else
+    let _ = shell (cat ["mkdir -p \"$(dirname '", path, "')\" && head -c 32 /dev/urandom | xxd -p -c 32 > '", path, "' && chmod 600 '", path, "'"])
+    trim_trailing (read_file path)
+
+-- ── Canonical signed message (binds artifact + beacon + time) ─────────
+build_message digest pulse_id value_hex created_at =
+  cat ["ledatic-receipt|v1|", digest, "|", pulse_id, "|", value_hex, "|", created_at]
+
+-- ── Receipt JSON ──────────────────────────────────────────────────────
+build_receipt name size digest pulse_id value_hex beacon_ts beacon_url pubkey_hex pk_fp sig_hex created_at =
+  cat [
+    "{\n",
+    "  \"kind\": \"ledatic.receipt\",\n",
+    "  \"version\": 1,\n",
+    "  \"artifact\": {\n",
+    "    \"name\": \"", name, "\",\n",
+    "    \"size_bytes\": ", show size, ",\n",
+    "    \"sha256\": \"", digest, "\"\n",
+    "  },\n",
+    "  \"beacon\": {\n",
+    "    \"url\": \"", beacon_url, "\",\n",
+    "    \"pulse_id\": ", pulse_id, ",\n",
+    "    \"value_hex\": \"", value_hex, "\",\n",
+    "    \"timestamp_utc\": \"", beacon_ts, "\"\n",
+    "  },\n",
+    "  \"signer\": {\n",
+    "    \"alg\": \"ed25519\",\n",
+    "    \"pubkey_hex\": \"", pubkey_hex, "\",\n",
+    "    \"pk_fp\": \"", pk_fp, "\"\n",
+    "  },\n",
+    "  \"sig\": \"", sig_hex, "\",\n",
+    "  \"created_at\": ", created_at, "\n",
+    "}\n"
+  ]
+
+now_unix _ = trim_trailing (shell "date -u +%s")
+
+-- ── Main ──────────────────────────────────────────────────────────────
+sign_one artifact out key_path beacon_url =
+  let digest = sha256_hex_file artifact
+  let size = file_size_bytes artifact
+  let beacon = fetch_beacon beacon_url
+  let (pulse_id, value_hex, beacon_ts) = beacon
+  if length (chars value_hex) == 0 then
+    let _ = print (cat ["beacon unreachable: ", beacon_url])
+    4
+  else sign_step2 artifact out key_path beacon_url digest size pulse_id value_hex beacon_ts
+
+sign_step2 artifact out key_path beacon_url digest size pulse_id value_hex beacon_ts =
+  let seed_hex = ensure_key_hex key_path
+  if length (chars seed_hex) != 64 then
+    let _ = print (cat ["could not load/create key: ", key_path])
+    7
+  else
+    let seed = hex_to_bytes seed_hex
+    let pk = ed25519_pk_from_sk seed
+    let pubkey_hex = bytes_to_hex pk 32
+    let pk_fp = str_sub pubkey_hex 0 16
+    let created_at = now_unix 0
+    let msg = build_message digest pulse_id value_hex created_at
+    let msg_bytes = string_to_bytes msg
+    let msg_len = string_length_bytes msg
+    let sig = ed25519_sign seed msg_bytes msg_len
+    let sig_hex = bytes_to_hex sig 64
+    let name = basename artifact
+    let body = build_receipt name size digest pulse_id value_hex beacon_ts beacon_url pubkey_hex pk_fp sig_hex created_at
+    let _ = write_file out body
+    let _ = print (cat ["receipt: ", out, "  pk_fp=", pk_fp, "  pulse_id=", pulse_id])
+    0
+
+main =
+  let ua = tail args
+  if length ua < 1 then
+    let _ = print "usage: sign.rail <artifact> [receipt_out] [key_hex_path]"
+    2
+  else
+    let artifact = head ua
+    let out = if length ua >= 2 then head (tail ua) else cat [artifact, ".receipt.json"]
+    let key_path = if length ua >= 3 then head (tail (tail ua)) else env_or "LEDATIC_SDK_KEY" (key_path_default 0)
+    let beacon_url = env_or "LEDATIC_BEACON_URL" (beacon_url_default 0)
+    sign_one artifact out key_path beacon_url
