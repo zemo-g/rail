@@ -59,11 +59,11 @@ cp /tmp/rail_out "$BIN" && chmod +x "$BIN"
 ok "compile sdk.rail -> binary"
 
 # --- fixtures -------------------------------------------------------------
+VHEX="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+LOOKDIR="$SANDBOX/lookup"; mkdir -p "$LOOKDIR/empty"
 printf 'ledatic verify_sdk selftest artifact\n' > "$ART"
 cp "$ART" "$ART_TAMPERED"; printf 'X' >> "$ART_TAMPERED"   # 1 byte different -> digest changes
-cat > "$PULSE" <<'JSON'
-{"pulse_id": 999, "value_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff", "timestamp_utc": "2026-05-29T00:00:00Z"}
-JSON
+printf '{"pulse_id": 999, "value_hex": "%s", "timestamp_utc": "2026-05-29T00:00:00Z"}\n' "$VHEX" > "$PULSE"
 
 # --- crypto gates (hermetic, file:// beacon) ------------------------------
 expect_exit 0 "keygen"            "$BIN" keygen "$KEY"
@@ -92,9 +92,17 @@ badsig="${newc}${sig:1}"
 sed "s/\"sig\": \"$sig\"/\"sig\": \"$badsig\"/" "$RECEIPT" > "$RECEIPT_BADSIG"
 expect_exit 6 "verify sig-tamper -> 6"     "$BIN" verify "$ART" "$RECEIPT_BADSIG"
 
-# --- live beacon reachability (skip with SDK_SELFTEST_OFFLINE=1) ----------
+# --- membership gates (hermetic, file:// pulse-by-id lookup) --------------
+# receipt cites pulse 999; lookup serves /<id> as a file named by the id.
+printf '{"pulse_id": 999, "value_hex": "%s", "timestamp_utc": "x"}\n' "$VHEX" > "$LOOKDIR/999"
+expect_exit 0 "membership match -> 0"      env LEDATIC_PULSE_LOOKUP="file://$LOOKDIR/"       "$BIN" verify "$ART" "$RECEIPT" --check-beacon
+printf '{"pulse_id": 999, "value_hex": "%s", "timestamp_utc": "x"}\n' "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" > "$LOOKDIR/999"
+expect_exit 8 "membership mismatch -> 8"   env LEDATIC_PULSE_LOOKUP="file://$LOOKDIR/"       "$BIN" verify "$ART" "$RECEIPT" --check-beacon
+expect_exit 9 "membership unverifiable -> 9" env LEDATIC_PULSE_LOOKUP="file://$LOOKDIR/empty/" "$BIN" verify "$ART" "$RECEIPT" --check-beacon
+
+# --- live beacon (skip with SDK_SELFTEST_OFFLINE=1) -----------------------
 if [ "${SDK_SELFTEST_OFFLINE:-0}" = "1" ]; then
-  echo "  --   live beacon check skipped (SDK_SELFTEST_OFFLINE=1)"
+  echo "  --   live beacon checks skipped (SDK_SELFTEST_OFFLINE=1)"
 else
   raw=$(curl -s --max-time 6 'https://ledatic.org/entropy/pulse' 2>/dev/null)
   if printf '%s' "$raw" | grep -q '"pulse_id"' && \
@@ -103,6 +111,8 @@ else
   else
     bad "live beacon unreachable or malformed"
   fi
+  # against prod (no by-id endpoint yet) --check-beacon must honestly say unverifiable, never a false pass
+  expect_exit 9 "live --check-beacon honestly unverifiable -> 9" "$BIN" verify "$ART" "$RECEIPT" --check-beacon
 fi
 
 echo "== $PASS ok / $FAIL bad =="
