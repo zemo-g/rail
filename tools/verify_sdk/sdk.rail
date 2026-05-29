@@ -3,12 +3,21 @@
 -- One binary, four subcommands:
 --   keygen [key.hex]              generate a local Ed25519 key (refuses to clobber)
 --   pubkey [key.hex]              print the public key (hex) for a key file
---   sign   <artifact> [out] [key] sign an artifact -> receipt.json (auto-creates key)
---   verify <artifact> <receipt>   verify a receipt OFFLINE (exit 0 ok / 5 digest / 6 sig)
+--   sign   <artifact> [out] [key] [--anchor]  sign -> receipt.json (auto-creates key)
+--   verify <artifact> <receipt> [--check-beacon]  verify OFFLINE (0 ok / 5 digest / 6 sig)
+--
+-- Two receipt grades:
+--   BARE (default, free, offline) — the caller's own Ed25519 signature over
+--     {digest, pulse, time}. Self-verifying; never touches Ledatic at sign time.
+--   ANCHORED (--anchor, 1 credit) — additionally carries a witness{} block:
+--     Ledatic counter-signs "I observed this digest at this pulse at time T".
+--     verify checks it against the PINNED witness key, so it is backdate-proof
+--     and non-repudiable without trusting the caller's clock. Purely additive.
 --
 -- Trust model (A): the CALLER holds the signing key. The only thing pulled
--- from Ledatic is a fresh entropy-beacon pulse per artifact — that pulse is
--- the supply, not a gateway the artifact passes through.
+-- from Ledatic is a fresh entropy-beacon pulse per artifact (and, for --anchor,
+-- a counter-signature) — that is the supply, not a gateway the artifact passes
+-- through. Bare signing and ALL verification work with no Ledatic round-trip.
 --
 -- What `verify` proves OFFLINE, standalone (no server, no trust in Ledatic):
 --   (1) the artifact matches the receipt's SHA-256, and
@@ -41,7 +50,14 @@ import "stdlib/env.rail"
 import "stdlib/file.rail"
 
 beacon_url_default _ = "https://ledatic.org/entropy/pulse"
+anchor_url_default _ = "https://ledatic.org/attest/witness"
 default_key _ = env_or "LEDATIC_SDK_KEY" (cat [getenv "HOME", "/.ledatic/sdk/key.hex"])
+
+-- Pinned Ledatic SDK witness pubkey. An anchored receipt carries a witness{}
+-- block counter-signed by this key; verify checks it against THIS constant,
+-- never against a pubkey carried inside the receipt (else it would be forgeable).
+-- Override for rotation/tests via $LEDATIC_WITNESS_PUBKEY.
+sdk_witness_pubkey _ = env_or "LEDATIC_WITNESS_PUBKEY" "45ad2e2d671eab439f1e201b9b52bc40803c3f09fd2553d1e751e4a9afe768a7"
 
 env_or key fallback =
   let v = getenv key
@@ -120,8 +136,25 @@ fetch_beacon url =
 build_message digest pulse_id value_hex created_at =
   cat ["ledatic-receipt|v1|", digest, "|", pulse_id, "|", value_hex, "|", created_at]
 
+-- The Ledatic witness counter-signs the same binding under its own key. Uses
+-- the SAME canonical message as the existing attest infra so an anchored
+-- receipt and a native ledatic.attestation are interchangeable.
+build_witness_message digest pulse_id value_hex witnessed_at =
+  cat ["attest|v1|", digest, "|", pulse_id, "|", value_hex, "|", witnessed_at]
+
+-- Optional witness{} block appended to an anchored receipt (extra fragment).
+build_witness_block witnessed_at sig_hex pk_fp =
+  cat [
+    ",\n  \"witness\": {\n",
+    "    \"alg\": \"ed25519\",\n",
+    "    \"pk_fp\": \"", pk_fp, "\",\n",
+    "    \"witnessed_at\": ", witnessed_at, ",\n",
+    "    \"sig\": \"", sig_hex, "\"\n",
+    "  }"
+  ]
+
 -- ── Receipt JSON ──────────────────────────────────────────────────────
-build_receipt name size digest pulse_id value_hex beacon_ts beacon_url pubkey_hex pk_fp sig_hex created_at =
+build_receipt name size digest pulse_id value_hex beacon_ts beacon_url pubkey_hex pk_fp sig_hex created_at extra =
   cat [
     "{\n",
     "  \"kind\": \"ledatic.receipt\",\n",
@@ -143,7 +176,7 @@ build_receipt name size digest pulse_id value_hex beacon_ts beacon_url pubkey_he
     "    \"pk_fp\": \"", pk_fp, "\"\n",
     "  },\n",
     "  \"sig\": \"", sig_hex, "\",\n",
-    "  \"created_at\": ", created_at, "\n",
+    "  \"created_at\": ", created_at, extra, "\n",
     "}\n"
   ]
 
@@ -178,17 +211,32 @@ cmd_pubkey key_path =
     let _ = print (pk_hex_of_seed seed_hex)
     0
 
+-- ── Anchor (optional, metered): ask Ledatic to counter-sign the binding ─
+-- POSTs {sha256,pulse_id,value_hex} to the witness endpoint with the API key.
+-- Server replies with {witnessed_at, pk_fp, sig}. We embed that as witness{}.
+-- A status sentinel (__HTTP__<code>) lets us tell 402-out-of-credits apart
+-- from a transport failure without depending on the body shape alone.
+anchor_post anchor_url api_key digest pulse_id value_hex =
+  let body = cat ["{\"sha256\":\"", digest, "\",\"pulse_id\":", pulse_id, ",\"value_hex\":\"", value_hex, "\"}"]
+  shell (cat ["curl -s -w '__HTTP__%{http_code}' -X POST -H 'content-type: application/json' -H 'x-sdk-key: ", api_key, "' --data '", body, "' '", anchor_url, "'"])
+
+anchor_split raw =
+  let ps = str_split "__HTTP__" raw
+  if ps == [] then ("", "")
+  else if tail ps == [] then (head ps, "")
+  else (head ps, trim_trailing (head (tail ps)))
+
 -- ── Subcommand: sign ──────────────────────────────────────────────────
-cmd_sign artifact out key_path beacon_url =
+cmd_sign artifact out key_path beacon_url want_anchor =
   let digest = sha256_hex_file artifact
   let size = file_size_bytes artifact
   let (pulse_id, value_hex, beacon_ts) = fetch_beacon beacon_url
   if length (chars value_hex) == 0 then
     let _ = print (cat ["beacon unreachable: ", beacon_url])
     4
-  else cmd_sign2 artifact out key_path beacon_url digest size pulse_id value_hex beacon_ts
+  else cmd_sign2 artifact out key_path beacon_url digest size pulse_id value_hex beacon_ts want_anchor
 
-cmd_sign2 artifact out key_path beacon_url digest size pulse_id value_hex beacon_ts =
+cmd_sign2 artifact out key_path beacon_url digest size pulse_id value_hex beacon_ts want_anchor =
   let seed_hex = ensure_key_hex key_path
   if length (chars seed_hex) != 64 then
     let _ = print (cat ["could not load/create key: ", key_path])
@@ -200,10 +248,40 @@ cmd_sign2 artifact out key_path beacon_url digest size pulse_id value_hex beacon
     let created_at = now_unix 0
     let msg = build_message digest pulse_id value_hex created_at
     let sig_hex = bytes_to_hex (ed25519_sign seed (string_to_bytes msg) (string_length_bytes msg)) 64
-    let body = build_receipt (basename artifact) size digest pulse_id value_hex beacon_ts beacon_url pubkey_hex pk_fp sig_hex created_at
-    let _ = write_file out body
-    let _ = print (cat ["receipt: ", out, "  pk_fp=", pk_fp, "  pulse_id=", pulse_id])
-    0
+    if want_anchor == 0 then
+      let body = build_receipt (basename artifact) size digest pulse_id value_hex beacon_ts beacon_url pubkey_hex pk_fp sig_hex created_at ""
+      let _ = write_file out body
+      let _ = print (cat ["receipt: ", out, "  pk_fp=", pk_fp, "  pulse_id=", pulse_id])
+      0
+    else cmd_sign_anchor artifact out beacon_url digest size pulse_id value_hex beacon_ts pubkey_hex pk_fp sig_hex created_at
+
+cmd_sign_anchor artifact out beacon_url digest size pulse_id value_hex beacon_ts pubkey_hex pk_fp sig_hex created_at =
+  let api_key = env_or "LEDATIC_SDK_API_KEY" ""
+  if api_key == "" then
+    let _ = print "anchor requested (--anchor) but LEDATIC_SDK_API_KEY is not set"
+    2
+  else
+    let anchor_url = env_or "LEDATIC_ANCHOR_URL" (anchor_url_default 0)
+    let (rbody, rstatus) = anchor_split (anchor_post anchor_url api_key digest pulse_id value_hex)
+    let wresp = parse_json rbody
+    let w_sig = json_str (json_get wresp "sig")
+    if w_sig != "" then
+      let w_when = show (json_int (json_get wresp "witnessed_at"))
+      let w_fp = json_str (json_get wresp "pk_fp")
+      let wext = build_witness_block w_when w_sig w_fp
+      let body = build_receipt (basename artifact) size digest pulse_id value_hex beacon_ts beacon_url pubkey_hex pk_fp sig_hex created_at wext
+      let _ = write_file out body
+      let _ = print (cat ["receipt: ", out, "  pk_fp=", pk_fp, "  pulse_id=", pulse_id, "  + witnessed at ", w_when])
+      0
+    else if str_contains "payment_required" rbody then
+      let _ = print "anchor refused: out of credits (top up your pack)"
+      3
+    else if rstatus == "402" then
+      let _ = print "anchor refused: out of credits (HTTP 402)"
+      3
+    else
+      let _ = print (cat ["anchor unreachable or error (status ", rstatus, "): ", anchor_url])
+      4
 
 -- ── Beacon membership (optional online check) ────────────────────────
 -- Confirm the cited pulse really had this value_hex on the public chain.
@@ -233,6 +311,38 @@ check_membership lookup_base pulse_id want_value =
     let _ = print (cat ["BAD  membership mismatch: chain=", got_value, "  receipt=", want_value])
     8
 
+-- ── Witness verification (anchored receipts) ─────────────────────────
+-- After the caller's own signature checks out, an optional witness{} block
+-- carries Ledatic's counter-signature. It is checked against the PINNED
+-- pubkey (sdk_witness_pubkey), never the receipt's own claim — a forged block
+-- carrying its own key must fail. Fail closed (exit 10) on any mismatch.
+finish_verify r digest pulse_id value_hex check_beacon lookup_base =
+  let wit = json_get r "witness"
+  if head wit == "obj" then verify_witness wit digest pulse_id value_hex check_beacon lookup_base
+  else
+    if check_beacon == 1 then check_membership lookup_base pulse_id value_hex
+    else 0
+
+verify_witness wit digest pulse_id value_hex check_beacon lookup_base =
+  let w_sig = json_str (json_get wit "sig")
+  let w_when = show (json_int (json_get wit "witnessed_at"))
+  let w_fp = json_str (json_get wit "pk_fp")
+  let pin = sdk_witness_pubkey 0
+  let pin_fp = str_sub pin 0 16
+  if w_fp != pin_fp then
+    let _ = print (cat ["BAD  witness key mismatch: receipt pk_fp=", w_fp, "  pinned=", pin_fp])
+    10
+  else
+    let wmsg = build_witness_message digest pulse_id value_hex w_when
+    let wok = ed25519_verify (hex_to_bytes pin) (string_to_bytes wmsg) (string_length_bytes wmsg) (hex_to_bytes w_sig)
+    if wok == 1 then
+      let _ = print (cat ["  +  Ledatic-witnessed at ", w_when, " (pk_fp ", w_fp, ")"])
+      if check_beacon == 1 then check_membership lookup_base pulse_id value_hex
+      else 0
+    else
+      let _ = print "BAD  witness signature (forged or altered witness block)"
+      10
+
 -- ── Subcommand: verify (offline; optional --check-beacon) ─────────────
 cmd_verify artifact receipt_path check_beacon lookup_base =
   let r = parse_json (read_file receipt_path)
@@ -256,8 +366,7 @@ cmd_verify artifact receipt_path check_beacon lookup_base =
     let ok = ed25519_verify (hex_to_bytes pubkey_hex) (string_to_bytes msg) (string_length_bytes msg) (hex_to_bytes sig_hex)
     if ok == 1 then
       let _ = print (cat ["ok   artifact=", name, "  pulse_id=", pulse_id, "  pk_fp=", pk_fp])
-      if check_beacon == 1 then check_membership lookup_base pulse_id value_hex
-      else 0
+      finish_verify r want_digest pulse_id value_hex check_beacon lookup_base
     else
       let _ = print "BAD  signature"
       6
@@ -267,13 +376,15 @@ usage _ =
   let _ = print "Ledatic verifiability SDK"
   let _ = print "  sdk keygen [key.hex]              generate a local Ed25519 key (refuses to clobber)"
   let _ = print "  sdk pubkey [key.hex]              print the public key (hex) for a key file"
-  let _ = print "  sdk sign   <artifact> [out] [key] sign an artifact -> receipt.json"
+  let _ = print "  sdk sign   <artifact> [out] [key] [--anchor]  sign -> receipt.json"
+  let _ = print "       --anchor adds a Ledatic witness counter-signature (1 credit): 2 no-key / 3 out-of-credits / 4 unreachable"
   let _ = print "  sdk verify <artifact> <receipt> [--check-beacon]"
-  let _ = print "       offline: 0 ok / 5 digest / 6 sig"
+  let _ = print "       offline: 0 ok / 5 digest / 6 sig / 10 bad witness"
   let _ = print "       --check-beacon adds pulse membership: 8 mismatch / 9 unverifiable"
   let _ = print "key:    $LEDATIC_SDK_KEY or ~/.ledatic/sdk/key.hex"
   let _ = print "beacon: $LEDATIC_BEACON_URL or https://ledatic.org/entropy/pulse"
   let _ = print "lookup: $LEDATIC_PULSE_LOOKUP or <beacon>/<id> (pulse-by-id; not live yet)"
+  let _ = print "anchor: $LEDATIC_ANCHOR_URL + $LEDATIC_SDK_API_KEY (metered witness endpoint)"
   0
 
 -- ── Dispatch ──────────────────────────────────────────────────────────
@@ -286,12 +397,14 @@ main =
     if cmd == "keygen" then cmd_keygen (arg_or rest 0 (default_key 0))
     else if cmd == "pubkey" then cmd_pubkey (arg_or rest 0 (default_key 0))
     else if cmd == "sign" then
-      if length rest < 1 then usage 0
+      let want_anchor = list_contains "--anchor" rest
+      let pos = drop_flag "--anchor" rest
+      if length pos < 1 then usage 0
       else
-        let artifact = head rest
-        let out = arg_or rest 1 (cat [artifact, ".receipt.json"])
-        let key_path = arg_or rest 2 (default_key 0)
-        cmd_sign artifact out key_path (env_or "LEDATIC_BEACON_URL" (beacon_url_default 0))
+        let artifact = head pos
+        let out = arg_or pos 1 (cat [artifact, ".receipt.json"])
+        let key_path = arg_or pos 2 (default_key 0)
+        cmd_sign artifact out key_path (env_or "LEDATIC_BEACON_URL" (beacon_url_default 0)) want_anchor
     else if cmd == "verify" then
       let check_beacon = list_contains "--check-beacon" rest
       let pos = drop_flag "--check-beacon" rest
