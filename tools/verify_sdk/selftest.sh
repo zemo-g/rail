@@ -99,6 +99,9 @@ expect_exit 0 "membership match -> 0"      env LEDATIC_PULSE_LOOKUP="file://$LOO
 printf '{"pulse_id": 999, "value_hex": "%s", "timestamp_utc": "x"}\n' "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" > "$LOOKDIR/999"
 expect_exit 8 "membership mismatch -> 8"   env LEDATIC_PULSE_LOOKUP="file://$LOOKDIR/"       "$BIN" verify "$ART" "$RECEIPT" --check-beacon
 expect_exit 9 "membership unverifiable -> 9" env LEDATIC_PULSE_LOOKUP="file://$LOOKDIR/empty/" "$BIN" verify "$ART" "$RECEIPT" --check-beacon
+# endpoint serves the WRONG pulse for the requested id (e.g. latest-for-all misconfig) -> unverifiable, not a false pass
+printf '{"pulse_id": 12345, "value_hex": "%s", "timestamp_utc": "x"}\n' "$VHEX" > "$LOOKDIR/999"
+expect_exit 9 "membership wrong-id -> 9"   env LEDATIC_PULSE_LOOKUP="file://$LOOKDIR/"       "$BIN" verify "$ART" "$RECEIPT" --check-beacon
 
 # --- live beacon (skip with SDK_SELFTEST_OFFLINE=1) -----------------------
 if [ "${SDK_SELFTEST_OFFLINE:-0}" = "1" ]; then
