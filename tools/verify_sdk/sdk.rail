@@ -18,9 +18,14 @@
 -- public beacon chain. Forward time-binding ("can't be backdated earlier than
 -- the pulse") only bites once a verifier can confirm pulse_id -> value_hex
 -- against the chain. The live beacon serves ONLY the latest pulse — there is
--- no pulse-by-id or chain-segment endpoint (confirmed 2026-05-29), so that
--- membership check is blocked on a Ledatic-side endpoint. It is the v1
--- hardening step, deliberately not faked here.
+-- no pulse-by-id or chain-segment endpoint (confirmed 2026-05-29).
+--
+-- `verify --check-beacon` runs that check against $LEDATIC_PULSE_LOOKUP
+-- (default <beacon>/<id>): exit 8 on a value mismatch, exit 9 when nothing
+-- answers — so against today's prod it reports UNVERIFIABLE, never a false
+-- pass. It goes live the day a pulse-by-id endpoint ships, with no client
+-- change. That endpoint (persist each pulse to KV under entropy/pulse/<id>)
+-- is the v1 hardening step and the one metered surface in model (A).
 --
 -- key:    $LEDATIC_SDK_KEY or ~/.ledatic/sdk/key.hex (0600)
 -- beacon: $LEDATIC_BEACON_URL or https://ledatic.org/entropy/pulse
@@ -45,6 +50,8 @@ env_or key fallback =
 -- ── arg helpers ───────────────────────────────────────────────────────
 drop_n n xs = if n == 0 then xs else if xs == [] then xs else drop_n (n - 1) (tail xs)
 arg_or xs n dflt = let r = drop_n n xs in if r == [] then dflt else head r
+list_contains x xs = if xs == [] then 0 else if head xs == x then 1 else list_contains x (tail xs)
+drop_flag flag xs = if xs == [] then [] else if head xs == flag then drop_flag flag (tail xs) else cons (head xs) (drop_flag flag (tail xs))
 
 -- ── trim trailing whitespace/newlines ────────────────────────────────
 trim_trailing s = join "" (reverse (drop_ws (reverse (chars s))))
@@ -198,8 +205,31 @@ cmd_sign2 artifact out key_path beacon_url digest size pulse_id value_hex beacon
     let _ = print (cat ["receipt: ", out, "  pk_fp=", pk_fp, "  pulse_id=", pulse_id])
     0
 
--- ── Subcommand: verify (offline) ──────────────────────────────────────
-cmd_verify artifact receipt_path =
+-- ── Beacon membership (optional online check) ────────────────────────
+-- Confirm the cited pulse really had this value_hex on the public chain.
+-- Honest about today's reality: prod serves only the latest pulse, so until
+-- a pulse-by-id endpoint exists this returns UNVERIFIABLE (exit 9), never a
+-- false pass. A real mismatch (a forged/altered pulse) is exit 8.
+fetch_pulse_value lookup_base pulse_id =
+  let url = cat [lookup_base, pulse_id]
+  let raw = shell (cat ["curl -s --max-time 6 '", url, "'"])
+  if str_contains "\"value_hex\"" raw then json_str (json_get (parse_json raw) "value_hex")
+  else ""
+
+check_membership lookup_base pulse_id want_value =
+  let got = fetch_pulse_value lookup_base pulse_id
+  if got == "" then
+    let _ = print (cat ["     membership UNVERIFIABLE: no pulse-by-id endpoint (", lookup_base, pulse_id, ")"])
+    9
+  else if got == want_value then
+    let _ = print (cat ["     membership ok: pulse ", pulse_id, " matches the public chain"])
+    0
+  else
+    let _ = print (cat ["BAD  membership mismatch: chain=", got, "  receipt=", want_value])
+    8
+
+-- ── Subcommand: verify (offline; optional --check-beacon) ─────────────
+cmd_verify artifact receipt_path check_beacon lookup_base =
   let r = parse_json (read_file receipt_path)
   let artifact_obj = json_get r "artifact"
   let want_digest = json_str (json_get artifact_obj "sha256")
@@ -221,7 +251,8 @@ cmd_verify artifact receipt_path =
     let ok = ed25519_verify (hex_to_bytes pubkey_hex) (string_to_bytes msg) (string_length_bytes msg) (hex_to_bytes sig_hex)
     if ok == 1 then
       let _ = print (cat ["ok   artifact=", name, "  pulse_id=", pulse_id, "  pk_fp=", pk_fp])
-      0
+      if check_beacon == 1 then check_membership lookup_base pulse_id value_hex
+      else 0
     else
       let _ = print "BAD  signature"
       6
@@ -232,9 +263,12 @@ usage _ =
   let _ = print "  sdk keygen [key.hex]              generate a local Ed25519 key (refuses to clobber)"
   let _ = print "  sdk pubkey [key.hex]              print the public key (hex) for a key file"
   let _ = print "  sdk sign   <artifact> [out] [key] sign an artifact -> receipt.json"
-  let _ = print "  sdk verify <artifact> <receipt>   verify a receipt offline (0 ok / 5 digest / 6 sig)"
+  let _ = print "  sdk verify <artifact> <receipt> [--check-beacon]"
+  let _ = print "       offline: 0 ok / 5 digest / 6 sig"
+  let _ = print "       --check-beacon adds pulse membership: 8 mismatch / 9 unverifiable"
   let _ = print "key:    $LEDATIC_SDK_KEY or ~/.ledatic/sdk/key.hex"
   let _ = print "beacon: $LEDATIC_BEACON_URL or https://ledatic.org/entropy/pulse"
+  let _ = print "lookup: $LEDATIC_PULSE_LOOKUP or <beacon>/<id> (pulse-by-id; not live yet)"
   0
 
 -- ── Dispatch ──────────────────────────────────────────────────────────
@@ -254,6 +288,10 @@ main =
         let key_path = arg_or rest 2 (default_key 0)
         cmd_sign artifact out key_path (env_or "LEDATIC_BEACON_URL" (beacon_url_default 0))
     else if cmd == "verify" then
-      if length rest < 2 then usage 0
-      else cmd_verify (head rest) (head (tail rest))
+      let check_beacon = list_contains "--check-beacon" rest
+      let pos = drop_flag "--check-beacon" rest
+      if length pos < 2 then usage 0
+      else
+        let lookup_base = env_or "LEDATIC_PULSE_LOOKUP" (cat [env_or "LEDATIC_BEACON_URL" (beacon_url_default 0), "/"])
+        cmd_verify (head pos) (head (tail pos)) check_beacon lookup_base
     else usage 0
