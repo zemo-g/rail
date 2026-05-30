@@ -1,0 +1,345 @@
+-- tools/ad/revad.rail — reverse-mode AD (Tapenade two-sweep) over a real float_arr kernel.
+--
+-- This is the next cut of Pillar 3 (attested numerics) past tools/ad/diff.rail. Where diff.rail
+-- did SYMBOLIC source-to-source AD on a tiny Expr DSL, this implements the reverse-mode
+-- store-all two-sweep the design spec (notes/rail-pillars-design-2026-05-30.md) calls for over a
+-- real float_arr computation: a 1-hidden-layer MLP forward to a scalar loss.
+--
+--   z = W1 . x          (W1 : H x N,  x : N)          -- pre-activation
+--   h = relu(z)         (h : H)
+--   y = W2 . h          (W2 : 1 x H,  y : scalar)
+--   loss = (y - t)^2
+--
+-- Dims here: N=3 inputs, H=4 hidden. The reverse pass accumulates adjoints (gradients) wrt
+-- every weight in W1 and W2, walking the ops in reverse (LIFO) per the spec's transformation
+-- table. Validated against numerical central finite-difference (perturb each weight by +/-1e-4)
+-- to within 1e-4, and checked for bit-identical determinism across two runs.
+--
+-- WHY THIS SHAPE (the Rail gotchas it dodges):
+--  * NO float scalar is ever passed to a user function (scalar-float params miscompile, both for
+--    arithmetic use AND for recursive-float-return). Every float lives in a float_arr cell or a
+--    float LOCAL. Functions take the param/tape/grad ARRAYS + INT indices/dims and read floats
+--    back via float_arr_get -- unambiguously float -- exactly the eval_into pattern from diff.rail.
+--  * NO ADT holds a raw float (no ADT is used at all here).
+--  * relu / its derivative compare against a genuine float-zero LOCAL (`zero = 0.0 - 0.0`) instead
+--    of the literal `0.0`, which otherwise trips an int/float typecheck-mismatch warning.
+--  * loop counters use `==` and `<` on ints only; empty/length checks are not needed (fixed dims).
+--
+-- The whole computation is laid out in ONE flat float_arr ("P", the param+state block) at fixed
+-- compile-time slot offsets, so there are no closures, no dynamic alloc inside the sweeps, and the
+-- reverse reduction has ONE fixed order => identical roundings => bit-identical gradients. That
+-- determinism is what makes a gradient hashable -> signable -> chain-anchorable (Pillar 1).
+--
+-- Run: ./rail_native run tools/ad/revad.rail
+
+-- ---------------------------------------------------------------------------------------------
+-- Fixed dims (compile-time constants threaded as int locals, never as float).
+--   N = 3 (input dim), H = 4 (hidden dim).
+-- ---------------------------------------------------------------------------------------------
+-- Flat slot layout inside the single float_arr `P` (offsets are int constants):
+--   x      : [0  .. 3)    N=3      input vector
+--   W1     : [3  .. 15)   H*N=12   row-major, W1[j][k] at 3 + j*N + k
+--   W2     : [15 .. 19)   H=4      W2[j] at 15 + j
+--   t      : [19 .. 20)   1        target scalar
+--   z      : [20 .. 24)   H=4      TAPE: pre-activation  (recorded by forward)
+--   h      : [24 .. 28)   H=4      TAPE: post-relu       (recorded by forward)
+--   y      : [28 .. 29)   1        TAPE: output scalar   (recorded by forward)
+--   loss   : [29 .. 30)   1        scalar loss
+-- Adjoint / gradient block lives in a SEPARATE float_arr `G` (same idea, reverse sweep target):
+--   ybar   : [0  .. 1)    1        d loss / d y
+--   hbar   : [1  .. 5)    H=4      d loss / d h[j]
+--   zbar   : [5  .. 9)    H=4      d loss / d z[j]
+--   gW2    : [9  .. 13)   H=4      gradient wrt W2[j]
+--   gW1    : [13 .. 25)   H*N=12   gradient wrt W1[j][k]  at 13 + j*N + k
+-- ---------------------------------------------------------------------------------------------
+
+-- Offset helpers (pure int arithmetic; safe as user fns -- no float params).
+off_x k = k
+off_w1 j k = 3 + j * 3 + k
+off_w2 j = 15 + j
+off_t u = 19
+off_z j = 20 + j
+off_h j = 24 + j
+off_y u = 28
+off_loss u = 29
+
+g_ybar u = 0
+g_hbar j = 1 + j
+g_zbar j = 5 + j
+g_gw2 j = 9 + j
+g_gw1 j k = 13 + j * 3 + k
+
+-- ---------------------------------------------------------------------------------------------
+-- FORWARD PASS (primal) -- also records the intermediates the backward sweep needs (the "tape").
+-- Reads/writes only float_arr cells; carries dims as int args. Result written to P[loss].
+-- Returns 0 (side-effects into P). This mirrors diff.rail's eval_into out-cell discipline.
+-- ---------------------------------------------------------------------------------------------
+
+-- z[j] = sum_k W1[j][k] * x[k]   (one hidden unit's pre-activation)
+fwd_z_unit p j k n acc =
+  if k == n then float_arr_set p (off_z j) acc
+  else
+    let w = float_arr_get p (off_w1 j k)
+    let xv = float_arr_get p (off_x k)
+    fwd_z_unit p j (k + 1) n (acc + w * xv)
+
+-- h[j] = relu(z[j])
+fwd_h_unit p j =
+  let zero = 0.0 - 0.0
+  let zv = float_arr_get p (off_z j)
+  let hv = if zv < zero then zero else zv
+  float_arr_set p (off_h j) hv
+
+-- compute z[j], h[j] for j = 0..H-1
+fwd_hidden p j h n =
+  if j == h then 0
+  else
+    let zacc = 0.0 - 0.0
+    let _ = fwd_z_unit p j 0 n zacc
+    let _ = fwd_h_unit p j
+    fwd_hidden p (j + 1) h n
+
+-- y = sum_j W2[j] * h[j]
+fwd_y p j h acc =
+  if j == h then float_arr_set p (off_y 0) acc
+  else
+    let w = float_arr_get p (off_w2 j)
+    let hv = float_arr_get p (off_h j)
+    fwd_y p (j + 1) h (acc + w * hv)
+
+-- loss = (y - t)^2
+fwd_loss p =
+  let yv = float_arr_get p (off_y 0)
+  let tv = float_arr_get p (off_t 0)
+  let d = yv - tv
+  float_arr_set p (off_loss 0) (d * d)
+
+forward p h n =
+  let _ = fwd_hidden p 0 h n
+  let _ = fwd_y p 0 h (0.0 - 0.0)
+  let _ = fwd_loss p
+  0
+
+-- ---------------------------------------------------------------------------------------------
+-- REVERSE PASS (adjoint) -- walks the ops in reverse, ACCUMULATING adjoints into G.
+-- Seed: d loss / d loss = 1. Then by the spec's transformation table:
+--   loss = (y - t)^2  ->  ybar = 2*(y - t)
+--   y = sum_j W2[j]*h[j]  ->  gW2[j] += ybar*h[j] ;  hbar[j] += ybar*W2[j]
+--   h[j] = relu(z[j])     ->  zbar[j]  = hbar[j] * (z[j] > 0 ? 1 : 0)
+--   z[j] = sum_k W1[j][k]*x[k]  ->  gW1[j][k] += zbar[j]*x[k]
+-- Adjoints ACCUMULATE; the reduction order is fixed (j ascending, k ascending) => deterministic.
+-- ---------------------------------------------------------------------------------------------
+
+-- ybar = 2*(y - t)
+bwd_loss p g =
+  let yv = float_arr_get p (off_y 0)
+  let tv = float_arr_get p (off_t 0)
+  let two = 1.0 + 1.0
+  float_arr_set g (g_ybar 0) (two * (yv - tv))
+
+-- for each j: gW2[j] += ybar*h[j] ; hbar[j] += ybar*W2[j]
+bwd_y p g j h =
+  if j == h then 0
+  else
+    let ybar = float_arr_get g (g_ybar 0)
+    let hv = float_arr_get p (off_h j)
+    let w2 = float_arr_get p (off_w2 j)
+    let cur_gw2 = float_arr_get g (g_gw2 j)
+    let _ = float_arr_set g (g_gw2 j) (cur_gw2 + ybar * hv)
+    let cur_hbar = float_arr_get g (g_hbar j)
+    let _ = float_arr_set g (g_hbar j) (cur_hbar + ybar * w2)
+    bwd_y p g (j + 1) h
+
+-- zbar[j] = hbar[j] * drelu(z[j])
+bwd_relu p g j h =
+  if j == h then 0
+  else
+    let zero = 0.0 - 0.0
+    let one = 1.0 + zero
+    let zv = float_arr_get p (off_z j)
+    let drelu = if zv < zero then zero else one
+    let hbar = float_arr_get g (g_hbar j)
+    let _ = float_arr_set g (g_zbar j) (hbar * drelu)
+    bwd_relu p g (j + 1) h
+
+-- inner: gW1[j][k] += zbar[j]*x[k]
+bwd_w1_unit p g j k n =
+  if k == n then 0
+  else
+    let zbar = float_arr_get g (g_zbar j)
+    let xv = float_arr_get p (off_x k)
+    let cur = float_arr_get g (g_gw1 j k)
+    let _ = float_arr_set g (g_gw1 j k) (cur + zbar * xv)
+    bwd_w1_unit p g j (k + 1) n
+
+bwd_w1 p g j h n =
+  if j == h then 0
+  else
+    let _ = bwd_w1_unit p g j 0 n
+    bwd_w1 p g (j + 1) h n
+
+backward p g h n =
+  let _ = bwd_loss p g
+  let _ = bwd_y p g 0 h
+  let _ = bwd_relu p g 0 h
+  let _ = bwd_w1 p g 0 h n
+  0
+
+-- zero out the adjoint/gradient block before a reverse sweep (size = 25 cells).
+zero_grad g i m =
+  if i == m then 0
+  else
+    let z = 0.0 - 0.0
+    let _ = float_arr_set g i z
+    zero_grad g (i + 1) m
+
+-- one full analytic gradient: forward (records tape) then backward (accumulates into G).
+analytic_grad p g h n =
+  let _ = zero_grad g 0 25
+  let _ = forward p h n
+  let _ = backward p g h n
+  0
+
+-- ---------------------------------------------------------------------------------------------
+-- NUMERICAL GRADIENT (central finite-difference) for validation.
+-- Perturb P[slot] by +/- EPS, re-run forward, read loss, restore. lr/eps are float LOCALS, and
+-- the perturbed slot is addressed by an INT arg -- no float crosses a function boundary.
+-- ---------------------------------------------------------------------------------------------
+num_grad_slot p h n slot out og =
+  let eps = 0.0001
+  let x0 = float_arr_get p slot
+  let _ = float_arr_set p slot (x0 + eps)
+  let _ = forward p h n
+  let fp = float_arr_get p (off_loss 0)
+  let _ = float_arr_set p slot (x0 - eps)
+  let _ = forward p h n
+  let fm = float_arr_get p (off_loss 0)
+  let _ = float_arr_set p slot x0
+  let denom = eps + eps
+  float_arr_set out og ((fp - fm) / denom)
+
+-- ---------------------------------------------------------------------------------------------
+-- VALIDATION: compare analytic gW1/gW2 against numerical, accumulate max abs diff into acc[0].
+-- ---------------------------------------------------------------------------------------------
+absf x = if x < (0.0 - 0.0) then 0.0 - x else x
+
+upd_max acc v =
+  let cur = float_arr_get acc 0
+  if v > cur then float_arr_set acc 0 v else 0
+
+-- compare analytic gW2[j] vs numerical d loss / d W2[j]
+check_w2 p g h n acc j =
+  if j == h then 0
+  else
+    let num = float_arr_new 1 0.0
+    let _ = num_grad_slot p h n (off_w2 j) num 0
+    let a = float_arr_get g (g_gw2 j)
+    let b = float_arr_get num 0
+    let d = absf (a - b)
+    let _ = upd_max acc d
+    let _ = print (cat ["  gW2[", show j, "]      analytic=", show_float a, "  numerical=", show_float b, "  |d|=", show_float d])
+    check_w2 p g h n acc (j + 1)
+
+-- compare analytic gW1[j][k] vs numerical
+check_w1_unit p g h n acc j k =
+  if k == n then 0
+  else
+    let num = float_arr_new 1 0.0
+    let _ = num_grad_slot p h n (off_w1 j k) num 0
+    let a = float_arr_get g (g_gw1 j k)
+    let b = float_arr_get num 0
+    let d = absf (a - b)
+    let _ = upd_max acc d
+    let _ = print (cat ["  gW1[", show j, "][", show k, "]   analytic=", show_float a, "  numerical=", show_float b, "  |d|=", show_float d])
+    check_w1_unit p g h n acc j (k + 1)
+
+check_w1 p g h n acc j =
+  if j == h then 0
+  else
+    let _ = check_w1_unit p g h n acc j 0
+    check_w1 p g h n acc (j + 1)
+
+-- ---------------------------------------------------------------------------------------------
+-- Determinism: copy the gradient block out so two runs can be compared bit-for-bit.
+-- ---------------------------------------------------------------------------------------------
+copy_grad g dst i m =
+  if i == m then 0
+  else
+    let _ = float_arr_set dst i (float_arr_get g i)
+    copy_grad g dst (i + 1) m
+
+-- count slots where two gradient snapshots differ (exact ==, i.e. bit-identical floats).
+count_diff a b i m acc =
+  if i == m then acc
+  else
+    let va = float_arr_get a i
+    let vb = float_arr_get b i
+    let nxt = if va == vb then acc else acc + 1
+    count_diff a b (i + 1) m nxt
+
+-- ---------------------------------------------------------------------------------------------
+main =
+  let _ = print "=== Pillar 3 (next cut): reverse-mode AD (Tapenade two-sweep) over a float_arr MLP ==="
+  let _ = print "kernel:  h = relu(W1 . x);  y = W2 . h;  loss = (y - t)^2     (N=3 in, H=4 hidden)"
+  let nn = 3
+  let hh = 4
+
+  -- single flat param/state block.
+  let p = float_arr_new 30 0.0
+  -- input x = [0.5, -1.0, 2.0]
+  let _ = float_arr_set p (off_x 0) 0.5
+  let _ = float_arr_set p (off_x 1) (0.0 - 1.0)
+  let _ = float_arr_set p (off_x 2) 2.0
+  -- W1 (4x3), hand-picked so some pre-activations are >0 and some <0 (exercises both relu sides):
+  --   row 0: [ 0.10, -0.20,  0.30]
+  --   row 1: [-0.40,  0.50, -0.10]
+  --   row 2: [ 0.20,  0.10,  0.40]
+  --   row 3: [-0.30, -0.50,  0.05]
+  let _ = float_arr_set p (off_w1 0 0) 0.10
+  let _ = float_arr_set p (off_w1 0 1) (0.0 - 0.20)
+  let _ = float_arr_set p (off_w1 0 2) 0.30
+  let _ = float_arr_set p (off_w1 1 0) (0.0 - 0.40)
+  let _ = float_arr_set p (off_w1 1 1) 0.50
+  let _ = float_arr_set p (off_w1 1 2) (0.0 - 0.10)
+  let _ = float_arr_set p (off_w1 2 0) 0.20
+  let _ = float_arr_set p (off_w1 2 1) 0.10
+  let _ = float_arr_set p (off_w1 2 2) 0.40
+  let _ = float_arr_set p (off_w1 3 0) (0.0 - 0.30)
+  let _ = float_arr_set p (off_w1 3 1) (0.0 - 0.50)
+  let _ = float_arr_set p (off_w1 3 2) 0.05
+  -- W2 (1x4) = [0.7, -0.6, 0.9, 0.3]
+  let _ = float_arr_set p (off_w2 0) 0.7
+  let _ = float_arr_set p (off_w2 1) (0.0 - 0.6)
+  let _ = float_arr_set p (off_w2 2) 0.9
+  let _ = float_arr_set p (off_w2 3) 0.3
+  -- target t = 1.0
+  let _ = float_arr_set p (off_t 0) 1.0
+
+  let g = float_arr_new 25 0.0
+
+  -- run the analytic gradient (forward records tape, backward accumulates adjoints)
+  let _ = analytic_grad p g hh nn
+  let _ = print (cat ["forward:  y=", show_float (float_arr_get p (off_y 0)), "   loss=", show_float (float_arr_get p (off_loss 0))])
+  let _ = print (cat ["seed:     d loss / d y (ybar) = ", show_float (float_arr_get g (g_ybar 0))])
+  let _ = print "--- analytic (reverse-mode) vs numerical (central finite-difference, eps=1e-4) ---"
+
+  let acc = float_arr_new 1 0.0       -- acc[0] = max abs diff seen
+  let _ = check_w2 p g hh nn acc 0
+  let _ = check_w1 p g hh nn acc 0
+  let maxd = float_arr_get acc 0
+  let _ = print (cat ["max |analytic - numerical| over all 16 weights = ", show_float maxd])
+  let tol = 0.0001
+  let _ = print (cat ["gradient check (tol 1e-4): ", if maxd < tol then "PASS" else "FAIL"])
+
+  -- determinism: snapshot the gradient, recompute from scratch, compare bit-for-bit.
+  let snap1 = float_arr_new 25 0.0
+  let _ = copy_grad g snap1 0 25
+  let _ = analytic_grad p g hh nn          -- recompute (fresh forward + backward)
+  let snap2 = float_arr_new 25 0.0
+  let _ = copy_grad g snap2 0 25
+  let ndiff = count_diff snap1 snap2 0 25 0
+  let _ = print (cat ["determinism: gradient recomputed twice, differing slots = ", show ndiff, "  -> ", if ndiff == 0 then "BIT-IDENTICAL (reproducible)" else "DIVERGED"])
+
+  let ok = if maxd < tol then (if ndiff == 0 then 1 else 0) else 0
+  let _ = print (cat ["RESULT: ", if ok == 1 then "PASS (gradient matches numerical AND deterministic)" else "FAIL"])
+  0

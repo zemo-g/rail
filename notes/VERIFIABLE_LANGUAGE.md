@@ -18,6 +18,12 @@ language-level expression of "physicify"; the substrate for PAOS.
 | **P3** Attested numerics | source-to-source AD; the gradient is itself a re-runnable Rail program | **LANDED** first cut `tools/ad/diff.rail` (Expr→Expr AD; validated vs numerical ~1e-11; deterministic; **2nd-order AD free**; AD-driven gradient descent converges to the minimum) |
 | **Demo** | a computation that proves itself (compose P1+P2+P3) | **GREEN** `tools/verifiable_selftest.sh` (deterministic P3 result → P1 chain → verify) |
 
+### Swarm extensions (2026-05-30, parallel agents, all re-validated independently)
+- **P3** `tools/ad/revad.rail` — reverse-mode AD (Tapenade two-sweep) over a 1-hidden-layer MLP; analytic vs numerical gradient max|d|≈5e-13, deterministic.
+- **P2** `tools/auth/authdict.rail` — authenticated key→value dictionary (BST); clean accept + tampered / forged-root / wrong-key all rejected.
+- **P1** `tools/attest/attest_chain_beacon.rail` — beacon-pulse-anchored ledger with pulse-monotonicity verification (offline/local-key).
+- **Design** `notes/rail-compiler-phase-design.md` — implementation specs for the high-risk compiler phase (P2 Stage B `auth`/`unauth` desugar + the incremental checked type layer).
+
 ## How to run
 
 ```bash
