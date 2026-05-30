@@ -36,6 +36,9 @@ language-level expression of "physicify"; the substrate for PAOS.
 ./rail_native run tools/ad/diff.rail
 # all pillars + the "computation that proves itself" composition
 bash tools/verifiable_selftest.sh
+# the integrated attested step: toolchain + deterministic gradient + authenticated inputs,
+# beacon-anchored, signed, hash-chained, and verified end to end
+bash tools/attested_step.sh
 ```
 
 ## Roadmap / follow-ups (the live-surface ones need care)
