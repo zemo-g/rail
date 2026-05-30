@@ -376,6 +376,34 @@ diagnostics make the self-train compile-as-oracle loop report type errors as dat
 
 ---
 
+## 2.8 VERIFIED CORRECTION (2026-05-30, after reading the rmap machinery)
+
+Increment B as written above is **WRONG on convergence** — verified by reading
+`infer_ty`/`infer_call_ty`/`refine_rmap` (compile.rail ~2388-2491). For
+`rec_half n x = if n<=0 then x else rec_half (n-1) (x /. 2.0)`:
+- the then-branch `x` is a bare `V` → `infer_ty` returns **0/UNKNOWN** (line 2418: V is always 0);
+- the else-branch is `A rec_half ...` → `infer_call_ty` returns `__ret_rec_half` from the rmap,
+  which starts 0 and never rises — the float-ness lives in the recursive call's **argument**
+  (`x /. 2.0`), and `infer_call_ty` does NOT propagate arg types into the return.
+
+So the fixpoint settles at `__ret_rec_half = 0`. Deriving `__float_ret_` from `__ret_==2` therefore
+does **not** mark rec_half float (B fails its own target), AND the rmap is more conservative on
+param-return/recursion than the current two-pass, so a blind swap risks **regressing** functions the
+two-pass marks. **Do not implement B as a simple swap.**
+
+The real recursive-float-return fix is JOINT (more than a "net deletion"):
+1. **A** (`__argf_` call-site agreement) marks the param `x` as `__float_` — rec_half's own recursive
+   call passes `x /. 2.0` (float) in arg 1, so `__argf_rec_half_1 = FLOAT`.
+2. **Extend `infer_ty`'s "V" case** (line 2418): a var marked `__float_` (look it up in `ar`/env)
+   contributes **2**, not 0. Then the then-branch `x` → 2, the lub → 2, `__ret_rec_half` → 2, and the
+   `__float_ret_` derivation works.
+3. Keep the existing two-pass as a **union fallback** (mark float if EITHER the two-pass OR the rmap
+   says so) so no currently-marked function regresses.
+
+Net: B is not standalone; sequence it as a rider on A + the `infer_ty` V-tweak + the union guard, and
+gate on the full 142-test suite + the diff-fuzzer. (This correction is the kind of analysis the
+compiler tracks need BEFORE coding — exactly why they were kept out of the autonomous swarm.)
+
 # Cross-cutting
 
 - Both tracks are **additive** to the env-marker + arity-map machinery already in `compile.rail`; neither
