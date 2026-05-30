@@ -13,10 +13,10 @@ language-level expression of "physicify"; the substrate for PAOS.
 
 | Pillar | What | Status |
 |---|---|---|
-| **P1** Attestation ledger | append-only, Ed25519-signed, hash-chained ledger over the v1 attestations | **LANDED** `tools/attest/attest_chain.rail` (selfhost/append/verify, offline/local-key) — `verify --deep` in progress |
-| **P2** `auth` types | authenticated data structures (λ• model): a value carrying proof of its derivation | **building** Stage A library `tools/auth/authkit.rail` |
-| **P3** Attested numerics | source-to-source AD; the gradient is itself a re-runnable Rail program; deterministic kernels | **building** first cut `tools/ad/diff.rail` |
-| **Demo** | a computation that proves itself (compose P1+P2+P3) | pending |
+| **P1** Attestation ledger | append-only, Ed25519-signed, hash-chained ledger over the v1 attestations | **LANDED** `tools/attest/attest_chain.rail` — selfhost/append/verify + `selfcheck` (PROVEN byte-identical fixed point). offline/local-key |
+| **P2** `auth` types | authenticated data structures (λ• model): a value carrying proof of its derivation | **LANDED** Stage A `tools/auth/authkit.rail` (Merkle: prove / verify-from-root-only / tamper-reject) |
+| **P3** Attested numerics | source-to-source AD; the gradient is itself a re-runnable Rail program | **LANDED** first cut `tools/ad/diff.rail` (Expr→Expr AD; validated vs numerical ~1e-11; deterministic; **2nd-order AD free**) |
+| **Demo** | a computation that proves itself (compose P1+P2+P3) | **GREEN** `tools/verifiable_selftest.sh` (deterministic P3 result → P1 chain → verify) |
 
 ## How to run
 
@@ -25,7 +25,11 @@ language-level expression of "physicify"; the substrate for PAOS.
 ./rail_native run tools/attest/attest_chain.rail selfhost
 ./rail_native run tools/attest/attest_chain.rail append <file>
 ./rail_native run tools/attest/attest_chain.rail verify
-# P2 / P3 — see tools/auth/ and tools/ad/ (added as they land)
+# P2 / P3
+./rail_native run tools/auth/authkit.rail
+./rail_native run tools/ad/diff.rail
+# all pillars + the "computation that proves itself" composition
+bash tools/verifiable_selftest.sh
 ```
 
 ## Roadmap / follow-ups (the live-surface ones need care)
