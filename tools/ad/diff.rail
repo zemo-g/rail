@@ -1,0 +1,117 @@
+-- tools/ad/diff.rail — source-to-source automatic differentiation (Pillar 3, first cut).
+--
+-- `diff e i` transforms an expression into its gradient EXPRESSION wrt input i: Expr -> Expr.
+-- The gradient is itself a program you can evaluate, recompile, or re-attest -- "the gradient
+-- is a Rail program," the property that motivates language-level AD (the moat is attestation,
+-- not ergonomics). Validated: symbolic diff == numerical finite-difference; eval is deterministic
+-- (fixed order) => bit-reproducible, the basis for attested gradients.
+--
+-- First-cut scope: a small arithmetic Expr DSL (Var / constant / + - * /). No float fields live
+-- in the ADT (constants are int indices into a consts array) to dodge the float-in-ADT trap.
+-- FOLLOW-UP (design spec): reverse-mode two-sweep over float_arr kernels (Tapenade, transformer
+-- scale) + a fixed-order Metal reduction kernel for bit-reproducible attested training.
+--
+-- Run: ./rail_native run tools/ad/diff.rail
+
+type Expr = | Var i | Kst ci | Add a b | Sub a b | Mul a b | Div a b
+
+-- consts[0] = 0.0, consts[1] = 1.0, user constants at index >= 2.
+-- eval_into writes the result into out[0] and returns 0. Operands are read back via
+-- float_arr_get (unambiguously float), so arithmetic compiles to fadd/fmul without relying
+-- on cross-function float-return inference (which fails for a recursive float-returning fn:
+-- `eval a + eval b` would see eval as non-float -> _rail_add derefs the bits as a pointer).
+eval_into e inputs consts out = match e
+  | Var i -> float_arr_set out 0 (float_arr_get inputs i)
+  | Kst ci -> float_arr_set out 0 (float_arr_get consts ci)
+  | Add a b ->
+      let oa = float_arr_new 1 0.0
+      let ob = float_arr_new 1 0.0
+      let _ = eval_into a inputs consts oa
+      let _ = eval_into b inputs consts ob
+      float_arr_set out 0 (float_arr_get oa 0 + float_arr_get ob 0)
+  | Sub a b ->
+      let oa = float_arr_new 1 0.0
+      let ob = float_arr_new 1 0.0
+      let _ = eval_into a inputs consts oa
+      let _ = eval_into b inputs consts ob
+      float_arr_set out 0 (float_arr_get oa 0 - float_arr_get ob 0)
+  | Mul a b ->
+      let oa = float_arr_new 1 0.0
+      let ob = float_arr_new 1 0.0
+      let _ = eval_into a inputs consts oa
+      let _ = eval_into b inputs consts ob
+      float_arr_set out 0 (float_arr_get oa 0 * float_arr_get ob 0)
+  | Div a b ->
+      let oa = float_arr_new 1 0.0
+      let ob = float_arr_new 1 0.0
+      let _ = eval_into a inputs consts oa
+      let _ = eval_into b inputs consts ob
+      float_arr_set out 0 (float_arr_get oa 0 / float_arr_get ob 0)
+
+eval e inputs consts =
+  let out = float_arr_new 1 0.0
+  let _ = eval_into e inputs consts out
+  float_arr_get out 0
+
+-- symbolic derivative wrt input i; returns a new Expr (no floats involved).
+diff e i = match e
+  | Var j -> if j == i then Kst 1 else Kst 0
+  | Kst ci -> Kst 0
+  | Add a b -> Add (diff a i) (diff b i)
+  | Sub a b -> Sub (diff a i) (diff b i)
+  | Mul a b -> Add (Mul (diff a i) b) (Mul a (diff b i))
+  | Div a b -> Div (Sub (Mul (diff a i) b) (Mul a (diff b i))) (Mul b b)
+
+show_expr e = match e
+  | Var i -> cat ["x", show i]
+  | Kst ci -> cat ["k", show ci]
+  | Add a b -> cat ["(", show_expr a, " + ", show_expr b, ")"]
+  | Sub a b -> cat ["(", show_expr a, " - ", show_expr b, ")"]
+  | Mul a b -> cat ["(", show_expr a, " * ", show_expr b, ")"]
+  | Div a b -> cat ["(", show_expr a, " / ", show_expr b, ")"]
+
+-- central finite-difference of the original expression wrt input i.
+num_grad e inputs consts i =
+  let h = 0.0001
+  let x0 = float_arr_get inputs i
+  let _ = float_arr_set inputs i (x0 + h)
+  let fp = eval e inputs consts
+  let _ = float_arr_set inputs i (x0 - h)
+  let fm = eval e inputs consts
+  let _ = float_arr_set inputs i x0
+  (fp - fm) / (2.0 * h)
+
+main =
+  let _ = print "=== Pillar 3 (first cut): source-to-source AD on an Expr DSL ==="
+  -- f(x0,x1) = x0*x1 + x0*x0   =>   df/dx0 = x1 + 2*x0,  df/dx1 = x0
+  let f = Add (Mul (Var 0) (Var 1)) (Mul (Var 0) (Var 0))
+  let inputs = float_arr_new 2 0.0
+  let _ = float_arr_set inputs 0 2.0
+  let _ = float_arr_set inputs 1 3.0
+  let consts = float_arr_new 2 0.0
+  let _ = float_arr_set consts 0 0.0
+  let _ = float_arr_set consts 1 1.0
+  let _ = print (cat ["f       = ", show_expr f])
+  let _ = print (cat ["f(2,3)  = ", show_float (eval f inputs consts), "   (expect 10)"])
+  -- the gradient EXPRESSIONS (themselves programs):
+  let g0 = diff f 0
+  let g1 = diff f 1
+  let _ = print (cat ["df/dx0  = ", show_expr g0])
+  let _ = print (cat ["df/dx1  = ", show_expr g1])
+  -- validate symbolic-AD eval vs numerical finite-difference:
+  -- validate symbolic-AD eval vs numerical finite-difference (locals, not float params):
+  let s0 = eval g0 inputs consts
+  let n0 = num_grad f inputs consts 0
+  let d0r = s0 - n0
+  let d0 = if d0r < 0.0 then 0.0 - d0r else d0r
+  let _ = print (cat ["df/dx0  symbolic=", show_float s0, "  numerical=", show_float n0, "  |d|=", show_float d0, (if d0 < 0.0001 then "  PASS" else "  FAIL")])
+  let s1 = eval g1 inputs consts
+  let n1 = num_grad f inputs consts 1
+  let d1r = s1 - n1
+  let d1 = if d1r < 0.0 then 0.0 - d1r else d1r
+  let _ = print (cat ["df/dx1  symbolic=", show_float s1, "  numerical=", show_float n1, "  |d|=", show_float d1, (if d1 < 0.0001 then "  PASS" else "  FAIL")])
+  -- determinism: same inputs => bit-identical gradient (fixed eval order).
+  let r1 = eval g0 inputs consts
+  let r2 = eval g0 inputs consts
+  let _ = print (cat ["determinism: eval(df/dx0) twice equal = ", if r1 == r2 then "YES (reproducible)" else "NO"])
+  0
