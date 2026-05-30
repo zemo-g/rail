@@ -15,7 +15,7 @@ language-level expression of "physicify"; the substrate for PAOS.
 |---|---|---|
 | **P1** Attestation ledger | append-only, Ed25519-signed, hash-chained ledger over the v1 attestations | **LANDED** `tools/attest/attest_chain.rail` — selfhost/append/verify + `selfcheck` (PROVEN byte-identical fixed point). offline/local-key |
 | **P2** `auth` types | authenticated data structures (λ• model): a value carrying proof of its derivation | **LANDED** Stage A `tools/auth/authkit.rail` (Merkle: prove / verify-from-root-only / tamper-reject) |
-| **P3** Attested numerics | source-to-source AD; the gradient is itself a re-runnable Rail program | **LANDED** first cut `tools/ad/diff.rail` (Expr→Expr AD; validated vs numerical ~1e-11; deterministic; **2nd-order AD free**) |
+| **P3** Attested numerics | source-to-source AD; the gradient is itself a re-runnable Rail program | **LANDED** first cut `tools/ad/diff.rail` (Expr→Expr AD; validated vs numerical ~1e-11; deterministic; **2nd-order AD free**; AD-driven gradient descent converges to the minimum) |
 | **Demo** | a computation that proves itself (compose P1+P2+P3) | **GREEN** `tools/verifiable_selftest.sh` (deterministic P3 result → P1 chain → verify) |
 
 ## How to run
