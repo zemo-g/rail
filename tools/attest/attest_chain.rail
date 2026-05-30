@@ -1,0 +1,191 @@
+-- tools/attest/attest_chain.rail — append-only, hash-chained attestation ledger.
+--
+-- A SEPARATE chaining layer over the existing per-artifact attestations: it does
+-- NOT modify attest.rail / verify.rail / the Pi signer. Each entry is a one-line
+-- record, Ed25519-signed and linked to the previous entry by `prev_hash`, so the
+-- whole sequence is tamper-evident and replayable by a pure-Rail verifier.
+--
+-- Canonical signed line:  chainv1|<seq>|<prev_hash>|<kind>|<entry_digest>|<ts>
+-- Ledger line:            <canonical> ## <sig_hex> ## <pubkey_hex>
+--
+-- Commands:
+--   selfhost        record sha256(tools/compile.rail) + sha256(rail_native), the
+--                   source<->binary binding of the self-hosting toolchain.
+--   append <file>   wrap any artifact (e.g. an existing *.attestation.json) as an entry.
+--   verify          walk the chain: every signature + every prev_hash link + seq order.
+--
+-- Config (env): CHAIN_FILE (default ~/.ledatic/witness/attest_chain.jsonl),
+--               CHAIN_KEY  (default ~/.ledatic/witness/chain_seed.hex; 64-hex Ed25519 seed).
+--
+-- SCOPE (first cut, deliberately offline): signs with a LOCAL key, no Pi/beacon/publish.
+-- FOLLOW-UPS (touch the live surface; do with care): (1) sign via the Pi witness instead
+-- of the local seed; (2) bind each entry to a real beacon pulse_id (replacing the wallclock
+-- `ts`); (3) publish the chain head at ledatic.org/attest/chain/; (4) `verify --deep` that
+-- re-runs `./rail_native self` and byte-compares to upgrade a `selfhost` entry's claim to a
+-- proven byte-identical fixed point.
+--
+-- Usage: ./rail_native run tools/attest/attest_chain.rail <selfhost|append <file>|verify>
+
+import "stdlib/sha256.rail"
+import "stdlib/x25519.rail"
+import "stdlib/sha512.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+import "stdlib/env.rail"
+
+-- ── small helpers ────────────────────────────────────────────────────
+acl_drop_ws cs =
+  if cs == [] then cs
+  else
+    let c = head cs
+    if c == "\n" then acl_drop_ws (tail cs)
+    else if c == "\r" then acl_drop_ws (tail cs)
+    else if c == " " then acl_drop_ws (tail cs)
+    else if c == "\t" then acl_drop_ws (tail cs)
+    else cs
+
+trim_trailing s = join "" (reverse (acl_drop_ws (reverse (chars s))))
+
+env_or key fallback =
+  let v = getenv key
+  if length (chars v) == 0 then fallback else v
+
+acl_home _ = getenv "HOME"
+chain_file_path _ = env_or "CHAIN_FILE" (cat [acl_home 0, "/.ledatic/witness/attest_chain.jsonl"])
+seed_path _ = env_or "CHAIN_KEY" (cat [acl_home 0, "/.ledatic/witness/chain_seed.hex"])
+load_seed _ = hex_to_bytes (trim_trailing (read_file (seed_path 0)))
+
+-- ── sha256 hex over a file's raw bytes (NUL-safe; same pattern as attest.rail) ──
+sha256_hex_file path =
+  let bytes = read_file_bytes path
+  let n = arr_len bytes
+  let h = sha256_h_init 0
+  let k_tbl = sha256_k_table 0
+  let state = arr_new 8 0
+  let end = sha_process_from bytes n h state k_tbl 0
+  let _ = sha_final_block bytes n h state k_tbl end
+  let out = arr_new 32 0
+  let _ = be32_write out 0 (arr_get h 0)
+  let _ = be32_write out 4 (arr_get h 1)
+  let _ = be32_write out 8 (arr_get h 2)
+  let _ = be32_write out 12 (arr_get h 3)
+  let _ = be32_write out 16 (arr_get h 4)
+  let _ = be32_write out 20 (arr_get h 5)
+  let _ = be32_write out 24 (arr_get h 6)
+  let _ = be32_write out 28 (arr_get h 7)
+  bytes_to_hex out 32
+
+-- ── canonical line + signing ─────────────────────────────────────────
+canon seq prev_hash kind entry_digest ts =
+  cat ["chainv1|", show seq, "|", prev_hash, "|", kind, "|", entry_digest, "|", ts]
+
+sign_hex seed msg =
+  let mb = string_to_bytes msg
+  let ml = string_length_bytes msg
+  bytes_to_hex (ed25519_sign seed mb ml) 64
+
+verify_msg pk_bytes msg sig_hex =
+  let mb = string_to_bytes msg
+  let ml = string_length_bytes msg
+  ed25519_verify pk_bytes mb ml (hex_to_bytes sig_hex)
+
+entry_line seq prev_hash kind entry_digest ts seed pk_hex =
+  let msg = canon seq prev_hash kind entry_digest ts
+  cat [msg, " ## ", sign_hex seed msg, " ## ", pk_hex]
+
+canon_of line = head (str_split " ## " line)
+
+-- ── chain persistence ────────────────────────────────────────────────
+acl_drop_empty lines =
+  if lines == [] then []
+  else
+    let l = head lines
+    if length (chars l) == 0 then acl_drop_empty (tail lines)
+    else cons l (acl_drop_empty (tail lines))
+
+read_chain _ = acl_drop_empty (str_split "\n" (read_file (chain_file_path 0)))
+
+acl_last xs = head (reverse xs)
+acl_snoc xs x = reverse (cons x (reverse xs))
+
+now_ts _ = trim_trailing (shell "date -u +%s")
+
+append_entry kind entry_digest =
+  let cf = chain_file_path 0
+  let _ = shell (cat ["mkdir -p $(dirname ", cf, ") && touch ", cf])
+  let lines = read_chain 0
+  let seq = length lines
+  let prev = if lines == [] then "genesis" else sha256_hex (canon_of (acl_last lines))
+  let seed = load_seed 0
+  let pk_hex = bytes_to_hex (ed25519_pk_from_sk seed) 32
+  let line = entry_line seq prev kind entry_digest (now_ts 0) seed pk_hex
+  let _ = write_file cf (cat [join "\n" (acl_snoc lines line), "\n"])
+  let _ = print (cat ["appended  seq=", show seq, "  kind=", kind, "  -> ", cf])
+  0
+
+-- ── verify-chain walk (pure Rail) ────────────────────────────────────
+verify_walk lines expected_prev expected_seq =
+  if lines == [] then 1
+  else
+    let line = head lines
+    let parts = str_split " ## " line
+    let msg = head parts
+    let sig_hex = head (tail parts)
+    let pk_hex = head (tail (tail parts))
+    let fields = str_split "|" msg
+    let seq_s = head (tail fields)
+    let prev_h = head (tail (tail fields))
+    let kind = head (tail (tail (tail fields)))
+    let sig_ok = verify_msg (hex_to_bytes pk_hex) msg sig_hex
+    if sig_ok != 1 then
+      let _ = print (cat ["  seq ", seq_s, "  BAD signature"])
+      0
+    else if prev_h != expected_prev then
+      let _ = print (cat ["  seq ", seq_s, "  BAD prev_hash link (chain broken)"])
+      0
+    else if seq_s != show expected_seq then
+      let _ = print (cat ["  seq ", seq_s, "  BAD seq (want ", show expected_seq, ")"])
+      0
+    else
+      let _ = print (cat ["  seq ", seq_s, "  ok  (", kind, ")"])
+      verify_walk (tail lines) (sha256_hex msg) (expected_seq + 1)
+
+-- ── commands ─────────────────────────────────────────────────────────
+cmd_selfhost _ =
+  let src_h = sha256_hex_file "tools/compile.rail"
+  let bin_h = sha256_hex_file "rail_native"
+  let _ = print (cat ["compile.rail sha256 = ", src_h])
+  let _ = print (cat ["rail_native  sha256 = ", bin_h])
+  append_entry "selfhost" (sha256_hex (cat ["selfhost|", src_h, "|", bin_h]))
+
+cmd_append path = append_entry "artifact" (sha256_hex_file path)
+
+cmd_verify _ =
+  let lines = read_chain 0
+  if lines == [] then
+    let _ = print "chain empty"
+    0
+  else
+    let ok = verify_walk lines "genesis" 0
+    let _ = print (cat ["chain valid: ", (if ok == 1 then "YES" else "NO"), "  (", show (length lines), " entries)"])
+    if ok == 1 then 0 else 1
+
+main =
+  let ua = tail args
+  if length ua < 1 then
+    let _ = print "usage: attest_chain.rail <selfhost | append <file> | verify>"
+    2
+  else
+    let cmd = head ua
+    if cmd == "selfhost" then cmd_selfhost 0
+    else if cmd == "append" then
+      if length ua < 2 then
+        let _ = print "usage: attest_chain.rail append <file>"
+        2
+      else cmd_append (head (tail ua))
+    else if cmd == "verify" then cmd_verify 0
+    else
+      let _ = print (cat ["unknown command: ", cmd])
+      2
