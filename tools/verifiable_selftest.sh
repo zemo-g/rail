@@ -27,6 +27,17 @@ echo "================ P3: source-to-source AD (gradient is a program) =========
 "$RN" run tools/ad/diff.rail > "$WORK/p3.txt" 2>&1 || fail=1
 tail -4 "$WORK/p3.txt"
 
+echo "================ SWARM EXTENSIONS ================"
+echo "-- P3 reverse-mode AD (revad) --"
+"$RN" run tools/ad/revad.rail > "$WORK/revad.txt" 2>&1 || fail=1
+grep -E "RESULT" "$WORK/revad.txt" | tail -1
+echo "-- P2 authenticated dictionary --"
+"$RN" run tools/auth/authdict.rail > "$WORK/authdict.txt" 2>&1 || fail=1
+grep -E "clean" "$WORK/authdict.txt" | tail -1
+echo "-- P1 beacon-anchored ledger (selftest) --"
+"$RN" run tools/attest/attest_chain_beacon.rail selftest > "$WORK/beacon.txt" 2>&1 || fail=1
+grep -E "SELFTEST" "$WORK/beacon.txt" | tail -1
+
 echo "================ COMPOSE: a computation that proves itself ================"
 echo "  recording the deterministic P3 computation into the attestation chain..."
 "$RN" run tools/attest/attest_chain.rail append "$WORK/p3.txt" > "$WORK/c1.txt" 2>&1 || fail=1

@@ -1,0 +1,337 @@
+-- tools/attest/attest_chain_beacon.rail — append-only, hash-chained attestation
+-- ledger with BEACON-PULSE ANCHORING.
+--
+-- A self-contained sibling of attest_chain.rail. The crypto + ledger logic is
+-- COPIED here (no import of the reference file) so this tool stands alone. The
+-- addition over the base ledger: each entry carries a `pulse_id` (and `value_hex`)
+-- and the `verify` walk ALSO enforces pulse-id monotonicity — a chain entry can
+-- never claim an EARLIER pulse than its predecessor. That binds the chain to a
+-- tamper-evident external clock (the entropy beacon) without trusting wallclock.
+--
+-- Canonical signed line (pulse_id + value_hex are INSIDE the signature):
+--   chainv1b|<seq>|<prev_hash>|<kind>|<entry_digest>|<pulse_id>|<value_hex>
+-- Ledger line:
+--   <canonical> ## <sig_hex> ## <pubkey_hex>
+--
+-- OFFLINE BY CONSTRUCTION. No network, no Pi, no real beacon fetch. The pulse
+-- source is PLUGGABLE with an offline default, resolved in this order:
+--   1. env PULSE_ID        (explicit integer pulse for this append)
+--   2. env PULSE_FILE      (path to a file whose trimmed contents = the pulse int)
+--   3. monotone counter    (previous entry's pulse + 1; genesis starts at 1)
+-- The matching value_hex (the beacon's value at that pulse) comes from env
+-- PULSE_VALUE_HEX if set, else a deterministic local stand-in sha256(pulse_id).
+-- Signing uses a LOCAL Ed25519 seed read from env CHAIN_KEY (64-hex), exactly
+-- like the reference spike — NOT the live Pi.
+--
+-- Config (env): CHAIN_FILE (default ~/.ledatic/witness/attest_chain_beacon.jsonl)
+--               CHAIN_KEY  (default ~/.ledatic/witness/chain_seed.hex; 64-hex seed)
+--               PULSE_ID / PULSE_FILE / PULSE_VALUE_HEX  (pluggable offline pulse)
+--
+-- Commands:
+--   selfhost          record sha256(tools/compile.rail)+sha256(rail_native), anchored
+--   append <file>     wrap any artifact file as an entry, anchored to the pulse
+--   verify            walk: every sig + every prev_hash link + seq + PULSE MONOTONICITY
+--   selftest          fully-offline end-to-end: build entries with increasing pulses,
+--                     verify PASS, then prove a tampered entry AND a forged/non-monotone
+--                     pulse are REJECTED. Zero network. (no CHAIN_KEY env needed)
+--
+-- Usage: ./rail_native run tools/attest/attest_chain_beacon.rail <selftest|verify|selfhost|append <file>>
+
+import "stdlib/sha256.rail"
+import "stdlib/x25519.rail"
+import "stdlib/sha512.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+import "stdlib/env.rail"
+
+-- ── small helpers (acb_ prefix: avoid duplicate-symbol link failures) ────
+acb_drop_ws cs =
+  if cs == [] then cs
+  else
+    let c = head cs
+    if c == "\n" then acb_drop_ws (tail cs)
+    else if c == "\r" then acb_drop_ws (tail cs)
+    else if c == " " then acb_drop_ws (tail cs)
+    else if c == "\t" then acb_drop_ws (tail cs)
+    else cs
+
+acb_trim s = join "" (reverse (acb_drop_ws (reverse (chars s))))
+
+acb_env_or key fallback =
+  let v = getenv key
+  if (chars v) == [] then fallback else v
+
+acb_home _ = getenv "HOME"
+acb_chain_file _ = acb_env_or "CHAIN_FILE" (cat [acb_home 0, "/.ledatic/witness/attest_chain_beacon.jsonl"])
+acb_seed_path _ = acb_env_or "CHAIN_KEY" (cat [acb_home 0, "/.ledatic/witness/chain_seed.hex"])
+acb_load_seed _ = hex_to_bytes (acb_trim (read_file (acb_seed_path 0)))
+
+-- ── string -> int (Rail to_int is float-only; walk chars) ────────────────
+acb_digit c =
+  if c == "0" then 0 else if c == "1" then 1 else if c == "2" then 2
+  else if c == "3" then 3 else if c == "4" then 4 else if c == "5" then 5
+  else if c == "6" then 6 else if c == "7" then 7 else if c == "8" then 8
+  else if c == "9" then 9 else 0-1
+
+acb_pint_go cs acc =
+  if cs == [] then acc
+  else
+    let d = acb_digit (head cs)
+    if d < 0 then acc
+    else acb_pint_go (tail cs) (acc * 10 + d)
+
+-- parse a non-negative int from a (possibly whitespace-padded) string; -1 on empty
+acb_parse_int s =
+  let t = acb_trim s
+  if (chars t) == [] then 0-1 else acb_pint_go (chars t) 0
+
+-- ── sha256 hex over a file's raw bytes (NUL-safe; same pattern as attest.rail) ──
+acb_sha256_file path =
+  let bytes = read_file_bytes path
+  let n = arr_len bytes
+  let h = sha256_h_init 0
+  let k_tbl = sha256_k_table 0
+  let state = arr_new 8 0
+  let end = sha_process_from bytes n h state k_tbl 0
+  let _ = sha_final_block bytes n h state k_tbl end
+  let out = arr_new 32 0
+  let _ = be32_write out 0 (arr_get h 0)
+  let _ = be32_write out 4 (arr_get h 1)
+  let _ = be32_write out 8 (arr_get h 2)
+  let _ = be32_write out 12 (arr_get h 3)
+  let _ = be32_write out 16 (arr_get h 4)
+  let _ = be32_write out 20 (arr_get h 5)
+  let _ = be32_write out 24 (arr_get h 6)
+  let _ = be32_write out 28 (arr_get h 7)
+  bytes_to_hex out 32
+
+-- ── canonical line + signing (pulse_id + value_hex are signed) ───────────
+acb_canon seq prev_hash kind entry_digest pulse_id value_hex =
+  cat ["chainv1b|", show seq, "|", prev_hash, "|", kind, "|", entry_digest, "|", show pulse_id, "|", value_hex]
+
+acb_sign_hex seed msg =
+  let mb = string_to_bytes msg
+  let ml = string_length_bytes msg
+  bytes_to_hex (ed25519_sign seed mb ml) 64
+
+acb_verify_msg pk_bytes msg sig_hex =
+  let mb = string_to_bytes msg
+  let ml = string_length_bytes msg
+  ed25519_verify pk_bytes mb ml (hex_to_bytes sig_hex)
+
+acb_entry_line seq prev_hash kind entry_digest pulse_id value_hex seed pk_hex =
+  let msg = acb_canon seq prev_hash kind entry_digest pulse_id value_hex
+  cat [msg, " ## ", acb_sign_hex seed msg, " ## ", pk_hex]
+
+acb_canon_of line = head (str_split " ## " line)
+
+-- ── chain persistence ────────────────────────────────────────────────────
+acb_drop_empty lines =
+  if lines == [] then []
+  else
+    let l = head lines
+    if (chars l) == [] then acb_drop_empty (tail lines)
+    else cons l (acb_drop_empty (tail lines))
+
+acb_read_chain _ = acb_drop_empty (str_split "\n" (read_file (acb_chain_file 0)))
+
+acb_last xs = head (reverse xs)
+acb_snoc xs x = reverse (cons x (reverse xs))
+
+-- drop first n elements (no stdlib/list import here, so define our own)
+acb_drop n xs =
+  if n <= 0 then xs
+  else if xs == [] then []
+  else acb_drop (n - 1) (tail xs)
+
+-- field extraction from a canonical msg: chainv1b|seq|prev|kind|digest|pulse|value
+acb_field msg i = head (acb_drop i (str_split "|" msg))
+acb_msg_pulse msg = acb_parse_int (acb_field msg 5)
+
+-- previous pulse for the monotone-counter default; genesis -> 0
+acb_prev_pulse lines =
+  if lines == [] then 0
+  else acb_msg_pulse (acb_canon_of (acb_last lines))
+
+-- ── pluggable OFFLINE pulse source ───────────────────────────────────────
+-- precedence: PULSE_ID env > PULSE_FILE env > monotone (prev+1)
+acb_resolve_pulse lines =
+  let pe = getenv "PULSE_ID"
+  if (chars pe) != [] then acb_parse_int pe
+  else
+    let pf = getenv "PULSE_FILE"
+    if (chars pf) != [] then acb_parse_int (read_file pf)
+    else (acb_prev_pulse lines) + 1
+
+-- value_hex at the pulse: PULSE_VALUE_HEX env, else deterministic local stand-in
+acb_resolve_value pulse_id =
+  let ve = getenv "PULSE_VALUE_HEX"
+  if (chars ve) != [] then acb_trim ve
+  else sha256_hex (cat ["pulse|", show pulse_id])
+
+acb_append_entry kind entry_digest =
+  let cf = acb_chain_file 0
+  let _ = shell (cat ["mkdir -p $(dirname ", cf, ") && touch ", cf])
+  let lines = acb_read_chain 0
+  let seq = length lines
+  let prev = if lines == [] then "genesis" else sha256_hex (acb_canon_of (acb_last lines))
+  let pulse_id = acb_resolve_pulse lines
+  let prev_pulse = acb_prev_pulse lines
+  if pulse_id < prev_pulse then
+    let _ = print (cat ["REFUSED: pulse ", show pulse_id, " < previous ", show prev_pulse, " (would break monotonicity)"])
+    1
+  else
+    let value_hex = acb_resolve_value pulse_id
+    let seed = acb_load_seed 0
+    let pk_hex = bytes_to_hex (ed25519_pk_from_sk seed) 32
+    let line = acb_entry_line seq prev kind entry_digest pulse_id value_hex seed pk_hex
+    let _ = write_file cf (cat [join "\n" (acb_snoc lines line), "\n"])
+    let _ = print (cat ["appended  seq=", show seq, "  kind=", kind, "  pulse=", show pulse_id, "  -> ", cf])
+    0
+
+-- ── verify-chain walk (pure Rail) — sig + prev_hash + seq + PULSE MONOTONICITY ──
+acb_walk lines expected_prev expected_seq prev_pulse =
+  if lines == [] then 1
+  else
+    let line = head lines
+    let parts = str_split " ## " line
+    let msg = head parts
+    let sig_hex = head (tail parts)
+    let pk_hex = head (tail (tail parts))
+    let seq_s = acb_field msg 1
+    let prev_h = acb_field msg 2
+    let kind = acb_field msg 3
+    let pulse = acb_msg_pulse msg
+    let sig_ok = acb_verify_msg (hex_to_bytes pk_hex) msg sig_hex
+    if sig_ok != 1 then
+      let _ = print (cat ["  seq ", seq_s, "  BAD signature"])
+      0
+    else if prev_h != expected_prev then
+      let _ = print (cat ["  seq ", seq_s, "  BAD prev_hash link (chain broken)"])
+      0
+    else if seq_s != show expected_seq then
+      let _ = print (cat ["  seq ", seq_s, "  BAD seq (want ", show expected_seq, ")"])
+      0
+    else if pulse < prev_pulse then
+      let _ = print (cat ["  seq ", seq_s, "  BAD pulse ", show pulse, " < prev ", show prev_pulse, " (non-monotone)"])
+      0
+    else
+      let _ = print (cat ["  seq ", seq_s, "  ok  (", kind, ", pulse=", show pulse, ")"])
+      acb_walk (tail lines) (sha256_hex msg) (expected_seq + 1) pulse
+
+acb_verify_lines lines =
+  if lines == [] then
+    let _ = print "chain empty"
+    0
+  else
+    let ok = acb_walk lines "genesis" 0 0
+    let _ = print (cat ["chain valid: ", (if ok == 1 then "YES" else "NO"), "  (", show (length lines), " entries)"])
+    ok
+
+-- ── commands ───────────────────────────────────────────────────────────
+acb_cmd_selfhost _ =
+  let src_h = acb_sha256_file "tools/compile.rail"
+  let bin_h = acb_sha256_file "rail_native"
+  let _ = print (cat ["compile.rail sha256 = ", src_h])
+  let _ = print (cat ["rail_native  sha256 = ", bin_h])
+  acb_append_entry "selfhost-fixedpoint" (sha256_hex (cat ["selfhost|", src_h, "|", bin_h]))
+
+acb_cmd_append path = acb_append_entry "artifact" (acb_sha256_file path)
+
+acb_cmd_verify _ =
+  let ok = acb_verify_lines (acb_read_chain 0)
+  if ok == 1 then 0 else 1
+
+-- ── selftest: fully offline, deterministic, zero network ────────────────
+-- Builds a 3-entry chain in-memory with increasing pulses, signs with a local
+-- throwaway seed, then proves: (A) honest chain verifies, (B) tampered entry is
+-- rejected, (C) a forged earlier pulse on the last entry is rejected.
+
+-- build the honest chain as a list of ledger lines
+acb_st_build seed pk_hex =
+  let m0 = acb_canon 0 "genesis" "test-run" (sha256_hex "evidence-0") 100 (sha256_hex "v100")
+  let l0 = cat [m0, " ## ", acb_sign_hex seed m0, " ## ", pk_hex]
+  let p1 = sha256_hex m0
+  let m1 = acb_canon 1 p1 "artifact" (sha256_hex "evidence-1") 250 (sha256_hex "v250")
+  let l1 = cat [m1, " ## ", acb_sign_hex seed m1, " ## ", pk_hex]
+  let p2 = sha256_hex m1
+  let m2 = acb_canon 2 p2 "selfhost-fixedpoint" (sha256_hex "evidence-2") 999 (sha256_hex "v999")
+  let l2 = cat [m2, " ## ", acb_sign_hex seed m2, " ## ", pk_hex]
+  [l0, l1, l2]
+
+-- re-sign a canonical msg with the seed (used to forge a "validly signed" but
+-- non-monotone entry, proving monotonicity is enforced INDEPENDENTLY of the sig)
+acb_st_resign seed pk_hex msg = cat [msg, " ## ", acb_sign_hex seed msg, " ## ", pk_hex]
+
+acb_st_expect label want got =
+  if want == got then
+    let _ = print (cat ["  PASS  ", label])
+    0
+  else
+    let _ = print (cat ["  FAIL  ", label, "  (wanted ", show want, " got ", show got, ")"])
+    1
+
+acb_cmd_selftest _ =
+  -- canonical RFC8032 test seed (32 bytes); deterministic + offline
+  let seed2 = hex_to_bytes "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+  let pk_hex = bytes_to_hex (ed25519_pk_from_sk seed2) 32
+  let _ = print (cat ["selftest: local seed pubkey = ", pk_hex])
+  let chain = acb_st_build seed2 pk_hex
+  -- (1) honest chain: must verify YES
+  let _ = print "[1] honest chain (increasing pulses 100<250<999):"
+  let ok_honest = acb_verify_lines chain
+  let f1 = acb_st_expect "honest chain verifies" 1 ok_honest
+  -- (2) tamper: flip the entry_digest of seq 1 WITHOUT re-signing -> BAD signature
+  let _ = print "[2] tampered entry (seq1 digest altered, sig stale):"
+  let bad_m1 = acb_canon 1 (sha256_hex (head chain)) "artifact" (sha256_hex "EVIDENCE-TAMPERED") 250 (sha256_hex "v250")
+  let stale_sig = head (tail (str_split " ## " (head (tail chain))))
+  let tampered_l1 = cat [bad_m1, " ## ", stale_sig, " ## ", pk_hex]
+  let tampered = [head chain, tampered_l1, head (tail (tail chain))]
+  let ok_tampered = acb_verify_lines tampered
+  let f2 = acb_st_expect "tampered chain REJECTED" 0 ok_tampered
+  -- (3) forged non-monotone pulse: seq2 claims pulse 50 (< 250), VALIDLY re-signed.
+  --     Sig passes, but pulse-monotonicity must still reject it.
+  let _ = print "[3] forged non-monotone pulse (seq2 pulse 50 < 250, re-signed valid, prev_hash CORRECT):"
+  -- prev_hash must hash the previous CANONICAL message (not the full ledger line),
+  -- so the link is intact and the ONLY defect left is the non-monotone pulse.
+  let p2 = sha256_hex (acb_canon_of (head (tail chain)))
+  let forged_m2 = acb_canon 2 p2 "selfhost-fixedpoint" (sha256_hex "evidence-2") 50 (sha256_hex "v50")
+  let forged_l2 = acb_st_resign seed2 pk_hex forged_m2
+  let forged = [head chain, head (tail chain), forged_l2]
+  let ok_forged = acb_verify_lines forged
+  let f3 = acb_st_expect "non-monotone pulse REJECTED (despite valid sig)" 0 ok_forged
+  -- (4) sanity: confirm the forged entry's signature ALONE is valid (isolates the
+  --     monotonicity check as the thing that rejected it)
+  let _ = print "[4] confirm forged entry's signature is itself valid:"
+  let fsig = head (tail (str_split " ## " forged_l2))
+  let sig_alone = acb_verify_msg (hex_to_bytes pk_hex) forged_m2 fsig
+  let f4 = acb_st_expect "forged-entry signature valid (so only pulse-check rejects)" 1 sig_alone
+  let _ = print ""
+  let fails = f1 + f2 + f3 + f4
+  if fails == 0 then
+    let _ = print "SELFTEST: PASS  (honest verifies; tamper + non-monotone pulse both rejected; offline)"
+    0
+  else
+    let _ = print (cat ["SELFTEST: FAIL  (", show fails, " checks failed)"])
+    1
+
+main =
+  let ua = tail args
+  if length ua < 1 then
+    let _ = print "usage: attest_chain_beacon.rail <selftest | verify | selfhost | append <file>>"
+    2
+  else
+    let cmd = head ua
+    if cmd == "selftest" then acb_cmd_selftest 0
+    else if cmd == "verify" then acb_cmd_verify 0
+    else if cmd == "selfhost" then acb_cmd_selfhost 0
+    else if cmd == "append" then
+      if length ua < 2 then
+        let _ = print "usage: attest_chain_beacon.rail append <file>"
+        2
+      else acb_cmd_append (head (tail ua))
+    else
+      let _ = print (cat ["unknown command: ", cmd])
+      2
