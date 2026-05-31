@@ -1,8 +1,56 @@
 # HANDOFF — Increment B: float-result recognition (joint inference fixpoint)
 
+## RESOLVED by `4cf64de` — executed + independently verified 2026-05-31
+
+**This handoff is complete. Do not re-implement.** It is kept below as the historical
+diagnosis record. The task was executed in a fresh session, then independently re-verified
+from source by a separate (history-carrying) session.
+
+**What actually landed — smaller than this doc feared.** The "high-risk joint inference
+fixpoint" was NOT required for the DoD repro. Phase-0 diagnosis showed Increment A
+(call-site agreement) was already in place, so the only missing link was *let-local
+propagation*. The realized fix is **2 additive edits** (`tools/compile.rail`):
+- new helper `argf_scan_d` threads a `__vf_<name>` marker into the rmap when a let-bound
+  value is provably float (`infer_ty == 2`);
+- `infer_ty`'s "V" case reads that marker, so a bare local contributes FLOAT(2), not UNKNOWN(0).
+
+Float seeds up the relu→neuron→mlp chain purely through `ty_lub(0,2)=2` (relu's `0.0`
+literal): `__ret_mlp==2` → `y` earns `__vf_` → `mse y 1.0` marks `pred` `__float_` → `d*d`
+takes the float-mul path. The two-pass `returns_float`/`collect_float_ret_fns` machinery was
+left **untouched** — no §2.3 swap, no union fallback. The fix is strictly additive and inert
+for int code (diff-fuzzer grammar unaffected).
+
+**Independent verification (reproduced from source in a throwaway worktree — not trusted):**
+
+| Gate | Result |
+|---|---|
+| Full test suite | **146/146** (exit 0) |
+| `mse y 1.0` (DoD repro) | **0.015625** |
+| `examples/mlp_natural.rail` | `1.125 / 0.375 / 0 / 2.75` (no regression) |
+| diff-fuzzer `--seed=42 --n=20` | `20 agree / 0 divergence` |
+| **Byte-identical fixed point** | committed binary self-compiles to itself; SHA-256 `b5e357706114f2106fece1e87a1b105528d9d0d5b4cf0f8cf0ac9bb751de3df1` identical on both sides |
+| Regression-lock (`t140` is real) | parent `bec321f`, identical source → `5.30782934581719e+36` garbage; `4cf64de` → `0.015625` |
+| Memory honesty | thesis/trap/index updated, scoped to let-local compose, explicitly note recursive-return + union-fallback were NOT done, flag `unpushed` — no overclaim |
+
+**Verdict: correct and honest** — the scope claimed equals the scope delivered.
+
+**Still open (out of scope here, do NOT assume done):** the recursive-float-return + `show`-on-
+unboxed-float case (Phase 2 below) was deliberately not attempted; the joint fixpoint + param
+V-tweak are still the path if that is ever needed.
+
+**Finding carried forward:** the required-reading reference below,
+`notes/rail-compiler-phase-design.md` §2.8, does NOT exist on `feat/type-layer` — it lives on
+`feat/verifiable-language` (`337d66a`). Read it via
+`git show 337d66a:notes/rail-compiler-phase-design.md`. It did not block this fix (Phase-0
+diagnose-first found the smaller change empirically), but cross-branch handoff references
+should be co-located or made explicit next time.
+
+---
+
 **Written 2026-05-30 by the type-layer session. For a FRESH dedicated session.**
 This is a fixed-point-risky compiler-core change. It was deliberately NOT attempted at
-marathon-tail. Read this whole doc + `notes/rail-compiler-phase-design.md` §2.8 before editing.
+marathon-tail. Read this whole doc + `notes/rail-compiler-phase-design.md` §2.8 before editing
+(NOTE: that doc is on `feat/verifiable-language` @ `337d66a`, not this branch — see above).
 
 ---
 
