@@ -1,0 +1,176 @@
+-- tools/auth/authdict.rail — authenticated KEY->VALUE DICTIONARY, lambda-dot model (Pillar 2, Stage A).
+--
+-- Second instance of the authenticated-data-structure construction (companion to authkit.rail,
+-- which does Merkle membership). Here the structure is a SORTED binary search tree keyed by string:
+-- internal nodes carry a split key + the digests of their two subtrees; leaves carry (key, value).
+--
+-- The Prover holds the whole dict and emits a proof stream of shallow projections (each node with
+-- its children collapsed to their sub-digests). The Verifier holds ONLY the root digest + the proof
+-- and replays it: at every step it checks sha256(projection) == the running expected digest, follows
+-- the SAME key-driven BST navigation from the key embedded in the projection, and at the leaf binds
+-- the answer to the looked-up key. Forging a wrong value (or answering for a different key) requires
+-- a sha256 collision -> infeasible. The verifier's state is a single constant-size digest + a cursor.
+--
+-- Run: ./rail_native run tools/auth/authdict.rail
+import "stdlib/sha256.rail"
+
+-- Leaf holds a (key,value) entry; Node holds a split key and two sub-trees.
+-- Navigation rule: lookup_key < split_key  => go left, else go right.
+type Dict = | Leaf k v | Node k l r
+
+-- ── list helpers (mirrors authkit) ────────────────────────────────────
+snoc xs x = reverse (cons x (reverse xs))
+list_init xs = reverse (tail (reverse xs))
+drop_n n xs = if n == 0 then xs else (if xs == [] then xs else drop_n (n - 1) (tail xs))
+nth xs n = head (drop_n n xs)
+
+-- ── length-prefixed string encoding (collision-free framing) ──────────
+-- A raw "k:v"-style join is ambiguous if k or v contain the delimiter. Length-prefixing makes the
+-- byte string that gets hashed unambiguous regardless of key/value contents: "<len>#<bytes>".
+enc s = cat [show (length (chars s)), "#", s]
+
+-- decode one "<len>#<rest...>" framed field at the FRONT of s; return (field, remainder).
+-- walk chars to find the '#' that terminates the decimal length, then str_sub the body out.
+hash_pos s i = if str_sub s i 1 == "#" then i else hash_pos s (i + 1)
+parse_dec s i acc =
+  if str_sub s i 1 == "#" then (acc, i)
+  else parse_dec s (i + 1) (acc * 10 + (char_to_int (nth (chars s) i) - 48))
+dec_one s =
+  let pr = parse_dec s 0 0
+  let (n, hp) = pr
+  let body = str_sub s (hp + 1) n
+  let rest = str_sub s (hp + 1 + n) (length (chars s) - (hp + 1 + n))
+  (body, rest)
+
+-- ── shallow projections ───────────────────────────────────────────────
+-- Leaf:  "L|" ++ enc(key) ++ enc(value)              (both length-prefixed, so unambiguous)
+-- Node:  "N|" ++ enc(splitkey) ++ ":" ++ digest(l) ++ ":" ++ digest(r)
+--        (the two digests are fixed 64-char hex, so splitting the tail on ':' is safe.)
+proj_of t = match t
+  | Leaf k v -> cat ["L|", enc k, enc v]
+  | Node k l r -> cat ["N|", enc k, ":", digest l, ":", digest r]
+
+digest t = sha256_hex (proj_of t)
+
+is_leaf pj = str_sub pj 0 2 == "L|"
+-- body of a leaf projection (after "L|") is enc(key) ++ enc(value): decode key, then value.
+leaf_key pj = let p = dec_one (str_sub pj 2 (length (chars pj) - 2)) in head_of2 p
+leaf_value pj =
+  let body = str_sub pj 2 (length (chars pj) - 2)
+  let kp = dec_one body
+  let (k, restv) = kp
+  let vp = dec_one restv
+  head_of2 vp
+head_of2 p = let (a, b) = p in a
+
+-- split key of a node projection (after "N|"): enc(key) ++ ":" ++ dl ++ ":" ++ dr.
+node_key pj = let p = dec_one (str_sub pj 2 (length (chars pj) - 2)) in head_of2 p
+
+-- ── lexicographic string comparison (own impl; no reliance on runtime str '<') ──
+-- returns true iff a < b. Walk shared prefix; shorter string is the smaller on a tie.
+str_lt_go a b i la lb =
+  if i == la then (if i == lb then false else true)        -- a exhausted: a<b iff b longer
+  else if i == lb then false                                -- b exhausted first: a>=b
+  else
+    let ca = char_to_int (nth (chars a) i)
+    let cb = char_to_int (nth (chars b) i)
+    if ca < cb then true
+    else if ca > cb then false
+    else str_lt_go a b (i + 1) la lb
+str_lt a b = str_lt_go a b 0 (length (chars a)) (length (chars b))
+str_eq a b = (str_lt a b == false) && (str_lt b a == false)
+
+-- ── PROVER: holds the full dict; emits a projection at each node it opens ──
+-- Returns (value, proof_list). value is "" with the proof still emitted if the key is absent at a leaf.
+prover_lookup t key proof = match t
+  | Leaf k v -> (v, snoc proof (cat ["L|", enc k, enc v]))
+  | Node k l r ->
+      let proof2 = snoc proof (cat ["N|", enc k, ":", digest l, ":", digest r])
+      if str_lt key k then prover_lookup l key proof2
+      else prover_lookup r key proof2
+
+-- ── VERIFIER: holds ONLY `expected` (the root digest) + the proof; checks each step ──
+-- Navigates using the key recovered from each node projection; binds the leaf key to `key`.
+verifier_lookup expected key proof =
+  if proof == [] then error "proof exhausted"
+  else
+    let pj = head proof
+    let rest = tail proof
+    if sha256_hex pj != expected then error "digest mismatch (tampered / wrong root)"
+    else if is_leaf pj then
+      -- the leaf must be FOR the key we asked about, else the proof authenticates a wrong entry.
+      if str_eq (leaf_key pj) key then leaf_value pj
+      else error "wrong key (proof authenticates a different entry)"
+    else
+      let parts = str_split ":" (str_sub pj 2 (length (chars pj) - 2))
+      -- parts[0] = enc(splitkey), parts[1] = dl, parts[2] = dr (digests are ':'-free hex)
+      let dl = nth parts 1
+      let dr = nth parts 2
+      if str_lt key (node_key pj) then verifier_lookup dl key rest
+      else verifier_lookup dr key rest
+
+-- ── presentation ───────────────────────────────────────────────────────
+print_proof proof =
+  if proof == [] then 0
+  else
+    let _ = print (cat ["    ", head proof])
+    print_proof (tail proof)
+
+show_result r =
+  if is_error r then cat ["REJECT (", err_msg r, ")"]
+  else cat ["accept value=", r]
+
+-- build a small sorted dict over keys apple<banana<cherry<date<fig (BST split keys chosen so
+-- the navigation rule lands each key at its own leaf):
+--            Node "cherry"
+--          /              \
+--    Node "banana"       Node "date"
+--    /        \          /        \
+-- Leaf apple Leaf banana Leaf cherry  Node "fig"
+--                                     /       \
+--                                Leaf date   Leaf fig
+build_dict =
+  let left = Node "banana" (Leaf "apple" "red-fruit") (Leaf "banana" "yellow-fruit")
+  let right_r = Node "fig" (Leaf "date" "brown-fruit") (Leaf "fig" "purple-fruit")
+  let right = Node "date" (Leaf "cherry" "small-red") right_r
+  Node "cherry" left right
+
+main =
+  let _ = print "=== Pillar 2 (Stage A): authenticated KEY->VALUE dictionary (sorted BST, lambda-dot) ==="
+  let t = build_dict
+  let root = digest t
+  let _ = print (cat ["dict root = ", root])
+
+  -- 1) CLEAN lookup of a present key -> correct value
+  let key = "cherry"
+  let res = prover_lookup t key []
+  let (val, proof) = res
+  let _ = print (cat ["PROVER: lookup '", key, "' -> value=", val, "  proof entries=", show (length proof)])
+  let _ = print_proof proof
+  let _ = print (cat ["VERIFIER (clean):       ", show_result (verifier_lookup root key proof)])
+
+  -- 2) TAMPERED proof: swap the leaf projection's value for a forgery, keep the root.
+  let kf = leaf_key (head (reverse proof))
+  let proof_bad = snoc (list_init proof) (cat ["L|", enc kf, enc "HACKED-VALUE"])
+  let _ = print (cat ["VERIFIER (tampered):    ", show_result (verifier_lookup root key proof_bad)])
+
+  -- 3) FORGED root: a made-up root digest is rejected at the very first step.
+  let _ = print (cat ["VERIFIER (forged root): ", show_result (verifier_lookup "deadbeefdeadbeef" key proof)])
+
+  -- 4) BONUS: a proof claiming a WRONG VALUE for the key. Ask for absent key "cherryz", which
+  --    navigates to the SAME leaf as "cherry" (cherry < cherryz < date). Every digest along the
+  --    path is genuine and matches the running root, so the sha256 chain PASSES end to end -- yet
+  --    the leaf carries key "cherry", not "cherryz". The leaf-key BINDING is what rejects it: the
+  --    verifier refuses to hand back a value the proof never authenticated for the requested key.
+  let absent = "cherryz"
+  let zres = prover_lookup t absent []
+  let (zval, zproof) = zres
+  let _ = print (cat ["PROVER: lookup absent '", absent, "' lands on leaf value=", zval,
+                      " (a value it must NOT be allowed to claim for that key)"])
+  let _ = print (cat ["VERIFIER (wrong-value/key binding): ", show_result (verifier_lookup root absent zproof)])
+
+  -- and a clean lookup of a DIFFERENT present key still works end-to-end:
+  let r2 = prover_lookup t "fig" []
+  let (v2, p2) = r2
+  let _ = print (cat ["VERIFIER (clean 'fig'): ", show_result (verifier_lookup root "fig" p2)])
+  0
