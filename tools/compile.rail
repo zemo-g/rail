@@ -482,17 +482,26 @@ pvariants ts idx =
   if ct ts == "bar" then
     let r = ad ts
     let (ctor, r2) = xp "id" r
-    let (arity, r3) = count_params r2
+    let (arity, authmask, r3) = count_params r2
     let r4 = sn r3
     let (rest, r5) = pvariants r4 (idx + 1)
-    (cons [ctor, idx, arity] rest, r5)
+    (cons [ctor, idx, arity, authmask] rest, r5)
   else ([], ts)
 
+-- count_params returns (arity, authmask, rest). authmask is a per-field 0/1 list
+-- (field-order, head = first field): 1 = the field was written `auth <type>`, an
+-- authenticated field whose `auth` modifier consumes the FOLLOWING type token and
+-- contributes ONE field. P2 Stage B reads authmask; B0 leaves it inert (no codegen
+-- consumes it yet, so an auth-typed ADT behaves exactly as a plain ADT).
 count_params ts =
   if ct ts == "id" then
-    let (n, r) = count_params (ad ts)
-    (n + 1, r)
-  else (0, ts)
+    if cv ts == "auth" then
+      let (n, m, r) = count_params (ad (ad ts))
+      (n + 1, cons 1 m, r)
+    else
+      let (n, m, r) = count_params (ad ts)
+      (n + 1, cons 0 m, r)
+  else (0, [], ts)
 
 count_foreign_params ts =
   if ct ts == "id" then
@@ -2648,6 +2657,295 @@ ctor_arities variants =
     let encoded = 0 - (100 + idx * 100 + arity)
     cons (name, encoded) (ctor_arities (tail variants))
 
+-- P2 Stage B / B1: auth-type projection synthesis.
+-- For every ADT whose definition uses the `auth` field modifier, synthesize a
+-- pair of functions reproducing the Stage A oracle (tools/auth/authkit.rail)
+-- byte-for-byte:
+--   proj_of_<TY> t = match t | Ctor f0 .. fn -> cat [<tag>, __auth_enc p0, ..]
+--   digest_<TY>  t = sha256_hex (proj_of_<TY> t)
+-- <tag> is the ctor's first char; each field piece is length-framed by __auth_enc
+-- (B4) so a payload containing ":" round-trips safely. An auth field (mask=1)
+-- contributes the child's digest `digest_<TY> fi`, a plain field (mask=0) its raw
+-- value. Inert for any
+-- program with no auth-typed ADT (collect_auth_types -> [] -> identity), so
+-- compile.rail (which declares no ADTs at all) self-compiles byte-identically.
+amask_has_one m =
+  if m == [] then false
+  else if head m == 1 then true
+  else amask_has_one (tail m)
+
+variants_have_auth vs =
+  if vs == [] then false
+  else
+    let v = head vs
+    let mask = head (tail (tail (tail v)))
+    if amask_has_one mask then true
+    else variants_have_auth (tail vs)
+
+-- Walk decls, collect [name, variants] for each ADT with at least one auth field.
+collect_auth_types decls =
+  if decls == [] then []
+  else
+    let d = head decls
+    if head d == "TY" then
+      let nm = head (tail d)
+      let vs = head (tail (tail d))
+      if variants_have_auth vs then cons [nm, vs] (collect_auth_types (tail decls))
+      else collect_auth_types (tail decls)
+    else collect_auth_types (tail decls)
+
+-- field bind names f0, f1, ... f(n-1) for a ctor of the given arity
+synth_binds i n =
+  if i >= n then []
+  else cons (cat ["f", show i]) (synth_binds (i + 1) n)
+
+-- one projection piece per field: child digest for an auth field, raw var
+-- otherwise; each field is length-prefix framed by __auth_enc ("<len>#<bytes>")
+-- so a field value containing any byte (incl. ':') stays unambiguous.
+synth_field_pieces tyname mask i =
+  if mask == [] then []
+  else
+    let b = cat ["f", show i]
+    let raw = if head mask == 1 then ["A", ["V", cat ["digest_", tyname]], ["V", b]] else ["V", b]
+    let piece = ["A", ["V", "__auth_enc"], raw]
+    cons piece (synth_field_pieces tyname (tail mask) (i + 1))
+
+-- one match arm per variant: | Ctor f0 .. fn -> cat [<tag>, framed-pieces..]
+synth_arms tyname variants =
+  if variants == [] then []
+  else
+    let v = head variants
+    let ctor = head v
+    let arity = head (tail (tail v))
+    let mask = head (tail (tail (tail v)))
+    let binds = synth_binds 0 arity
+    let tag = str_sub ctor 0 1
+    let elems = cons ["S", tag] (synth_field_pieces tyname mask 0)
+    let body = ["A", ["V", "cat"], ["L", elems]]
+    cons [ctor, binds, body, []] (synth_arms tyname (tail variants))
+
+-- proj_of_<TY> + digest_<TY> decl pair for each collected auth type
+synth_auth_decls types =
+  if types == [] then []
+  else
+    let ty = head types
+    let name = head ty
+    let variants = head (tail ty)
+    let projfn = ["fn", cat ["proj_of_", name], ["t"], ["M", ["V", "t"], synth_arms name variants]]
+    let digfn = ["fn", cat ["digest_", name], ["t"], ["A", ["V", "sha256_hex"], ["A", ["V", cat ["proj_of_", name]], ["V", "t"]]]]
+    cons projfn (cons digfn (synth_auth_decls (tail types)))
+
+decls_have_fn nm decls =
+  if decls == [] then false
+  else
+    let d = head decls
+    if head d == "fn" then
+      if head (tail d) == nm then true
+      else decls_have_fn nm (tail decls)
+    else decls_have_fn nm (tail decls)
+
+-- Ideal-mode primitives (B2a): `unauth`/`auth_make` as identity. This is the
+-- "free oracle" of the lambda-dot model -- the auth-typed source runs unmodified,
+-- computing the plain value with no proof I/O. Emitted only if the user did not
+-- already define them (avoids duplicate symbols). The Prover/Verifier clones
+-- (B2b/B2c) inline their own proof logic and never call these.
+synth_ideal_prims decls =
+  let ua = if decls_have_fn "unauth" decls then [] else [["fn", "unauth", ["x"], ["V", "x"]]]
+  let am = if decls_have_fn "auth_make" decls then [] else [["fn", "auth_make", ["v"], ["V", "v"]]]
+  append ua am
+
+-- ── B2b: the duplicator (Prover clone) ──────────────────────────────────
+-- Recognized auth-traversal shape: a fn whose whole body is `match (unauth P) | arms`.
+-- Returns the auth param name P, or "" if the fn is not an auth traversal.
+auth_fn_param body =
+  if head body != "M" then ""
+  else
+    let scrut = head (tail body)
+    if head scrut != "A" then ""
+    else
+      let f = head (tail scrut)
+      let a = head (tail (tail scrut))
+      if head f != "V" then ""
+      else if head (tail f) != "unauth" then ""
+      else if head a != "V" then ""
+      else head (tail a)
+
+-- which collected auth type owns a given constructor
+variants_have_ctor vs ctor =
+  if vs == [] then false
+  else if head (head vs) == ctor then true
+  else variants_have_ctor (tail vs) ctor
+
+type_of_ctor types ctor =
+  if types == [] then ""
+  else
+    let ty = head types
+    if variants_have_ctor (head (tail ty)) ctor then head ty
+    else type_of_ctor (tail types) ctor
+
+-- leftmost atom of an application spine
+spine_head node =
+  if head node == "A" then spine_head (head (tail node)) else node
+
+is_self_call node name =
+  if head node == "A" then
+    let sh = spine_head node
+    if head sh == "V" then head (tail sh) == name else false
+  else false
+
+-- rebuild a self-call spine: rename the leftmost V to <name><suffix> and
+-- thread each original arg (so nested self-calls in args are handled too).
+rebuild_self node name suffix pbuf =
+  if head node == "A" then ["A", rebuild_self (head (tail node)) name suffix pbuf, thread_self (head (tail (tail node))) name suffix pbuf]
+  else ["V", cat [name, suffix]]
+
+-- strict local rewrite: every self-call `name X..` -> `<name><suffix> X.. pbuf`;
+-- everything else is structurally preserved (NO arm reorder -> order invariant holds).
+thread_self node name suffix pbuf =
+  let tg = head node
+  if tg == "A" then
+    if is_self_call node name then ["A", rebuild_self node name suffix pbuf, pbuf]
+    else ["A", thread_self (head (tail node)) name suffix pbuf, thread_self (head (tail (tail node))) name suffix pbuf]
+  else if tg == "O" then ["O", head (tail node), thread_self (head (tail (tail node))) name suffix pbuf, thread_self (head (tail (tail (tail node)))) name suffix pbuf]
+  else if tg == "?" then ["?", thread_self (head (tail node)) name suffix pbuf, thread_self (head (tail (tail node))) name suffix pbuf, thread_self (head (tail (tail (tail node)))) name suffix pbuf]
+  else if tg == "D" then ["D", head (tail node), thread_self (head (tail (tail node))) name suffix pbuf, thread_self (head (tail (tail (tail node)))) name suffix pbuf]
+  else if tg == "TD" then ["TD", head (tail node), thread_self (head (tail (tail node))) name suffix pbuf, thread_self (head (tail (tail (tail node)))) name suffix pbuf]
+  else if tg == "M" then ["M", thread_self (head (tail node)) name suffix pbuf, thread_self_arms (head (tail (tail node))) name suffix pbuf]
+  else if tg == "L" then ["L", thread_self_list (head (tail node)) name suffix pbuf]
+  else node
+
+thread_self_arms arms name suffix pbuf =
+  if arms == [] then []
+  else
+    let a = head arms
+    cons [head a, head (tail a), thread_self (head (tail (tail a))) name suffix pbuf, head (tail (tail (tail a)))] (thread_self_arms (tail arms) name suffix pbuf)
+
+thread_self_list xs name suffix pbuf =
+  if xs == [] then []
+  else cons (thread_self (head xs) name suffix pbuf) (thread_self_list (tail xs) name suffix pbuf)
+
+-- Prover: holds the plain structure; at each opened node, append its shallow
+-- projection to a 1-cell mutable proof buffer (arr), then descend. Proof bytes
+-- + order are byte-identical to authkit.rail's prover_fetch BY CONSTRUCTION
+-- (entry-append of proj_of_<TY> P == per-arm snoc of the same projection).
+synth_prove_fn name params body types =
+  let p = auth_fn_param body
+  let arms = head (tail (tail body))
+  let ty = type_of_ctor types (head (head arms))
+  let pbuf = ["V", "__pbuf"]
+  let proj = ["A", ["V", cat ["proj_of_", ty]], ["V", p]]
+  let getbuf = ["A", ["A", ["V", "arr_get"], pbuf], ["I", "0"]]
+  let newbuf = ["A", ["A", ["V", "append"], getbuf], ["A", ["A", ["V", "cons"], proj], ["L", []]]]
+  let setexpr = ["A", ["A", ["A", ["V", "arr_set"], pbuf], ["I", "0"]], newbuf]
+  let arms2 = thread_self_arms arms name "__prove" pbuf
+  let pbody = ["D", "_", setexpr, ["M", ["V", p], arms2]]
+  ["fn", cat [name, "__prove"], append params ["__pbuf"], pbody]
+
+-- ── B2c: the duplicator (Verifier clone) ───────────────────────────────
+-- The Verifier holds ONLY the root digest + the proof stream (NOT the tree).
+-- It replays the same traversal: at each step it pops the next projection,
+-- hash-checks it against the running expected digest (mismatch -> reject),
+-- then reconstructs the variant by parsing the projection -- auth fields come
+-- back as child DIGESTS (the new expected for the recursion), plain fields as
+-- their literal value. Accept/reject decisions are identical to authkit.rail's
+-- hand-written verifier_fetch; forging a wrong answer needs a sha256 collision.
+
+-- nested `tail` (k times) and head-of-that: field i of the length-decoded
+-- `__auth_fields` list is parts[i] (tag already stripped) -- head (tail^i parts).
+tail_n e k = if k == 0 then e else ["A", ["V", "tail"], tail_n e (k - 1)]
+nth_expr e k = ["A", ["V", "head"], tail_n e k]
+
+-- the auth param (the tree) is replaced by `__exp` (the expected digest);
+-- every other param (path, ...) is preserved, and `__vbuf` is appended.
+repl_param ps p =
+  if ps == [] then []
+  else cons (if head ps == p then "__exp" else head ps) (repl_param (tail ps) p)
+
+-- bind each of an arm's field names to its slice of the split projection,
+-- then run the (self-call-rewritten) arm body.
+verify_bind_lets binds idx parts inner =
+  if binds == [] then inner
+  else ["D", head binds, nth_expr parts idx, verify_bind_lets (tail binds) (idx + 1) parts inner]
+
+-- dispatch on the projection tag (first char), one arm per variant.
+verify_arm_chain arms name parts vbuf =
+  if arms == [] then ["A", ["V", "error"], ["S", "reject: no matching variant"]]
+  else
+    let a = head arms
+    let ctor = head a
+    let binds = head (tail a)
+    let abody = head (tail (tail a))
+    let tag = str_sub ctor 0 1
+    let cond = ["O", "==", ["A", ["A", ["A", ["V", "str_sub"], ["V", "__pj"]], ["I", "0"]], ["I", "1"]], ["S", tag]]
+    let rew = thread_self abody name "__verify" vbuf
+    let thenb = verify_bind_lets binds 0 parts rew
+    ["?", cond, thenb, verify_arm_chain (tail arms) name parts vbuf]
+
+synth_verify_fn name params body types =
+  let p = auth_fn_param body
+  let arms = head (tail (tail body))
+  let vbuf = ["V", "__vbuf"]
+  let getbuf = ["A", ["A", ["V", "arr_get"], vbuf], ["I", "0"]]
+  let pop = ["A", ["A", ["A", ["V", "arr_set"], vbuf], ["I", "0"]], ["A", ["V", "tail"], getbuf]]
+  let hashne = ["O", "!=", ["A", ["V", "sha256_hex"], ["V", "__pj"]], ["V", "__exp"]]
+  let splitp = ["A", ["V", "__auth_fields"], ["V", "__pj"]]
+  let chain = verify_arm_chain arms name ["V", "__parts"] vbuf
+  let inner = ["D", "__parts", splitp, chain]
+  let hbody = ["?", hashne, ["A", ["V", "error"], ["S", "reject: digest mismatch"]], inner]
+  let vbody = ["D", "__pj", ["A", ["V", "head"], getbuf], ["D", "_", pop, hbody]]
+  ["fn", cat [name, "__verify"], append (repl_param params p) ["__vbuf"], vbody]
+
+-- emit a __prove + __verify clone pair per user fn matching the auth-traversal shape
+synth_clones decls types =
+  if decls == [] then []
+  else
+    let d = head decls
+    if head d == "fn" then
+      let nm = head (tail d)
+      let ps = head (tail (tail d))
+      let bd = head (tail (tail (tail d)))
+      if auth_fn_param bd != "" then
+        cons (synth_prove_fn nm ps bd types) (cons (synth_verify_fn nm ps bd types) (synth_clones (tail decls) types))
+      else synth_clones (tail decls) types
+    else synth_clones (tail decls) types
+
+-- Only synthesize when sha256_hex is actually in scope (the program imported it).
+-- A digest needs the hash primitive; without it, synthesizing digest_<TY> would
+-- be an undefined-symbol link error. Gating here keeps an auth-typed ADT fully
+-- inert (behaves as a plain ADT, B0's guarantee) for any program that does not
+-- opt into hashing -- e.g. a parse-only test that declares `auth` but never digests.
+-- B4: length-prefix field framing. A projection is `<tag><enc f0><enc f1>..`
+-- where `enc s = len(s) ++ "#" ++ s`, so a field is recovered by reading its
+-- declared length and taking exactly that many bytes -- collision-free for ANY
+-- payload (colons, hashes, digits all safe), unlike the old ":"-join which
+-- silently mis-parsed a field containing ":". Emitted as parsed Rail source so
+-- the duplicator's encoder (proj_of) and decoder (__verify) stay in lockstep.
+auth_helper_src _ =
+  cat ["__auth_enc s = cat [show (length (chars s)), \"#\", s]\n",
+       "__auth_pi_go cs acc = if cs == [] then acc else __auth_pi_go (tail cs) (acc * 10 + (char_to_int (head cs) - 48))\n",
+       "__auth_pi s = __auth_pi_go (chars s) 0\n",
+       "__auth_dec pj o end acc =\n",
+       "  if o >= end then reverse acc\n",
+       "  else\n",
+       "    let rest = str_sub pj o (end - o)\n",
+       "    let h = str_find \"#\" rest\n",
+       "    let n = __auth_pi (str_sub rest 0 h)\n",
+       "    let vstart = o + h + 1\n",
+       "    let v = str_sub pj vstart n\n",
+       "    __auth_dec pj (vstart + n) end (cons v acc)\n",
+       "__auth_fields pj = __auth_dec pj 1 (length (chars pj)) []\n"]
+
+inject_auth_fns decls =
+  let types = collect_auth_types decls
+  if types == [] then decls
+  else if decls_have_fn "sha256_hex" decls then
+    let helpers = pprog (tokenize (auth_helper_src 0))
+    let d0 = append decls helpers
+    let d1 = append d0 (synth_auth_decls types)
+    let d2 = append d1 (synth_ideal_prims decls)
+    append d2 (synth_clones decls types)
+  else decls
+
 mk_early_ret nm ps bd lc =
   if nm == "main" then ""
   else if length ps == 0 then ""
@@ -3838,7 +4136,7 @@ compile_program_with_file src fname =
   if nerrs > 0 then
     let _ = print (cat [show nerrs, " error(s) found"])
     ""
-  else compile_checked decls
+  else compile_checked (inject_auth_fns decls)
 
 compile_checked decls =
   let decls = opt_decls decls
@@ -3859,6 +4157,7 @@ compile_checked decls =
 compile_program src =
   let toks = tokenize src
   let decls = pprog toks
+  let decls = inject_auth_fns decls
   let decls = opt_decls decls
   let ar = get_arities decls
   let siblings = build_ctor_siblings decls
@@ -4313,6 +4612,50 @@ run_tests _ =
   -- 0.015625. Before the fix infer_ty(V y)=0 demoted __argf_mse_0 -> pred untagged
   -- as int -> 5.3e+36 garbage. The inlined `mse (mlp 1.0 2.0) 1.0` always worked.
   let t140 = run_test "float_result_compose" "relu x = if x > 0.0 then x else 0.0\nneuron w1 x1 w2 x2 b = relu (w1 * x1 + w2 * x2 + b)\nmlp x1 x2 =\n  let h1 = neuron 0.5 x1 0.25 x2 0.0\n  let h2 = neuron 0.25 x1 0.5 x2 0.0\n  neuron 0.5 h1 0.5 h2 0.0\nmse pred target = let d = pred - target in d * d\nmain =\n  let y = mlp 1.0 2.0\n  let _ = print (show_float (mse y 1.0))\n  0" "0.015625"
+  -- t141 (P2 Stage B / B0): the `auth` field modifier parses as a field-type prefix.
+  -- `Mk auth int int` is arity 2 (auth + int = ONE authenticated field, then a plain
+  -- int), constructs from 2 args, and destructures exactly like a plain ADT. auth is
+  -- inert in B0 (no codegen reads the authmask yet). Mk 100 7 -> bal + tag = 107.
+  let t141 = run_test "auth_field_parse_plain" "type Acc = | Mk auth int int\ntotal a = match a\n  | Mk bal tag -> bal + tag\nmain =\n  let _ = print (show (total (Mk 100 7)))\n  0" "107"
+  -- t142 (P2 Stage B / B1): an auth-typed ADT triggers projection synthesis. The
+  -- compiler auto-derives digest_Tree (proj_of_Tree + sha256_hex) from the `auth`
+  -- markers; its Merkle root MUST be byte-identical to the hand-written Stage A
+  -- oracle (tools/auth/authkit.rail). The pinned hex is that oracle's live root.
+  let t142 = run_test "auth_digest_merkle" "import \"stdlib/sha256.rail\"\ntype Tree = | Tip s | Bin auth Tree auth Tree\nmain =\n  let t = Bin (Bin (Tip \"alpha\") (Tip \"bravo\")) (Bin (Tip \"charlie\") (Tip \"delta\"))\n  let _ = print (digest_Tree t)\n  0" "afc59941de7c976817a9101ca0301139fca9a8fb844d4ccfbca8facbce8b9b5c"
+  -- t143 (P2 Stage B / B2a): Ideal mode. The compiler synthesizes identity
+  -- `unauth`/`auth_make`, so an auth-typed traversal written ONCE with `unauth`
+  -- links and computes the plain value (the lambda-dot "free oracle"). Path
+  -- [1,0] = right-then-left -> the "charlie" leaf.
+  let t143 = run_test "auth_ideal_unauth" "import \"stdlib/sha256.rail\"\ntype Tree = | Tip s | Bin auth Tree auth Tree\nfetch t path = match unauth t\n  | Tip s -> s\n  | Bin l r -> if head path == 0 then fetch l (tail path) else fetch r (tail path)\nmain =\n  let t = Bin (Bin (Tip \"alpha\") (Tip \"bravo\")) (Bin (Tip \"charlie\") (Tip \"delta\"))\n  let _ = print (fetch t (cons 1 (cons 0 [])))\n  0" "charlie"
+  -- t144 (P2 Stage B / B2b): Prover clone. The compiler synthesizes `fetch__prove`
+  -- from the SAME `match unauth t` traversal: at every opened node it appends that
+  -- node's shallow projection to a 1-cell proof buffer, then descends. Path [1,0]
+  -- opens root, right child, then the "charlie" leaf -> 3 projections, value "charlie".
+  -- Byte-for-byte the same proof authkit.rail's hand-written prover_fetch emits.
+  let t144 = run_test "auth_prove_proof" "import \"stdlib/sha256.rail\"\ntype Tree = | Tip s | Bin auth Tree auth Tree\nfetch t path = match unauth t\n  | Tip s -> s\n  | Bin l r -> if head path == 0 then fetch l (tail path) else fetch r (tail path)\nmain =\n  let t = Bin (Bin (Tip \"alpha\") (Tip \"bravo\")) (Bin (Tip \"charlie\") (Tip \"delta\"))\n  let pbuf = arr_new 1 []\n  let v = fetch__prove t (cons 1 (cons 0 [])) pbuf\n  let pf = arr_get pbuf 0\n  let _ = print (cat [v, \" \", show (length pf)])\n  0" "charlie 3"
+  -- t145-t148 (P2 Stage B / B2c): Verifier clone. The compiler synthesizes
+  -- `fetch__verify` -- it holds ONLY the root digest + the prover's proof (NOT
+  -- the tree), pops each projection, hash-checks vs the running expected digest,
+  -- and reconstructs the variant by parsing the projection. The full prove->verify
+  -- round-trip ACCEPTS the honest proof and REJECTS all three tamper classes,
+  -- with the same accept/reject decisions as authkit.rail's hand-written verifier.
+  let t145 = run_test "auth_verify_accept" "import \"stdlib/sha256.rail\"\ntype Tree = | Tip s | Bin auth Tree auth Tree\nfetch t path = match unauth t\n  | Tip s -> s\n  | Bin l r -> if head path == 0 then fetch l (tail path) else fetch r (tail path)\nmain =\n  let t = Bin (Bin (Tip \"alpha\") (Tip \"bravo\")) (Bin (Tip \"charlie\") (Tip \"delta\"))\n  let root = digest_Tree t\n  let path = cons 1 (cons 0 [])\n  let pbuf = arr_new 1 []\n  let _ = fetch__prove t path pbuf\n  let proof = arr_get pbuf 0\n  let vbuf = arr_new 1 []\n  let _ = arr_set vbuf 0 proof\n  let res = fetch__verify root path vbuf\n  let _ = print (if is_error res then \"REJECT\" else cat [\"accept:\", res])\n  0" "accept:charlie"
+  let t146 = run_test "auth_verify_tamper_leaf" "import \"stdlib/sha256.rail\"\ntype Tree = | Tip s | Bin auth Tree auth Tree\nfetch t path = match unauth t\n  | Tip s -> s\n  | Bin l r -> if head path == 0 then fetch l (tail path) else fetch r (tail path)\nmain =\n  let t = Bin (Bin (Tip \"alpha\") (Tip \"bravo\")) (Bin (Tip \"charlie\") (Tip \"delta\"))\n  let root = digest_Tree t\n  let path = cons 1 (cons 0 [])\n  let pbuf = arr_new 1 []\n  let _ = fetch__prove t path pbuf\n  let proof = arr_get pbuf 0\n  let bad = cons (head proof) (cons (head (tail proof)) (cons \"T:HACKED\" []))\n  let vbuf = arr_new 1 []\n  let _ = arr_set vbuf 0 bad\n  let res = fetch__verify root path vbuf\n  let _ = print (if is_error res then \"REJECT\" else cat [\"accept:\", res])\n  0" "REJECT"
+  let t147 = run_test "auth_verify_bad_root" "import \"stdlib/sha256.rail\"\ntype Tree = | Tip s | Bin auth Tree auth Tree\nfetch t path = match unauth t\n  | Tip s -> s\n  | Bin l r -> if head path == 0 then fetch l (tail path) else fetch r (tail path)\nmain =\n  let t = Bin (Bin (Tip \"alpha\") (Tip \"bravo\")) (Bin (Tip \"charlie\") (Tip \"delta\"))\n  let path = cons 1 (cons 0 [])\n  let pbuf = arr_new 1 []\n  let _ = fetch__prove t path pbuf\n  let proof = arr_get pbuf 0\n  let vbuf = arr_new 1 []\n  let _ = arr_set vbuf 0 proof\n  let res = fetch__verify \"deadbeef\" path vbuf\n  let _ = print (if is_error res then \"REJECT\" else cat [\"accept:\", res])\n  0" "REJECT"
+  let t148 = run_test "auth_verify_tamper_node" "import \"stdlib/sha256.rail\"\ntype Tree = | Tip s | Bin auth Tree auth Tree\nfetch t path = match unauth t\n  | Tip s -> s\n  | Bin l r -> if head path == 0 then fetch l (tail path) else fetch r (tail path)\nmain =\n  let t = Bin (Bin (Tip \"alpha\") (Tip \"bravo\")) (Bin (Tip \"charlie\") (Tip \"delta\"))\n  let root = digest_Tree t\n  let path = cons 1 (cons 0 [])\n  let pbuf = arr_new 1 []\n  let _ = fetch__prove t path pbuf\n  let proof = arr_get pbuf 0\n  let bad = cons (head proof) (cons \"B:dead:beef\" (cons (head (tail (tail proof))) []))\n  let vbuf = arr_new 1 []\n  let _ = arr_set vbuf 0 bad\n  let res = fetch__verify root path vbuf\n  let _ = print (if is_error res then \"REJECT\" else cat [\"accept:\", res])\n  0" "REJECT"
+  -- t149-t151 (P2 Stage B / B3): generalization to the asymmetric string-keyed BST.
+  -- Node carries a plain key field plus two auth children; navigation is data-driven
+  -- (slt key k), and the leaf-key binding guard (k == key) falls out of the user's
+  -- own traversal. Proves the duplicator handles mixed plain+auth fields + order guard.
+  let dict_src = "import \"stdlib/sha256.rail\"\ntype Dict = | Leaf k v | Node k auth Dict auth Dict\nslt a b = char_to_int (head (chars a)) < char_to_int (head (chars b))\nlookup d key = match unauth d\n  | Leaf k v -> if k == key then v else error \"absent\"\n  | Node k l r -> if slt key k then lookup l key else lookup r key\n"
+  let t149 = run_test "auth_dict_accept" (cat [dict_src, "main =\n  let t = Node \"b\" (Leaf \"a\" \"apple\") (Leaf \"b\" \"banana\")\n  let root = digest_Dict t\n  let pb = arr_new 1 []\n  let _ = lookup__prove t \"a\" pb\n  let pa = arr_get pb 0\n  let vb = arr_new 1 []\n  let _ = arr_set vb 0 pa\n  let res = lookup__verify root \"a\" vb\n  let _ = print (if is_error res then \"REJECT\" else cat [\"accept:\", res])\n  0"]) "accept:apple"
+  let t150 = run_test "auth_dict_wrong_key" (cat [dict_src, "main =\n  let t = Node \"b\" (Leaf \"a\" \"apple\") (Leaf \"b\" \"banana\")\n  let root = digest_Dict t\n  let pb = arr_new 1 []\n  let _ = lookup__prove t \"z\" pb\n  let pz = arr_get pb 0\n  let vb = arr_new 1 []\n  let _ = arr_set vb 0 pz\n  let res = lookup__verify root \"z\" vb\n  let _ = print (if is_error res then \"REJECT\" else cat [\"accept:\", res])\n  0"]) "REJECT"
+  let t151 = run_test "auth_dict_tamper" (cat [dict_src, "main =\n  let t = Node \"b\" (Leaf \"a\" \"apple\") (Leaf \"b\" \"banana\")\n  let root = digest_Dict t\n  let pb = arr_new 1 []\n  let _ = lookup__prove t \"a\" pb\n  let pa = arr_get pb 0\n  let bad = cons (head pa) (cons \"L:a:HACKED\" [])\n  let vb = arr_new 1 []\n  let _ = arr_set vb 0 bad\n  let res = lookup__verify root \"a\" vb\n  let _ = print (if is_error res then \"REJECT\" else cat [\"accept:\", res])\n  0"]) "REJECT"
+  -- t152 (P2 Stage B / B4): length-prefix framing closes the ':'-collision. A leaf
+  -- value containing a colon must round-trip: under the old ':'-join the verifier
+  -- silently truncated "ap:ple" -> "ap" yet ACCEPTED (a soundness hole); framing
+  -- recovers the exact bytes by declared length.
+  let t152 = run_test "auth_dict_colon_value" (cat [dict_src, "main =\n  let t = Node \"b\" (Leaf \"a\" \"ap:ple\") (Leaf \"b\" \"banana\")\n  let root = digest_Dict t\n  let pb = arr_new 1 []\n  let _ = lookup__prove t \"a\" pb\n  let pa = arr_get pb 0\n  let vb = arr_new 1 []\n  let _ = arr_set vb 0 pa\n  let res = lookup__verify root \"a\" vb\n  let _ = print (if is_error res then \"REJECT\" else cat [\"accept:\", res])\n  0"]) "accept:ap:ple"
   let s1 = (if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0)
   let s2 = (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0)
   let s3 = (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0)
@@ -4323,7 +4666,7 @@ run_tests _ =
   let s8 = (if t71 then 1 else 0) + (if t72 then 1 else 0) + (if t73 then 1 else 0) + (if t74 then 1 else 0) + (if t75 then 1 else 0) + (if t76 then 1 else 0) + (if t77 then 1 else 0) + (if t78 then 1 else 0) + (if t79 then 1 else 0) + (if t80 then 1 else 0)
   let s9 = (if t81 then 1 else 0) + (if t82 then 1 else 0) + (if t83 then 1 else 0) + (if t84 then 1 else 0) + (if t85 then 1 else 0) + (if t86 then 1 else 0) + (if t87 then 1 else 0) + (if t88 then 1 else 0) + (if t89 then 1 else 0) + (if t90 then 1 else 0)
   let s10 = (if t91 then 1 else 0) + (if t92 then 1 else 0) + (if t93 then 1 else 0) + (if t94 then 1 else 0) + (if t95 then 1 else 0) + (if t96 then 1 else 0) + (if t97 then 1 else 0) + (if t98 then 1 else 0)
-  let s11 = (if t99 then 1 else 0) + (if t100 then 1 else 0) + (if t101 then 1 else 0) + (if t102 then 1 else 0) + (if t103 then 1 else 0) + (if t104 then 1 else 0) + (if t105 then 1 else 0) + (if t106 then 1 else 0) + (if t107 then 1 else 0) + (if t108 then 1 else 0) + (if t109 then 1 else 0) + (if t110 then 1 else 0) + (if t111 then 1 else 0) + (if t112 then 1 else 0) + (if t113 then 1 else 0) + (if t114 then 1 else 0) + (if t115 then 1 else 0) + (if t116 then 1 else 0) + (if t117 then 1 else 0) + (if t118 then 1 else 0) + (if t119 then 1 else 0) + (if t120 then 1 else 0) + (if t121 then 1 else 0) + (if t122 then 1 else 0) + (if t123 then 1 else 0) + (if t124 then 1 else 0) + (if t125 then 1 else 0) + (if t126 then 1 else 0) + (if t127 then 1 else 0) + (if t128 then 1 else 0) + (if t129 then 1 else 0) + (if t130 then 1 else 0) + (if t131 then 1 else 0) + (if t132 then 1 else 0) + (if t133 then 1 else 0) + (if t134 then 1 else 0) + (if t135 then 1 else 0) + (if t136 then 1 else 0) + (if t137 then 1 else 0) + (if t138 then 1 else 0) + (if t139 then 1 else 0) + (if t140 then 1 else 0)
+  let s11 = (if t99 then 1 else 0) + (if t100 then 1 else 0) + (if t101 then 1 else 0) + (if t102 then 1 else 0) + (if t103 then 1 else 0) + (if t104 then 1 else 0) + (if t105 then 1 else 0) + (if t106 then 1 else 0) + (if t107 then 1 else 0) + (if t108 then 1 else 0) + (if t109 then 1 else 0) + (if t110 then 1 else 0) + (if t111 then 1 else 0) + (if t112 then 1 else 0) + (if t113 then 1 else 0) + (if t114 then 1 else 0) + (if t115 then 1 else 0) + (if t116 then 1 else 0) + (if t117 then 1 else 0) + (if t118 then 1 else 0) + (if t119 then 1 else 0) + (if t120 then 1 else 0) + (if t121 then 1 else 0) + (if t122 then 1 else 0) + (if t123 then 1 else 0) + (if t124 then 1 else 0) + (if t125 then 1 else 0) + (if t126 then 1 else 0) + (if t127 then 1 else 0) + (if t128 then 1 else 0) + (if t129 then 1 else 0) + (if t130 then 1 else 0) + (if t131 then 1 else 0) + (if t132 then 1 else 0) + (if t133 then 1 else 0) + (if t134 then 1 else 0) + (if t135 then 1 else 0) + (if t136 then 1 else 0) + (if t137 then 1 else 0) + (if t138 then 1 else 0) + (if t139 then 1 else 0) + (if t140 then 1 else 0) + (if t141 then 1 else 0) + (if t142 then 1 else 0) + (if t143 then 1 else 0) + (if t144 then 1 else 0) + (if t145 then 1 else 0) + (if t146 then 1 else 0) + (if t147 then 1 else 0) + (if t148 then 1 else 0) + (if t149 then 1 else 0) + (if t150 then 1 else 0) + (if t151 then 1 else 0) + (if t152 then 1 else 0)
   -- Track B: cross-function return-type inference (precise-GC plan).
   let i1 = run_infer_test "pure_int" "square x = x * x\nmain = square 7" "square" 1
   let i2 = run_infer_test "pure_float" "halve x = x +. 0.0\nmain = 0" "halve" 2
@@ -4333,8 +4676,8 @@ run_tests _ =
   let i6 = run_infer_test "match_int" "type Shape = | Circ r | Sq s\narea sh = match sh\n  | Circ r -> r * r * 3\n  | Sq s -> s * s\nmain = 0" "area" 1
   let s_inf = (if i1 then 1 else 0) + (if i2 then 1 else 0) + (if i3 then 1 else 0) + (if i4 then 1 else 0) + (if i5 then 1 else 0) + (if i6 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s_inf
-  let _ = print (cat [show total, "/146 tests passed"])
-  if total == 146 then 0 else 1
+  let _ = print (cat [show total, "/158 tests passed"])
+  if total == 158 then 0 else 1
 
 self_compile _ =
   let _ = print "\n=== Self-compilation ==="
