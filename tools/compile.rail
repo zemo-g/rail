@@ -2347,7 +2347,7 @@ get_arities decls =
   -- V-series Inc1: seed float-param markers for value-referenced float-bodied fns
   -- (higher-order float path: float_arr_map dbl, etc.) before the call-site lub.
   let hof_seed = collect_hofpos decls full_ar
-  let argf_markers = collect_argf decls full_ar ret_markers hof_seed
+  let argf_markers = collect_argf_fix decls full_ar ret_markers hof_seed 6
   let ar_with_argf = append argf_markers full_ar
   -- C4-fix: third float-return pass, now param-float-aware. A fn whose
   -- return-expr is float ONLY because of float params (e.g. fb x y =
@@ -2463,10 +2463,12 @@ infer_ty node ar rmap =
   else if tg == "F" then 3
   else if tg == "V" then
     -- A let-local proven float (e.g. `let y = mlp 1.0 2.0`) carries a __vf_
-    -- marker threaded in by argf_scan's D/TD case. Without it a bare V is
-    -- UNKNOWN(0). This lets a float user-fn RESULT bound to a local compose
-    -- as a float arg at a later call site (Increment B).
-    if efind (cat ["__vf_", head (tail node)]) rmap == 2 then 2 else 0
+    -- marker threaded in by argf_scan's D/TD case; a float/int PARAM carries a
+    -- __vf_ marker threaded in by collect_argf's per-fn penv (multi-hop, #42).
+    -- 2=float, 1=int (lets concrete int params demote downstream float-marks),
+    -- absent/0=unresolved (composes as a float arg at a later call site, Inc B).
+    let vf = efind (cat ["__vf_", head (tail node)]) rmap
+    if vf == 2 then 2 else if vf == 1 then 1 else 0
   else if tg == "O" then
     let op = head (tail node)
     if op == "<" || op == ">" || op == "<=" || op == ">=" || op == "==" || op == "!=" || op == "&&" || op == "||" then 1
@@ -2585,7 +2587,16 @@ argf_demote fname i arity acc =
 
 argf_obs_args fname args i ar rmap acc =
   if args == [] then acc
-  else argf_obs_args fname (tail args) (i + 1) ar rmap (argf_set fname i (infer_ty (head args) ar rmap) acc)
+  else
+    let a = head args
+    let t = infer_ty a ar rmap
+    -- Skip recording an UNRESOLVED bare-variable arg (a param not yet proven
+    -- float/int by the penv fixpoint). Recording it as 0 would poison the lub
+    -- permanently (argf_join 0 anything = 0), blocking multi-hop float
+    -- propagation. Non-V unknowns (call-returns, _expr) still record 0 ->
+    -- conservative demote, preserving the prior mixed-type soundness exactly.
+    let acc2 = if head a == "V" && t == 0 then acc else argf_set fname i t acc
+    argf_obs_args fname (tail args) (i + 1) ar rmap acc2
 
 argf_call fname args ar rmap acc =
   let n = length args
@@ -2642,12 +2653,40 @@ argf_scan_d node ar rmap acc =
   let rmap2 = if infer_ty val ar rmap == 2 then cons (cat ["__vf_", nm], 2) rmap else rmap
   argf_scan bd ar rmap2 acc2
 
+-- per-fn param-float env: __vf_<p>=2 (float) / =1 (int), derived from the
+-- discovered __argf_<nm>_<i> slots in ar. Threaded into argf_scan so a bare
+-- variable arg that is a param of the enclosing fn resolves to its concrete
+-- type and propagates float-ness across a user-fn hop (the #42 multi-hop fix).
+argf_penv_vf ps nm ar i acc =
+  if ps == [] then acc
+  else
+    let p = head ps
+    let slot = efind (argf_key nm i) ar
+    let acc2 = if slot == 2 then cons (cat ["__vf_", p], 2) acc
+               else if slot == 1 then cons (cat ["__vf_", p], 1) acc
+               else acc
+    argf_penv_vf (tail ps) nm ar (i + 1) acc2
+
 collect_argf decls ar rmap acc =
   if decls == [] then acc
   else
     let d = head decls
-    if head d == "fn" then collect_argf (tail decls) ar rmap (argf_scan (head (tail (tail (tail d)))) ar rmap acc)
+    if head d == "fn" then
+      let nm = head (tail d)
+      let ps = head (tail (tail d))
+      let bd = head (tail (tail (tail d)))
+      let rmap2 = argf_penv_vf ps nm ar 0 rmap
+      collect_argf (tail decls) ar rmap (argf_scan bd ar rmap2 acc)
     else collect_argf (tail decls) ar rmap acc
+
+-- Fixpoint: fold the discovered __argf markers back into the arity map each
+-- round so the next round's penv can see them -> bare-variable params resolve
+-- across multiple user-fn hops (chk -> approx; float_arr_fold -> faf_go).
+-- Bounded at n (mirrors hoff_fix=6); the lub is monotone (slots only narrow
+-- toward 0), so any round past convergence is idempotent.
+collect_argf_fix decls ar rmap acc n =
+  if n <= 0 then acc
+  else collect_argf_fix decls ar rmap (collect_argf decls (append acc ar) rmap acc) (n - 1)
 
 -- ── V-series Inc1: higher-order float-param marking (native float_arr path) ──
 -- A named fn passed AS A VALUE into a float-consuming HOF position (e.g.
