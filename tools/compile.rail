@@ -1994,17 +1994,17 @@ is_float_fn fname =
 -- returns_float: does the RETURN expression of this AST node yield a float?
 -- Unlike body_has_float, this only checks the return path, not the whole body.
 -- Used to mark user functions as float-returning in the arity map.
-returns_float node fret_list =
+returns_float node fret_list penv =
   let tg = head node
   if tg == "FL" then true
   else if tg == "I" || tg == "S" || tg == "B" || tg == "NULL" then false
-  else if tg == "V" then false
+  else if tg == "V" then efind (cat ["__float_", head (tail node)]) penv != (0 - 1)
   else if tg == "?" then
     -- if/then/else: both branches must return float
-    returns_float (head (tail (tail node))) fret_list && returns_float (head (tail (tail (tail node)))) fret_list
+    returns_float (head (tail (tail node))) fret_list penv && returns_float (head (tail (tail (tail node)))) fret_list penv
   else if tg == "D" || tg == "TD" then
     -- let binding: check the body (continuation), not the value
-    returns_float (head (tail (tail (tail node)))) fret_list
+    returns_float (head (tail (tail (tail node)))) fret_list penv
   else if tg == "A" then
     -- function call: check if callee is a known float function
     let (fname, _) = flat node
@@ -2014,19 +2014,19 @@ returns_float node fret_list =
     -- binary op: +,-,*,/ with float operand returns float
     let op = head (tail node)
     if op == "+" || op == "-" || op == "*" || op == "/" then
-      returns_float (head (tail (tail node))) fret_list || returns_float (head (tail (tail (tail node)))) fret_list
+      returns_float (head (tail (tail node))) fret_list penv || returns_float (head (tail (tail (tail node)))) fret_list penv
     else false
   else if tg == "M" then
     -- match: all arms must return float
-    rf_all_arms (head (tail (tail node))) fret_list
+    rf_all_arms (head (tail (tail node))) fret_list penv
   else false
 
-rf_all_arms arms fret_list =
+rf_all_arms arms fret_list penv =
   if length arms == 0 then true
   else
     let arm = head arms
     let arm_body = head (tail (tail arm))
-    if returns_float arm_body fret_list then rf_all_arms (tail arms) fret_list
+    if returns_float arm_body fret_list penv then rf_all_arms (tail arms) fret_list penv
     else false
 
 rf_has name lst =
@@ -2345,7 +2345,16 @@ get_arities decls =
   let full_ar = append ret_markers base_ar
   -- Increment A: whole-call-site float-param agreement (additive __argf_ markers).
   let argf_markers = collect_argf decls full_ar ret_markers []
-  append argf_markers full_ar
+  let ar_with_argf = append argf_markers full_ar
+  -- C4-fix: third float-return pass, now param-float-aware. A fn whose
+  -- return-expr is float ONLY because of float params (e.g. fb x y =
+  -- (x /. y) -. y) is invisible to passes 1-2 (param floatness is unknown
+  -- until __argf_ proves every call site passes floats). Re-scan with a
+  -- per-fn penv from mark_argf_params; additive (only ADDs float-ret names),
+  -- two iterations for one level of call indirection (mirrors passes 1-2).
+  let fret_pf1 = collect_float_ret_pf decls ar_with_argf fret_pass2
+  let fret_pf2 = collect_float_ret_pf decls ar_with_argf fret_pf1
+  append (mk_fret_markers fret_pf2) ar_with_argf
 
 -- Scan function declarations: if returns_float, add name to list
 collect_float_ret_fns decls known =
@@ -2356,10 +2365,29 @@ collect_float_ret_fns decls known =
     if head d == "fn" then
       let nm = head (tail d)
       let bd = head (tail (tail (tail d)))
-      let rf = returns_float bd known
+      let rf = returns_float bd known []
       if rf then collect_float_ret_fns (tail decls) (cons nm known)
       else collect_float_ret_fns (tail decls) known
     else collect_float_ret_fns (tail decls) known
+
+-- C4-fix third pass: param-float-aware float-return detection. Builds each
+-- fn's penv from __argf_ markers (same source mark_argf_params/codegen uses),
+-- so a fn whose return-expr is float ONLY via float params (e.g.
+-- fb x y = (x /. y) -. y) is caught. Additive: seeded with the pass-1/2 set,
+-- can only ADD names. Requires the __argf_ markers, so it runs after argf.
+collect_float_ret_pf decls ar known =
+  if length decls == 0 then known
+  else
+    let d = head decls
+    if head d == "fn" then
+      let nm = head (tail d)
+      let ps = head (tail (tail d))
+      let bd = head (tail (tail (tail d)))
+      let penv = mark_argf_params ps nm ar [] 0
+      let rf = returns_float bd known penv
+      if rf then collect_float_ret_pf (tail decls) ar (cons nm known)
+      else collect_float_ret_pf (tail decls) ar known
+    else collect_float_ret_pf (tail decls) ar known
 
 mk_fret_markers names =
   if length names == 0 then []
@@ -4879,6 +4907,12 @@ run_tests _ =
   -- one backward sweep writing every partial into the float_arr __go. f x y = x*y+3x
   -- at (2,5): df/dx=y+3=8 (idx 0), df/dy=x=2 (idx 1). Must match the forward oracle.
   let t157 = run_test "p3_rgrad_multi" "#grad f\nf x y = (x *. y) +. (3.0 *. x)\nmain =\n  let go = float_arr_new 2 0.0\n  let _ = f__rgrad 2.0 5.0 go\n  let _ = print (cat [show_float (float_arr_get go 0), \" \", show_float (float_arr_get go 1)])\n  0" "8 2"
+  -- t158: float-return inference for a fn whose return-expr is float ONLY via
+  -- float params (no FL literal to anchor it). fb x y = (x /. y) -. y was
+  -- mis-inferred int-returning, so nested arithmetic (fb ..) +. (fb ..)
+  -- reinterpreted the raw double bits as a tagged int -> garbage/segfault.
+  -- fb 10 2 = 5-2 = 3; 3+3 = 6. Locks the param-float-aware third fret pass.
+  let t158 = run_test "float_ret_param_only" "fb x y = (x /. y) -. y\nmain =\n  let s = (fb 10.0 2.0) +. (fb 10.0 2.0)\n  let _ = print (show_float s)\n  0" "6"
   let s1 =(if t1 then 1 else 0) + (if t2 then 1 else 0) + (if t3 then 1 else 0) + (if t4 then 1 else 0) + (if t5 then 1 else 0) + (if t6 then 1 else 0) + (if t7 then 1 else 0) + (if t8 then 1 else 0) + (if t9 then 1 else 0) + (if t10 then 1 else 0)
   let s2 = (if t11 then 1 else 0) + (if t12 then 1 else 0) + (if t13 then 1 else 0) + (if t14 then 1 else 0) + (if t15 then 1 else 0) + (if t16 then 1 else 0) + (if t17 then 1 else 0) + (if t18 then 1 else 0) + (if t19 then 1 else 0) + (if t20 then 1 else 0)
   let s3 = (if t21 then 1 else 0) + (if t22 then 1 else 0) + (if t23 then 1 else 0) + (if t24 then 1 else 0) + (if t25 then 1 else 0) + (if t26 then 1 else 0) + (if t27 then 1 else 0) + (if t28 then 1 else 0) + (if t29 then 1 else 0) + (if t30 then 1 else 0)
@@ -4889,7 +4923,7 @@ run_tests _ =
   let s8 = (if t71 then 1 else 0) + (if t72 then 1 else 0) + (if t73 then 1 else 0) + (if t74 then 1 else 0) + (if t75 then 1 else 0) + (if t76 then 1 else 0) + (if t77 then 1 else 0) + (if t78 then 1 else 0) + (if t79 then 1 else 0) + (if t80 then 1 else 0)
   let s9 = (if t81 then 1 else 0) + (if t82 then 1 else 0) + (if t83 then 1 else 0) + (if t84 then 1 else 0) + (if t85 then 1 else 0) + (if t86 then 1 else 0) + (if t87 then 1 else 0) + (if t88 then 1 else 0) + (if t89 then 1 else 0) + (if t90 then 1 else 0)
   let s10 = (if t91 then 1 else 0) + (if t92 then 1 else 0) + (if t93 then 1 else 0) + (if t94 then 1 else 0) + (if t95 then 1 else 0) + (if t96 then 1 else 0) + (if t97 then 1 else 0) + (if t98 then 1 else 0)
-  let s11 = (if t99 then 1 else 0) + (if t100 then 1 else 0) + (if t101 then 1 else 0) + (if t102 then 1 else 0) + (if t103 then 1 else 0) + (if t104 then 1 else 0) + (if t105 then 1 else 0) + (if t106 then 1 else 0) + (if t107 then 1 else 0) + (if t108 then 1 else 0) + (if t109 then 1 else 0) + (if t110 then 1 else 0) + (if t111 then 1 else 0) + (if t112 then 1 else 0) + (if t113 then 1 else 0) + (if t114 then 1 else 0) + (if t115 then 1 else 0) + (if t116 then 1 else 0) + (if t117 then 1 else 0) + (if t118 then 1 else 0) + (if t119 then 1 else 0) + (if t120 then 1 else 0) + (if t121 then 1 else 0) + (if t122 then 1 else 0) + (if t123 then 1 else 0) + (if t124 then 1 else 0) + (if t125 then 1 else 0) + (if t126 then 1 else 0) + (if t127 then 1 else 0) + (if t128 then 1 else 0) + (if t129 then 1 else 0) + (if t130 then 1 else 0) + (if t131 then 1 else 0) + (if t132 then 1 else 0) + (if t133 then 1 else 0) + (if t134 then 1 else 0) + (if t135 then 1 else 0) + (if t136 then 1 else 0) + (if t137 then 1 else 0) + (if t138 then 1 else 0) + (if t139 then 1 else 0) + (if t140 then 1 else 0) + (if t141 then 1 else 0) + (if t142 then 1 else 0) + (if t143 then 1 else 0) + (if t144 then 1 else 0) + (if t145 then 1 else 0) + (if t146 then 1 else 0) + (if t147 then 1 else 0) + (if t148 then 1 else 0) + (if t149 then 1 else 0) + (if t150 then 1 else 0) + (if t151 then 1 else 0) + (if t152 then 1 else 0) + (if t153 then 1 else 0) + (if t154 then 1 else 0) + (if t155 then 1 else 0) + (if t156 then 1 else 0) + (if t157 then 1 else 0)
+  let s11 = (if t99 then 1 else 0) + (if t100 then 1 else 0) + (if t101 then 1 else 0) + (if t102 then 1 else 0) + (if t103 then 1 else 0) + (if t104 then 1 else 0) + (if t105 then 1 else 0) + (if t106 then 1 else 0) + (if t107 then 1 else 0) + (if t108 then 1 else 0) + (if t109 then 1 else 0) + (if t110 then 1 else 0) + (if t111 then 1 else 0) + (if t112 then 1 else 0) + (if t113 then 1 else 0) + (if t114 then 1 else 0) + (if t115 then 1 else 0) + (if t116 then 1 else 0) + (if t117 then 1 else 0) + (if t118 then 1 else 0) + (if t119 then 1 else 0) + (if t120 then 1 else 0) + (if t121 then 1 else 0) + (if t122 then 1 else 0) + (if t123 then 1 else 0) + (if t124 then 1 else 0) + (if t125 then 1 else 0) + (if t126 then 1 else 0) + (if t127 then 1 else 0) + (if t128 then 1 else 0) + (if t129 then 1 else 0) + (if t130 then 1 else 0) + (if t131 then 1 else 0) + (if t132 then 1 else 0) + (if t133 then 1 else 0) + (if t134 then 1 else 0) + (if t135 then 1 else 0) + (if t136 then 1 else 0) + (if t137 then 1 else 0) + (if t138 then 1 else 0) + (if t139 then 1 else 0) + (if t140 then 1 else 0) + (if t141 then 1 else 0) + (if t142 then 1 else 0) + (if t143 then 1 else 0) + (if t144 then 1 else 0) + (if t145 then 1 else 0) + (if t146 then 1 else 0) + (if t147 then 1 else 0) + (if t148 then 1 else 0) + (if t149 then 1 else 0) + (if t150 then 1 else 0) + (if t151 then 1 else 0) + (if t152 then 1 else 0) + (if t153 then 1 else 0) + (if t154 then 1 else 0) + (if t155 then 1 else 0) + (if t156 then 1 else 0) + (if t157 then 1 else 0) + (if t158 then 1 else 0)
   -- Track B: cross-function return-type inference (precise-GC plan).
   let i1 = run_infer_test "pure_int" "square x = x * x\nmain = square 7" "square" 1
   let i2 = run_infer_test "pure_float" "halve x = x +. 0.0\nmain = 0" "halve" 2
@@ -4899,8 +4933,8 @@ run_tests _ =
   let i6 = run_infer_test "match_int" "type Shape = | Circ r | Sq s\narea sh = match sh\n  | Circ r -> r * r * 3\n  | Sq s -> s * s\nmain = 0" "area" 1
   let s_inf = (if i1 then 1 else 0) + (if i2 then 1 else 0) + (if i3 then 1 else 0) + (if i4 then 1 else 0) + (if i5 then 1 else 0) + (if i6 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s_inf
-  let _ = print (cat [show total, "/163 tests passed"])
-  if total == 163 then 0 else 1
+  let _ = print (cat [show total, "/164 tests passed"])
+  if total == 164 then 0 else 1
 
 self_compile _ =
   let _ = print "\n=== Self-compilation ==="
