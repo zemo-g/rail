@@ -2344,7 +2344,10 @@ get_arities decls =
   let ret_markers = infer_return_types decls base_ar
   let full_ar = append ret_markers base_ar
   -- Increment A: whole-call-site float-param agreement (additive __argf_ markers).
-  let argf_markers = collect_argf decls full_ar ret_markers []
+  -- V-series Inc1: seed float-param markers for value-referenced float-bodied fns
+  -- (higher-order float path: float_arr_map dbl, etc.) before the call-site lub.
+  let hof_seed = collect_hofpos decls full_ar
+  let argf_markers = collect_argf decls full_ar ret_markers hof_seed
   let ar_with_argf = append argf_markers full_ar
   -- C4-fix: third float-return pass, now param-float-aware. A fn whose
   -- return-expr is float ONLY because of float params (e.g. fb x y =
@@ -2600,7 +2603,13 @@ argf_scan node ar rmap acc =
   else if tg == "V" then
     let nm = head (tail node)
     let av = efind nm ar
-    if av != (0 - 1) && av >= 0 && av < 100 then argf_demote nm 0 (infer_arity_of nm ar) acc
+    if av != (0 - 1) && av >= 0 && av < 100 then
+      -- V-series Inc1: a named fn passed into a float-applying HOF param is
+      -- pre-seeded __hofpos_ + observed float; suppress the blanket value-ref
+      -- demotion so its float param survives (raw f64 bits already flow across
+      -- the blr correctly -- only the callee's fmov-vs-asr read was wrong).
+      if efind (cat ["__hofpos_", nm]) acc != (0 - 1) then acc
+      else argf_demote nm 0 (infer_arity_of nm ar) acc
     else acc
   else if tg == "O" then argf_scan (head (tail (tail (tail node)))) ar rmap (argf_scan (head (tail (tail node))) ar rmap acc)
   else if tg == "?" then argf_scan (head (tail (tail (tail node)))) ar rmap (argf_scan (head (tail (tail node))) ar rmap (argf_scan (head (tail node)) ar rmap acc))
@@ -2639,6 +2648,141 @@ collect_argf decls ar rmap acc =
     let d = head decls
     if head d == "fn" then collect_argf (tail decls) ar rmap (argf_scan (head (tail (tail (tail d)))) ar rmap acc)
     else collect_argf (tail decls) ar rmap acc
+
+-- ── V-series Inc1: higher-order float-param marking (native float_arr path) ──
+-- A named fn passed AS A VALUE into a float-consuming HOF position (e.g.
+-- `float_arr_map dbl xs`) must keep its float-param convention so the indirect
+-- blr reads/returns raw f64 bits (float_arr_get/set already use raw bits; the
+-- only break was the callee body compiling as int because nothing marked its
+-- param float). Bodies are TYPE-AGNOSTIC -- `x * x` is float iff x is float --
+-- so the signal comes from the APPLICATION CONTEXT: a param applied to a known
+-- float (float_arr_get a i) is float-consuming. We compute __hoff_<H>_<k> = how
+-- many leading float args param k of H is applied to (transitively through
+-- forwarders like float_arr_map -> fam_go, via a bounded fixpoint), then at
+-- value-ref sites seed __argf_<g>_i=2 for g's leading params + __hofpos_<g> to
+-- suppress the V-case demotion. The seed is one observation in the argf lub, so
+-- a genuine int direct-call site still joins it to 0 (sound for mixed/ill-typed).
+hoff_key h k = cat ["__hoff_", h, "_", show k]
+
+idx_of nm ps i =
+  if ps == [] then 0 - 1
+  else if head ps == nm then i
+  else idx_of nm (tail ps) (i + 1)
+
+hoff_max_set key m hofmap =
+  if efind key hofmap > m then hofmap else rmap_set key m hofmap
+
+-- count consecutive leading args that are statically float (empty env: float
+-- literals + float builtins like float_arr_get count; bare params do not).
+lead_float_count args =
+  if args == [] then 0
+  else if is_float (head args) [] then 1 + lead_float_count (tail args)
+  else 0
+
+-- contributions of one application (fn applied to args) inside H (params hps):
+-- (a) fn is a param of H applied to leading floats -> raise __hoff_H_<idx fn>.
+-- (b) any arg that is a param p of H passed at position j inherits __hoff_fn_j
+--     -> raise __hoff_H_<idx p> (transitive forwarding through global callees).
+hoff_app H hps fn args hofmap =
+  let pidx = idx_of fn hps 0
+  let m0 = if pidx >= 0 then hoff_max_set (hoff_key H pidx) (lead_float_count args) hofmap else hofmap
+  hoff_inherit H hps fn args 0 m0
+
+hoff_inherit H hps fn args j hofmap =
+  if args == [] then hofmap
+  else
+    let a = head args
+    let hm2 = if head a == "V" then
+                let q = idx_of (head (tail a)) hps 0
+                if q >= 0 then
+                  let m = efind (hoff_key fn j) hofmap
+                  if m > 0 then hoff_max_set (hoff_key H q) m hofmap else hofmap
+                else hofmap
+              else hofmap
+    hoff_inherit H hps fn (tail args) (j + 1) hm2
+
+hoff_scan H hps node hofmap =
+  let tg = head node
+  if tg == "A" then
+    let (fn, args) = flat node
+    hoff_scan_list H hps args (hoff_app H hps fn args hofmap)
+  else if tg == "O" then hoff_scan H hps (head (tail (tail (tail node)))) (hoff_scan H hps (head (tail (tail node))) hofmap)
+  else if tg == "?" then hoff_scan H hps (head (tail (tail (tail node)))) (hoff_scan H hps (head (tail (tail node))) (hoff_scan H hps (head (tail node)) hofmap))
+  else if tg == "D" || tg == "TD" then hoff_scan H hps (head (tail (tail (tail node)))) (hoff_scan H hps (head (tail (tail node))) hofmap)
+  else if tg == "L" || tg == "T" then hoff_scan_list H hps (head (tail node)) hofmap
+  else if tg == "M" then hoff_arms H hps (head (tail (tail node))) (hoff_scan H hps (head (tail node)) hofmap)
+  else if tg == "F" then hoff_scan H hps (head (tail (tail node))) hofmap
+  else hofmap
+
+hoff_scan_list H hps nodes hofmap =
+  if nodes == [] then hofmap
+  else hoff_scan_list H hps (tail nodes) (hoff_scan H hps (head nodes) hofmap)
+
+hoff_arms H hps arms hofmap =
+  if arms == [] then hofmap
+  else hoff_arms H hps (tail arms) (hoff_scan H hps (head (tail (tail (head arms)))) hofmap)
+
+hoff_pass decls hofmap =
+  if decls == [] then hofmap
+  else
+    let d = head decls
+    if head d == "fn" then hoff_pass (tail decls) (hoff_scan (head (tail d)) (head (tail (tail d))) (head (tail (tail (tail d)))) hofmap)
+    else hoff_pass (tail decls) hofmap
+
+hoff_fix decls hofmap n =
+  if n <= 0 then hofmap
+  else hoff_fix decls (hoff_pass decls hofmap) (n - 1)
+
+-- seed float-param markers for g (leading m params) + __hofpos_<g>.
+seed_float_fn g m ar acc =
+  let av = efind g ar
+  if av == (0 - 1) || av < 0 || av >= 100 then acc
+  else seed_params g m 0 (cons (cat ["__hofpos_", g], 1) acc)
+
+seed_params g m k acc =
+  if k >= m then acc
+  else seed_params g m (k + 1) (rmap_set (argf_key g k) 2 acc)
+
+-- at a call `fn arg0 arg1 ...`: any arg that is a named fn g passed into a
+-- float-consuming position (__hoff_fn_j > 0) gets g's leading params seeded.
+hofpos_obs fn args j ar hofmap acc =
+  if args == [] then acc
+  else
+    let a = head args
+    let m = efind (hoff_key fn j) hofmap
+    let acc1 = if m > 0 && head a == "V" then seed_float_fn (head (tail a)) m ar acc else acc
+    hofpos_obs fn (tail args) (j + 1) ar hofmap acc1
+
+hofpos_scan node ar hofmap acc =
+  let tg = head node
+  if tg == "A" then
+    let (fn, args) = flat node
+    hofpos_scan_list args ar hofmap (hofpos_obs fn args 0 ar hofmap acc)
+  else if tg == "O" then hofpos_scan (head (tail (tail (tail node)))) ar hofmap (hofpos_scan (head (tail (tail node))) ar hofmap acc)
+  else if tg == "?" then hofpos_scan (head (tail (tail (tail node)))) ar hofmap (hofpos_scan (head (tail (tail node))) ar hofmap (hofpos_scan (head (tail node)) ar hofmap acc))
+  else if tg == "D" || tg == "TD" then hofpos_scan (head (tail (tail (tail node)))) ar hofmap (hofpos_scan (head (tail (tail node))) ar hofmap acc)
+  else if tg == "L" || tg == "T" then hofpos_scan_list (head (tail node)) ar hofmap acc
+  else if tg == "M" then hofpos_arms (head (tail (tail node))) ar hofmap (hofpos_scan (head (tail node)) ar hofmap acc)
+  else if tg == "F" then hofpos_scan (head (tail (tail node))) ar hofmap acc
+  else acc
+
+hofpos_scan_list nodes ar hofmap acc =
+  if nodes == [] then acc
+  else hofpos_scan_list (tail nodes) ar hofmap (hofpos_scan (head nodes) ar hofmap acc)
+
+hofpos_arms arms ar hofmap acc =
+  if arms == [] then acc
+  else hofpos_arms (tail arms) ar hofmap (hofpos_scan (head (tail (tail (head arms)))) ar hofmap acc)
+
+-- value-ref seed pass: compute the HOF-signature fixpoint, then scan all bodies.
+collect_hofpos decls ar = hofpos_decls decls ar (hoff_fix decls [] 6) []
+
+hofpos_decls decls ar hofmap acc =
+  if decls == [] then acc
+  else
+    let d = head decls
+    if head d == "fn" then hofpos_decls (tail decls) ar hofmap (hofpos_scan (head (tail (tail (tail d)))) ar hofmap acc)
+    else hofpos_decls (tail decls) ar hofmap acc
 
 -- compile_func hook: mark param p __float_ when __argf_<fn>_<i> proved all-sites-float.
 -- Mark a param float (slot==2, all sites float) OR int (slot==1, all sites int -> scvtf-promote
