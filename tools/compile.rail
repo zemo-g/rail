@@ -2344,10 +2344,10 @@ get_arities decls =
   let ret_markers = infer_return_types decls base_ar
   let full_ar = append ret_markers base_ar
   -- Increment A: whole-call-site float-param agreement (additive __argf_ markers).
-  -- V-series Inc1: seed float-param markers for value-referenced float-bodied fns
-  -- (higher-order float path: float_arr_map dbl, etc.) before the call-site lub.
-  let hof_seed = collect_hofpos decls full_ar
-  let argf_markers = collect_argf_fix decls full_ar ret_markers hof_seed 6
+  -- V-series Inc1/Inc3: collect_argf_unified couples the HOF-float seed
+  -- (collect_hofpos: float_arr_map dbl, fold reduce-fns) with the call-site lub in
+  -- a two-round fixpoint so fold accumulators feed the reduce-fn float marking (#41).
+  let argf_markers = collect_argf_unified decls full_ar ret_markers
   let ar_with_argf = append argf_markers full_ar
   -- C4-fix: third float-return pass, now param-float-aware. A fn whose
   -- return-expr is float ONLY because of float params (e.g. fb x y =
@@ -2590,12 +2590,23 @@ argf_obs_args fname args i ar rmap acc =
   else
     let a = head args
     let t = infer_ty a ar rmap
-    -- Skip recording an UNRESOLVED bare-variable arg (a param not yet proven
-    -- float/int by the penv fixpoint). Recording it as 0 would poison the lub
-    -- permanently (argf_join 0 anything = 0), blocking multi-hop float
-    -- propagation. Non-V unknowns (call-returns, _expr) still record 0 ->
-    -- conservative demote, preserving the prior mixed-type soundness exactly.
-    let acc2 = if head a == "V" && t == 0 then acc else argf_set fname i t acc
+    -- Abstain (don't record) on an UNRESOLVED arg whose type can't be known yet
+    -- WITHOUT poisoning the lub (argf_join 0 x = 0 permanently). Two shapes:
+    --  (1) a bare param V -- its float/int comes from the penv fixpoint (#42); and
+    --  (2) an application `(g ...)` of a HIGHER-ORDER param g (g not a global fn) --
+    --      its return type is the passed-in fn's, only knowable once the param is
+    --      typed. This is the fold self-update `faf_go f (f acc (get a i)) ...`:
+    --      recording 0 there demotes the accumulator slot that the initial-value
+    --      observation (float z) set to 2, and the accumulator never gets float-
+    --      marked (the #41 fold gap). The slot's real type still comes from the
+    --      caller's z; genuine global-fn returns / _expr / IIFEs still record 0
+    --      (conservative demote), preserving prior mixed-type soundness.
+    let bare_v = head a == "V" && t == 0
+    let hoparam_app = if head a == "A" && t == 0 then
+                        let (g, gargs) = flat a
+                        g != "_expr" && efind g ar == (0 - 1)
+                      else false
+    let acc2 = if bare_v || hoparam_app then acc else argf_set fname i t acc
     argf_obs_args fname (tail args) (i + 1) ar rmap acc2
 
 argf_call fname args ar rmap acc =
@@ -2688,6 +2699,23 @@ collect_argf_fix decls ar rmap acc n =
   if n <= 0 then acc
   else collect_argf_fix decls ar rmap (collect_argf decls (append acc ar) rmap acc) (n - 1)
 
+-- V-series Inc3 (#41): two-round unified float-dataflow seed. collect_hofpos (HOF
+-- seed) and collect_argf (call-site lub) are mutually dependent for folds: the
+-- accumulator's float-ness comes from collect_argf (__argf_faf_go_acc=2 via #42
+-- multi-hop from the 0.0 literal), but collect_hofpos's penv-aware lead_float_count
+-- must SEE that to mark the reduce-fn param float (__hoff_faf_go_f) and seed the
+-- passed-in reduce fn (addf/maxf). Round 1 establishes the accumulator; round 2's
+-- collect_hofpos picks it up (penv = append argf1 ar) and seeds the reduce fn;
+-- round 2's argf folds it in. Two rounds = exactly the hofpos<->argf cycle depth
+-- (forwarding depth is handled WITHIN each collect_hofpos by hoff_fix's 6 iters).
+-- For programs with no float HOFs (compile.rail itself) round 2 == round 1, so the
+-- emitted binary is byte-identical -- the self-host fixed point is preserved.
+collect_argf_unified decls ar rmap =
+  let hof1 = collect_hofpos decls ar
+  let argf1 = collect_argf_fix decls ar rmap hof1 6
+  let hof2 = collect_hofpos decls (append argf1 ar)
+  collect_argf_fix decls ar rmap hof2 6
+
 -- ── V-series Inc1: higher-order float-param marking (native float_arr path) ──
 -- A named fn passed AS A VALUE into a float-consuming HOF position (e.g.
 -- `float_arr_map dbl xs`) must keep its float-param convention so the indirect
@@ -2711,20 +2739,22 @@ idx_of nm ps i =
 hoff_max_set key m hofmap =
   if efind key hofmap > m then hofmap else rmap_set key m hofmap
 
--- count consecutive leading args that are statically float (empty env: float
--- literals + float builtins like float_arr_get count; bare params do not).
-lead_float_count args =
+-- count consecutive leading args that are statically float. penv carries the
+-- enclosing fn's float params (`__float_<p>`, derived from __argf slots): WITHOUT
+-- it a fold's `f acc (get a i)` sees acc (a bare param) as non-float -> stops at 0
+-- -> the reduce-fn f is never marked float-consuming (the #41 fold-acc gap).
+lead_float_count args penv =
   if args == [] then 0
-  else if is_float (head args) [] then 1 + lead_float_count (tail args)
+  else if is_float (head args) penv then 1 + lead_float_count (tail args) penv
   else 0
 
 -- contributions of one application (fn applied to args) inside H (params hps):
 -- (a) fn is a param of H applied to leading floats -> raise __hoff_H_<idx fn>.
 -- (b) any arg that is a param p of H passed at position j inherits __hoff_fn_j
 --     -> raise __hoff_H_<idx p> (transitive forwarding through global callees).
-hoff_app H hps fn args hofmap =
+hoff_app H hps penv fn args hofmap =
   let pidx = idx_of fn hps 0
-  let m0 = if pidx >= 0 then hoff_max_set (hoff_key H pidx) (lead_float_count args) hofmap else hofmap
+  let m0 = if pidx >= 0 then hoff_max_set (hoff_key H pidx) (lead_float_count args penv) hofmap else hofmap
   hoff_inherit H hps fn args 0 m0
 
 hoff_inherit H hps fn args j hofmap =
@@ -2740,37 +2770,57 @@ hoff_inherit H hps fn args j hofmap =
               else hofmap
     hoff_inherit H hps fn (tail args) (j + 1) hm2
 
-hoff_scan H hps node hofmap =
+hoff_scan H hps penv node hofmap =
   let tg = head node
   if tg == "A" then
     let (fn, args) = flat node
-    hoff_scan_list H hps args (hoff_app H hps fn args hofmap)
-  else if tg == "O" then hoff_scan H hps (head (tail (tail (tail node)))) (hoff_scan H hps (head (tail (tail node))) hofmap)
-  else if tg == "?" then hoff_scan H hps (head (tail (tail (tail node)))) (hoff_scan H hps (head (tail (tail node))) (hoff_scan H hps (head (tail node)) hofmap))
-  else if tg == "D" || tg == "TD" then hoff_scan H hps (head (tail (tail (tail node)))) (hoff_scan H hps (head (tail (tail node))) hofmap)
-  else if tg == "L" || tg == "T" then hoff_scan_list H hps (head (tail node)) hofmap
-  else if tg == "M" then hoff_arms H hps (head (tail (tail node))) (hoff_scan H hps (head (tail node)) hofmap)
-  else if tg == "F" then hoff_scan H hps (head (tail (tail node))) hofmap
+    hoff_scan_list H hps penv args (hoff_app H hps penv fn args hofmap)
+  else if tg == "O" then hoff_scan H hps penv (head (tail (tail (tail node)))) (hoff_scan H hps penv (head (tail (tail node))) hofmap)
+  else if tg == "?" then hoff_scan H hps penv (head (tail (tail (tail node)))) (hoff_scan H hps penv (head (tail (tail node))) (hoff_scan H hps penv (head (tail node)) hofmap))
+  else if tg == "D" || tg == "TD" then hoff_scan H hps penv (head (tail (tail (tail node)))) (hoff_scan H hps penv (head (tail (tail node))) hofmap)
+  else if tg == "L" || tg == "T" then hoff_scan_list H hps penv (head (tail node)) hofmap
+  else if tg == "M" then hoff_arms H hps penv (head (tail (tail node))) (hoff_scan H hps penv (head (tail node)) hofmap)
+  else if tg == "F" then hoff_scan H hps penv (head (tail (tail node))) hofmap
   else hofmap
 
-hoff_scan_list H hps nodes hofmap =
+hoff_scan_list H hps penv nodes hofmap =
   if nodes == [] then hofmap
-  else hoff_scan_list H hps (tail nodes) (hoff_scan H hps (head nodes) hofmap)
+  else hoff_scan_list H hps penv (tail nodes) (hoff_scan H hps penv (head nodes) hofmap)
 
-hoff_arms H hps arms hofmap =
+hoff_arms H hps penv arms hofmap =
   if arms == [] then hofmap
-  else hoff_arms H hps (tail arms) (hoff_scan H hps (head (tail (tail (head arms)))) hofmap)
+  else hoff_arms H hps penv (tail arms) (hoff_scan H hps penv (head (tail (tail (head arms)))) hofmap)
 
-hoff_pass decls hofmap =
+-- penv = enclosing fn's float-param env from already-known __argf slots (the #41
+-- coupling: collect_argf's accumulator-float discovery feeds back into the HOF seed).
+-- PERF: penv depends only on `ar`, which is CONSTANT within one collect_hofpos, so
+-- it is invariant across the hoff_fix iterations. Precompute it ONCE per decl via
+-- penv_list and thread the aligned list through, rather than recomputing it on every
+-- one of the 6 passes. The old per-pass recompute (a full-`ar` efind walk per param,
+-- each allocating cat/cons keys) was a ~6x marking-phase blowup + GC thrash that made
+-- the self-compile run >90 min. Marking RESULTS are byte-identical -- penv_list yields
+-- the same penv mark_argf_params produced inline; this only removes redundant work.
+penv_list decls ar =
+  if decls == [] then []
+  else
+    let d = head decls
+    if head d == "fn" then cons (mark_argf_params (head (tail (tail d))) (head (tail d)) ar [] 0) (penv_list (tail decls) ar)
+    else cons [] (penv_list (tail decls) ar)
+
+hoff_pass decls penvs hofmap =
   if decls == [] then hofmap
   else
     let d = head decls
-    if head d == "fn" then hoff_pass (tail decls) (hoff_scan (head (tail d)) (head (tail (tail d))) (head (tail (tail (tail d)))) hofmap)
-    else hoff_pass (tail decls) hofmap
+    if head d == "fn" then
+      let nm = head (tail d)
+      let ps = head (tail (tail d))
+      let bd = head (tail (tail (tail d)))
+      hoff_pass (tail decls) (tail penvs) (hoff_scan nm ps (head penvs) bd hofmap)
+    else hoff_pass (tail decls) (tail penvs) hofmap
 
-hoff_fix decls hofmap n =
+hoff_fix decls penvs hofmap n =
   if n <= 0 then hofmap
-  else hoff_fix decls (hoff_pass decls hofmap) (n - 1)
+  else hoff_fix decls penvs (hoff_pass decls penvs hofmap) (n - 1)
 
 -- seed float-param markers for g (leading m params) + __hofpos_<g>.
 seed_float_fn g m ar acc =
@@ -2814,7 +2864,9 @@ hofpos_arms arms ar hofmap acc =
   else hofpos_arms (tail arms) ar hofmap (hofpos_scan (head (tail (tail (head arms)))) ar hofmap acc)
 
 -- value-ref seed pass: compute the HOF-signature fixpoint, then scan all bodies.
-collect_hofpos decls ar = hofpos_decls decls ar (hoff_fix decls [] 6) []
+collect_hofpos decls ar =
+  let penvs = penv_list decls ar
+  hofpos_decls decls ar (hoff_fix decls penvs [] 6) []
 
 hofpos_decls decls ar hofmap acc =
   if decls == [] then acc
