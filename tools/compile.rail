@@ -3771,6 +3771,65 @@ mc_sweep nm rstages j incoming =
     let ctname = cat ["__ct", show (j - 1)]
     ["D", ctname, pushexpr, mc_sweep nm (tail rstages) (j - 1) ctname]
 
+-- mcr_chain: like mc_chain but the terminal is a dot-product READOUT
+--   float_arr_sum (float_arr_map2 gmul w z)   (w = 2nd param, z = last map binding, gmul a "V").
+-- Collects the SAME [bind,G,src] map stages (>=1); the readout fn name is pulled by mcr_gmul.
+-- Returns [] unless the whole body is exactly a linear map-chain ending in that readout.
+mcr_chain body prevsrc wname =
+  if head body != "D" then []
+  else
+    let bn = head (tail body)
+    let bval = head (tail (tail body))
+    let brest = head (tail (tail (tail body)))
+    let (vfn, vargs) = flat bval
+    if vfn != "float_arr_map" then []
+    else if length vargs != 2 then []
+    else if head (head vargs) != "V" then []
+    else if head (head (tail vargs)) != "V" then []
+    else if head (tail (head (tail vargs))) != prevsrc then []
+    else
+      let gname = head (tail (head vargs))
+      let stage = [bn, gname, prevsrc]
+      if head brest == "D" then
+        let more = mcr_chain brest bn wname
+        if more == [] then [] else cons stage more
+      else
+        let (rfn, rargs) = flat brest
+        if rfn != "float_arr_sum" then []
+        else if length rargs != 1 then []
+        else
+          let inner = head rargs
+          let (ifn, iargs) = flat inner
+          if ifn != "float_arr_map2" then []
+          else if length iargs != 3 then []
+          else if head (head iargs) != "V" then []
+          else if head (head (tail iargs)) != "V" then []
+          else if head (head (tail (tail iargs))) != "V" then []
+          else if head (tail (head (tail iargs))) != wname then []
+          else if head (tail (head (tail (tail iargs)))) != bn then []
+          else cons stage []
+
+-- mcr_gmul: pull the readout's binary fn name from the (already validated) chain-readout terminal.
+mcr_gmul body =
+  if head body != "D" then ""
+  else
+    let brest = head (tail (tail (tail body)))
+    if head brest == "D" then mcr_gmul brest
+    else
+      let (rfn, rargs) = flat brest
+      if rfn != "float_arr_sum" then ""
+      else
+        let inner = head rargs
+        let (ifn, iargs) = flat inner
+        if ifn != "float_arr_map2" then ""
+        else if length iargs != 3 then ""
+        else if head (head iargs) != "V" then ""
+        else head (tail (head iargs))
+
+detect_chain_readout body params =
+  if length params != 2 then false
+  else (mcr_chain body (head params) (head (tail params))) != []
+
 synth_grad_decls marks decls =
   if marks == [] then []
   else
@@ -3853,6 +3912,36 @@ synth_grad_decls marks decls =
           let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", xsname]]], ["V", "__gy"]]
           let rmapfn = ["fn", cat [nm, "__rgrad"], append params ["__gy"], bcast]
           cons rmapfn rest
+        else if detect_chain_readout body params then
+          -- V5 slice 3 (contraction readout on the map-chain): a linear map-chain feeding a
+          -- dot-product readout  L = sum_i g(w_i, z_i)  (z = last map binding, w = 2nd param,
+          -- g #grad-marked binary fn e.g. mul).  rgrad takes (..params.., __gy, __wrt) and returns
+          -- the gradient w.r.t. PARAM __wrt:  __wrt=0 -> dL/dxs (seed cot(z) = dg/dz . __gy, then
+          -- thread back through every map); else -> dL/dw (= dg/dw . __gy).  Reuses V4's ga/gb/scl
+          -- contraction reverse and slice-2's mc_reltfns/mc_primals/mc_sweep.  m>=1 (m=0 is V4).
+          let stages = mcr_chain body (head params) (head (tail params))
+          let m = length stages
+          let wname = head (tail params)
+          let gmul = mcr_gmul body
+          let zname = head (head (reverse stages))
+          let reltfns = mc_reltfns nm stages 0
+          let gaderiv = ["A", ["A", ["A", ["V", cat [gmul, "__grad"]], ["V", "__va"]], ["V", "__vb"]], ["I", "0"]]
+          let gbderiv = ["A", ["A", ["A", ["V", cat [gmul, "__grad"]], ["V", "__va"]], ["V", "__vb"]], ["I", "1"]]
+          let gafn = ["fn", cat [nm, "__rgrad_ga"], ["__va", "__vb"], gaderiv]
+          let gbfn = ["fn", cat [nm, "__rgrad_gb"], ["__va", "__vb"], gbderiv]
+          let sclfn = ["fn", cat [nm, "__rgrad_scl"], ["__vp", "__vc"], ["O", "*", ["V", "__vp"], ["V", "__vc"]]]
+          let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", wname]]], ["V", "__gy"]]
+          let pa = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_ga"]]], ["V", wname]], ["V", zname]]
+          let pb = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_gb"]]], ["V", wname]], ["V", zname]]
+          let dw = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_scl"]]], pa], bcast]
+          let ctz = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_scl"]]], pb], bcast]
+          let seedname = cat ["__ct", show (m - 1)]
+          let sweepbody = mc_sweep nm (reverse stages) (m - 1) seedname
+          let dxs = ["D", seedname, ctz, sweepbody]
+          let guard = ["O", "==", ["V", "__wrt"], ["I", "0"]]
+          let rbody = mc_primals stages ["?", guard, dxs, dw]
+          let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy", "__wrt"], rbody]
+          append reltfns (cons gafn (cons gbfn (cons sclfn (cons rgfn rest))))
         else if detect_map_chain body params then
           -- V5 slice 2 (array reverse-mode let-spine walker): a strict linear map-chain ending in
           -- a sum. Forward primals re-materialize each map input; the scalar upstream __gy is
