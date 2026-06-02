@@ -3692,31 +3692,84 @@ grad_chain ps body idx =
     let guard = ["O", "==", ["V", "__gi"], ["I", show idx]]
     ["?", guard, grad_deriv body (head ps) [], grad_chain (tail ps) body (idx + 1)]
 
--- V5 slice 1: detect  g xs = let m = float_arr_map G xs in float_arr_sum m  (single array
--- param, G a #grad-marked unary fn) -- a 2-node array let-DAG (map then sum). The let merely
--- NAMES the map result, so the VJP equals the V3 nested form (is_sum_map_v). detect crash-safely:
--- head/tail on a non-D or short body degrade to 0/[] via runtime safety, so it is sound to call
--- on any body and returns false for everything but this exact shape.
-detect_let_sum_map body params =
-  if head body != "D" then false
-  else if length params != 1 then false
+-- V5 slice 2: the array reverse-mode let-spine walker (cotangent threading). Recognizes a STRICT
+-- linear map-chain ending in a sum:
+--     g xs = let a0 = float_arr_map G0 xs in let a1 = float_arr_map G1 a0 in ...
+--            let a{m-1} = float_arr_map G{m-1} a{m-2} in float_arr_sum a{m-1}
+-- single array param; each Gj a #grad-marked unary fn; each stage's source is the PREVIOUS binding
+-- (the param for the first), so there is no fan-out -- exactly one cotangent per name -- and the
+-- reverse sweep is exact. m=1 is the slice-1 map-then-sum case, now subsumed. Loss L = sum a{m-1};
+-- reverse mode seeds a{m-1}'s array cotangent as the broadcast of the scalar upstream __gy, then
+-- threads it back through each map (diagonal Jacobian: cot(source_j) = Gj'(source_j) .* cot(a_j)).
+
+-- mc_chain: validate the spine is a strict linear map-chain and collect stages [[bind,G,src],...]
+-- in forward order, or [] if the body is not exactly this shape. prevsrc = the name the next
+-- binding's source must equal. Crash-safe: head/tail on a non-D or short node degrade to 0/[] via
+-- runtime safety, so it is sound to call on any body.
+mc_chain body prevsrc =
+  if head body != "D" then []
   else
     let bn = head (tail body)
     let bval = head (tail (tail body))
-    let bret = head (tail (tail (tail body)))
-    if head bret == "D" then false
+    let brest = head (tail (tail (tail body)))
+    let (vfn, vargs) = flat bval
+    if vfn != "float_arr_map" then []
+    else if length vargs != 2 then []
+    else if head (head vargs) != "V" then []
+    else if head (head (tail vargs)) != "V" then []
+    else if head (tail (head (tail vargs))) != prevsrc then []
     else
-      let (vfn, vargs) = flat bval
-      let (rfn, rargs) = flat bret
-      if vfn != "float_arr_map" then false
-      else if length vargs != 2 then false
-      else if head (head vargs) != "V" then false
-      else if head (head (tail vargs)) != "V" then false
-      else if head (tail (head (tail vargs))) != head params then false
-      else if rfn != "float_arr_sum" then false
-      else if length rargs != 1 then false
-      else if head (head rargs) != "V" then false
-      else head (tail (head rargs)) == bn
+      let gname = head (tail (head vargs))
+      let stage = [bn, gname, prevsrc]
+      if head brest == "D" then
+        let more = mc_chain brest bn
+        if more == [] then [] else cons stage more
+      else
+        let (rfn, rargs) = flat brest
+        if rfn != "float_arr_sum" then []
+        else if length rargs != 1 then []
+        else if head (head rargs) != "V" then []
+        else if head (tail (head rargs)) != bn then []
+        else cons stage []
+
+detect_map_chain body params =
+  if length params != 1 then false
+  else (mc_chain body (head params)) != []
+
+-- mc_reltfns: one reverse-elt helper per stage:  nm__rgrad_eltJ __vx __vc = (GJ__grad __vx 0) *. __vc
+mc_reltfns nm stages idx =
+  if stages == [] then []
+  else
+    let st = head stages
+    let gname = head (tail st)
+    let gderiv = ["A", ["A", ["V", cat [gname, "__grad"]], ["V", "__vx"]], ["I", "0"]]
+    let f = ["fn", cat [nm, "__rgrad_elt", show idx], ["__vx", "__vc"], ["O", "*", gderiv, ["V", "__vc"]]]
+    cons f (mc_reltfns nm (tail stages) (idx + 1))
+
+-- mc_primals: wrap inner with the forward primal lets (re-materialize each map result that is an
+-- INPUT to a later stage). Caller passes stages MINUS the last (the last binding is only summed).
+mc_primals stages inner =
+  if stages == [] then inner
+  else
+    let st = head stages
+    let bn = head st
+    let gname = head (tail st)
+    let src = head (tail (tail st))
+    let mapexpr = ["A", ["A", ["V", "float_arr_map"], ["V", gname]], ["V", src]]
+    ["D", bn, mapexpr, mc_primals (tail stages) inner]
+
+-- mc_sweep: the reverse cotangent sweep. rstages = stages in REVERSE forward-order. For stage j>0
+-- bind __ct{j-1} = float_arr_map2 nm__rgrad_elt{j} src_j incoming ; for stage 0 RETURN that map2
+-- (= cotangent of xs = dL/dxs). incoming names the cotangent of a_j flowing in.
+mc_sweep nm rstages j incoming =
+  let st = head rstages
+  let src = head (tail (tail st))
+  let eltname = cat [nm, "__rgrad_elt", show j]
+  let pushexpr = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", eltname]], ["V", src]], ["V", incoming]]
+  if j == 0 then pushexpr
+  else
+    let ctname = cat ["__ct", show (j - 1)]
+    ["D", ctname, pushexpr, mc_sweep nm (tail rstages) (j - 1) ctname]
 
 synth_grad_decls marks decls =
   if marks == [] then []
@@ -3800,19 +3853,23 @@ synth_grad_decls marks decls =
           let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", xsname]]], ["V", "__gy"]]
           let rmapfn = ["fn", cat [nm, "__rgrad"], append params ["__gy"], bcast]
           cons rmapfn rest
-        else if detect_let_sum_map body params then
-          -- V5 slice 1 (array let-DAG, map-then-sum):  g xs = let m = float_arr_map G xs in
-          -- float_arr_sum m.  The let names the map result; the VJP is identical to the V3
-          -- nested form, emitted here with the let seen through (oracle = the nested gn__rgrad).
-          let bval = head (tail (tail body))
-          let (vfn, vargs) = flat bval
-          let gname = head (tail (head vargs))
+        else if detect_map_chain body params then
+          -- V5 slice 2 (array reverse-mode let-spine walker): a strict linear map-chain ending in
+          -- a sum. Forward primals re-materialize each map input; the scalar upstream __gy is
+          -- broadcast to the last binding's cotangent, then threaded back through every map
+          -- (diagonal-Jacobian VJP) to xs. m=1 reduces exactly to slice 1.
+          let stages = mc_chain body (head params)
+          let m = length stages
           let xsname = head params
-          let gderiv = ["A", ["A", ["V", cat [gname, "__grad"]], ["V", "__vx"]], ["I", "0"]]
-          let reltfn = ["fn", cat [nm, "__rgrad_elt"], ["__vx", "__vc"], ["O", "*", gderiv, ["V", "__vc"]]]
+          let reltfns = mc_reltfns nm stages 0
+          let primals_init = reverse (tail (reverse stages))
+          let seedname = cat ["__ct", show (m - 1)]
           let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", xsname]]], ["V", "__gy"]]
-          let rmapfn = ["fn", cat [nm, "__rgrad"], append params ["__gy"], ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_elt"]]], ["V", xsname]], bcast]]
-          cons reltfn (cons rmapfn rest)
+          let sweepbody = mc_sweep nm (reverse stages) (m - 1) seedname
+          let fullsweep = ["D", seedname, bcast, sweepbody]
+          let rbody = mc_primals primals_init fullsweep
+          let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy"], rbody]
+          append reltfns (cons rgfn rest)
         else
           let gfn = ["fn", cat [nm, "__grad"], append params ["__gi"], grad_chain params body 0]
           if grad_rev_supported body && grad_rev_names_ok params body then
