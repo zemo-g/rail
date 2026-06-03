@@ -3870,23 +3870,98 @@ lc_chain body prevsrc =
           else if head (tail (head rargs)) != bn then []
           else cons stage []
 
--- detect_layer_chain (slice 5a, fixed depth 2): a #grad net  net W1 W2 x  whose body is
--- exactly two layer stages feeding a sum readout. params = [W1, W2, x] (the L weights then
--- the input x, x last). Requires the two collected stage weights to be params[0]/params[1]
--- in order, so __wrt=k cleanly selects dL/d(params[k]). Mutually exclusive from the
--- slice-2/3/4 walkers by param count (3 vs 1/2) and the matvec-app disambiguator above.
-detect_layer_chain body params =
-  if length params != 3 then false
+-- lc_last: the final element of a non-empty list (the input x, last in params).
+lc_last lst =
+  if (tail lst) == [] then head lst
+  else lc_last (tail lst)
+
+-- lc_wmatch: each collected stage's weight (stage[2]) equals the positional param.
+-- Walks stages and params together; the one leftover param is the input x.
+lc_wmatch stages params =
+  if stages == [] then true
   else
-    let xin = head (tail (tail params))
+    let w = head (tail (tail (head stages)))
+    if w != head params then false
+    else lc_wmatch (tail stages) (tail params)
+
+-- detect_layer_chain (slice 5b, general depth L): a #grad net  net W1 .. WL x  whose
+-- body is L layer stages feeding a sum readout. params = [W1,..,WL, x] (the L weights
+-- then the input x, x last); there are L+1 params and L stages, with stage[k].weight =
+-- params[k] in order so __wrt=k selects dL/d(params[k]) and __wrt=L selects dL/dx.
+-- Mutually exclusive from the slice-2/3/4 walkers by the matvec-app map disambiguator
+-- in lc_chain plus the (#stages == #params - 1) shape. L=1 reduces to the slice-4 grad.
+detect_layer_chain body params =
+  if length params < 2 then false
+  else
+    let xin = lc_last params
     let stages = lc_chain body xin
-    if length stages != 2 then false
+    if stages == [] then false
+    else if length stages != ((length params) - 1) then false
+    else lc_wmatch stages params
+
+-- ---- slice-5b reverse-AST builders (one stage per layer; reused for any depth L) ----
+-- All names are fixed prefixes (__z{k}/__h{k}/__ctz{k}/__cth{k}/__cty), so only nm and
+-- the input var xin vary. Each returns a list of [name, valAST] let-bindings (or the fn
+-- list / selector). Hand-checked to emit BYTE-IDENTICAL output to slice 5a at L=2.
+
+-- lc_actfn_go: per-stage act-deriv elt helper  \__vz __vc -> (act__grad __vz 0) *. __vc
+lc_actfn_go nm stages i =
+  if stages == [] then []
+  else
+    let act = head (tail (head stages))
+    let actd = ["A", ["A", ["V", cat [act, "__grad"]], ["V", "__vz"]], ["I", "0"]]
+    let fn = ["fn", cat [nm, "__rgrad_act", show i], ["__vz", "__vc"], ["O", "*", actd, ["V", "__vc"]]]
+    cons fn (lc_actfn_go nm (tail stages) (i + 1))
+
+-- lc_fwd_go: forward primals  __z{k} = float_mat_vec W prev ; __h{k} = float_arr_map act
+-- __z{k}  (the last layer emits only __z{L}; its __h is never needed -- readout reseeds).
+lc_fwd_go stages i prev =
+  if stages == [] then []
+  else
+    let st = head stages
+    let act = head (tail st)
+    let w = head (tail (tail st))
+    let znm = cat ["__z", show (i + 1)]
+    let ze = ["A", ["A", ["V", "float_mat_vec"], ["V", w]], prev]
+    if (tail stages) == [] then cons [znm, ze] []
     else
-      let s0 = head stages
-      let s1 = head (tail stages)
-      if head (tail (tail s0)) != head params then false
-      else if head (tail (tail s1)) != head (tail params) then false
-      else true
+      let hnm = cat ["__h", show (i + 1)]
+      let he = ["A", ["A", ["V", "float_arr_map"], ["V", act]], ["V", znm]]
+      cons [znm, ze] (cons [hnm, he] (lc_fwd_go (tail stages) (i + 1) ["V", hnm]))
+
+-- lc_rev_go: reverse sweep over rstages = reverse stages, i from L-1 downto 0.
+-- __ctz{i+1} = float_arr_map2 nm__rgrad_act{i} __z{i+1} upstream ; then (for i>0) the
+-- upstream into the layer below  __cth{i} = float_mat_vec_t W __ctz{i+1}.
+lc_rev_go nm rstages i upstream =
+  if rstages == [] then []
+  else
+    let st = head rstages
+    let w = head (tail (tail st))
+    let ctznm = cat ["__ctz", show (i + 1)]
+    let znm = cat ["__z", show (i + 1)]
+    let ctze = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_act", show i]]], ["V", znm]], upstream]
+    if i == 0 then cons [ctznm, ctze] []
+    else
+      let cthnm = cat ["__cth", show i]
+      let cthe = ["A", ["A", ["V", "float_mat_vec_t"], ["V", w]], ["V", ctznm]]
+      cons [ctznm, ctze] (cons [cthnm, cthe] (lc_rev_go nm (tail rstages) (i - 1) ["V", cthnm]))
+
+-- lc_sel_go: the __wrt if-chain.  __wrt=k -> dW{k+1} = float_outer __ctz{k+1} in{k+1}
+-- (in1 = x, in{k+1} = __h{k}) ; fallthrough __wrt=L -> dx = float_mat_vec_t W1 __ctz1.
+lc_sel_go w0 xin stages k =
+  if stages == [] then ["A", ["A", ["V", "float_mat_vec_t"], ["V", w0]], ["V", "__ctz1"]]
+  else
+    let ink = if k == 0 then ["V", xin] else ["V", cat ["__h", show k]]
+    let dwe = ["A", ["A", ["V", "float_outer"], ["V", cat ["__ctz", show (k + 1)]]], ink]
+    let g = ["O", "==", ["V", "__wrt"], ["I", show k]]
+    ["?", g, dwe, lc_sel_go w0 xin (tail stages) (k + 1)]
+
+-- lc_mk_lets: fold a [name,valAST] binding list into nested ["D",name,val,body] lets.
+lc_mk_lets binds final =
+  if binds == [] then final
+  else
+    let b = head binds
+    ["D", head b, head (tail b), lc_mk_lets (tail binds) final]
 
 -- mv_act: recognize the matvec-layer LET-form
 --   f W x = let z = float_mat_vec W x in float_arr_sum (float_arr_map act z)
@@ -4009,41 +4084,28 @@ synth_grad_decls marks decls =
           let rmapfn = ["fn", cat [nm, "__rgrad"], append params ["__gy"], bcast]
           cons rmapfn rest
         else if detect_layer_chain body params then
-          -- V5 slice 5a (whole-net, fixed depth 2):  net W1 W2 x =
-          --   let h1 = float_arr_map act1 (float_mat_vec W1 x) in
-          --   let y  = float_arr_map act2 (float_mat_vec W2 h1) in float_arr_sum y
-          -- Two dense layers (flat row-major weights) + sum readout. The reverse
-          -- re-materializes the forward primals, seeds the terminal cotangent
-          -- (d(sum y)/dy = broadcast __gy), and sweeps back: ct_z_k = act_k'(z_k) .* up;
-          -- per-layer dW = outer(ct_z, in) and the upstream input cotangent = W^T . ct_z
-          -- (the slice-4 atoms). __wrt selects 0 -> dL/dW1, 1 -> dL/dW2, 2 -> dL/dx.
-          -- The emitted body is exactly the hand-written net__rgrad the oracle validates.
-          let xin = head (tail (tail params))
+          -- V5 slice 5b (whole-net, general depth L):  net W1 .. WL x =
+          --   let h1 = float_arr_map act1 (float_mat_vec W1 x) in ... in float_arr_sum hL
+          -- L dense layers (flat row-major weights) + sum readout. Synthesizes ONE
+          -- net__rgrad W1 .. WL x __gy __wrt that re-materializes the forward primals,
+          -- seeds the terminal cotangent (d(sum)/d = broadcast __gy), and sweeps back:
+          -- ct_z_k = act_k'(z_k) .* upstream ; per-layer dW_k = outer(ct_z_k, in_k) and
+          -- the upstream input cotangent = W_k^T . ct_z_k (the slice-4 atoms). __wrt=k
+          -- selects dL/dW{k+1} (k=0..L-1) and __wrt=L selects dL/dx. The L=2 emission is
+          -- byte-identical to the slice-5a shape the oracle validated; L=1 reduces to s4.
+          let xin = lc_last params
           let stages = lc_chain body xin
-          let act0 = head (tail (head stages))
-          let act1 = head (tail (head (tail stages)))
-          let w0 = head params
-          let w1 = head (tail params)
-          let act0d = ["A", ["A", ["V", cat [act0, "__grad"]], ["V", "__vz"]], ["I", "0"]]
-          let act1d = ["A", ["A", ["V", cat [act1, "__grad"]], ["V", "__vz"]], ["I", "0"]]
-          let actfn0 = ["fn", cat [nm, "__rgrad_act0"], ["__vz", "__vc"], ["O", "*", act0d, ["V", "__vc"]]]
-          let actfn1 = ["fn", cat [nm, "__rgrad_act1"], ["__vz", "__vc"], ["O", "*", act1d, ["V", "__vc"]]]
-          let z1e = ["A", ["A", ["V", "float_mat_vec"], ["V", w0]], ["V", xin]]
-          let h1e = ["A", ["A", ["V", "float_arr_map"], ["V", act0]], ["V", "__z1"]]
-          let z2e = ["A", ["A", ["V", "float_mat_vec"], ["V", w1]], ["V", "__h1"]]
-          let ctye = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", "__z2"]]], ["V", "__gy"]]
-          let ctz2e = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_act1"]]], ["V", "__z2"]], ["V", "__cty"]]
-          let cth1e = ["A", ["A", ["V", "float_mat_vec_t"], ["V", w1]], ["V", "__ctz2"]]
-          let ctz1e = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_act0"]]], ["V", "__z1"]], ["V", "__cth1"]]
-          let dW1e = ["A", ["A", ["V", "float_outer"], ["V", "__ctz1"]], ["V", xin]]
-          let dW2e = ["A", ["A", ["V", "float_outer"], ["V", "__ctz2"]], ["V", "__h1"]]
-          let ctxe = ["A", ["A", ["V", "float_mat_vec_t"], ["V", w0]], ["V", "__ctz1"]]
-          let g0 = ["O", "==", ["V", "__wrt"], ["I", "0"]]
-          let g1 = ["O", "==", ["V", "__wrt"], ["I", "1"]]
-          let sel = ["?", g0, dW1e, ["?", g1, dW2e, ctxe]]
-          let rbody = ["D", "__z1", z1e, ["D", "__h1", h1e, ["D", "__z2", z2e, ["D", "__cty", ctye, ["D", "__ctz2", ctz2e, ["D", "__cth1", cth1e, ["D", "__ctz1", ctz1e, sel]]]]]]]
+          let nlayers = length stages
+          let w0 = head (tail (tail (head stages)))
+          let actfns = lc_actfn_go nm stages 0
+          let fwd = lc_fwd_go stages 0 ["V", xin]
+          let ctybind = ["__cty", ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", cat ["__z", show nlayers]]]], ["V", "__gy"]]]
+          let rev = lc_rev_go nm (reverse stages) (nlayers - 1) ["V", "__cty"]
+          let allbinds = append fwd (cons ctybind rev)
+          let sel = lc_sel_go w0 xin stages 0
+          let rbody = lc_mk_lets allbinds sel
           let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy", "__wrt"], rbody]
-          cons actfn0 (cons actfn1 (cons rgfn rest))
+          append actfns (cons rgfn rest)
         else if detect_matvec_layer body params then
           -- V5 slice 4 (matvec layer): f W x = let z = float_mat_vec W x in
           --   float_arr_sum (float_arr_map act z)  is a dense layer (flat row-major W,
