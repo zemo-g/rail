@@ -1,0 +1,130 @@
+-- Rung 22: ALLOCATOR SURVIVAL across a long training loop on the synthesized net__rgrad.
+-- Rungs 1-21 proved the gradient is CORRECT. Rung 22 proves the loop SURVIVES at length:
+-- "a wall, not math." Every step, net__rgrad + fwd allocate ~20 fresh small arrays
+-- (cotangents, outer products, mat_vec_t results). Over hundreds of thousands of steps
+-- that is hundreds of MB of transient traffic. The fix is per-step arena_mark/arena_reset:
+-- the weights live OUTSIDE the window (allocated once in main, mutated in place), and each
+-- step's transients are reclaimed by resetting the bump pointer back to the step's mark.
+--
+-- This file trains the rung-1/rung-15 dot-readout net for K steps. A CLI flag selects
+-- the arena mode so the harness can measure peak RSS both ways with ONE binary:
+--   /tmp/r22 reset     -> arena_reset every step  (expect bounded RSS, flat regardless of K)
+--   /tmp/r22 noreset   -> no reset                (expect RSS to climb with K; reset is the fix)
+-- In-Rail gate (reset run): loop COMPLETES K steps AND final MSE converged (< 1e-6)
+-- -- i.e. arena_reset reclaimed transients WITHOUT corrupting the persistent weights
+-- below the mark. The check uses `<.` (fcmp), which is NaN-safe: NaN <. x is always
+-- false, so "converged" implicitly subsumes "finite". We deliberately AVOID polymorphic
+-- `==` on a float -- it interprets the raw f64 bits as a tagged pointer and dereferences
+-- it, a value-dependent segfault (the converged ~1e-33 loss happens to chase unmapped
+-- memory). RSS contrast is reported by the shell harness.
+-- Build: ./rail_native --out-prefix /tmp/r22 tools/ad/nn/rung22_allocator_survival_test.rail
+-- Run:   /usr/bin/time -l /tmp/r22 reset ; /usr/bin/time -l /tmp/r22 noreset
+
+import "stdlib/float_arr.rail"
+
+#grad sq
+sq z = z *. z
+
+#grad net
+net W1 W2 x g =
+  let h1 = float_arr_map sq (float_mat_vec W1 x)
+  let y  = float_arr_map sq (float_mat_vec W2 h1)
+  float_dot y g
+
+fwd W1 W2 x =
+  let h1 = float_arr_map sq (float_mat_vec W1 x)
+  float_arr_map sq (float_mat_vec W2 h1)
+
+sub2 a b = a -. b
+twodiff a b = 2.0 *. (a -. b)
+
+sqsum_go a n i acc =
+  if i >= n then acc
+  else sqsum_go a n (i + 1) (acc +. ((float_arr_get a i) *. (float_arr_get a i)))
+
+mse y t =
+  let d = float_arr_map2 sub2 y t
+  sqsum_go d (float_arr_len d) 0 0.0
+
+axpy_go W dW lr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set W i ((float_arr_get W i) -. (lr *. (float_arr_get dW i)))
+    axpy_go W dW lr n (i + 1)
+
+step W1 W2 x t lr =
+  let y   = fwd W1 W2 x
+  let g   = float_arr_map2 twodiff y t
+  let dW1 = net__rgrad W1 W2 x g 1.0 0
+  let dW2 = net__rgrad W1 W2 x g 1.0 1
+  let _ = axpy_go W1 dW1 lr (float_arr_len W1) 0
+  let _ = axpy_go W2 dW2 lr (float_arr_len W2) 0
+  0
+
+-- the long loop. doreset=1 -> reclaim each step's transients; 0 -> let them pile up.
+loop W1 W2 x t lr doreset k i =
+  if i >= k then 0
+  else
+    let mk = arena_mark 0
+    let _  = step W1 W2 x t lr
+    let _  = if doreset == 1 then arena_reset mk else 0
+    loop W1 W2 x t lr doreset k (i + 1)
+
+mkW1 =
+  let W = float_arr_new 6 0.0
+  let _ = float_arr_set W 0 0.5
+  let _ = float_arr_set W 1 0.2
+  let _ = float_arr_set W 2 (0.0 -. 0.1)
+  let _ = float_arr_set W 3 0.4
+  let _ = float_arr_set W 4 0.3
+  let _ = float_arr_set W 5 (0.0 -. 0.2)
+  W
+mkW2 =
+  let W = float_arr_new 6 0.0
+  let _ = float_arr_set W 0 0.4
+  let _ = float_arr_set W 1 (0.0 -. 0.1)
+  let _ = float_arr_set W 2 0.2
+  let _ = float_arr_set W 3 0.1
+  let _ = float_arr_set W 4 0.3
+  let _ = float_arr_set W 5 (0.0 -. 0.2)
+  W
+mkX =
+  let x = float_arr_new 2 0.0
+  let _ = float_arr_set x 0 0.5
+  let _ = float_arr_set x 1 (0.0 -. 0.3)
+  x
+mkT =
+  let t = float_arr_new 2 0.0
+  let _ = float_arr_set t 0 0.30
+  let _ = float_arr_set t 1 0.10
+  t
+
+-- argv: default reset ON; "noreset" anywhere -> reset OFF (control for the RSS contrast)
+wants_noreset av =
+  if av == [] then 0
+  else if (head av) == "noreset" then 1
+  else wants_noreset (tail av)
+
+main =
+  let doreset = if (wants_noreset args) == 1 then 0 else 1
+  let kk = 500000
+  let _ = print (cat ["=== Rung 22: allocator survival, ", show kk, " steps, reset=", show doreset, " ==="])
+  let W1 = mkW1
+  let W2 = mkW2
+  let x  = mkX
+  let t  = mkT
+  let m0 = mse (fwd W1 W2 x) t
+  let _  = loop W1 W2 x t 0.5 doreset kk 0
+  let mF = mse (fwd W1 W2 x) t
+  -- float-safe gate: `<.` emits fcmp and excludes NaN/inf (NaN <. x is always false),
+  -- so "converged" subsumes "finite". Never use polymorphic `==` on a float here.
+  let conv = if mF <. 0.000001 then 1 else 0
+  let okreset = conv
+  let _ = print (cat ["start mse=", show_float m0, "  final mse=", show_float mF,
+                      "  converged(<1e-6)=", show conv])
+  let _ = if doreset == 1 then
+            (if okreset == 1
+              then print (cat ["PASS: ", show kk, " arena-windowed steps completed; weights intact, MSE converged"])
+              else print "FAIL: reset run did not converge (possible weight corruption)")
+          else print "noreset control run done (see peak RSS for unbounded growth)"
+  if doreset == 1 then (if okreset == 1 then 0 else 1) else 0
