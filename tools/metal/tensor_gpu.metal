@@ -1044,3 +1044,44 @@ kernel void matmul_bf16(
     }
     if (row < M && col < N) C[row * N + col] = bfloat(sum);
 }
+
+// ═══════════════════════════════════════════════════════════
+// EXACT INTEGER MATMUL — bit-reproducible fixed-point accumulation
+// One thread per output (i,j). Each thread runs its OWN sequential
+// 2-limb integer accumulation; there is NO cross-thread reduction and
+// NO atomics, so the result is independent of threadgroup/tile schedule
+// and matches the CPU reference (tools/bitexact/bx2_exact_matmul.rail)
+// BIT-FOR-BIT. Inputs Aq,Bq are pre-quantized int32 (|q| < 2^31). The
+// per-output result is a 2-limb integer [hi, lo] with lo in [0, 2^31),
+// representing the exact integer hi*2^31 + lo. The per-step arithmetic
+// (plo0/plo/phi/lon/carry) mirrors bx2's acc_add exactly.
+// ═══════════════════════════════════════════════════════════
+
+#define EXLIMB 2147483648L   // 2^31
+
+kernel void exact_matmul(
+    device const int  *Aq [[buffer(0)]],
+    device const int  *Bq [[buffer(1)]],
+    device long       *Hi [[buffer(2)]],
+    device long       *Lo [[buffer(3)]],
+    constant uint &M [[buffer(4)]],
+    constant uint &K [[buffer(5)]],
+    constant uint &N [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint i = gid.y, j = gid.x;
+    if (i >= M || j >= N) return;
+    long hi = 0, lo = 0;
+    for (uint p = 0; p < K; p++) {
+        long prod = (long)Aq[i * K + p] * (long)Bq[p * N + j];
+        long plo0 = prod - (prod / EXLIMB) * EXLIMB;      // C truncated mod
+        long plo  = (plo0 < 0) ? plo0 + EXLIMB : plo0;    // Euclidean [0,2^31)
+        long phi  = (prod - plo) / EXLIMB;
+        long lon  = lo + plo;
+        long carry = (lon >= EXLIMB) ? 1 : 0;
+        lo = lon - carry * EXLIMB;
+        hi = hi + phi + carry;
+    }
+    Hi[i * N + j] = hi;
+    Lo[i * N + j] = lo;
+}
