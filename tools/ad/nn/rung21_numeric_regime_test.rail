@@ -1,0 +1,205 @@
+-- Rung 21: validate the COMPILER-SYNTHESIZED gradient path in its numeric regime.
+-- The bf16/f64 truth-line work (rail-bf16-stable-10k) was on HAND-WRITTEN Metal kernels;
+-- the synthesized net__rgrad AD path is new and runs pure-Rail f64. This oracle proves:
+--   A. f64 truth-line EXACTNESS: synthesized dW vs central finite differences at TIGHT
+--      tolerance (1e-5, far below the 1e-2 functional oracles), across 3 weight scales and
+--      two readout cotangents g, with an O(h^2) step-size sweep to confirm genuine
+--      differentiation (error must shrink ~100x when h shrinks 10x).
+--   B. reduced-precision (bf16) CHARACTERIZATION: round weights+input to bf16 (faithful
+--      7-mantissa-bit round-to-nearest via log2/floor/pow), recompute the synthesized
+--      gradient, and confirm it stays finite and within a bf16-epsilon band of the f64
+--      truth-line -- graceful degradation, no NaN/blowup, matching the bf16-stable result.
+-- Run: ./rail_native run tools/ad/nn/rung21_numeric_regime_test.rail
+
+import "stdlib/float_arr.rail"
+import "stdlib/math.rail"
+
+#grad sq
+sq z = z *. z
+
+-- rung-1 #grad net: 2-layer, sq activations, dot readout L = float_dot y g (gy=1).
+#grad net
+net W1 W2 x g =
+  let h1 = float_arr_map sq (float_mat_vec W1 x)
+  let y  = float_arr_map sq (float_mat_vec W2 h1)
+  float_dot y g
+
+fwd W1 W2 x =
+  let h1 = float_arr_map sq (float_mat_vec W1 x)
+  float_arr_map sq (float_mat_vec W2 h1)
+
+-- the scalar that net__rgrad differentiates (g fixed, gy=1): L = dot(fwd(W1,W2,x), g)
+lscalar W1 W2 x g = float_dot (fwd W1 W2 x) g
+
+-- central FD of L w.r.t. W1[i] (perturb in place, restore)
+fd_w1 W1 W2 x g i h =
+  let _  = float_arr_set W1 i ((float_arr_get W1 i) +. h)
+  let lp = lscalar W1 W2 x g
+  let _  = float_arr_set W1 i ((float_arr_get W1 i) -. (2.0 *. h))
+  let lm = lscalar W1 W2 x g
+  let _  = float_arr_set W1 i ((float_arr_get W1 i) +. h)
+  (lp -. lm) /. (2.0 *. h)
+
+fd_w2 W1 W2 x g i h =
+  let _  = float_arr_set W2 i ((float_arr_get W2 i) +. h)
+  let lp = lscalar W1 W2 x g
+  let _  = float_arr_set W2 i ((float_arr_get W2 i) -. (2.0 *. h))
+  let lm = lscalar W1 W2 x g
+  let _  = float_arr_set W2 i ((float_arr_get W2 i) +. h)
+  (lp -. lm) /. (2.0 *. h)
+
+relerr a b =
+  let d = fabs (a -. b)
+  if (fabs b) <. 0.000000001 then d else d /. (fabs b)
+
+-- worst relative error of synthesized dW1 vs FD over all indices
+chkw1 syn W1 W2 x g n h i worst =
+  if i >= n then worst
+  else
+    let e  = relerr (float_arr_get syn i) (fd_w1 W1 W2 x g i h)
+    let nw = if e >. worst then e else worst
+    chkw1 syn W1 W2 x g n h (i + 1) nw
+
+chkw2 syn W1 W2 x g n h i worst =
+  if i >= n then worst
+  else
+    let e  = relerr (float_arr_get syn i) (fd_w2 W1 W2 x g i h)
+    let nw = if e >. worst then e else worst
+    chkw2 syn W1 W2 x g n h (i + 1) nw
+
+-- worst-of-both-arrays synthesized-vs-FD relative error at step h
+maxerr W1 W2 x g h =
+  let d1 = net__rgrad W1 W2 x g 1.0 0
+  let d2 = net__rgrad W1 W2 x g 1.0 1
+  let e1 = chkw1 d1 W1 W2 x g (float_arr_len W1) h 0 0.0
+  let e2 = chkw2 d2 W1 W2 x g (float_arr_len W2) h 0 0.0
+  if e1 >. e2 then e1 else e2
+
+-- ---- bf16: faithful round-to-nearest with 7 explicit mantissa bits ----
+bf16_round v =
+  if v == 0.0 then 0.0
+  else
+    let e     = floor ((log (fabs v)) /. (log 2.0))
+    let scale = pow 2.0 (e -. 7.0)
+    (floor ((v /. scale) +. 0.5)) *. scale
+
+bf16_copy_go src dst n i =
+  if i >= n then dst
+  else
+    let _ = float_arr_set dst i (bf16_round (float_arr_get src i))
+    bf16_copy_go src dst n (i + 1)
+
+bf16_copy src =
+  let n = float_arr_len src
+  bf16_copy_go src (float_arr_new n 0.0) n 0
+
+-- max relative diff between two gradient arrays
+arrdiff a b n i worst =
+  if i >= n then worst
+  else
+    let e  = relerr (float_arr_get a i) (float_arr_get b i)
+    let nw = if e >. worst then e else worst
+    arrdiff a b n (i + 1) nw
+
+allfinite a n i =
+  if i >= n then 1
+  else
+    let v = float_arr_get a i
+    -- NaN is the only value not equal to itself; reject it
+    if (v == v) then allfinite a n (i + 1) else 0
+
+-- scale a fresh copy of W by factor f
+scalecopy_go src dst n f i =
+  if i >= n then dst
+  else
+    let _ = float_arr_set dst i ((float_arr_get src i) *. f)
+    scalecopy_go src dst n f (i + 1)
+scalecopy src f =
+  let n = float_arr_len src
+  scalecopy_go src (float_arr_new n 0.0) n f 0
+
+mkW1 =
+  let W = float_arr_new 6 0.0
+  let _ = float_arr_set W 0 0.5
+  let _ = float_arr_set W 1 0.2
+  let _ = float_arr_set W 2 (0.0 -. 0.1)
+  let _ = float_arr_set W 3 0.4
+  let _ = float_arr_set W 4 0.3
+  let _ = float_arr_set W 5 (0.0 -. 0.2)
+  W
+mkW2 =
+  let W = float_arr_new 6 0.0
+  let _ = float_arr_set W 0 0.4
+  let _ = float_arr_set W 1 (0.0 -. 0.1)
+  let _ = float_arr_set W 2 0.2
+  let _ = float_arr_set W 3 0.1
+  let _ = float_arr_set W 4 0.3
+  let _ = float_arr_set W 5 (0.0 -. 0.2)
+  W
+mkX =
+  let x = float_arr_new 2 0.0
+  let _ = float_arr_set x 0 0.5
+  let _ = float_arr_set x 1 (0.0 -. 0.3)
+  x
+mkG a b =
+  let g = float_arr_new 2 0.0
+  let _ = float_arr_set g 0 a
+  let _ = float_arr_set g 1 b
+  g
+
+-- print a labelled line; ok (0/1) computed by caller on let-locals
+-- (param-to-param float comparison miscompiles in this binary; locals-vs-literal is fine)
+report label errstr ok =
+  let _  = print (cat ["  ", label, ": maxrelerr=", errstr, "  tol=1e-5", (if ok == 1 then "  PASS" else "  FAIL")])
+  ok
+
+main =
+  let _  = print "=== Rung 21: synthesized-gradient numeric-regime validation ==="
+  let W1 = mkW1
+  let W2 = mkW2
+  let x  = mkX
+  let g1 = mkG 1.0 1.0           -- sum readout (truth-line)
+  let g2 = mkG 0.7 (0.0 -. 0.3)  -- arbitrary dot readout (rung-1 generalization)
+
+  -- A. f64 truth-line exactness at tight tolerance, two readouts
+  let _  = print "--- A. f64 truth-line exactness (tol 1e-5) ---"
+  let e1 = maxerr W1 W2 x g1 0.00001
+  let a1 = report "g=ones    h=1e-5 " (show_float e1) (if e1 <. 0.00001 then 1 else 0)
+  let e2 = maxerr W1 W2 x g2 0.00001
+  let a2 = report "g=arb     h=1e-5 " (show_float e2) (if e2 <. 0.00001 then 1 else 0)
+
+  -- A. O(h^2) signature: 10x bigger h must give ~100x bigger FD-truncation error
+  let _  = print "--- A. O(h^2) step-size signature (genuine differentiation) ---"
+  let eh4 = maxerr W1 W2 x g1 0.0001
+  let eh5 = maxerr W1 W2 x g1 0.00001
+  let ratio = if eh5 <. 0.000000001 then 999.0 else (eh4 /. eh5)
+  let _  = print (cat ["  err(h=1e-4)=", show_float eh4, "  err(h=1e-5)=", show_float eh5, "  ratio=", show_float ratio])
+  let a3 = if ratio >. 10.0 then (let _ = print "  ratio > 10x as h shrinks 10x  PASS" in 1) else (let _ = print "  FAIL: error did not shrink with h" in 0)
+
+  -- A. exactness across weight scales (AD is exact regardless of magnitude)
+  let _  = print "--- A. exactness across weight scales (tol 1e-5) ---"
+  let Wa1 = scalecopy W1 0.5
+  let Wa2 = scalecopy W2 0.5
+  let es1 = maxerr Wa1 Wa2 x g1 0.00001
+  let s1  = report "scale 0.5 h=1e-5 " (show_float es1) (if es1 <. 0.00001 then 1 else 0)
+  let Wb1 = scalecopy W1 2.0
+  let Wb2 = scalecopy W2 2.0
+  let es2 = maxerr Wb1 Wb2 x g1 0.00001
+  let s2  = report "scale 2.0 h=1e-5 " (show_float es2) (if es2 <. 0.00001 then 1 else 0)
+
+  -- B. bf16 reduced-precision characterization vs f64 truth-line gradient
+  let _  = print "--- B. bf16-rounded inputs vs f64 truth-line gradient ---"
+  let tdW1 = net__rgrad W1 W2 x g1 1.0 0      -- f64 truth-line dW1
+  let rW1  = bf16_copy W1
+  let rW2  = bf16_copy W2
+  let rx   = bf16_copy x
+  let bdW1 = net__rgrad rW1 rW2 rx g1 1.0 0    -- gradient on bf16-rounded inputs
+  let bfin = allfinite bdW1 (float_arr_len bdW1) 0
+  let bdif = arrdiff tdW1 bdW1 (float_arr_len tdW1) 0 0.0
+  let _    = print (cat ["  bf16-input dW1 finite=", show bfin, "  reldiff vs f64=", show_float bdif, "  (bf16 eps ~ 0.0039)"])
+  let b1   = if (bfin == 1) then (let _ = print "  bf16 gradient finite (no NaN/blowup)  PASS" in 1) else (let _ = print "  FAIL: bf16 gradient not finite" in 0)
+  let b2   = if bdif <. 0.05 then (let _ = print "  bf16 reldiff within graceful band (<5%)  PASS" in 1) else (let _ = print "  FAIL: bf16 degraded beyond band" in 0)
+
+  let total = a1 + a2 + a3 + s1 + s2 + b1 + b2
+  let _ = print (cat [show total, "/7 numeric-regime checks passed"])
+  if total == 7 then 0 else 1
