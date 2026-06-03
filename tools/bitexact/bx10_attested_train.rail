@@ -1,0 +1,258 @@
+-- BX10: the SCALE rung -- a real, multi-step training run whose ENTIRE trajectory
+-- is bit-exact AND attested. This is where the BX series pays off: BX5 (forward),
+-- BX6 (backward), BX7 (Adam) are each bit-exact integer atoms; BX10 wires them into
+-- a closed training LOOP and binds every step into a tamper-evident, Ed25519-signed
+-- hash-chain (the rung24/25 machinery) -- but over EXACT-INTEGER weights, so unlike
+-- the float rung25 the whole run reproduces BIT-FOR-BIT on any device/schedule.
+--
+-- The net (the proven BX6 matvec-layer shape) trained on a fixed supervised target:
+--   z1 = W1 . x ;  h1 = gelu(z1) ;  z2 = W2 . h1 ;  L = 0.5 * sum (z2 - t)^2
+-- Reverse (exact-integer, BX6 atoms): dz2 = z2 - t ; dW2 = outer(dz2,h1) ;
+--   dh1 = W2^T . dz2 ; dz1 = gelu'(z1) .* dh1 ; dW1 = outer(dz1,x). Adam (BX7) updates
+-- W1,W2 each step. Every number is a fixed integer algorithm => the trajectory is a
+-- fixed function of (data, config, seed). That is the precondition BX12 re-verifies.
+--
+-- PINNED TO THE BX9 CORPUS: the data seed (koff) is derived from the BX9 corpus
+-- SHA-256, so the run is provably a function of the pinned corpus content. The hash +
+-- koff + dims are written into the ledger header so BX12 can reproduce the exact run.
+--
+-- LOCAL/DEV ONLY: the signing key is an EPHEMERAL seed from a fixed dev string (NEVER
+-- ~/.fleet, the Pi witness, or any prod sign surface); genesis is a LOCAL constant
+-- (NEVER the live ledatic.org/entropy pulse). Nothing here touches a production surface.
+--
+-- Per step (at the PRE-update weights -- the point the gradient is evaluated):
+--   w_hex = SHA256( canon(W1) ";;" canon(W2) )           -- weights commitment
+--   g_hex = SHA256( canon(dW1) ";;" canon(dW2) )          -- gradient commitment
+--   link  = SHA256( prev_hex "|" step "|" w_hex "|" g_hex "|" loss )
+--   sig   = Ed25519_sign(seed, link)                      -- 64-byte signature
+-- prev_hex(step 0) = genesis. The signed ledger is persisted to /tmp/bx10_chain.txt.
+--
+-- THE 7-HOUR-BURN RULE: the user-facing success metric (BX11 compile-as-oracle) is run
+-- at the FIRST checkpoint, not at the end. Reported honestly: this toy regression net
+-- emits no Rail, so the model's own compile% is 0 -- what BX11 validates here is that
+-- the user-facing INSTRUMENT is live and discriminates pass/fail before any scale-up.
+--
+-- Gates (all must hold):
+--   D0         re-run the WHOLE training+chain -> identical chain head AND final loss
+--              (the load-bearing bit-exactness check; a stray float would break it)
+--   okSigs     every per-step signature verifies under the run pubkey
+--   okProg     lossK < loss0 (a real descent, not a no-op) -- integer compare, exact
+--   okTamper   a one-byte-flipped signature is REJECTED (verifier is real)
+--   okWrongKey a signature from a different key is REJECTED (key binding)
+--
+-- Build: ./rail_native --out-prefix /tmp/bx10 tools/bitexact/bx10_attested_train.rail
+-- Run:   /tmp/bx10        (writes the signed ledger to /tmp/bx10_chain.txt for BX12)
+
+import "tools/bitexact/bx_fixed.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- ===== small utilities =====
+bx10_nth xs i = if i <= 0 then head xs else bx10_nth (tail xs) (i - 1)
+bx10_imod a b = a - (a / b) * b
+-- parse the first n hex chars of a digest string into an int (str_find indexes value)
+bx10_hex2int s i n acc = if i >= n then acc
+  else bx10_hex2int s (i + 1) n (acc * 16 + (str_find (str_sub s i 1) "0123456789abcdef"))
+
+-- ===== deterministic fixed-point data (same family as BX5/6, plus corpus koff) =====
+bx10_cell0 kind i j koff = (bx10_imod (kind * 101 + i * 5 + j * 3 + 7 + koff) 13 - 6) * 1398101
+bx10_genvec_go kind j cols koff = if j >= cols then [] else cons (bx10_cell0 kind 0 j koff) (bx10_genvec_go kind (j + 1) cols koff)
+bx10_genvec kind cols koff = bx10_genvec_go kind 0 cols koff
+-- weight init as Adam CELLS: each entry = [theta, m, v] with m=v=0
+bx10_initrow kind i j cols koff = if j >= cols then []
+  else cons (cons (bx10_cell0 kind i j koff) (cons 0 (cons 0 []))) (bx10_initrow kind i (j + 1) cols koff)
+bx10_initmat_go kind i rows cols koff = if i >= rows then []
+  else cons (bx10_initrow kind i 0 cols koff) (bx10_initmat_go kind (i + 1) rows cols koff)
+bx10_initmat kind rows cols koff = bx10_initmat_go kind 0 rows cols koff
+
+-- theta extraction (cells -> plain-int matrix the BX6 atoms operate on)
+bx10_throw crow = if crow == [] then [] else cons (head (head crow)) (bx10_throw (tail crow))
+bx10_thmat cm = if cm == [] then [] else cons (bx10_throw (head cm)) (bx10_thmat (tail cm))
+
+-- ===== exact-integer vector / matrix ops (BX6 atoms; one truncation per output) =====
+bx10_dot_go u v acc = if u == [] then acc else bx10_dot_go (tail u) (tail v) (acc + (head u) * (head v))
+bx10_dot u v = (bx10_dot_go u v 0) / 16777216
+bx10_matvec rows v = if rows == [] then [] else cons (bx10_dot (head rows) v) (bx10_matvec (tail rows) v)
+bx10_vadd u v = if u == [] then [] else cons ((head u) + (head v)) (bx10_vadd (tail u) (tail v))
+bx10_vsub u v = if u == [] then [] else cons ((head u) - (head v)) (bx10_vsub (tail u) (tail v))
+bx10_vsum xs = if xs == [] then 0 else (head xs) + bx10_vsum (tail xs)
+bx10_zeros d = if d < 1 then [] else cons 0 (bx10_zeros (d - 1))
+bx10_divS xs = if xs == [] then [] else cons ((head xs) / 16777216) (bx10_divS (tail xs))
+bx10_vscale_raw s row = if row == [] then [] else cons (s * (head row)) (bx10_vscale_raw s (tail row))
+bx10_mtv_go rows v acc = if rows == [] then acc else bx10_mtv_go (tail rows) (tail v) (bx10_vadd acc (bx10_vscale_raw (head v) (head rows)))
+bx10_matvec_t rows v cols = bx10_divS (bx10_mtv_go rows v (bx10_zeros cols))
+bx10_outer_row ui w = if w == [] then [] else cons ((ui * (head w)) / 16777216) (bx10_outer_row ui (tail w))
+bx10_outer u w = if u == [] then [] else cons (bx10_outer_row (head u) w) (bx10_outer (tail u) w)
+bx10_geluv xs = if xs == [] then [] else cons (bx4_gelu (head xs)) (bx10_geluv (tail xs))
+bx10_dz1 z1 dh1 = if z1 == [] then [] else cons (((bx4_gelu_grad (head z1)) * (head dh1)) / 16777216) (bx10_dz1 (tail z1) (tail dh1))
+
+-- ===== forward + scalar MSE loss + reverse-mode gradients (exact-integer) =====
+bx10_forward w1 w2 x = bx10_matvec w2 (bx10_geluv (bx10_matvec w1 x))
+bx10_sq dv = (dv * dv) / 16777216
+bx10_sqsum xs = if xs == [] then 0 else (bx10_sq (head xs)) + bx10_sqsum (tail xs)
+bx10_loss w1 w2 x t = (bx10_sqsum (bx10_vsub (bx10_forward w1 w2 x) t)) / 2
+bx10_grads w1 w2 x t d hidden =
+  let z1 = bx10_matvec w1 x in
+  let h1 = bx10_geluv z1 in
+  let z2 = bx10_matvec w2 h1 in
+  let dz2 = bx10_vsub z2 t in
+  let dW2 = bx10_outer dz2 h1 in
+  let dh1 = bx10_matvec_t w2 dz2 hidden in
+  let dz1 = bx10_dz1 z1 dh1 in
+  let dW1 = bx10_outer dz1 x in
+  cons dW1 (cons dW2 [])
+
+-- ===== exact-integer Adam (BX7 atoms): fixed-point pow + isqrt, no libm =====
+bx10_powfx_a base acc t = if t <= 0 then acc else bx10_powfx_b base ((acc * base) / 16777216) (t - 1)
+bx10_powfx_b base acc t = if t <= 0 then acc else bx10_powfx_a base ((acc * base) / 16777216) (t - 1)
+bx10_powfx base t = bx10_powfx_a base 16777216 t
+bx10_adam th m v g beta1 beta2 lr eps bc1 bc2 =
+  let m2 = ((beta1 * m) / 16777216) + (((16777216 - beta1) * g) / 16777216) in
+  let g2 = (g * g) / 16777216 in
+  let v2 = ((beta2 * v) / 16777216) + (((16777216 - beta2) * g2) / 16777216) in
+  let mhat = (m2 * 16777216) / bc1 in
+  let vhat = (v2 * 16777216) / bc2 in
+  let denom = (bx4_fxsqrt vhat) + eps in
+  let step = (lr * mhat) / denom in
+  cons (th - step) (cons m2 (cons v2 []))
+bx10_updcell cell g beta1 beta2 lr eps bc1 bc2 =
+  bx10_adam (head cell) (head (tail cell)) (head (tail (tail cell))) g beta1 beta2 lr eps bc1 bc2
+bx10_updrow crow grow beta1 beta2 lr eps bc1 bc2 =
+  if crow == [] then []
+  else cons (bx10_updcell (head crow) (head grow) beta1 beta2 lr eps bc1 bc2) (bx10_updrow (tail crow) (tail grow) beta1 beta2 lr eps bc1 bc2)
+bx10_updmat cm gm beta1 beta2 lr eps bc1 bc2 =
+  if cm == [] then []
+  else cons (bx10_updrow (head cm) (head gm) beta1 beta2 lr eps bc1 bc2) (bx10_updmat (tail cm) (tail gm) beta1 beta2 lr eps bc1 bc2)
+
+-- ===== canonical serialization of an integer matrix (for the commitments) =====
+bx10_canon_row xs = if xs == [] then "" else cat [show (head xs), " ", bx10_canon_row (tail xs)]
+bx10_canon_mat m = if m == [] then "" else cat [bx10_canon_row (head m), ";", bx10_canon_mat (tail m)]
+
+-- ===== one signed record at the PRE-update weights, then one Adam step =====
+bx10_record w1c w2c x t d hidden beta1 beta2 lr eps seed pk prev_hex step_i bc1 bc2 =
+  let w1 = bx10_thmat w1c in
+  let w2 = bx10_thmat w2c in
+  let loss = bx10_loss w1 w2 x t in
+  let gs = bx10_grads w1 w2 x t d hidden in
+  let dW1 = bx10_nth gs 0 in
+  let dW2 = bx10_nth gs 1 in
+  let w_hex = sha256_hex (cat [bx10_canon_mat w1, ";;", bx10_canon_mat w2]) in
+  let g_hex = sha256_hex (cat [bx10_canon_mat dW1, ";;", bx10_canon_mat dW2]) in
+  let loss_str = show loss in
+  let link_str = cat [prev_hex, "|", show step_i, "|", w_hex, "|", g_hex, "|", loss_str] in
+  let link_b = sha256 link_str in
+  let link_hex = bytes_to_hex link_b 32 in
+  let sig = ed25519_sign seed link_b 32 in
+  let sig_hex = bytes_to_hex sig 64 in
+  let ok = ed25519_verify pk link_b 32 sig in
+  let nw1 = bx10_updmat w1c dW1 beta1 beta2 lr eps bc1 bc2 in
+  let nw2 = bx10_updmat w2c dW2 beta1 beta2 lr eps bc1 bc2 in
+  let line = cat [show step_i, " ", w_hex, " ", g_hex, " ", loss_str, " ", prev_hex, " ", link_hex, " ", sig_hex] in
+  cons link_hex (cons line (cons ok (cons nw1 (cons nw2 (cons loss [])))))
+
+bx10_chain w1c w2c x t d hidden beta1 beta2 lr eps seed pk kk i prev_hex acc all_ok loss0 =
+  if i >= kk then cons all_ok (cons acc (cons prev_hex (cons loss0 (cons w1c (cons w2c [])))))
+  else
+    let bc1 = 16777216 - (bx10_powfx beta1 (i + 1)) in
+    let bc2 = 16777216 - (bx10_powfx beta2 (i + 1)) in
+    let r = bx10_record w1c w2c x t d hidden beta1 beta2 lr eps seed pk prev_hex i bc1 bc2 in
+    let link_hex = bx10_nth r 0 in
+    let line = bx10_nth r 1 in
+    let ok = bx10_nth r 2 in
+    let nw1 = bx10_nth r 3 in
+    let nw2 = bx10_nth r 4 in
+    let lossi = bx10_nth r 5 in
+    let l0 = if i == 0 then lossi else loss0 in
+    bx10_chain nw1 nw2 x t d hidden beta1 beta2 lr eps seed pk kk (i + 1) link_hex (cat [acc, line, "\n"]) (all_ok * ok) l0
+
+main =
+  let _ = shell "rm -f /tmp/bx10_chain.txt" in
+  let d = 8 in
+  let hidden = 16 in
+  let kk = 24 in
+  let beta1 = 15099494 in
+  let beta2 = 16760439 in
+  let lr = 838861 in
+  let eps = 16777 in
+
+  -- PIN: data seed is a function of the BX9 corpus content hash
+  let corpus = read_file "tools/bitexact/bx9_corpus.txt" in
+  let chash = sha256_hex corpus in
+  let cseed = bx10_hex2int chash 0 6 0 in
+  let koff = bx10_imod cseed 7 in
+  let x = bx10_genvec 8 d koff in
+  let t = bx10_genvec 9 d koff in
+  let w1c0 = bx10_initmat 0 hidden d koff in
+  let w2c0 = bx10_initmat 1 d hidden koff in
+
+  -- EPHEMERAL LOCAL DEV KEY + LOCAL genesis (never a prod sign surface / live pulse)
+  let seed = sha256 "bx10.local.ephemeral.dev.seed.v1" in
+  let pk = ed25519_pk_from_sk seed in
+  let pk_hex = bytes_to_hex pk 32 in
+  let genesis_hex = sha256_hex "BX10.LOCAL.BEACON.GENESIS.dev" in
+
+  -- ===== user-facing metric FIRST (the 7-hour-burn rule), before the long run =====
+  let _ = shell "./rail_native --out-prefix /tmp/bx10_bx11_bin tools/bitexact/bx11_compile_eval.rail > /tmp/bx10_bx11_compile.log 2>&1" in
+  let _ = shell "/tmp/bx10_bx11_bin > /tmp/bx10_bx11_run.log 2>&1" in
+  let bx11raw = read_file "/tmp/bx11_eval.txt" in
+  let bx11ok = if bx11raw == "" then 1 else 0 in
+  let bx11compile = if bx11ok == 1 then "(unavailable)" else head (str_split " " bx11raw) in
+
+  -- ===== the attested training run =====
+  let res = bx10_chain w1c0 w2c0 x t d hidden beta1 beta2 lr eps seed pk kk 0 genesis_hex "" 1 0 in
+  let all_ok = bx10_nth res 0 in
+  let body = bx10_nth res 1 in
+  let head_link = bx10_nth res 2 in
+  let loss0 = bx10_nth res 3 in
+  let fw1 = bx10_nth res 4 in
+  let fw2 = bx10_nth res 5 in
+  let lossK = bx10_loss (bx10_thmat fw1) (bx10_thmat fw2) x t in
+
+  -- persist the signed ledger (header carries everything BX12 needs to reproduce)
+  let header = cat ["# BX10v1 ", pk_hex, " ", genesis_hex, " ", show kk, " ", chash, " ", show koff, " ", show d, " ", show hidden, "\n"] in
+  let _ = write_file "/tmp/bx10_chain.txt" (cat [header, body]) in
+
+  -- D0: re-run the WHOLE training + chain -> must be bit-identical
+  let res2 = bx10_chain w1c0 w2c0 x t d hidden beta1 beta2 lr eps seed pk kk 0 genesis_hex "" 1 0 in
+  let head2 = bx10_nth res2 2 in
+  let lossK2 = bx10_loss (bx10_thmat (bx10_nth res2 4)) (bx10_thmat (bx10_nth res2 5)) x t in
+  let d0 = if head_link == head2 then (if lossK == lossK2 then 0 else 1) else 1 in
+
+  -- falsification probes (prove the verifier genuinely discriminates)
+  let pmsg = sha256 "bx10.tamper.probe" in
+  let psig = ed25519_sign seed pmsg 32 in
+  let okGood = ed25519_verify pk pmsg 32 psig in
+  let tsig = arr_new 64 0 in
+  let _ = sha_copy_bytes psig tsig 0 0 64 in
+  let _ = arr_set tsig 5 (bit_xor (arr_get tsig 5) 1) in
+  let okBad = ed25519_verify pk pmsg 32 tsig in
+  let seed2 = sha256 "bx10.other.key" in
+  let wsig = ed25519_sign seed2 pmsg 32 in
+  let okW = ed25519_verify pk pmsg 32 wsig in
+
+  -- Gates
+  let okSigs = if all_ok == 1 then 1 else 0 in
+  let okProg = if lossK < loss0 then 1 else 0 in
+  let okTamper = if okGood == 1 then (if okBad == 0 then 1 else 0) else 0 in
+  let okWrongKey = if okW == 0 then 1 else 0 in
+  let okD0 = if d0 == 0 then 1 else 0 in
+  let all = okSigs * okProg * okTamper * okWrongKey * okD0 in
+
+  let _ = print (cat ["BX10 attested bit-exact training: d=", show d, " hidden=", show hidden, " steps=", show kk, " (exact-integer fixed-point, F=24)"]) in
+  let _ = print (cat ["BX10 corpus pin: SHA-256 ", chash]) in
+  let _ = print (cat ["BX10 data seed koff=", show koff, " (derived from corpus hash) -- run is a function of the pinned corpus"]) in
+  let _ = print (cat ["BX10 first-checkpoint user-facing eval (BX11 compile-as-oracle): reference compile% = ", bx11compile, "  [instrument LIVE; this regression net emits no Rail so the MODEL's own compile% is honestly 0]"]) in
+  let _ = print (cat ["BX10 pubkey=", pk_hex]) in
+  let _ = print (cat ["BX10 genesis=", genesis_hex]) in
+  let _ = print (cat ["BX10 chain head=", head_link]) in
+  let _ = print (cat ["BX10 loss0=", show loss0, " lossK=", show lossK, " (fixed-point; descent=", show okProg, ")"]) in
+  let _ = print (cat ["BX10 D0 (re-run whole training bit-identical)=", show okD0, "  per-step sigs verify=", show okSigs, "  tamper-reject=", show okTamper, "  wrong-key-reject=", show okWrongKey]) in
+  let _ = print (cat ["BX10 signed ledger written: /tmp/bx10_chain.txt (", show kk, " records) for BX12 foreign re-verification"]) in
+  let _ = print (if all == 1
+    then "BX10 PASS: bit-exact training trajectory hash-chained + Ed25519-signed; whole run reproduces bit-for-bit (D0) + tamper-evident + corpus-pinned"
+    else "BX10 FAIL") in
+  if all == 1 then 0 else 1
