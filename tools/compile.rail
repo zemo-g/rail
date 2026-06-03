@@ -3864,16 +3864,31 @@ lc_chain body prevsrc =
           if more == [] then [] else cons stage more
         else
           let (rfn, rargs) = flat brest
-          if rfn != "float_arr_sum" then []
-          else if length rargs != 1 then []
-          else if head (head rargs) != "V" then []
-          else if head (tail (head rargs)) != bn then []
-          else cons stage []
+          let oksum = if rfn != "float_arr_sum" then 0
+                      else if length rargs != 1 then 0
+                      else if head (head rargs) != "V" then 0
+                      else if head (tail (head rargs)) != bn then 0
+                      else 1
+          let okdot = if rfn != "float_dot" then 0
+                      else if length rargs != 2 then 0
+                      else if head (head rargs) != "V" then 0
+                      else if head (tail (head rargs)) != bn then 0
+                      else if head (head (tail rargs)) != "V" then 0
+                      else 1
+          if (oksum + okdot) == 0 then [] else cons stage []
 
 -- lc_last: the final element of a non-empty list (the input x, last in params).
 lc_last lst =
   if (tail lst) == [] then head lst
   else lc_last (tail lst)
+
+-- lc_count: number of let-stages on the spine (each "D" node) before the terminal
+-- readout. Used to locate the input x = params[L] WITHOUT first knowing x (the dot
+-- readout adds a trailing g param, so x is no longer simply the last param). lc_chain
+-- remains the authority that fully validates the matvec source-threading with this x.
+lc_count body =
+  if head body != "D" then 0
+  else 1 + (lc_count (head (tail (tail (tail body)))))
 
 -- lc_wmatch: each collected stage's weight (stage[2]) equals the positional param.
 -- Walks stages and params together; the one leftover param is the input x.
@@ -3893,11 +3908,17 @@ lc_wmatch stages params =
 detect_layer_chain body params =
   if length params < 2 then false
   else
-    let xin = lc_last params
-    let stages = lc_chain body xin
-    if stages == [] then false
-    else if length stages != ((length params) - 1) then false
-    else lc_wmatch stages params
+    let nl = lc_count body
+    if nl == 0 then false
+    else
+      let okarity = if length params == (nl + 1) then true else (length params == (nl + 2))
+      if okarity == false then false
+      else
+        let xin = list_nth params nl
+        let stages = lc_chain body xin
+        if stages == [] then false
+        else if length stages != nl then false
+        else lc_wmatch stages params
 
 -- ---- slice-5b reverse-AST builders (one stage per layer; reused for any depth L) ----
 -- All names are fixed prefixes (__z{k}/__h{k}/__ctz{k}/__cth{k}/__cty), so only nm and
@@ -3963,6 +3984,34 @@ lc_mk_lets binds final =
     let b = head binds
     ["D", head b, head (tail b), lc_mk_lets (tail binds) final]
 
+-- lc_readout: walk the (already-validated) layer-chain spine to its terminal readout
+-- and classify it. ["sum"] for float_arr_sum last ; ["dot", gname] for float_dot last g.
+-- The readout determines the seed cotangent on the net output y (the slice-5b general-L
+-- spine reuses everything else): sum -> d(sum y)/dy = 1 (broadcast __gy) ; dot g ->
+-- d(sum_i y_i g_i)/dy = g (so __cty_i = g_i * __gy), which injects an ARBITRARY upstream
+-- cotangent g and is the composition primitive a downstream loss gradient plugs into.
+lc_readout body =
+  if head body == "D" then lc_readout (head (tail (tail (tail body))))
+  else
+    let (rfn, rargs) = flat body
+    if rfn == "float_dot" then ["dot", head (tail (head (tail rargs)))]
+    else ["sum"]
+
+-- lc_seedmul_fn: the per-net elementwise seed-scaler  \__a __b -> __a *. __b  emitted
+-- ONLY for a dot readout (so the proven sum path stays byte-identical to slice 5b).
+lc_seedmul_fn nm =
+  ["fn", cat [nm, "__rgrad_seedmul"], ["__a", "__b"], ["O", "*", ["V", "__a"], ["V", "__b"]]]
+
+-- lc_seedbind: the __cty binding. sum -> float_arr_new (len __z{L}) __gy (broadcast,
+-- byte-identical to slice 5b). dot g -> float_arr_map2 nm__rgrad_seedmul g (broadcast
+-- __gy), i.e. __cty_i = g_i * __gy.
+lc_seedbind nm ro nlayers =
+  let gyv = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", cat ["__z", show nlayers]]]], ["V", "__gy"]]
+  if head ro == "dot" then
+    ["__cty", ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_seedmul"]]], ["V", head (tail ro)]], gyv]]
+  else
+    ["__cty", gyv]
+
 -- mv_act: recognize the matvec-layer LET-form
 --   f W x = let z = float_mat_vec W x in float_arr_sum (float_arr_map act z)
 -- (W = param0, x = param1, z the let binding, act a #grad-marked unary fn). The
@@ -4000,6 +4049,108 @@ mv_act body params =
 
 detect_matvec_layer body params =
   (mv_act body params) != ""
+
+-- res_is_add: the residual-join combiner (e.g. add2 a b = a +. b) must be EXACTLY float
+-- addition of its two params, so both partials are 1 and the fan-out reduces to a pure SUM
+-- of the skip and sublayer cotangents. Looked up by name in decls (the combiner is NOT
+-- #grad-marked). Rejects anything that is not the dotted float-add of the two params.
+res_is_add cfn decls =
+  let cd = grad_lookup_fn cfn decls
+  if cd == [] then false
+  else
+    let cps = head (tail (tail cd))
+    let cbd = head (tail (tail (tail cd)))
+    if length cps != 2 then false
+    else if head cbd != "O" then false
+    else if head (tail cbd) != "+." then false
+    else
+      let lop = head (tail (tail cbd))
+      let rop = head (tail (tail (tail cbd)))
+      if head lop != "V" then false
+      else if head rop != "V" then false
+      else
+        let lv = head (tail lop)
+        let rv = head (tail rop)
+        let p0 = head cps
+        let p1 = head (tail cps)
+        if lv == p0 then rv == p1
+        else if lv == p1 then rv == p0
+        else false
+
+-- detect_residual (rung 6): a #grad net  net W x [g]  whose body is a residual block
+--   let z = float_mat_vec W x in let s = float_arr_map act z in
+--   let r = float_arr_map2 add x s in <readout> r
+-- (W=param0, x=param1; act #grad-marked unary; add = res_is_add float addition; readout
+-- = float_dot r g with g=param2 / params=3, OR float_arr_sum r with params=2). The new
+-- structural piece vs the layer-chain is FAN-OUT: x feeds BOTH the matvec and the skip,
+-- so dL/dx is the SUM of the two cotangents. Mutually exclusive from the slice-2/3/4/5b
+-- walkers: detect_matvec_layer needs the rest after z to be float_arr_sum (here it is a
+-- D node, flat -> ("_expr",[])); the map-chain walkers need a float_arr_map first binding.
+detect_residual body params decls =
+  if length params < 2 then false
+  else if head body != "D" then false
+  else
+    let z_bn = head (tail body)
+    let z_val = head (tail (tail body))
+    let rest1 = head (tail (tail (tail body)))
+    let (z_fn, z_args) = flat z_val
+    if z_fn != "float_mat_vec" then false
+    else if length z_args != 2 then false
+    else if head (head z_args) != "V" then false
+    else if head (head (tail z_args)) != "V" then false
+    else
+      let wname = head (tail (head z_args))
+      let xname = head (tail (head (tail z_args)))
+      if wname != head params then false
+      else if xname != head (tail params) then false
+      else if head rest1 != "D" then false
+      else
+        let s_bn = head (tail rest1)
+        let s_val = head (tail (tail rest1))
+        let rest2 = head (tail (tail (tail rest1)))
+        let (s_fn, s_args) = flat s_val
+        if s_fn != "float_arr_map" then false
+        else if length s_args != 2 then false
+        else if head (head s_args) != "V" then false
+        else if head (head (tail s_args)) != "V" then false
+        else if head (tail (head (tail s_args))) != z_bn then false
+        else if head rest2 != "D" then false
+        else
+          let r_bn = head (tail rest2)
+          let r_val = head (tail (tail rest2))
+          let term = head (tail (tail (tail rest2)))
+          let (r_fn, r_args) = flat r_val
+          if r_fn != "float_arr_map2" then false
+          else if length r_args != 3 then false
+          else if head (head r_args) != "V" then false
+          else if head (head (tail r_args)) != "V" then false
+          else if head (head (tail (tail r_args))) != "V" then false
+          else
+            let cfn = head (tail (head r_args))
+            let aA = head (tail (head (tail r_args)))
+            let aB = head (tail (head (tail (tail r_args))))
+            let okargs = if aA == xname then aB == s_bn
+                         else if aA == s_bn then aB == xname
+                         else false
+            if okargs == false then false
+            else if (res_is_add cfn decls) == false then false
+            else
+              let (t_fn, t_args) = flat term
+              let okdot = if t_fn != "float_dot" then 0
+                          else if length params != 3 then 0
+                          else if length t_args != 2 then 0
+                          else if head (head t_args) != "V" then 0
+                          else if head (tail (head t_args)) != r_bn then 0
+                          else if head (head (tail t_args)) != "V" then 0
+                          else if head (tail (head (tail t_args))) != head (tail (tail params)) then 0
+                          else 1
+              let oksum = if t_fn != "float_arr_sum" then 0
+                          else if length params != 2 then 0
+                          else if length t_args != 1 then 0
+                          else if head (head t_args) != "V" then 0
+                          else if head (tail (head t_args)) != r_bn then 0
+                          else 1
+              (okdot + oksum) > 0
 
 synth_grad_decls marks decls =
   if marks == [] then []
@@ -4084,22 +4235,25 @@ synth_grad_decls marks decls =
           let rmapfn = ["fn", cat [nm, "__rgrad"], append params ["__gy"], bcast]
           cons rmapfn rest
         else if detect_layer_chain body params then
-          -- V5 slice 5b (whole-net, general depth L):  net W1 .. WL x =
-          --   let h1 = float_arr_map act1 (float_mat_vec W1 x) in ... in float_arr_sum hL
-          -- L dense layers (flat row-major weights) + sum readout. Synthesizes ONE
-          -- net__rgrad W1 .. WL x __gy __wrt that re-materializes the forward primals,
-          -- seeds the terminal cotangent (d(sum)/d = broadcast __gy), and sweeps back:
+          -- V5 slice 5b/rung1 (whole-net, general depth L):  net W1 .. WL x [g] =
+          --   let h1 = float_arr_map act1 (float_mat_vec W1 x) in ... in <readout> hL
+          -- L dense layers (flat row-major weights) + a scalar readout. Synthesizes ONE
+          -- net__rgrad W1 .. WL x [g] __gy __wrt that re-materializes the forward primals,
+          -- seeds the terminal cotangent from the readout (rung1: sum -> broadcast __gy ;
+          -- dot g -> g .* __gy, the arbitrary-cotangent injection), then sweeps back:
           -- ct_z_k = act_k'(z_k) .* upstream ; per-layer dW_k = outer(ct_z_k, in_k) and
           -- the upstream input cotangent = W_k^T . ct_z_k (the slice-4 atoms). __wrt=k
-          -- selects dL/dW{k+1} (k=0..L-1) and __wrt=L selects dL/dx. The L=2 emission is
-          -- byte-identical to the slice-5a shape the oracle validated; L=1 reduces to s4.
-          let xin = lc_last params
+          -- selects dL/dW{k+1} (k=0..L-1) and __wrt=L selects dL/dx. The sum emission is
+          -- byte-identical to the slice-5b shape the oracle validated; L=1 reduces to s4.
+          let nlayers = lc_count body
+          let xin = list_nth params nlayers
           let stages = lc_chain body xin
-          let nlayers = length stages
           let w0 = head (tail (tail (head stages)))
-          let actfns = lc_actfn_go nm stages 0
+          let ro = lc_readout body
+          let actbase = lc_actfn_go nm stages 0
+          let actfns = if head ro == "dot" then cons (lc_seedmul_fn nm) actbase else actbase
           let fwd = lc_fwd_go stages 0 ["V", xin]
-          let ctybind = ["__cty", ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", cat ["__z", show nlayers]]]], ["V", "__gy"]]]
+          let ctybind = lc_seedbind nm ro nlayers
           let rev = lc_rev_go nm (reverse stages) (nlayers - 1) ["V", "__cty"]
           let allbinds = append fwd (cons ctybind rev)
           let sel = lc_sel_go w0 xin stages 0
@@ -4128,6 +4282,44 @@ synth_grad_decls marks decls =
           let rbody = ["D", "__z", zexpr, ["D", "__ctz", ctzexpr, ["?", guard, dW, dx]]]
           let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy", "__wrt"], rbody]
           cons actfn (cons rgfn rest)
+        else if detect_residual body params decls then
+          -- Rung 6 (residual fan-out): net W x [g] =
+          --   let z = float_mat_vec W x in let s = float_arr_map act z in
+          --   let r = float_arr_map2 add x s in <readout> r   (x reused: matvec input AND
+          -- skip = FAN-OUT). The structurally new reverse piece vs the layer-chain: x's
+          -- cotangent is the SUM of the skip path (__cty, since r = x + s with dr/dx = 1)
+          -- and the sublayer path (W^T . __ctz). Synthesizes net__rgrad W x [g] __gy __wrt:
+          --   __z = float_mat_vec W x ; __cty = readout seed (dot g -> g .* __gy ; sum ->
+          --   broadcast __gy) ; __ctz = act'(__z) .* __cty ; __wrt=0 -> dW = outer(__ctz,x) ;
+          --   else -> dx = __cty + W^T . __ctz  (the fan-out sum). add verified by res_is_add.
+          let z_val = head (tail (tail body))
+          let (z_fn, z_args) = flat z_val
+          let wname = head (tail (head z_args))
+          let xname = head (tail (head (tail z_args)))
+          let rest1 = head (tail (tail (tail body)))
+          let s_val = head (tail (tail rest1))
+          let (s_fn, s_args) = flat s_val
+          let actnm = head (tail (head s_args))
+          let rest2 = head (tail (tail (tail rest1)))
+          let term = head (tail (tail (tail rest2)))
+          let (t_fn, t_args) = flat term
+          let ro = if t_fn == "float_dot" then ["dot", head (tail (head (tail t_args)))] else ["sum"]
+          let actderiv = ["A", ["A", ["V", cat [actnm, "__grad"]], ["V", "__vz"]], ["I", "0"]]
+          let actfn = ["fn", cat [nm, "__rgrad_act"], ["__vz", "__vc"], ["O", "*", actderiv, ["V", "__vc"]]]
+          let addvfn = ["fn", cat [nm, "__rgrad_addv"], ["__a", "__b"], ["O", "+", ["V", "__a"], ["V", "__b"]]]
+          let seedmulfn = ["fn", cat [nm, "__rgrad_seedmul"], ["__a", "__b"], ["O", "*", ["V", "__a"], ["V", "__b"]]]
+          let zexpr = ["A", ["A", ["V", "float_mat_vec"], ["V", wname]], ["V", xname]]
+          let gyv = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", "__z"]]], ["V", "__gy"]]
+          let ctyexpr = if head ro == "dot" then ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_seedmul"]]], ["V", head (tail ro)]], gyv] else gyv
+          let ctzexpr = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_act"]]], ["V", "__z"]], ["V", "__cty"]]
+          let dW = ["A", ["A", ["V", "float_outer"], ["V", "__ctz"]], ["V", xname]]
+          let wtctz = ["A", ["A", ["V", "float_mat_vec_t"], ["V", wname]], ["V", "__ctz"]]
+          let dx = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_addv"]]], ["V", "__cty"]], wtctz]
+          let guard = ["O", "==", ["V", "__wrt"], ["I", "0"]]
+          let rbody = ["D", "__z", zexpr, ["D", "__cty", ctyexpr, ["D", "__ctz", ctzexpr, ["?", guard, dW, dx]]]]
+          let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy", "__wrt"], rbody]
+          let helpers = if head ro == "dot" then cons actfn (cons addvfn (cons seedmulfn [])) else cons actfn (cons addvfn [])
+          append helpers (cons rgfn rest)
         else if detect_chain_readout body params then
           -- V5 slice 3 (contraction readout on the map-chain): a linear map-chain feeding a
           -- dot-product readout  L = sum_i g(w_i, z_i)  (z = last map binding, w = 2nd param,
