@@ -1,0 +1,197 @@
+-- Rung 25: per-step hash-chained, Ed25519-signed training record over the
+-- COMPILER-SYNTHESIZED gradient loop. This is PAOS Stage-2: the training
+-- trajectory itself becomes a tamper-evident, independently-verifiable ledger.
+--
+-- Rungs 1-24 proved the synthesized net__rgrad is correct (FD), survivable
+-- (allocator), routable (GPU), and resumable (checkpoint). Rung 25 makes a run
+-- ACCOUNTABLE: every step emits a signed record binding (weights, gradient,
+-- loss, step) at the point the gradient was evaluated, hash-chained to its
+-- predecessor and anchored to a genesis beacon value. Tamper with any step --
+-- reorder, insert, delete, edit a weight -- and the chain hash or a signature
+-- breaks.
+--
+-- LOCAL/DEV ONLY (binding constraint): the signing key is an EPHEMERAL seed
+-- derived in-process from a fixed dev string (NEVER ~/.fleet, the Pi witness,
+-- or any prod sign surface), and the genesis is a LOCAL constant (NEVER the
+-- live ledatic.org/entropy pulse). Nothing here touches a production surface.
+--
+-- Per step (at the PRE-update weights -- the point the gradient is evaluated):
+--   w_hex   = SHA256( canon(W1) ";" canon(W2) )          -- weights commitment
+--   g_hex   = SHA256( canon(dW1) ";" canon(dW2) )         -- gradient commitment
+--   link    = SHA256( prev_hex "|" step "|" w_hex "|" g_hex "|" loss )
+--   sig     = Ed25519_sign(seed, link)                    -- 64-byte signature
+-- prev_hex(step 0) = genesis = SHA256(local beacon constant). The signed ledger
+-- is persisted to /tmp/r25chain.txt for rung 26 to independently re-verify.
+--
+-- Gates (all must hold):
+--   1. okSigs      -- every per-step signature verifies under the run pubkey
+--   2. okProg      -- lossK <. loss0 (a real training trajectory, not a no-op)
+--   3. okTamper    -- a one-byte-flipped signature is REJECTED (verifier is real)
+--   4. okWrongKey  -- a signature from a different key is REJECTED (key binding)
+-- Float gates use `<.` (fcmp, NaN-safe); never polymorphic `==` on a float.
+--
+-- Build: ./rail_native --out-prefix /tmp/r25 tools/ad/nn/rung25_attested_training_record_test.rail
+-- Run:   /tmp/r25      (also writes the signed ledger to /tmp/r25chain.txt)
+
+import "stdlib/float_arr.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+#grad sq
+sq z = z *. z
+
+#grad net
+net W1 W2 x g =
+  let h1 = float_arr_map sq (float_mat_vec W1 x)
+  let y  = float_arr_map sq (float_mat_vec W2 h1)
+  float_dot y g
+
+fwd W1 W2 x =
+  let h1 = float_arr_map sq (float_mat_vec W1 x)
+  float_arr_map sq (float_mat_vec W2 h1)
+
+sub2 a b = a -. b
+twodiff a b = 2.0 *. (a -. b)
+
+sqsum_go a n i acc =
+  if i >= n then acc
+  else sqsum_go a n (i + 1) (acc +. ((float_arr_get a i) *. (float_arr_get a i)))
+mse y t =
+  let d = float_arr_map2 sub2 y t
+  sqsum_go d (float_arr_len d) 0 0.0
+
+axpy_go W dW lr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set W i ((float_arr_get W i) -. (lr *. (float_arr_get dW i)))
+    axpy_go W dW lr n (i + 1)
+
+-- canonical decimal serialization of a float array (comma-joined show_float)
+arr_canon_go W n i acc =
+  if i >= n then acc
+  else arr_canon_go W n (i + 1) (cat [acc, (if i == 0 then "" else ","), show_float (float_arr_get W i)])
+arr_canon W n = arr_canon_go W n 0 ""
+
+-- one signed record at the CURRENT (pre-update) weights, then apply one SGD step.
+-- returns [link_hex, file_line, ok]; mutates W1,W2 in place.
+record_step W1 W2 x t lr seed pk prev_hex step_i =
+  let y       = fwd W1 W2 x
+  let loss    = mse y t
+  let g       = float_arr_map2 twodiff y t
+  let dW1     = net__rgrad W1 W2 x g 1.0 0
+  let dW2     = net__rgrad W1 W2 x g 1.0 1
+  let w_hex   = sha256_hex (cat [arr_canon W1 6, ";", arr_canon W2 6])
+  let g_hex   = sha256_hex (cat [arr_canon dW1 6, ";", arr_canon dW2 6])
+  let loss_str = show_float loss
+  let link_str = cat [prev_hex, "|", show step_i, "|", w_hex, "|", g_hex, "|", loss_str]
+  let link_b  = sha256 link_str
+  let link_hex = bytes_to_hex link_b 32
+  let sig     = ed25519_sign seed link_b 32
+  let sig_hex = bytes_to_hex sig 64
+  let ok      = ed25519_verify pk link_b 32 sig
+  let _       = axpy_go W1 dW1 lr 6 0
+  let _       = axpy_go W2 dW2 lr 6 0
+  let line    = cat [show step_i, " ", w_hex, " ", g_hex, " ", loss_str, " ", prev_hex, " ", link_hex, " ", sig_hex]
+  cons link_hex (cons line (cons ok []))
+
+chain_loop W1 W2 x t lr seed pk kk i prev_hex acc all_ok =
+  if i >= kk then cons all_ok (cons acc (cons prev_hex []))
+  else
+    let r = record_step W1 W2 x t lr seed pk prev_hex i
+    let link_hex = head r
+    let line = head (tail r)
+    let ok = head (tail (tail r))
+    chain_loop W1 W2 x t lr seed pk kk (i + 1) link_hex (cat [acc, line, "\n"]) (all_ok * ok)
+
+mkW1 =
+  let W = float_arr_new 6 0.0
+  let _ = float_arr_set W 0 0.5
+  let _ = float_arr_set W 1 0.2
+  let _ = float_arr_set W 2 (0.0 -. 0.1)
+  let _ = float_arr_set W 3 0.4
+  let _ = float_arr_set W 4 0.3
+  let _ = float_arr_set W 5 (0.0 -. 0.2)
+  W
+mkW2 =
+  let W = float_arr_new 6 0.0
+  let _ = float_arr_set W 0 0.4
+  let _ = float_arr_set W 1 (0.0 -. 0.1)
+  let _ = float_arr_set W 2 0.2
+  let _ = float_arr_set W 3 0.1
+  let _ = float_arr_set W 4 0.3
+  let _ = float_arr_set W 5 (0.0 -. 0.2)
+  W
+mkX =
+  let x = float_arr_new 2 0.0
+  let _ = float_arr_set x 0 0.5
+  let _ = float_arr_set x 1 (0.0 -. 0.3)
+  x
+mkT =
+  let t = float_arr_new 2 0.0
+  let _ = float_arr_set t 0 0.30
+  let _ = float_arr_set t 1 0.10
+  t
+
+main =
+  let _ = shell "rm -f /tmp/r25chain.txt"
+  let lr = 0.5
+  let kk = 8
+  let x  = mkX
+  let t  = mkT
+  let W1 = mkW1
+  let W2 = mkW2
+
+  -- EPHEMERAL LOCAL DEV KEY: derived in-process, never a prod key path.
+  let seed = sha256 "rung25.local.ephemeral.dev.seed.v1"
+  let pk   = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+  -- LOCAL genesis beacon constant (stands in for the prod entropy pulse).
+  let genesis_hex = sha256_hex "RUNG25.LOCAL.BEACON.GENESIS.dev"
+
+  let loss0 = mse (fwd W1 W2 x) t
+  let res = chain_loop W1 W2 x t lr seed pk kk 0 genesis_hex "" 1
+  let all_ok    = head res
+  let body      = head (tail res)
+  let head_link = head (tail (tail res))
+  let lossK = mse (fwd W1 W2 x) t
+
+  -- persist the signed ledger for rung 26 to independently re-verify
+  let header = cat ["# RUNG25v1 ", pk_hex, " ", genesis_hex, " ", show kk, "\n"]
+  let _ = write_file "/tmp/r25chain.txt" (cat [header, body])
+
+  -- falsification probes (prove the verifier genuinely discriminates):
+  let pmsg = sha256 "rung25.tamper.probe"
+  let psig = ed25519_sign seed pmsg 32
+  let okGood = ed25519_verify pk pmsg 32 psig
+  let tsig = arr_new 64 0
+  let _ = sha_copy_bytes psig tsig 0 0 64
+  let _ = arr_set tsig 5 (bit_xor (arr_get tsig 5) 1)
+  let okBad = ed25519_verify pk pmsg 32 tsig
+  let seed2 = sha256 "rung25.other.key"
+  let wsig = ed25519_sign seed2 pmsg 32
+  let okW  = ed25519_verify pk pmsg 32 wsig
+
+  -- Gates
+  let okSigs     = if all_ok == 1 then 1 else 0
+  let okProg     = if lossK <. loss0 then 1 else 0
+  let okTamper   = if okGood == 1 then (if okBad == 0 then 1 else 0) else 0
+  let okWrongKey = if okW == 0 then 1 else 0
+  let all = okSigs * okProg * okTamper * okWrongKey
+
+  let _ = print (cat ["Rung 25 attested training record: K=", show kk, " lr=", show_float lr])
+  let _ = print (cat ["  pubkey=", pk_hex])
+  let _ = print (cat ["  genesis=", genesis_hex])
+  let _ = print (cat ["  chain head=", head_link])
+  let _ = print (cat ["  loss0=", show_float loss0, "  lossK=", show_float lossK,
+                      "  (progress ", show okProg, ")"])
+  let _ = print (cat ["  all per-step sigs verify=", show okSigs,
+                      "  tamper-reject=", show okTamper, "  wrong-key-reject=", show okWrongKey])
+  let _ = print (cat ["  signed ledger written: /tmp/r25chain.txt (", show kk, " records)"])
+  let _ = print (if all == 1
+                 then "RUNG 25 PASS: synthesized-grad training trajectory is hash-chained + Ed25519-signed; ledger is tamper-evident and persisted for independent re-verification"
+                 else "RUNG 25 FAIL")
+  if all == 1 then 0 else 1
