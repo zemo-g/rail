@@ -1,0 +1,98 @@
+-- BX11: the USER-FACING success metric -- compile% on a held-out Rail task set,
+-- with rail_native itself as the oracle. WRITTEN BEFORE the BX10 training run
+-- (the 7-hour-burn rule: define success in user-facing terms first, run it at
+-- the FIRST checkpoint, abort if it is 0 even while val_loss drops).
+--
+-- A "task" is a prompt the model should complete into Rail source. The scorer
+-- takes the candidate Rail, compiles it with rail_native (--out-prefix, so it
+-- never touches the mhd-owned /tmp/rail_out), runs the binary, and checks the
+-- output. Two numbers per run:
+--   compile%  = fraction of candidates that compile + link clean
+--   correct%  = fraction whose program output matches the expected string
+--
+-- This file is also the INSTRUMENT SELF-CHECK: it embeds reference completions
+-- for each task plus one deliberately-broken candidate, and asserts the scorer
+-- reports exactly the broken one as a compile failure. That proves the
+-- measurement discriminates PASS from FAIL before it is trusted on a model.
+--
+-- BX10 reuses bx11_score_one: it writes the model's per-task completion and
+-- calls the same scorer at each checkpoint.
+
+-- Compile one candidate Rail source, run it, return (compiled, correct).
+-- compiled = 1 if the toolchain reported "ld: OK"; correct = 1 if the program
+-- output contains the expected string. No exit-code dependence (we grep the
+-- compile log + program output), so it is robust to shell return quirks.
+bx11_score_one src expected idx =
+  let path = join "" ["/tmp/bx11_cand_", show idx, ".rail"] in
+  let binp = join "" ["/tmp/bx11_cand_", show idx, "_bin"] in
+  let logp = join "" ["/tmp/bx11_cand_", show idx, ".log"] in
+  let outp = join "" ["/tmp/bx11_cand_", show idx, ".out"] in
+  let _ = write_file path src in
+  let cc = join "" ["./rail_native --out-prefix ", binp, " ", path, " > ", logp, " 2>&1"] in
+  let _ = shell cc in
+  let log = read_file logp in
+  let compiled = if str_contains "ld: OK" log then 1 else 0 in
+  if compiled == 0 then (0, 0)
+  else
+    let rc = join "" [binp, " > ", outp, " 2>&1"] in
+    let _ = shell rc in
+    let out = read_file outp in
+    let correct = if str_contains expected out then 1 else 0 in
+    (1, correct)
+
+-- Score the whole task set. Each task = (src, expected, should_compile).
+-- Accumulates compile count, correct count, and instrument-agreement count.
+bx11_go tasks idx nC nCorrect nInstr =
+  if tasks == [] then [nC, nCorrect, nInstr]
+  else
+    let t = head tasks in
+    let (src, expected, shouldc) = t in
+    let r = bx11_score_one src expected idx in
+    let (compiled, correct) = r in
+    let instr = if compiled == shouldc then 1 else 0 in
+    bx11_go (tail tasks) (idx + 1) (nC + compiled) (nCorrect + correct) (nInstr + instr)
+
+bx11_len xs = if xs == [] then 0 else 1 + bx11_len (tail xs)
+
+-- ===== held-out Rail task set (reference completions for the self-check) =====
+-- Prompts (documentation):
+--   t0: define double x = x*2; print (double 21)         -> 42
+--   t1: define add a b = a+b; print (add 19 23)          -> 42
+--   t2: sum [1..5] with fold add 0                        -> 15
+--   t3: factorial fact 5                                  -> 120
+--   t4: string join "he"++"llo"                           -> hello
+--   t5: BROKEN -- unbalanced application, must NOT compile -> (compile FAIL)
+
+bx11_t0 = "double x = x * 2\nmain = let _ = print (show (double 21)) in 0\n"
+bx11_t1 = "add a b = a + b\nmain = let _ = print (show (add 19 23)) in 0\n"
+bx11_t2 = "add a b = a + b\nmain = let _ = print (show (fold add 0 [1, 2, 3, 4, 5])) in 0\n"
+bx11_t3 = "fact n = if n <= 1 then 1 else n * fact (n - 1)\nmain = let _ = print (show (fact 5)) in 0\n"
+bx11_t4 = "main = let _ = print (join \"\" [\"he\", \"llo\"]) in 0\n"
+bx11_t5 = "main = let _ = print (zzz qqq www\n"
+
+bx11_tasks =
+  [ (bx11_t0, "42", 1)
+  , (bx11_t1, "42", 1)
+  , (bx11_t2, "15", 1)
+  , (bx11_t3, "120", 1)
+  , (bx11_t4, "hello", 1)
+  , (bx11_t5, "", 0)
+  ]
+
+main =
+  let res = bx11_go bx11_tasks 0 0 0 0 in
+  let nC = head res in
+  let nCorrect = head (tail res) in
+  let nInstr = head (tail (tail res)) in
+  let ntasks = bx11_len bx11_tasks in
+  let compile_pct = (nC * 100) / ntasks in
+  let correct_pct = (nCorrect * 100) / ntasks in
+  let instr_ok = if nInstr == ntasks then 0 else 1 in
+  let _ = print (join "" ["BX11 compile%: ", show compile_pct, "  (", show nC, "/", show ntasks, " candidates compile+link)"]) in
+  let _ = print (join "" ["BX11 correct%: ", show correct_pct, "  (", show nCorrect, "/", show ntasks, " produce the expected output)"]) in
+  let _ = print (join "" ["BX11 instrument self-check (broken task detected as FAIL, others PASS): ", if instr_ok == 0 then "PASS" else "FAIL"]) in
+  let _ = write_file "/tmp/bx11_eval.txt" (join "" [show compile_pct, " ", show correct_pct, " ", show nC, " ", show nCorrect, " ", show ntasks, "\n"]) in
+  let _ = print (if instr_ok == 0
+    then "BX11 PASS: compile-as-oracle eval instrument validated; ready to gate BX10 first checkpoint"
+    else "BX11 FAIL: instrument did not discriminate pass/fail") in
+  0
