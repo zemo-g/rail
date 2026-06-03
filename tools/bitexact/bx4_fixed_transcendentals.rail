@@ -1,0 +1,203 @@
+-- BX4: fixed-point INTEGER transcendentals (sqrt / rsqrt / exp / tanh / gelu).
+--
+-- Enemy #3 of FP determinism is the transcendental: foreign libm exp/tanh/sqrt use
+-- different polynomial approximations and rounding on every platform, so two honest
+-- implementations disagree in the low bits. We defeat it the same way BX2/BX3 defeated
+-- the reduction: compute each function with a FIXED INTEGER algorithm. Integer
+-- arithmetic is exact and associative, so any device (CPU, Apple GPU with no f64, a
+-- foreign Python re-impl) that runs the SAME algorithm produces BIT-IDENTICAL output.
+--
+-- Representation: fixed-point with F=24 fractional bits, S=2^24=16777216 (same scale as
+-- BX2's quantizer). A real x is the integer X = round(x*S). The D3 witness compares the
+-- INTEGER results -- sidestepping any decimal round-trip ambiguity (BX2 pattern): if the
+-- integer fixed-point output matches, the deterministic convert-back yields the same float.
+--
+-- All internal divides truncate toward zero (ARM sdiv); the Python witness must do the
+-- same (its `td` helper). Every reduction is to exp of a NON-POSITIVE argument, which is
+-- bounded in (0, S] and never overflows 62-bit ints.
+
+foreign sqrt x -> float
+foreign exp  x -> float
+foreign tanh x -> float
+
+-- ================= integer sqrt (digit-by-digit) =================
+-- MUTUAL recursion (a/b ping-pong), NOT self-recursion: a constant multiply (`d * 4`) in
+-- a SELF-loop tail-call argument is miscompiled by the self-loop raw-register optimizer
+-- (emits 8d+1 instead of 4d via tag mangling). Mutual recursion routes the argument
+-- through a normal, correctly-tagged call.  (rail-bug-self-loop-const-mul-arg)
+bx4_topbit_a n d = if d * 4 > n then d else bx4_topbit_b n (d * 4)
+bx4_topbit_b n d = if d * 4 > n then d else bx4_topbit_a n (d * 4)
+bx4_topbit n d = bx4_topbit_a n d
+bx4_isqrt_a n c d =
+  if d == 0 then c
+  else
+    let cd = c + d in
+    if n >= cd then bx4_isqrt_b (n - cd) ((c / 2) + d) (d / 4)
+    else bx4_isqrt_b n (c / 2) (d / 4)
+bx4_isqrt_b n c d =
+  if d == 0 then c
+  else
+    let cd = c + d in
+    if n >= cd then bx4_isqrt_a (n - cd) ((c / 2) + d) (d / 4)
+    else bx4_isqrt_a n (c / 2) (d / 4)
+bx4_isqrt n = if n < 1 then 0 else bx4_isqrt_a n 0 (bx4_topbit n 1)
+
+bx4_fxsqrt xq = bx4_isqrt (xq * 16777216)
+bx4_fxrsqrt xq = let q = bx4_fxsqrt xq in if q == 0 then 0 else 281474976710656 / q
+
+-- ================= fixed-point exp (arg-reduced, unrolled poly) =================
+-- 2^k via repeated doubling. acc+acc (addition) and k-1 (decrement) are the proven-safe
+-- self-loop ops; only constant-MULTIPLY in a tail arg is miscompiled.
+bx4_pow2_go acc k = if k == 0 then acc else bx4_pow2_go (acc + acc) (k - 1)
+bx4_pow2 k = if k < 1 then 1 else bx4_pow2_go 1 k
+
+-- e^f * S for f = fq/S in [0, ln2). Degree-8 Horner, FULLY UNROLLED (no loop), all
+-- positive integer ops bounded < 2^49. Coeffs c_i = round(S / i!).
+bx4_exp_poly fq =
+  let p8 = 416 in
+  let p7 = 3329 + (p8 * fq) / 16777216 in
+  let p6 = 23302 + (p7 * fq) / 16777216 in
+  let p5 = 139810 + (p6 * fq) / 16777216 in
+  let p4 = 699051 + (p5 * fq) / 16777216 in
+  let p3 = 2796203 + (p4 * fq) / 16777216 in
+  let p2 = 8388608 + (p3 * fq) / 16777216 in
+  let p1 = 16777216 + (p2 * fq) / 16777216 in
+  let p0 = 16777216 + (p1 * fq) / 16777216 in
+  p0
+
+-- e^x * S for x <= 0 (ax = |x|q > 0). LN2_q = round(ln2 * S) = 11629080.
+bx4_exp_neg ax =
+  let k = ax / 11629080 in
+  let fq = ax - k * 11629080 in
+  let ef = bx4_exp_poly fq in
+  let emf = 281474976710656 / ef in
+  if k >= 50 then 0
+  else let p2 = bx4_pow2 k in (emf + p2 / 2) / p2
+
+-- e^x * S for x > 0; capped where it would exceed 62-bit range (x ~> 24).
+-- The k>=36 branch is dead for BX4's bounded domain (|x|<=6 -> k<=8); its sentinel
+-- is a runtime product (NOT a bare literal): value-position integer literals > 32767
+-- are miscompiled (tagged 2N+1 forced through a single `mov`).  (rail-bug-value-literal-tag-mov)
+bx4_exp_pos xq =
+  let k = xq / 11629080 in
+  let fq = xq - k * 11629080 in
+  let ef = bx4_exp_poly fq in
+  if k >= 36 then ef * (bx4_pow2 35)
+  else (ef * (bx4_pow2 k))
+
+-- xq==0 routes through exp_pos (e^0*S = poly(0) = S), avoiding a bare 16777216 return
+-- (same value-literal-tag bug).
+bx4_fxexp xq =
+  if xq < 0 then bx4_exp_neg (0 - xq)
+  else bx4_exp_pos xq
+
+-- ================= tanh / sigmoid / gelu (built on exp<=0) =================
+-- tanh(x>=0) = (S - e^{-2x})/(S + e^{-2x}); e^{-2x} uses arg -2x <= 0 (no overflow).
+bx4_tanh_pos axq =
+  let em = bx4_fxexp (0 - (axq + axq)) in
+  ((16777216 - em) * 16777216) / (16777216 + em)
+bx4_tanh xq = if xq < 0 then 0 - (bx4_tanh_pos (0 - xq)) else bx4_tanh_pos xq
+
+-- gelu(x) = 0.5*x*(1 + tanh(g*(x + a*x^3))), g=0.7978845608 (g_q=13386610), a=0.044715 (a_q=750194)
+bx4_gelu xq =
+  let x2 = (xq * xq) / 16777216 in
+  let x3 = (x2 * xq) / 16777216 in
+  let ax3 = (750194 * x3) / 16777216 in
+  let inner0 = xq + ax3 in
+  let inner = (13386610 * inner0) / 16777216 in
+  let th = bx4_tanh inner in
+  let onep = 16777216 + th in
+  (xq * onep) / 33554432
+
+-- ================= float<->fixed helpers =================
+bx4_quant x = let s = x *. 16777216.0 in
+  let r = if s <. 0.0 then s -. 0.5 else s +. 0.5 in float_to_int r
+bx4_back rq = (int_to_float rq) /. 16777216.0
+bx4_fabs x = if x <. 0.0 then 0.0 -. x else x
+bx4_geluref x =
+  let inner = 0.7978845608 *. (x +. (0.044715 *. (x *. (x *. x)))) in
+  0.5 *. x *. (1.0 +. (tanh inner))
+
+-- ================= accuracy sweeps (vs libm) =================
+-- sqrt/rsqrt: x = i/4, i in [1..n]
+bx4_sqrt_sweep i n worst fails =
+  if i > n then cons worst (cons fails [])
+  else
+    let x = (int_to_float i) /. 4.0 in
+    let err = bx4_fabs ((bx4_back (bx4_fxsqrt (bx4_quant x))) -. (sqrt x)) in
+    let em = float_to_int (err *. 1000000.0) in
+    let w2 = if em > worst then em else worst in
+    bx4_sqrt_sweep (i + 1) n w2 (fails + (if em > 200 then 1 else 0))
+bx4_rsqrt_sweep i n worst fails =
+  if i > n then cons worst (cons fails [])
+  else
+    let x = (int_to_float i) /. 4.0 in
+    let err = bx4_fabs ((bx4_back (bx4_fxrsqrt (bx4_quant x))) -. (1.0 /. (sqrt x))) in
+    let em = float_to_int (err *. 1000000.0) in
+    let w2 = if em > worst then em else worst in
+    bx4_rsqrt_sweep (i + 1) n w2 (fails + (if em > 200 then 1 else 0))
+-- exp: x = -i/32, i in [0..n]  (args <= 0)
+bx4_exp_sweep i n worst fails =
+  if i > n then cons worst (cons fails [])
+  else
+    let x = 0.0 -. ((int_to_float i) /. 32.0) in
+    let err = bx4_fabs ((bx4_back (bx4_fxexp (bx4_quant x))) -. (exp x)) in
+    let em = float_to_int (err *. 1000000.0) in
+    let w2 = if em > worst then em else worst in
+    bx4_exp_sweep (i + 1) n w2 (fails + (if em > 200 then 1 else 0))
+-- tanh/gelu: x = (i - n/2)/16, sweeps negative..positive
+bx4_tanh_sweep i n worst fails =
+  if i > n then cons worst (cons fails [])
+  else
+    let x = ((int_to_float i) -. (int_to_float n) /. 2.0) /. 16.0 in
+    let err = bx4_fabs ((bx4_back (bx4_tanh (bx4_quant x))) -. (tanh x)) in
+    let em = float_to_int (err *. 1000000.0) in
+    let w2 = if em > worst then em else worst in
+    bx4_tanh_sweep (i + 1) n w2 (fails + (if em > 300 then 1 else 0))
+bx4_gelu_sweep i n worst fails =
+  if i > n then cons worst (cons fails [])
+  else
+    let x = ((int_to_float i) -. (int_to_float n) /. 2.0) /. 16.0 in
+    let err = bx4_fabs ((bx4_back (bx4_gelu (bx4_quant x))) -. (bx4_geluref x)) in
+    let em = float_to_int (err *. 1000000.0) in
+    let w2 = if em > worst then em else worst in
+    bx4_gelu_sweep (i + 1) n w2 (fails + (if em > 400 then 1 else 0))
+
+-- D0 checksum: sum of every integer output, twice -> must be identical
+bx4_checksum i n acc =
+  if i > n then acc
+  else
+    let xq = bx4_quant ((int_to_float i) /. 4.0) in
+    let nx = 0 - xq in
+    bx4_checksum (i + 1) n (acc + (bx4_fxsqrt xq) + (bx4_fxexp nx) + (bx4_tanh xq) + (bx4_gelu xq))
+
+-- D3 dump: "Xq fxexp(Xq) tanh(Xq) gelu(Xq)" for x in [-6,6] step 1/16
+bx4_dump i n acc =
+  if i > n then acc
+  else
+    let x = ((int_to_float i) -. (int_to_float n) /. 2.0) /. 16.0 in
+    let xq = bx4_quant x in
+    let line = join " " (cons (show xq) (cons (show (bx4_fxexp xq)) (cons (show (bx4_tanh xq)) (cons (show (bx4_gelu xq)) (cons "\n" []))))) in
+    bx4_dump (i + 1) n (join "" (cons acc (cons line [])))
+
+bx4_verdict label res tol =
+  let w = head res in let f = head (tail res) in
+  let _ = print (join "" (cons label (cons " worst_err=" (cons (show w) (cons "e-6 fails=" (cons (show f) [])))))) in
+  f
+
+main =
+  let sq = bx4_verdict "BX4 sqrt :" (bx4_sqrt_sweep 1 400 0 0) 0 in
+  let rq = bx4_verdict "BX4 rsqrt:" (bx4_rsqrt_sweep 1 400 0 0) 0 in
+  let ex = bx4_verdict "BX4 exp  :" (bx4_exp_sweep 0 320 0 0) 0 in
+  let th = bx4_verdict "BX4 tanh :" (bx4_tanh_sweep 0 192 0 0) 0 in
+  let ge = bx4_verdict "BX4 gelu :" (bx4_gelu_sweep 0 192 0 0) 0 in
+  let c1 = bx4_checksum 1 400 0 in
+  let c2 = bx4_checksum 1 400 0 in
+  let d0 = if c1 == c2 then 0 else 1 in
+  let _ = print (join "" (cons "BX4 D0 (run-twice checksum identical): " (cons (if d0 == 0 then "PASS" else "FAIL") []))) in
+  let _ = write_file "/tmp/bx4_dump.txt" (bx4_dump 0 192 "") in
+  let tot = sq + rq + ex + th + ge + d0 in
+  let _ = print (if tot == 0
+    then "BX4 PASS: fixed-point sqrt/rsqrt/exp/tanh/gelu accurate vs libm + deterministic (D0)"
+    else "BX4 FAIL") in
+  0
