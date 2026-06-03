@@ -1,0 +1,327 @@
+-- Rung 10 gate oracle: CAUSAL-masked single-head attention fwd+bwd vs finite diff.
+--   Before softmax, set scores[i,j] = -1.0e9 for j>i (a large negative). Everything
+--   else identical to rung9. Causal mask => A[i,j]=0 for j>i, so the masked-position
+--   contributions to dscore (hence to dQ/dK) are zero.
+-- Three checks:
+--   (1) dQ/dK/dV agree with central finite differences (h=0.0001),
+--   (2) masked attention weights A[i,j]==0 for j>i,
+--   (3) masked dscore[i,j]==0 for j>i (the "masked-position gradients are zero" assert).
+-- Standalone; floats routed through params; results in heap float_arr. ASCII only.
+-- Run: /tmp/rail_atoms --out-prefix /tmp/rung10 run tools/ad/nn/rung10_attention_causal_oracle_test.rail
+
+import "stdlib/float_arr.rail"
+
+foreign exp x -> float
+foreign sqrt x -> float
+
+fabs1 d = if d <. 0.0 then 0.0 -. d else d
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+fzero a = if (fabs1 a) <. 0.0000001 then 1 else 0
+
+-- ===== FORWARD with causal mask =====
+qk_dot Q K d i j p acc =
+  if p >= d then acc
+  else qk_dot Q K d i j (p + 1) (acc +. ((float_arr_get Q (i * d + p)) *. (float_arr_get K (j * d + p))))
+
+-- scores already /sqrt(d); masked entries (j>i) forced to -1.0e9
+sc_fill Q K L d invs S idx =
+  if idx >= L * L then S
+  else
+    let i = idx / L
+    let j = idx - (i * L)
+    let raw = qk_dot Q K d i j 0 0.0
+    let sv = if j > i then (0.0 -. 1.0e9) else (raw *. invs)
+    let _ = float_arr_set S idx sv
+    sc_fill Q K L d invs S (idx + 1)
+
+scores_of Q K L d =
+  let invs = 1.0 /. (sqrt (to_float d))
+  let S = float_arr_new (L * L) 0.0
+  sc_fill Q K L d invs S 0
+
+row_max S L i j acc =
+  if j >= L then acc
+  else
+    let v = float_arr_get S (i * L + j)
+    let nacc = if v >. acc then v else acc
+    row_max S L i (j + 1) nacc
+
+row_esum S L i m j acc =
+  if j >= L then acc
+  else row_esum S L i m (j + 1) (acc +. (exp ((float_arr_get S (i * L + j)) -. m)))
+
+arow_fill S A L i m Z j =
+  if j >= L then A
+  else
+    let e = exp ((float_arr_get S (i * L + j)) -. m)
+    let _ = float_arr_set A (i * L + j) (e /. Z)
+    arow_fill S A L i m Z (j + 1)
+
+a_rows S A L i =
+  if i >= L then A
+  else
+    let m = row_max S L i 0 (0.0 -. 1.0e30)
+    let Z = row_esum S L i m 0 0.0
+    let _ = arow_fill S A L i m Z 0
+    a_rows S A L (i + 1)
+
+softmax_rows S L =
+  let A = float_arr_new (L * L) 0.0
+  a_rows S A L 0
+
+ov_dot A V L d i q j acc =
+  if j >= L then acc
+  else ov_dot A V L d i q (j + 1) (acc +. ((float_arr_get A (i * L + j)) *. (float_arr_get V (j * d + q))))
+
+ov_fill A V L d O idx =
+  if idx >= L * d then O
+  else
+    let i = idx / d
+    let q = idx - (i * d)
+    let _ = float_arr_set O idx (ov_dot A V L d i q 0 0.0)
+    ov_fill A V L d O (idx + 1)
+
+attn_O Q K V L d =
+  let S = scores_of Q K L d
+  let A = softmax_rows S L
+  let O = float_arr_new (L * d) 0.0
+  ov_fill A V L d O 0
+
+loss_go O Up t idx acc =
+  if idx >= t then acc
+  else loss_go O Up t (idx + 1) (acc +. ((float_arr_get O idx) *. (float_arr_get Up idx)))
+
+attn_loss Q K V Up L d =
+  let O = attn_O Q K V L d
+  loss_go O Up (L * d) 0 0.0
+
+-- ===== BACKWARD (identical algebra; mask is carried implicitly via A) =====
+dv_dot A Up L d j q i acc =
+  if i >= L then acc
+  else dv_dot A Up L d j q (i + 1) (acc +. ((float_arr_get A (i * L + j)) *. (float_arr_get Up (i * d + q))))
+
+dv_fill A Up L d dV idx =
+  if idx >= L * d then dV
+  else
+    let j = idx / d
+    let q = idx - (j * d)
+    let _ = float_arr_set dV idx (dv_dot A Up L d j q 0 0.0)
+    dv_fill A Up L d dV (idx + 1)
+
+da_dot Up V L d i j q acc =
+  if q >= d then acc
+  else da_dot Up V L d i j (q + 1) (acc +. ((float_arr_get Up (i * d + q)) *. (float_arr_get V (j * d + q))))
+
+da_fill Up V L d dA idx =
+  if idx >= L * L then dA
+  else
+    let i = idx / L
+    let j = idx - (i * L)
+    let _ = float_arr_set dA idx (da_dot Up V L d i j 0 0.0)
+    da_fill Up V L d dA (idx + 1)
+
+row_dasum dA A L i k acc =
+  if k >= L then acc
+  else row_dasum dA A L i (k + 1) (acc +. ((float_arr_get dA (i * L + k)) *. (float_arr_get A (i * L + k))))
+
+-- dscore[i,j] = invs * A[i,j]*(dA[i,j] - rowsum_i). A[i,j]=0 for j>i => masked dscore=0.
+dsc_rowfill dA A L invs rs dS i j =
+  if j >= L then dS
+  else
+    let aij = float_arr_get A (i * L + j)
+    let v = aij *. ((float_arr_get dA (i * L + j)) -. rs)
+    let _ = float_arr_set dS (i * L + j) (v *. invs)
+    dsc_rowfill dA A L invs rs dS i (j + 1)
+
+dsc_rows dA A L invs dS i =
+  if i >= L then dS
+  else
+    let rs = row_dasum dA A L i 0 0.0
+    let _ = dsc_rowfill dA A L invs rs dS i 0
+    dsc_rows dA A L invs dS (i + 1)
+
+dscore_of dA A L d =
+  let invs = 1.0 /. (sqrt (to_float d))
+  let dS = float_arr_new (L * L) 0.0
+  dsc_rows dA A L invs dS 0
+
+dq_dot dS K L d i p j acc =
+  if j >= L then acc
+  else dq_dot dS K L d i p (j + 1) (acc +. ((float_arr_get dS (i * L + j)) *. (float_arr_get K (j * d + p))))
+
+dq_fill dS K L d dQ idx =
+  if idx >= L * d then dQ
+  else
+    let i = idx / d
+    let p = idx - (i * d)
+    let _ = float_arr_set dQ idx (dq_dot dS K L d i p 0 0.0)
+    dq_fill dS K L d dQ (idx + 1)
+
+dk_dot dS Q L d j p i acc =
+  if i >= L then acc
+  else dk_dot dS Q L d j p (i + 1) (acc +. ((float_arr_get dS (i * L + j)) *. (float_arr_get Q (i * d + p))))
+
+dk_fill dS Q L d dK idx =
+  if idx >= L * d then dK
+  else
+    let j = idx / d
+    let p = idx - (j * d)
+    let _ = float_arr_set dK idx (dk_dot dS Q L d j p 0 0.0)
+    dk_fill dS Q L d dK (idx + 1)
+
+bwd_dV Q K V Up L d =
+  let S = scores_of Q K L d
+  let A = softmax_rows S L
+  let dV = float_arr_new (L * d) 0.0
+  dv_fill A Up L d dV 0
+
+bwd_dQ Q K V Up L d =
+  let S = scores_of Q K L d
+  let A = softmax_rows S L
+  let dA = float_arr_new (L * L) 0.0
+  let _ = da_fill Up V L d dA 0
+  let dS = dscore_of dA A L d
+  let dQ = float_arr_new (L * d) 0.0
+  dq_fill dS K L d dQ 0
+
+bwd_dK Q K V Up L d =
+  let S = scores_of Q K L d
+  let A = softmax_rows S L
+  let dA = float_arr_new (L * L) 0.0
+  let _ = da_fill Up V L d dA 0
+  let dS = dscore_of dA A L d
+  let dK = float_arr_new (L * d) 0.0
+  dk_fill dS Q L d dK 0
+
+-- expose A and dscore directly so we can assert masked entries are zero
+fwd_A Q K V L d =
+  let S = scores_of Q K L d
+  softmax_rows S L
+
+fwd_dscore Q K V Up L d =
+  let S = scores_of Q K L d
+  let A = softmax_rows S L
+  let dA = float_arr_new (L * L) 0.0
+  let _ = da_fill Up V L d dA 0
+  dscore_of dA A L d
+
+-- ===== FINITE DIFFERENCE =====
+fd_Q Q K V Up L d idx =
+  let h = 0.0001
+  let orig = float_arr_get Q idx
+  let _ = float_arr_set Q idx (orig +. h)
+  let fp = attn_loss Q K V Up L d
+  let _ = float_arr_set Q idx (orig -. h)
+  let fm = attn_loss Q K V Up L d
+  let _ = float_arr_set Q idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+fd_K Q K V Up L d idx =
+  let h = 0.0001
+  let orig = float_arr_get K idx
+  let _ = float_arr_set K idx (orig +. h)
+  let fp = attn_loss Q K V Up L d
+  let _ = float_arr_set K idx (orig -. h)
+  let fm = attn_loss Q K V Up L d
+  let _ = float_arr_set K idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+fd_V Q K V Up L d idx =
+  let h = 0.0001
+  let orig = float_arr_get V idx
+  let _ = float_arr_set V idx (orig +. h)
+  let fp = attn_loss Q K V Up L d
+  let _ = float_arr_set V idx (orig -. h)
+  let fm = attn_loss Q K V Up L d
+  let _ = float_arr_set V idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+chkQ dQ Q K V Up L d n idx acc =
+  if idx >= n then acc
+  else chkQ dQ Q K V Up L d n (idx + 1) (acc + (fnear (float_arr_get dQ idx) (fd_Q Q K V Up L d idx)))
+
+chkK dK Q K V Up L d n idx acc =
+  if idx >= n then acc
+  else chkK dK Q K V Up L d n (idx + 1) (acc + (fnear (float_arr_get dK idx) (fd_K Q K V Up L d idx)))
+
+chkV dV Q K V Up L d n idx acc =
+  if idx >= n then acc
+  else chkV dV Q K V Up L d n (idx + 1) (acc + (fnear (float_arr_get dV idx) (fd_V Q K V Up L d idx)))
+
+-- count masked (j>i) entries that are zero, over an [L,L] matrix M
+mask_zero_go M L idx acc =
+  if idx >= L * L then acc
+  else
+    let i = idx / L
+    let j = idx - (i * L)
+    let contrib = if j > i then (fzero (float_arr_get M idx)) else 0
+    mask_zero_go M L (idx + 1) (acc + contrib)
+
+-- number of strictly-upper (j>i) entries in an LxL matrix = L*(L-1)/2
+mask_count L = (L * (L - 1)) / 2
+
+mkQ =
+  let Q = float_arr_new 6 0.0
+  let _ = float_arr_set Q 0 0.5
+  let _ = float_arr_set Q 1 0.2
+  let _ = float_arr_set Q 2 (0.0 -. 0.3)
+  let _ = float_arr_set Q 3 0.4
+  let _ = float_arr_set Q 4 0.1
+  let _ = float_arr_set Q 5 (0.0 -. 0.25)
+  Q
+
+mkK =
+  let K = float_arr_new 6 0.0
+  let _ = float_arr_set K 0 0.1
+  let _ = float_arr_set K 1 0.6
+  let _ = float_arr_set K 2 0.3
+  let _ = float_arr_set K 3 (0.0 -. 0.2)
+  let _ = float_arr_set K 4 0.35
+  let _ = float_arr_set K 5 0.15
+  K
+
+mkV =
+  let V = float_arr_new 6 0.0
+  let _ = float_arr_set V 0 1.0
+  let _ = float_arr_set V 1 (0.0 -. 0.5)
+  let _ = float_arr_set V 2 0.25
+  let _ = float_arr_set V 3 0.75
+  let _ = float_arr_set V 4 (0.0 -. 0.4)
+  let _ = float_arr_set V 5 0.6
+  V
+
+mkUp =
+  let U = float_arr_new 6 0.0
+  let _ = float_arr_set U 0 1.0
+  let _ = float_arr_set U 1 (0.0 -. 0.5)
+  let _ = float_arr_set U 2 0.3
+  let _ = float_arr_set U 3 0.7
+  let _ = float_arr_set U 4 (0.0 -. 0.2)
+  let _ = float_arr_set U 5 0.9
+  U
+
+main =
+  let _ = print "=== Rung 10 GATE: CAUSAL attention fwd+bwd (finite-diff) + masked-grad-zero assert (L=3 d=2) ==="
+  let Q = mkQ
+  let K = mkK
+  let V = mkV
+  let Up = mkUp
+  let dV = bwd_dV Q K V Up 3 2
+  let dQ = bwd_dQ Q K V Up 3 2
+  let dK = bwd_dK Q K V Up 3 2
+  let cQ = chkQ dQ Q K V Up 3 2 6 0 0
+  let cK = chkK dK Q K V Up 3 2 6 0 0
+  let cV = chkV dV Q K V Up 3 2 6 0 0
+  let A = fwd_A Q K V 3 2
+  let dS = fwd_dscore Q K V Up 3 2
+  let mc = mask_count 3
+  let zA = mask_zero_go A 3 0 0
+  let zS = mask_zero_go dS 3 0 0
+  let fdtot = cQ + cK + cV
+  let masktot = zA + zS
+  let total = fdtot + masktot
+  let want = 18 + (2 * mc)
+  let _ = print (cat [show cQ, "/6 dQ  ", show cK, "/6 dK  ", show cV, "/6 dV"])
+  let _ = print (cat [show zA, "/", show mc, " masked A==0   ", show zS, "/", show mc, " masked dscore==0"])
+  let _ = print (cat [show total, "/", show want, " causal attention checks passed"])
+  if total == want then 0 else 1

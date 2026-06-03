@@ -1,0 +1,158 @@
+-- Rung 20 gate oracle: train/val split + a STRICT perplexity eval, written NOW
+-- (define-success-first) before any training run exists.
+--   split: int-id seq ids[0..L) at index s -> train = ids[0..s), val = ids[s..L).
+--     Verify len(train)+len(val)==L and the boundary elements line up:
+--       train[s-1]==ids[s-1], val[0]==ids[s].
+--   perplexity: given T per-token predicted distributions (each a float_arr over
+--     vocab V summing to 1) and the true next-token ids, define
+--       ppl = exp( (1/T) * sum_t ( -log( prob_t[target_t] ) ) ).
+--     foreign exp / foreign log do the math; probs kept strictly > 0 (log(0)=-inf).
+-- VERIFY (hand-checkable):
+--   case A: every distribution UNIFORM over V=4  =>  -log(prob)=log V for all t,
+--           mean = log V, ppl = exp(log V) = V = 4.0.
+--   case B: a PEAKED distribution putting 0.999 on the correct token => per-token
+--           -log(0.999), mean = -log(0.999), ppl = exp(-log 0.999) ~= 1.001.
+-- Distributions stored as an int array of float_arr handles (arr holds tagged
+-- ptrs); the true-target ids in a parallel int array. Floats route through the
+-- recursive accumulator param (callee-saved float-reg trap). ASCII-only.
+-- Run: /tmp/rail_atoms --out-prefix /tmp/rung20 run tools/ad/nn/rung20_split_perplexity_verify_test.rail
+
+import "stdlib/float_arr.rail"
+
+foreign exp x -> float
+foreign log x -> float
+
+fabs1 d = if d <. 0.0 then 0.0 -. d else d
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+
+-- ---- train/val split -------------------------------------------------------
+-- Copy ids[from .. from+n) into a fresh int array of length n.
+slice_fill ids dst from n i =
+  if i >= n then dst
+  else
+    let _ = arr_set dst i (arr_get ids (from + i))
+    slice_fill ids dst from n (i + 1)
+
+-- take_prefix ids s : train = ids[0..s)
+take_prefix ids s =
+  let dst = arr_new s 0
+  slice_fill ids dst 0 s 0
+
+-- drop_prefix ids s L : val = ids[s..L), length L-s
+drop_prefix ids s ln =
+  let m = ln - s
+  let dst = arr_new m 0
+  slice_fill ids dst s m 0
+
+-- ---- perplexity ------------------------------------------------------------
+-- Accumulate sum_t -log( dist_t[target_t] ). dists is an int array of float_arr
+-- handles; tgts is a parallel int array of target indices. acc threads the
+-- running float sum through the param (NOT a let) to dodge the float-reg trap.
+nll_sum dists tgts T t acc =
+  if t >= T then acc
+  else
+    let dist = arr_get dists t
+    let tg = arr_get tgts t
+    let p = float_arr_get dist tg
+    nll_sum dists tgts T (t + 1) (acc +. (0.0 -. (log p)))
+
+-- perplexity dists tgts T : exp( (1/T) * sum_t -log(prob_t[target_t]) ).
+-- T routed in as a float divisor (int->float auto-promotes in the /. below).
+perplexity dists tgts T =
+  let total = nll_sum dists tgts T 0 0.0
+  let mean = total /. (int_to_float T)
+  exp mean
+
+-- ---- builders --------------------------------------------------------------
+-- uniform_dist V : a float_arr of length V with every entry = 1/V.
+uni_fill d V val i =
+  if i >= V then d
+  else
+    let _ = float_arr_set d i val
+    uni_fill d V val (i + 1)
+
+uniform_dist V =
+  let d = float_arr_new V 0.0
+  let val = 1.0 /. (int_to_float V)
+  uni_fill d V val 0
+
+-- peaked_dist V hot p : prob p on index hot, the remaining (1-p) spread evenly
+-- over the other V-1 entries (so the row still sums to 1, all strictly > 0).
+peak_fill d V hot rest i =
+  if i >= V then d
+  else
+    let _ = float_arr_set d i rest
+    peak_fill d V hot rest (i + 1)
+
+peaked_dist V hot p =
+  let d = float_arr_new V 0.0
+  let rest = (1.0 -. p) /. (int_to_float (V - 1))
+  let _ = peak_fill d V hot rest 0
+  let _ = float_arr_set d hot p
+  d
+
+-- Fill a dists array with the SAME uniform distribution at each of T steps,
+-- and a tgts array (any in-range targets; uniform => target choice irrelevant).
+fill_uniform_seq dists tgts T V i =
+  if i >= T then 0
+  else
+    let _ = arr_set dists i (uniform_dist V)
+    let _ = arr_set tgts i (i - ((i / V) * V))
+    fill_uniform_seq dists tgts T V (i + 1)
+
+-- Peaked sequence: each step's hot index IS the target, prob p on it.
+fill_peaked_seq dists tgts T V p i =
+  if i >= T then 0
+  else
+    let hot = i - ((i / V) * V)
+    let _ = arr_set dists i (peaked_dist V hot p)
+    let _ = arr_set tgts i hot
+    fill_peaked_seq dists tgts T V p (i + 1)
+
+main =
+  let _ = print "=== Rung 20 GATE: train/val split + strict perplexity eval ==="
+
+  -- ---- split verification (ids = [10,11,12,13,14,15], L=6, s=4) ----
+  let L = 6
+  let ids = arr_new L 0
+  let _ = arr_set ids 0 10
+  let _ = arr_set ids 1 11
+  let _ = arr_set ids 2 12
+  let _ = arr_set ids 3 13
+  let _ = arr_set ids 4 14
+  let _ = arr_set ids 5 15
+  let s = 4
+  let tr = take_prefix ids s
+  let va = drop_prefix ids s L
+  let c_sum = if ((arr_len tr) + (arr_len va)) == L then 1 else 0
+  let c_trlen = if (arr_len tr) == s then 1 else 0
+  let c_valen = if (arr_len va) == (L - s) then 1 else 0
+  let c_trb = if (arr_get tr (s - 1)) == (arr_get ids (s - 1)) then 1 else 0
+  let c_vab = if (arr_get va 0) == (arr_get ids s) then 1 else 0
+  let split_ok = c_sum + c_trlen + c_valen + c_trb + c_vab
+
+  -- ---- perplexity case A: uniform over V=4 => ppl == 4.0 ----
+  let V = 4
+  let Ta = 3
+  let dA = arr_new Ta 0
+  let gA = arr_new Ta 0
+  let _ = fill_uniform_seq dA gA Ta V 0
+  let pplA = perplexity dA gA Ta
+  let a_uniform = fnear pplA 4.0
+
+  -- ---- perplexity case B: peaked 0.999 on correct token => ppl ~= 1.001 ----
+  let Tb = 3
+  let dB = arr_new Tb 0
+  let gB = arr_new Tb 0
+  let _ = fill_peaked_seq dB gB Tb V 0.999 0
+  let pplB = perplexity dB gB Tb
+  -- exp(-log 0.999) = 1/0.999 = 1.001001...
+  let b_peaked = fnear pplB 1.001001
+
+  let total = split_ok + a_uniform + b_peaked
+  let n = 5 + 1 + 1
+  let _ = print (cat [show split_ok, "/5 split (len-sum, train-len, val-len, train boundary, val boundary)"])
+  let _ = print (cat [show a_uniform, "/1 uniform-V4 perplexity == 4.0  (got ", show_float pplA, ")"])
+  let _ = print (cat [show b_peaked, "/1 peaked-0.999 perplexity ~= 1.001  (got ", show_float pplB, ")"])
+  let _ = print (cat [show total, "/", show n, " split+perplexity checks passed"])
+  if total == n then 0 else 1
