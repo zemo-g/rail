@@ -3830,6 +3830,44 @@ detect_chain_readout body params =
   if length params != 2 then false
   else (mcr_chain body (head params) (head (tail params))) != []
 
+-- mv_act: recognize the matvec-layer LET-form
+--   f W x = let z = float_mat_vec W x in float_arr_sum (float_arr_map act z)
+-- (W = param0, x = param1, z the let binding, act a #grad-marked unary fn). The
+-- first binding being float_mat_vec (not float_arr_map) is what distinguishes this
+-- from the map-chain walkers, so they stay mutually exclusive. Returns the
+-- activation name, or "" if the body is not exactly this shape. Crash-safe:
+-- head/tail on a non-D or short node degrade to 0/[] via runtime safety.
+mv_act body params =
+  if length params != 2 then ""
+  else if head body != "D" then ""
+  else
+    let bn = head (tail body)
+    let bval = head (tail (tail body))
+    let brest = head (tail (tail (tail body)))
+    let (vfn, vargs) = flat bval
+    if vfn != "float_mat_vec" then ""
+    else if length vargs != 2 then ""
+    else if head (head vargs) != "V" then ""
+    else if head (head (tail vargs)) != "V" then ""
+    else if head (tail (head vargs)) != head params then ""
+    else if head (tail (head (tail vargs))) != head (tail params) then ""
+    else
+      let (rfn, rargs) = flat brest
+      if rfn != "float_arr_sum" then ""
+      else if length rargs != 1 then ""
+      else
+        let inner = head rargs
+        let (ifn, iargs) = flat inner
+        if ifn != "float_arr_map" then ""
+        else if length iargs != 2 then ""
+        else if head (head iargs) != "V" then ""
+        else if head (head (tail iargs)) != "V" then ""
+        else if head (tail (head (tail iargs))) != bn then ""
+        else head (tail (head iargs))
+
+detect_matvec_layer body params =
+  (mv_act body params) != ""
+
 synth_grad_decls marks decls =
   if marks == [] then []
   else
@@ -3912,6 +3950,28 @@ synth_grad_decls marks decls =
           let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", xsname]]], ["V", "__gy"]]
           let rmapfn = ["fn", cat [nm, "__rgrad"], append params ["__gy"], bcast]
           cons rmapfn rest
+        else if detect_matvec_layer body params then
+          -- V5 slice 4 (matvec layer): f W x = let z = float_mat_vec W x in
+          --   float_arr_sum (float_arr_map act z)  is a dense layer (flat row-major W,
+          --   out*n) + elementwise nonlinearity act (#grad-marked unary) + sum readout.
+          --   Reverse: ct_z_j = act'(z_j) .* __gy ; then dL/dW = outer(ct_z, x) (__wrt=0,
+          --   param0) and dL/dx = W^T . ct_z (__wrt=1, param1). The two reverse atoms are
+          --   the float_outer / float_mat_vec_t stdlib prims; the per-elt act deriv reuses
+          --   the proven (act__grad __vz 0) .* __vc shape from the map walkers.
+          let actnm = mv_act body params
+          let wname = head params
+          let xname = head (tail params)
+          let actderiv = ["A", ["A", ["V", cat [actnm, "__grad"]], ["V", "__vz"]], ["I", "0"]]
+          let actfn = ["fn", cat [nm, "__rgrad_act"], ["__vz", "__vc"], ["O", "*", actderiv, ["V", "__vc"]]]
+          let zexpr = ["A", ["A", ["V", "float_mat_vec"], ["V", wname]], ["V", xname]]
+          let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", "__z"]]], ["V", "__gy"]]
+          let ctzexpr = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_act"]]], ["V", "__z"]], bcast]
+          let dW = ["A", ["A", ["V", "float_outer"], ["V", "__ctz"]], ["V", xname]]
+          let dx = ["A", ["A", ["V", "float_mat_vec_t"], ["V", wname]], ["V", "__ctz"]]
+          let guard = ["O", "==", ["V", "__wrt"], ["I", "0"]]
+          let rbody = ["D", "__z", zexpr, ["D", "__ctz", ctzexpr, ["?", guard, dW, dx]]]
+          let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy", "__wrt"], rbody]
+          cons actfn (cons rgfn rest)
         else if detect_chain_readout body params then
           -- V5 slice 3 (contraction readout on the map-chain): a linear map-chain feeding a
           -- dot-product readout  L = sum_i g(w_i, z_i)  (z = last map binding, w = 2nd param,
