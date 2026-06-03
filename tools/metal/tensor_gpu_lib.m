@@ -2064,3 +2064,67 @@ int tgl_jit_dispatch_silu_hadamard(int kid, const double *A, const double *B,
     }
     return 1;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// EXACT INTEGER MATMUL — bit-reproducible fixed-point accumulation
+// Aq,Bq are Rail float_arr holding EXACT-INTEGER doubles (the fixed-point
+// quantized inputs, |q| < 2^31, so exactly representable in f64 AND in
+// int32). They are packed into int32 GPU buffers WITHOUT going through the
+// f64->f32 path (which would corrupt magnitudes above 2^24). The kernel
+// returns the per-output 2-limb accumulator as int64 [hi, lo]; those are
+// written back into the Rail float_arr Hi,Lo as exact-integer doubles
+// (hi, lo in [0,2^31), both within f64's 2^53 exact-integer range for the
+// fixed-point regime). Bit-identical to the CPU reference in bx2.
+// ────────────────────────────────────────────────────────────────────
+int tgl_exact_matmul(const double *Aq, const double *Bq,
+                     double *Hi, double *Lo, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = Aq + 1, *Bptr = Bq + 1;
+    double *Hptr = Hi + 1, *Lptr = Lo + 1;
+
+    @autoreleasepool {
+        uint32_t sA = (uint32_t)M*K, sB = (uint32_t)K*N, sC = (uint32_t)M*N;
+        id<MTLBuffer> bA = pool_acquire((NSUInteger)sA * 4);   // int32 in
+        id<MTLBuffer> bB = pool_acquire((NSUInteger)sB * 4);   // int32 in
+        id<MTLBuffer> bH = pool_acquire((NSUInteger)sC * 8);   // int64 out
+        id<MTLBuffer> bL = pool_acquire((NSUInteger)sC * 8);   // int64 out
+
+        int32_t *Ai = (int32_t*)bA.contents;
+        int32_t *Bi = (int32_t*)bB.contents;
+        for (uint32_t t = 0; t < sA; t++) Ai[t] = (int32_t)Aptr[t];
+        for (uint32_t t = 0; t < sB; t++) Bi[t] = (int32_t)Bptr[t];
+
+        id<MTLComputePipelineState> p = pso(@"exact_matmul");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bA offset:0 atIndex:0];
+        [enc setBuffer:bB offset:0 atIndex:1];
+        [enc setBuffer:bH offset:0 atIndex:2];
+        [enc setBuffer:bL offset:0 atIndex:3];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:4];
+        [enc setBytes:&ku length:4 atIndex:5];
+        [enc setBytes:&nu length:4 atIndex:6];
+
+        // one thread per output element; non-uniform grid (N across, M down)
+        NSUInteger tw = 16, th = 16;
+        if ((NSUInteger)N < tw) tw = (NSUInteger)N;
+        if ((NSUInteger)M < th) th = (NSUInteger)M;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)N, (NSUInteger)M, 1)
+          threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        long *Hl = (long*)bH.contents;
+        long *Ll = (long*)bL.contents;
+        for (uint32_t t = 0; t < sC; t++) {
+            Hptr[t] = (double)Hl[t];
+            Lptr[t] = (double)Ll[t];
+        }
+        pool_release(bA); pool_release(bB); pool_release(bH); pool_release(bL);
+    }
+    return 1;
+}
