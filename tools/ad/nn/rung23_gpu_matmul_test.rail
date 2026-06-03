@@ -1,0 +1,251 @@
+-- Rung 23: PERFORMANCE -- route matmul through the v5.1 Metal GPU path so the
+-- attested-gradient machinery is usable at real scale, not just toy scale.
+--
+-- Rungs 1-22 proved the synthesized gradient is CORRECT (FD-gated) and the loop
+-- SURVIVES at length (arena_mark/reset). But pure-Rail scalar matmul tops out near
+-- ~0.23 GFLOP/s -- fine for a few-neuron demo, a wall for anything real. This rung
+-- decides demo-vs-usable by routing matmul (the dominant cost of both forward AND
+-- backward) through tools/metal/libtensor_gpu.dylib via gpu_matmul_dispatch.
+--
+-- Three load-bearing checks, one binary, each prints its own PASS/FAIL:
+--   A. MATMUL BACKWARD is FD-correct. For C=A.B the reverse atoms are dA=G.B^T and
+--      dB=A^T.G. We finite-difference L=<G, A.B> wrt every entry of A and B and check
+--      the analytic GPU-routed gradient matches (tol 1e-2: the kernel stages f64->f32
+--      internally, so f32 precision is the right bar).
+--   B. GPU vs CPU SPEEDUP is real and the GPU result is CORRECT. Same matmul both ways
+--      at d=256; assert max|gpu-cpu| is tiny (f32 tol) AND gpu is faster (the usable-vs-toy
+--      verdict). Reports GFLOP/s each way.
+--   C. A batched 2-layer net (sq activations) TRAINS end-to-end on the GPU path: every
+--      forward (X.W1, H1.W2) and every backward (dW2=H1^T.ctz2, dH1=ctz2.W2^T, dW1=X^T.ctz1)
+--      is a GPU matmul. Gate: loss strictly decreases under gradient descent + report
+--      steps/sec. The gradient seed is (2/N)(Y-T) = d(MSE)/dY so lr behaves normally.
+--
+-- SCOPE (honest): this proves the GPU matmul PRIMITIVE + its FD-verified backward +
+-- a hand-wired batched net that trains usably on Metal. Teaching the compiler's
+-- net__rgrad synthesizer to EMIT gpu_matmul_dispatch (instead of scalar float_mat_vec)
+-- from a #grad directive is the documented next step -- a compile.rail change, out of
+-- scope for this performance rung. Float gate uses `<.` (fcmp, NaN-safe): never
+-- polymorphic `==` on a float (it reads the f64 bits as a tagged pointer -> segfault).
+--
+-- Build: ./rail_native --out-prefix /tmp/r23 tools/ad/nn/rung23_gpu_matmul_test.rail
+-- Run:   /tmp/r23
+-- (Uses the GPU dylib; ensure tools/metal/libtensor_gpu.dylib is present -- ensure_dylib builds it.)
+
+import "stdlib/tensor.rail"
+
+-- millisecond wall clock via perl Time::HiRes
+now_ms _ =
+  let s = shell "perl -MTime::HiRes -e 'print int(Time::HiRes::time()*1000)'"
+  parse_int s
+
+gmm A B m k n = gpu_matmul_dispatch A B m k n
+
+-- CPU reference matmul (scalar triple loop) -- the pure-Rail baseline
+cpu_dot A B k n i j p acc =
+  if p >= k then acc
+  else cpu_dot A B k n i j (p + 1) (acc +. ((float_arr_get A (i * k + p)) *. (float_arr_get B (p * n + j))))
+cpu_mm_fill A B C m k n i j =
+  if i >= m then C
+  else if j >= n then cpu_mm_fill A B C m k n (i + 1) 0
+  else
+    let _ = float_arr_set C (i * n + j) (cpu_dot A B k n i j 0 0.0)
+    cpu_mm_fill A B C m k n i (j + 1)
+cpu_mm A B m k n = cpu_mm_fill A B (float_arr_new (m * n) 0.0) m k n 0 0
+
+transpose_go A AT r c i j =
+  if i >= r then AT
+  else if j >= c then transpose_go A AT r c (i + 1) 0
+  else
+    let _ = float_arr_set AT (j * r + i) (float_arr_get A (i * c + j))
+    transpose_go A AT r c i (j + 1)
+transpose A r c = transpose_go A (float_arr_new (r * c) 0.0) r c 0 0
+
+-- backward of C=A(m x k).B(k x n) with upstream G(m x n):
+--   dA = G . B^T  (m x n)(n x k) -> (m x k)
+--   dB = A^T . G  (k x m)(m x n) -> (k x n)
+mm_dA G B m k n = gmm G (transpose B k n) m n k
+mm_dB A G m k n = gmm (transpose A m k) G k m n
+
+-- ===== Section A: finite-difference the matmul backward =====
+dotsum_go X Y n i acc =
+  if i >= n then acc
+  else dotsum_go X Y n (i + 1) (acc +. ((float_arr_get X i) *. (float_arr_get Y i)))
+dotsum X Y n = dotsum_go X Y n 0 0.0
+loss A B G m k n = dotsum G (gmm A B m k n) (m * n)
+
+fd_at arr p A B G m k n h =
+  let _  = float_arr_set arr p ((float_arr_get arr p) +. h)
+  let lp = loss A B G m k n
+  let _  = float_arr_set arr p ((float_arr_get arr p) -. (2.0 *. h))
+  let lm = loss A B G m k n
+  let _  = float_arr_set arr p ((float_arr_get arr p) +. h)
+  (lp -. lm) /. (2.0 *. h)
+
+absf v = if v <. 0.0 then (0.0 -. v) else v
+relerr a fd =
+  let d = absf (a -. fd)
+  let s = absf a
+  if s <. 0.000001 then d else (d /. s)
+maxrel_go ana arr A B G m k n h cnt i acc =
+  if i >= cnt then acc
+  else
+    let fd = fd_at arr i A B G m k n h
+    let re = relerr (float_arr_get ana i) fd
+    let nx = if acc <. re then re else acc
+    maxrel_go ana arr A B G m k n h cnt (i + 1) nx
+
+-- ===== Section B: GPU vs CPU correctness + speedup =====
+maxdiff_go X Y n i acc =
+  if i >= n then acc
+  else
+    let d = absf ((float_arr_get X i) -. (float_arr_get Y i))
+    maxdiff_go X Y n (i + 1) (if acc <. d then d else acc)
+maxdiff X Y n = maxdiff_go X Y n 0 0.0
+
+-- ===== Section C: batched 2-layer net (sq activations) on the GPU path =====
+sq_go src dst n i =
+  if i >= n then dst
+  else
+    let _ = float_arr_set dst i (let v = float_arr_get src i in v *. v)
+    sq_go src dst n (i + 1)
+sqarr src n = sq_go src (float_arr_new n 0.0) n 0
+
+-- dL/dY = (2/N)(Y - T): matches d(mean squared error)/dY so the lr is well-scaled
+dydiff_go Y T dst sc n i =
+  if i >= n then dst
+  else
+    let _ = float_arr_set dst i (sc *. ((float_arr_get Y i) -. (float_arr_get T i)))
+    dydiff_go Y T dst sc n (i + 1)
+dydiff Y T n = dydiff_go Y T (float_arr_new n 0.0) (2.0 /. (int_to_float n)) n 0
+
+-- up * (2*Z) elementwise (chain through sq: dY/dZ = 2Z)
+chainsq_go up Z dst n i =
+  if i >= n then dst
+  else
+    let _ = float_arr_set dst i ((float_arr_get up i) *. (2.0 *. (float_arr_get Z i)))
+    chainsq_go up Z dst n (i + 1)
+chainsq up Z n = chainsq_go up Z (float_arr_new n 0.0) n 0
+
+sse_go Y T n i acc =
+  if i >= n then acc
+  else
+    let d = (float_arr_get Y i) -. (float_arr_get T i)
+    sse_go Y T n (i + 1) (acc +. (d *. d))
+mse Y T n = (sse_go Y T n 0 0.0) /. (int_to_float n)
+
+axpy_go W dW lr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set W i ((float_arr_get W i) -. (lr *. (float_arr_get dW i)))
+    axpy_go W dW lr n (i + 1)
+
+fwd X W1 W2 B n h m =
+  let Z1 = gmm X W1 B n h
+  let H1 = sqarr Z1 (B * h)
+  let Z2 = gmm H1 W2 B h m
+  sqarr Z2 (B * m)
+fwd_loss X W1 W2 T B n h m = mse (fwd X W1 W2 B n h m) T (B * m)
+
+step X W1 W2 T B n h m lr =
+  let Z1 = gmm X W1 B n h
+  let H1 = sqarr Z1 (B * h)
+  let Z2 = gmm H1 W2 B h m
+  let Y  = sqarr Z2 (B * m)
+  let dY   = dydiff Y T (B * m)
+  let ctz2 = chainsq dY Z2 (B * m)
+  let dW2  = mm_dB H1 ctz2 B h m
+  let dH1  = mm_dA ctz2 W2 B h m
+  let ctz1 = chainsq dH1 Z1 (B * h)
+  let dW1  = mm_dB X ctz1 B n h
+  let _ = axpy_go W1 dW1 lr (n * h) 0
+  let _ = axpy_go W2 dW2 lr (h * m) 0
+  0
+trainloop X W1 W2 T B n h m lr k i =
+  if i >= k then 0
+  else
+    let mk = arena_mark 0
+    let _  = step X W1 W2 T B n h m lr
+    let _  = arena_reset mk
+    trainloop X W1 W2 T B n h m lr k (i + 1)
+
+fillpat W sz scale i =
+  if i >= sz then W
+  else
+    let _ = float_arr_set W i (scale *. (int_to_float (((i * 13 + 5) - ((((i * 13 + 5)) / 17) * 17)) - 8)))
+    fillpat W sz scale (i + 1)
+mkarr sz scale = fillpat (float_arr_new sz 0.0) sz scale 0
+
+-- 2*x^3 GFLOP for an x*x*x matmul (mul+add per MAC)
+gflops_str macs ms =
+  if ms <= 0 then "inf"
+  else show_float ((int_to_float (2 * macs)) /. (int_to_float ms) /. 1000000.0)
+
+main =
+  let _ = ensure_dylib 0
+
+  -- ----- Section A: matmul backward FD-verified -----
+  let am = 4
+  let ak = 3
+  let an = 2
+  let A = mkarr (am * ak) 0.1
+  let B = mkarr (ak * an) 0.1
+  let G = mkarr (am * an) 0.1
+  let dA = mm_dA G B am ak an
+  let dB = mm_dB A G am ak an
+  let h  = 0.001
+  let eA = maxrel_go dA A A B G am ak an h (am * ak) 0 0.0
+  let eB = maxrel_go dB B A B G am ak an h (ak * an) 0 0.0
+  let okBwd = if eA <. 0.01 then (if eB <. 0.01 then 1 else 0) else 0
+  let _ = print (cat ["A. matmul backward FD:  dA relerr=", show_float eA, "  dB relerr=", show_float eB,
+                      (if okBwd == 1 then "   PASS" else "   FAIL")])
+
+  -- ----- Section B: GPU vs CPU correctness + speedup at d=256 -----
+  let d = 256
+  let P = mkarr (d * d) 0.02
+  let Q = mkarr (d * d) 0.02
+  let tc0 = now_ms 0
+  let Cc  = cpu_mm P Q d d d
+  let tc1 = now_ms 0
+  let tg0 = now_ms 0
+  let Cg  = gmm P Q d d d
+  let tg1 = now_ms 0
+  let cms = tc1 - tc0
+  let gms = tg1 - tg0
+  let md  = maxdiff Cc Cg (d * d)
+  let macs = d * d * d
+  let okBench = if md <. 0.01 then (if gms < cms then 1 else 0) else 0
+  let _ = print (cat ["B. gpu vs cpu matmul d=", show d, ":  cpu=", show cms, "ms (", gflops_str macs cms,
+                      " GF)  gpu=", show gms, "ms (", gflops_str macs gms, " GF)  max|d|=", show_float md,
+                      (if okBench == 1 then "   PASS" else "   FAIL")])
+
+  -- ----- Section C: batched 2-layer net trains on the GPU path -----
+  let bb = 64
+  let nn = 256
+  let hh = 512
+  let mm = 256
+  let k  = 60
+  let lr = 0.02
+  let X  = mkarr (bb * nn) 0.02
+  let Wt1 = mkarr (nn * hh) 0.01
+  let Wt2 = mkarr (hh * mm) 0.01
+  let T   = fwd X Wt1 Wt2 bb nn hh mm
+  let W1 = mkarr (nn * hh) 0.013
+  let W2 = mkarr (hh * mm) 0.013
+  let L0 = fwd_loss X W1 W2 T bb nn hh mm
+  let t0 = now_ms 0
+  let _  = trainloop X W1 W2 T bb nn hh mm lr k 0
+  let t1 = now_ms 0
+  let Lk = fwd_loss X W1 W2 T bb nn hh mm
+  let tms = t1 - t0
+  let sps = if tms <= 0 then 0 else (k * 1000) / tms
+  let okTrain = if Lk <. L0 then 1 else 0
+  let _ = print (cat ["C. batched GPU net B=", show bb, " n=", show nn, " h=", show hh, " m=", show mm,
+                      " steps=", show k, ":  loss ", show_float L0, " -> ", show_float Lk,
+                      "  (", show tms, "ms, ~", show sps, " steps/sec)",
+                      (if okTrain == 1 then "   PASS" else "   FAIL")])
+
+  let all = okBwd * okBench * okTrain
+  let _ = print (if all == 1
+                 then "RUNG 23 PASS: matmul on Metal is usable-scale, its backward is FD-correct, and a batched net trains on the GPU path"
+                 else "RUNG 23 FAIL")
+  if all == 1 then 0 else 1
