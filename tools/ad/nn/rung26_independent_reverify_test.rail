@@ -1,0 +1,198 @@
+-- Rung 26: INDEPENDENT re-verification of the rung-25 attested training ledger.
+-- This is the rung that CLOSES THE LOOP.
+--
+-- Rung 25 produced /tmp/r25chain.txt: a hash-chained, Ed25519-signed record of a
+-- synthesized-net__rgrad training run. Rung 26 plays the part of a skeptical
+-- third party who trusts NONE of those hashes. It:
+--   1. re-compiles net__rgrad FROM SOURCE -- this file carries its own copy of the
+--      `#grad net` directive, so the compiler re-synthesizes the reverse-mode
+--      gradient independently (a separate binary from rung 25);
+--   2. re-runs the identical deterministic trajectory from the same init;
+--   3. at every step RECOMPUTES the weights/gradient/loss commitments and the
+--      chain link from scratch (seeded only by the ledger's genesis);
+--   4. checks the recomputed commitments BYTE-MATCH the published ones, the
+--      published prev-link equals its own independently-tracked previous link,
+--      and the published Ed25519 signature verifies against ITS OWN recomputed
+--      link hash under the ledger's pubkey.
+-- If net__rgrad were synthesized differently, or any record were forged/edited/
+-- reordered, a recomputed commitment would diverge and its signature would fail.
+-- A passing rung 26 means: the signed gradient is exactly the gradient an
+-- independent re-compilation of the source produces -- attestation closed.
+--
+-- Gates (all must hold):
+--   1. okAll  -- for EVERY step: recomputed w_hex/g_hex/loss/link match the
+--               ledger AND the ledger's signature verifies vs the recomputed link
+--   2. okNeg  -- ledger-specific falsification: record 0's real signature verifies
+--               against the recomputed link, but a one-byte perturbation of that
+--               recomputed message is REJECTED (the sig binds to exact content)
+-- String gates use `==` (safe on strings/ints); float identity is enforced
+-- indirectly via show_float string-equality and the signature over the hash.
+--
+-- Build: ./rail_native --out-prefix /tmp/r26 tools/ad/nn/rung26_independent_reverify_test.rail
+-- Run:   /tmp/r26       (consumes /tmp/r25chain.txt produced by rung 25)
+
+import "stdlib/float_arr.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- Independent copy of the EXACT rung-25 net: the compiler re-synthesizes
+-- net__rgrad from this `#grad net` directive with no knowledge of rung 25.
+#grad sq
+sq z = z *. z
+
+#grad net
+net W1 W2 x g =
+  let h1 = float_arr_map sq (float_mat_vec W1 x)
+  let y  = float_arr_map sq (float_mat_vec W2 h1)
+  float_dot y g
+
+fwd W1 W2 x =
+  let h1 = float_arr_map sq (float_mat_vec W1 x)
+  float_arr_map sq (float_mat_vec W2 h1)
+
+sub2 a b = a -. b
+twodiff a b = 2.0 *. (a -. b)
+
+sqsum_go a n i acc =
+  if i >= n then acc
+  else sqsum_go a n (i + 1) (acc +. ((float_arr_get a i) *. (float_arr_get a i)))
+mse y t =
+  let d = float_arr_map2 sub2 y t
+  sqsum_go d (float_arr_len d) 0 0.0
+
+axpy_go W dW lr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set W i ((float_arr_get W i) -. (lr *. (float_arr_get dW i)))
+    axpy_go W dW lr n (i + 1)
+
+arr_canon_go W n i acc =
+  if i >= n then acc
+  else arr_canon_go W n (i + 1) (cat [acc, (if i == 0 then "" else ","), show_float (float_arr_get W i)])
+arr_canon W n = arr_canon_go W n 0 ""
+
+idx xs i = if i <= 0 then head xs else idx (tail xs) (i - 1)
+
+-- ledger-specific falsification on record 0 (fresh weights, recompute from genesis)
+neg_control W1 W2 x t pkb gen rec0 =
+  let f = str_split " " rec0
+  let f_sig = idx f 6
+  let y = fwd W1 W2 x
+  let loss = mse y t
+  let g = float_arr_map2 twodiff y t
+  let dW1 = net__rgrad W1 W2 x g 1.0 0
+  let dW2 = net__rgrad W1 W2 x g 1.0 1
+  let w_hex = sha256_hex (cat [arr_canon W1 6, ";", arr_canon W2 6])
+  let g_hex = sha256_hex (cat [arr_canon dW1 6, ";", arr_canon dW2 6])
+  let link_str = cat [gen, "|", "0", "|", w_hex, "|", g_hex, "|", show_float loss]
+  let link_b = sha256 link_str
+  let sig_b = hex_to_bytes f_sig
+  let pos = ed25519_verify pkb link_b 32 sig_b
+  let bad = arr_new 32 0
+  let _ = sha_copy_bytes link_b bad 0 0 32
+  let _ = arr_set bad 0 (bit_xor (arr_get bad 0) 1)
+  let neg = ed25519_verify pkb bad 32 sig_b
+  if pos == 1 then (if neg == 0 then 1 else 0) else 0
+
+-- independent re-verification: re-run the trajectory, recompute + check each record
+verify_loop W1 W2 x t lr pkb recs prev step_i acc =
+  if recs == [] then acc
+  else
+    let line = head recs
+    if line == "" then acc
+    else
+      let f = str_split " " line
+      let f_w    = idx f 1
+      let f_g    = idx f 2
+      let f_loss = idx f 3
+      let f_prev = idx f 4
+      let f_link = idx f 5
+      let f_sig  = idx f 6
+      let y = fwd W1 W2 x
+      let loss = mse y t
+      let g = float_arr_map2 twodiff y t
+      let dW1 = net__rgrad W1 W2 x g 1.0 0
+      let dW2 = net__rgrad W1 W2 x g 1.0 1
+      let w_hex = sha256_hex (cat [arr_canon W1 6, ";", arr_canon W2 6])
+      let g_hex = sha256_hex (cat [arr_canon dW1 6, ";", arr_canon dW2 6])
+      let loss_str = show_float loss
+      let link_str = cat [prev, "|", show step_i, "|", w_hex, "|", g_hex, "|", loss_str]
+      let link_b = sha256 link_str
+      let link_hex = bytes_to_hex link_b 32
+      let sig_b = hex_to_bytes f_sig
+      let cV = ed25519_verify pkb link_b 32 sig_b
+      let cW = if f_w == w_hex then 1 else 0
+      let cG = if f_g == g_hex then 1 else 0
+      let cL = if f_loss == loss_str then 1 else 0
+      let cP = if f_prev == prev then 1 else 0
+      let cK = if f_link == link_hex then 1 else 0
+      let step_ok = cV * cW * cG * cL * cP * cK
+      let _ = axpy_go W1 dW1 lr 6 0
+      let _ = axpy_go W2 dW2 lr 6 0
+      verify_loop W1 W2 x t lr pkb (tail recs) link_hex (step_i + 1) (acc * step_ok)
+
+mkW1 =
+  let W = float_arr_new 6 0.0
+  let _ = float_arr_set W 0 0.5
+  let _ = float_arr_set W 1 0.2
+  let _ = float_arr_set W 2 (0.0 -. 0.1)
+  let _ = float_arr_set W 3 0.4
+  let _ = float_arr_set W 4 0.3
+  let _ = float_arr_set W 5 (0.0 -. 0.2)
+  W
+mkW2 =
+  let W = float_arr_new 6 0.0
+  let _ = float_arr_set W 0 0.4
+  let _ = float_arr_set W 1 (0.0 -. 0.1)
+  let _ = float_arr_set W 2 0.2
+  let _ = float_arr_set W 3 0.1
+  let _ = float_arr_set W 4 0.3
+  let _ = float_arr_set W 5 (0.0 -. 0.2)
+  W
+mkX =
+  let x = float_arr_new 2 0.0
+  let _ = float_arr_set x 0 0.5
+  let _ = float_arr_set x 1 (0.0 -. 0.3)
+  x
+mkT =
+  let t = float_arr_new 2 0.0
+  let _ = float_arr_set t 0 0.30
+  let _ = float_arr_set t 1 0.10
+  t
+
+main =
+  let lr = 0.5
+  let x = mkX
+  let t = mkT
+  let content = read_file "/tmp/r25chain.txt"
+  let lines = str_split "\n" content
+  let header = head lines
+  let hf = str_split " " header
+  let pk_hex  = idx hf 2
+  let gen_hex = idx hf 3
+  let pkb = hex_to_bytes pk_hex
+  let recs = tail lines
+  let rec0 = head recs
+  let n_recs = (length lines) - 2
+
+  -- ledger-specific falsification (must distinguish valid from perturbed)
+  let okNeg = neg_control mkW1 mkW2 x t pkb gen_hex rec0
+  -- full independent re-verification from fresh weights + the ledger's genesis
+  let allv = verify_loop mkW1 mkW2 x t lr pkb recs gen_hex 0 1
+  let okAll = if allv == 1 then 1 else 0
+  let all = okAll * okNeg
+
+  let _ = print (cat ["Rung 26 independent re-verification of /tmp/r25chain.txt"])
+  let _ = print (cat ["  ledger pubkey=", pk_hex])
+  let _ = print (cat ["  ledger genesis=", gen_hex])
+  let _ = print (cat ["  records re-verified=", show n_recs])
+  let _ = print (cat ["  all recomputed commitments match + all sigs verify=", show okAll])
+  let _ = print (cat ["  ledger-specific tamper falsification (pos&&!neg)=", show okNeg])
+  let _ = print (if all == 1
+                 then "RUNG 26 PASS: an independent re-compilation of net__rgrad reproduces every signed commitment bit-for-bit and every Ed25519 signature verifies -- attestation loop closed"
+                 else "RUNG 26 FAIL")
+  if all == 1 then 0 else 1
