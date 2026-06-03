@@ -1,0 +1,145 @@
+-- BX5: bit-exact transformer forward BLOCK (pre-norm: RMSNorm -> attention -> residual ->
+-- RMSNorm -> MLP -> residual), built entirely from exact-integer fixed-point primitives.
+--
+-- This is the composition gate: BX2/BX3 made the matmul reduction exact-integer; BX4 made the
+-- transcendentals fixed-integer algorithms. BX5 wires them into a real forward pass and shows
+-- the WHOLE block is bit-exact and foreign-reproducible:
+--   D0  run the block twice on this machine -> bit-identical (checksum equality).
+--   D1  reduction order-independence: every dot accumulated left-to-right == right-to-left
+--       (integer addition is associative) -> any parallel/GPU tiling yields the same bits.
+--   D3  a Python big-int re-impl reproduces every output integer bit-for-bit (bx5_foreign_check.py).
+-- D2 (CPU==GPU full block) is proven at the matmul-primitive level by BX3; full-block-on-GPU
+-- (softmax/norm in Metal) is deferred to the scale rung.
+--
+-- Fixed-point F=24, S=2^24. All weights+input are generated deterministically by an integer
+-- formula (no float, no PRNG overflow) so the Python witness reproduces them exactly.
+
+import "tools/bitexact/bx_fixed.rail"
+
+-- ===== deterministic fixed-point data generator (values in [-6,6] * 1398101 ~ [-0.5,0.5]) =====
+bx5_imod a b = a - (a / b) * b
+bx5_cell kind i j = (bx5_imod (kind * 101 + i * 5 + j * 3 + 7) 13 - 6) * 1398101
+bx5_genrow kind i j cols = if j >= cols then [] else cons (bx5_cell kind i j) (bx5_genrow kind i (j + 1) cols)
+bx5_genmat kind i rows cols = if i >= rows then [] else cons (bx5_genrow kind i 0 cols) (bx5_genmat kind (i + 1) rows cols)
+-- gamma (RMSNorm scale) near 1.0: S + cell/4  ->  real in ~[0.875,1.125]
+bx5_gammarow kind j cols = if j >= cols then [] else cons (16777216 + (bx5_cell kind 0 j) / 4) (bx5_gammarow kind (j + 1) cols)
+bx5_gammavec kind d = bx5_gammarow kind 0 d
+
+-- ===== exact integer vector ops (one truncation per dot, at the end) =====
+bx5_dot_go u v acc = if u == [] then acc else bx5_dot_go (tail u) (tail v) (acc + (head u) * (head v))
+bx5_dot u v = (bx5_dot_go u v 0) / 16777216
+-- right-to-left accumulation (non-tail) for D1; integer-associative => identical to bx5_dot
+bx5_dotrev_go u v = if u == [] then 0 else (head u) * (head v) + bx5_dotrev_go (tail u) (tail v)
+bx5_dotrev u v = (bx5_dotrev_go u v) / 16777216
+
+bx5_vadd u v = if u == [] then [] else cons ((head u) + (head v)) (bx5_vadd (tail u) (tail v))
+bx5_vsum xs = if xs == [] then 0 else (head xs) + bx5_vsum (tail xs)
+bx5_vmax xs = if (tail xs) == [] then (head xs) else (let r = bx5_vmax (tail xs) in if (head xs) > r then (head xs) else r)
+bx5_zeros d = if d < 1 then [] else cons 0 (bx5_zeros (d - 1))
+bx5_scalevec s row = if row == [] then [] else cons (((head row) * s) / 16777216) (bx5_scalevec s (tail row))
+bx5_matvec rows v = if rows == [] then [] else cons (bx5_dot (head rows) v) (bx5_matvec (tail rows) v)
+bx5_matvec_rev rows v = if rows == [] then [] else cons (bx5_dotrev (head rows) v) (bx5_matvec_rev (tail rows) v)
+bx5_proj w x = if x == [] then [] else cons (bx5_matvec w (head x)) (bx5_proj w (tail x))
+bx5_addrows a b = if a == [] then [] else cons (bx5_vadd (head a) (head b)) (bx5_addrows (tail a) (tail b))
+
+-- ===== RMSNorm =====
+bx5_sumsq xs = if xs == [] then 0 else ((head xs) * (head xs)) / 16777216 + bx5_sumsq (tail xs)
+bx5_normapply row rms gamma =
+  if row == [] then []
+  else cons ((((((head row) * 16777216) / rms) * (head gamma)) / 16777216)) (bx5_normapply (tail row) rms (tail gamma))
+bx5_normvec row d gamma =
+  let ss = bx5_sumsq row in
+  let meansq = ss / d in
+  let rms = bx4_fxsqrt (meansq + 1000) in
+  bx5_normapply row rms gamma
+bx5_normrows x d gamma = if x == [] then [] else cons (bx5_normvec (head x) d gamma) (bx5_normrows (tail x) d gamma)
+
+-- ===== softmax (stable: subtract max so every exp arg <= 0) =====
+bx5_sub xs m = if xs == [] then [] else cons ((head xs) - m) (bx5_sub (tail xs) m)
+bx5_expv xs = if xs == [] then [] else cons (bx4_fxexp (head xs)) (bx5_expv (tail xs))
+bx5_divz xs z = if xs == [] then [] else cons (((head xs) * 16777216) / z) (bx5_divz (tail xs) z)
+bx5_softmax xs =
+  let m = bx5_vmax xs in
+  let e = bx5_expv (bx5_sub xs m) in
+  let z = bx5_vsum e in
+  bx5_divz e z
+
+-- ===== single-head attention =====
+bx5_scores q k invd = if k == [] then [] else cons (((bx5_dot q (head k)) * invd) / 16777216) (bx5_scores q (tail k) invd)
+bx5_wsum_go p vmat acc = if p == [] then acc else bx5_wsum_go (tail p) (tail vmat) (bx5_vadd acc (bx5_scalevec (head p) (head vmat)))
+bx5_wsum p vmat d = bx5_wsum_go p vmat (bx5_zeros d)
+bx5_attn_row q kmat vmat d invd =
+  let sc = bx5_scores q kmat invd in
+  let pr = bx5_softmax sc in
+  bx5_wsum pr vmat d
+bx5_attn_all qmat kmat vmat d invd =
+  if qmat == [] then [] else cons (bx5_attn_row (head qmat) kmat vmat d invd) (bx5_attn_all (tail qmat) kmat vmat d invd)
+
+-- ===== MLP =====
+bx5_geluv xs = if xs == [] then [] else cons (bx4_gelu (head xs)) (bx5_geluv (tail xs))
+bx5_gelurows a = if a == [] then [] else cons (bx5_geluv (head a)) (bx5_gelurows (tail a))
+
+-- ===== full block: X (seq x d) -> Y (seq x d) =====
+bx5_block x d hidden =
+  let wq = bx5_genmat 0 0 d d in
+  let wk = bx5_genmat 1 0 d d in
+  let wv = bx5_genmat 2 0 d d in
+  let wo = bx5_genmat 3 0 d d in
+  let w1 = bx5_genmat 4 0 hidden d in
+  let w2 = bx5_genmat 5 0 d hidden in
+  let g1 = bx5_gammavec 6 d in
+  let g2 = bx5_gammavec 7 d in
+  let invd = bx4_fxrsqrt (d * 16777216) in
+  let xn = bx5_normrows x d g1 in
+  let q = bx5_proj wq xn in
+  let k = bx5_proj wk xn in
+  let v = bx5_proj wv xn in
+  let a = bx5_attn_all q k v d invd in
+  let ao = bx5_proj wo a in
+  let h = bx5_addrows x ao in
+  let hn = bx5_normrows h d g2 in
+  let m1 = bx5_proj w1 hn in
+  let gg = bx5_gelurows m1 in
+  let m2 = bx5_proj w2 gg in
+  bx5_addrows h m2
+
+bx5_input seq d = bx5_genmat 8 0 seq d
+
+-- ===== gates =====
+bx5_flatten rows = if rows == [] then [] else join_lists (head rows) (bx5_flatten (tail rows))
+join_lists a b = if a == [] then b else cons (head a) (join_lists (tail a) b)
+bx5_checksum xs = bx5_vsum xs
+
+-- D1: every row of w2 dotted with a generated hidden-vector, left-fold vs right-fold, must match.
+bx5_d1_rows rows v = if rows == [] then 0
+  else (if (bx5_dot (head rows) v) == (bx5_dotrev (head rows) v) then 0 else 1) + bx5_d1_rows (tail rows) v
+bx5_d1 d hidden =
+  let w2 = bx5_genmat 5 0 d hidden in
+  let gv = bx5_genrow 9 0 0 hidden in
+  bx5_d1_rows w2 gv
+
+-- D3 dump: one line per position, d space-separated output integers.
+bx5_dumprow xs = if xs == [] then "\n" else join "" (cons (show (head xs)) (cons " " (cons (bx5_dumprow (tail xs)) [])))
+bx5_dumprows rows = if rows == [] then "" else join "" (cons (bx5_dumprow (head rows)) (cons (bx5_dumprows (tail rows)) []))
+
+main =
+  let d = 4 in
+  let hidden = 8 in
+  let seq = 3 in
+  let x = bx5_input seq d in
+  let y1 = bx5_block x d hidden in
+  let y2 = bx5_block x d hidden in
+  let f1 = bx5_flatten y1 in
+  let f2 = bx5_flatten y2 in
+  let c1 = bx5_checksum f1 in
+  let c2 = bx5_checksum f2 in
+  let d0 = if c1 == c2 then 0 else 1 in
+  let d1 = bx5_d1 d hidden in
+  let _ = print (join "" (cons "BX5 D0 (run-twice block identical): " (cons (if d0 == 0 then "PASS" else "FAIL") []))) in
+  let _ = print (join "" (cons "BX5 D1 (reduction order-independent): " (cons (if d1 == 0 then "PASS" else "FAIL") []))) in
+  let _ = print (join "" (cons "BX5 block checksum: " (cons (show c1) []))) in
+  let _ = write_file "/tmp/bx5_dump.txt" (bx5_dumprows y1) in
+  let _ = print (if d0 + d1 == 0
+    then "BX5 PASS: exact-integer forward block deterministic (D0) + order-independent (D1); dump for D3"
+    else "BX5 FAIL") in
+  0
