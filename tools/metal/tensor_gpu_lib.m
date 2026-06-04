@@ -2128,3 +2128,61 @@ int tgl_exact_matmul(const double *Aq, const double *Bq,
     }
     return 1;
 }
+
+// Threadgroup-tiled variant of tgl_exact_matmul. Same int32-in / [hi,lo]-out
+// ABI; dispatches the exact_matmul_tiled kernel with full 16x16 threadgroups
+// (grid padded up to tile multiples, kernel bounds-guards loads + store).
+// Result is bit-for-bit identical to tgl_exact_matmul — tiling is a memory
+// optimization, the per-output accumulation order is unchanged.
+int tgl_exact_matmul_tiled(const double *Aq, const double *Bq,
+                           double *Hi, double *Lo, int M, int K, int N) {
+    if (ensure_init() != 1) return -1;
+    const double *Aptr = Aq + 1, *Bptr = Bq + 1;
+    double *Hptr = Hi + 1, *Lptr = Lo + 1;
+
+    @autoreleasepool {
+        uint32_t sA = (uint32_t)M*K, sB = (uint32_t)K*N, sC = (uint32_t)M*N;
+        id<MTLBuffer> bA = pool_acquire((NSUInteger)sA * 4);   // int32 in
+        id<MTLBuffer> bB = pool_acquire((NSUInteger)sB * 4);   // int32 in
+        id<MTLBuffer> bH = pool_acquire((NSUInteger)sC * 8);   // int64 out
+        id<MTLBuffer> bL = pool_acquire((NSUInteger)sC * 8);   // int64 out
+
+        int32_t *Ai = (int32_t*)bA.contents;
+        int32_t *Bi = (int32_t*)bB.contents;
+        for (uint32_t t = 0; t < sA; t++) Ai[t] = (int32_t)Aptr[t];
+        for (uint32_t t = 0; t < sB; t++) Bi[t] = (int32_t)Bptr[t];
+
+        id<MTLComputePipelineState> p = pso(@"exact_matmul_tiled");
+        if (!p) return -1;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bA offset:0 atIndex:0];
+        [enc setBuffer:bB offset:0 atIndex:1];
+        [enc setBuffer:bH offset:0 atIndex:2];
+        [enc setBuffer:bL offset:0 atIndex:3];
+        uint32_t mu=M, ku=K, nu=N;
+        [enc setBytes:&mu length:4 atIndex:4];
+        [enc setBytes:&ku length:4 atIndex:5];
+        [enc setBytes:&nu length:4 atIndex:6];
+
+        // Tiled: full 16x16 threadgroups; grid padded up to tile multiples so
+        // every lane in each group exists (cooperative load + barrier need it).
+        NSUInteger gx = ((NSUInteger)N + 15) / 16;
+        NSUInteger gy = ((NSUInteger)M + 15) / 16;
+        [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+           threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+
+        long *Hl = (long*)bH.contents;
+        long *Ll = (long*)bL.contents;
+        for (uint32_t t = 0; t < sC; t++) {
+            Hptr[t] = (double)Hl[t];
+            Lptr[t] = (double)Ll[t];
+        }
+        pool_release(bA); pool_release(bB); pool_release(bH); pool_release(bL);
+    }
+    return 1;
+}
