@@ -1,0 +1,126 @@
+-- GX4: D1 (schedule-independence) ON THE GPU itself, pure Rail (no host/.m change).
+-- BX3 already showed GPU-exact == CPU-exact (incl. CPU-reversed). GX4 removes the CPU
+-- from the order-independence claim: it varies the reduction SCHEDULE on-device two ways
+-- and demands bit-identical [hi,lo] limbs each time.
+--
+--   (1) K-axis reversed: permute the contraction index (A columns + B rows by p->k-1-p).
+--       The exact_matmul now sums each dot in REVERSE order. Integer add is associative
+--       -> identical [hi,lo]. (Inputs include negatives, so it is a signed reorder.)
+--   (2) row-block decomposition: compute rows [0,h) and [h,m) in SEPARATE dispatches and
+--       splice them back together. One-thread-per-output means dispatch granularity cannot
+--       change any output -> assembled limbs == the monolithic m*n dispatch.
+--
+-- Build: ./rail_native --out-prefix /tmp/gx4 tools/bitexact/gx4_gpu_schedule.rail
+-- Run:   /tmp/gx4
+
+import "stdlib/tensor.rail"
+
+-- fixed-point quantize (matches bx2/bx3 quantf exactly), packed as exact-int doubles
+quantf x =
+  let s = x *. 16777216.0
+  let r = if s <. 0.0 then s -. 0.5 else s +. 0.5
+  float_to_int r
+quant_arr_f_go src dst n i =
+  if i >= n then dst
+  else
+    let _ = float_arr_set dst i (int_to_float (quantf (float_arr_get src i)))
+    quant_arr_f_go src dst n (i + 1)
+quant_arr_f src n = quant_arr_f_go src (float_arr_new n 0.0) n 0
+
+-- deterministic fill with NEGATIVES (same family as bx3's fillpat)
+fillpat W sz scale i =
+  if i >= sz then W
+  else
+    let _ = float_arr_set W i (scale *. (int_to_float (((i * 13 + 5) - ((((i * 13 + 5)) / 17) * 17)) - 8)))
+    fillpat W sz scale (i + 1)
+mkarr sz scale = fillpat (float_arr_new sz 0.0) sz scale 0
+
+-- reverse the K (contraction) axis. A is m x k row-major: A'[i][p] = A[i][k-1-p].
+revcols_go A R m k i j =
+  if i >= m then R
+  else if j >= k then revcols_go A R m k (i + 1) 0
+  else
+    let _ = float_arr_set R (i * k + j) (float_arr_get A (i * k + (k - 1 - j)))
+    revcols_go A R m k i (j + 1)
+revcols A m k = revcols_go A (float_arr_new (m * k) 0.0) m k 0 0
+-- B is k x n row-major: B'[p][j] = B[k-1-p][j].
+revrows_go B R k n i j =
+  if i >= k then R
+  else if j >= n then revrows_go B R k n (i + 1) 0
+  else
+    let _ = float_arr_set R (i * n + j) (float_arr_get B ((k - 1 - i) * n + j))
+    revrows_go B R k n i (j + 1)
+revrows B k n = revrows_go B (float_arr_new (k * n) 0.0) k n 0 0
+
+-- copy hh rows starting at r0 from an m x k array into a fresh hh x k array
+subrows_go A R k r0 hh i j =
+  if i >= hh then R
+  else if j >= k then subrows_go A R k r0 hh (i + 1) 0
+  else
+    let _ = float_arr_set R (i * k + j) (float_arr_get A ((r0 + i) * k + j))
+    subrows_go A R k r0 hh i (j + 1)
+subrows A k r0 hh = subrows_go A (float_arr_new (hh * k) 0.0) k r0 hh 0 0
+
+-- splice an hh x n sub-result into DST starting at output-row r0
+splice_go SRC DST r0 n hh i =
+  if i >= hh * n then DST
+  else
+    let _ = float_arr_set DST (r0 * n + i) (float_arr_get SRC i)
+    splice_go SRC DST r0 n hh (i + 1)
+
+-- limb mismatch count between two GPU [hi,lo] result pairs (exact-int doubles)
+limb_bad H1 L1 H2 L2 n i bad =
+  if i >= n then bad
+  else
+    let hb = if (float_to_int (float_arr_get H1 i)) == (float_to_int (float_arr_get H2 i)) then 0 else 1
+    let lb = if (float_to_int (float_arr_get L1 i)) == (float_to_int (float_arr_get L2 i)) then 0 else 1
+    limb_bad H1 L1 H2 L2 n (i + 1) (bad + hb + lb)
+pf b = if b == 1 then "PASS" else "FAIL"
+
+main =
+  let _ = ensure_dylib 0
+  let m = 64
+  let k = 64
+  let n = 64
+  let nn = m * n
+  let P = mkarr (m * k) 0.02
+  let Q = mkarr (k * n) 0.02
+  let Aqf = quant_arr_f P (m * k)
+  let Bqf = quant_arr_f Q (k * n)
+
+  -- baseline: monolithic GPU exact_matmul
+  let H0 = float_arr_new nn 0.0
+  let L0 = float_arr_new nn 0.0
+  let _ = tgl_exact_matmul Aqf Bqf H0 L0 m k n
+
+  -- (1) reduction-order independence ON device: reverse the K axis of both operands
+  let Ar = revcols Aqf m k
+  let Br = revrows Bqf k n
+  let H1 = float_arr_new nn 0.0
+  let L1 = float_arr_new nn 0.0
+  let _ = tgl_exact_matmul Ar Br H1 L1 m k n
+  let badRev = limb_bad H0 L0 H1 L1 nn 0 0
+  let okRev = if badRev == 0 then 1 else 0
+  let _ = print (cat ["GX4 (1) GPU reduction-order independence (K-axis reversed on device): limb_mismatches=", show badRev, "   ", pf okRev])
+
+  -- (2) dispatch-granularity independence: rows [0,h) and [h,m) in SEPARATE dispatches
+  let h = 27
+  let At = subrows Aqf k 0 h
+  let Ht = float_arr_new (h * n) 0.0
+  let Lt = float_arr_new (h * n) 0.0
+  let _ = tgl_exact_matmul At Bqf Ht Lt h k n
+  let Ab = subrows Aqf k h (m - h)
+  let Hb = float_arr_new ((m - h) * n) 0.0
+  let Lb = float_arr_new ((m - h) * n) 0.0
+  let _ = tgl_exact_matmul Ab Bqf Hb Lb (m - h) k n
+  let H2 = splice_go Hb (splice_go Ht (float_arr_new nn 0.0) 0 n h 0) h n (m - h) 0
+  let L2 = splice_go Lb (splice_go Lt (float_arr_new nn 0.0) 0 n h 0) h n (m - h) 0
+  let badBlk = limb_bad H0 L0 H2 L2 nn 0 0
+  let okBlk = if badBlk == 0 then 1 else 0
+  let _ = print (cat ["GX4 (2) GPU dispatch-granularity independence (row-block split ", show h, "+", show (m - h), "): limb_mismatches=", show badBlk, "   ", pf okBlk])
+
+  let allok = if okRev == 1 then okBlk else 0
+  let _ = print (if allok == 1
+    then "GX4 PASS: the GPU exact-integer matmul is schedule-independent ON DEVICE -- reversed contraction order and split dispatch granularity both reproduce bit-identical [hi,lo] limbs. D1 holds on the GPU without leaning on the CPU."
+    else "GX4 FAIL: on-device schedule changed the limbs -- the GPU reduction is not order-free, stop before re-attesting on GPU")
+  if allok == 1 then 0 else 1
