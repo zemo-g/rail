@@ -1,0 +1,93 @@
+-- R3 (1B ladder): quantization / dynamic range for the Gemma 4 E2B exact-integer forward.
+-- Also carries the P0 SPEC (dims + op->atom map + quant rule) so the build artifacts ARE the spec.
+--
+-- ===== P0 SPEC (Gemma 4 E2B text decoder, exact-integer forward) =====
+-- Representative dims (confirm against config.json at R5 load; the SCHEME is size-agnostic):
+--   layers ~30  d_model 2048  heads 8  kv_heads 2 (GQA)  head_dim 256  mlp_hidden ~8192
+--   vocab 262144  rope_theta 10000 (local) / 1000000 (global)  norm_eps 1e-6  act GeGLU  PLE embed
+-- Every forward op maps to a PROVEN exact-integer atom (a FIXED integer algorithm -> bit-identical):
+--   matmul/contraction -> GX1 two-limb superaccumulator (this rung proves it is REQUIRED + SUFFICIENT)
+--   RMSNorm            -> bx4_fxrsqrt (rung BX, exact isqrt)
+--   RoPE / sin / cos   -> bx4_sinb/bx4_cosb + r1d_rope          (R1, just landed)
+--   GeGLU / gelu       -> bx4_gelu (+bx4_gelu_grad for backward) (bx_fixed)
+--   softmax exp        -> bx4_fxexp                              (bx_fixed)
+--   attention SDPA     -> GX6 exact attention                   (just landed)
+-- Quant rule: F=24, S=2^24. real x -> X=round(x*S). All divides truncate toward zero (ARM sdiv).
+--   Uniform ABSOLUTE precision 2^-24 ~ 6e-8 (vs bf16's ~4e-3 near 1, and bf16's RELATIVE scaling).
+--   Representable |x| < 2^62/S = 2^38 ~ 2.7e11 (single int63); activations/weights live in |x|<256.
+--
+-- ===== R3 GATE (two falsifiers, buildable now with synthetic tensors, NO model download) =====
+--  (1) dequant round-trip bound: quant(x) then back, max|back-x| over weight-like AND activation-like
+--      ranges must be <= 0.5 ulp = 0.5/S ~ 2.98e-8. UNIFORM across magnitude -> justifies dropping
+--      per-tensor scales for E2B (the dynamic range never needs them post-norm).
+--  (2) overflow headroom: the K-deep contraction accumulator bit-width, computed by ADDING exponents
+--      (never forming the overflowing product), must EXCEED single-limb int63 (2^62 -> two-limb
+--      REQUIRED) and stay under two-limb (2^93 -> SUFFICIENT) even at the absolute worst spike.
+-- D0 is trivially exact (pure integer). R4 will DEMONSTRATE the wrap empirically; R3 BOUNDS it.
+--
+-- Build: ./rail_native --out-prefix /tmp/r3q tools/bitexact/r3_quant.rail
+-- Run:   /tmp/r3q
+
+import "tools/bitexact/bx_fixed.rail"
+
+-- deterministic value generator: index j in [0,N) -> a float spanning [lo, hi]
+r3_val lo hi j N = lo +. ((hi -. lo) *. (int_to_float j) /. (int_to_float N))
+
+-- round-trip sweep: quant then dequant, carry max abs error in a float_arr[1] cell (int-only loop --
+-- a float accumulator reading the loop index SEGFAULTS, per rail-bug-self-loop-cross-dep-args).
+-- arg order mirrors the proven r1c_sweep (N j <float consts> <cell>): floats carried unchanged, cell mutated.
+r3_rt_sweep N j lo hi acc =
+  if j >= N then 0
+  else
+    let x = r3_val lo hi j N in
+    let rt = bx4_back (bx4_quant x) in
+    let e = bx4_fabs (rt -. x) in
+    let _ = float_arr_set acc 0 (if e >. (float_arr_get acc 0) then e else (float_arr_get acc 0)) in
+    r3_rt_sweep N (j + 1) lo hi acc
+
+-- bit length of a nonneg int (exponent+1). MUTUAL recursion, not a direct self-loop: a 2-arg
+-- self-loop with arg1=n/2 AND arg2=a+1 HANGS even though the args are independent (a broader
+-- sibling of rail-bug-self-loop-cross-dep-args -- the divide-arg + increment-arg write schedule
+-- miscompiles). The bx4_isqrt_a/b / bx4_topbit_a/b idiom dodges it.
+r3_bl_a n a = if n == 0 then a else r3_bl_b (n / 2) (a + 1)
+r3_bl_b n a = if n == 0 then a else r3_bl_a (n / 2) (a + 1)
+r3_bitlen n = r3_bl_a n 0
+
+main =
+  -- (1) dequant round-trip bound: two ranges show UNIFORM absolute precision (the key fixed-pt property)
+  let N = 20000 in
+  let actc = float_arr_new 1 0.0 in                       -- activation-like |x| up to 256
+  let wtc  = float_arr_new 1 0.0 in                       -- weight-like   |x| up to 1
+  let _ = r3_rt_sweep N 0 (0.0 -. 256.0) 256.0 actc in
+  let _ = r3_rt_sweep N 0 (0.0 -. 1.0)   1.0   wtc  in
+  let eact = float_arr_get actc 0 in
+  let ewt  = float_arr_get wtc 0 in
+  let rtbound = 0.00000004 in                             -- 4e-8 (theory: 0.5/S = 2.98e-8, uniform)
+  let okrt = if eact <. rtbound then (if ewt <. rtbound then 1 else 0) else 0 in
+  let _ = print (cat ["R3 round-trip  max|deq-x|  act[-256,256]=", show eact, "  wt[-1,1]=", show ewt,
+                      "  (bound ", show rtbound, ", uniform abs precision)   ", if okrt == 1 then "PASS" else "FAIL"]) in
+
+  -- (2) overflow headroom: worst-case K-deep contraction accumulator bit-width, by ADDING exponents.
+  --   X = x*S with |x|<=256  -> Xmax = 256*S = 2^32 (exponent 32, fits in int63 so bitlen is real)
+  --   W = w*S with |w|<=1     -> Wmax = S     = 2^24 (exponent 24)
+  --   K = 8192 (E2B mlp_hidden contraction depth) -> exponent 13
+  let xmax_exp = (r3_bitlen (256 * 16777216)) - 1 in      -- 32  (operand fits; never form the product)
+  let wmax_exp = (r3_bitlen 16777216) - 1 in              -- 24
+  let k_exp    = (r3_bitlen 8192) - 1 in                  -- 13
+  let acc_exp       = xmax_exp + wmax_exp + k_exp in      -- 69  realistic (|w|<=1)
+  let acc_exp_spike = xmax_exp + xmax_exp + k_exp in      -- 77  absolute worst (both operands spike to 256)
+  let single_exp = 62 in                                  -- int63 signed ceiling 2^62
+  let two_exp    = 93 in                                  -- GX1 two-limb superaccumulator ceiling ~2^93
+  let needs_two = if acc_exp > single_exp then 1 else 0 in        -- single-limb WRAPS -> two-limb REQUIRED
+  let two_ok    = if acc_exp_spike < two_exp then 1 else 0 in     -- two-limb HOLDS even the worst spike
+  let okof = if needs_two == 1 then two_ok else 0 in
+  let _ = print (cat ["R3 headroom    acc bits realistic=", show acc_exp, " spike=", show acc_exp_spike,
+                      "  vs single=", show single_exp, " two=", show two_exp,
+                      "   two-limb REQUIRED=", show needs_two, " SUFFICIENT=", show two_ok,
+                      "   ", if okof == 1 then "PASS" else "FAIL"]) in
+
+  let allok = if okrt == 1 then okof else 0 in
+  let _ = print (if allok == 1
+    then "R3 PASS: F=24 gives uniform ~3e-8 absolute precision over the whole E2B weight/activation range (no per-tensor scales needed), and the contraction accumulator (2^69, spike 2^77) overflows single-limb int63 yet sits safely inside the two-limb superaccumulator -- the quant scheme + accumulator width for the 1B-scale forward are settled."
+    else "R3 FAIL: inspect the round-trip bound or the overflow-headroom line") in
+  if allok == 1 then 0 else 1
