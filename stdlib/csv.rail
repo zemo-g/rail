@@ -1,0 +1,159 @@
+-- stdlib/csv.rail — RFC-4180-style CSV parser and writer for Rail
+-- Import: import "stdlib/csv.rail"
+--
+-- Public API:
+--   csv_parse_line line   -> list of field strings (one record).
+--                            Handles "quoted, fields" with embedded commas,
+--                            "" escaped double-quotes, and whitespace inside
+--                            quotes is preserved verbatim.
+--   csv_parse text        -> list of records (each a list of field strings).
+--                            Splits on newline but RESPECTS quoted newlines:
+--                            a newline inside a "..." field stays in the field.
+--                            Recognizes both "\n" and "\r\n" line endings; a
+--                            lone trailing newline does not produce an empty
+--                            final record.
+--   csv_row_to_string xs  -> a single CSV line. Fields containing a comma,
+--                            double-quote, CR, or LF are wrapped in quotes
+--                            with inner quotes doubled.
+--
+-- Implementation notes:
+--   * `chars s` yields single-character strings; we compare them directly
+--     (c == ",") rather than via char_to_int, which is unreliable here.
+--   * Field characters are accumulated head-first into a list, then reversed
+--     and joined — `join ""` and `cat`/`cons`/`chars` are builtins, so this
+--     module pulls in no other stdlib.
+--   * Helpers are NOT underscore-prefixed: a leading `_` marks a name private
+--     and strips it on import, which would break the exported entry points.
+--   * The parser is a single character-walking state machine. Branching uses
+--     nested if/then/else because && / || do not short-circuit. No arithmetic
+--     loop counters, so no tail-loop miscompile traps apply.
+
+-- Single-character constants synthesized at runtime (no \r literal in Rail).
+csv_dq = char_from_int 34      -- "
+csv_cr = char_from_int 13      -- carriage return
+csv_lf = char_from_int 10      -- line feed
+
+-- Reverse a list (local; avoids importing list.rail).
+csv_rev xs = csv_rev_acc xs []
+csv_rev_acc xs acc =
+  if xs == [] then acc
+  else csv_rev_acc (tail xs) (cons (head xs) acc)
+
+-- Turn an accumulated (reversed) list of single-char strings into a field.
+csv_finish_field rev_chars = join "" (csv_rev rev_chars)
+
+-- ---------------------------------------------------------------------------
+-- csv_parse_line: parse exactly one record (no embedded newlines expected).
+-- ---------------------------------------------------------------------------
+-- State machine over the char list `cs`:
+--   cur    = reversed list of chars for the field being built
+--   fields = reversed list of completed field strings
+-- csv_unq / csv_inq are the outside-quotes / inside-quotes states.
+
+csv_parse_line line = csv_rev (csv_unq (chars line) [] [])
+
+-- Outside quotes.
+csv_unq cs cur fields =
+  if cs == [] then cons (csv_finish_field cur) fields
+  else
+    let c = head cs
+    let rest = tail cs
+    if c == "," then csv_unq rest [] (cons (csv_finish_field cur) fields)
+    else if c == csv_dq then csv_inq rest cur fields
+    else csv_unq rest (cons c cur) fields
+
+-- Inside quotes. A "" is an escaped quote; a lone " closes the field.
+csv_inq cs cur fields =
+  if cs == [] then cons (csv_finish_field cur) fields
+  else
+    let c = head cs
+    let rest = tail cs
+    if c == csv_dq then
+      (if rest == [] then csv_unq rest cur fields
+       else if head rest == csv_dq then csv_inq (tail rest) (cons csv_dq cur) fields
+       else csv_unq rest cur fields)
+    else csv_inq rest (cons c cur) fields
+
+-- ---------------------------------------------------------------------------
+-- csv_parse: parse whole text into records, respecting quoted newlines.
+-- ---------------------------------------------------------------------------
+-- Single pass over all chars. We accumulate field chars (cur), the current
+-- record's fields (fields), and completed records (rows). A newline only
+-- ends a record when we are OUTSIDE quotes. CR is dropped outside quotes so
+-- "\r\n" endings collapse cleanly.
+
+csv_parse text = csv_rev (csv_doc_unq (chars text) [] [] [])
+
+-- Close the current record and push it onto rows (reversing its fields).
+csv_push_row cur fields rows =
+  cons (csv_rev (cons (csv_finish_field cur) fields)) rows
+
+-- Outside quotes (document level).
+csv_doc_unq cs cur fields rows =
+  if cs == [] then csv_doc_end cur fields rows
+  else
+    let c = head cs
+    let rest = tail cs
+    if c == csv_lf then csv_doc_unq rest [] [] (csv_push_row cur fields rows)
+    else if c == csv_cr then csv_doc_unq rest cur fields rows
+    else if c == "," then csv_doc_unq rest [] (cons (csv_finish_field cur) fields) rows
+    else if c == csv_dq then csv_doc_inq rest cur fields rows
+    else csv_doc_unq rest (cons c cur) fields rows
+
+-- Inside quotes (document level): newlines/commas are literal data.
+csv_doc_inq cs cur fields rows =
+  if cs == [] then csv_doc_end cur fields rows
+  else
+    let c = head cs
+    let rest = tail cs
+    if c == csv_dq then
+      (if rest == [] then csv_doc_unq rest cur fields rows
+       else if head rest == csv_dq then csv_doc_inq (tail rest) (cons csv_dq cur) fields rows
+       else csv_doc_unq rest cur fields rows)
+    else csv_doc_inq rest (cons c cur) fields rows
+
+-- End of input: only emit a final record if there's pending content. A file
+-- ending in a newline leaves cur=[] and fields=[], which we drop.
+csv_doc_end cur fields rows =
+  if cur == [] then
+    (if fields == [] then rows
+     else csv_push_row cur fields rows)
+  else csv_push_row cur fields rows
+
+-- ---------------------------------------------------------------------------
+-- csv_row_to_string: serialize a list of fields to one CSV line.
+-- ---------------------------------------------------------------------------
+
+-- Does a field need quoting? True if it contains comma, quote, CR, or LF.
+csv_needs_quote f = csv_scan_special (chars f)
+csv_scan_special cs =
+  if cs == [] then false
+  else
+    let c = head cs
+    if c == "," then true
+    else if c == csv_dq then true
+    else if c == csv_cr then true
+    else if c == csv_lf then true
+    else csv_scan_special (tail cs)
+
+-- Double every embedded quote.
+csv_escape_chars cs =
+  if cs == [] then []
+  else
+    let c = head cs
+    if c == csv_dq then cons csv_dq (cons csv_dq (csv_escape_chars (tail cs)))
+    else cons c (csv_escape_chars (tail cs))
+
+csv_quote_field f =
+  join "" (cons csv_dq (cons (join "" (csv_escape_chars (chars f))) (cons csv_dq [])))
+
+csv_field_out f =
+  if csv_needs_quote f then csv_quote_field f
+  else f
+
+-- Map each field through csv_field_out and join with commas.
+csv_fields_out fields =
+  if fields == [] then []
+  else cons (csv_field_out (head fields)) (csv_fields_out (tail fields))
+
+csv_row_to_string fields = join "," (csv_fields_out fields)
