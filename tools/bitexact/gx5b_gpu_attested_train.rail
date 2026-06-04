@@ -1,0 +1,333 @@
+-- GX5b: the HEADLINE -- re-run BX10's ENTIRE attested bit-exact training trajectory
+-- with every MATMUL routed through the GPU exact-integer kernel (tgl_exact_matmul),
+-- and prove the signed hash-chain reproduces BIT-FOR-BIT. This is "bit-exact training
+-- AT SCALE while USING THE GPU": the chain head and the full ledger SHA-256 must equal
+-- the canonical CPU values produced by bx10_attested_train.rail.
+--
+-- The GPU substitutes for THREE matmul-family atoms (all exact-integer reductions):
+--   forward  bx10_matvec  -> gx5b_gpu_matvec     (A m*k @ v k -> m, reconstruct S /S)
+--   backprop bx10_matvec_t-> gx5b_gpu_matvec_t   (A^T via transpose marshal, then /S)
+--   grad     bx10_outer   -> gx5b_gpu_outer      (K=1 product reduction, then /S)
+-- via the GX5a BRIDGE: reconstruct the exact integer S = hi*2^31 + lo from the two-limb
+-- GPU result FIRST, then apply BX10's own truncate-toward-zero divide. (Naive Euclidean
+-- rescale would diverge on negatives -- GX5a falsified that.) Elementwise gelu/gelu' and
+-- the Adam optimizer stay scalar CPU (they are not reductions); every REDUCTION is on GPU.
+--
+-- bx10_attested_train.rail is NOT modified (it produced the canonical ledger). The CPU
+-- atoms here are copied verbatim for the per-op D2 diagnostics; the chain machinery is
+-- copied with ONLY the matmul calls swapped to GPU. Everything else (data pin, keys,
+-- genesis, Adam, canon, sha256, ed25519) is identical => any divergence is a GPU/bridge
+-- bug, isolated by the diagnostics before the end-to-end gate.
+--
+-- Build: ./rail_native --out-prefix /tmp/gx5b tools/bitexact/gx5b_gpu_attested_train.rail
+-- Run:   /tmp/gx5b
+
+import "stdlib/tensor.rail"
+import "tools/bitexact/bx_fixed.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- ===== canonical constants (the CPU bx10 results GX5b must reproduce on GPU) =====
+gx5b_canon_head = "bfb9a889b37c3808bbbff1ff239ceda1ac6dbf3966efe6d487b4dbd469815fc2"
+gx5b_canon_ledger = "7bdb671adcc10742cb2d54ea2973b998e765a3f1c54486662da3c24b52fdc3ed"
+
+-- ===== small utilities (verbatim from bx10) =====
+bx10_nth xs i = if i <= 0 then head xs else bx10_nth (tail xs) (i - 1)
+bx10_imod a b = a - (a / b) * b
+bx10_hex2int s i n acc = if i >= n then acc
+  else bx10_hex2int s (i + 1) n (acc * 16 + (str_find (str_sub s i 1) "0123456789abcdef"))
+
+-- ===== deterministic fixed-point data (verbatim from bx10) =====
+bx10_cell0 kind i j koff = (bx10_imod (kind * 101 + i * 5 + j * 3 + 7 + koff) 13 - 6) * 1398101
+bx10_genvec_go kind j cols koff = if j >= cols then [] else cons (bx10_cell0 kind 0 j koff) (bx10_genvec_go kind (j + 1) cols koff)
+bx10_genvec kind cols koff = bx10_genvec_go kind 0 cols koff
+bx10_initrow kind i j cols koff = if j >= cols then []
+  else cons (cons (bx10_cell0 kind i j koff) (cons 0 (cons 0 []))) (bx10_initrow kind i (j + 1) cols koff)
+bx10_initmat_go kind i rows cols koff = if i >= rows then []
+  else cons (bx10_initrow kind i 0 cols koff) (bx10_initmat_go kind (i + 1) rows cols koff)
+bx10_initmat kind rows cols koff = bx10_initmat_go kind 0 rows cols koff
+bx10_throw crow = if crow == [] then [] else cons (head (head crow)) (bx10_throw (tail crow))
+bx10_thmat cm = if cm == [] then [] else cons (bx10_throw (head cm)) (bx10_thmat (tail cm))
+
+-- ===== exact-integer CPU atoms (verbatim from bx10; the D2 reference) =====
+bx10_dot_go u v acc = if u == [] then acc else bx10_dot_go (tail u) (tail v) (acc + (head u) * (head v))
+bx10_dot u v = (bx10_dot_go u v 0) / 16777216
+bx10_matvec rows v = if rows == [] then [] else cons (bx10_dot (head rows) v) (bx10_matvec (tail rows) v)
+bx10_vadd u v = if u == [] then [] else cons ((head u) + (head v)) (bx10_vadd (tail u) (tail v))
+bx10_vsub u v = if u == [] then [] else cons ((head u) - (head v)) (bx10_vsub (tail u) (tail v))
+bx10_vsum xs = if xs == [] then 0 else (head xs) + bx10_vsum (tail xs)
+bx10_zeros d = if d < 1 then [] else cons 0 (bx10_zeros (d - 1))
+bx10_divS xs = if xs == [] then [] else cons ((head xs) / 16777216) (bx10_divS (tail xs))
+bx10_vscale_raw s row = if row == [] then [] else cons (s * (head row)) (bx10_vscale_raw s (tail row))
+bx10_mtv_go rows v acc = if rows == [] then acc else bx10_mtv_go (tail rows) (tail v) (bx10_vadd acc (bx10_vscale_raw (head v) (head rows)))
+bx10_matvec_t rows v cols = bx10_divS (bx10_mtv_go rows v (bx10_zeros cols))
+bx10_outer_row ui w = if w == [] then [] else cons ((ui * (head w)) / 16777216) (bx10_outer_row ui (tail w))
+bx10_outer u w = if u == [] then [] else cons (bx10_outer_row (head u) w) (bx10_outer (tail u) w)
+bx10_geluv xs = if xs == [] then [] else cons (bx4_gelu (head xs)) (bx10_geluv (tail xs))
+bx10_dz1 z1 dh1 = if z1 == [] then [] else cons (((bx4_gelu_grad (head z1)) * (head dh1)) / 16777216) (bx10_dz1 (tail z1) (tail dh1))
+bx10_forward w1 w2 x = bx10_matvec w2 (bx10_geluv (bx10_matvec w1 x))
+bx10_sq dv = (dv * dv) / 16777216
+bx10_sqsum xs = if xs == [] then 0 else (bx10_sq (head xs)) + bx10_sqsum (tail xs)
+bx10_loss w1 w2 x t = (bx10_sqsum (bx10_vsub (bx10_forward w1 w2 x) t)) / 2
+bx10_grads w1 w2 x t d hidden =
+  let z1 = bx10_matvec w1 x in
+  let h1 = bx10_geluv z1 in
+  let z2 = bx10_matvec w2 h1 in
+  let dz2 = bx10_vsub z2 t in
+  let dW2 = bx10_outer dz2 h1 in
+  let dh1 = bx10_matvec_t w2 dz2 hidden in
+  let dz1 = bx10_dz1 z1 dh1 in
+  let dW1 = bx10_outer dz1 x in
+  cons dW1 (cons dW2 [])
+
+-- ===== exact-integer Adam + canon (verbatim from bx10; shared by GPU chain) =====
+bx10_powfx_a base acc t = if t <= 0 then acc else bx10_powfx_b base ((acc * base) / 16777216) (t - 1)
+bx10_powfx_b base acc t = if t <= 0 then acc else bx10_powfx_a base ((acc * base) / 16777216) (t - 1)
+bx10_powfx base t = bx10_powfx_a base 16777216 t
+bx10_adam th m v g beta1 beta2 lr eps bc1 bc2 =
+  let m2 = ((beta1 * m) / 16777216) + (((16777216 - beta1) * g) / 16777216) in
+  let g2 = (g * g) / 16777216 in
+  let v2 = ((beta2 * v) / 16777216) + (((16777216 - beta2) * g2) / 16777216) in
+  let mhat = (m2 * 16777216) / bc1 in
+  let vhat = (v2 * 16777216) / bc2 in
+  let denom = (bx4_fxsqrt vhat) + eps in
+  let step = (lr * mhat) / denom in
+  cons (th - step) (cons m2 (cons v2 []))
+bx10_updcell cell g beta1 beta2 lr eps bc1 bc2 =
+  bx10_adam (head cell) (head (tail cell)) (head (tail (tail cell))) g beta1 beta2 lr eps bc1 bc2
+bx10_updrow crow grow beta1 beta2 lr eps bc1 bc2 =
+  if crow == [] then []
+  else cons (bx10_updcell (head crow) (head grow) beta1 beta2 lr eps bc1 bc2) (bx10_updrow (tail crow) (tail grow) beta1 beta2 lr eps bc1 bc2)
+bx10_updmat cm gm beta1 beta2 lr eps bc1 bc2 =
+  if cm == [] then []
+  else cons (bx10_updrow (head cm) (head gm) beta1 beta2 lr eps bc1 bc2) (bx10_updmat (tail cm) (tail gm) beta1 beta2 lr eps bc1 bc2)
+bx10_canon_row xs = if xs == [] then "" else cat [show (head xs), " ", bx10_canon_row (tail xs)]
+bx10_canon_mat m = if m == [] then "" else cat [bx10_canon_row (head m), ";", bx10_canon_mat (tail m)]
+
+-- ===== GPU marshalling: int lists <-> exact-int float_arr, with the GX5a bridge =====
+-- vector (length n) -> float_arr of exact-int doubles
+gx5b_fill_vec A xs i =
+  if xs == [] then A
+  else
+    let _ = float_arr_set A i (int_to_float (head xs))
+    gx5b_fill_vec A (tail xs) (i + 1)
+gx5b_vec_to_fa xs n = gx5b_fill_vec (float_arr_new n 0.0) xs 0
+-- matrix (m rows x k) row-major -> float_arr; A[i*k+j]
+gx5b_fill_row Af row base j =
+  if row == [] then Af
+  else
+    let _ = float_arr_set Af (base + j) (int_to_float (head row))
+    gx5b_fill_row Af (tail row) base (j + 1)
+gx5b_fill_mat Af rows k i =
+  if rows == [] then Af
+  else
+    let _ = gx5b_fill_row Af (head rows) (i * k) 0
+    gx5b_fill_mat Af (tail rows) k (i + 1)
+gx5b_mat_to_fa A m k = gx5b_fill_mat (float_arr_new (m * k) 0.0) A k 0
+-- TRANSPOSE marshal: rows is (rlen x cols); produce At (cols x rlen) with At[j*rlen+i]=rows[i][j]
+gx5b_fillT_row At row rlen i j =
+  if row == [] then At
+  else
+    let _ = float_arr_set At (j * rlen + i) (int_to_float (head row))
+    gx5b_fillT_row At (tail row) rlen i (j + 1)
+gx5b_fillT_mat At rows rlen i =
+  if rows == [] then At
+  else
+    let _ = gx5b_fillT_row At (head rows) rlen i 0
+    gx5b_fillT_mat At (tail rows) rlen (i + 1)
+gx5b_matT_to_fa rows rlen cols = gx5b_fillT_mat (float_arr_new (cols * rlen) 0.0) rows rlen 0
+-- read back: reconstruct exact S = hi*2^31 + lo, then BX10 truncate-divide by 2^24
+gx5b_read_div Hi Lo m i =
+  if i >= m then []
+  else
+    let s = (float_to_int (float_arr_get Hi i)) * 2147483648 + (float_to_int (float_arr_get Lo i))
+    cons (s / 16777216) (gx5b_read_div Hi Lo m (i + 1))
+gx5b_read_div_row Hi Lo n base j =
+  if j >= n then []
+  else
+    let s = (float_to_int (float_arr_get Hi (base + j))) * 2147483648 + (float_to_int (float_arr_get Lo (base + j)))
+    cons (s / 16777216) (gx5b_read_div_row Hi Lo n base (j + 1))
+gx5b_read_div_mat Hi Lo m n i =
+  if i >= m then []
+  else cons (gx5b_read_div_row Hi Lo n (i * n) 0) (gx5b_read_div_mat Hi Lo m n (i + 1))
+
+-- ===== GPU matmul-family atoms (drop-in for bx10_matvec / matvec_t / outer) =====
+gx5b_gpu_matvec A v m k =
+  let Af = gx5b_mat_to_fa A m k in
+  let Vf = gx5b_vec_to_fa v k in
+  let Hi = float_arr_new m 0.0 in
+  let Lo = float_arr_new m 0.0 in
+  let _ = tgl_exact_matmul Af Vf Hi Lo m k 1 in
+  gx5b_read_div Hi Lo m 0
+gx5b_gpu_matvec_t rows v rlen cols =
+  let At = gx5b_matT_to_fa rows rlen cols in
+  let Vf = gx5b_vec_to_fa v rlen in
+  let Hi = float_arr_new cols 0.0 in
+  let Lo = float_arr_new cols 0.0 in
+  let _ = tgl_exact_matmul At Vf Hi Lo cols rlen 1 in
+  gx5b_read_div Hi Lo cols 0
+gx5b_gpu_outer u w m n =
+  let Af = gx5b_vec_to_fa u m in
+  let Bf = gx5b_vec_to_fa w n in
+  let Hi = float_arr_new (m * n) 0.0 in
+  let Lo = float_arr_new (m * n) 0.0 in
+  let _ = tgl_exact_matmul Af Bf Hi Lo m 1 n in
+  gx5b_read_div_mat Hi Lo m n 0
+
+-- ===== GPU forward + gradients (same shapes as bx10, matmuls on device) =====
+gx5b_forward w1 w2 x d hidden =
+  gx5b_gpu_matvec w2 (bx10_geluv (gx5b_gpu_matvec w1 x hidden d)) d hidden
+gx5b_loss w1 w2 x t d hidden = (bx10_sqsum (bx10_vsub (gx5b_forward w1 w2 x d hidden) t)) / 2
+gx5b_grads w1 w2 x t d hidden =
+  let z1 = gx5b_gpu_matvec w1 x hidden d in
+  let h1 = bx10_geluv z1 in
+  let z2 = gx5b_gpu_matvec w2 h1 d hidden in
+  let dz2 = bx10_vsub z2 t in
+  let dW2 = gx5b_gpu_outer dz2 h1 d hidden in
+  let dh1 = gx5b_gpu_matvec_t w2 dz2 d hidden in
+  let dz1 = bx10_dz1 z1 dh1 in
+  let dW1 = gx5b_gpu_outer dz1 x hidden d in
+  cons dW1 (cons dW2 [])
+
+-- ===== one signed record (GPU loss+grads), then one Adam step (verbatim shape) =====
+gx5b_record w1c w2c x t d hidden beta1 beta2 lr eps seed pk prev_hex step_i bc1 bc2 =
+  let w1 = bx10_thmat w1c in
+  let w2 = bx10_thmat w2c in
+  let loss = gx5b_loss w1 w2 x t d hidden in
+  let gs = gx5b_grads w1 w2 x t d hidden in
+  let dW1 = bx10_nth gs 0 in
+  let dW2 = bx10_nth gs 1 in
+  let w_hex = sha256_hex (cat [bx10_canon_mat w1, ";;", bx10_canon_mat w2]) in
+  let g_hex = sha256_hex (cat [bx10_canon_mat dW1, ";;", bx10_canon_mat dW2]) in
+  let loss_str = show loss in
+  let link_str = cat [prev_hex, "|", show step_i, "|", w_hex, "|", g_hex, "|", loss_str] in
+  let link_b = sha256 link_str in
+  let link_hex = bytes_to_hex link_b 32 in
+  let sig = ed25519_sign seed link_b 32 in
+  let sig_hex = bytes_to_hex sig 64 in
+  let ok = ed25519_verify pk link_b 32 sig in
+  let nw1 = bx10_updmat w1c dW1 beta1 beta2 lr eps bc1 bc2 in
+  let nw2 = bx10_updmat w2c dW2 beta1 beta2 lr eps bc1 bc2 in
+  let line = cat [show step_i, " ", w_hex, " ", g_hex, " ", loss_str, " ", prev_hex, " ", link_hex, " ", sig_hex] in
+  cons link_hex (cons line (cons ok (cons nw1 (cons nw2 (cons loss [])))))
+
+gx5b_chain w1c w2c x t d hidden beta1 beta2 lr eps seed pk kk i prev_hex acc all_ok loss0 =
+  if i >= kk then cons all_ok (cons acc (cons prev_hex (cons loss0 (cons w1c (cons w2c [])))))
+  else
+    let bc1 = 16777216 - (bx10_powfx beta1 (i + 1)) in
+    let bc2 = 16777216 - (bx10_powfx beta2 (i + 1)) in
+    let r = gx5b_record w1c w2c x t d hidden beta1 beta2 lr eps seed pk prev_hex i bc1 bc2 in
+    let link_hex = bx10_nth r 0 in
+    let line = bx10_nth r 1 in
+    let ok = bx10_nth r 2 in
+    let nw1 = bx10_nth r 3 in
+    let nw2 = bx10_nth r 4 in
+    let lossi = bx10_nth r 5 in
+    let l0 = if i == 0 then lossi else loss0 in
+    gx5b_chain nw1 nw2 x t d hidden beta1 beta2 lr eps seed pk kk (i + 1) link_hex (cat [acc, line, "\n"]) (all_ok * ok) l0
+
+-- ===== D2 list/matrix equality (int ==, segfault-safe) =====
+gx5b_list_eq a b =
+  if a == [] then (if b == [] then 1 else 0)
+  else if b == [] then 0
+  else if (head a) == (head b) then gx5b_list_eq (tail a) (tail b)
+  else 0
+gx5b_mat_eq a b =
+  if a == [] then (if b == [] then 1 else 0)
+  else if b == [] then 0
+  else if (gx5b_list_eq (head a) (head b)) == 1 then gx5b_mat_eq (tail a) (tail b)
+  else 0
+pf b = if b == 1 then "PASS" else "FAIL"
+
+main =
+  let _ = ensure_dylib 0 in
+  let d = 8 in
+  let hidden = 16 in
+  let kk = 24 in
+  let beta1 = 15099494 in
+  let beta2 = 16760439 in
+  let lr = 838861 in
+  let eps = 16777 in
+
+  -- identical data pin as bx10 (run is a function of the BX9 corpus content)
+  let corpus = read_file "tools/bitexact/bx9_corpus.txt" in
+  let chash = sha256_hex corpus in
+  let cseed = bx10_hex2int chash 0 6 0 in
+  let koff = bx10_imod cseed 7 in
+  let x = bx10_genvec 8 d koff in
+  let t = bx10_genvec 9 d koff in
+  let w1c0 = bx10_initmat 0 hidden d koff in
+  let w2c0 = bx10_initmat 1 d hidden koff in
+
+  -- identical ephemeral LOCAL dev key + LOCAL genesis (never a prod sign surface)
+  let seed = sha256 "bx10.local.ephemeral.dev.seed.v1" in
+  let pk = ed25519_pk_from_sk seed in
+  let pk_hex = bytes_to_hex pk 32 in
+  let genesis_hex = sha256_hex "BX10.LOCAL.BEACON.GENESIS.dev" in
+
+  -- ===== DIAGNOSTIC: per-op D2 on the REAL step-0 operands (localizes any bridge bug) =====
+  let w1 = bx10_thmat w1c0 in
+  let w2 = bx10_thmat w2c0 in
+  let z1 = bx10_matvec w1 x in
+  let h1 = bx10_geluv z1 in
+  let z2 = bx10_matvec w2 h1 in
+  let dz2 = bx10_vsub z2 t in
+  let dh1c = bx10_matvec_t w2 dz2 hidden in
+  let dz1 = bx10_dz1 z1 dh1c in
+  -- forward matvec (w1 . x): GPU vs CPU
+  let okFwd = gx5b_list_eq (gx5b_gpu_matvec w1 x hidden d) z1 in
+  -- transpose matvec (w2^T . dz2): GPU vs CPU
+  let okMvt = gx5b_list_eq (gx5b_gpu_matvec_t w2 dz2 d hidden) dh1c in
+  -- outer (dz1 (x) x): GPU vs CPU  -- the K=1 reduction
+  let okOut = gx5b_mat_eq (gx5b_gpu_outer dz1 x hidden d) (bx10_outer dz1 x) in
+  -- full forward + full gradient (all three GPU atoms composed) vs CPU
+  let okFwdAll = gx5b_list_eq (gx5b_forward w1 w2 x d hidden) (bx10_forward w1 w2 x) in
+  let gC = bx10_grads w1 w2 x t d hidden in
+  let gG = gx5b_grads w1 w2 x t d hidden in
+  let okGrad = if (gx5b_mat_eq (bx10_nth gG 0) (bx10_nth gC 0)) == 1 then (gx5b_mat_eq (bx10_nth gG 1) (bx10_nth gC 1)) else 0 in
+  let okDiag = okFwd * okMvt * okOut * okFwdAll * okGrad in
+  let _ = print (cat ["GX5b D2 per-op (GPU vs bx10 CPU on real step-0): fwd-matvec=", pf okFwd, " matvec_t=", pf okMvt, " outer=", pf okOut, " forward-composed=", pf okFwdAll, " full-grad=", pf okGrad]) in
+
+  -- ===== HEADLINE: the FULL attested chain, every matmul on the GPU =====
+  let res = gx5b_chain w1c0 w2c0 x t d hidden beta1 beta2 lr eps seed pk kk 0 genesis_hex "" 1 0 in
+  let all_ok = bx10_nth res 0 in
+  let body = bx10_nth res 1 in
+  let head_link = bx10_nth res 2 in
+  let loss0 = bx10_nth res 3 in
+  let fw1 = bx10_nth res 4 in
+  let fw2 = bx10_nth res 5 in
+  let lossK = gx5b_loss (bx10_thmat fw1) (bx10_thmat fw2) x t d hidden in
+
+  -- reconstruct the EXACT ledger bytes (header + body) and hash them
+  let header = cat ["# BX10v1 ", pk_hex, " ", genesis_hex, " ", show kk, " ", chash, " ", show koff, " ", show d, " ", show hidden, "\n"] in
+  let ledger = cat [header, body] in
+  let ledger_hex = sha256_hex ledger in
+  let _ = write_file "/tmp/gx5b_chain.txt" ledger in
+
+  -- D0 on GPU: re-run the whole GPU chain -> bit-identical head + loss
+  let res2 = gx5b_chain w1c0 w2c0 x t d hidden beta1 beta2 lr eps seed pk kk 0 genesis_hex "" 1 0 in
+  let head2 = bx10_nth res2 2 in
+  let lossK2 = gx5b_loss (bx10_thmat (bx10_nth res2 4)) (bx10_thmat (bx10_nth res2 5)) x t d hidden in
+  let okD0 = if head_link == head2 then (if lossK == lossK2 then 1 else 0) else 0 in
+
+  -- gates
+  let okHead = if head_link == gx5b_canon_head then 1 else 0 in
+  let okLedger = if ledger_hex == gx5b_canon_ledger then 1 else 0 in
+  let okSigs = if all_ok == 1 then 1 else 0 in
+  let okProg = if lossK < loss0 then 1 else 0 in
+
+  let _ = print (cat ["GX5b GPU chain head = ", head_link]) in
+  let _ = print (cat ["GX5b canon  head    = ", gx5b_canon_head, "   match=", pf okHead]) in
+  let _ = print (cat ["GX5b GPU ledger SHA-256 = ", ledger_hex]) in
+  let _ = print (cat ["GX5b canon  ledger SHA  = ", gx5b_canon_ledger, "   match=", pf okLedger]) in
+  let _ = print (cat ["GX5b loss0=", show loss0, " lossK=", show lossK, " descent=", pf okProg, "   per-step sigs verify=", pf okSigs, "   GPU D0 re-run bit-identical=", pf okD0]) in
+
+  let allok = okDiag * okHead * okLedger * okSigs * okProg * okD0 in
+  let _ = print (if allok == 1
+    then "GX5b PASS: BX10's ENTIRE attested bit-exact training trajectory reproduces BIT-FOR-BIT with every matmul on the GPU exact-integer kernel -- chain head AND full ledger SHA-256 equal the canonical CPU values. Bit-exact training AT SCALE while USING THE GPU is earned: exact-integer reduction makes CPU and GPU one and the same number."
+    else "GX5b FAIL: GPU-driven chain diverged from the canonical CPU ledger -- inspect the per-op D2 line above to localize (matvec / matvec_t / outer)") in
+  if allok == 1 then 0 else 1
