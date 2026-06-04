@@ -1085,3 +1085,63 @@ kernel void exact_matmul(
     Hi[i * N + j] = hi;
     Lo[i * N + j] = lo;
 }
+
+// ═══════════════════════════════════════════════════════════
+// EXACT INTEGER MATMUL, THREADGROUP-TILED — same bit-exact result as
+// exact_matmul, with the standard GEMM tiling optimization applied.
+// Each output (i,j) is STILL owned by exactly one thread that runs its
+// OWN sequential p=0..K-1 2-limb accumulation; tiling only stages the A
+// and B operands through threadgroup memory to cut global-memory traffic.
+// It changes WHERE operands are read, never the ORDER they are summed, so
+// the per-output [hi,lo] limbs are bit-for-bit identical to exact_matmul
+// and to the CPU reference (D1 schedule-independence + D2 GPU==CPU hold
+// by construction). The point of the rung: bit-exactness survives the real
+// performance optimization, it does not force the slow untiled kernel.
+// Threads must NOT early-return for out-of-bounds (i,j): every lane in the
+// 16x16 group participates in the cooperative tile load + barrier; only the
+// loads and the final store are bounds-guarded.
+// ═══════════════════════════════════════════════════════════
+
+#define EXTILE 16
+
+kernel void exact_matmul_tiled(
+    device const int  *Aq [[buffer(0)]],
+    device const int  *Bq [[buffer(1)]],
+    device long       *Hi [[buffer(2)]],
+    device long       *Lo [[buffer(3)]],
+    constant uint &M [[buffer(4)]],
+    constant uint &K [[buffer(5)]],
+    constant uint &N [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    threadgroup int As[EXTILE][EXTILE];
+    threadgroup int Bs[EXTILE][EXTILE];
+    uint i = gid.y, j = gid.x;
+    long hi = 0, lo = 0;
+    uint nTiles = (K + EXTILE - 1) / EXTILE;
+    for (uint t = 0; t < nTiles; t++) {
+        uint aCol = t * EXTILE + lid.x;   // p-index this lane loads for A[i][p]
+        uint bRow = t * EXTILE + lid.y;   // p-index this lane loads for B[p][j]
+        As[lid.y][lid.x] = (i < M && aCol < K) ? Aq[i * K + aCol] : 0;
+        Bs[lid.y][lid.x] = (bRow < K && j < N) ? Bq[bRow * N + j] : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint pbase = t * EXTILE;
+        uint plim  = (pbase + EXTILE <= K) ? EXTILE : (K - pbase);
+        for (uint pp = 0; pp < plim; pp++) {
+            long prod = (long)As[lid.y][pp] * (long)Bs[pp][lid.x];
+            long plo0 = prod - (prod / EXLIMB) * EXLIMB;      // C truncated mod
+            long plo  = (plo0 < 0) ? plo0 + EXLIMB : plo0;    // Euclidean [0,2^31)
+            long phi  = (prod - plo) / EXLIMB;
+            long lon  = lo + plo;
+            long carry = (lon >= EXLIMB) ? 1 : 0;
+            lo = lon - carry * EXLIMB;
+            hi = hi + phi + carry;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (i < M && j < N) {
+        Hi[i * N + j] = hi;
+        Lo[i * N + j] = lo;
+    }
+}
