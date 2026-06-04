@@ -1,0 +1,101 @@
+-- GX5a: the load-bearing BRIDGE for re-attesting BX10 on the GPU. Proves the GPU
+-- exact_matmul can stand in for BX10's bx10_dot BIT-FOR-BIT, including the signed case.
+--
+-- BX10's dot (bx10_attested_train.rail:77-78) accumulates raw quantized products into
+-- a single int63 S, then does ONE deferred rescale S / 2^24 with Rail's truncate-TOWARD-
+-- ZERO divide. The GPU returns the same exact sum as Euclidean two-limb [hi, lo] with
+-- lo in [0, 2^31). The TRAP: rescaling the Euclidean limbs as hi*128 + lo/2^24 (floor-ish)
+-- does NOT equal trunc-toward-zero(S/2^24) when S < 0. So the bridge MUST reconstruct the
+-- exact integer S = hi*2^31 + lo first, then apply BX10's own divide. This test falsifies
+-- both directions: the correct bridge matches bx10_dot on every row (incl. negatives), and
+-- the naive Euclidean rescale provably DIVERGES on the negative rows (non-vacuous).
+--
+-- Build: ./rail_native --out-prefix /tmp/gx5a tools/bitexact/gx5a_dot_bridge.rail
+-- Run:   /tmp/gx5a
+
+import "stdlib/tensor.rail"
+
+-- BX10's exact dot semantics (verbatim shape).
+bx10_dot_go u v acc = if u == [] then acc else bx10_dot_go (tail u) (tail v) (acc + (head u) * (head v))
+bx10_dot u v = (bx10_dot_go u v 0) / 16777216
+
+-- deterministic quantized-int generator WITH negatives (|q| < 2^31, fits int32 buffer).
+qval idx = (((idx * 13 + 5) - ((((idx * 13 + 5)) / 17) * 17)) - 8) * 100003
+
+-- GPU operand A (m x K) and vector V (K x 1) as exact-int doubles.
+fillA_go A K base m i j =
+  if i >= m then A
+  else if j >= K then fillA_go A K base m (i + 1) 0
+  else
+    let _ = float_arr_set A (i * K + j) (int_to_float (qval (base + i * K + j)))
+    fillA_go A K base m i (j + 1)
+mkA m K base = fillA_go (float_arr_new (m * K) 0.0) K base m 0 0
+fillV_go V K base p =
+  if p >= K then V
+  else
+    let _ = float_arr_set V p (int_to_float (qval (base + p)))
+    fillV_go V K base (p + 1)
+mkV K base = fillV_go (float_arr_new K 0.0) K base 0
+
+-- read row i / vector back as int lists for the CPU bx10_dot (same values as the GPU saw).
+row_list_go A K i p acc = if p < 0 then acc else row_list_go A K i (p - 1) (cons (float_to_int (float_arr_get A (i * K + p))) acc)
+row_list A K i = row_list_go A K i (K - 1) []
+v_list_go V K p acc = if p < 0 then acc else v_list_go V K (p - 1) (cons (float_to_int (float_arr_get V p)) acc)
+v_list V K = v_list_go V K (K - 1) []
+
+-- CORRECT bridge: reconstruct exact S = hi*2^31 + lo, then BX10's truncate divide.
+gpu_dot_correct Hi Lo i =
+  let s = (float_to_int (float_arr_get Hi i)) * 2147483648 + (float_to_int (float_arr_get Lo i))
+  s / 16777216
+-- NAIVE rescale (the trap): Euclidean limbs hi*128 + lo/2^24 -- diverges for S < 0.
+gpu_dot_naive Hi Lo i =
+  (float_to_int (float_arr_get Hi i)) * 128 + (float_to_int (float_arr_get Lo i)) / 16777216
+
+-- scan all rows: count correct-bridge mismatches vs bx10_dot
+count_correct_bad A V Hi Lo K m i bad =
+  if i >= m then bad
+  else
+    let cd = bx10_dot (row_list A K i) (v_list V K)
+    let gd = gpu_dot_correct Hi Lo i
+    count_correct_bad A V Hi Lo K m (i + 1) (if cd == gd then bad else bad + 1)
+-- count naive-rescale mismatches vs bx10_dot (expected > 0: the negative rows)
+count_naive_bad A V Hi Lo K m i bad =
+  if i >= m then bad
+  else
+    let cd = bx10_dot (row_list A K i) (v_list V K)
+    let gd = gpu_dot_naive Hi Lo i
+    count_naive_bad A V Hi Lo K m (i + 1) (if cd == gd then bad else bad + 1)
+-- count how many CPU dots were negative (proves the signed case is exercised)
+count_neg A V K m i neg =
+  if i >= m then neg
+  else
+    let cd = bx10_dot (row_list A K i) (v_list V K)
+    count_neg A V K m (i + 1) (if cd < 0 then neg + 1 else neg)
+pf b = if b == 1 then "PASS" else "FAIL"
+
+main =
+  let _ = ensure_dylib 0
+  let m = 96
+  let K = 24
+  let A = mkA m K 0
+  let V = mkV K 777
+  let Hi = float_arr_new m 0.0
+  let Lo = float_arr_new m 0.0
+  let _ = tgl_exact_matmul A V Hi Lo m K 1
+
+  let neg = count_neg A V K m 0 0
+  let badC = count_correct_bad A V Hi Lo K m 0 0
+  let badN = count_naive_bad A V Hi Lo K m 0 0
+  let okC = if badC == 0 then 1 else 0
+  let okNeg = if neg > 0 then 1 else 0
+  let okTrap = if badN > 0 then 1 else 0
+
+  let _ = print (cat ["GX5a negative dots exercised: ", show neg, " of ", show m, " rows   ", pf okNeg])
+  let _ = print (cat ["GX5a CORRECT bridge (reconstruct exact S, then bx10 truncate-divide) vs bx10_dot: mismatches=", show badC, "   ", pf okC])
+  let _ = print (cat ["GX5a NAIVE rescale (Euclidean hi*128 + lo/2^24) vs bx10_dot: mismatches=", show badN, " (>0 expected -- the signed trap is real, bridge non-vacuous)   ", pf okTrap])
+
+  let allok = if okC == 1 then (if okNeg == 1 then okTrap else 0) else 0
+  let _ = print (if allok == 1
+    then "GX5a PASS: the GPU exact_matmul substitutes for bx10_dot BIT-FOR-BIT on every row including negatives, via exact-integer reconstruction + BX10's own deferred truncate-divide. The naive Euclidean rescale would have silently broken D2 on the negative rows. Bridge is sound -> GPU can drive BX10's matmul."
+    else "GX5a FAIL: bridge not bit-exact OR trap not demonstrated -- do NOT route BX10 matmul through GPU yet")
+  if allok == 1 then 0 else 1
