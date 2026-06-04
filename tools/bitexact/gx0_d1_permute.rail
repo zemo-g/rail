@@ -1,0 +1,78 @@
+-- GX0: D1 order-independence falsification for the deferred-rescale integer dot,
+-- plus the single-limb int63 overflow-ceiling probe that motivates GX1's
+-- multi-limb superaccumulator. CPU-only (diagnose-first): proves "integer add is
+-- associative -> bit-exact on ANY summation schedule" on the REAL reduction shape
+-- (bx6_dot = raw products summed, divided by S=16777216 exactly ONCE at the end)
+-- BEFORE a single line of Metal is written. The deferred single rescale is what
+-- turns the GPU port into a pure exact-integer reduction problem.
+--
+-- This is the test I never actually ran when I first claimed D1: the whole GPU
+-- argument rests on "integer add is associative," but a hidden per-term truncation
+-- or magnitude-dependent step would break it. So: permute the order and falsify.
+
+-- deterministic fixed-point test vectors (F=24, S=2^24): u_k = k.0, v_k = (k+1).0.
+-- products = k*(k+1)*S^2 are STRICTLY INCREASING (not a palindrome), so a reversed
+-- schedule is a genuine reordering -- required for the order-dependent control below.
+gx0_mku k n = if k > n then [] else cons (k * 16777216) (gx0_mku (k + 1) n)
+gx0_mkv k n = if k > n then [] else cons ((k + 1) * 16777216) (gx0_mkv (k + 1) n)
+
+-- product list (pairing u_k<->v_k is FIXED); the summation ORDER is the only
+-- variable across the four schedules below.
+gx0_prods u v = if u == [] then [] else cons ((head u) * (head v)) (gx0_prods (tail u) (tail v))
+
+gx0_rev xs acc = if xs == [] then acc else gx0_rev (tail xs) (cons (head xs) acc)
+gx0_app a b = if a == [] then b else cons (head a) (gx0_app (tail a) b)
+gx0_evens xs = if xs == [] then [] else if (tail xs) == [] then xs else cons (head xs) (gx0_evens (tail (tail xs)))
+gx0_odds xs = if xs == [] then [] else if (tail xs) == [] then [] else cons (head (tail xs)) (gx0_odds (tail (tail xs)))
+
+-- four summation schedules over the SAME products: linear, reversed, pairwise-tree,
+-- and an odd-then-even interleave shuffle.
+gx0_sum xs acc = if xs == [] then acc else gx0_sum (tail xs) (acc + head xs)
+gx0_pair xs = if xs == [] then [] else if (tail xs) == [] then xs else cons ((head xs) + (head (tail xs))) (gx0_pair (tail (tail xs)))
+gx0_tree xs = if xs == [] then 0 else if (tail xs) == [] then head xs else gx0_tree (gx0_pair xs)
+
+-- order-DEPENDENT control (a poor-man's block-float: halve the accumulator whenever
+-- it crosses a threshold). Losing low bits at a magnitude-dependent point makes the
+-- result order-SENSITIVE, so natural != reversed PROVES the harness can actually
+-- detect a non-associative reduction -- i.e. the D1 PASS is not vacuous.
+gx0_block xs acc = if xs == [] then acc else
+  let s = acc + head xs in
+  let s2 = if s >= 36028797018963968 then s / 2 else s in
+  gx0_block (tail xs) s2
+
+-- single-limb int63 overflow ceiling: add a unit product (2^48) repeatedly until the
+-- running sum wraps negative; the K at the wrap is the hard limit that GX1's
+-- multi-limb superaccumulator must lift for "at scale" to be real.
+-- MUTUAL recursion (a/b ping-pong), NOT self-recursion: a self-tail-call whose
+-- accumulator arg depends on a passed-through arg (acc' = acc + p) hits the
+-- self-loop cross-dep-args miscompile (rail-bug-self-loop-cross-dep-args) and
+-- returns a corrupt K=14; the ping-pong dodges it and reports the true K=16383.
+gx0_ovf_a p acc k = let s = acc + p in if s < 0 then k else gx0_ovf_b p s (k + 1)
+gx0_ovf_b p acc k = let s = acc + p in if s < 0 then k else gx0_ovf_a p s (k + 1)
+
+main =
+  let u = gx0_mku 1 16 in
+  let v = gx0_mkv 1 16 in
+  let p = gx0_prods u v in
+  let sN = gx0_sum p 0 in
+  let sR = gx0_sum (gx0_rev p []) 0 in
+  let sT = gx0_tree p in
+  let sS = gx0_sum (gx0_app (gx0_odds p) (gx0_evens p)) 0 in
+  let d1ok = if sN == sR then (if sN == sT then (if sN == sS then 1 else 0) else 0) else 0 in
+  let dotN = sN / 16777216 in
+  let dotS = sS / 16777216 in
+  let dotok = if dotN == dotS then 1 else 0 in
+  let bN = gx0_block p 0 in
+  let bR = gx0_block (gx0_rev p []) 0 in
+  let ctrl = if bN == bR then 0 else 1 in
+  let kceil = gx0_ovf_a 281474976710656 0 0 in
+  let _ = print (join "" ["GX0 D1 raw sums: nat=", show sN, " rev=", show sR, " tree=", show sT, " shuf=", show sS]) in
+  let _ = print (join "" ["GX0 D1 order-independent (nat==rev==tree==shuf): ", if d1ok == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["GX0 deferred-rescale dot (single divide at end): nat=", show dotN, " shuf=", show dotS, " identical=", if dotok == 1 then "1" else "0"]) in
+  let _ = print (join "" ["GX0 control (order-DEPENDENT block-float): nat=", show bN, " rev=", show bR, " -> harness discriminates=", if ctrl == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["GX0 single-limb int63 overflow ceiling: K=", show kceil, " unit products (2^48); summing >= K raw products needs GX1 multi-limb superaccumulator"]) in
+  let allok = if d1ok == 1 then (if ctrl == 1 then (if dotok == 1 then 1 else 0) else 0) else 0 in
+  let _ = print (if allok == 1
+    then "GX0 PASS: integer reduction is order-independent on the real deferred-rescale shape; harness catches a non-associative control; int63 ceiling quantified -> GPU port is a pure exact-integer reduction problem"
+    else "GX0 FAIL: order-dependence or non-discriminating harness -- stop before Metal") in
+  0
