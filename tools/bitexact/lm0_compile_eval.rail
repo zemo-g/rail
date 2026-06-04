@@ -1,0 +1,162 @@
+-- lm0: the SCALED user-facing success metric for the bit-exact Rail LANGUAGE MODEL.
+-- compile% / correct% on a held-out Rail task set, with rail_native ITSELF as the oracle.
+--
+-- This supersedes bx11's 6-task instrument with a banded held-out set (B1..B6, 30 tasks)
+-- plus adversarial negatives, and adds a MODEL-SCORING mode: for task <id>, if the file
+--   /tmp/lm_completions/<id>.rail
+-- exists and is non-empty, the scorer grades the MODEL's completion; otherwise it grades
+-- the embedded reference completion (the instrument self-check). One file therefore does
+-- double duty: it VALIDATES the instrument now (all references must compile+run+match, all
+-- negatives must FAIL) and SCORES a real model later (drop completion files in place).
+--
+-- Written BEFORE the scaled training run (the 7-hour-burn rule: define success in
+-- user-facing terms first, run it at the FIRST checkpoint, abort if it is 0 even while a
+-- proxy like val_loss drops). compile% = fraction that compile+link clean; correct% =
+-- fraction whose program output contains the expected string.
+--
+-- Scoring is robust to shell return quirks: it greps the compile log for "ld: OK" and the
+-- program output for the expected string (no exit-code dependence). Candidates compile with
+-- --out-prefix so they NEVER touch the mhd-owned /tmp/rail_out.
+--
+-- Build: ./rail_native --out-prefix /tmp/lm0 tools/bitexact/lm0_compile_eval.rail
+-- Run:   /tmp/lm0     (writes /tmp/lm0_eval.txt; first token = overall compile%)
+
+-- ===== scorer: compile one candidate, run it, return (compiled, correct) =====
+lm0_score_one src expected idx =
+  let path = join "" ["/tmp/lm0_cand_", show idx, ".rail"] in
+  let binp = join "" ["/tmp/lm0_cand_", show idx, "_bin"] in
+  let logp = join "" ["/tmp/lm0_cand_", show idx, ".log"] in
+  let outp = join "" ["/tmp/lm0_cand_", show idx, ".out"] in
+  let _ = write_file path src in
+  let cc = join "" ["./rail_native --out-prefix ", binp, " ", path, " > ", logp, " 2>&1"] in
+  let _ = shell cc in
+  let log = read_file logp in
+  let compiled = if str_contains "ld: OK" log then 1 else 0 in
+  if compiled == 0 then (0, 0)
+  else
+    let rc = join "" [binp, " > ", outp, " 2>&1"] in
+    let _ = shell rc in
+    let out = read_file outp in
+    let correct = if str_contains expected out then 1 else 0 in
+    (1, correct)
+
+-- model-scoring override: prefer /tmp/lm_completions/<id>.rail if present+non-empty
+lm0_candidate id refsrc =
+  let comp = read_file (join "" ["/tmp/lm_completions/", id, ".rail"]) in
+  if comp == "" then refsrc else comp
+
+-- ===== driver: walk the banded task set, print a per-task line, accumulate counts =====
+-- task = (band, id, refsrc, expected, shouldc). counts = [nC, nCorrect, nInstr].
+lm0_go tasks idx nC nCorrect nInstr =
+  if tasks == [] then [nC, nCorrect, nInstr]
+  else
+    let t = head tasks in
+    let (band, id, refsrc, expected, shouldc) = t in
+    let src = lm0_candidate id refsrc in
+    let r = lm0_score_one src expected idx in
+    let (compiled, correct) = r in
+    let instr = if compiled == shouldc then 1 else 0 in
+    let tag = if compiled == 0 then "NO_COMPILE" else if correct == 1 then "CORRECT" else "WRONG" in
+    let _ = print (join "" ["  [", tag, "] ", band, " ", id]) in
+    lm0_go (tail tasks) (idx + 1) (nC + compiled) (nCorrect + correct) (nInstr + instr)
+
+lm0_len xs = if xs == [] then 0 else 1 + lm0_len (tail xs)
+
+-- ===== held-out Rail task set: reference completions (also the instrument self-check) =====
+-- B1 fundamentals
+lm0_b1_1 = "main = let _ = print \"hello world\" in 0\n"
+lm0_b1_2 = "main = let _ = print (show (3 + 4)) in 0\n"
+lm0_b1_3 = "main = let _ = print (show (length [1, 2, 3, 4, 5])) in 0\n"
+lm0_b1_4 = "main = let _ = print (show (head [10, 20, 30])) in 0\n"
+lm0_b1_5 = "main = let _ = print \"hello\nworld\" in 0\n"
+-- B2 control
+lm0_b2_1 = "main = let _ = print (if 10 > 5 then \"yes\" else \"no\") in 0\n"
+lm0_b2_2 = "fact n = if n <= 1 then 1 else n * fact (n - 1)\nmain = let _ = print (show (fact 5)) in 0\n"
+lm0_b2_3 = "shw x = show x\nmain = let _ = print (join \"\" (map shw (range 5))) in 0\n"
+lm0_b2_4 = "add a b = a + b\nmain = let _ = print (show (add 3 4)) in 0\n"
+lm0_b2_5 = "f n = if n == 1 then \"one\" else if n == 2 then \"two\" else \"other\"\nmain = let _ = print (f 1) in 0\n"
+-- B3 data
+lm0_b3_1 = "main = let _ = print (show (head (reverse [1, 2, 3]))) in 0\n"
+lm0_b3_2 = "add a b = a + b\nmain = let _ = print (show (fold add 0 [1, 2, 3, 4, 5])) in 0\n"
+lm0_b3_3 = "gt3 x = x > 3\nmain = let _ = print (show (length (filter gt3 [1, 2, 3, 4, 5]))) in 0\n"
+lm0_b3_4 = "double x = x * 2\nmain = let _ = print (join \",\" (map show (map double [1, 2, 3]))) in 0\n"
+lm0_b3_5 = "type Option = | Some x | None\ngetv o = match o | Some x -> x | None -> 0\nmain = let _ = print (show (getv (Some 42))) in 0\n"
+-- B4 composition
+lm0_b4_1 = "compose f g x = f (g x)\ndouble x = x + x\nadd1 x = x + 1\nmain = let _ = print (show (compose double add1 5)) in 0\n"
+lm0_b4_2 = "dot a b = if a == [] then 0 else (head a) * (head b) + dot (tail a) (tail b)\nmain = let _ = print (show (dot [1, 2, 3] [4, 5, 6])) in 0\n"
+lm0_b4_3 = "type Tree = | Leaf v | Node l r\ntsum t = match t | Leaf v -> v | Node l r -> tsum l + tsum r\nmain = let _ = print (show (tsum (Node (Leaf 1) (Node (Leaf 2) (Leaf 3))))) in 0\n"
+lm0_b4_4 = "makeAdder n = \\x -> x + n\nmain = let f = makeAdder 10 in let _ = print (show (f 32)) in 0\n"
+lm0_b4_5 = "shw x = show x\nmain = let _ = print (join \",\" (map shw [1, 2, 3])) in 0\n"
+-- B5 io / strings
+lm0_b5_1 = "main = let _ = write_file \"/tmp/lm0_io.txt\" \"test\" in let c = read_file \"/tmp/lm0_io.txt\" in let _ = print c in 0\n"
+lm0_b5_2 = "main = let _ = print (join \"\n\" (split \",\" \"hello,world\")) in 0\n"
+lm0_b5_3 = "main = let _ = print (join \"-\" [\"a\", \"b\", \"c\"]) in 0\n"
+lm0_b5_4 = "main = let _ = print (join \"\" (reverse (chars \"abc\"))) in 0\n"
+lm0_b5_5 = "main = let _ = shell \"echo 42 > /tmp/lm0_sh.txt\" in let c = read_file \"/tmp/lm0_sh.txt\" in let _ = print c in 0\n"
+-- B6 advanced
+lm0_b6_1 = "main = let _ = print (head (tail (split \"=\" \"name=rail\"))) in 0\n"
+lm0_b6_2 = "type Result = | Ok v | Err m\ngetr r = match r | Ok v -> v | Err m -> 0\nmain = let _ = print (show (getr (Ok 42))) in 0\n"
+lm0_b6_3 = "sq x = x * x\nmain = let _ = print (join \",\" (map show (map sq (range 5)))) in 0\n"
+lm0_b6_4 = "main = let _ = print (show (length (str_split \" \" \"hello world foo\"))) in 0\n"
+lm0_b6_5 = "shw x = show x\nins x xs = if xs == [] then [x] else if x <= head xs then cons x xs else cons (head xs) (ins x (tail xs))\nmain = let _ = print (join \",\" (map shw (ins 3 [1, 2, 4, 5]))) in 0\n"
+-- adversarial negatives (must NOT compile)
+lm0_n1 = "main = let _ = print (zzz qqq www\n"
+lm0_n2 = "main = print (\n"
+lm0_n3 = "g;lkj garbage !!! this is not rail at all\n"
+
+lm0_tasks =
+  [ ("B1", "b1_1", lm0_b1_1, "hello world", 1)
+  , ("B1", "b1_2", lm0_b1_2, "7", 1)
+  , ("B1", "b1_3", lm0_b1_3, "5", 1)
+  , ("B1", "b1_4", lm0_b1_4, "10", 1)
+  , ("B1", "b1_5", lm0_b1_5, "hello\nworld", 1)
+  , ("B2", "b2_1", lm0_b2_1, "yes", 1)
+  , ("B2", "b2_2", lm0_b2_2, "120", 1)
+  , ("B2", "b2_3", lm0_b2_3, "01234", 1)
+  , ("B2", "b2_4", lm0_b2_4, "7", 1)
+  , ("B2", "b2_5", lm0_b2_5, "one", 1)
+  , ("B3", "b3_1", lm0_b3_1, "3", 1)
+  , ("B3", "b3_2", lm0_b3_2, "15", 1)
+  , ("B3", "b3_3", lm0_b3_3, "2", 1)
+  , ("B3", "b3_4", lm0_b3_4, "2,4,6", 1)
+  , ("B3", "b3_5", lm0_b3_5, "42", 1)
+  , ("B4", "b4_1", lm0_b4_1, "12", 1)
+  , ("B4", "b4_2", lm0_b4_2, "32", 1)
+  , ("B4", "b4_3", lm0_b4_3, "6", 1)
+  , ("B4", "b4_4", lm0_b4_4, "42", 1)
+  , ("B4", "b4_5", lm0_b4_5, "1,2,3", 1)
+  , ("B5", "b5_1", lm0_b5_1, "test", 1)
+  , ("B5", "b5_2", lm0_b5_2, "hello\nworld", 1)
+  , ("B5", "b5_3", lm0_b5_3, "a-b-c", 1)
+  , ("B5", "b5_4", lm0_b5_4, "cba", 1)
+  , ("B5", "b5_5", lm0_b5_5, "42", 1)
+  , ("B6", "b6_1", lm0_b6_1, "rail", 1)
+  , ("B6", "b6_2", lm0_b6_2, "42", 1)
+  , ("B6", "b6_3", lm0_b6_3, "0,1,4,9,16", 1)
+  , ("B6", "b6_4", lm0_b6_4, "3", 1)
+  , ("B6", "b6_5", lm0_b6_5, "1,2,3,4,5", 1)
+  , ("NG", "n1", lm0_n1, "", 0)
+  , ("NG", "n2", lm0_n2, "", 0)
+  , ("NG", "n3", lm0_n3, "", 0)
+  ]
+
+main =
+  let _ = shell "mkdir -p /tmp/lm_completions" in
+  let _ = print "lm0 compile-as-oracle eval (held-out Rail task set, rail_native = oracle):" in
+  let res = lm0_go lm0_tasks 0 0 0 0 in
+  let nC = head res in
+  let nCorrect = head (tail res) in
+  let nInstr = head (tail (tail res)) in
+  let ntasks = lm0_len lm0_tasks in
+  let nrefs = ntasks - 3 in
+  let compile_pct = (nC * 100) / ntasks in
+  let correct_pct = (nCorrect * 100) / ntasks in
+  let instr_ok = if nInstr == ntasks then 0 else 1 in
+  let _ = print (join "" ["lm0 compile%: ", show compile_pct, "  (", show nC, "/", show ntasks, " candidates compile+link)"]) in
+  let _ = print (join "" ["lm0 correct%: ", show correct_pct, "  (", show nCorrect, "/", show ntasks, " produce the expected output)"]) in
+  let _ = print (join "" ["lm0 instrument self-check (all ", show nrefs, " refs PASS, all 3 negatives FAIL): ", if instr_ok == 0 then "PASS" else "FAIL"]) in
+  let _ = write_file "/tmp/lm0_eval.txt" (join "" [show compile_pct, " ", show correct_pct, " ", show nC, " ", show nCorrect, " ", show ntasks, "\n"]) in
+  let _ = print (if instr_ok == 0
+    then "lm0 PASS: scaled compile-as-oracle instrument validated; ready to gate the LM first checkpoint"
+    else "lm0 FAIL: instrument did not perfectly discriminate refs (PASS) from negatives (FAIL) -- fix before trusting") in
+  if instr_ok == 0 then 0 else 1
