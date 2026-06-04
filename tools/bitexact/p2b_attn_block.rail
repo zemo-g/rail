@@ -1,0 +1,444 @@
+-- P2b (1B ladder): exact-integer ATTENTION sub-block, composes at real Gemma 4 E2B shapes.
+-- Companion to P2a (the GeGLU MLP block). Together they ARE a full E2B decoder layer. This rung
+-- proves the proven exact-integer atoms (two-limb superaccumulator, fixed-point RMSNorm, exact
+-- RoPE, exact softmax) COMPOSE into the characteristic transformer op at REAL shapes:
+--   d_model 2048,  heads 8,  kv_heads 2 (GQA, group 4),  head_dim 256,  projection depth K=2048.
+-- Sequence length L is a free parameter (bit-exactness is L-independent); L=8 keeps it tractable.
+--
+-- Forward (every step a FIXED INTEGER algorithm -> bit-identical on any device/schedule):
+--   Xn   = RMSNorm(X)                              -- pre-attention norm (fixed-point fxsqrt)
+--   Q    = Xn Wq^T   (L x 2048)                    -- projection, K=2048 two-limb contraction
+--   K,V  = Xn Wk^T, Xn Wv^T  (L x 512)             -- GQA: only 2 kv heads
+--   Qr,Kr= RoPE(Q),RoPE(K)  per head, per position -- exact-integer rotate-half (bx4_sinb/cosb)
+--   per query head h (kv = h/4):  S = Qr_h Kr_kv^T / sqrt(hd);  P = softmax(S);  O_h = P V_kv
+--   out  = X + concat_h(O_h) Wo^T                  -- O projection (K=2048) + residual
+--
+-- Gates: D0 (run-twice bit-identical), D2 (GPU exact_matmul == CPU two-limb on the K projection at
+-- real depth 2048). ACC vs libm float reference is added in part 2. Worst-case accumulator width is
+-- already proven required+sufficient in R3/R4/R6; here activations are post-norm O(1) (realistic
+-- regime), so the two-limb atom is used uniformly and the reconstruct-divide rescale is valid.
+--
+-- Build: ./rail_native --out-prefix /tmp/p2b tools/bitexact/p2b_attn_block.rail
+-- Run:   /tmp/p2b
+
+import "stdlib/tensor.rail"
+import "tools/bitexact/bx_fixed.rail"
+
+foreign sin x -> float
+foreign cos x -> float
+foreign pow x y -> float
+
+-- ===== deterministic on-the-fly weights/inputs (NO dense weight ever materialized) =====
+p2b_imod a b = a - (a / b) * b
+p2b_x t c = (p2b_imod (t * 2311 + c * 131 + 7) 2001 - 1000) * 8192            -- X[t][c] pre-norm
+p2b_w kind o c = (p2b_imod (kind * 6151 + o * 131 + c * 17 + 1) 1021 - 510) * 1024  -- |w|<1 fixed-pt
+p2b_g c = 16777216 + (p2b_imod (c * 11 + 3) 401 - 200) * 4096                 -- RMSNorm gamma ~1.0
+
+-- ===== two-limb superaccumulator, IN-PLACE 2-cell acc (acc[0]=hi, acc[1]=lo). zero hot-loop alloc.
+-- V = hi*2^31 + lo; deferred single truncate-divide by S (valid since |V|<2^62 in the post-norm regime).
+p2b_rescale h l = (h * 2147483648 + l) / 16777216
+-- projection dot: acc += sum_p w(kind,o,p)*src[sbase+p]   (single advancing counter p; r6_genA-safe)
+p2b_dot kind o src sbase K acc p =
+  if p >= K then 0
+  else
+    let a = (p2b_w kind o p) * (arr_get src (sbase + p)) in
+    let ahi = a / 2147483648 in
+    let alo = a - ahi * 2147483648 in
+    let h0 = (arr_get acc 0) + ahi in
+    let l0 = (arr_get acc 1) + alo in
+    let h = if l0 >= 2147483648 then h0 + 1 else if l0 < 0 then h0 - 1 else h0 in
+    let l = if l0 >= 2147483648 then l0 - 2147483648 else if l0 < 0 then l0 + 2147483648 else l0 in
+    let _ = arr_set acc 0 h in
+    let _ = arr_set acc 1 l in
+    p2b_dot kind o src sbase K acc (p + 1)
+-- array-array dot: acc += sum_p A[abase+p]*B[bbase+p]  (contiguous; QK^T per head)
+p2b_adot A abase B bbase K acc p =
+  if p >= K then 0
+  else
+    let a = (arr_get A (abase + p)) * (arr_get B (bbase + p)) in
+    let ahi = a / 2147483648 in
+    let alo = a - ahi * 2147483648 in
+    let h0 = (arr_get acc 0) + ahi in
+    let l0 = (arr_get acc 1) + alo in
+    let h = if l0 >= 2147483648 then h0 + 1 else if l0 < 0 then h0 - 1 else h0 in
+    let l = if l0 >= 2147483648 then l0 - 2147483648 else if l0 < 0 then l0 + 2147483648 else l0 in
+    let _ = arr_set acc 0 h in
+    let _ = arr_set acc 1 l in
+    p2b_adot A abase B bbase K acc (p + 1)
+-- strided dot for P V: acc += sum_j P[pbase+j]*V[vbase + j*vstride]   (V row-strided by kvdim)
+p2b_pvdot P pbase V vbase vstride L acc j =
+  if j >= L then 0
+  else
+    let a = (arr_get P (pbase + j)) * (arr_get V (vbase + j * vstride)) in
+    let ahi = a / 2147483648 in
+    let alo = a - ahi * 2147483648 in
+    let h0 = (arr_get acc 0) + ahi in
+    let l0 = (arr_get acc 1) + alo in
+    let h = if l0 >= 2147483648 then h0 + 1 else if l0 < 0 then h0 - 1 else h0 in
+    let l = if l0 >= 2147483648 then l0 - 2147483648 else if l0 < 0 then l0 + 2147483648 else l0 in
+    let _ = arr_set acc 0 h in
+    let _ = arr_set acc 1 l in
+    p2b_pvdot P pbase V vbase vstride L acc (j + 1)
+
+-- ===== fill X (L x d) =====
+p2b_fillX X d L t c =
+  if t >= L then X
+  else if c >= d then p2b_fillX X d L (t + 1) 0
+  else let _ = arr_set X (t * d + c) (p2b_x t c) in p2b_fillX X d L t (c + 1)
+
+-- ===== RMSNorm per token into a length-d scratch xn (base-aware input), eps_q = round(1e-6*S) = 17 =====
+p2b_ssq_a X base d i acc = if i >= d then acc else p2b_ssq_b X base d (i + 1) (acc + ((arr_get X (base + i)) * (arr_get X (base + i))) / 16777216)
+p2b_ssq_b X base d i acc = if i >= d then acc else p2b_ssq_a X base d (i + 1) (acc + ((arr_get X (base + i)) * (arr_get X (base + i))) / 16777216)
+p2b_rms X base d = let ss = p2b_ssq_a X base d 0 0 in let meansq = ss / d in bx4_fxsqrt (meansq + 17)
+p2b_normapply X base xn d rms i =
+  if i >= d then xn
+  else let _ = arr_set xn i (((((arr_get X (base + i)) * 16777216) / rms) * (p2b_g i)) / 16777216) in
+       p2b_normapply X base xn d rms (i + 1)
+
+-- ===== projection: out[obase + o] = sum_p w(kind,o,p)*src[sbase+p], o in [0,outN), K-deep =====
+p2b_fill kind src sbase K out obase outN acc o =
+  if o >= outN then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = p2b_dot kind o src sbase K acc 0 in
+    let _ = arr_set out (obase + o) (p2b_rescale (arr_get acc 0) (arr_get acc 1)) in
+    p2b_fill kind src sbase K out obase outN acc (o + 1)
+
+-- ===== exact-integer RoPE (rotate-half), per head, base-aware. freq_i = base^(-2i/hd) via exp.
+p2b_freq i hd lnb = bx4_fxexp (0 - ((2 * i * lnb) / hd))
+p2b_rope src sbase out obase hd pos lnb i =
+  if i + i >= hd then out
+  else
+    let fq = p2b_freq i hd lnb in
+    let thq = pos * fq in
+    let cq = bx4_cosb thq in
+    let sq = bx4_sinb thq in
+    let qi = arr_get src (sbase + i) in
+    let qj = arr_get src (sbase + i + hd / 2) in
+    let _ = arr_set out (obase + i) ((qi * cq - qj * sq) / 16777216) in
+    let _ = arr_set out (obase + i + hd / 2) ((qj * cq + qi * sq) / 16777216) in
+    p2b_rope src sbase out obase hd pos lnb (i + 1)
+-- apply RoPE to every head of a projected tensor T (L tokens, nh heads of width hd, row stride rstride)
+p2b_rope_heads src out L nh hd rstride lnb t h =
+  if t >= L then out
+  else if h >= nh then p2b_rope_heads src out L nh hd rstride lnb (t + 1) 0
+  else
+    let base = t * rstride + h * hd in
+    let _ = p2b_rope src base out base hd t lnb 0 in
+    p2b_rope_heads src out L nh hd rstride lnb t (h + 1)
+
+-- ===== per-head scaled-dot-product attention (Qr stride 2048, Kr stride 512 -- E2B fixed) =====
+p2b_scores_j Qr qb Kr kb S hd L scaleq i j acc =
+  if j >= L then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = p2b_adot Qr (qb + i * 2048) Kr (kb + j * 512) hd acc 0 in
+    let raw = p2b_rescale (arr_get acc 0) (arr_get acc 1) in
+    let _ = arr_set S (i * L + j) ((raw * scaleq) / 16777216) in
+    p2b_scores_j Qr qb Kr kb S hd L scaleq i (j + 1) acc
+p2b_scores_i Qr qb Kr kb S hd L scaleq i acc =
+  if i >= L then S
+  else let _ = p2b_scores_j Qr qb Kr kb S hd L scaleq i 0 acc in
+       p2b_scores_i Qr qb Kr kb S hd L scaleq (i + 1) acc
+
+-- exact-integer row softmax (max, bx4_fxexp, sum, divide) on an L x L scores buffer
+p2b_rowmax S base L j m = if j >= L then m else let v = arr_get S (base + j) in p2b_rowmax S base L (j + 1) (if v > m then v else m)
+p2b_exprow S E base L m j sum = if j >= L then sum else let e = bx4_fxexp ((arr_get S (base + j)) - m) in let _ = arr_set E (base + j) e in p2b_exprow S E base L m (j + 1) (sum + e)
+p2b_normrow E P base L sum j = if j >= L then P else let _ = arr_set P (base + j) (((arr_get E (base + j)) * 16777216) / sum) in p2b_normrow E P base L sum (j + 1)
+p2b_softmax_i S E P base L = let m = p2b_rowmax S base L 1 (arr_get S base) in let sum = p2b_exprow S E base L m 0 0 in p2b_normrow E P base L sum 0
+p2b_softmax S E P L i = if i >= L then P else let _ = p2b_softmax_i S E P (i * L) L in p2b_softmax S E P L (i + 1)
+
+-- context O_h[i][col] = sum_j P[i][j] * V_kv[j][col]; scatter into attn at head h offset (qdim stride 2048)
+p2b_ctx_col P V vb kvdim attn ab hd L i col acc =
+  if col >= hd then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = p2b_pvdot P (i * L) V (vb + col) kvdim L acc 0 in
+    let _ = arr_set attn (ab + i * 2048 + col) (p2b_rescale (arr_get acc 0) (arr_get acc 1)) in
+    p2b_ctx_col P V vb kvdim attn ab hd L i (col + 1)
+p2b_ctx_i P V vb kvdim attn ab hd L i acc =
+  if i >= L then attn
+  else let _ = p2b_ctx_col P V vb kvdim attn ab hd L i 0 acc in p2b_ctx_i P V vb kvdim attn ab hd L (i + 1) acc
+
+-- one query head h (kv = h/group): scores -> softmax -> context into head h slice of attn (L x 2048)
+p2b_head Qr Kr V attn S E P hd L scaleq group kvdim h acc =
+  let kv = h / group in
+  let qb = h * hd in
+  let kb = kv * hd in
+  let _ = p2b_scores_i Qr qb Kr kb S hd L scaleq 0 acc in
+  let _ = p2b_softmax S E P L 0 in
+  p2b_ctx_i P V kb kvdim attn (h * hd) hd L 0 acc
+p2b_heads Qr Kr V attn S E P hd L scaleq nh group kvdim h acc =
+  if h >= nh then attn
+  else let _ = p2b_head Qr Kr V attn S E P hd L scaleq group kvdim h acc in
+       p2b_heads Qr Kr V attn S E P hd L scaleq nh group kvdim (h + 1) acc
+
+-- O projection + residual: Y[t] = X[t] + attn[t] Wo^T  (Wo kind=3, contraction over qdim)
+p2b_addrow X Y d base c =
+  if c >= d then 0
+  else let _ = arr_set Y (base + c) ((arr_get X (base + c)) + (arr_get Y (base + c))) in p2b_addrow X Y d base (c + 1)
+p2b_resid X attn Y d qdim L acc t =
+  if t >= L then Y
+  else
+    let _ = p2b_fill 3 attn (t * qdim) qdim Y (t * d) d acc 0 in
+    let _ = p2b_addrow X Y d (t * d) 0 in
+    p2b_resid X attn Y d qdim L acc (t + 1)
+
+-- per-token RMSNorm + QKV projections (xn is a reused length-d scratch)
+p2b_proj_tokens X xn Q K V d L qdim kvdim acc t =
+  if t >= L then 0
+  else
+    let rms = p2b_rms X (t * d) d in
+    let _ = p2b_normapply X (t * d) xn d rms 0 in
+    let _ = p2b_fill 0 xn 0 d Q (t * qdim) qdim acc 0 in
+    let _ = p2b_fill 1 xn 0 d K (t * kvdim) kvdim acc 0 in
+    let _ = p2b_fill 2 xn 0 d V (t * kvdim) kvdim acc 0 in
+    p2b_proj_tokens X xn Q K V d L qdim kvdim acc (t + 1)
+
+-- ===== full integer attention sub-block: X (L x d) -> Y (L x d) =====
+p2b_block_int X d L nh nkv hd lnb =
+  let qdim = nh * hd in
+  let kvdim = nkv * hd in
+  let group = nh / nkv in
+  let scaleq = bx4_fxrsqrt (hd * 16777216) in
+  let acc = arr_new 2 0 in
+  let xn = arr_new d 0 in
+  let Q = arr_new (L * qdim) 0 in
+  let K = arr_new (L * kvdim) 0 in
+  let V = arr_new (L * kvdim) 0 in
+  let _ = p2b_proj_tokens X xn Q K V d L qdim kvdim acc 0 in
+  let Qr = p2b_rope_heads Q (arr_new (L * qdim) 0) L nh hd qdim lnb 0 0 in
+  let Kr = p2b_rope_heads K (arr_new (L * kvdim) 0) L nkv hd kvdim lnb 0 0 in
+  let attn = arr_new (L * qdim) 0 in
+  let S = arr_new (L * L) 0 in
+  let E = arr_new (L * L) 0 in
+  let P = arr_new (L * L) 0 in
+  let _ = p2b_heads Qr Kr V attn S E P hd L scaleq nh group kvdim 0 acc in
+  let Y = arr_new (L * d) 0 in
+  p2b_resid X attn Y d qdim L acc 0
+
+-- ===== D2: GPU exact_matmul == CPU two-limb on the K projection (L x kvdim, depth d) =====
+p2b_i2f src dst n i = if i >= n then dst else let _ = float_arr_set dst i (int_to_float (arr_get src i)) in p2b_i2f src dst n (i + 1)
+p2b_int_to_fa A n = p2b_i2f A (float_arr_new (n + 0) 0.0) n 0
+-- B (d x kvdim): B[p*kvdim + c] = w(1,c,p) so (Xn @ B)[i][c] = sum_p Xn[i][p]*w(1,c,p) = K[i][c]
+p2b_fillB B d kvdim p c = if p >= d then B else if c >= kvdim then p2b_fillB B d kvdim (p + 1) 0 else let _ = float_arr_set B (p * kvdim + c) (int_to_float (p2b_w 1 c p)) in p2b_fillB B d kvdim p (c + 1)
+p2b_copyrow src dst d base k = if k >= d then 0 else let _ = arr_set dst (base + k) (arr_get src k) in p2b_copyrow src dst d base (k + 1)
+-- per-token: normalize into xn, copy into Xn_full[t*d..], CPU-project K into Kc[t*kvdim..]
+p2b_d2_setup X Xn xn Kc d L kvdim acc t =
+  if t >= L then 0
+  else
+    let rms = p2b_rms X (t * d) d in
+    let _ = p2b_normapply X (t * d) xn d rms 0 in
+    let _ = p2b_copyrow xn Xn d (t * d) 0 in
+    let _ = p2b_fill 1 xn 0 d Kc (t * kvdim) kvdim acc 0 in
+    p2b_d2_setup X Xn xn Kc d L kvdim acc (t + 1)
+p2b_d2_a Hi Lo K n i bad = if i >= n then bad else let s = (float_to_int (float_arr_get Hi i)) * 2147483648 + (float_to_int (float_arr_get Lo i)) in p2b_d2_b Hi Lo K n (i + 1) (if (s / 16777216) == (arr_get K i) then bad else bad + 1)
+p2b_d2_b Hi Lo K n i bad = if i >= n then bad else let s = (float_to_int (float_arr_get Hi i)) * 2147483648 + (float_to_int (float_arr_get Lo i)) in p2b_d2_a Hi Lo K n (i + 1) (if (s / 16777216) == (arr_get K i) then bad else bad + 1)
+
+p2b_eq A B n i bad = if i >= n then bad else p2b_eq A B n (i + 1) (if (arr_get A i) == (arr_get B i) then bad else bad + 1)
+pf b = if b == 1 then "PASS" else "FAIL"
+
+-- ===== TRUE real-valued (libm) reference: same structure, f64 throughout. The residual ACC vs this
+-- is the TOTAL cost of the exact-integer scheme (quant + fixed transcendental algorithms) vs the
+-- ideal real-valued GQA attention. All float accumulators live in a float_arr[1] cell (int-only loop).
+p2b_xf t c = (int_to_float (p2b_x t c)) /. 16777216.0
+p2b_wf kind o c = (int_to_float (p2b_w kind o c)) /. 16777216.0
+p2b_gf c = (int_to_float (p2b_g c)) /. 16777216.0
+p2b_fexp x = pow 2.718281828459045 x                              -- exp via pow(e,.) (no foreign exp)
+p2b_ffillX Xf d L t c =
+  if t >= L then Xf
+  else if c >= d then p2b_ffillX Xf d L (t + 1) 0
+  else let _ = float_arr_set Xf (t * d + c) (p2b_xf t c) in p2b_ffillX Xf d L t (c + 1)
+-- RMSNorm
+p2b_fssq Xf base d i cell =
+  if i >= d then 0
+  else let v = float_arr_get Xf (base + i) in
+       let _ = float_arr_set cell 0 ((float_arr_get cell 0) +. (v *. v)) in
+       p2b_fssq Xf base d (i + 1) cell
+p2b_frms Xf base d cell =
+  let _ = float_arr_set cell 0 0.0 in
+  let _ = p2b_fssq Xf base d 0 cell in
+  let ms = (float_arr_get cell 0) /. (int_to_float d) in
+  sqrt (ms +. (17.0 /. 16777216.0))
+p2b_fnorm Xf base xnf d rms i =
+  if i >= d then xnf
+  else let _ = float_arr_set xnf i (((float_arr_get Xf (base + i)) /. rms) *. (p2b_gf i)) in
+       p2b_fnorm Xf base xnf d rms (i + 1)
+-- projection
+p2b_fdot kind o src sbase K cell p =
+  if p >= K then 0
+  else let _ = float_arr_set cell 0 ((float_arr_get cell 0) +. ((p2b_wf kind o p) *. (float_arr_get src (sbase + p)))) in
+       p2b_fdot kind o src sbase K cell (p + 1)
+p2b_ffill kind src sbase K out obase outN cell o =
+  if o >= outN then 0
+  else let _ = float_arr_set cell 0 0.0 in
+       let _ = p2b_fdot kind o src sbase K cell 0 in
+       let _ = float_arr_set out (obase + o) (float_arr_get cell 0) in
+       p2b_ffill kind src sbase K out obase outN cell (o + 1)
+-- RoPE (true base^(-2i/hd))
+p2b_frope src sbase out obase hd pos i =
+  if i + i >= hd then out
+  else
+    let f = pow 10000.0 (0.0 -. ((2.0 *. (int_to_float i)) /. (int_to_float hd))) in
+    let th = (int_to_float pos) *. f in
+    let c = cos th in
+    let s = sin th in
+    let qi = float_arr_get src (sbase + i) in
+    let qj = float_arr_get src (sbase + i + hd / 2) in
+    let _ = float_arr_set out (obase + i) ((qi *. c) -. (qj *. s)) in
+    let _ = float_arr_set out (obase + i + hd / 2) ((qj *. c) +. (qi *. s)) in
+    p2b_frope src sbase out obase hd pos (i + 1)
+p2b_frope_heads src out L nh hd rstride t h =
+  if t >= L then out
+  else if h >= nh then p2b_frope_heads src out L nh hd rstride (t + 1) 0
+  else let base = t * rstride + h * hd in
+       let _ = p2b_frope src base out base hd t 0 in
+       p2b_frope_heads src out L nh hd rstride t (h + 1)
+-- attention
+p2b_fadot A abase B bbase K cell p =
+  if p >= K then 0
+  else let _ = float_arr_set cell 0 ((float_arr_get cell 0) +. ((float_arr_get A (abase + p)) *. (float_arr_get B (bbase + p)))) in
+       p2b_fadot A abase B bbase K cell (p + 1)
+p2b_fscore_j Qr qb Kr kb Sf hd L scal i j cell =
+  if j >= L then 0
+  else let _ = float_arr_set cell 0 0.0 in
+       let _ = p2b_fadot Qr (qb + i * 2048) Kr (kb + j * 512) hd cell 0 in
+       let _ = float_arr_set Sf (i * L + j) ((float_arr_get cell 0) *. scal) in
+       p2b_fscore_j Qr qb Kr kb Sf hd L scal i (j + 1) cell
+p2b_fscore_i Qr qb Kr kb Sf hd L scal i cell =
+  if i >= L then Sf
+  else let _ = p2b_fscore_j Qr qb Kr kb Sf hd L scal i 0 cell in p2b_fscore_i Qr qb Kr kb Sf hd L scal (i + 1) cell
+-- rowmax into a float_arr[1] max-cell (int-only loop; float-accumulator-as-recursive-arg segfaults)
+p2b_frowmax Sf base L j mcell =
+  if j >= L then 0
+  else let v = float_arr_get Sf (base + j) in
+       let _ = float_arr_set mcell 0 (if v >. (float_arr_get mcell 0) then v else (float_arr_get mcell 0)) in
+       p2b_frowmax Sf base L (j + 1) mcell
+p2b_fexprow Sf Ef base L m j cell =
+  if j >= L then 0
+  else let e = p2b_fexp ((float_arr_get Sf (base + j)) -. m) in
+       let _ = float_arr_set Ef (base + j) e in
+       let _ = float_arr_set cell 0 ((float_arr_get cell 0) +. e) in
+       p2b_fexprow Sf Ef base L m (j + 1) cell
+p2b_fnormrow Ef Pf base L sm j = if j >= L then 0 else let _ = float_arr_set Pf (base + j) ((float_arr_get Ef (base + j)) /. sm) in p2b_fnormrow Ef Pf base L sm (j + 1)
+p2b_fsoftmax_i Sf Ef Pf base L cell mcell =
+  let _ = float_arr_set mcell 0 (float_arr_get Sf base) in
+  let _ = p2b_frowmax Sf base L 1 mcell in
+  let m = float_arr_get mcell 0 in
+  let _ = float_arr_set cell 0 0.0 in
+  let _ = p2b_fexprow Sf Ef base L m 0 cell in
+  let sm = float_arr_get cell 0 in
+  p2b_fnormrow Ef Pf base L sm 0
+p2b_fsoftmax Sf Ef Pf L i cell mcell = if i >= L then 0 else let _ = p2b_fsoftmax_i Sf Ef Pf (i * L) L cell mcell in p2b_fsoftmax Sf Ef Pf L (i + 1) cell mcell
+p2b_fpvdot Pf pbase V vbase vstride L cell j =
+  if j >= L then 0
+  else let _ = float_arr_set cell 0 ((float_arr_get cell 0) +. ((float_arr_get Pf (pbase + j)) *. (float_arr_get V (vbase + j * vstride)))) in
+       p2b_fpvdot Pf pbase V vbase vstride L cell (j + 1)
+p2b_fctx_col Pf V vb kvdim attn ab hd L i col cell =
+  if col >= hd then 0
+  else let _ = float_arr_set cell 0 0.0 in
+       let _ = p2b_fpvdot Pf (i * L) V (vb + col) kvdim L cell 0 in
+       let _ = float_arr_set attn (ab + i * 2048 + col) (float_arr_get cell 0) in
+       p2b_fctx_col Pf V vb kvdim attn ab hd L i (col + 1) cell
+p2b_fctx_i Pf V vb kvdim attn ab hd L i cell =
+  if i >= L then attn
+  else let _ = p2b_fctx_col Pf V vb kvdim attn ab hd L i 0 cell in p2b_fctx_i Pf V vb kvdim attn ab hd L (i + 1) cell
+p2b_fhead Qr Kr V attn Sf Ef Pf hd L scal group kvdim h cell mcell =
+  let kv = h / group in
+  let _ = p2b_fscore_i Qr (h * hd) Kr (kv * hd) Sf hd L scal 0 cell in
+  let _ = p2b_fsoftmax Sf Ef Pf L 0 cell mcell in
+  p2b_fctx_i Pf V (kv * hd) kvdim attn (h * hd) hd L 0 cell
+p2b_fheads Qr Kr V attn Sf Ef Pf hd L scal nh group kvdim h cell mcell =
+  if h >= nh then attn
+  else let _ = p2b_fhead Qr Kr V attn Sf Ef Pf hd L scal group kvdim h cell mcell in
+       p2b_fheads Qr Kr V attn Sf Ef Pf hd L scal nh group kvdim (h + 1) cell mcell
+p2b_faddrow Xf Yf d base c =
+  if c >= d then 0
+  else let _ = float_arr_set Yf (base + c) ((float_arr_get Xf (base + c)) +. (float_arr_get Yf (base + c))) in p2b_faddrow Xf Yf d base (c + 1)
+p2b_fresid Xf attn Yf d qdim L cell t =
+  if t >= L then Yf
+  else let _ = p2b_ffill 3 attn (t * qdim) qdim Yf (t * d) d cell 0 in
+       let _ = p2b_faddrow Xf Yf d (t * d) 0 in
+       p2b_fresid Xf attn Yf d qdim L cell (t + 1)
+p2b_fproj Xf xnf Qf Kf Vf d L qdim kvdim cell t =
+  if t >= L then 0
+  else let rms = p2b_frms Xf (t * d) d cell in
+       let _ = p2b_fnorm Xf (t * d) xnf d rms 0 in
+       let _ = p2b_ffill 0 xnf 0 d Qf (t * qdim) qdim cell 0 in
+       let _ = p2b_ffill 1 xnf 0 d Kf (t * kvdim) kvdim cell 0 in
+       let _ = p2b_ffill 2 xnf 0 d Vf (t * kvdim) kvdim cell 0 in
+       p2b_fproj Xf xnf Qf Kf Vf d L qdim kvdim cell (t + 1)
+p2b_block_float Xf d L nh nkv hd =
+  let qdim = nh * hd in
+  let kvdim = nkv * hd in
+  let group = nh / nkv in
+  let scal = 1.0 /. (sqrt (int_to_float hd)) in
+  let cell = float_arr_new 1 0.0 in
+  let mcell = float_arr_new 1 0.0 in
+  let xnf = float_arr_new (d + 0) 0.0 in
+  let Qf = float_arr_new (L * qdim) 0.0 in
+  let Kf = float_arr_new (L * kvdim) 0.0 in
+  let Vf = float_arr_new (L * kvdim) 0.0 in
+  let _ = p2b_fproj Xf xnf Qf Kf Vf d L qdim kvdim cell 0 in
+  let Qr = p2b_frope_heads Qf (float_arr_new (L * qdim) 0.0) L nh hd qdim 0 0 in
+  let Kr = p2b_frope_heads Kf (float_arr_new (L * kvdim) 0.0) L nkv hd kvdim 0 0 in
+  let attn = float_arr_new (L * qdim) 0.0 in
+  let Sf = float_arr_new (L * L) 0.0 in
+  let Ef = float_arr_new (L * L) 0.0 in
+  let Pf = float_arr_new (L * L) 0.0 in
+  let _ = p2b_fheads Qr Kr Vf attn Sf Ef Pf hd L scal nh group kvdim 0 cell mcell in
+  let Yf = float_arr_new (L * d) 0.0 in
+  p2b_fresid Xf attn Yf d qdim L cell 0
+-- max | dequant(int Y) - float Y | over all L*d cells (cell accumulator, int-only loop)
+p2b_maxerr Y Yf n cell i =
+  if i >= n then 0
+  else let e = bx4_fabs (((int_to_float (arr_get Y i)) /. 16777216.0) -. (float_arr_get Yf i)) in
+       let _ = float_arr_set cell 0 (if e >. (float_arr_get cell 0) then e else (float_arr_get cell 0)) in
+       p2b_maxerr Y Yf n cell (i + 1)
+
+main =
+  let _ = ensure_dylib 0 in
+  let d = 2048 in
+  let L = 8 in
+  let nh = 8 in
+  let nkv = 2 in
+  let hd = 256 in
+  let lnb = 154523870 in
+  let qdim = nh * hd in
+  let kvdim = nkv * hd in
+  let X = p2b_fillX (arr_new (L * d) 0) d L 0 0 in
+  let Y1 = p2b_block_int X d L nh nkv hd lnb in
+  let Y2 = p2b_block_int X d L nh nkv hd lnb in
+  let badD0 = p2b_eq Y1 Y2 (L * d) 0 0 in
+  let d0 = if badD0 == 0 then 1 else 0 in
+  let acc = arr_new 2 0 in
+  let xn = arr_new d 0 in
+  let Xn = arr_new (L * d) 0 in
+  let Kc = arr_new (L * kvdim) 0 in
+  let _ = p2b_d2_setup X Xn xn Kc d L kvdim acc 0 in
+  let Af = p2b_int_to_fa Xn (L * d) in
+  let Bf = p2b_fillB (float_arr_new (d * kvdim) 0.0) d kvdim 0 0 in
+  let Hi = float_arr_new (L * kvdim) 0.0 in
+  let Lo = float_arr_new (L * kvdim) 0.0 in
+  let _ = tgl_exact_matmul Af Bf Hi Lo L d kvdim in
+  let badD2 = p2b_d2_a Hi Lo Kc (L * kvdim) 0 0 in
+  let d2 = if badD2 == 0 then 1 else 0 in
+  -- ACC: exact-integer forward vs the TRUE real-valued (libm) GQA attention
+  let Xf = p2b_ffillX (float_arr_new (L * d) 0.0) d L 0 0 in
+  let Yf = p2b_block_float Xf d L nh nkv hd in
+  let ecell = float_arr_new 1 0.0 in
+  let _ = p2b_maxerr Y1 Yf (L * d) ecell 0 in
+  let emax = float_arr_get ecell 0 in
+  let bound = 0.01 in
+  let accok = if emax <. bound then 1 else 0 in
+  let _ = print (cat ["P2b attn block  d=", show d, " L=", show L, " heads=", show nh, "/", show nkv, " hd=", show hd,
+                      "   D0(run-twice)=", pf d0, "   D2(GPU==CPU K-proj, ", show (L * kvdim), " cells)=mism ", show badD2, " ", pf d2]) in
+  let _ = print (cat ["                max|deq(int)-float(libm)|=", show emax, " (bound ", show bound, ") ", pf accok]) in
+  let allok = if d0 == 1 then (if accok == 1 then d2 else 0) else 0 in
+  let _ = print (if allok == 1
+    then "P2b PASS: exact-integer GQA attention (RMSNorm + QKV proj + RoPE + softmax + PV + O proj + residual) composes at real Gemma 4 E2B shapes -- bit-identical run-to-run (D0), within 0.01 of the true real-valued attention (ACC), and the depth-2048 K projection reproduces GPU==CPU two-limb bit-for-bit (D2). With P2a (the GeGLU MLP block) this is a full E2B decoder layer in exact integers, GPU-reproducible to the bit."
+    else "P2b FAIL: inspect D0 / ACC / D2") in
+  if allok == 1 then 0 else 1
