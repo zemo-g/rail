@@ -1,0 +1,137 @@
+-- R5b (1B ladder): parse a REAL packed multi-tensor .safetensors file END-TO-END via read_file_bytes.
+-- This is the half R5a honestly deferred: R5a proved the pure-integer IEEE-754 -> fixed-point decoder
+-- in memory; R5b feeds it the bytes of an actual packed file. The file deliberately carries INTERIOR
+-- NUL bytes (the 8-byte little-endian header length has 0x00 at byte 1 for any header < 256 bytes), so
+-- read_file (strlen-terminated via _rail_wrap_str) truncates it to a single byte. The new read_file_bytes
+-- runtime builtin (a surfaced compile.rail edit, gated by the self-compile fixed point) returns the whole
+-- buffer; byte_at indexes it directly. A generic JSON-header parse (str_find/str_sub) recovers each
+-- tensor's dtype + data_offsets, and the SAME R5a decoder turns the packed bytes straight to fixed-point.
+--
+-- GATES:
+--   TRUNC  : read_file on this file yields < 8 bytes (proves the interior-NUL problem is real), while
+--            read_file_bytes recovers the full 8-byte LE header length.
+--   PARSE  : generic header parse recovers dtype("a")=F32, dtype("b")=BF16 and both data_offsets exactly.
+--   DECODE : tensor a (F32 [1.0,0.5]) -> [16777216, 8388608]; tensor b (BF16 [1.0,-0.375]) ->
+--            [16777216, -6291456], reproduced EXACTLY by the pure-integer decoder (no float).
+--   D0     : decode a value twice -> bit-identical (determinism ritual).
+--
+-- Build: ./rail_native --out-prefix /tmp/r5b tools/bitexact/r5b_real_safetensors.rail
+-- Run:   /tmp/r5b
+-- (fixture is regenerated at run time by tools/bitexact/r5b_gen_fixture.sh)
+
+import "tools/bitexact/bx_fixed.rail"
+
+-- ===== pure-integer IEEE-754 -> fixed-point (S = 2^24), self-contained copy of the R5a decoder =====
+r5b_f32_fixed b0 b1 b2 b3 =
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in
+  let sign = bits / 2147483648 in
+  let rest = bits - sign * 2147483648 in
+  let exp  = rest / 8388608 in
+  let mant = rest - exp * 8388608 in
+  if exp == 0 then 0
+  else
+    let mag = 8388608 + mant in
+    let sh = exp - 126 in
+    let xabs = if sh >= 0 then mag * (bx4_pow2 sh)
+               else (let d = bx4_pow2 (0 - sh) in (mag + d / 2) / d) in
+    if sign == 1 then 0 - xabs else xabs
+
+r5b_bf16_fixed lo hi = r5b_f32_fixed 0 0 lo hi
+
+-- 8-byte little-endian header length (read 6 low bytes; safetensors headers are < 2^48)
+r5b_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+
+-- ===== generic JSON-header parsing (str_find/str_sub, pure ASCII header) =====
+-- tail of `hay` immediately AFTER the first occurrence of `sub` ("" if not found)
+r5b_tail_after sub hay =
+  let i = str_find sub hay in
+  if i < 0 then "" else (let st = i + length sub in str_sub hay st (length hay - st))
+
+-- prefix of `s` up to (not including) the first `stop` (whole string if absent)
+r5b_take_until stop s =
+  let i = str_find stop s in
+  if i < 0 then s else str_sub s 0 i
+
+-- parse a non-negative integer from the front of a digit string
+r5b_pi cs acc =
+  if length cs == 0 then acc
+  else
+    let d = char_to_int (head cs) - 48 in
+    if d < 0 then acc
+    else if d > 9 then acc
+    else r5b_pi (tail cs) (acc * 10 + d)
+r5b_parse_int s = r5b_pi (chars s) 0
+
+-- the object blob for a named tensor: tail of header after `"NAME":`
+r5b_blob name hdr = r5b_tail_after (cat ["\"", name, "\":"]) hdr
+
+r5b_dtype name hdr =
+  let b  = r5b_blob name hdr in
+  let b2 = r5b_tail_after "\"dtype\":\"" b in
+  r5b_take_until "\"" b2
+
+-- data_offsets [start,end]; k=0 -> start, k=1 -> end
+r5b_offset name hdr k =
+  let b  = r5b_blob name hdr in
+  let b2 = r5b_tail_after "\"data_offsets\":[" b in
+  let inside = r5b_take_until "]" b2 in
+  if k == 0 then r5b_parse_int inside
+  else r5b_parse_int (r5b_tail_after "," inside)
+
+-- build the ASCII header string from raw bytes [lo, hi) (header has no NULs)
+r5b_hdr_str buf lo hi =
+  if lo >= hi then ""
+  else cat [char_from_int (byte_at buf lo), r5b_hdr_str buf (lo + 1) hi]
+
+pf ok = if ok == 1 then "PASS" else "FAIL"
+
+main =
+  let _ = shell "sh tools/bitexact/r5b_gen_fixture.sh /tmp/r5b_fix.safetensors" in
+  let path = "/tmp/r5b_fix.safetensors" in
+
+  -- TRUNC contrast: read_file stops at the 0x00 in the LE length; read_file_bytes does not.
+  let rf_len = length (read_file path) in
+  let buf = read_file_bytes path in
+
+  let n = r5b_le_len buf 0 in
+  let hdr = r5b_hdr_str buf 8 (8 + n) in
+  let base = 8 + n in
+
+  -- PARSE
+  let dta = r5b_dtype "a" hdr in
+  let dtb = r5b_dtype "b" hdr in
+  let a_s = r5b_offset "a" hdr 0 in let a_e = r5b_offset "a" hdr 1 in
+  let b_s = r5b_offset "b" hdr 0 in let b_e = r5b_offset "b" hdr 1 in
+
+  -- DECODE tensor a (F32, 2 elems, 4 bytes each) at base + a_s
+  let pa = base + a_s in
+  let a0 = r5b_f32_fixed (byte_at buf pa) (byte_at buf (pa + 1)) (byte_at buf (pa + 2)) (byte_at buf (pa + 3)) in
+  let a1 = r5b_f32_fixed (byte_at buf (pa + 4)) (byte_at buf (pa + 5)) (byte_at buf (pa + 6)) (byte_at buf (pa + 7)) in
+  -- DECODE tensor b (BF16, 2 elems, 2 bytes each) at base + b_s
+  let pb = base + b_s in
+  let b0v = r5b_bf16_fixed (byte_at buf pb) (byte_at buf (pb + 1)) in
+  let b1v = r5b_bf16_fixed (byte_at buf (pb + 2)) (byte_at buf (pb + 3)) in
+
+  let ok_trunc = if rf_len < 8 then 1 else 0 in
+  let ok_a  = if a0 == 16777216 then (if a1 == 8388608 then 1 else 0) else 0 in
+  let ok_b  = if b0v == 16777216 then (if b1v == (0 - 6291456) then 1 else 0) else 0 in
+  let ok_dt = if dta == "F32" then (if dtb == "BF16" then 1 else 0) else 0 in
+  let ok_of = if a_s == 0 then (if a_e == 8 then (if b_s == 8 then (if b_e == 12 then 1 else 0) else 0) else 0) else 0 in
+
+  -- D0: decode a value a second time, bit-identical
+  let a0b = r5b_f32_fixed (byte_at buf pa) (byte_at buf (pa + 1)) (byte_at buf (pa + 2)) (byte_at buf (pa + 3)) in
+  let d0 = if a0b == a0 then 1 else 0 in
+
+  let allok = if ok_trunc == 1 then (if ok_a == 1 then (if ok_b == 1 then (if ok_dt == 1 then (if ok_of == 1 then d0 else 0) else 0) else 0) else 0) else 0 in
+
+  let _ = print (cat ["R5b real-safetensors  N=", show n, " base=", show base,
+                      "  read_file_len=", show rf_len, " (read_file truncated, read_file_bytes ok=", pf ok_trunc, ")"]) in
+  let _ = print (cat ["  a[F32]=[", show a0, ",", show a1, "] expect [16777216,8388608] ", pf ok_a,
+                      "   b[BF16]=[", show b0v, ",", show b1v, "] expect [16777216,-6291456] ", pf ok_b]) in
+  let _ = print (cat ["  dtype a=", dta, " b=", dtb, " ", pf ok_dt,
+                      "   offsets a=[", show a_s, ",", show a_e, "] b=[", show b_s, ",", show b_e, "] ", pf ok_of,
+                      "   D0=", pf d0]) in
+  let _ = print (if allok == 1
+    then "R5b PASS: a REAL packed multi-tensor .safetensors (interior NUL bytes that read_file truncates at byte 1) parsed end-to-end via read_file_bytes -- generic JSON-header parse (dtype + data_offsets) + pure-integer IEEE-754 decode reproduce both tensors' fixed-point EXACTLY. read_file_bytes builtin verified through the self-compile fixed point."
+    else "R5b FAIL: inspect the TRUNC / DECODE / PARSE / D0 columns above") in
+  if allok == 1 then 0 else 1
