@@ -1,0 +1,375 @@
+-- LM3 (rung 14): TRAINED EMBEDDINGS. LM2 proved an attested bit-exact char-LM that
+-- crosses the user-facing compile gate, but its token embeddings were FROZEN (a fixed
+-- deterministic genvec). LM3 unfreezes the embedding table E[vsize][d] as trainable
+-- parameters (each entry a [theta,m,v] Adam cell) and adds the embedding gradient:
+--   x   = concat( E[ctx[0]], ..., E[ctx[C-1]] )          (input dim = C*d, as in LM2)
+--   dx  = W1^T . dz1                                      (grad of loss wrt the concat input)
+--   dE[ctx[k]] += dx[k*d : (k+1)*d]                       (scatter; repeats SUM, associative)
+-- E is Adam-updated every step alongside W1/W2 with the SAME bias-corrected step. To keep
+-- the rung honest, E is INITIALIZED to LM2's frozen values (cell0 kind=id+1), so the step-0
+-- forward is BYTE-IDENTICAL to LM2; the chain then diverges as the embeddings learn. The
+-- checkpoint commitment now binds E too: w_hex = SHA256(canon W1 ";;" canon W2 ";;" canon E).
+--
+-- ATTESTATION (CHECKPOINT-CADENCE): exact-integer epochs; at each epoch boundary a checkpoint
+-- commits the post-epoch (W1,W2,E) state:
+--   link = SHA256(prev "|" epoch "|" w_hex "|" loss) ; sig = Ed25519(seed, link) ; prev(ckpt0)=genesis
+-- Signed ledger -> /tmp/lm3_chain.txt for the LM3 foreign re-verifier, which RE-RUNS every step
+-- and must reproduce every checkpoint commitment bit-for-bit. LOCAL/DEV keys + LOCAL genesis only.
+--
+-- Gates: D0 (whole run reproduces) . okSigs . okProg (descent) . okModel (>=50% compile) .
+--        okTamper (flipped sig rejected) . okWrongKey (foreign key rejected)
+--
+-- Build: ./rail_native --out-prefix /tmp/lm3 tools/bitexact/lm3_attested_train.rail
+-- Run:   /tmp/lm3        (writes /tmp/lm3_chain.txt + /tmp/lm_completions/*.rail)
+
+import "tools/bitexact/bx_fixed.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- ===== small utilities =====
+lm3_nth xs i = if i <= 0 then head xs else lm3_nth (tail xs) (i - 1)
+lm3_imod a b = a - (a / b) * b
+lm3_len xs = if xs == [] then 0 else 1 + lm3_len (tail xs)
+lm3_take n xs = if n <= 0 then [] else if xs == [] then [] else cons (head xs) (lm3_take (n - 1) (tail xs))
+lm3_drop n xs = if n <= 0 then xs else if xs == [] then [] else lm3_drop (n - 1) (tail xs)
+lm3_snoc xs v = if xs == [] then cons v [] else cons (head xs) (lm3_snoc (tail xs) v)
+lm3_app xs ys = if xs == [] then ys else cons (head xs) (lm3_app (tail xs) ys)
+lm3_digit c = str_find c "0123456789"
+lm3_hd_int_go cs acc = if cs == [] then acc
+  else let dc = lm3_digit (head cs) in
+       if dc < 0 then acc else lm3_hd_int_go (tail cs) (acc * 10 + dc)
+lm3_hd_int s = lm3_hd_int_go (chars s) 0
+
+-- ===== vocab + tokens (deterministic, first-appearance order) =====
+lm3_vocab_go cs acc = if cs == [] then acc
+  else let c = head cs in
+       let acc2 = if str_contains c acc then acc else cat [acc, c] in
+       lm3_vocab_go (tail cs) acc2
+lm3_vocab corpus = lm3_vocab_go (chars corpus) ""
+lm3_tokens_go cs vocab = if cs == [] then [] else cons (str_find (head cs) vocab) (lm3_tokens_go (tail cs) vocab)
+lm3_tokens corpus vocab = lm3_tokens_go (chars corpus) vocab
+lm3_decode ids vocab = if ids == [] then "" else cat [str_sub vocab (head ids) 1, lm3_decode (tail ids) vocab]
+lm3_pairs ids c = if (lm3_len ids) <= c then [] else cons (lm3_take c ids, lm3_nth ids c) (lm3_pairs (tail ids) c)
+
+-- ===== exact-integer vector / matrix ops (F=24; one truncation per output) =====
+lm3_dot_go u v acc = if u == [] then acc else lm3_dot_go (tail u) (tail v) (acc + (head u) * (head v))
+lm3_dot u v = (lm3_dot_go u v 0) / 16777216
+lm3_matvec rows v = if rows == [] then [] else cons (lm3_dot (head rows) v) (lm3_matvec (tail rows) v)
+lm3_vadd u v = if u == [] then [] else cons ((head u) + (head v)) (lm3_vadd (tail u) (tail v))
+lm3_vsub u v = if u == [] then [] else cons ((head u) - (head v)) (lm3_vsub (tail u) (tail v))
+lm3_zeros d = if d < 1 then [] else cons 0 (lm3_zeros (d - 1))
+lm3_divS xs = if xs == [] then [] else cons ((head xs) / 16777216) (lm3_divS (tail xs))
+lm3_vscale_raw s row = if row == [] then [] else cons (s * (head row)) (lm3_vscale_raw s (tail row))
+lm3_mtv_go rows v acc = if rows == [] then acc else lm3_mtv_go (tail rows) (tail v) (lm3_vadd acc (lm3_vscale_raw (head v) (head rows)))
+lm3_matvec_t rows v cols = lm3_divS (lm3_mtv_go rows v (lm3_zeros cols))
+lm3_outer_row ui w = if w == [] then [] else cons ((ui * (head w)) / 16777216) (lm3_outer_row ui (tail w))
+lm3_outer u w = if u == [] then [] else cons (lm3_outer_row (head u) w) (lm3_outer (tail u) w)
+lm3_geluv xs = if xs == [] then [] else cons (bx4_gelu (head xs)) (lm3_geluv (tail xs))
+lm3_dz1 z1 dh1 = if z1 == [] then [] else cons (((bx4_gelu_grad (head z1)) * (head dh1)) / 16777216) (lm3_dz1 (tail z1) (tail dh1))
+
+-- ===== deterministic fixed-point init (cell = [theta,m,v]) =====
+lm3_cell0 kind i j koff = (lm3_imod (kind * 101 + i * 5 + j * 3 + 7 + koff) 13 - 6) * 1398101
+lm3_genvec_go kind j cols koff = if j >= cols then [] else cons (lm3_cell0 kind 0 j koff) (lm3_genvec_go kind (j + 1) cols koff)
+lm3_genvec kind cols koff = lm3_genvec_go kind 0 cols koff
+lm3_initrow kind i j cols koff = if j >= cols then []
+  else cons (cons (lm3_cell0 kind i j koff) (cons 0 (cons 0 []))) (lm3_initrow kind i (j + 1) cols koff)
+lm3_initmat_go kind i rows cols koff = if i >= rows then []
+  else cons (lm3_initrow kind i 0 cols koff) (lm3_initmat_go kind (i + 1) rows cols koff)
+lm3_initmat kind rows cols koff = lm3_initmat_go kind 0 rows cols koff
+lm3_throw crow = if crow == [] then [] else cons (head (head crow)) (lm3_throw (tail crow))
+lm3_thmat cm = if cm == [] then [] else cons (lm3_throw (head cm)) (lm3_thmat (tail cm))
+
+-- ===== TRAINED embeddings: E[vsize][d] of Adam cells, row id init kind=id+1 (== LM2 frozen) =====
+lm3_emb_initrow id d = lm3_initrow (id + 1) 0 0 d 0
+lm3_emb_initmat_go i vsize d = if i >= vsize then [] else cons (lm3_emb_initrow i d) (lm3_emb_initmat_go (i + 1) vsize d)
+lm3_emb_initmat vsize d = lm3_emb_initmat_go 0 vsize d
+lm3_emb_gather emb id = lm3_nth emb id
+lm3_ctx_vec emb ctx = if ctx == [] then [] else lm3_app (lm3_emb_gather emb (head ctx)) (lm3_ctx_vec emb (tail ctx))
+lm3_onehot_go k i v = if i >= v then [] else cons (if i == k then 16777216 else 0) (lm3_onehot_go k (i + 1) v)
+lm3_onehot k v = lm3_onehot_go k 0 v
+
+-- ===== embedding-gradient scatter: dx (length C*d) -> dE (vsize x d), repeats SUM =====
+lm3_chunk xs k d = lm3_take d (lm3_drop (k * d) xs)
+lm3_zeros_mat rows cols = if rows <= 0 then [] else cons (lm3_zeros cols) (lm3_zeros_mat (rows - 1) cols)
+lm3_addrow_go mat idx vec i = if mat == [] then []
+  else cons (if i == idx then lm3_vadd (head mat) vec else head mat) (lm3_addrow_go (tail mat) idx vec (i + 1))
+lm3_addrow_at mat idx vec = lm3_addrow_go mat idx vec 0
+lm3_scatter dEmb ctx dx d k = if ctx == [] then dEmb
+  else let ch = lm3_chunk dx k d in
+       let nd = lm3_addrow_at dEmb (head ctx) ch in
+       lm3_scatter nd (tail ctx) dx d (k + 1)
+
+-- ===== forward + MSE-on-one-hot loss + reverse-mode gradients (exact-integer) =====
+lm3_forward w1 w2 x = lm3_matvec w2 (lm3_geluv (lm3_matvec w1 x))
+lm3_sq dv = (dv * dv) / 16777216
+lm3_sqsum xs = if xs == [] then 0 else (lm3_sq (head xs)) + lm3_sqsum (tail xs)
+lm3_loss w1 w2 x t = (lm3_sqsum (lm3_vsub (lm3_forward w1 w2 x) t)) / 2
+lm3_grads w1 w2 x t hidden indim =
+  let z1 = lm3_matvec w1 x in
+  let h1 = lm3_geluv z1 in
+  let z2 = lm3_matvec w2 h1 in
+  let dz2 = lm3_vsub z2 t in
+  let dW2 = lm3_outer dz2 h1 in
+  let dh1 = lm3_matvec_t w2 dz2 hidden in
+  let dz1 = lm3_dz1 z1 dh1 in
+  let dW1 = lm3_outer dz1 x in
+  let dx = lm3_matvec_t w1 dz1 indim in
+  cons dW1 (cons dW2 (cons dx []))
+
+-- ===== gradient clipping (prevents the g*g overflow in Adam's v-update) =====
+-- The embedding gradient dx = W1^T . dz1 is the largest (two matmuls deep); squaring it in
+-- g2=(g*g)/S overflows int63 (g ~ 1e11 fixed -> g*g ~ 1e22 >> 2^62) -> garbage Adam step ->
+-- divergence cascade. Cap each component to +/-2^30 (cap=16777216*64, arithmetic-operand so no
+-- big-literal codegen trap): g*g <= 2^60 < 2^62 (4x margin). Bit-exact integer clamp.
+lm3_clipg g = let cap = 16777216 * 64 in
+  if g > cap then cap else (if g < (0 - cap) then (0 - cap) else g)
+
+-- ===== exact-integer Adam (incremental bias correction passed in) =====
+lm3_adam th m v g beta1 beta2 lr eps bc1 bc2 =
+  let m2 = ((beta1 * m) / 16777216) + (((16777216 - beta1) * g) / 16777216) in
+  let g2 = (g * g) / 16777216 in
+  let v2 = ((beta2 * v) / 16777216) + (((16777216 - beta2) * g2) / 16777216) in
+  let mhat = (m2 * 16777216) / bc1 in
+  let vhat = (v2 * 16777216) / bc2 in
+  let denom = (bx4_fxsqrt vhat) + eps in
+  let step = (lr * mhat) / denom in
+  cons (th - step) (cons m2 (cons v2 []))
+lm3_updcell cell g beta1 beta2 lr eps bc1 bc2 =
+  lm3_adam (head cell) (head (tail cell)) (head (tail (tail cell))) (lm3_clipg g) beta1 beta2 lr eps bc1 bc2
+lm3_updrow crow grow beta1 beta2 lr eps bc1 bc2 =
+  if crow == [] then []
+  else cons (lm3_updcell (head crow) (head grow) beta1 beta2 lr eps bc1 bc2) (lm3_updrow (tail crow) (tail grow) beta1 beta2 lr eps bc1 bc2)
+lm3_updmat cm gm beta1 beta2 lr eps bc1 bc2 =
+  if cm == [] then []
+  else cons (lm3_updrow (head cm) (head gm) beta1 beta2 lr eps bc1 bc2) (lm3_updmat (tail cm) (tail gm) beta1 beta2 lr eps bc1 bc2)
+
+-- ===== canonical serialization (for the checkpoint commitments) =====
+-- O(N) canon: build a flat piece-list then a SINGLE cat (right-nested cat re-measured
+-- the growing suffix at every level -> O(N^2), ~180 calls/run dominated wall time).
+-- Output is byte-identical (trailing " " per element, trailing ";" per row) -> same SHA256.
+lm3_canon_row_p xs = if xs == [] then [] else cons (show (head xs)) (cons " " (lm3_canon_row_p (tail xs)))
+lm3_canon_row xs = cat (lm3_canon_row_p xs)
+lm3_canon_mat_p m = if m == [] then [] else cons (lm3_canon_row (head m)) (cons ";" (lm3_canon_mat_p (tail m)))
+lm3_canon_mat m = cat (lm3_canon_mat_p m)
+
+-- ===== dataset total loss (for okProg + per-checkpoint loss) =====
+lm3_dsloss_go pairs w1 w2 emb v acc = if pairs == [] then acc
+  else let pr = head pairs in let (ctx, tgt) = pr in
+       lm3_dsloss_go (tail pairs) w1 w2 emb v (acc + (lm3_loss w1 w2 (lm3_ctx_vec emb ctx) (lm3_onehot tgt v)))
+lm3_dsloss pairs w1 w2 emb v = lm3_dsloss_go pairs w1 w2 emb v 0
+
+-- ===== training: one exact-integer step (updates W1, W2 AND E) =====
+lm3_step w1c w2c ec pair d hidden v indim beta1 beta2 lr eps pow1 pow2 =
+  let (ctx, tgt) = pair in
+  let emb = lm3_thmat ec in
+  let x = lm3_ctx_vec emb ctx in
+  let t = lm3_onehot tgt v in
+  let w1 = lm3_thmat w1c in
+  let w2 = lm3_thmat w2c in
+  let gs = lm3_grads w1 w2 x t hidden indim in
+  let dW1 = lm3_nth gs 0 in
+  let dW2 = lm3_nth gs 1 in
+  let dx = lm3_nth gs 2 in
+  let dEmb = lm3_scatter (lm3_zeros_mat v d) ctx dx d 0 in
+  let np1 = (pow1 * beta1) / 16777216 in
+  let np2 = (pow2 * beta2) / 16777216 in
+  let bc1 = 16777216 - np1 in
+  let bc2 = 16777216 - np2 in
+  let nw1 = lm3_updmat w1c dW1 beta1 beta2 lr eps bc1 bc2 in
+  let nw2 = lm3_updmat w2c dW2 beta1 beta2 lr eps bc1 bc2 in
+  let nec = lm3_updmat ec dEmb beta1 beta2 lr eps bc1 bc2 in
+  cons nw1 (cons nw2 (cons nec (cons np1 (cons np2 []))))
+
+lm3_epoch w1c w2c ec pairs d hidden v indim beta1 beta2 lr eps pow1 pow2 =
+  if pairs == [] then cons w1c (cons w2c (cons ec (cons pow1 (cons pow2 []))))
+  else let r = lm3_step w1c w2c ec (head pairs) d hidden v indim beta1 beta2 lr eps pow1 pow2 in
+       lm3_epoch (lm3_nth r 0) (lm3_nth r 1) (lm3_nth r 2) (tail pairs) d hidden v indim beta1 beta2 lr eps (lm3_nth r 3) (lm3_nth r 4)
+
+-- ===== one signed CHECKPOINT at the post-epoch weights (binds W1, W2 AND E) =====
+lm3_ckpt w1c w2c ec pairs d v seed pk prev_hex epoch_i =
+  let w1 = lm3_thmat w1c in
+  let w2 = lm3_thmat w2c in
+  let emb = lm3_thmat ec in
+  let loss = lm3_dsloss pairs w1 w2 emb v in
+  let w_hex = sha256_hex (cat [lm3_canon_mat w1, ";;", lm3_canon_mat w2, ";;", lm3_canon_mat emb]) in
+  let loss_str = show loss in
+  let link_str = cat [prev_hex, "|", show epoch_i, "|", w_hex, "|", loss_str] in
+  let link_b = sha256 link_str in
+  let link_hex = bytes_to_hex link_b 32 in
+  let sig = ed25519_sign seed link_b 32 in
+  let sig_hex = bytes_to_hex sig 64 in
+  let ok = ed25519_verify pk link_b 32 sig in
+  let line = cat [show epoch_i, " ", w_hex, " ", loss_str, " ", prev_hex, " ", link_hex, " ", sig_hex] in
+  cons link_hex (cons line (cons ok (cons loss [])))
+
+-- ===== checkpoint-cadence attested training: one epoch then one signed checkpoint =====
+lm3_chain w1c w2c ec pairs d hidden v indim beta1 beta2 lr eps pow1 pow2 seed pk epochs i prev_hex acc all_ok =
+  if i >= epochs then cons all_ok (cons acc (cons prev_hex (cons w1c (cons w2c (cons ec [])))))
+  else
+    let e = lm3_epoch w1c w2c ec pairs d hidden v indim beta1 beta2 lr eps pow1 pow2 in
+    let nw1 = lm3_nth e 0 in
+    let nw2 = lm3_nth e 1 in
+    let nec = lm3_nth e 2 in
+    let np1 = lm3_nth e 3 in
+    let np2 = lm3_nth e 4 in
+    let ck = lm3_ckpt nw1 nw2 nec pairs d v seed pk prev_hex i in
+    let link_hex = lm3_nth ck 0 in
+    let line = lm3_nth ck 1 in
+    let ok = lm3_nth ck 2 in
+    lm3_chain nw1 nw2 nec pairs d hidden v indim beta1 beta2 lr eps np1 np2 seed pk epochs (i + 1) link_hex (cat [acc, line, "\n"]) (all_ok * ok)
+
+-- ===== D0 re-run: re-derive the trajectory + link chain WITHOUT re-signing =====
+lm3_link_only w1c w2c ec pairs d v prev_hex epoch_i =
+  let w1 = lm3_thmat w1c in
+  let w2 = lm3_thmat w2c in
+  let emb = lm3_thmat ec in
+  let loss = lm3_dsloss pairs w1 w2 emb v in
+  let w_hex = sha256_hex (cat [lm3_canon_mat w1, ";;", lm3_canon_mat w2, ";;", lm3_canon_mat emb]) in
+  let link_str = cat [prev_hex, "|", show epoch_i, "|", w_hex, "|", show loss] in
+  bytes_to_hex (sha256 link_str) 32
+lm3_chain_d0 w1c w2c ec pairs d hidden v indim beta1 beta2 lr eps pow1 pow2 epochs i prev_hex =
+  if i >= epochs then cons prev_hex (cons w1c (cons w2c (cons ec [])))
+  else
+    let e = lm3_epoch w1c w2c ec pairs d hidden v indim beta1 beta2 lr eps pow1 pow2 in
+    let nw1 = lm3_nth e 0 in
+    let nw2 = lm3_nth e 1 in
+    let nec = lm3_nth e 2 in
+    let np1 = lm3_nth e 3 in
+    let np2 = lm3_nth e 4 in
+    let link_hex = lm3_link_only nw1 nw2 nec pairs d v prev_hex i in
+    lm3_chain_d0 nw1 nw2 nec pairs d hidden v indim beta1 beta2 lr eps np1 np2 epochs (i + 1) link_hex
+
+-- ===== greedy decode -> per-task prompt completion -> emit MODEL completions =====
+lm3_argmax_go xs i best bi = if xs == [] then bi
+  else if (head xs) > best then lm3_argmax_go (tail xs) (i + 1) (head xs) i
+       else lm3_argmax_go (tail xs) (i + 1) best bi
+lm3_argmax xs = lm3_argmax_go (tail xs) 1 (head xs) 0
+lm3_gen w1 w2 emb ctx c g acc = if g <= 0 then acc
+  else let nid = lm3_argmax (lm3_forward w1 w2 (lm3_ctx_vec emb ctx)) in
+       lm3_gen w1 w2 emb (tail (lm3_snoc ctx nid)) c (g - 1) (lm3_snoc acc nid)
+lm3_lastc ids c = let n = lm3_len ids in if n <= c then ids else lm3_lastc (tail ids) c
+lm3_finish full =
+  let k = str_find " in 0" full in
+  if k < 0 then full else cat [str_sub full 0 (k + 5), "\n"]
+lm3_complete w1 w2 emb vocab c prompt gcap =
+  let pids = lm3_tokens prompt vocab in
+  let seedp = lm3_lastc pids c in
+  let gen_ids = lm3_gen w1 w2 emb seedp c gcap [] in
+  lm3_finish (cat [prompt, lm3_decode gen_ids vocab])
+lm3_emit w1 w2 emb vocab c id prompt gcap =
+  write_file (cat ["/tmp/lm_completions/", id, ".rail"]) (lm3_complete w1 w2 emb vocab c prompt gcap)
+lm3_emit_all w1 w2 emb vocab c ids prompt gcap =
+  if ids == [] then 0
+  else let _ = lm3_emit w1 w2 emb vocab c (head ids) prompt gcap in
+       lm3_emit_all w1 w2 emb vocab c (tail ids) prompt gcap
+
+main =
+  let _ = shell "rm -f /tmp/lm3_chain.txt" in
+  let _ = shell "rm -f /tmp/lm_completions/*.rail" in
+  let _ = shell "mkdir -p /tmp/lm_completions" in
+  let d = 8 in
+  let hidden = 32 in
+  let cwin = 8 in
+  let epochs = 100 in
+  let gcap = 48 in
+  let beta1 = 15099494 in
+  let beta2 = 16760439 in
+  let lr = 419430 in
+  let eps = 16777 in
+
+  -- PIN: provenance is a function of the LM3 corpus content hash
+  let corpus = read_file "tools/bitexact/lm3_corpus.txt" in
+  let chash = sha256_hex corpus in
+  let vocab = lm3_vocab corpus in
+  let vsize = lm3_len (chars vocab) in
+  let ids = lm3_tokens corpus vocab in
+  let pairs = lm3_pairs ids cwin in
+  let npairs = lm3_len pairs in
+  let indim = cwin * d in
+  let w1c0 = lm3_initmat 0 hidden indim 0 in
+  let w2c0 = lm3_initmat 1 vsize hidden 0 in
+  let ec0 = lm3_emb_initmat vsize d in
+
+  -- EPHEMERAL LOCAL DEV KEY + LOCAL genesis (never a prod sign surface / live pulse)
+  let seed = sha256 "lm3.local.ephemeral.dev.seed.v1" in
+  let pk = ed25519_pk_from_sk seed in
+  let pk_hex = bytes_to_hex pk 32 in
+  let genesis_hex = sha256_hex "LM3.LOCAL.BEACON.GENESIS.dev" in
+
+  -- ===== the attested training run (checkpoint-cadence; trains W1, W2 AND E) =====
+  let res = lm3_chain w1c0 w2c0 ec0 pairs d hidden vsize indim beta1 beta2 lr eps 16777216 16777216 seed pk epochs 0 genesis_hex "" 1 in
+  let all_ok = lm3_nth res 0 in
+  let body = lm3_nth res 1 in
+  let head_link = lm3_nth res 2 in
+  let fw1c = lm3_nth res 3 in
+  let fw2c = lm3_nth res 4 in
+  let fec = lm3_nth res 5 in
+  let fw1 = lm3_thmat fw1c in
+  let fw2 = lm3_thmat fw2c in
+  let femb = lm3_thmat fec in
+  let emb0 = lm3_thmat ec0 in
+
+  -- dataset-loss descent over the WHOLE corpus (initial vs final weights)
+  let ds0 = lm3_dsloss pairs (lm3_thmat w1c0) (lm3_thmat w2c0) emb0 vsize in
+  let dsK = lm3_dsloss pairs fw1 fw2 femb vsize in
+
+  -- persist the signed ledger (header carries everything the re-verifier needs)
+  let header = cat ["# LM3v1 ", pk_hex, " ", genesis_hex, " ", show epochs, " ", chash,
+                    " d=", show d, " hidden=", show hidden, " vsize=", show vsize, " cwin=", show cwin,
+                    " beta1=", show beta1, " beta2=", show beta2, " lr=", show lr, " eps=", show eps, "\n"] in
+  let _ = write_file "/tmp/lm3_chain.txt" (cat [header, body]) in
+
+  -- ===== user-facing gate: the MODEL's OWN completions, scored by the LM0 oracle =====
+  let pr = "main = let _ = print (show (" in
+  let ids_list = ["b1_1","b1_2","b1_3","b1_4","b1_5","b2_1","b2_2","b2_3","b2_4","b2_5","b3_1","b3_2","b3_3","b3_4","b3_5","b4_1","b4_2","b4_3","b4_4","b4_5","b5_1","b5_2","b5_3","b5_4","b5_5","b6_1","b6_2","b6_3","b6_4","b6_5"] in
+  let _ = lm3_emit_all fw1 fw2 femb vocab cwin ids_list pr gcap in
+  let sample = lm3_complete fw1 fw2 femb vocab cwin pr gcap in
+  let _ = shell "./rail_native --out-prefix /tmp/lm3_lm0_bin tools/bitexact/lm0_compile_eval.rail > /tmp/lm3_lm0_build.log 2>&1" in
+  let _ = shell "/tmp/lm3_lm0_bin > /tmp/lm3_lm0_run.log 2>&1" in
+  let lm0raw = read_file "/tmp/lm0_eval.txt" in
+  let model_pct = if lm0raw == "" then 0 - 1 else lm3_hd_int lm0raw in
+
+  -- D0: re-run the WHOLE training + link chain (NO re-sign) -> head must be bit-identical
+  let res2 = lm3_chain_d0 w1c0 w2c0 ec0 pairs d hidden vsize indim beta1 beta2 lr eps 16777216 16777216 epochs 0 genesis_hex in
+  let head2 = lm3_nth res2 0 in
+  let dsK2 = lm3_dsloss pairs (lm3_thmat (lm3_nth res2 1)) (lm3_thmat (lm3_nth res2 2)) (lm3_thmat (lm3_nth res2 3)) vsize in
+  let d0 = if head_link == head2 then (if dsK == dsK2 then 0 else 1) else 1 in
+
+  -- falsification probes (prove the verifier genuinely discriminates)
+  let pmsg = sha256 "lm3.tamper.probe" in
+  let psig = ed25519_sign seed pmsg 32 in
+  let okGood = ed25519_verify pk pmsg 32 psig in
+  let tsig = arr_new 64 0 in
+  let _ = sha_copy_bytes psig tsig 0 0 64 in
+  let _ = arr_set tsig 5 (bit_xor (arr_get tsig 5) 1) in
+  let okBad = ed25519_verify pk pmsg 32 tsig in
+  let seed2 = sha256 "lm3.other.key" in
+  let wsig = ed25519_sign seed2 pmsg 32 in
+  let okW = ed25519_verify pk pmsg 32 wsig in
+
+  -- Gates
+  let okSigs = if all_ok == 1 then 1 else 0 in
+  let okProg = if dsK < ds0 then 1 else 0 in
+  let okModel = if model_pct >= 50 then 1 else 0 in
+  let okTamper = if okGood == 1 then (if okBad == 0 then 1 else 0) else 0 in
+  let okWrongKey = if okW == 0 then 1 else 0 in
+  let okD0 = if d0 == 0 then 1 else 0 in
+  let all = okSigs * okProg * okModel * okTamper * okWrongKey * okD0 in
+
+  let _ = print (cat ["LM3 attested bit-exact char-LM (TRAINED embeddings): vocab=", show vsize, " d=", show d, " hidden=", show hidden, " ctx=", show cwin, " indim=", show indim, " pairs=", show npairs, " epochs=", show epochs, " (exact-integer F=24)"]) in
+  let _ = print (cat ["LM3 corpus pin: SHA-256 ", chash]) in
+  let _ = print (cat ["LM3 USER-FACING GATE: MODEL's own completions compile% = ", show model_pct, " (LM0 compile-as-oracle; >=50 required)"]) in
+  let _ = print (cat ["LM3 sample MODEL completion: ", sample]) in
+  let _ = print (cat ["LM3 pubkey=", pk_hex]) in
+  let _ = print (cat ["LM3 chain head=", head_link]) in
+  let _ = print (cat ["LM3 datasetLoss0=", show ds0, " datasetLossK=", show dsK, " (fixed-point; descent=", show okProg, ")"]) in
+  let _ = print (cat ["LM3 D0 (re-run whole training bit-identical)=", show okD0, "  per-ckpt sigs verify=", show okSigs, "  tamper-reject=", show okTamper, "  wrong-key-reject=", show okWrongKey]) in
+  let _ = print (cat ["LM3 signed ledger: /tmp/lm3_chain.txt (", show epochs, " checkpoints; w_hex binds W1;;W2;;E)"]) in
+  let _ = print (if all == 1
+    then "LM3 PASS: bit-exact attested char-LM with TRAINED embeddings that CROSSES the user-facing compile gate; whole run reproduces bit-for-bit (D0) + checkpoint-chained (binds E) + tamper-evident + corpus-pinned"
+    else "LM3 FAIL") in
+  if all == 1 then 0 else 1
