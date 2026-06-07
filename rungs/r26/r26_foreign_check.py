@@ -88,8 +88,14 @@ def fxln(x):
     mant = a + a
     return k * 11629080 + mant
 
+def tdiv(a, b):
+    # truncate toward zero (mirror Rail '/' == ARM64 sdiv), NOT Python's floor //.
+    # log2(p<1) and p*log2(p) are NEGATIVE, where floor and trunc diverge by 1 ulp.
+    q = abs(a) // abs(b)
+    return -q if (a < 0) != (b < 0) else q
+
 def log2_q24(x):
-    return (fxln(x) * 24204406) // Q
+    return tdiv(fxln(x) * 24204406, Q)
 
 def entropy_q24(hist):
     total = sum(hist)
@@ -101,7 +107,7 @@ def entropy_q24(hist):
             continue
         p = (c * Q) // total
         lg = log2_q24(p)
-        term = (p * lg) // Q
+        term = tdiv(p * lg, Q)
         acc -= term
     return acc
 
