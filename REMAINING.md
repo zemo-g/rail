@@ -86,7 +86,18 @@ came from runtime markers (r26: `cum=[]` in the trace; r27: only `PRCG rem=271` 
 
 ### D. Walled — need external resources
 
-- **r22 (four-ISA)** — REMOTE HW. x86 ELF won't even link here (`x86_64-elf-ld: cannot find -lc`; fix = static SYSV link like the aarch64 path). The **Pi (Linux-ARM64) leg IS reachable** over Tailscale (`zemog@100.87.231.45`): cross-compile (`rail_native linux`), scp, run, 2-way `cmp` with the ARM64-Mac chain. x86 still needs an x86_64 Linux host (none here; no qemu, Rosetta runs Mach-O not ELF).
+- **r22 (four-ISA)** — TWO blockers. (a) **LOCAL GATE RED (deeper than the handoff framed):** the ARM64
+  binary fails its own `okUtterRepro` because Rail's `lm4_gen` produces a CORRUPTED token sequence under
+  POST-TRAINING ARENA PRESSURE (lm4_chain + dsloss + he_all pin GBs the conservative GC marks). The
+  foreign Python verifier (no arena) decodes the CORRECT words. A 2026-06-07 fix attempt -- decode from
+  clean re-derived weights after `arena_reset` -- FAILED (garbled) because the re-derivation re-fills the
+  arena before the decode; reverted. CORRECT FIX: add `bnd_wp_ser`/`bnd_wp_deser` to cross_isa (it imports
+  only bx_fixed+crypto), then train -> persist `fwp` -> `arena_reset` -> reload `fwp` into the clean arena
+  -> decode (committed + a repro decode, both clean) -> write chain -> retrain only for the `okD0` hash.
+  See task #5 for the full recipe. (b) REMOTE HW: x86 ELF won't link here (`x86_64-elf-ld: cannot find
+  -lc`; fix = static SYSV link); the **Pi (Linux-ARM64) leg IS reachable** (`zemog@100.87.231.45`,
+  cross-compile/scp/run/`cmp`) BUT only meaningful AFTER the local gate is fixed (the bug is ISA-
+  independent, so the Pi would reproduce it). x86 still needs an x86_64 Linux host (none here).
 - **r29 (Pi witness)** — REMOTE HW. `tools/attest/pi_sign_server.rail` exists; needs the Pi online to countersign + verify pulse recency.
 
 ### E. Walled — open research
