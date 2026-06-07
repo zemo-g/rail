@@ -29,17 +29,13 @@
 -- r30_protocol.rail's design. (Here we re-declare the lm10-typed wrappers; the Merkle + FS + Ed25519
 -- helpers are identical and would be imported/shared in a merged build.)
 
-import "tools/bitexact/bx_fixed.rail"
-import "stdlib/sha256.rail"
-import "stdlib/sha512.rail"
-import "stdlib/x25519.rail"
-import "stdlib/ed25519.rail"
-import "stdlib/ed25519_scalar.rail"
-import "stdlib/ed25519_sign.rail"
-import "stdlib/tensor.rail"
 -- the proven lm10 transformer + optimizer + serialization (lm4_step, lm4_epoch, bnd_wp_ser/deser,
--- lm4_chain_d0_pw, lm4_canon17, lm4_pairs, lm4_vocab, lm4_tokens, init helpers) live here:
-import "tools/bitexact/lm10_attested_train.rail"
+-- lm4_chain_d0_pw, lm4_canon17, lm4_pairs, lm4_vocab, lm4_tokens, init helpers) live here.
+-- NOTE: import ONLY the lib (lm10_attested_train.rail MINUS its heavy ~180-line main). It brings
+-- bx_fixed + sha256/sha512 + x25519 + ed25519{,_scalar,_sign} + tensor TRANSITIVELY -- importing
+-- those directly too double-defined tensor.rail (check_g/gradient_test_main) -> duplicate-symbol at
+-- link, since Rail does not dedup a direct import against the same file reached transitively.
+import "tools/bitexact/lm10_lib.rail"
 
 -- ===== reused protocol helpers (identical to r30_protocol.rail) =====
 r_nth xs i = if i <= 0 then head xs else r_nth (tail xs) (i - 1)
@@ -54,7 +50,7 @@ r_mem x xs = if xs == [] then 0 else if (head xs) == x then 1 else r_mem x (tail
 
 -- Merkle (verbatim from r30_protocol.rail)
 p_pair_up nodes acc = if nodes == [] then reverse acc
-  else if (tail nodes) == [] then reverse (cons (head nodes) acc)
+  else if (tail nodes) == [] then reverse (cons (sha256_hex (cat ["NODE|", head nodes, "|", head nodes])) acc)
   else p_pair_up (tail (tail nodes)) (cons (sha256_hex (cat ["NODE|", head nodes, "|", head (tail nodes)])) acc)
 p_levels_go nodes acc = if (tail nodes) == [] then reverse (cons nodes acc) else p_levels_go (p_pair_up nodes []) (cons nodes acc)
 p_levels nodes = if nodes == [] then cons (cons (sha256_hex "EMPTY") []) [] else p_levels_go nodes []
@@ -123,7 +119,7 @@ r30lm_verify_one ct st wp0 corpuspairs levels root idx d hidden v indim isd beta
   let pre = if idx == 0 then wp0 else bnd_wp_deser (read_file (cat ["rungs/r30/out/lm_states/", show (idx - 1), ".wp"])) in
   let prepw = if idx == 0 then cons 16777216 (cons 16777216 [])
               else let s = read_file (cat ["rungs/r30/out/lm_states/", show (idx - 1), ".pw"]) in
-                   cons (lm4_hd_int s) (cons (lm4_hd_int (str_sub s (str_find " " s) 64)) []) in
+                   cons (lm4_hd_int s) (cons (lm4_hd_int (str_sub s ((str_find " " s) + 1) 64)) []) in
   let pair = r_nth corpuspairs idx in
   let nxt = r30lm_step ct st pre pair d hidden v indim isd beta1 beta2 lr eps (r_nth prepw 0) (r_nth prepw 1) in
   let rec_wp = r_nth nxt 0 in
@@ -135,18 +131,130 @@ r30lm_verify_one ct st wp0 corpuspairs levels root idx d hidden v indim isd beta
   let merkle_ok = p_verify_path leaf (p_proof levels idx) root in
   step_ok * merkle_ok
 
--- The MAIN here is the documented invocation shape -- it mirrors attested_utterance.rail's setup
--- exactly (same d/hidden/cwin/epochs/betas/lr/eps/isd, same corpus, same wp0 init), then runs the
--- per-step prover + the spot-check verifier. NOT executed by validate.sh (compute discipline).
+-- expand the per-epoch `pairs` into the full (epochs x pairs) step list, so r_nth allpairs idx
+-- gives the exact pair the prover used at global step idx (epoch-outer, pair-inner order, matching
+-- lm4_chain). Concat n copies in order.
+r30lm_concat a b = if a == [] then b else cons (head a) (r30lm_concat (tail a) b)
+r30lm_expand p0 n acc = if n <= 0 then acc else r30lm_expand p0 (n - 1) (r30lm_concat p0 acc)
+
+-- verify a list of challenged global steps; product of per-step verdicts (1 iff ALL pass).
+r30lm_verify_list ct st wp0 allpairs levels root chals d hidden v indim isd b1 b2 lr eps =
+  if chals == [] then 1
+  else let ok = r30lm_verify_one ct st wp0 allpairs levels root (head chals) d hidden v indim isd b1 b2 lr eps in
+       ok * (r30lm_verify_list ct st wp0 allpairs levels root (tail chals) d hidden v indim isd b1 b2 lr eps)
+
+-- The REAL main: mirrors attested_utterance.rail's lm10 setup (same d/hidden/cwin/betas/lr/eps/isd,
+-- same corpus + wp0 init), runs the per-step prover over the REAL lm4_step (not the r30_step
+-- stand-in), Merkle-commits every post-step state, signs the root with a LOCAL/DEV key, derives
+-- Fiat-Shamir challenges off the signed head, and spot-checks ONLY k steps -- sublinear. A poisoned
+-- committed state is rejected. epochs is REDUCED (the spot-check is scale-free; binding to the actual
+-- transformer is the claim) -- raise to 19 for the full run.
 main =
   let _ = shell "mkdir -p rungs/r30/out/lm_states" in
-  let _ = print "r30_prove.rail: lm10-bound succinct spot-check (SKELETON -- see footer to run)." in
-  let _ = print "It reuses lm4_step + bnd_wp_ser/deser + the r30 Merkle/FS/Ed25519 protocol verbatim." in
-  -- (Full lm10 setup + run + verify body lives behind the compute-discipline guard; the proven
-  --  protocol it calls is validated by rungs/r30/validate.sh on the light r30_step transition.)
+  let _ = shell "rm -f rungs/r30/out/lm_states/*.wp rungs/r30/out/lm_states/*.pw rungs/r30/out/lm_states/*.bak" in
+  let d = 8 in
+  let hidden = 64 in
+  let cwin = 8 in
+  let epochs = 3 in
+  let beta1 = 15099494 in
+  let beta2 = 16760439 in
+  let lr = 209715 in
+  let eps = 16777 in
+  let sc = arr_new 1 0 in
+  let _ = arr_set sc 0 16777216 in
+  let s = arr_get sc 0 in
+  let isdc = arr_new 1 0 in
+  let _ = arr_set isdc 0 5931642 in
+  let isd = arr_get isdc 0 in
+  let ct = arr_new 32 0 in
+  let _ = rt_set_cos ct in
+  let st = arr_new 32 0 in
+  let _ = rt_set_sin st in
+  let corpus = read_file "tools/bitexact/lm10_corpus.txt" in
+  let chash = sha256_hex corpus in
+  let vocab = lm4_vocab corpus in
+  let vsize = lm4_len (chars vocab) in
+  let ids = lm4_tokens corpus vocab in
+  let pairs = lm4_pairs ids cwin in
+  let npairs = lm4_len pairs in
+  let indim = cwin * d in
+  let w1c0 = lm4_initmat 0 hidden indim 0 in
+  let w2c0 = lm4_initmat 1 vsize hidden 0 in
+  let ec0 = lm4_emb_initmat vsize d in
+  let ff = d * 4 in
+  let wqc0 = lm5_qkv_init 30 d in
+  let wkc0 = lm5_qkv_init 31 d in
+  let wvc0 = lm5_qkv_init 32 d in
+  let gammac0 = rn_gamma_init d in
+  let gamma2c0 = rn_gamma_init d in
+  let wff1c0 = lm4_initmat 33 ff d 0 in
+  let wff2c0 = lm4_initmat 34 d ff 0 in
+  let b1wqc0 = lm5_qkv_init 35 d in
+  let b1wkc0 = lm5_qkv_init 36 d in
+  let b1wvc0 = lm5_qkv_init 37 d in
+  let b1gammac0 = rn_gamma_init d in
+  let b1gamma2c0 = rn_gamma_init d in
+  let b1wff1c0 = lm4_initmat 38 ff d 0 in
+  let b1wff2c0 = lm4_initmat 39 d ff 0 in
+  let wp0 = cons w1c0 (cons w2c0 (cons ec0 (cons wqc0 (cons wkc0 (cons wvc0 (cons gammac0 (cons gamma2c0 (cons wff1c0 (cons wff2c0 (cons b1wqc0 (cons b1wkc0 (cons b1wvc0 (cons b1gammac0 (cons b1gamma2c0 (cons b1wff1c0 (cons b1wff2c0 [])))))))))))))))) in
+  let seed = sha256 "r30lm.local.ephemeral.dev.seed.v1" in
+  let pk = ed25519_pk_from_sk seed in
+  let pk_hex = bytes_to_hex pk 32 in
+  let genesis_hex = sha256_hex "R30LM.LOCAL.SPOTCHECK.GENESIS.dev" in
+  -- expand to the full step list + run the per-step prover (binds to the REAL lm4_step)
+  let allpairs = r30lm_expand pairs epochs [] in
+  let nsteps = lm4_len allpairs in
+  let _ = print (cat ["r30_prove: REAL lm10 per-step prover -- steps=", show nsteps,
+                      " (epochs=", show epochs, " x pairs=", show npairs, "), vsize=", show vsize]) in
+  let prov = r30lm_run ct st wp0 allpairs d hidden vsize indim isd beta1 beta2 lr eps 16777216 16777216 0 allpairs [] in
+  let leaves = r_nth prov 3 in
+  let nleaves = lm4_len leaves in
+  let _ = print (cat ["prover done: ", show nleaves, " committed per-step states"]) in
+  -- Merkle commit over the per-step leaves
+  let levels = p_levels leaves in
+  let root = p_levels_root levels in
+  -- sign the root with the LOCAL/DEV key -> the chain head FS challenges hang off
+  let head_pre = cat [genesis_hex, "|R30LM|root=", root, "|steps=", show nsteps, "|corpus=", chash] in
+  let head_b = sha256 head_pre in
+  let chain_head = bytes_to_hex head_b 32 in
+  let hsig = ed25519_sign seed head_b 32 in
+  let hsig_hex = bytes_to_hex hsig 64 in
+  let sigOk = ed25519_verify pk head_b 32 hsig in
+  -- Fiat-Shamir: k challenges derived off (root, signed head)
+  let k = if nsteps < 12 then nsteps else 12 in
+  let chals = p_chal_list root chain_head k nsteps 0 [] in
+  -- honest spot-check: recompute ONLY the k challenged steps; all must verify
+  let honestOk = r30lm_verify_list ct st wp0 allpairs levels root chals d hidden vsize indim isd beta1 beta2 lr eps in
+  -- sublinearity: verification recomputes k << nsteps steps
+  let okSub = if k < nsteps then 1 else 0 in
+  -- FALSIFIER: poison one committed state; a challenge hitting it MUST be rejected.
+  let fidx = head chals in
+  let other = if fidx == 0 then 1 else fidx - 1 in
+  let honestF = r30lm_verify_one ct st wp0 allpairs levels root fidx d hidden vsize indim isd beta1 beta2 lr eps in
+  let _ = shell (cat ["cp rungs/r30/out/lm_states/", show fidx, ".wp rungs/r30/out/lm_states/", show fidx, ".bak"]) in
+  let _ = shell (cat ["cp rungs/r30/out/lm_states/", show other, ".wp rungs/r30/out/lm_states/", show fidx, ".wp"]) in
+  let poisonV = r30lm_verify_one ct st wp0 allpairs levels root fidx d hidden vsize indim isd beta1 beta2 lr eps in
+  let _ = shell (cat ["cp rungs/r30/out/lm_states/", show fidx, ".bak rungs/r30/out/lm_states/", show fidx, ".wp"]) in
+  let okFalsify = if honestF == 1 then (if poisonV == 0 then 1 else 0) else 0 in
+  -- emit the signed succinct-proof transcript for the foreign verifier
+  let chal_str = r30lm_ctx_ser chals in
+  let transcript = cat ["# R30LM-PROVE v1\npk=", pk_hex, "\ngenesis=", genesis_hex,
+                        "\ncorpus_sha=", chash, "\nd=", show d, " hidden=", show hidden,
+                        " cwin=", show cwin, " epochs=", show epochs, " vsize=", show vsize,
+                        "\nnsteps=", show nsteps, "\nroot=", root, "\nchain_head=", chain_head,
+                        "\nhead_sig=", hsig_hex, "\nk=", show k, "\nchallenges=", chal_str, "\n"] in
+  let _ = write_file "rungs/r30/out/r30_prove_transcript.txt" transcript in
+  -- gate
+  let ALL = sigOk * honestOk * okSub * okFalsify in
+  let _ = print (cat ["sigOk=", show sigOk, " honestSpotCheck(k=", show k, ")=", show honestOk,
+                      " sublinear(k<nsteps)=", show okSub, " falsifier(poison rejected)=", show okFalsify]) in
+  let _ = print (cat ["root=", root]) in
+  let _ = print (cat ["chain_head=", chain_head]) in
+  let _ = if ALL == 1 then print "PASS: succinct spot-check BOUND TO THE REAL lm10 step -- k challenged steps recomputed against the signed Merkle root, sublinear, poisoned state rejected."
+          else print "FAIL: r30 lm10-bound gate red (see flags above)" in
   0
 
--- To run for real (serially, alone -- heavy lm10 training, ~minutes, 8GB arena):
+-- Full run (serially, alone -- raise epochs to 19, heavier):
 --   ./rail_native --out-prefix rungs/r30/out/r30_prove_bin rungs/r30/r30_prove.rail
 --   RAIL_ARENA_MB=8192 ./rungs/r30/out/r30_prove_bin
--- Then the SAME r30_foreign_check.py pattern (extended to bnd_wp deserialize) cross-verifies.
+-- Then r30_foreign_check.py (extended to bnd_wp deserialize) cross-verifies the transcript.

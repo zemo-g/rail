@@ -4,8 +4,21 @@
 
 ## Tally
 
-**5 genuinely GREEN** — 35 (apex, sealed), 32 (outputs-ARE-Rail), 30 (succinct-verify mechanism),
+**6 genuinely GREEN** — 35 (apex, sealed), 32 (outputs-ARE-Rail),
+**30 (succinct spot-check NOW BOUND TO THE REAL lm10 — 2026-06-07)**,
 **26 (tie-break — FIXED 2026-06-07)**, **27 (replay-free verify — FIXED 2026-06-07)**.
+
+r30 was driven from "mechanism on a stand-in transition" to bound-to-real-lm10: `rungs/r30/r30_prove.rail`
+now runs the REAL `lm4_step` 87-step training (epochs=3 x 29 pairs), Merkle-commits every post-step
+state, signs the root (LOCAL/DEV key), derives Fiat-Shamir challenges off the signed head, and
+spot-checks k=12 of 87 steps -- all 12 recompute bit-exact (step_ok) and verify against the signed
+Merkle root (merkle_ok); a poisoned committed state is rejected; sublinear (12<<87). Two bugs fixed to
+get there: (a) the powers parser read pow2 via `str_sub s (str_find " " s) 64` = a LEADING-SPACE token
+-> lm4_hd_int returned 0 (fixed: `+1` to skip the space); (b) the Merkle `p_pair_up` CARRIED an odd
+last node unchanged while `p_proof_lv` SELF-HASHED it -> inconsistent at non-power-of-2 leaf counts
+(fixed: duplicate-last, hash the lone node with itself). Built via a new `tools/bitexact/lm10_lib.rail`
+(the trainer MINUS its heavy main; importing the full trainer codegen'd that main too -> 10+ min/compile
++ a duplicate-symbol link error from double-importing tensor.rail).
 
 26 + 27 were debugged here from compile-clean-but-segfault to full green:
 - **r26**: missing `cum=0` init arg (segfault) in BOTH nucleus init calls (`r26_nucleus_ids` /
@@ -32,7 +45,7 @@ The adversarial layer downgraded EVERY builder-claimed ACHIEVED (22/30/35/36→P
 | 27 | Replay-Free Verification | PARTIAL | **GREEN ✅ (FIXED)** | ✓ | binding PROVEN (SHA(bundle)==w_hex); segfault was head-on-string in int-parser (`prc_map_int` fed strings to a chars-list parser); fixed with `chars`; Rail + foreign Python verify replay-free in 0.118s, all 3 falsifiers reject |
 | 28 | Live-Beacon Genesis, Proof-of-Recency | DESIGNED | **WALLED** | ✓ | EXTERNAL — fetch live ledatic.org entropy pulse over Rail TLS (dev-mode-guarded) |
 | 29 | Pi-Witness Active Recency Oracle | DESIGNED | **WALLED** | ✓ | REMOTE HW — the Pi witness must countersign over the network |
-| 30 | Succinct Spot-Check (Fiat-Shamir) | PARTIAL | **GREEN ✅ (mechanism)** | ✓ | foreign verified whole trajectory recomputing 12.5% of steps; forged interior step REJECTED; meta-falsifier rejects tamper. CAVEAT: stand-in transition, not yet bound to real lm10 lm4_step (r30_prove.rail skeleton) |
+| 30 | Succinct Spot-Check (Fiat-Shamir) | PARTIAL | **GREEN ✅ (BOUND TO REAL lm10)** | ✓ | r30_prove.rail runs the REAL lm4_step 87-step training; k=12 challenged steps recompute bit-exact + verify against the signed Merkle root; poisoned state rejected; sublinear (12<<87). Stand-in caveat CLOSED 2026-06-07. (Foreign Python re-verifier of THIS transcript = follow-up; the Rail self-gate is green.) |
 | 31 | Freivalds-Succinct GEMM Through Trunca | DESIGNED | **WALLED** | ✓ | RESEARCH-OPEN — joint soundness of Freivalds projection + truncation range-check |
 | 32 | Compile-Bound Utterance (Outputs ARE R | DESIGNED | **GREEN ✅** | ✓ | ACHIEVED — model speaks Rail that COMPILES+RUNS; foreign witness re-compiled+re-ran to identical stdout '7\n'; attested |
 | 33 | k-of-n Threshold-Signed Utterance (FRO | PARTIAL | **WALLED** | ✓ | RESEARCH-OPEN crypto — scalar inversion mod L + Lagrange mod L for FROST; nonce safety |

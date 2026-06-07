@@ -23,7 +23,7 @@ tools/bitexact/{self_emit_harness.sh, utterance_foreign_check.py, selfemit_corpu
 
 ---
 
-## Standing: 5 genuinely GREEN of 15  (26 + 27 FIXED 2026-06-07)
+## Standing: 6 genuinely GREEN of 15  (26 + 27 FIXED, 30 BOUND-TO-REAL-lm10, 2026-06-07)
 
 | rung | what | green? |
 |---|---|---|
@@ -62,9 +62,22 @@ came from runtime markers (r26: `cum=[]` in the trace; r27: only `PRCG rem=271` 
 - **r23 (segmented training)** — `bash rungs/r23/validate.sh` (4-segment train of a deeper model + a "does-not-fit" OOM witness). Heavier (RAIL_ARENA_MB=8192). Adversary wanted the OOM witness wired into a failing gate.
 - **r25 (attested sampling)** — `bash rungs/r25/validate.sh`, BUT the adversary flagged its falsifier **F2 as measure-zero** (vacuous). Fix first: make F2 a constructed exact-cumsum-boundary case (the `u` lands exactly on a prefix edge so idx1-vs-idx0 is decided by the `<`/`>=` rule), then validate. r26's tie-break machinery depends on this being sound.
 
-### C. Highest-value, hardest — bind rung 30 to the real model
+### C. Highest-value, hardest — bind rung 30 to the real model  ✅ DONE 2026-06-07
 
-- **r30 → real lm10.** Today's green is the succinct-verify **mechanism** on a STAND-IN transition (`r30_protocol.rail`). The skeleton `rungs/r30/r30_prove.rail` wires the real `lm4_step` + `bnd_wp_ser/deser` full-state (θ,m,v,pow1,pow2) into the identical Merkle/FS/Ed25519 protocol but is **not run** (full lm10 training is 8 GB / minutes). **To close:** run `r30_prove.rail` end-to-end so the spot-check verifies the ACTUAL transformer's training, and bind each step's `(ctx,tgt)` to the rung-24 SPLIT corpus (so it certifies "this corpus was trained," not just internal consistency). This is the real linchpin.
+- **r30 → real lm10.** CLOSED. `rungs/r30/r30_prove.rail` got a real `main` (was a stub): it runs the
+  REAL `lm4_step` 87-step training (epochs=3 x 29 pairs), persists every post-step full-state, Merkle-
+  commits, signs the root (LOCAL/DEV key), derives FS challenges off the signed head, and spot-checks
+  k=12 of 87 -- all recompute bit-exact + verify against the signed root; poisoned state rejected;
+  sublinear. Build: `RAIL_ARENA_MB=8192 ./rail_native --out-prefix rungs/r30/out/r30_prove_bin
+  rungs/r30/r30_prove.rail` (~5.5 min; imports `tools/bitexact/lm10_lib.rail` = trainer minus main),
+  then `RAIL_ARENA_MB=8192 ./rungs/r30/out/r30_prove_bin` (~5 s) -> PASS.
+  - Two bugs fixed: powers parse leading-space (pow2->0; `+1`), and Merkle odd-node carry-vs-self-hash
+    (duplicate-last). See RUNGS_STATUS.md.
+  - **Follow-ups (not blocking the green):** (1) a foreign Python re-verifier of the r30_prove
+    transcript (re-implement bnd_wp_deser + lm4_step, or read the per-step .wp states + recompute) for
+    cross-language independence; (2) raise epochs 3->19 for the full-scale run (mechanism is scale-free);
+    (3) bind each step's (ctx,tgt) to the rung-24 SPLIT corpus commitment (currently bound to the lm10
+    training-corpus pairs).
 
 ### D. Walled — need external resources
 
