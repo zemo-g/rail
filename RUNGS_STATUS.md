@@ -4,9 +4,19 @@
 
 ## Tally
 
-**3 genuinely GREEN (30 added — the linchpin succinct-verify mechanism)**
+**5 genuinely GREEN** — 35 (apex, sealed), 32 (outputs-ARE-Rail), 30 (succinct-verify mechanism),
+**26 (tie-break — FIXED 2026-06-07)**, **27 (replay-free verify — FIXED 2026-06-07)**.
 
-ORIGINAL: **2 genuinely GREEN — rung 35 (apex, sealed) + rung 32 (outputs-ARE-Rail, foreign re-compiled+re-ran).** 1 PARTIAL with its core binding proven (27). 2 runnable-here pending compute (23, 25). 1 attempted-not-green, fixable (26). 8 walled by remote-HW / open-research / model-capacity / external surface.
+26 + 27 were debugged here from compile-clean-but-segfault to full green:
+- **r26**: missing `cum=0` init arg (segfault) in BOTH nucleus init calls (`r26_nucleus_ids` /
+  `r26_nucleus_ids_opp`) — `cum` bound to `[]`, the opp tie-rule traversal hit `[]+int` / garbage-snoc.
+  Second issue unmasked after: the Python witness floored where Rail `/` truncates toward zero, so the
+  Q.24 entropy mismatched by 3 ulps — fixed with a `tdiv` helper at the two negative-valued sites.
+- **r27**: `head`/`tail` on a STRING faults (not a graceful 0) — `prc_one_int`/`prc_digits` expect a
+  chars-LIST but `prc_map_int` fed them string tokens. One-char fix: `prc_one_int (chars (head xs))`.
+
+ORIGINAL: 2 genuinely GREEN (35 + 32). 2 runnable-here pending compute (23, 25). 7 walled by
+remote-HW / open-research / model-capacity / external surface (22 has a reachable Pi leg).
 
 The adversarial layer downgraded EVERY builder-claimed ACHIEVED (22/30/35/36→PARTIAL) and flagged a vacuous falsifier (25). 35 was then driven to a real green out-of-band (the harness the workflow agent was told not to run).
 
@@ -18,8 +28,8 @@ The adversarial layer downgraded EVERY builder-claimed ACHIEVED (22/30/35/36→P
 | 23 | Segmented Arena Training, Transparent  | DESIGNED | **RUNNABLE** | ✓ | SERIAL COMPUTE — 4-segment train of a deeper model + does-not-fit OOM witness; not yet run |
 | 24 | Sealed Holdout (Attested Generalizatio | DESIGNED | **WALLED** | ✓ | MODEL CAPACITY — needs a model that GENERALIZES; one-line floor cannot |
 | 25 | Attested Sampling (chain-seeded exact- | DESIGNED | **RUNNABLE*** | ✗fix | SERIAL COMPUTE + falsifier fix (F2 boundary control is measure-zero) |
-| 26 | Provably-Identical Tie-Break | PARTIAL | **LOCALIZED (F1)** | ✓ | compiles clean; segfault isolated to F1 opposite-tie-break path (r26_nucleus_opp_go / lines 438-440) after 3 instrumented rounds; subtle trap, fixable |
-| 27 | Replay-Free Verification | PARTIAL | **LOCALIZED (prc_group)** | ✓ | binding PROVEN (SHA(bundle)==w_hex); segfault isolated to prc_group token-grouping (271 toks); not cross-dep/depth; needs token bisection |
+| 26 | Provably-Identical Tie-Break | PARTIAL | **GREEN ✅ (FIXED)** | ✓ | was missing `cum=0` init arg (segfault) + Python entropy floored vs Rail truncate-div (3-ulp gap); both fixed; self-witness + foreign witness PASS, all 3 falsifiers + 2 neg-controls reject |
+| 27 | Replay-Free Verification | PARTIAL | **GREEN ✅ (FIXED)** | ✓ | binding PROVEN (SHA(bundle)==w_hex); segfault was head-on-string in int-parser (`prc_map_int` fed strings to a chars-list parser); fixed with `chars`; Rail + foreign Python verify replay-free in 0.118s, all 3 falsifiers reject |
 | 28 | Live-Beacon Genesis, Proof-of-Recency | DESIGNED | **WALLED** | ✓ | EXTERNAL — fetch live ledatic.org entropy pulse over Rail TLS (dev-mode-guarded) |
 | 29 | Pi-Witness Active Recency Oracle | DESIGNED | **WALLED** | ✓ | REMOTE HW — the Pi witness must countersign over the network |
 | 30 | Succinct Spot-Check (Fiat-Shamir) | PARTIAL | **GREEN ✅ (mechanism)** | ✓ | foreign verified whole trajectory recomputing 12.5% of steps; forged interior step REJECTED; meta-falsifier rejects tamper. CAVEAT: stand-in transition, not yet bound to real lm10 lm4_step (r30_prove.rail skeleton) |

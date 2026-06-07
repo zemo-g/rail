@@ -23,13 +23,15 @@ tools/bitexact/{self_emit_harness.sh, utterance_foreign_check.py, selfemit_corpu
 
 ---
 
-## Standing: 3 genuinely GREEN of 15
+## Standing: 5 genuinely GREEN of 15  (26 + 27 FIXED 2026-06-07)
 
 | rung | what | green? |
 |---|---|---|
 | **35** Self-Emission (apex) | model emits exact `compile.rail:is_digit`; self-host fixed point holds; 170/170 tests; mutation falsifier fires; Ed25519-sealed | ✅ sealed |
 | **32** Outputs-ARE-Rail | model speaks Rail that compiles+runs; foreign witness re-compiles+re-runs to identical `7\n` | ✅ |
 | **30** Succinct spot-check (linchpin) | foreign party verifies whole trajectory recomputing ~12.5% of steps; forged interior step REJECTED | ✅ *(mechanism on stand-in; see below)* |
+| **26** Provably-Identical Tie-Break | fixed missing `cum=0` init arg (segfault) + Python entropy truncate-div mismatch; self+foreign witness PASS, all falsifiers/neg-controls reject | ✅ FIXED |
+| **27** Replay-Free Verification | fixed head-on-string fault in the bundle int-parser (`prc_map_int (chars ...)`); Rail + foreign Python verify replay-free in 0.118s | ✅ FIXED |
 
 All 15 rungs + 6 seams have implementations on disk (`rungs/r22..r36/`). Adversary-verified, no fabricated passes.
 
@@ -37,14 +39,23 @@ All 15 rungs + 6 seams have implementations on disk (`rungs/r22..r36/`). Adversa
 
 ## Remaining work, by tractability
 
-### A. Debuggable here — 1–2 bisection rounds each (→ likely 5 green)
+### A. Debuggable here — ✅ DONE 2026-06-07 (both GREEN, markers removed)
 
-Both compile clean, segfault at runtime, **precisely localized** (debug `print` markers still in the source):
+- **r26 (tie-break sampling)** — TWO bugs. (1) Both nucleus init calls (`r26_nucleus_ids` L173,
+  `r26_nucleus_ids_opp` L356) passed only 6 args to the 7-param `*_go`, dropping the `cum=0` init —
+  `cum` bound to `[]`; the opp tie-rule traversal reached `[]+int` / `r26_snoc <garbage>` → segfault.
+  Fix: add the `0` cum-init to both. (2) Unmasked after: the Python witness used floor `//` where
+  Rail `/` truncates toward zero, so the negative Q.24 entropy (`log2(p<1)`, `p·log2 p`) differed by
+  3 ulps. Fix: a `tdiv` helper in `r26_foreign_check.py` at `log2_q24` + the entropy `term`.
+  `bash rungs/r26/validate.sh` → R26 VALIDATE PASS.
+- **r27 (replay-free verify)** — `head`/`tail` on a STRING faults here (not a graceful 0). The bundle
+  int-parser (`prc_one_int`/`prc_digits`) consumes a chars-LIST, but `prc_map_int` fed it the
+  space-split STRING tokens. One-char fix: `prc_one_int (chars (head xs))`. `bash rungs/r27/validate.sh`
+  → PASS (Rail + foreign Python replay-free in 0.118s, all 3 falsifiers reject).
 
-- **r26 (tie-break sampling)** — crash isolated to the **F1 opposite-tie-break path**, `rungs/r26/tiebreak_sampling.rail` lines 438–440 (`r26_nucleus_ids_opp` → `r26_nucleus_opp_go` → `r26_maxbelow_opp`/`r26_gt_opp`, OR `r26_draws` on its result). Ruled OUT: empty-set (returns -1 gracefully), infinite-loop (would hang not crash), big-literal-arg (let-bound), arena. **Next:** add markers after line 438 (`nucHi_opp`) and 439 (`drawsNucHi_opp`) to split which of the three calls dies; read `r26_maxbelow_opp_a/_b` (327–347) + `r26_gt_opp` (323) for the trap. Validate: `bash rungs/r26/validate.sh` (RAIL_ARENA_MB=512, no training — fast).
-- **r27 (replay-free verify)** — binding **already PROVEN** (`SHA(bundle)==ledger w_hex`, trainer side green); crash isolated to **`prc_group`** token-grouping (271 tokens), `rungs/r27/rung27_verify.rail`. Ruled OUT: cross-dep reorder (tried mutual-rec AND self-loop+let), prc_semi_split (prints `tokcount=271` fine), depth, sha256(bundle). **Next:** bisect by token — make `parse_bundle` group only the first N tokens (e.g. `lm4_take toks 50`) and binary-search the crashing token; inspect `prc_row_ints`/`prc_one_int` on that token's content. Validate: `bash rungs/r27/validate.sh`.
-
-**Lesson (apply here):** instrument empirically; do NOT trust analysis-guesses for segfaults (3 plausible agent fixes compiled but didn't resolve). Remove the `R26-DBG*`/`R27-DBG*` markers once fixed.
+**Lesson (held up):** instrument empirically; do NOT trust analysis-guesses for segfaults. Both fixes
+came from runtime markers (r26: `cum=[]` in the trace; r27: only `PRCG rem=271` before the crash →
+`prc_row_ints` on token 0). The `R26-DBG*`/`R27-DBG*` markers have been removed.
 
 ### B. Runnable here, not yet attempted
 
