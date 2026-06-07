@@ -97,20 +97,32 @@ r30lm_step ct st wp pair d hidden v indim isd beta1 beta2 lr eps pow1 pow2 =
 
 -- PROVER: stream over (epoch x pairs) = the global step index; commit each post-step state as a leaf,
 -- per-segment arena_reset to bound memory (the ladder's "Merkle DAG streamed with arena_reset").
--- Returns the reversed leaf list; the post-states are persisted to disk (bnd_wp_ser) so the verifier
--- can read pre/post for any challenged step without holding the whole trajectory in the arena.
--- (Full streaming bookkeeping elided in this skeleton; the SHAPE is what binds to the protocol.)
-r30lm_run ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 gstep allpairs leaves =
-  if pairs == [] then cons wp (cons pow1 (cons pow2 (cons (reverse leaves) [])))
-  else let nxt = r30lm_step ct st wp (head pairs) d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
-       let nwp = r_nth nxt 0 in
-       let np1 = r_nth nxt 1 in
-       let np2 = r_nth nxt 2 in
-       let leaf = r30lm_leaf gstep (head pairs) nwp np1 np2 in
-       -- persist post-state so the verifier reads it later (bounded memory): write_file then proceed
-       let _ = write_file (cat ["rungs/r30/out/lm_states/", show gstep, ".wp"]) (bnd_wp_ser nwp) in
-       let _ = write_file (cat ["rungs/r30/out/lm_states/", show gstep, ".pw"]) (cat [show np1, " ", show np2]) in
-       r30lm_run ct st nwp (tail pairs) d hidden v indim isd beta1 beta2 lr eps np1 np2 (gstep + 1) allpairs (cons leaf leaves)
+-- The post-states are persisted to disk (bnd_wp_ser) so the verifier reads pre/post for any
+-- challenged step without holding the whole trajectory in the arena. STREAMING (the skeleton's
+-- stated intent, now real): per-step arena_reset bounds memory -- without it the conservative GC
+-- pins each lm4_step's transient and the arena fills ~step 260 (551-step run STALLS). After the
+-- reset, wp AND the powers are RELOADED FROM DISK (never relying on a value surviving the reset);
+-- allpairs is allocated before the first mark, so its structural tail-sharing survives every reset.
+-- Each leaf is persisted (.leaf) and read back post-stream; returns the final gstep (== nsteps).
+r30lm_stream ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 gstep =
+  if pairs == [] then gstep
+  else
+    let mk = arena_mark 0 in
+    let nxt = r30lm_step ct st wp (head pairs) d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
+    let nwp = r_nth nxt 0 in
+    let np1 = r_nth nxt 1 in
+    let np2 = r_nth nxt 2 in
+    let _ = write_file (cat ["rungs/r30/out/lm_states/", show gstep, ".wp"]) (bnd_wp_ser nwp) in
+    let _ = write_file (cat ["rungs/r30/out/lm_states/", show gstep, ".pw"]) (cat [show np1, " ", show np2]) in
+    let _ = write_file (cat ["rungs/r30/out/lm_states/", show gstep, ".leaf"]) (r30lm_leaf gstep (head pairs) nwp np1 np2) in
+    let _ = arena_reset mk in
+    let wp2 = bnd_wp_deser (read_file (cat ["rungs/r30/out/lm_states/", show gstep, ".wp"])) in
+    let pw = read_file (cat ["rungs/r30/out/lm_states/", show gstep, ".pw"]) in
+    let p1 = lm4_hd_int pw in
+    let p2 = lm4_hd_int (str_sub pw ((str_find " " pw) + 1) 64) in
+    r30lm_stream ct st wp2 (tail pairs) d hidden v indim isd beta1 beta2 lr eps p1 p2 (gstep + 1)
+-- read the persisted leaves [0..n) back into a list (post-stream, clean arena)
+r30lm_readleaves i n = if i >= n then [] else cons (read_file (cat ["rungs/r30/out/lm_states/", show i, ".leaf"])) (r30lm_readleaves (i + 1) n)
 
 -- VERIFIER: for a challenged global step `idx`, read pre (post-state idx-1, or wp0 if idx==0) from
 -- disk, read the (ctx,tgt) pair from the corpus (rung-24 binding), recompute lm4_step, compare
@@ -151,11 +163,11 @@ r30lm_verify_list ct st wp0 allpairs levels root chals d hidden v indim isd b1 b
 -- transformer is the claim) -- raise to 19 for the full run.
 main =
   let _ = shell "mkdir -p rungs/r30/out/lm_states" in
-  let _ = shell "rm -f rungs/r30/out/lm_states/*.wp rungs/r30/out/lm_states/*.pw rungs/r30/out/lm_states/*.bak" in
+  let _ = shell "rm -f rungs/r30/out/lm_states/*.wp rungs/r30/out/lm_states/*.pw rungs/r30/out/lm_states/*.bak rungs/r30/out/lm_states/*.leaf" in
   let d = 8 in
   let hidden = 64 in
   let cwin = 8 in
-  let epochs = 3 in
+  let epochs = 19 in
   let beta1 = 15099494 in
   let beta2 = 16760439 in
   let lr = 209715 in
@@ -206,10 +218,10 @@ main =
   let nsteps = lm4_len allpairs in
   let _ = print (cat ["r30_prove: REAL lm10 per-step prover -- steps=", show nsteps,
                       " (epochs=", show epochs, " x pairs=", show npairs, "), vsize=", show vsize]) in
-  let prov = r30lm_run ct st wp0 allpairs d hidden vsize indim isd beta1 beta2 lr eps 16777216 16777216 0 allpairs [] in
-  let leaves = r_nth prov 3 in
+  let _ = r30lm_stream ct st wp0 allpairs d hidden vsize indim isd beta1 beta2 lr eps 16777216 16777216 0 in
+  let leaves = r30lm_readleaves 0 nsteps in
   let nleaves = lm4_len leaves in
-  let _ = print (cat ["prover done: ", show nleaves, " committed per-step states"]) in
+  let _ = print (cat ["prover done: ", show nleaves, " committed per-step states (memory-bounded stream)"]) in
   -- Merkle commit over the per-step leaves
   let levels = p_levels leaves in
   let root = p_levels_root levels in

@@ -73,11 +73,16 @@ came from runtime markers (r26: `cum=[]` in the trace; r27: only `PRCG rem=271` 
   then `RAIL_ARENA_MB=8192 ./rungs/r30/out/r30_prove_bin` (~5 s) -> PASS.
   - Two bugs fixed: powers parse leading-space (pow2->0; `+1`), and Merkle odd-node carry-vs-self-hash
     (duplicate-last). See RUNGS_STATUS.md.
-  - **Follow-ups (not blocking the green):** (1) a foreign Python re-verifier of the r30_prove
-    transcript (re-implement bnd_wp_deser + lm4_step, or read the per-step .wp states + recompute) for
-    cross-language independence; (2) raise epochs 3->19 for the full-scale run (mechanism is scale-free);
-    (3) bind each step's (ctx,tgt) to the rung-24 SPLIT corpus commitment (currently bound to the lm10
-    training-corpus pairs).
+  - **Follow-ups:** (1) ✅ DONE -- foreign Python re-verifier `rungs/r30/r30_prove_foreign_check.py`
+    independently reproduces the Merkle root + FS challenges + Ed25519 sig + all challenged paths +
+    falsifier from the persisted trajectory (cross-language envelope verification; the transition
+    recompute stays the Rail self-gate's job -- a full Python lm4_step port is the only remaining
+    independence piece). (2) ✅ DONE -- full-scale epochs=19 (551 steps) via a memory-bounded STREAMING
+    prover (per-step arena_reset + reload wp/powers from disk + leaves persisted; without it the arena
+    fills ~step 260 and stalls). (3) DEFERRED (low value) -- bind (ctx,tgt) to the rung-24 SPLIT corpus:
+    r30's leaf ALREADY commits each step's (ctx,tgt) + the corpus hash, and rung-24's generalization
+    claim is itself walled on model capacity, so a holdout commitment adds bytes but no new verifiable
+    claim until the model generalizes.
 
 ### D. Walled — need external resources
 
