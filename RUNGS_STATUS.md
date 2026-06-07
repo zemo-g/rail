@@ -4,6 +4,35 @@
 
 ## Tally
 
+**12 of 15 genuinely GREEN (2026-06-07 push: 6 -> 12)** — 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
++ 23. Remaining RED: **22, 24, 25**.
+
+2026-06-07 second pass drove 6 more to green:
+- **23** segmented training — ran clean (segmented head == one-shot, byte-for-bit across 4 arena-reset segments).
+- **28** live-beacon genesis — ran clean (public pulse fetch + fallback; proof-of-recency not-before).
+- **29** Pi-witness dual-sign — ran clean (separation of duties = two LOCAL keys; the Pi is modelled, not required).
+- **31** Freivalds GEMM — FIXED: honest verify was rejected because rs_i*Slist_i (2^16*2^54) overflowed
+  int63 as a single multiply; added a proper two-limb dot (`r31_tldot`) + magnitude-sound gWrap witness.
+- **33** FROST — FIXED: multi-line `let all = a * b \n * c` product (leading-operator continuation) doesn't
+  parse under Rail's newline lets; joined to one line.
+- **34** economic stake — FIXED: isqrt was INLINED self-recursion (`r_isqrt_go x ((g+x/g)/2) (i-1)`) = the
+  self-loop cross-dep-arg miscompile -> corrupted Adam denom -> chain root diverged from foreign Python;
+  fixed to the mutual-recursion form (`r_isqrt_go <-> r_isqrt_step`) the GREEN r30_protocol uses.
+
+RED (precise diagnoses):
+- **25** attested sampling — asm codegen bug FIXED (`if invtemp == 16777216` compared a bare big literal ->
+  invalid `mov #33554433`; removed the identity fast-path) + F2 falsifier de-vacuumed (constructed exact
+  boundary). STILL red on `SAMPLED-reproduces`: re-train+re-sample gives a DIFFERENT t_hex (arena-state-
+  dependent generation NON-determinism; foreign Python samples correctly). Shared root with r22.
+- **22** four-ISA — `lm4_gen` decode is arena-state-dependent (garbled, NON-deterministic across the
+  pressured vs post-reset arena; foreign Python decodes correctly). NOT GC (16GB bump didn't help), NOT the
+  gen-loop (r27's identical loop is green). A deep memory/Metal-readout read in the post-training generation
+  path. PLUS x86/Pi exec legs hardware-walled.
+- **24** sealed holdout — HONEST generalization gate; ~60+ min/run (epochs=40 x2 exact-int CPU train).
+  Capacity question: does the tiny d=8/2-block model generalize to the sealed holdout? (running to confirm.)
+
+--- earlier 6-green detail ---
+
 **6 genuinely GREEN** — 35 (apex, sealed), 32 (outputs-ARE-Rail),
 **30 (succinct spot-check NOW BOUND TO THE REAL lm10 — 2026-06-07)**,
 **26 (tie-break — FIXED 2026-06-07)**, **27 (replay-free verify — FIXED 2026-06-07)**.
