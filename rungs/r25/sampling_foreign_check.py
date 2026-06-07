@@ -227,9 +227,12 @@ def main():
     gen_f1 = r25_gen(w1, w2, emb, blk0, blk1, ISD, seedp, u_invtemp, flip, u_gcap, bnd=0)
     flipkey_reject = (sha256_hex(ids_canon(gen_f1)) != u_thex)
 
-    # ---- F2 swap the walk boundary (>=) -> at least one token must diverge ----
-    gen_f2 = r25_gen(w1, w2, emb, blk0, blk1, ISD, seedp, u_invtemp, u_rngkey, u_gcap, bnd=1)
-    boundary_reject = (sha256_hex(ids_canon(gen_f2)) != u_thex)
+    # ---- F2 boundary falsifier -- CONSTRUCTED exact-cumsum-boundary (NOT measure-zero) ----
+    # The stream-swap (bnd=1) almost never differs from bnd=0 on RANDOM u_t; the boundaries diverge
+    # ONLY when u lands EXACTLY on a prefix edge. Construct prefix sums {4000000, 8000000, S} and set
+    # u to the first edge: strict-> (bnd 0) lands idx1; >= (bnd 1) lands idx0 -> MUST differ.
+    f2_probs = [100, 100, 50]
+    boundary_reject = (r25_icdf(f2_probs, 100, bnd=0) != r25_icdf(f2_probs, 100, bnd=1))
 
     # ---- F3 non-producing key forgery: a DIFFERENT key cannot reproduce the signed t_hex ----
     other = sha256_hex("lm10.attacker.nonproducing.key")
