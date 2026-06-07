@@ -54,6 +54,26 @@ r31_acc_a h l xs = if xs == [] then (h, l) else
 r31_acc_b h l xs = if xs == [] then (h, l) else
   let r = r31_add h l (head xs) in let (h2, l2) = r in r31_acc_a h2 l2 (tail xs)
 
+-- TWO-LIMB DOT: sum_i a_i*b_i where a_i is SMALL (|a_i| <= 2^17, e.g. FS coeff or w-entry)
+-- but b_i fits int63 (|b_i| <= 2^54). Each a_i*b_i can EXCEED int63, so we must NOT form the
+-- single int63 product (that wraps). Split b_i = bhi*2^31 + blo; a_i*bhi (~2^40) and a_i*blo
+-- (~2^48) each fit int63, and the running H=sum(a_i*bhi), L=sum(a_i*blo) fit int63 at m,k<=128.
+-- True value = H*2^31 + L; normalize to canonical (hi, lo in [0,2^31)). Mutual recursion = the
+-- self-loop-cross-dep miscompile dodge.  THIS is what r31_lhs_terms/r31_acc_a got wrong: they
+-- formed (head rs)*(head Slist) as ONE int63 multiply -> overflow -> garbage hi limb.
+-- Pass the SMALLER-magnitude operand as `a` so a_i*blo and a_i*bhi each fit int63. Normalize the
+-- low piece (a_i*blo) into (H,L) via r31_add EVERY term so L never grows past 2^32 (no accumulator
+-- overflow); the high piece (a_i*bhi) lands directly in the 2^31 limb H.
+r31_tld_a a b H L = if a == [] then (H, L) else
+  let bi = head b in let bhi = bi / 2147483648 in let blo = bi - bhi * 2147483648 in
+  let r = r31_add H L ((head a) * blo) in let (h2, l2) = r in
+  r31_tld_b (tail a) (tail b) (h2 + (head a) * bhi) l2
+r31_tld_b a b H L = if a == [] then (H, L) else
+  let bi = head b in let bhi = bi / 2147483648 in let blo = bi - bhi * 2147483648 in
+  let r = r31_add H L ((head a) * blo) in let (h2, l2) = r in
+  r31_tld_a (tail a) (tail b) (h2 + (head a) * bhi) l2
+r31_tldot a b = let (H, L) = r31_tld_a a b 0 0 in r31_norm H L
+
 -- ===========================================================================
 -- 1. The GPU readout GEMM, with the PRE-truncation accumulator EXPOSED.
 --    This is exactly gpu_matvec from lm10, except we ALSO return the exact
@@ -188,11 +208,11 @@ r31_verify rows v Hi Lo =
   -- Fiat-Shamir: r is a hash of (A, v, S) -> prover can't choose A,v after r.
   let digest = r31_transcript rows v Slist in
   let rs = r31_fs_coeffs_from digest m 0 [] in
-  -- LHS = r^T S  (two-limb)
-  let lhs = r31_acc_a 0 0 (r31_lhs_terms rs Slist) in
-  -- RHS = (r^T A) . v  (two-limb; r^T A products overflow int63)
+  -- LHS = r^T S  (two-limb dot: rs_i SMALL, Slist_i large -> split Slist)
+  let lhs = r31_tldot rs Slist in
+  -- RHS = (r^T A) . v  (w=r^T A entries are LARGE; v is the small input -> pass v as `a`)
   let w = r31_w rows v rs 0 k in
-  let rhs = r31_acc_a 0 0 (r31_rhs_terms w v) in
+  let rhs = r31_tldot v w in
   let freivalds_ok = r31_two_eq lhs rhs in
   let range_ok = r31_range_all Slist in
   let limb_ok = r31_limb_range_all Lo m 0 in
@@ -340,11 +360,15 @@ main =
   let digest_w = r31_transcript rows v Slist in
   let rs_w = r31_fs_coeffs_from digest_w m 0 [] in
   let lhs_terms = r31_lhs_terms rs_w Slist in
-  let two_lhs = r31_acc_a 0 0 lhs_terms in
-  let (h2, l2) = two_lhs in
-  let two_recon = h2 * 2147483648 + l2 in
-  let one_lhs = r31_sum1 lhs_terms 0 in
-  let gWrap = if one_lhs == two_recon then 0 else 1 in  -- 1 == single-limb WRAPPED
+  let one_lhs = r31_sum1 lhs_terms 0 in                  -- single-limb int63 dot (WRAPS if |value|>2^62)
+  let (gwhi, gwlo) = r31_tldot rs_w Slist in             -- the CORRECT two-limb dot
+  -- decompose the single-limb result canonically; if the products overflowed int63 it WRAPPED, so its
+  -- (hi,lo) will NOT equal the correct two-limb -> gWrap=1 (the superaccumulator is load-bearing).
+  let ohi = one_lhs / 2147483648 in
+  let olo0 = one_lhs - ohi * 2147483648 in
+  let (ohi2, olo) = if olo0 < 0 then (ohi - 1, olo0 + 2147483648) else (ohi, olo0) in
+  let gWrap = if ohi2 == gwhi then (if olo == gwlo then 0 else 1) else 1 in
+  let two_recon = gwhi in                                -- (for the print line below)
 
   -- ---- SUCCINCTNESS witness: verifier cost = ONE matvec-pass (O(m*k)) ----
   -- the recompute baseline (gpu_d2_all) is O(pairs * m*k). With P checkpoints
