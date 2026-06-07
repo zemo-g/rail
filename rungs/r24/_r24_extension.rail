@@ -1,0 +1,150 @@
+
+-- ============================================================================================
+-- RUNG 24 EXTENSION: SEALED HOLDOUT (ATTESTED GENERALIZATION)
+-- ============================================================================================
+-- Built on the proven lm10 transformer + Ed25519 hash-chain + canon + bnd_wp_ser (all VERBATIM
+-- above). This block adds ONLY the rung-24 machinery:
+--   (1) a SPLIT record committing SHA-256(sorted-unique train lines) signed from the TRAIN side,
+--       chained prev=genesis, placed BEFORE checkpoint 0 (so the test set is provably untrained).
+--   (2) a deterministic Q.24-exact held-out eval metric: teacher-forced greedy-argmax next-token
+--       accuracy over the ECHO positions of the held-out lines (the positions that require a
+--       LEARNED COPY RULE -- exactly where an n-gram/line-lookup baseline fails by construction).
+--   (3) the control bracket FOLDED INTO THE GATE: a pure-lookup baseline (n-gram argmax over the
+--       train-only context table) must score < T; the honest transformer must score >= T.
+--   (4) the three falsifiers (train-on-holdout -> SHA mismatch ; memorizer < T ; post-hoc swap).
+--   (5) checkpoint-0 ABORT: if held-out echo-acc >= T at epoch 0 (pre-training), the split leaks
+--       or the metric is trivial -> the run must ABORT, not pass (the 7-hour-burn lesson).
+-- T is PRE-REGISTERED below as a function of vocab/random-baseline.
+
+-- ===== sorted-unique line set + SPLIT SHA (canonical, foreign-reproducible) =====
+-- lines are split on '\n'; we drop empties, dedup, sort lexicographically by byte, rejoin with
+-- trailing '\n' per line. The foreign verifier reproduces this exact string -> same SHA-256.
+r24_lt a b =
+  -- byte-lexicographic strict less-than on two strings (chars walk)
+  r24_lt_go (chars a) (chars b)
+r24_lt_go a b =
+  if a == [] then (if b == [] then 0 else 1)
+  else if b == [] then 0
+  else let ca = char_to_int (head a) in let cb = char_to_int (head b) in
+       if ca < cb then 1 else if ca > cb then 0 else r24_lt_go (tail a) (tail b)
+r24_contains_line x xs = if xs == [] then 0 else if (head xs) == x then 1 else r24_contains_line x (tail xs)
+r24_dedup_go xs acc = if xs == [] then acc
+  else let h = head xs in
+       if (r24_contains_line h acc) == 1 then r24_dedup_go (tail xs) acc
+       else r24_dedup_go (tail xs) (lm4_snoc acc h)
+-- insertion sort (stable, byte-lex). lists are tiny (<=16 lines) so O(n^2) is fine.
+r24_insert x xs = if xs == [] then cons x []
+  else if (r24_lt x (head xs)) == 1 then cons x xs
+  else cons (head xs) (r24_insert x (tail xs))
+r24_sort xs = if xs == [] then [] else r24_insert (head xs) (r24_sort (tail xs))
+r24_nonempty_lines_go cs cur acc =
+  if cs == [] then (if cur == "" then acc else lm4_snoc acc cur)
+  else let c = head cs in
+       if (char_to_int c) == 10 then (if cur == "" then r24_nonempty_lines_go (tail cs) "" acc
+                                       else r24_nonempty_lines_go (tail cs) "" (lm4_snoc acc cur))
+       else r24_nonempty_lines_go (tail cs) (cat [cur, c]) acc
+r24_nonempty_lines text = r24_nonempty_lines_go (chars text) "" []
+r24_join_nl_go xs = if xs == [] then [] else cons (head xs) (cons "\n" (r24_join_nl_go (tail xs)))
+r24_join_nl xs = cat (r24_join_nl_go xs)
+-- canonical SPLIT serialization of a corpus text: sorted unique non-empty lines, each + '\n'.
+r24_split_canon text = r24_join_nl (r24_sort (r24_dedup_go (r24_nonempty_lines text) []))
+r24_split_sha text = sha256_hex (r24_split_canon text)
+
+-- ===== deterministic held-out eval (teacher-forced greedy-argmax next-token accuracy) =====
+-- For a held-out id stream H and the trained weights, slide a cwin window over H; at each position
+-- predict argmax(forward(window)); compare to the true next id. We score TWO accuracies:
+--   - full: every next-token position (context)
+--   - echo: ONLY the positions flagged in `echomask` (the copy-rule positions; built from the line)
+-- This is bit-exact Q.24 integer arithmetic (same forward path as training), so reproducible.
+r24_correct_at ct st w1 w2 emb blk0 blk1 isd window tgt =
+  let logits = lm4_forward ct st w1 w2 emb blk0 blk1 (lm5_ctx_rows emb window) isd in
+  if (lm4_argmax logits) == tgt then 1 else 0
+-- walk positions i = 0 .. len(ids)-cwin-1 ; window = ids[i:i+cwin], tgt = ids[i+cwin].
+-- mask m: 1 at echo positions. Returns [echo_correct, echo_total, full_correct, full_total].
+r24_eval_go ct st w1 w2 emb blk0 blk1 isd ids mask cwin i n ec et fc ft =
+  if i >= n then cons ec (cons et (cons fc (cons ft [])))
+  else
+    let window = lm4_take cwin (lm4_drop i ids) in
+    let tgt = lm4_nth ids (i + cwin) in
+    let ok = r24_correct_at ct st w1 w2 emb blk0 blk1 isd window tgt in
+    let isecho = lm4_nth mask i in
+    r24_eval_go ct st w1 w2 emb blk0 blk1 isd ids mask cwin (i + 1) n
+      (ec + (isecho * ok)) (et + isecho) (fc + ok) (ft + 1)
+r24_eval ct st w1 w2 emb blk0 blk1 isd ids mask cwin =
+  let n = (lm4_len ids) - cwin in
+  if n <= 0 then cons 0 (cons 0 (cons 0 (cons 0 [])))
+  else r24_eval_go ct st w1 w2 emb blk0 blk1 isd ids mask cwin 0 n 0 0 0 0
+
+-- echo-position mask for the held-out id stream: a next-token position i (predicting ids[i+cwin])
+-- is an ECHO position iff the char being predicted is a digit that lies in the COMMENT tail (after
+-- "-- ") AND the SAME digit already appears earlier inside the cwin window (the copy source).
+-- Determined structurally from the decoded chars so the foreign verifier reproduces it identically.
+r24_is_digit_id vocab id = let c = str_sub vocab id 1 in let k = str_find c "0123456789" in if k < 0 then 1 else 0
+-- returns 1 if id decodes to a digit char, else 0 (note: str_find>=0 means digit)
+r24_isdig vocab id = let c = str_sub vocab id 1 in if (str_find c "0123456789") < 0 then 0 else 1
+-- a window "echoes" the target iff target is a digit AND that exact digit id occurs in the window.
+r24_in_window id win = if win == [] then 0 else if (head win) == id then 1 else r24_in_window id (tail win)
+r24_echomask_go ids vocab cwin i n acc =
+  if i >= n then acc
+  else
+    let window = lm4_take cwin (lm4_drop i ids) in
+    let tgt = lm4_nth ids (i + cwin) in
+    let flag = if (r24_isdig vocab tgt) == 1 then (r24_in_window tgt window) else 0 in
+    r24_echomask_go ids vocab cwin (i + 1) n (lm4_snoc acc flag)
+r24_echomask ids vocab cwin = let n = (lm4_len ids) - cwin in if n <= 0 then [] else r24_echomask_go ids vocab cwin 0 n []
+
+-- ===== pure-lookup baseline: n-gram argmax over the TRAIN-ONLY (context -> next) table =====
+-- For each held-out window, find ALL train windows equal to it; argmax over their next-ids (ties ->
+-- lowest id). If no train window matches the context, fall back to id 0 (the line-start token 'm').
+-- This is the memorizer/lookup model: it can only reproduce contexts it has SEEN. By construction
+-- the held-out echo contexts (e.g. "31)) -- ") never appear in train -> fallback -> WRONG on echo.
+r24_build_train_wins_go ids cwin i n acc =
+  if i >= n then acc
+  else r24_build_train_wins_go ids cwin (i + 1) n (lm4_snoc acc (cons (lm4_take cwin (lm4_drop i ids)) (cons (lm4_nth ids (i + cwin)) [])))
+r24_build_train_wins ids cwin = let n = (lm4_len ids) - cwin in if n <= 0 then [] else r24_build_train_wins_go ids cwin 0 n []
+r24_eqlist a b = if a == [] then (if b == [] then 1 else 0) else if b == [] then 0 else if (head a) == (head b) then r24_eqlist (tail a) (tail b) else 0
+-- count occurrences of next-id `cand` among train-wins whose context == win
+r24_count_next win cand wins = if wins == [] then 0
+  else let e = head wins in
+       let add = if ((r24_eqlist (head e) win) == 1) then (if (lm4_nth e 1) == cand then 1 else 0) else 0 in
+       add + r24_count_next win cand (tail wins)
+-- does any train-win have this context?
+r24_ctx_seen win wins = if wins == [] then 0 else if (r24_eqlist (head (head wins)) win) == 1 then 1 else r24_ctx_seen win (tail wins)
+-- argmax next-id over vocab for a given context (lowest id wins ties); 0 if context unseen.
+-- MUTUAL RECURSION (_a/_b): the new `bc` arg reads the OLD `c` arg, a cross-dependency that the
+-- self-loop codegen miscompiles (rail-bug-self-loop-cross-dep-args). Mutual recursion dodges it.
+r24_lookup_argmax_a win wins vsize c best bc =
+  if c >= vsize then bc
+  else let cnt = r24_count_next win c wins in
+       if cnt > best then r24_lookup_argmax_b win wins vsize (c + 1) cnt c
+       else r24_lookup_argmax_b win wins vsize (c + 1) best bc
+r24_lookup_argmax_b win wins vsize c best bc =
+  if c >= vsize then bc
+  else let cnt = r24_count_next win c wins in
+       if cnt > best then r24_lookup_argmax_a win wins vsize (c + 1) cnt c
+       else r24_lookup_argmax_a win wins vsize (c + 1) best bc
+r24_lookup_pred win wins vsize = if (r24_ctx_seen win wins) == 0 then 0 else r24_lookup_argmax_a win wins vsize 0 (0 - 1) 0
+r24_lookup_eval_go wins ids mask cwin vsize i n ec et =
+  if i >= n then cons ec (cons et [])
+  else
+    let window = lm4_take cwin (lm4_drop i ids) in
+    let tgt = lm4_nth ids (i + cwin) in
+    let ok = if (r24_lookup_pred window wins vsize) == tgt then 1 else 0 in
+    let isecho = lm4_nth mask i in
+    r24_lookup_eval_go wins ids mask cwin vsize (i + 1) n (ec + (isecho * ok)) (et + isecho)
+r24_lookup_eval wins ids mask cwin vsize =
+  let n = (lm4_len ids) - cwin in if n <= 0 then cons 0 (cons 0 []) else r24_lookup_eval_go wins ids mask cwin vsize 0 n 0 0
+
+-- ===== signed SPLIT record (committed BEFORE checkpoint 0; prev = genesis) =====
+-- link = SHA256(genesis "|SPLIT|" train_split_sha "|" holdout_split_sha "|" cwin "|" T_num "|" T_den)
+-- The TRAIN sha is what the model trains on; the HOLDOUT sha proves the test set identity. Signing
+-- from the train side (the seed is the trainer's key) binds the split BEFORE any weight is seen.
+r24_split_record genesis_hex train_sha hold_sha cwin tnum tden seed pk =
+  let link_str = cat [genesis_hex, "|SPLIT|", train_sha, "|", hold_sha, "|", show cwin, "|", show tnum, "|", show tden] in
+  let link_b = sha256 link_str in
+  let link_hex = bytes_to_hex link_b 32 in
+  let sig = ed25519_sign seed link_b 32 in
+  let sig_hex = bytes_to_hex sig 64 in
+  let ok = ed25519_verify pk link_b 32 sig in
+  let line = cat ["SPLIT ", train_sha, " ", hold_sha, " ", show cwin, " ", show tnum, " ", show tden, " ", genesis_hex, " ", link_hex, " ", sig_hex] in
+  cons link_hex (cons line (cons ok []))

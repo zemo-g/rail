@@ -1,0 +1,169 @@
+-- rungs/r33/frost_main.rail
+-- ============================================================================
+-- RUNG 33 driver: 2-of-3 FROST-Ed25519 threshold sign over the pulse-anchored
+-- utterance link, verified by the UNMODIFIED ed25519_verify, with the rung's
+-- falsifiers. Compute-disciplined: this driver performs NO lm10 training. It
+-- threshold-signs the SAME 32-byte message ed25519 signs in the proven
+-- attested-utterance pipeline (`ulink_b`), read from out/u_ulink.txt when the
+-- proven run has produced it, else a self-contained pulse-anchored message so
+-- the crypto gate stands alone. The composition into the full pipeline (swap
+-- the single-key `usig` for this `gsig`) is spelled out in IMPL.md.
+-- ============================================================================
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "rungs/r33/frost.rail"
+
+-- list nth helper (local; avoids depending on lm4_nth)
+lm_nth xs i = if i <= 0 then head xs else lm_nth (tail xs) (i - 1)
+-- 64-byte sig equality
+frost_sig_eq a b = frost_sig_eq_loop a b 0 0
+frost_sig_eq_loop a b i acc =
+  if i >= 64 then (if acc == 0 then 1 else 0)
+  else frost_sig_eq_loop a b (i + 1) (bit_or acc (bit_xor (arr_get a i) (arr_get b i)))
+
+-- helper: flip one bit of a 64-byte sig (returns a fresh copy)
+flip_sig_bit sig idx =
+  let d = arr_new 64 0 in
+  let _ = sha_copy_bytes sig d 0 0 64 in
+  let _ = arr_set d idx (bit_xor (arr_get d idx) 1) in
+  d
+
+main =
+  -- ===== the message to threshold-sign =====
+  -- pulse: a LOCAL/DEV beacon stand-in (rung 28 supplies a live pulse; here a
+  -- fixed dev value keeps the demo off any prod sign surface).
+  let pulse32 = sha256 "LM10.LOCAL.BEACON.PULSE.dev.rung33" in
+  let pulse_hex = bytes_to_hex pulse32 32 in
+  -- message: a self-contained pulse-anchored utterance link. This is the SAME
+  -- SHAPE as the proven attested_utterance `ulink_b` (a 32-byte SHA-256 of the
+  -- canonical UTTER record). The composition into the full pipeline -- replace
+  -- `usig = ed25519_sign seed ulink_b 32` with this 2-of-3 ceremony over the
+  -- real ulink_b -- is documented in IMPL.md. We keep the gate self-contained
+  -- and deterministic (no lm10 re-train) so the threshold-crypto rung stands on
+  -- its own; the message bytes are pulse-anchored either way.
+  let msg32 = sha256 (cat ["RUNG33|UTTER|", pulse_hex, "|standalone-utterance-link"]) in
+  let msg_hex = bytes_to_hex msg32 32 in
+  -- ===== dealer secrets (DEMO ONLY -- production uses a DKG; see IMPL.md) ==
+  -- s = group secret (never held by any signer at sign time), a1 = poly coeff.
+  let s = sc_reduce (sha512_bytes (sha256 "rung33.dealer.group.secret.dev") 32) in
+  let a1 = sc_reduce (sha512_bytes (sha256 "rung33.dealer.poly.a1.dev") 32) in
+  -- ===== 2-of-3 ceremony over {signer1, signer2} =====
+  let r = frost_2of3_sign s a1 msg32 pulse32 in
+  let sig = lm_nth r 0 in
+  let A_enc = lm_nth r 1 in
+  let R_enc = lm_nth r 2 in
+  let z1 = lm_nth r 3 in
+  let z2 = lm_nth r 4 in
+  let sh1 = lm_nth r 5 in
+  let sh2 = lm_nth r 6 in
+  -- ===== THE GATE: UNMODIFIED ed25519_verify accepts under the GROUP pk =====
+  let okGroup = ed25519_verify A_enc msg32 32 sig in
+  -- ===== distinct-pubkey: each signer's individual pk must differ from group
+  let pk1 = frost_scalar_mult_base sh1 in
+  let pk2 = frost_scalar_mult_base sh2 in
+  let okDistinct = if (sc_eq pk1 pk2) == 1 then 0
+                   else if (sc_eq pk1 A_enc) == 1 then 0
+                   else if (sc_eq pk2 A_enc) == 1 then 0
+                   else 1 in
+  -- ===== any 2-of-3 verifies under the SAME group pk =====
+  let r13 = frost_2of3_sign_pair s a1 msg32 pulse32 1 3 in
+  let sig13 = lm_nth r13 0 in
+  let A13 = lm_nth r13 1 in
+  let okPair13 = ed25519_verify A_enc msg32 32 sig13 in
+  let okSameGroup = if (sc_eq A13 A_enc) == 1 then 1 else 0 in
+  let r23 = frost_2of3_sign_pair s a1 msg32 pulse32 2 3 in
+  let sig23 = lm_nth r23 0 in
+  let okPair23 = ed25519_verify A_enc msg32 32 sig23 in
+  -- ===== re-run determinism: same shares+pulse -> byte-identical sig =====
+  let r_again = frost_2of3_sign s a1 msg32 pulse32 in
+  let sig_again = lm_nth r_again 0 in
+  let okDet = if (frost_sig_eq sig sig_again) == 1 then 1 else 0 in
+  -- ===== FALSIFIER 1: only k-1 shares (single signer cannot reconstruct) ==
+  -- A lone signer1 forms R1 alone, c over R1, partial z1 with its lambda for
+  -- a {1} "set" (lambda=1). sig=(R1_enc||z1). Must FAIL verify under A.
+  let R1solo = frost_commit sh1 pulse32 msg32 in
+  let R1enc = let o = arr_new 32 0 in let _ = ed_encode o R1solo in o in
+  let csolo = frost_challenge R1enc A_enc msg32 in
+  let zsolo = sc_muladd csolo sh1 (frost_nonce sh1 pulse32 msg32) in
+  let sigsolo = frost_assemble_sig R1enc zsolo in
+  let okMinorityFails = if (ed25519_verify A_enc msg32 32 sigsolo) == 0 then 1 else 0 in
+  -- ===== FALSIFIER 2: tamper one partial pre-aggregation -> aggregate fails
+  let z1bad = sc_add z1 (sc_one32 0) in
+  let zsum_bad = sc_add z1bad z2 in
+  let sig_bad = frost_assemble_sig R_enc zsum_bad in
+  let okTamperPartial = if (ed25519_verify A_enc msg32 32 sig_bad) == 0 then 1 else 0 in
+  -- ===== FALSIFIER 3: "k=2" reusing signer1 twice -> caught by distinct-pk =
+  -- Reconstruct with set {1,1}: lambda undefined (xj-xi=0 -> sc_inv(0)),
+  -- and the two pubkeys are identical -> okDistinct already catches identity
+  -- reuse. We also show the duplicate-id sig does NOT verify under A.
+  let lamdup = frost_lagrange2 1 1 in        -- inv(0) -> 0; lambda=0
+  let zd = frost_partial sh1 pulse32 msg32 (frost_challenge R_enc A_enc msg32) lamdup in
+  let zdup = sc_add zd zd in
+  let sigdup = frost_assemble_sig R_enc zdup in
+  let okDupFails = if (ed25519_verify A_enc msg32 32 sigdup) == 0 then 1 else 0 in
+  -- ===== FALSIFIER 4: flip one sig bit -> reject =====
+  let okBitflip = if (ed25519_verify A_enc msg32 32 (flip_sig_bit sig 10)) == 0 then 1 else 0 in
+  -- ===== FALSIFIER 5: wrong message (pulse swapped) -> reject =====
+  let msg_other = sha256 (cat ["RUNG33|UTTER|", pulse_hex, "|DIFFERENT"]) in
+  let okWrongMsg = if (ed25519_verify A_enc msg_other 32 sig) == 0 then 1 else 0 in
+  -- ===== sanity: sc_inv is correct (a * a^-1 == 1 mod L) =====
+  let atest = sc_reduce (sha512_bytes (sha256 "rung33.inv.test") 32) in
+  let okInv = if (sc_eq (sc_mul atest (sc_inv atest)) (sc_one32 0)) == 1 then 1 else 0 in
+  -- ===== persist the threshold-signed ledger for the FOREIGN verifier =====
+  let sig_hex = bytes_to_hex sig 64 in
+  let A_hex = bytes_to_hex A_enc 32 in
+  let R_hex = bytes_to_hex R_enc 32 in
+  let z1_hex = bytes_to_hex z1 32 in
+  let z2_hex = bytes_to_hex z2 32 in
+  let s_hex = bytes_to_hex s 32 in
+  let a1_hex = bytes_to_hex a1 32 in
+  let ledger = cat [
+    "# RUNG33-FROST-ED25519 v1\n",
+    "pulse_hex ", pulse_hex, "\n",
+    "msg_hex ", msg_hex, "\n",
+    "group_pk ", A_hex, "\n",
+    "R_enc ", R_hex, "\n",
+    "z1 ", z1_hex, "\n",
+    "z2 ", z2_hex, "\n",
+    "sig ", sig_hex, "\n",
+    "n 3\n",
+    "t 2\n",
+    "signers 1,2\n",
+    "# dealer secrets (DEMO ONLY) -- present so the foreign verifier can\n",
+    "# independently rebuild shares, run its own 2-of-3 ceremony, AND confirm\n",
+    "# no party holds s at sign time (s only appears in the dealer setup).\n",
+    "dealer_s ", s_hex, "\n",
+    "dealer_a1 ", a1_hex, "\n"
+  ] in
+  let _ = write_file "rungs/r33/frost_ledger.txt" ledger in
+  -- ===== GATE COMPOSITION =====
+  let all = okGroup * okDistinct * okPair13 * okSameGroup * okPair23 * okDet
+            * okMinorityFails * okTamperPartial * okDupFails * okBitflip
+            * okWrongMsg * okInv in
+  let _ = print "============ RUNG 33: k-of-n THRESHOLD-SIGNED UTTERANCE ============" in
+  let _ = print (cat ["message (utterance link)  = ", msg_hex]) in
+  let _ = print (cat ["pulse (DEV beacon)        = ", pulse_hex]) in
+  let _ = print (cat ["group pubkey A            = ", A_hex]) in
+  let _ = print (cat ["aggregate R               = ", R_hex]) in
+  let _ = print (cat ["threshold sig (R||S)      = ", sig_hex]) in
+  let _ = print "------ verification (UNMODIFIED ed25519_verify) ------" in
+  let _ = print (cat ["2-of-3 {1,2} verifies under group pk = ", show okGroup]) in
+  let _ = print (cat ["2-of-3 {1,3} verifies under same pk  = ", show okPair13, " (same A=", show okSameGroup, ")"]) in
+  let _ = print (cat ["2-of-3 {2,3} verifies under same pk  = ", show okPair23]) in
+  let _ = print (cat ["distinct per-signer pubkeys          = ", show okDistinct]) in
+  let _ = print (cat ["deterministic (re-run byte-identical)= ", show okDet]) in
+  let _ = print (cat ["sc_inv correct (a * a^-1 == 1 mod L) = ", show okInv]) in
+  let _ = print "------ falsifiers (each must REJECT) ------" in
+  let _ = print (cat ["k-1 (single share) reconstruction fails = ", show okMinorityFails]) in
+  let _ = print (cat ["tampered partial -> aggregate fails     = ", show okTamperPartial]) in
+  let _ = print (cat ["duplicate-signer (key reuse) fails      = ", show okDupFails]) in
+  let _ = print (cat ["one-bit flip rejected                   = ", show okBitflip]) in
+  let _ = print (cat ["wrong message rejected                  = ", show okWrongMsg]) in
+  let _ = print (cat ["ledger written: rungs/r33/frost_ledger.txt"]) in
+  let _ = print (if all == 1
+    then "PASS: a 2-of-3 FROST-Ed25519 threshold over the pulse-anchored utterance link produced a single 64-byte sig the UNMODIFIED ed25519_verify accepts under one group pubkey; no minority forged it; any 2-of-3 reconstructs the same group sig; re-run is byte-identical."
+    else "FAIL") in
+  if all == 1 then 0 else 1

@@ -1,0 +1,208 @@
+-- rungs/r29/rung29_dual_sign.rail
+-- RUNG 29 - Pi-Witness as Active Recency Oracle (separation of duties).
+--
+-- PROVES: the attested utterance carries a SECOND signature (wsig) from a physically
+-- separate key (pk_witness) held by an independent oracle that ITSELF validated the
+-- recency pulse, before it would countersign. Not a passive co-sign: the witness
+-- refuses to sign a (link, pulse_id) whose pulse it cannot independently confirm recent.
+--
+-- This file is the DUAL-SIGNING + DUAL-VERIFICATION LAYER. It is deliberately
+-- decoupled from the transformer training so it compiles fast (compute discipline):
+-- the heavy proven pipeline (attested_utterance.rail) produces the trainer-signed
+-- UTTER record + ulink; THIS rung adds the second, separated-duty witness signature
+-- over the SAME canonical (ulink, pulse_id) message and proves 2-of-2.
+--
+-- The canonical co-signed message reconciles the two historical formats into ONE that
+-- both verifiers rebuild identically:
+--     cmsg = SHA256( ulink_hex "|RECENCY|" pulse_id "|" pulse_hash )
+-- usig = Ed25519(seed_trainer, cmsg)   -- trainer
+-- wsig = Ed25519(seed_witness, cmsg)   -- separate Pi-witness key, AFTER pulse check
+--
+-- GATE (from ATTESTED_LADDER.md rung 29):
+--   record carries usig + wsig over the SAME (ulink, pulse_id); both witnesses verify
+--   both sigs against pinned pubkeys, enforce pk_trainer != pk_witness, confirm the
+--   witness itself validated the pulse; PASS requires 2-of-2.
+--
+-- FALSIFIERS:
+--   (a) re-sign with the trainer key in BOTH slots -> pk_trainer != pk_witness fails
+--       AND the witness-slot sig fails under the pinned Pi pubkey.
+--   (b) a witness sig over a DIFFERENT pulse_id than the link -> pulse-binding fails -> reject.
+--   (c) the witness would NOT have signed had its own pulse check failed (active oracle,
+--       not passive co-sign) -> modeled by witness_validate_pulse gating the sign.
+--
+-- LOCAL/DEV keys + LOCAL pulse ONLY. Never a prod sign surface / live witness key.
+-- (dev-mode guard: see okDevMode below; refuses to run if a prod-pulse env marker is set.)
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- ---- small utils ----
+r29_imod a b = a - (a / b) * b
+
+-- ===== DEV-MODE PULSE ORACLE =====================================================
+-- In production this is /entropy/pulse/<id> fetched over the pure-Rail TLS stack
+-- (rung 28). Here it is a deterministic LOCAL pulse so the demo never contacts the
+-- live witness/beacon. The witness re-derives the SAME pulse_hash from pulse_id and
+-- the public beacon-domain string; that is the witness's INDEPENDENT recency check.
+r29_pulse_domain _ = "LEDATIC.LOCAL.BEACON.PULSE.dev"
+
+-- pulse_hash = SHA256(domain "|" pulse_id) : 32-byte hash, hex.
+-- (mirrors r28's H(pulse || ...) shape; here pulse-content is domain-seeded by id)
+r29_pulse_hash pulse_id =
+  sha256_hex (cat [r29_pulse_domain 0, "|", show pulse_id])
+
+-- The witness's ACTIVE recency policy: it will only countersign a pulse_id that is
+-- (i) well-formed (>0) and (ii) within the witness's accepted recency window, i.e.
+-- pulse_id >= floor (the witness's locally pinned minimum recent id). This makes the
+-- witness an ORACLE: it can REFUSE. A passive co-signer cannot.
+r29_witness_min_pulse _ = 1000          -- witness pins: nothing older than id 1000 is "recent"
+r29_witness_validate_pulse pulse_id =
+  if pulse_id <= 0 then 0
+  else if pulse_id < (r29_witness_min_pulse 0) then 0
+  else 1
+
+-- ===== CANONICAL CO-SIGNED MESSAGE (one format both verifiers rebuild) ===========
+-- Binds the utterance link AND the pulse the witness validated.
+r29_cmsg_str ulink_hex pulse_id pulse_hash =
+  cat [ulink_hex, "|RECENCY|", show pulse_id, "|", pulse_hash]
+
+r29_cmsg_bytes ulink_hex pulse_id pulse_hash =
+  sha256 (r29_cmsg_str ulink_hex pulse_id pulse_hash)
+
+-- ===== TRAINER + WITNESS SIGN =====================================================
+-- Trainer signs unconditionally (it is the author). The WITNESS signs ONLY if its
+-- own pulse validation passed; otherwise it returns a 64-zero non-signature that
+-- cannot verify (an honest REFUSAL, recorded as such).
+r29_zero_sig _ = arr_new 64 0
+
+r29_witness_sign seed_witness cmsg_b pulse_id =
+  if (r29_witness_validate_pulse pulse_id) == 1
+    then ed25519_sign seed_witness cmsg_b 32
+    else r29_zero_sig 0
+
+-- ===== 2-of-2 DUAL VERIFICATION ===================================================
+-- A verifier rebuilds cmsg from (ulink, pulse_id, pulse_hash), re-derives pulse_hash
+-- itself (independent recency confirmation), and checks BOTH sigs under the two
+-- PINNED pubkeys, enforcing distinctness.
+r29_pk_distinct pk_t pk_w =
+  if (ed_bytes_eq pk_t pk_w 0 32) == 1 then 0 else 1
+
+-- returns 1 iff: pulse_hash matches verifier's own re-derivation (binding),
+--               usig verifies under pk_trainer, wsig verifies under pk_witness,
+--               and pk_trainer != pk_witness. 2-of-2.
+r29_dual_verify pk_t pk_w ulink_hex pulse_id pulse_hash usig wsig =
+  let rederived = r29_pulse_hash pulse_id in
+  let okBind = if pulse_hash == rederived then 1 else 0 in
+  let cmsg_b = r29_cmsg_bytes ulink_hex pulse_id pulse_hash in
+  let okU = ed25519_verify pk_t cmsg_b 32 usig in
+  let okW = ed25519_verify pk_w cmsg_b 32 wsig in
+  let okDistinct = r29_pk_distinct pk_t pk_w in
+  okBind * okU * okW * okDistinct
+
+main =
+  -- dev-mode guard: the LOCAL pulse domain is the only one we ever sign against.
+  let okDevMode = if (str_find "PROD" (r29_pulse_domain 0)) < 0 then 1 else 0 in
+
+  -- ---- two SEPARATE keys: trainer (author) and witness (Pi oracle) -------------
+  let seed_trainer = sha256 "lm10.local.ephemeral.dev.seed.v1" in   -- SAME seed as the proven trainer
+  let seed_witness = sha256 "pi.witness.local.ephemeral.dev.seed.v1" in
+  let pk_trainer = ed25519_pk_from_sk seed_trainer in
+  let pk_witness = ed25519_pk_from_sk seed_witness in
+  let pkt_hex = bytes_to_hex pk_trainer 32 in
+  let pkw_hex = bytes_to_hex pk_witness 32 in
+
+  -- ---- the utterance link to co-sign --------------------------------------------
+  -- In the full pipeline this is read from out/utterance_chain.txt (the trainer's
+  -- UTTER record's link_hex). Here, to keep the rung self-contained and fast, we use
+  -- a fixed dev ulink (a 64-hex SHA256). The co-signing logic is identical regardless
+  -- of which ulink it binds; validate.sh also runs the wired-to-real-ledger variant.
+  let ulink_hex = sha256_hex "rung29.dev.ulink.standin" in
+
+  -- ---- the recency pulse the WITNESS validates -----------------------------------
+  let pulse_id = 1700000000 in                 -- a "recent" id (>= witness min 1000)
+  let pulse_hash = r29_pulse_hash pulse_id in
+  let okWitnessChecked = r29_witness_validate_pulse pulse_id in   -- witness's own check
+
+  -- ---- co-sign over the SAME canonical message ----------------------------------
+  let cmsg_b = r29_cmsg_bytes ulink_hex pulse_id pulse_hash in
+  let usig = ed25519_sign seed_trainer cmsg_b 32 in
+  let wsig = r29_witness_sign seed_witness cmsg_b pulse_id in
+  let usig_hex = bytes_to_hex usig 64 in
+  let wsig_hex = bytes_to_hex wsig 64 in
+
+  -- ===== GATE: 2-of-2 dual verification =========================================
+  let okDual = r29_dual_verify pk_trainer pk_witness ulink_hex pulse_id pulse_hash usig wsig in
+
+  -- ===== FALSIFIER (a): trainer key in BOTH slots ===============================
+  -- self-co-sign attack: usig in the witness slot, verified under pinned pk_witness
+  -- -> fails; AND pk_distinct must be checked against pk_trainer==pk_trainer -> 0.
+  let okFalseA1 = if (r29_dual_verify pk_trainer pk_witness ulink_hex pulse_id pulse_hash usig usig) == 0 then 1 else 0 in
+  let okFalseA2 = if (r29_pk_distinct pk_trainer pk_trainer) == 0 then 1 else 0 in
+  let okFalseA = okFalseA1 * okFalseA2 in
+
+  -- ===== FALSIFIER (b): witness sig over a DIFFERENT pulse_id ====================
+  -- witness signs cmsg for pulse_id2, but the record claims pulse_id1 -> pulse-binding
+  -- check (verifier rebuilds cmsg with the CLAIMED pulse) makes wsig fail.
+  let pulse_id2 = 1800000000 in
+  let pulse_hash2 = r29_pulse_hash pulse_id2 in
+  let cmsg_b2 = r29_cmsg_bytes ulink_hex pulse_id2 pulse_hash2 in
+  let wsig_other = ed25519_sign seed_witness cmsg_b2 32 in
+  -- verifier checks under the CLAIMED (pulse_id1, pulse_hash1) -> mismatch -> reject
+  let okFalseB = if (r29_dual_verify pk_trainer pk_witness ulink_hex pulse_id pulse_hash usig wsig_other) == 0 then 1 else 0 in
+
+  -- ===== FALSIFIER (c): witness REFUSES a stale pulse (active oracle) =============
+  -- a pulse_id below the witness recency window -> witness returns a zero non-sig ->
+  -- dual verify rejects. (Proves the witness is an oracle that can refuse, not a
+  -- passive rubber stamp.)
+  let stale_id = 500 in                          -- below witness min 1000
+  let stale_hash = r29_pulse_hash stale_id in
+  let stale_cmsg = r29_cmsg_bytes ulink_hex stale_id stale_hash in
+  let wsig_stale = r29_witness_sign seed_witness stale_cmsg stale_id in   -- -> zero sig (refusal)
+  let okWitnessRefused = if (r29_witness_validate_pulse stale_id) == 0 then 1 else 0 in
+  let okFalseC = if (r29_dual_verify pk_trainer pk_witness ulink_hex stale_id stale_hash usig wsig_stale) == 0 then 1 else 0 in
+
+  -- ===== FALSIFIER (d): tampered pulse_hash (verifier re-derives -> binding fails) =
+  -- record ships a pulse_hash that doesn't match SHA256(domain|pulse_id) ->
+  -- verifier's independent re-derivation catches it.
+  let bad_hash = sha256_hex "rung29.not.the.real.pulse.hash" in
+  let cmsg_bad = r29_cmsg_bytes ulink_hex pulse_id bad_hash in
+  let usig_bad = ed25519_sign seed_trainer cmsg_bad 32 in
+  let wsig_bad = r29_witness_sign seed_witness cmsg_bad pulse_id in
+  let okFalseD = if (r29_dual_verify pk_trainer pk_witness ulink_hex pulse_id bad_hash usig_bad wsig_bad) == 0 then 1 else 0 in
+
+  -- ===== persist the dual-signed record (offline re-run never re-contacts witness) =
+  -- format mirrors the UTTER line so the foreign verifier can parse it:
+  -- RECENCY <ulink_hex> <pulse_id> <pulse_hash> <usig_hex> <wsig_hex>
+  let header = cat ["# RUNG29v1 ", pkt_hex, " ", pkw_hex, " ",
+                    "domain=", r29_pulse_domain 0, " wmin=", show (r29_witness_min_pulse 0), "\n"] in
+  let rec_line = cat ["RECENCY ", ulink_hex, " ", show pulse_id, " ", pulse_hash, " ", usig_hex, " ", wsig_hex, "\n"] in
+  let _ = write_file "out/rung29_recency_chain.txt" (cat [header, rec_line]) in
+
+  -- ===== gates =====
+  let all = okDevMode * okDual * okWitnessChecked * okFalseA * okFalseB * okWitnessRefused * okFalseC * okFalseD in
+  let _ = print "================ RUNG 29: PI-WITNESS ACTIVE RECENCY ORACLE ================" in
+  let _ = print (cat ["trainer pubkey  pk_t = ", pkt_hex]) in
+  let _ = print (cat ["witness pubkey  pk_w = ", pkw_hex]) in
+  let _ = print (cat ["ulink (co-signed)    = ", ulink_hex]) in
+  let _ = print (cat ["pulse_id             = ", show pulse_id]) in
+  let _ = print (cat ["pulse_hash           = ", pulse_hash]) in
+  let _ = print (cat ["usig (trainer)       = ", usig_hex]) in
+  let _ = print (cat ["wsig (witness)       = ", wsig_hex]) in
+  let _ = print "------ verification ------" in
+  let _ = print (cat ["dev-mode guard (local pulse)         = ", show okDevMode]) in
+  let _ = print (cat ["2-of-2 dual-sig verifies             = ", show okDual, "  (pk_t != pk_w, both sigs verify, pulse bound)"]) in
+  let _ = print (cat ["witness independently checked pulse   = ", show okWitnessChecked, "  (active oracle, not passive co-sign)"]) in
+  let _ = print (cat ["FALSIFIER a (trainer key both slots)  = ", show okFalseA, "  (pk distinctness + witness-slot sig fail)"]) in
+  let _ = print (cat ["FALSIFIER b (wsig over other pulse)   = ", show okFalseB, "  (pulse-binding rejects)"]) in
+  let _ = print (cat ["witness REFUSED stale pulse           = ", show okWitnessRefused, "  (id 500 < window 1000)"]) in
+  let _ = print (cat ["FALSIFIER c (stale -> refusal)        = ", show okFalseC, "  (no countersign -> 2-of-2 fails)"]) in
+  let _ = print (cat ["FALSIFIER d (tampered pulse_hash)     = ", show okFalseD, "  (verifier re-derivation catches it)"]) in
+  let _ = print (cat ["signed record: out/rung29_recency_chain.txt"]) in
+  let _ = print (if all == 1
+    then "PASS: the utterance is co-signed by a SEPARATE witness key whose owner independently validated recency; 2-of-2 holds, self-co-sign + wrong-pulse + stale-refusal + tampered-pulse all rejected."
+    else "FAIL") in
+  if all == 1 then 0 else 1

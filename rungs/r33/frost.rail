@@ -1,0 +1,224 @@
+-- rungs/r33/frost.rail
+-- ============================================================================
+-- RUNG 33 - k-of-n Threshold-Signed Utterance (FROST-Ed25519, in-substrate)
+-- ============================================================================
+-- The threshold-crypto layer. Reuses VERBATIM from stdlib:
+--   ed25519.rail        : ed_scalar_mul, ed_point_add, ed_point_new,
+--                         ed_point_copy, ed_encode, ed_decode, ed_b_bytes,
+--                         ed25519_verify  (UNMODIFIED -- the gate target)
+--   ed25519_scalar.rail : sc_muladd, sc_reduce, sc_l_bytes,
+--                         sc_bn_copy, sc_bn_zero, sc_bn_sub_inplace, sc_bn_ge
+--   sha512.rail         : sha512_bytes, sha_copy_bytes
+--   bytes.rail          : bytes_to_hex, hex_to_bytes
+--
+-- The genuinely-ABSENT pieces this module BUILDS (the rung's named wall):
+--   (a) scalar arithmetic mod L: sc_mul / sc_add / sc_sub / sc_neg
+--   (b) scalar INVERSION mod L  : sc_inv  (Fermat a^(L-2) via square&multiply
+--                                          over the bytes of L-2, using sc_mul)
+--   (b') Lagrange interpolation mod L (uses sc_inv)
+--   (c) deterministic pulse-derived per-signer nonces (anti-reuse)
+--   (d) the binding/challenge hash bit-identical to vanilla ed25519_verify
+--
+-- NOTE on imports: this file is *included* by frost_main.rail (which imports
+-- the stdlib first). It defines no main.
+
+-- ── scalar constants ────────────────────────────────────────────────────
+sc_zero32 _ = arr_new 32 0
+sc_one32 _ =
+  let o = arr_new 32 0 in
+  let _ = arr_set o 0 1 in
+  o
+
+-- L - 2, little-endian 32 bytes. L = 2^252 + 27742317777372353535851937790883648493
+-- L      = edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010 (LE)
+-- L - 2  = ebd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010 (LE)
+--          (low byte ed -> eb; rest unchanged, no borrow beyond byte 0)
+sc_l_minus_2 _ = hex_to_bytes "ebd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010"
+
+-- ── scalar arithmetic mod L (built on sc_muladd) ────────────────────────
+-- sc_mul a b = (a*b + 0) mod L
+sc_mul a b = sc_muladd a b (sc_zero32 0)
+-- sc_add a b = (a*1 + b) mod L
+sc_add a b = sc_muladd a (sc_one32 0) b
+-- sc_neg a = (L - a) mod L  (a is assumed already < L; if a==0 result is 0)
+sc_neg a =
+  let l = sc_l_bytes 0 in
+  let out = arr_new 32 0 in
+  let _ = sc_bn_copy l out 32 in
+  let _ = sc_bn_sub_inplace out a 32 in
+  -- out = L - a; if a was 0, out = L which must reduce to 0. Reduce to be safe.
+  let out64 = arr_new 64 0 in
+  let _ = sc_bn_copy out out64 32 in
+  sc_reduce out64
+-- sc_sub a b = (a - b) mod L = a + (L - b)
+sc_sub a b = sc_add a (sc_neg b)
+
+-- ── scalar equality / zero test (32-byte LE) ────────────────────────────
+sc_eq a b = sc_eq_loop a b 0 0
+sc_eq_loop a b i acc =
+  if i >= 32 then (if acc == 0 then 1 else 0)
+  else sc_eq_loop a b (i + 1) (bit_or acc (bit_xor (arr_get a i) (arr_get b i)))
+sc_is_zero a = sc_eq a (sc_zero32 0)
+
+-- ── scalar inversion mod L: Fermat a^(L-2) mod L ────────────────────────
+-- Square-and-multiply, scanning bits of (L-2) MSB->LSB. (L-2) is ~252 bits,
+-- so ~252 squarings + ~128 multiplies of 256-bit scalars through sc_mul.
+-- Self-tail-recursive driver only (Rail does NOT TCO mutual recursion).
+sc_inv a =
+  let e = sc_l_minus_2 0 in
+  -- result starts at 1
+  let r = sc_one32 0 in
+  sc_inv_iter r a e 255
+sc_inv_iter r a e bit_total =
+  if bit_total < 0 then r
+  else
+    let byte_idx = shr bit_total 3 in
+    let bit_idx = bit_and bit_total 7 in
+    let r2 = sc_mul r r in
+    let b = bit_and (shr (arr_get e byte_idx) bit_idx) 1 in
+    if b == 1 then sc_inv_iter (sc_mul r2 a) a e (bit_total - 1)
+    else sc_inv_iter r2 a e (bit_total - 1)
+
+-- ── group ops over a thin point wrapper ─────────────────────────────────
+-- A "point" is the ed25519.rail extended-coords array [X,Y,Z,T,valid].
+-- base point B (decoded once per call).
+frost_B _ = ed_decode (ed_b_bytes 0)
+-- [k]B for a 32-byte LE scalar k -> encoded 32-byte array.
+frost_scalar_mult_base k =
+  let pt = ed_point_new 0 in
+  let _ = ed_scalar_mul pt k 32 (frost_B 0) in
+  let out = arr_new 32 0 in
+  let _ = ed_encode out pt in
+  out
+-- [k]B -> point (not encoded)
+frost_scalar_mult_base_pt k =
+  let pt = ed_point_new 0 in
+  let _ = ed_scalar_mul pt k 32 (frost_B 0) in
+  pt
+
+-- ── Shamir share evaluation (degree t-1 = 1 polynomial: f(x)=s+a1*x) ────
+-- shares are computed by a trusted dealer ONLY for the demo (see IMPL.md
+-- soundness obligation: production replaces this with a DKG; no party ever
+-- learns s). The dealer is a setup artifact, not part of the per-sign trust.
+-- f(x) = (s + a1*x) mod L, x a small int id (1,2,3,...).
+frost_int_to_scalar n =
+  let b = arr_new 32 0 in
+  let _ = arr_set b 0 (bit_and n 255) in
+  let _ = arr_set b 1 (bit_and (shr n 8) 255) in
+  b
+frost_share s a1 xid =
+  let x = frost_int_to_scalar xid in
+  sc_add s (sc_mul a1 x)
+-- group pubkey A = [s]B (encoded)
+frost_group_pk s = frost_scalar_mult_base s
+
+-- ── Lagrange coefficient for participant xid within a 2-element set ──────
+-- For signer set S={x_i, x_j}, lambda_i = x_j / (x_j - x_i) mod L.
+frost_lagrange2 xi xj =
+  let xis = frost_int_to_scalar xi in
+  let xjs = frost_int_to_scalar xj in
+  let num = xjs in
+  let den = sc_sub xjs xis in
+  sc_mul num (sc_inv den)
+
+-- ── deterministic pulse-derived nonce (anti-reuse) ──────────────────────
+-- r_i = sc_reduce( SHA-512( domain || share_i || pulse32 || msg32 ) )
+-- Binding the share + pulse + message means the same signer never reuses a
+-- nonce across distinct (pulse,msg) and two signers (distinct shares) never
+-- collide. domain = ASCII "FROST-ED25519  nonce-v1" (23 bytes; the exact bytes
+-- are the source of truth, mirrored verbatim in the foreign verifier).
+frost_nonce_domain _ = hex_to_bytes "46524f53542d4544323535313920206e6f6e63652d7631"
+frost_nonce share pulse32 msg32 =
+  let dom = frost_nonce_domain 0 in
+  let dn = 23 in
+  let total = dn + 32 + 32 + 32 in
+  let buf = arr_new total 0 in
+  let _ = sha_copy_bytes dom buf 0 0 dn in
+  let _ = sha_copy_bytes share buf 0 dn 32 in
+  let _ = sha_copy_bytes pulse32 buf 0 (dn + 32) 32 in
+  let _ = sha_copy_bytes msg32 buf 0 (dn + 64) 32 in
+  let h = sha512_bytes buf total in
+  sc_reduce h
+
+-- ── the FROST challenge (BIT-IDENTICAL to ed25519_verify's k) ───────────
+-- c = sc_reduce( SHA-512( R_enc || A_enc || msg32 ) ).
+-- This is EXACTLY ed25519_verify_step4's k = SHA-512(R_enc||pub||msg),
+-- except verify feeds the raw 64-byte hash to [k]A while sign uses the
+-- reduced 32-byte scalar -- both yield the same point ([k mod L]A = [k]A),
+-- so the produced sig verifies under the UNMODIFIED ed25519_verify.
+frost_challenge R_enc A_enc msg32 =
+  let total = 32 + 32 + 32 in
+  let buf = arr_new total 0 in
+  let _ = sha_copy_bytes R_enc buf 0 0 32 in
+  let _ = sha_copy_bytes A_enc buf 0 32 32 in
+  let _ = sha_copy_bytes msg32 buf 0 64 32 in
+  let h = sha512_bytes buf total in
+  sc_reduce h
+
+-- ── one signer's commitment R_i = [r_i]B (point) ────────────────────────
+frost_commit share pulse32 msg32 =
+  frost_scalar_mult_base_pt (frost_nonce share pulse32 msg32)
+
+-- aggregate two commitment points -> encoded R_enc
+frost_aggregate_R Ri Rj =
+  let R = ed_point_new 0 in
+  let _ = ed_point_add R Ri Rj in
+  let out = arr_new 32 0 in
+  let _ = ed_encode out R in
+  out
+
+-- ── one signer's partial response z_i = r_i + c*lambda_i*share_i mod L ──
+-- (sc_muladd is exactly (a*b+c) mod L: a=c*lambda_i, b=share_i, c=r_i.)
+frost_partial share pulse32 msg32 c lambda =
+  let ri = frost_nonce share pulse32 msg32 in
+  let cl = sc_mul c lambda in
+  sc_muladd cl share ri
+
+-- aggregate partials -> S scalar (32-byte LE), then sig = R_enc || S
+frost_assemble_sig R_enc z_sum =
+  let sig = arr_new 64 0 in
+  let _ = sha_copy_bytes R_enc sig 0 0 32 in
+  let _ = sha_copy_bytes z_sum sig 0 32 32 in
+  sig
+
+-- ============================================================================
+-- 2-of-3 ceremony over a 32-byte message `msg32` and a 32-byte `pulse32`.
+-- Returns [sig64, A_enc, R_enc, z1, z2] for the chosen pair (ids 1,2).
+-- s, a1 are the dealer secrets (demo only).
+-- ============================================================================
+frost_2of3_sign s a1 msg32 pulse32 =
+  -- shares for ids 1,2,3 (3 is unused by this pair, present so n=3 is real)
+  let sh1 = frost_share s a1 1 in
+  let sh2 = frost_share s a1 2 in
+  let A_enc = frost_group_pk s in
+  -- chosen set S = {1,2}
+  let R1 = frost_commit sh1 pulse32 msg32 in
+  let R2 = frost_commit sh2 pulse32 msg32 in
+  let R_enc = frost_aggregate_R R1 R2 in
+  let c = frost_challenge R_enc A_enc msg32 in
+  let lam1 = frost_lagrange2 1 2 in
+  let lam2 = frost_lagrange2 2 1 in
+  let z1 = frost_partial sh1 pulse32 msg32 c lam1 in
+  let z2 = frost_partial sh2 pulse32 msg32 c lam2 in
+  let z_sum = sc_add z1 z2 in
+  let sig = frost_assemble_sig R_enc z_sum in
+  cons sig (cons A_enc (cons R_enc (cons z1 (cons z2 (cons sh1 (cons sh2 (cons sh1 [])))))))
+
+-- variant: any other pair {1,3} -> must reconstruct the SAME group sig's
+-- validity (different R_enc/S because nonces differ, but verifies under the
+-- same A). Used to prove "any 2-of-3 reconstruct the same group pubkey".
+frost_2of3_sign_pair s a1 msg32 pulse32 i j =
+  let shi = frost_share s a1 i in
+  let shj = frost_share s a1 j in
+  let A_enc = frost_group_pk s in
+  let Ri = frost_commit shi pulse32 msg32 in
+  let Rj = frost_commit shj pulse32 msg32 in
+  let R_enc = frost_aggregate_R Ri Rj in
+  let c = frost_challenge R_enc A_enc msg32 in
+  let lami = frost_lagrange2 i j in
+  let lamj = frost_lagrange2 j i in
+  let zi = frost_partial shi pulse32 msg32 c lami in
+  let zj = frost_partial shj pulse32 msg32 c lamj in
+  let z_sum = sc_add zi zj in
+  let sig = frost_assemble_sig R_enc z_sum in
+  cons sig (cons A_enc (cons R_enc (cons zi (cons zj []))))

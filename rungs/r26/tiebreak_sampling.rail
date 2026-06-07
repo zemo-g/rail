@@ -1,0 +1,539 @@
+-- ============================================================================
+-- RUNG 26 — Provably-Identical Tie-Break: Nucleus & Top-k
+-- ============================================================================
+-- Self-contained, VALIDATE-READY core for the rung-26 wall. It is *deliberately*
+-- decoupled from the multi-GB lm10 training run so the orchestrator can validate
+-- the genuinely-new wall (tie-break + top-k + nucleus + sample-entropy) on a
+-- *fixed, engineered* Q.24 logit distribution without paying the 2:44 / 8GB
+-- training cost. The proven machinery it reuses is referenced verbatim:
+--
+--   * SHA-256 counter-mode RNG (rung 25): u_t = first 24 bits of
+--     SHA256(rng_key ++ "," ++ show t). NOT an LCG (Rail int63 overflows -> the
+--     documented PRNG trap whose "fix" is awk, which destroys determinism).
+--   * Q.24 softmax with the SAME integer normalizer z (l_smnorm) so the
+--     inverse-CDF walk compares u against integer prefix-sums, never a re-divided
+--     float. (l_softmax/l_vmax/l_exps/l_vsum/l_smnorm are the rung-15 CE-core
+--     kernels in attested_utterance.rail, ported here byte-identically.)
+--   * SHA-256 / Ed25519 chain (sha256_hex, bytes_to_hex, ed25519_sign/verify).
+--
+-- THE WALL (one genuinely new thing): the substrate has NO stable-sort
+-- primitive. So we define an EXPLICIT TOTAL ORDER on (prob, token_id) and prove
+-- it equal in two languages on EXACT TIES. Top-k = k-th largest via repeated
+-- max_below with an identical exact-tie index choice. Nucleus = the smallest
+-- prefix (under that order) whose cumulative Q.24 prob >= p_threshold.
+--
+-- Run:  ./rail_native --out-prefix out/r26_bin rungs/r26/tiebreak_sampling.rail
+--       RAIL_ARENA_MB=512 ./out/r26_bin
+-- (512MB is plenty: no training, just sampling on a fixed distribution.)
+-- ============================================================================
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- ── shared list helpers (mirror attested_utterance.rail) ────────────────────
+r26_len xs = if xs == [] then 0 else 1 + r26_len (tail xs)
+r26_nth xs i = if i == 0 then head xs else r26_nth (tail xs) (i - 1)
+r26_snoc xs v = if xs == [] then cons v [] else cons (head xs) (r26_snoc (tail xs) v)
+
+-- ── Q.24 softmax kernels (ported byte-for-byte from the rung-15 CE core) ─────
+-- PROVEN range-reduced fixed-point exp, ported VERBATIM from the trainer's
+-- bx_fixed.rail (bx4_fxexp / bx4_exp_neg / bx4_exp_pos / bx4_exp_poly /
+-- bx4_pow2). A naive Taylor series DIVERGES for the large negative arguments that
+-- low-temperature softmax produces (logit/tau before max-subtract), so the
+-- argument reduction by ln2 is mandatory -- this is exactly the proven kernel.
+r26_pow2_go acc k = if k == 0 then acc else r26_pow2_go (acc + acc) (k - 1)
+r26_pow2 k = if k < 1 then 1 else r26_pow2_go 1 k
+-- e^f * S for f = fq/S in [0, ln2). Degree-8 Horner. Coeffs c_i = round(S/i!).
+r26_exp_poly fq =
+  let p8 = 416 in
+  let p7 = 3329 + (p8 * fq) / 16777216 in
+  let p6 = 23302 + (p7 * fq) / 16777216 in
+  let p5 = 139810 + (p6 * fq) / 16777216 in
+  let p4 = 699051 + (p5 * fq) / 16777216 in
+  let p3 = 2796203 + (p4 * fq) / 16777216 in
+  let p2 = 8388608 + (p3 * fq) / 16777216 in
+  let p1 = 16777216 + (p2 * fq) / 16777216 in
+  let p0 = 16777216 + (p1 * fq) / 16777216 in
+  p0
+-- e^x * S for x <= 0 (ax = |x|q > 0). LN2_q = round(ln2 * S) = 11629080.
+r26_exp_neg ax =
+  let k = ax / 11629080 in
+  let fq = ax - k * 11629080 in
+  let ef = r26_exp_poly fq in
+  let emf = 281474976710656 / ef in
+  if k >= 50 then 0
+  else let p2 = r26_pow2 k in (emf + p2 / 2) / p2
+-- e^x * S for x > 0. k>=36 branch dead for the bounded domain.
+r26_exp_pos xq =
+  let k = xq / 11629080 in
+  let fq = xq - k * 11629080 in
+  let ef = r26_exp_poly fq in
+  if k >= 36 then ef * (r26_pow2 35)
+  else (ef * (r26_pow2 k))
+r26_fxexp xq = if xq < 0 then r26_exp_neg (0 - xq) else r26_exp_pos xq
+
+r26_vmax_go xs m = if xs == [] then m else let v = head xs in if v > m then r26_vmax_go (tail xs) v else r26_vmax_go (tail xs) m
+r26_vmax xs = r26_vmax_go (tail xs) (head xs)
+r26_exps xs m = if xs == [] then [] else cons (r26_fxexp (head xs - m)) (r26_exps (tail xs) m)
+r26_vsum xs = if xs == [] then 0 else (head xs) + r26_vsum (tail xs)
+r26_smnorm es z = if es == [] then [] else cons ((head es * 16777216) / z) (r26_smnorm (tail es) z)
+-- softmax with TEMPERATURE: logits are prescaled by an exact-integer reciprocal
+-- temperature BEFORE the max-subtract. tau is given as a Q.24 value; the prescale
+-- is (logit * 16777216) / tau  (i.e. logit / tau in Q.24). Higher tau flattens.
+r26_tprescale xs tau = if xs == [] then [] else cons (((head xs) * 16777216) / tau) (r26_tprescale (tail xs) tau)
+r26_softmax_t xs tau =
+  let ts = r26_tprescale xs tau in
+  let m = r26_vmax ts in
+  let es = r26_exps ts m in
+  let z = r26_vsum es in
+  r26_smnorm es z
+
+-- ============================================================================
+-- THE TOTAL ORDER ON (prob, token_id)  — the rung-26 wall
+-- ============================================================================
+-- Stable sorts don't exist in the substrate. We never sort. Instead we define a
+-- strict total order GT((p_a,a),(p_b,b)) and select the k-th largest by repeated
+-- max-below. On EXACT TIES (p_a == p_b) the order falls back to token_id, with a
+-- FIXED tie direction. The Rail tie direction here is: LOWER token_id ranks
+-- HIGHER (wins the tie). The foreign verifier MUST reproduce this exact rule;
+-- the falsifier flips it to prove a single token diverges.
+--
+-- r26_gt p_a a p_b b  ->  1 iff (p_a,a) ranks strictly above (p_b,b)
+--   primary:   larger prob ranks higher
+--   tie-break: equal prob -> SMALLER token_id ranks higher  (TIE_LOW)
+r26_gt p_a a p_b b =
+  if p_a > p_b then 1
+  else if p_a < p_b then 0
+  else if a < b then 1 else 0
+
+-- max_below: scan (prob,id) pairs and return the [prob,id] that is the strict
+-- maximum under r26_gt among those ranking strictly BELOW the ceiling
+-- (ceil_p,ceil_id). Used to walk down the ranking one rung at a time, so the
+-- k-th largest is reached by k-1 below-steps. "below" means r26_gt ceil over it.
+-- Returns [bestp,bestid] or [-1,-1] if nothing ranks below the ceiling.
+-- MUTUAL RECURSION (_a/_b): bestp/bestid are updated together from the current
+-- (p,i); to keep the self-loop arg scheduler from ever reordering the writes,
+-- the recursion alternates between two identical bodies (disables the opt).
+r26_maxbelow_a probs i n ceilp ceilid bestp bestid =
+  if i >= n then cons bestp (cons bestid [])
+  else
+    let p = r26_nth probs i in
+    let isbelow = r26_gt ceilp ceilid p i in       -- ceiling ranks above (p,i)
+    if isbelow == 0 then r26_maxbelow_b probs (i + 1) n ceilp ceilid bestp bestid
+    else
+      let better = if bestid < 0 then 1 else r26_gt p i bestp bestid in
+      if better == 1 then r26_maxbelow_b probs (i + 1) n ceilp ceilid p i
+      else r26_maxbelow_b probs (i + 1) n ceilp ceilid bestp bestid
+r26_maxbelow_b probs i n ceilp ceilid bestp bestid =
+  if i >= n then cons bestp (cons bestid [])
+  else
+    let p = r26_nth probs i in
+    let isbelow = r26_gt ceilp ceilid p i in
+    if isbelow == 0 then r26_maxbelow_a probs (i + 1) n ceilp ceilid bestp bestid
+    else
+      let better = if bestid < 0 then 1 else r26_gt p i bestp bestid in
+      if better == 1 then r26_maxbelow_a probs (i + 1) n ceilp ceilid p i
+      else r26_maxbelow_a probs (i + 1) n ceilp ceilid bestp bestid
+r26_maxbelow probs n ceilp ceilid = r26_maxbelow_a probs 0 n ceilp ceilid 0 (0 - 1)
+
+-- global max under r26_gt (no ceiling): ceiling = (+inf,-1) so everything is below.
+-- We model +inf as a probability strictly above any Q.24 prob: 16777217 > 2^24.
+r26_argmax_pair probs n = let inf = 16777217 in r26_maxbelow probs n inf (0 - 1)
+
+-- topk_ids: the ordered list of the k highest-ranked token_ids under r26_gt,
+-- produced by k applications of max_below (NO sort). Returns ids in rank order.
+r26_topk_go probs n k ceilp ceilid acc =
+  if k <= 0 then acc
+  else
+    let mb = r26_maxbelow probs n ceilp ceilid in
+    let bp = head mb in
+    let bid = r26_nth mb 1 in
+    if bid < 0 then acc
+    else r26_topk_go probs n (k - 1) bp bid (r26_snoc acc bid)
+r26_topk_ids probs n k = let inf = 16777217 in r26_topk_go probs n k inf (0 - 1) []
+
+-- ============================================================================
+-- NUCLEUS (top-p): smallest prefix under r26_gt whose cumulative Q.24 prob
+-- >= p_threshold (p_threshold in Q.24, e.g. 0.9 = 15099494). The prefix is
+-- walked in rank order via the SAME max_below ladder, so the membership set is a
+-- deterministic function of the order on exact ties.
+-- Returns the list of token_ids in the nucleus (rank order).
+r26_nucleus_go probs n pthr ceilp ceilid cum acc =
+  if cum >= pthr then acc
+  else
+    let mb = r26_maxbelow probs n ceilp ceilid in
+    let bp = head mb in
+    let bid = r26_nth mb 1 in
+    if bid < 0 then acc
+    else r26_nucleus_go probs n pthr bp bid (cum + bp) (r26_snoc acc bid)
+r26_nucleus_ids probs n pthr = let inf = 16777217 in r26_nucleus_go probs n pthr inf (0 - 1) []
+
+-- ============================================================================
+-- SHA-256 counter-mode RNG (rung 25 mechanism). u_t = first 24 bits of
+-- SHA256(rng_key ++ "," ++ show t), returned as an integer in [0, 2^24).
+-- ============================================================================
+r26_u_t rng_key t =
+  let d = sha256 (cat [rng_key, ",", show t]) in
+  (arr_get d 0) * 65536 + (arr_get d 1) * 256 + (arr_get d 2)
+
+-- inverse-CDF draw RESTRICTED to a candidate-id set (top-k ids or nucleus ids).
+-- Renormalize the candidate masses to a fresh integer z' = sum of candidate
+-- probs, then walk integer prefix-sums comparing u' (scaled into [0,z')) with
+-- the SAME integer normalizer (never a re-divided float). Boundary is `<` on the
+-- running prefix-sum INCLUSIVE upper edge: token i wins iff
+--   prefix_before_i <= u' < prefix_before_i + cand_p_i
+-- which is the `<` upper / `>=` lower convention rung 25 pins. Candidate set is
+-- in rank order; ties already resolved by membership.
+r26_cand_mass probs ids = if ids == [] then 0 else (r26_nth probs (head ids)) + r26_cand_mass probs (tail ids)
+-- u' = u_t mapped into [0, z') by (u_t * z') / 2^24  (integer, deterministic)
+r26_scale_u u zc = (u * zc) / 16777216
+r26_walk_go probs ids up run =
+  if ids == [] then (0 - 1)               -- should not happen: up < z'
+  else
+    let id = head ids in
+    let p = r26_nth probs id in
+    let nxt = run + p in
+    if up < nxt then id                   -- prefix_before <= u' < prefix_before+p
+    else r26_walk_go probs (tail ids) up nxt
+-- draw one token from a candidate set under the chain-seeded RNG at step t.
+r26_draw probs cand rng_key t =
+  let zc = r26_cand_mass probs cand in
+  let u = r26_u_t rng_key t in
+  let up = r26_scale_u u zc in
+  r26_walk_go probs cand up 0
+
+-- ============================================================================
+-- SAMPLE ENTROPY (the diversity floor). H = -sum p_i log2 p_i, accumulated over
+-- a multi-draw histogram, reported in Q.24 BITS. The histogram counts realized
+-- draws across T sampled tokens; entropy of the empirical draw distribution is
+-- the attested, falsifiable diversity quantity. A memorized/low-tau model
+-- collapses to a single id -> H = 0; high-tau spreads mass -> H > floor.
+-- ============================================================================
+-- fixed-point log2 in Q.24 via the rung-15 ln kernel scaled by 1/ln2.
+-- ln(x) for x in Q.24; reuse the same truncating series as the trainer's fxln,
+-- restated locally (range-reduce by powers of two using mutual recursion to dodge
+-- the self-loop cross-dep-arg miscompile).
+r26_ln_up_a m k s = if m >= s then k else r26_ln_up_b (m + m) (k - 1) s
+r26_ln_up_b m k s = if m >= s then k else r26_ln_up_a (m + m) (k - 1) s
+r26_ln_upm_a m s = if m >= s then m else r26_ln_upm_b (m + m) s
+r26_ln_upm_b m s = if m >= s then m else r26_ln_upm_a (m + m) s
+r26_ln_dn_a m k s2 = if m < s2 then k else r26_ln_dn_b (m / 2) (k + 1) s2
+r26_ln_dn_b m k s2 = if m < s2 then k else r26_ln_dn_a (m / 2) (k + 1) s2
+r26_ln_dnm_a m s2 = if m < s2 then m else r26_ln_dnm_b (m / 2) s2
+r26_ln_dnm_b m s2 = if m < s2 then m else r26_ln_dnm_a (m / 2) s2
+r26_ln_mant m =
+  let num = (m - 16777216) * 16777216 in
+  let den = m + 16777216 in
+  let t = num / den in
+  let t2 = (t * t) / 16777216 in
+  let a0 = t in
+  let tp3 = (t * t2) / 16777216 in
+  let a1 = a0 + tp3 / 3 in
+  let tp5 = (tp3 * t2) / 16777216 in
+  let a2 = a1 + tp5 / 5 in
+  let tp7 = (tp5 * t2) / 16777216 in
+  let a3 = a2 + tp7 / 7 in
+  let tp9 = (tp7 * t2) / 16777216 in
+  let a4 = a3 + tp9 / 9 in
+  a4 + a4
+r26_fxln x =
+  if x < 1 then 0
+  else
+    let s = 16777216 in
+    let s2 = s + s in
+    let k0 = r26_ln_up_a x 0 s in
+    let m0 = r26_ln_upm_a x s in
+    let k1 = r26_ln_dn_a m0 k0 s2 in
+    let m1 = r26_ln_dnm_a m0 s2 in
+    k1 * 11629080 + r26_ln_mant m1
+-- log2(x) = ln(x) / ln(2). 1/ln2 in Q.24 = round(2^24 / 0.6931471805599453) =
+-- 24204406. So log2 (Q.24) = (fxln(x) * 24204406) / 2^24.
+r26_log2 x = (r26_fxln x * 24204406) / 16777216
+-- entropy over a histogram of counts: probs_i = count_i / total. H_bits =
+-- -sum (p_i * log2 p_i). Computed in Q.24. count list -> total -> H.
+r26_hist_total cs = if cs == [] then 0 else (head cs) + r26_hist_total (tail cs)
+r26_entropy_go cs total acc =
+  if cs == [] then acc
+  else
+    let c = head cs in
+    if c <= 0 then r26_entropy_go (tail cs) total acc
+    else
+      let p = (c * 16777216) / total in       -- p_i in Q.24
+      let lg = r26_log2 p in                   -- log2(p_i) in Q.24 (negative)
+      let term = (p * lg) / 16777216 in        -- p_i*log2 p_i in Q.24 (negative)
+      r26_entropy_go (tail cs) total (acc - term)
+r26_entropy_q24 cs = let total = r26_hist_total cs in if total <= 0 then 0 else r26_entropy_go cs total 0
+
+-- build a vocab-sized histogram from a list of drawn ids.
+r26_zeros n = if n <= 0 then [] else cons 0 (r26_zeros (n - 1))
+r26_bump cs id = r26_bump_go cs id 0
+r26_bump_go cs id i =
+  if cs == [] then []
+  else if i == id then cons ((head cs) + 1) (tail cs)
+  else cons (head cs) (r26_bump_go (tail cs) id (i + 1))
+r26_hist_of ids vsize = r26_hist_build ids (r26_zeros vsize)
+r26_hist_build ids cs = if ids == [] then cs else r26_hist_build (tail ids) (r26_bump cs (head ids))
+
+-- ============================================================================
+-- MULTI-DRAW: draw T tokens from a FIXED distribution under counter-mode RNG.
+-- (In the full pipeline the distribution is recomputed per step from the model;
+-- here the distribution is fixed so the rung tests the SAMPLING wall in
+-- isolation. The per-step recompute is identical machinery -- r26_softmax_t of
+-- the live logits -- and is wired in the integration note in IMPL.md.)
+-- mode: 1 = top-k(k), 2 = nucleus(pthr).  Returns the list of drawn ids.
+r26_draws_go probs cand vsize rng_key t tcap acc =
+  if t >= tcap then acc
+  else
+    let id = r26_draw probs cand rng_key t in
+    r26_draws_go probs cand vsize rng_key (t + 1) tcap (r26_snoc acc id)
+r26_draws probs cand vsize rng_key tcap = r26_draws_go probs cand vsize rng_key 0 tcap []
+
+-- canonical serialization of a drawn id stream -> t_hex (mirrors utt_ids_canon).
+r26_ids_canon ids = if ids == [] then "" else cat [show (head ids), ",", r26_ids_canon (tail ids)]
+
+-- canonical serialization of an id LIST (membership set) for committing the
+-- nucleus / top-k membership into the link (so the verifier checks the same set).
+r26_set_canon ids = if ids == [] then "" else cat [show (head ids), ".", r26_set_canon (tail ids)]
+
+-- ============================================================================
+-- THE ENGINEERED EXACT-TIE DISTRIBUTION
+-- ============================================================================
+-- A fixed Q.24 logit vector with a DELIBERATE exact tie between two tokens, so
+-- the tie-break rule is load-bearing. vocab = 6. logits chosen so:
+--   * tokens 2 and 4 have IDENTICAL logits -> identical softmax probs (exact tie)
+--   * the tie sits ON the nucleus boundary at one tau, so opposite tie-break ->
+--     different nucleus membership -> a drawn token diverges (the falsifier).
+-- logits given directly in Q.24:  [3.0, 1.0, 2.0, 0.5, 2.0, 1.5]
+--   token 0: 3.0  = 50331648
+--   token 1: 1.0  = 16777216
+--   token 2: 2.0  = 33554432   <-- tie with token 4
+--   token 3: 0.5  =  8388608
+--   token 4: 2.0  = 33554432   <-- tie with token 2
+--   token 5: 1.5  = 25165824
+r26_demo_logits _ =
+  cons 50331648 (cons 16777216 (cons 33554432 (cons 8388608 (cons 33554432 (cons 25165824 [])))))
+
+-- ── OPPOSITE tie-break nucleus (the falsifier's order): identical to
+--    r26_nucleus_ids but the exact-tie direction flips (higher token_id wins).
+--    A parallel gt/maxbelow pair so the ONLY difference is the tie rule. ───────
+r26_gt_opp p_a a p_b b =
+  if p_a > p_b then 1
+  else if p_a < p_b then 0
+  else if a > b then 1 else 0
+r26_maxbelow_opp_a probs i n ceilp ceilid bestp bestid =
+  if i >= n then cons bestp (cons bestid [])
+  else
+    let p = r26_nth probs i in
+    let isbelow = r26_gt_opp ceilp ceilid p i in
+    if isbelow == 0 then r26_maxbelow_opp_b probs (i + 1) n ceilp ceilid bestp bestid
+    else
+      let better = if bestid < 0 then 1 else r26_gt_opp p i bestp bestid in
+      if better == 1 then r26_maxbelow_opp_b probs (i + 1) n ceilp ceilid p i
+      else r26_maxbelow_opp_b probs (i + 1) n ceilp ceilid bestp bestid
+r26_maxbelow_opp_b probs i n ceilp ceilid bestp bestid =
+  if i >= n then cons bestp (cons bestid [])
+  else
+    let p = r26_nth probs i in
+    let isbelow = r26_gt_opp ceilp ceilid p i in
+    if isbelow == 0 then r26_maxbelow_opp_a probs (i + 1) n ceilp ceilid bestp bestid
+    else
+      let better = if bestid < 0 then 1 else r26_gt_opp p i bestp bestid in
+      if better == 1 then r26_maxbelow_opp_a probs (i + 1) n ceilp ceilid p i
+      else r26_maxbelow_opp_a probs (i + 1) n ceilp ceilid bestp bestid
+r26_maxbelow_opp probs n ceilp ceilid = r26_maxbelow_opp_a probs 0 n ceilp ceilid 0 (0 - 1)
+r26_nucleus_opp_go probs n pthr ceilp ceilid cum acc =
+  if cum >= pthr then acc
+  else
+    let mb = r26_maxbelow_opp probs n ceilp ceilid in
+    let bp = head mb in
+    let bid = r26_nth mb 1 in
+    if bid < 0 then acc
+    else r26_nucleus_opp_go probs n pthr bp bid (cum + bp) (r26_snoc acc bid)
+r26_nucleus_ids_opp probs n pthr = let inf = 16777217 in r26_nucleus_opp_go probs n pthr inf (0 - 1) []
+
+-- count nonzero histogram entries -> a list of 1s; summed gives distinct count.
+r26_nonzero_count cs = if cs == [] then [] else
+  (if (head cs) > 0 then cons 1 (r26_nonzero_count (tail cs)) else r26_nonzero_count (tail cs))
+
+-- comma-canon of a generic int list (for printing probs/logits).
+r26_ids_canon_logits xs = if xs == [] then "" else cat [show (head xs), ",", r26_ids_canon_logits (tail xs)]
+
+main =
+  let _ = print "================ RUNG 26: PROVABLY-IDENTICAL TIE-BREAK ================" in
+  let vsize = 6 in
+  let logits = r26_demo_logits 0 in
+  -- LOCAL/DEV ed25519 key (never a prod sign surface)
+  let seed = sha256 "r26.local.ephemeral.dev.seed.v1" in
+  let pk = ed25519_pk_from_sk seed in
+  let pk_hex = bytes_to_hex pk 32 in
+  let genesis_hex = sha256_hex "R26.LOCAL.TIEBREAK.GENESIS.dev" in
+  let rng_key = sha256_hex "r26.chain.seeded.rng.key.dev" in
+
+  -- ---- HIGH TEMPERATURE (tau = 4.0 = 67108864): spreads mass -> diversity ----
+  let tauHi = 67108864 in
+  let _ = print "R26-DBG1-before-softmax" in
+  let probsHi = r26_softmax_t logits tauHi in
+  let _ = print "R26-DBG2-after-softmax" in
+  let zHi = r26_vsum probsHi in
+  -- top-k = 4 (its realized draw spread is the DIVERSITY quantity, gated > floor).
+  -- nucleus threshold is pinned at the ENGINEERED exact-tie boundary p ~= 0.317
+  -- (Q.24 = 5313871): under TIE_LOW the nucleus is {0,2}, under TIE_HIGH it is
+  -- {0,4} -- membership DIFFERS, so the opposite tie-break makes a drawn token
+  -- diverge (the sharpest form of the rung-26 falsifier).
+  let kk = 4 in
+  let pthr = 5313871 in
+  let tkHi = r26_topk_ids probsHi vsize kk in
+  let _ = print "R26-DBG3-after-topk" in
+  let nucHi = r26_nucleus_ids probsHi vsize pthr in
+  let _ = print "R26-DBG4-after-nucleus" in
+  -- draw T=64 tokens from each candidate set under counter-mode RNG.
+  let tcap = 64 in
+  let drawsTkHi = r26_draws probsHi tkHi vsize rng_key tcap in
+  let drawsNucHi = r26_draws probsHi nucHi vsize rng_key tcap in
+  let _ = print "R26-DBG5-after-draws" in
+  let thexTkHi = sha256_hex (r26_ids_canon drawsTkHi) in
+  let thexNucHi = sha256_hex (r26_ids_canon drawsNucHi) in
+  -- sample-entropy of the realized draws (Q.24 bits): top-k spread = diversity,
+  -- nucleus spread tracks the knob.
+  let histTkHi = r26_hist_of drawsTkHi vsize in
+  let entTkHi = r26_entropy_q24 histTkHi in
+  let histNucHi = r26_hist_of drawsNucHi vsize in
+  let entNucHi = r26_entropy_q24 histNucHi in
+  let _ = print "R26-DBG6-after-entropy" in
+
+  -- ---- LOW TEMPERATURE (tau -> 0 modeled by tau = 0.05 = 838860): collapses ----
+  -- the lowest temperature we can represent without divide-by-zero; top-1 mass
+  -- dominates so every draw is the argmax -> single distinct sequence.
+  let tauLo = 838860 in
+  let probsLo = r26_softmax_t logits tauLo in
+  let nucLo = r26_nucleus_ids probsLo vsize pthr in
+  let drawsNucLo = r26_draws probsLo nucLo vsize rng_key tcap in
+  let histNucLo = r26_hist_of drawsNucLo vsize in
+  let entNucLo = r26_entropy_q24 histNucLo in
+  -- count distinct ids drawn at low tau (must be 1)
+  let distinctLo = r26_hist_total (r26_nonzero_count histNucLo) in
+  let _ = print "R26-DBG7-after-lowtemp" in
+
+  -- ---- COMMIT the UTTER record (mode params + Q.24 sample-entropy) + sign ----
+  -- ulink commits: tie rule, k, pthr, tauHi, the top-k membership set, the
+  -- nucleus membership set, both draw-stream t_hexes, the top-k DIVERSITY entropy
+  -- (Htk, gated above the floor) and the nucleus entropy (H, tracks the knob).
+  let tk_set_hex = sha256_hex (r26_set_canon tkHi) in
+  let nuc_set_hex = sha256_hex (r26_set_canon nucHi) in
+  let ulink_str = cat [genesis_hex, "|UTTER26|TIE_LOW|k=", show kk, "|p=", show pthr,
+                       "|tau=", show tauHi, "|rng=", rng_key,
+                       "|tk_set=", tk_set_hex, "|nuc_set=", nuc_set_hex,
+                       "|tk_thex=", thexTkHi, "|nuc_thex=", thexNucHi,
+                       "|Htk=", show entTkHi, "|H=", show entNucHi] in
+  let ulink_b = sha256 ulink_str in
+  let ulink_hex = bytes_to_hex ulink_b 32 in
+  let usig = ed25519_sign seed ulink_b 32 in
+  let usig_hex = bytes_to_hex usig 64 in
+  let uok = ed25519_verify pk ulink_b 32 usig in
+  let _ = print "R26-DBG8-after-sign" in
+
+  -- ============================ FALSIFIERS ============================
+  -- (F1) OPPOSITE TIE-BREAK on the engineered tie. The foreign verifier and the
+  -- Rail trainer agree on TIE_LOW; a verifier running TIE_HIGH must produce a
+  -- DIFFERENT nucleus membership at the boundary tau, hence a different drawn
+  -- token. We simulate the opposite-rule nucleus here and assert its draw-stream
+  -- t_hex DIVERGES from the committed one. (The cross-language half of this lives
+  -- in the foreign checker.)
+  let nucHi_opp = r26_nucleus_ids_opp probsHi vsize pthr in
+  let drawsNucHi_opp = r26_draws probsHi nucHi_opp vsize rng_key tcap in
+  let thexNucHi_opp = sha256_hex (r26_ids_canon drawsNucHi_opp) in
+  -- the engineered distribution makes the two nucleus sets differ -> divergence.
+  let okOppDiverges = if thexNucHi_opp == thexNucHi then 0 else 1 in
+  let _ = print "R26-DBG8b-after-F1-opp" in
+
+  -- (F2) MISLABELED TEMPERATURE. Commit H under tau=4.0 but a verifier recomputes
+  -- entropy under tau=1.0 (16777216). The recomputed entropy must DIFFER from the
+  -- committed H, so a forged record claiming tau=4.0 while actually tau=1.0 fails.
+  let tauMis = 16777216 in
+  let probsMis = r26_softmax_t logits tauMis in
+  let nucMis = r26_nucleus_ids probsMis vsize pthr in
+  let drawsNucMis = r26_draws probsMis nucMis vsize rng_key tcap in
+  let histMis = r26_hist_of drawsNucMis vsize in
+  let entMis = r26_entropy_q24 histMis in
+  let okTauMismatch = if entMis == entNucHi then 0 else 1 in
+  let _ = print "R26-DBG8c-after-F2-taumis" in
+
+  -- (F3) FORGED-COMMITMENT. Tamper the committed tie rule (TIE_LOW->TIE_HIGH) by
+  -- one token; the recorded sig must NOT verify against the tampered link.
+  let flink_str = cat [genesis_hex, "|UTTER26|TIE_HIGH|k=", show kk, "|p=", show pthr,
+                       "|tau=", show tauHi, "|rng=", rng_key,
+                       "|tk_set=", tk_set_hex, "|nuc_set=", nuc_set_hex,
+                       "|tk_thex=", thexTkHi, "|nuc_thex=", thexNucHi,
+                       "|Htk=", show entTkHi, "|H=", show entNucHi] in
+  let flink_b = sha256 flink_str in
+  let okForgeChain = if (ed25519_verify pk flink_b 32 usig) == 0 then 1 else 0 in
+  let _ = print "R26-DBG9-after-falsifiers" in
+
+  -- ============================ GATES ============================
+  -- the tie IS load-bearing: tokens 2 and 4 must have identical Q.24 probs.
+  let p2 = r26_nth probsHi 2 in
+  let p4 = r26_nth probsHi 4 in
+  let okTieExists = if p2 == p4 then 1 else 0 in
+  -- diversity floor at high tau: the realized top-k(4) draw spread exceeds 1 bit
+  -- (Q.24 = 16777216). A 2-token nucleus caps at exactly 1 bit, so the diversity
+  -- claim is carried by the >=3-token top-k spread -- a genuine multi-token draw.
+  let Hfloor = 16777216 in
+  let okDiversityHi = if entTkHi > Hfloor then 1 else 0 in
+  -- single-distinct-sequence as tau->0: low-tau nucleus collapses to 1 id.
+  let okCollapseLo = if distinctLo == 1 then 1 else 0 in
+  -- entropy actually MOVES with the knob: H(high tau) strictly > H(low tau).
+  let okKnobMoves = if entNucHi > entNucLo then 1 else 0 in
+  -- top-k and nucleus produced non-empty, sane sets.
+  let okTk = if (r26_len tkHi) == kk then 1 else 0 in
+  let okNuc = if (r26_len nucHi) > 0 then 1 else 0 in
+  let okUtterSig = if uok == 1 then 1 else 0 in
+
+  let all = okTieExists * okDiversityHi * okCollapseLo * okKnobMoves * okTk * okNuc * okUtterSig * okOppDiverges * okTauMismatch * okForgeChain in
+  let _ = print "R26-DBG10-after-gate" in
+
+  -- ---- persist the signed ledger for the foreign verifier ----
+  let header = cat ["# R26v1 ", pk_hex, " ", genesis_hex, " vsize=", show vsize,
+                    " rng=", rng_key, "\n"] in
+  let logits_line = cat ["LOGITS ", r26_ids_canon_logits logits, "\n"] in
+  let utter_line = cat ["UTTER26 TIE_LOW k=", show kk, " p=", show pthr,
+                        " tau=", show tauHi, " rng=", rng_key,
+                        " tk_set=", tk_set_hex, " nuc_set=", nuc_set_hex,
+                        " tk_thex=", thexTkHi, " nuc_thex=", thexNucHi,
+                        " Htk=", show entTkHi, " H=", show entNucHi, " ulink=", ulink_hex,
+                        " usig=", usig_hex, "\n"] in
+  let sets_line = cat ["SETS tk=", r26_set_canon tkHi, " nuc=", r26_set_canon nucHi,
+                       " nuc_opp=", r26_set_canon nucHi_opp, "\n"] in
+  let _ = write_file "out/r26_chain.txt" (cat [header, logits_line, sets_line, utter_line]) in
+
+  let _ = print (cat ["vocab=", show vsize, "  tie rule=TIE_LOW (lower id wins)"]) in
+  let _ = print (cat ["high-tau probs (Q.24): ", r26_ids_canon_logits probsHi, " (z=", show zHi, ")"]) in
+  let _ = print (cat ["engineered exact tie: p[2]=", show p2, " p[4]=", show p4, "  tie-exists=", show okTieExists]) in
+  let _ = print (cat ["top-k(", show kk, ") ids (rank order): ", r26_set_canon tkHi]) in
+  let _ = print (cat ["nucleus(p=0.317, exact-tie boundary) ids: ", r26_set_canon nucHi]) in
+  let _ = print (cat ["nucleus OPPOSITE tie ids:      ", r26_set_canon nucHi_opp]) in
+  let _ = print (cat ["top-k draw stream t_hex   = ", thexTkHi]) in
+  let _ = print (cat ["nucleus draw stream t_hex = ", thexNucHi]) in
+  let _ = print (cat ["top-k diversity entropy Htk (Q.24 bits) = ", show entTkHi]) in
+  let _ = print (cat ["nucleus entropy H (Q.24 bits) high-tau  = ", show entNucHi, "  low-tau = ", show entNucLo]) in
+  let _ = print (cat ["UTTER link = ", ulink_hex]) in
+  let _ = print "------ gates ------" in
+  let _ = print (cat ["exact tie is load-bearing        = ", show okTieExists]) in
+  let _ = print (cat ["diversity floor (Htk>1bit,high-tau)= ", show okDiversityHi]) in
+  let _ = print (cat ["single-sequence collapse (tau->0)= ", show okCollapseLo]) in
+  let _ = print (cat ["knob moves distribution          = ", show okKnobMoves]) in
+  let _ = print (cat ["top-k well-formed                = ", show okTk]) in
+  let _ = print (cat ["nucleus well-formed              = ", show okNuc]) in
+  let _ = print (cat ["UTTER signature verifies         = ", show okUtterSig]) in
+  let _ = print "------ falsifiers ------" in
+  let _ = print (cat ["F1 opposite tie-break diverges   = ", show okOppDiverges, "  (TIE_HIGH nucleus -> different draw stream)"]) in
+  let _ = print (cat ["F2 mislabeled-tau caught         = ", show okTauMismatch, "  (entropy under wrong tau != committed H)"]) in
+  let _ = print (cat ["F3 forged-commitment rejected    = ", show okForgeChain, "  (sig fails against tampered tie rule)"]) in
+  let _ = print (cat ["signed ledger: out/r26_chain.txt"]) in
+  let _ = print (if all == 1
+    then "PASS: top-k and nucleus are bit-exact through an exact-tie total order; diversity is an attested Q.24 quantity gated above a floor at high tau and collapsing to a single sequence as tau->0; opposite tie-break, mislabeled temperature, and a forged commitment are all rejected."
+    else "FAIL") in
+  if all == 1 then 0 else 1

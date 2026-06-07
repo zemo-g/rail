@@ -1,0 +1,397 @@
+-- ============================================================================
+-- RUNG 31 - Freivalds-Succinct GEMM Through the Truncating Nonlinearity
+-- ============================================================================
+-- PROVES: the dominant per-step arithmetic - the exact GPU readout GEMM
+-- (tgl_exact_matmul) - is verified for a whole checkpoint by a SINGLE
+-- Fiat-Shamir random linear check, O(n^2) instead of recomputing every
+-- dot+truncation (which is O(pairs . n^2), i.e. gpu_d2_all today).
+--
+-- THE WALL (verbatim from the ladder):
+--   Naive Freivalds on the POST-truncation result is UNSOUND: truncation is
+--   nonlinear, trunc(r^T A x) != r^T trunc(A x). The check must run on the
+--   EXACT 2-limb PRE-truncation accumulator (gpu_recon's hi*2^31+lo BEFORE
+--   /2^24), with each truncation verified separately as a remainder
+--   range-check in [0,2^24) - the gx5a_dot_bridge GPU==CPU invariant lifted
+--   from one dot to one PROJECTION per checkpoint. r must be Fiat-Shamir-bound
+--   (PRNG trap) and r^T A products overflow int63 -> need the 2-limb path.
+--
+-- WHAT IS REUSED VERBATIM (do not reinvent):
+--   * tgl_exact_matmul (stdlib/tensor.rail)         - the proven GPU exact GEMM
+--   * the gpu_one 2-limb reconstruction hi*2^31+lo  - lm10_attested_train.rail:80
+--   * gx1_add / gx1_acc / gx1_norm / gx1_recon      - gx1_superaccum.rail
+--       the SIGNED two-limb superaccumulator (exact to ~2^93), used for the
+--       r^T A . v RHS whose products overflow int63 (the named wall).
+--   * sha256_hex (stdlib/sha256.rail)               - Fiat-Shamir challenge
+--   * Q.24 fixed-point (s = 2^24 = 16777216)        - the trainer's scale
+--
+-- Build: ./rail_native --out-prefix /tmp/r31 rungs/r31/r31_freivalds_gemm.rail
+-- Run  : RAIL_ARENA_MB=2048 /tmp/r31      (emits rungs/r31/r31_proof.txt)
+-- ============================================================================
+
+import "stdlib/tensor.rail"
+import "stdlib/sha256.rail"
+
+-- Constants are written as literals in OPERAND position throughout (Q.24 scale
+-- 16777216 = 2^24; two-limb base 2147483648 = 2^31) to dodge the
+-- rail-bug-value-literal-tag-mov miscompile (a big literal in a bound/returned
+-- position can mis-emit). Same discipline as gx1_superaccum.rail.
+
+-- ===========================================================================
+-- 0. REUSED two-limb signed superaccumulator (gx1_superaccum.rail, verbatim shape).
+--    Carries dodge the self-loop cross-dep miscompile via MUTUAL recursion.
+-- ===========================================================================
+r31_norm h l =
+  if l >= 2147483648 then (h + 1, l - 2147483648)
+  else if l < 0 then (h - 1, l + 2147483648)
+  else (h, l)
+r31_add h l a =
+  let ahi = a / 2147483648 in
+  let alo = a - ahi * 2147483648 in
+  r31_norm (h + ahi) (l + alo)
+-- accumulate a list of signed int63 terms; mutual recursion (miscompile dodge).
+r31_acc_a h l xs = if xs == [] then (h, l) else
+  let r = r31_add h l (head xs) in let (h2, l2) = r in r31_acc_b h2 l2 (tail xs)
+r31_acc_b h l xs = if xs == [] then (h, l) else
+  let r = r31_add h l (head xs) in let (h2, l2) = r in r31_acc_a h2 l2 (tail xs)
+
+-- ===========================================================================
+-- 1. The GPU readout GEMM, with the PRE-truncation accumulator EXPOSED.
+--    This is exactly gpu_matvec from lm10, except we ALSO return the exact
+--    integer S_i = hi_i*2^31 + lo_i (the pre-truncation accumulator) which is
+--    what Freivalds must check. trunc happens in gpu_one; Freivalds runs BEFORE.
+-- ===========================================================================
+r31_fillrow A K i row j = if row == [] then A else let _ = float_arr_set A (i * K + j) (int_to_float (head row)) in r31_fillrow A K i (tail row) (j + 1)
+r31_fillmat A K rows i = if rows == [] then A else let _ = r31_fillrow A K i (head rows) 0 in r31_fillmat A K (tail rows) (i + 1)
+r31_fillvec V v j = if v == [] then V else let _ = float_arr_set V j (int_to_float (head v)) in r31_fillvec V (tail v) (j + 1)
+
+-- exact pre-truncation accumulator for row i (NO divide). This is gpu_recon's
+-- hi*2^31+lo BEFORE /2^24 - the linear quantity Freivalds is sound on.
+r31_S_of Hi Lo i = (float_to_int (float_arr_get Hi i)) * 2147483648 + (float_to_int (float_arr_get Lo i))
+-- list of exact accumulators S_0..S_{m-1}
+r31_Slist Hi Lo i acc = if i < 0 then acc else r31_Slist Hi Lo (i - 1) (cons (r31_S_of Hi Lo i) acc)
+-- the trainer's own truncate-toward-zero divide (gpu_one): post-trunc result.
+r31_trunc s = s / 16777216
+
+-- Run the proven GPU exact GEMM. Returns the float_arr [Hi, Lo] limbs so the
+-- caller can both (a) reconstruct post-trunc output and (b) Freivalds-check S.
+r31_gpu_gemm rows v =
+  let m = length rows in
+  let k = length v in
+  let a = r31_fillmat (float_arr_new (m * k) 0.0) k rows 0 in
+  let vv = r31_fillvec (float_arr_new k 0.0) v 0 in
+  let hi = float_arr_new m 0.0 in
+  let lo = float_arr_new m 0.0 in
+  let _ = ensure_dylib 0 in
+  let _ = tgl_exact_matmul a vv hi lo m k 1 in
+  cons hi (cons lo [])
+
+-- ===========================================================================
+-- 2. FIAT-SHAMIR challenge: derive the random projection vector r from a hash
+--    of the COMMITMENT, never from a (overflow-prone) PRNG. r MUST be a
+--    function of the data being checked (the limbs + v) so a prover cannot
+--    pick A,v adversarially AFTER seeing r. This is the PRNG-trap dodge.
+--    Coefficients are small (|r_i| < 2^16) to bound the RHS magnitude while
+--    keeping a large challenge space (16 bits per coord).
+-- ===========================================================================
+-- read a big-endian 16-bit value from byte-array B at byte offset off.
+-- Reuses hex_to_bytes (stdlib/bytes.rail) -> arr; arr_get is the proven path.
+-- (str_sub/char_to_int on hex chars is avoided: char_to_int wants a char from
+--  `chars`, not a str_sub string - a real pitfall.)
+r31_be16 B off = (arr_get B off) * 256 + (arr_get B (off + 1))
+-- build m FS coefficients from the (re-hashable) transcript digest. Each r_i in
+-- [1, 2^16] (never 0 - a zero coord would blind row i). A 32-byte digest gives
+-- 16 coords (2 bytes each); for m>16 we re-hash with a counter (domain-separated
+-- by "|fs|<blk>") so the challenge stays a deterministic function of the data.
+r31_fs_coeffs_from digest m i acc =
+  if i >= m then reverse acc
+  else
+    let blk = i / 16 in
+    let off = (i - blk * 16) * 2 in
+    let dg = if blk == 0 then digest else sha256_hex (cat [digest, "|fs|", show blk]) in
+    let B = hex_to_bytes dg in
+    let raw = r31_be16 B off in
+    r31_fs_coeffs_from digest m (i + 1) (cons (raw + 1) acc)
+
+-- the Fiat-Shamir transcript = H( commitment-bytes ). We bind the GPU limbs
+-- (the exact pre-trunc accumulators) AND the inputs A,v, so the challenge is
+-- a function of EVERYTHING the check covers. Canonicalize to a decimal string.
+r31_canon_ints xs = if xs == [] then "" else cat [show (head xs), ",", r31_canon_ints (tail xs)]
+r31_canon_rows rows = if rows == [] then "" else cat [r31_canon_ints (head rows), ";", r31_canon_rows (tail rows)]
+r31_transcript rows v Slist =
+  sha256_hex (cat ["R31|", r31_canon_rows rows, "#", r31_canon_ints v, "#", r31_canon_ints Slist])
+
+-- ===========================================================================
+-- 3. FREIVALDS LHS:  r^T S  = sum_i r_i * S_i.
+--    S_i fits int63 (one dot <= 2^54), but r_i*S_i and the running sum can
+--    exceed int63 -> accumulate in the two-limb superaccumulator.
+-- ===========================================================================
+r31_lhs_terms rs Slist = if rs == [] then [] else cons ((head rs) * (head Slist)) (r31_lhs_terms (tail rs) (tail Slist))
+-- single-limb (int63) reference sum - WRAPS for this problem size (witness that
+-- the two-limb path is load-bearing, not decorative). Same pattern as gx1_sum1.
+r31_sum1 xs acc = if xs == [] then acc else r31_sum1 (tail xs) (acc + head xs)
+
+-- ===========================================================================
+-- 4. FREIVALDS RHS:  (r^T A) . v.   First w = r^T A  (a k-vector):
+--    w_j = sum_i r_i * A_ij. With |r_i|<2^16, |A_ij|~2^25, m rows ->
+--    |w_j| ~ m*2^41, then w_j*v_j ~ 2^66 OVERFLOWS int63 -> two-limb path.
+--    We compute each w_j as a plain int (|w_j| < 2^54, safe), then sum
+--    w_j*v_j (each ~2^66, NOT safe) into the two-limb accumulator.
+-- ===========================================================================
+-- w = r^T A computed in ONE PASS over the rows (genuinely O(m*k), no nth):
+-- for each row i, accumulate r_i * A_i into the running k-vector acc. This is
+-- the lm4_mtv_go shape (matrix-transpose-vector by row-scaled accumulation).
+-- Each w_j stays single-limb safe: |w_j| ~ m*2^(qbits+rbits) < 2^54 here.
+r31_zeros k = if k <= 0 then [] else cons 0 (r31_zeros (k - 1))
+r31_vscale_add acc ri row = if row == [] then [] else cons ((head acc) + ri * (head row)) (r31_vscale_add (tail acc) ri (tail row))
+r31_w_go rows rs acc = if rows == [] then acc else r31_w_go (tail rows) (tail rs) (r31_vscale_add acc (head rs) (head rows))
+r31_w rows v rs j k = r31_w_go rows rs (r31_zeros k)
+-- RHS = sum_j w_j * v_j   (each term ~2^66 -> two-limb)
+r31_rhs_terms w v = if w == [] then [] else cons ((head w) * (head v)) (r31_rhs_terms (tail w) (tail v))
+
+-- ===========================================================================
+-- 5. RANGE CHECK: each truncation S_i -> q_i must have remainder in [0,2^24).
+--    Rail's / is truncate-TOWARD-ZERO (gx5a note). For S_i >= 0 the remainder
+--    rem = S_i - (S_i/2^24)*2^24 is in [0, 2^24). For S_i < 0, trunc-toward-
+--    zero gives rem in (-2^24, 0]. The SOUND invariant we check is the one the
+--    bridge relies on: rem = S_i - r31_trunc(S_i)*2^24 reconstructs S_i EXACTLY
+--    (rem in (-2^24, 2^24)) AND |rem| < 2^24. A +2^24 tamper of S_i shifts the
+--    quotient by exactly 1 with the SAME remainder, so the range-check alone
+--    will NOT catch a clean +2^24 tamper - but the Freivalds linear check WILL
+--    (S changed -> r^T S changes w.h.p.). Conversely a sub-2^24 tamper that
+--    Freivalds might (rarely) miss changes the remainder out of range. This is
+--    the COMPOSITION the soundness proof obligation must bound (see IMPL.md).
+-- ===========================================================================
+r31_rem s = s - (r31_trunc s) * 16777216
+r31_range_ok_one s = let rm = r31_rem s in if rm > 0 - 16777216 then (if rm < 16777216 then 1 else 0) else 0
+-- also assert exact reconstruction q*2^24 + rem == S (the bridge's core identity)
+r31_recon_ok_one s = if (r31_trunc s) * 16777216 + (r31_rem s) == s then 1 else 0
+r31_range_all Slist = if Slist == [] then 1 else (r31_range_ok_one (head Slist)) * (r31_recon_ok_one (head Slist)) * (r31_range_all (tail Slist))
+
+-- LIMB-RANGE check: the GPU's lo limb MUST be in [0, 2^31). This closes the
+-- second composition direction: a forged (hi-1, lo+2^31) keeps the reconstructed
+-- S = hi*2^31+lo IDENTICAL (so Freivalds, which sees only reconstructed S, is
+-- BLIND) but violates lo in [0,2^31) - the limb-range check catches it. So an
+-- adversary that satisfies Freivalds by violating the limb invariant is rejected.
+r31_lo_ok lo = if lo >= 0 then (if lo < 2147483648 then 1 else 0) else 0
+r31_limb_range_all Lo m i = if i >= m then 1 else (r31_lo_ok (float_to_int (float_arr_get Lo i))) * (r31_limb_range_all Lo m (i + 1))
+
+-- ===========================================================================
+-- 6. The succinct verifier: ONE projection verifies the whole GEMM.
+--    Returns 1 iff (Freivalds linear identity holds on the EXACT pre-trunc
+--    accumulators) AND (every truncation remainder is in range).
+-- ===========================================================================
+r31_two_eq a b = let (ha, la) = a in let (hb, lb) = b in if ha == hb then (if la == lb then 1 else 0) else 0
+r31_verify rows v Hi Lo =
+  let m = length rows in
+  let k = length v in
+  let Slist = r31_Slist Hi Lo (m - 1) [] in
+  -- Fiat-Shamir: r is a hash of (A, v, S) -> prover can't choose A,v after r.
+  let digest = r31_transcript rows v Slist in
+  let rs = r31_fs_coeffs_from digest m 0 [] in
+  -- LHS = r^T S  (two-limb)
+  let lhs = r31_acc_a 0 0 (r31_lhs_terms rs Slist) in
+  -- RHS = (r^T A) . v  (two-limb; r^T A products overflow int63)
+  let w = r31_w rows v rs 0 k in
+  let rhs = r31_acc_a 0 0 (r31_rhs_terms w v) in
+  let freivalds_ok = r31_two_eq lhs rhs in
+  let range_ok = r31_range_all Slist in
+  let limb_ok = r31_limb_range_all Lo m 0 in
+  -- JOINT acceptance: ALL THREE must hold (the composed bound, see IMPL.md sec.4):
+  --   freivalds_ok : linear identity r^T S == (r^T A).v on the EXACT pre-trunc S
+  --   range_ok     : every truncation remainder reconstructs S, |rem| < 2^24
+  --   limb_ok      : every GPU lo limb in [0,2^31) (no Freivalds-blind limb forge)
+  freivalds_ok * range_ok * limb_ok
+
+-- count distinct rows to confirm the GEMM is non-trivial (non-vacuous).
+r31_negS Slist = if Slist == [] then 0 else (if (head Slist) < 0 then 1 else 0) + r31_negS (tail Slist)
+
+-- CPU re-derivation of the EXACT pre-trunc accumulator S_i = <A_i, v> (single
+-- int63 limb; |S_i| < 2^51 here so one dot is exact). This is the gx5a bridge
+-- invariant re-asserted IN-PROGRAM: the GPU limbs must reconstruct to this.
+-- Guards against a transient GPU miscompute and proves the limbs Freivalds
+-- checks are the true accumulators (not a property of a buggy kernel).
+r31_cpu_dot row v acc = if row == [] then acc else r31_cpu_dot (tail row) (tail v) (acc + (head row) * (head v))
+r31_cpu_S rows v = if rows == [] then [] else cons (r31_cpu_dot (head rows) v 0) (r31_cpu_S (tail rows) v)
+r31_list_eq a b = if a == [] then (if b == [] then 1 else 0) else (if b == [] then 0 else (if (head a) == (head b) then r31_list_eq (tail a) (tail b) else 0))
+
+-- ===========================================================================
+-- 7. A REAL Q.24 readout matrix + activation, with negatives (signed case).
+--    Mirrors lm10's readout shapes: m = vsize-like (24), k = hidden (64).
+--    Deterministic generator with negatives; |q| < 2^31 so the int32 GPU
+--    buffer holds it and a single dot stays < int63.
+-- ===========================================================================
+-- |q| <= 8*90001 = 720008 < 2^31 (fits the int32 GPU buffer). Signed (negatives).
+-- With m=64, k=128 the SINGLE GPU dot S_i stays < 2^51 (exact), but the actual
+-- Fiat-Shamir-derived r^T S reaches ~2^67 and (r^T A).v ~2^67 -> SINGLE-limb
+-- int63 WRAPS -> the two-limb superaccumulator is genuinely load-bearing
+-- (witnessed in main: gWrap compares single-limb vs two-limb on the REAL r).
+r31_qval idx = (((idx * 13 + 5) - ((((idx * 13 + 5)) / 17) * 17)) - 8) * 720008
+r31_mkrow base k j acc = if j >= k then reverse acc else r31_mkrow base k (j + 1) (cons (r31_qval (base + j)) acc)
+r31_mkmat m k i acc = if i >= m then reverse acc else r31_mkmat m k (i + 1) (cons (r31_mkrow (i * k + 1) k 0 []) acc)
+r31_mkvec k base j acc = if j >= k then reverse acc else r31_mkvec k base (j + 1) (cons (r31_qval (base + j)) acc)
+
+pf b = if b == 1 then "PASS" else "FAIL"
+
+-- copy a float_arr (so we can tamper a copy without mutating the honest limbs)
+r31_copyfa src dst n i = if i >= n then dst else let _ = float_arr_set dst i (float_arr_get src i) in r31_copyfa src dst n (i + 1)
+-- perturb one row of the matrix (returns a new list-of-rows)
+r31_perturb_go rows idx i = if rows == [] then [] else
+  let row = head rows in
+  let nr = if i == idx then cons ((head row) + 100000) (tail row) else row in
+  cons nr (r31_perturb_go (tail rows) idx (i + 1))
+r31_perturb_row rows idx = r31_perturb_go rows idx 0
+
+-- emit a transcript file the foreign (Python) verifier re-derives independently:
+-- rows, v, and the GPU pre-trunc accumulators S. The foreign verifier MUST
+-- (1) re-derive the FS challenge by hashing (rows,v,S) the same way,
+-- (2) recompute r^T S and (r^T A).v in EXACT bignum and confirm equality,
+-- (3) range-check each S, (4) reproduce the four falsifier rejections.
+r31_emit_transcript rows v Slist =
+  let body = cat [
+    "m ", show (length rows), "\n",
+    "k ", show (length v), "\n",
+    "v ", r31_canon_ints v, "\n",
+    "A ", r31_canon_rows rows, "\n",
+    "S ", r31_canon_ints Slist, "\n"
+  ] in
+  write_file "rungs/r31/r31_transcript.txt" body
+
+main =
+  let _ = ensure_dylib 0 in
+  let m = 64 in
+  let k = 128 in
+  let rows = r31_mkmat m k 0 [] in
+  let v = r31_mkvec k 50000 0 [] in
+
+  -- run the proven GPU exact GEMM
+  let limbs = r31_gpu_gemm rows v in
+  let Hi = head limbs in
+  let Lo = head (tail limbs) in
+  let Slist = r31_Slist Hi Lo (m - 1) [] in
+  let neg = r31_negS Slist in
+
+  -- ---- BRIDGE: GPU pre-trunc accumulators reconstruct to the CPU dots ----
+  let cpuS = r31_cpu_S rows v in
+  let bridge_ok = r31_list_eq Slist cpuS in
+
+  -- ---- GATE 1: honest GEMM passes the succinct verifier ----
+  let ok_honest = r31_verify rows v Hi Lo in
+
+  -- ---- FALSIFIER (a): tamper ONE pre-trunc accumulator -> Freivalds fails ----
+  -- corrupt Hi[3] by +1 (adds 2^31 to S_3): linear identity must break w.h.p.
+  let Hi_a = float_arr_new m 0.0 in
+  let _ = r31_copyfa Hi Hi_a m 0 in
+  let _ = float_arr_set Hi_a 3 (int_to_float ((float_to_int (float_arr_get Hi 3)) + 1)) in
+  let ok_tamperA = r31_verify rows v Hi_a Lo in
+
+  -- ---- FALSIFIER (b): tamper by EXACTLY +2^24 (one ULP of the quotient) ----
+  -- Freivalds catches it (S changed). The clean +2^24 keeps the SAME remainder,
+  -- so this also demonstrates that range-check alone is INSUFFICIENT (composition).
+  let Lo_b = float_arr_new m 0.0 in
+  let _ = r31_copyfa Lo Lo_b m 0 in
+  let _ = float_arr_set Lo_b 7 (int_to_float ((float_to_int (float_arr_get Lo 7)) + 16777216)) in
+  let ok_tamperB = r31_verify rows v Hi Lo_b in
+  -- and show that the +2^24 tamper's remainder is STILL in range (range alone misses it)
+  let s7 = r31_S_of Hi Lo 7 in
+  let s7b = r31_S_of Hi Lo_b 7 in
+  let rangeB_alone = (r31_range_ok_one s7b) in
+
+  -- ---- FALSIFIER (c): wrong weight row -> r^T A diverges -> RHS != LHS ----
+  -- We keep the GPU limbs HONEST but feed the verifier a CORRUPTED A (row 5
+  -- perturbed). Now the FS challenge is over the corrupted A but the limbs are
+  -- the honest GEMM's: r^T A_bad . v != r^T S. Models "prover claims weights W'
+  -- but the committed accumulators are from W".
+  let rows_c = r31_perturb_row rows 5 in
+  let ok_tamperC = r31_verify rows_c v Hi Lo in
+
+  -- ---- FALSIFIER (d): the CONSTRUCTED joint adversary ----
+  -- An adversary that satisfies the RANGE check by violating Freivalds, OR vice
+  -- versa, must STILL be rejected by the joint AND. We construct the sharpest
+  -- case: a sub-2^24 tamper of S_2 (Freivalds catches w.h.p.) that ALSO pushes
+  -- the remainder out of [0,2^24) for negative S - so EITHER check fires. The
+  -- gate is the AND, so a single fired check rejects.
+  let Lo_d = float_arr_new m 0.0 in
+  let _ = r31_copyfa Lo Lo_d m 0 in
+  -- add 12345 (< 2^24) to S_2: changes the linear sum AND (if it crosses a
+  -- truncation boundary) the remainder. Joint AND must reject.
+  let _ = float_arr_set Lo_d 2 (int_to_float ((float_to_int (float_arr_get Lo 2)) + 12345)) in
+  let ok_tamperD = r31_verify rows v Hi Lo_d in
+
+  -- ---- FALSIFIER (e): the OTHER composition direction (Freivalds-blind) ----
+  -- Forge (Hi[9]-=1, Lo[9]+=2^31): reconstructed S_9 = hi*2^31+lo is UNCHANGED,
+  -- so the Freivalds linear check is BLIND - but lo is now >= 2^31, so the
+  -- limb-range check catches it. Proves an adversary CANNOT satisfy Freivalds by
+  -- violating the limb invariant. This is the sharp half of the joint bound.
+  let Hi_e = float_arr_new m 0.0 in
+  let Lo_e = float_arr_new m 0.0 in
+  let _ = r31_copyfa Hi Hi_e m 0 in
+  let _ = r31_copyfa Lo Lo_e m 0 in
+  let _ = float_arr_set Hi_e 9 (int_to_float ((float_to_int (float_arr_get Hi 9)) - 1)) in
+  let _ = float_arr_set Lo_e 9 (int_to_float ((float_to_int (float_arr_get Lo 9)) + 2147483648)) in
+  let s9 = r31_S_of Hi Lo 9 in
+  let s9e = r31_S_of Hi_e Lo_e 9 in
+  let freivalds_blind = if s9 == s9e then 1 else 0 in  -- reconstructed S unchanged
+  let ok_tamperE = r31_verify rows v Hi_e Lo_e in       -- must REJECT via limb-range
+
+  -- ---- TWO-LIMB-IS-LOAD-BEARING witness ----
+  -- Recompute the FS challenge + r^T S exactly as the verifier does, then show
+  -- the SINGLE-limb int63 sum WRAPS (!= the two-limb reconstruction). Proves the
+  -- named wall (r^T S / r^T A products overflow int63) is real, not vacuous.
+  let digest_w = r31_transcript rows v Slist in
+  let rs_w = r31_fs_coeffs_from digest_w m 0 [] in
+  let lhs_terms = r31_lhs_terms rs_w Slist in
+  let two_lhs = r31_acc_a 0 0 lhs_terms in
+  let (h2, l2) = two_lhs in
+  let two_recon = h2 * 2147483648 + l2 in
+  let one_lhs = r31_sum1 lhs_terms 0 in
+  let gWrap = if one_lhs == two_recon then 0 else 1 in  -- 1 == single-limb WRAPPED
+
+  -- ---- SUCCINCTNESS witness: verifier cost = ONE matvec-pass (O(m*k)) ----
+  -- the recompute baseline (gpu_d2_all) is O(pairs * m*k). With P checkpoints
+  -- the saving is exactly a factor of (#rows actually re-dotted). We report the
+  -- structural fact: verify touches each A cell ONCE (r^T A) + each S once.
+  let cells = m * k in
+
+  -- gates
+  let g1 = ok_honest in
+  let gA = if ok_tamperA == 0 then 1 else 0 in
+  let gB = if ok_tamperB == 0 then 1 else 0 in
+  let gC = if ok_tamperC == 0 then 1 else 0 in
+  let gD = if ok_tamperD == 0 then 1 else 0 in
+  let gE = if ok_tamperE == 0 then (if freivalds_blind == 1 then 1 else 0) else 0 in
+  let gNeg = if neg > 0 then 1 else 0 in
+  let gBridge = if bridge_ok == 1 then 1 else 0 in
+  let gRangeMiss = if rangeB_alone == 1 then 1 else 0 in  -- range alone MISSES +2^24 (composition non-vacuous)
+
+  let all = g1 * gA * gB * gC * gD * gE * gNeg * gWrap * gBridge in
+
+  let out = cat [
+    "RUNG 31 - Freivalds-Succinct GEMM Through the Truncating Nonlinearity\n",
+    "GEMM shape: m=", show m, " rows x k=", show k, " (", show cells, " cells), Q.24, signed\n",
+    "negative pre-trunc accumulators exercised: ", show neg, " of ", show m, "   ", pf gNeg, "\n",
+    "BRIDGE  GPU pre-trunc limbs reconstruct to CPU dots (gx5a invariant in-program): ", pf gBridge, "\n",
+    "\n",
+    "GATE 1  honest GEMM passes succinct verifier (Freivalds on exact pre-trunc S AND range-check AND limb-range): ", pf g1, "\n",
+    "FALS(a) tamper one pre-trunc accumulator (Hi[3]+=2^31) -> verifier REJECTS: ", pf gA, "\n",
+    "FALS(b) tamper by exactly +2^24 (Lo[7]+=2^24) -> verifier REJECTS: ", pf gB, "\n",
+    "        (range-check ALONE on S_7 still in-range=", show rangeB_alone, " -> Freivalds is what catches it; composition is non-vacuous: ", pf gRangeMiss, ")\n",
+    "        S_7 honest=", show s7, "  tampered=", show s7b, " (delta=+2^24)\n",
+    "FALS(c) wrong weight row (A[5] perturbed) -> r^T A diverges -> REJECTS: ", pf gC, "\n",
+    "FALS(d) constructed sub-2^24 tamper (Lo[2]+=12345) -> joint AND REJECTS: ", pf gD, "\n",
+    "FALS(e) Freivalds-BLIND limb forge (Hi[9]-=1,Lo[9]+=2^31; recon S unchanged=", show freivalds_blind, ") -> limb-range REJECTS: ", pf gE, "\n",
+    "        (this is the OTHER composition direction: satisfies Freivalds, violates the limb invariant)\n",
+    "\n",
+    "TWO-LIMB load-bearing: single-limb int63 r^T S = ", show one_lhs, " WRAPS vs two-limb exact = ", show two_recon, "   ", pf gWrap, "\n",
+    "\n",
+    "SUCCINCT: verifier arithmetic = one matvec-pass O(m*k)=", show cells, " (r^T A then .v),\n",
+    "          plus O(m) for r^T S + range-check. Recompute baseline gpu_d2_all is O(pairs*m*k).\n",
+    "\n",
+    if all == 1
+      then "RUNG 31 PASS: one Fiat-Shamir projection verifies the whole readout GEMM on the EXACT pre-truncation accumulators; every truncation remainder + GPU lo limb is range-checked; all five falsifiers reject (incl. BOTH composition directions). The naive post-truncation Freivalds is avoided (would be unsound). Soundness composition argued + bounded in IMPL.md.\n"
+      else "RUNG 31 FAIL: a gate did not hold - do NOT route checkpoint GEMM verification through the succinct check.\n"
+  ] in
+  let _ = print out in
+  let _ = write_file "rungs/r31/r31_proof.txt" out in
+  -- emit the machine-checkable transcript for the foreign verifier
+  let _ = r31_emit_transcript rows v Slist in
+  if all == 1 then 0 else 1
