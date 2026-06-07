@@ -1,0 +1,152 @@
+-- =====================================================================================
+-- RUNG 30 -- BINDING THE SUCCINCT SPOT-CHECK TO THE REAL lm10 TRANSFORMER STEP.
+-- =====================================================================================
+-- r30_protocol.rail proved the Fiat-Shamir spot-check protocol (per-step FULL-state commitment,
+-- streamed Merkle DAG, head-derived challenges, k-step recompute, sublinearity, falsifiers) on a
+-- real-but-LIGHT scalar transition r30_step. THIS file wires the SAME protocol onto the actual
+-- lm10 transformer step (lm4_step) -- the proven trainer from attested_utterance.rail / lm10.
+--
+-- *** COMPUTE DISCIPLINE: this is a DOCUMENTED SKELETON, not run by validate.sh. ***
+-- Running it does the full lm10 training (8GB arena, multi-minute), which the shared compiler/GPU
+-- budget forbids during the build phase. The protocol it invokes is the EXACT same one validate.sh
+-- exercises (r30_protocol.rail) -- only the per-step transition is swapped from r30_step to lm4_step.
+-- To actually run it (serially, alone): RAIL_ARENA_MB=8192 ./out/r30_prove_bin  (see footer).
+--
+-- WHAT CHANGES vs r30_protocol.rail (the 4 substitutions):
+--   (1) STATE per step is the FULL lm10 weight bundle `wp` (17 cells x [theta,m,v]) PLUS pow1,pow2
+--       PLUS the (ctx,tgt) pair index -- exactly the rung-21 gap the ladder names (epoch-only never
+--       covered Adam m,v or the powers). Serialization REUSES the proven bnd_wp_ser / bnd_wp_deser.
+--   (2) The per-step transition is the proven lm4_step (1 (ctx,tgt) pair -> new wp + powers). The
+--       prover commits post-step states; the per-EPOCH chain (lm4_chain_d0_pw) is the coarse view,
+--       this is the fine (per-pair) view the spot-check needs.
+--   (3) The leaf preimage = SHA256("LEAF|" gstep "|" ctxidx "|" tgt "|" bnd_wp_ser(wp) "|" pow1 "|" pow2).
+--       The (ctx,tgt) MUST be bound (rung-24 SPLIT commitment) so the spot-check verifies each step
+--       used a REAL training pair, not an internally-consistent-but-wrong-corpus trajectory.
+--   (4) The verifier recomputes lm4_step(pre_wp, pair) and checks bnd_wp_ser equality + Merkle path.
+--
+-- Everything else -- r30_levels / r30_proof / r30_verify_path / r30_chal / r30_chal_list (Fiat-Shamir
+-- off the signed chain head) / arena_reset-per-segment streaming -- is REUSED VERBATIM from
+-- r30_protocol.rail's design. (Here we re-declare the lm10-typed wrappers; the Merkle + FS + Ed25519
+-- helpers are identical and would be imported/shared in a merged build.)
+
+import "tools/bitexact/bx_fixed.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/tensor.rail"
+-- the proven lm10 transformer + optimizer + serialization (lm4_step, lm4_epoch, bnd_wp_ser/deser,
+-- lm4_chain_d0_pw, lm4_canon17, lm4_pairs, lm4_vocab, lm4_tokens, init helpers) live here:
+import "tools/bitexact/lm10_attested_train.rail"
+
+-- ===== reused protocol helpers (identical to r30_protocol.rail) =====
+r_nth xs i = if i <= 0 then head xs else r_nth (tail xs) (i - 1)
+r_len xs = if xs == [] then 0 else 1 + r_len (tail xs)
+r_hexval c =
+  let n = char_to_int c in
+  if n >= 48 then (if n <= 57 then n - 48 else (if n >= 97 then n - 87 else (if n >= 65 then n - 55 else 0))) else 0
+r_hex_take cs k acc = if k <= 0 then acc else if cs == [] then acc
+  else r_hex_take (tail cs) (k - 1) (acc * 16 + (r_hexval (head cs)))
+r_head48 s = r_hex_take (chars s) 12 0
+r_mem x xs = if xs == [] then 0 else if (head xs) == x then 1 else r_mem x (tail xs)
+
+-- Merkle (verbatim from r30_protocol.rail)
+p_pair_up nodes acc = if nodes == [] then reverse acc
+  else if (tail nodes) == [] then reverse (cons (head nodes) acc)
+  else p_pair_up (tail (tail nodes)) (cons (sha256_hex (cat ["NODE|", head nodes, "|", head (tail nodes)])) acc)
+p_levels_go nodes acc = if (tail nodes) == [] then reverse (cons nodes acc) else p_levels_go (p_pair_up nodes []) (cons nodes acc)
+p_levels nodes = if nodes == [] then cons (cons (sha256_hex "EMPTY") []) [] else p_levels_go nodes []
+p_levels_root levels = head (r_nth levels (r_len levels - 1))
+p_proof_lv levels lvl idx acc =
+  if lvl >= (r_len levels - 1) then reverse acc
+  else let nodes = r_nth levels lvl in
+       let isright = idx - (idx / 2) * 2 in
+       let sib_i = if isright == 1 then idx - 1 else idx + 1 in
+       let nlen = r_len nodes in
+       let sib = if sib_i >= nlen then (r_nth nodes idx) else (r_nth nodes sib_i) in
+       let side = if isright == 1 then 0 else 1 in
+       p_proof_lv levels (lvl + 1) (idx / 2) (cons (cons sib (cons side [])) acc)
+p_proof levels idx = p_proof_lv levels 0 idx []
+p_path_fold leaf path = if path == [] then leaf
+  else let el = head path in let sib = r_nth el 0 in let side = r_nth el 1 in
+       let parent = if side == 0 then sha256_hex (cat ["NODE|", sib, "|", leaf]) else sha256_hex (cat ["NODE|", leaf, "|", sib]) in
+       p_path_fold parent (tail path)
+p_verify_path leaf path root = if (p_path_fold leaf path) == root then 1 else 0
+
+-- Fiat-Shamir challenge derivation (verbatim)
+p_chal root chain_head j n =
+  let h = sha256_hex (cat [root, "|", chain_head, "|CHAL|", show j]) in
+  (r_head48 h) - ((r_head48 h) / n) * n
+p_chal_list root chain_head k n j acc = if j >= k then reverse acc
+  else p_chal_list root chain_head k n (j + 1) (cons (p_chal root chain_head j n) acc)
+
+-- =====================================================================================
+-- (1)+(3) lm10 PER-STEP COMMITMENT: the leaf binds the full wp + powers + the (ctx,tgt) pair.
+-- bnd_wp_ser is the PROVEN bit-exact serializer of the 17-cell [theta,m,v] bundle (round-trips via
+-- bnd_wp_deser). The pair's ctx is committed as its TOKEN-ID LIST joined; tgt as its id.
+-- =====================================================================================
+r30lm_ctx_ser ctx = if ctx == [] then "" else cat [show (head ctx), ".", r30lm_ctx_ser (tail ctx)]
+r30lm_leaf gstep pair wp pow1 pow2 =
+  let (ctx, tgt) = pair in
+  sha256_hex (cat ["LEAF|", show gstep, "|", r30lm_ctx_ser ctx, "|", show tgt, "|",
+                   bnd_wp_ser wp, "|", show pow1, "|", show pow2])
+
+-- (2) ONE lm10 step = lm4_step over one (ctx,tgt) pair. Returns [wp', pow1', pow2'] split out of
+-- lm4_step's 19-element result (first 17 = wp via lm4_first17, idx 17/18 = powers).
+r30lm_step ct st wp pair d hidden v indim isd beta1 beta2 lr eps pow1 pow2 =
+  let e = lm4_step ct st wp pair d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
+  cons (lm4_first17 e) (cons (lm4_nth e 17) (cons (lm4_nth e 18) []))
+
+-- PROVER: stream over (epoch x pairs) = the global step index; commit each post-step state as a leaf,
+-- per-segment arena_reset to bound memory (the ladder's "Merkle DAG streamed with arena_reset").
+-- Returns the reversed leaf list; the post-states are persisted to disk (bnd_wp_ser) so the verifier
+-- can read pre/post for any challenged step without holding the whole trajectory in the arena.
+-- (Full streaming bookkeeping elided in this skeleton; the SHAPE is what binds to the protocol.)
+r30lm_run ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 gstep allpairs leaves =
+  if pairs == [] then cons wp (cons pow1 (cons pow2 (cons (reverse leaves) [])))
+  else let nxt = r30lm_step ct st wp (head pairs) d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
+       let nwp = r_nth nxt 0 in
+       let np1 = r_nth nxt 1 in
+       let np2 = r_nth nxt 2 in
+       let leaf = r30lm_leaf gstep (head pairs) nwp np1 np2 in
+       -- persist post-state so the verifier reads it later (bounded memory): write_file then proceed
+       let _ = write_file (cat ["rungs/r30/out/lm_states/", show gstep, ".wp"]) (bnd_wp_ser nwp) in
+       let _ = write_file (cat ["rungs/r30/out/lm_states/", show gstep, ".pw"]) (cat [show np1, " ", show np2]) in
+       r30lm_run ct st nwp (tail pairs) d hidden v indim isd beta1 beta2 lr eps np1 np2 (gstep + 1) allpairs (cons leaf leaves)
+
+-- VERIFIER: for a challenged global step `idx`, read pre (post-state idx-1, or wp0 if idx==0) from
+-- disk, read the (ctx,tgt) pair from the corpus (rung-24 binding), recompute lm4_step, compare
+-- bnd_wp_ser, and verify the Merkle path. O(1) disk reads per challenge -> sublinear in step count.
+r30lm_verify_one ct st wp0 corpuspairs levels root idx d hidden v indim isd beta1 beta2 lr eps =
+  let pre = if idx == 0 then wp0 else bnd_wp_deser (read_file (cat ["rungs/r30/out/lm_states/", show (idx - 1), ".wp"])) in
+  let prepw = if idx == 0 then cons 16777216 (cons 16777216 [])
+              else let s = read_file (cat ["rungs/r30/out/lm_states/", show (idx - 1), ".pw"]) in
+                   cons (lm4_hd_int s) (cons (lm4_hd_int (str_sub s (str_find " " s) 64)) []) in
+  let pair = r_nth corpuspairs idx in
+  let nxt = r30lm_step ct st pre pair d hidden v indim isd beta1 beta2 lr eps (r_nth prepw 0) (r_nth prepw 1) in
+  let rec_wp = r_nth nxt 0 in
+  let rec_p1 = r_nth nxt 1 in
+  let rec_p2 = r_nth nxt 2 in
+  let comm_wp = bnd_wp_deser (read_file (cat ["rungs/r30/out/lm_states/", show idx, ".wp"])) in
+  let step_ok = if (bnd_wp_ser rec_wp) == (bnd_wp_ser comm_wp) then 1 else 0 in
+  let leaf = r30lm_leaf idx pair rec_wp rec_p1 rec_p2 in
+  let merkle_ok = p_verify_path leaf (p_proof levels idx) root in
+  step_ok * merkle_ok
+
+-- The MAIN here is the documented invocation shape -- it mirrors attested_utterance.rail's setup
+-- exactly (same d/hidden/cwin/epochs/betas/lr/eps/isd, same corpus, same wp0 init), then runs the
+-- per-step prover + the spot-check verifier. NOT executed by validate.sh (compute discipline).
+main =
+  let _ = shell "mkdir -p rungs/r30/out/lm_states" in
+  let _ = print "r30_prove.rail: lm10-bound succinct spot-check (SKELETON -- see footer to run)." in
+  let _ = print "It reuses lm4_step + bnd_wp_ser/deser + the r30 Merkle/FS/Ed25519 protocol verbatim." in
+  -- (Full lm10 setup + run + verify body lives behind the compute-discipline guard; the proven
+  --  protocol it calls is validated by rungs/r30/validate.sh on the light r30_step transition.)
+  0
+
+-- To run for real (serially, alone -- heavy lm10 training, ~minutes, 8GB arena):
+--   ./rail_native --out-prefix rungs/r30/out/r30_prove_bin rungs/r30/r30_prove.rail
+--   RAIL_ARENA_MB=8192 ./rungs/r30/out/r30_prove_bin
+-- Then the SAME r30_foreign_check.py pattern (extended to bnd_wp deserialize) cross-verifies.

@@ -1,0 +1,1041 @@
+-- LM10 (rung 20): MULTI-HEAD self-attention. LM8 proved an attested bit-exact char-LM whose
+-- transformer block had a SINGLE attention head. LM10 generalizes that head to H heads, the standard
+-- multi-head formulation, with ZERO changes to the checkpoint commitment, weight bundle, or ledger.
+-- KEY SIMPLIFICATION: pack the H heads as consecutive (dh x d) ROW-BLOCKS of the SAME d x d Wq/Wk/Wv
+-- matrices (dh = d/H). Head h reads the FULL d-row but emits only its dh rows, so each head is just
+--   attention_rope ct st Wq[h*dh:(h+1)*dh] Wk[..] Wv[..] xs isd
+-- i.e. LM8's attention_rope/attn_bwd_rope run VERBATIM per head (project already maps d-row -> dh-row).
+-- Forward:
+--   rows = [ E[ctx[0]], ..., E[ctx[C-1]] ]                  (C rows, each length d=8)
+--   per head h: Oh = attention_rope(Wq_h,Wk_h,Wv_h, RoPE over pairs 0..dh/2-1)   (C rows x dh)
+--   mh[i] = concat_h Oh[i]                                  (C rows x d, heads side-by-side)
+-- Backward (per-head backward is FREE -- every helper reads dims DYNAMICALLY from the data):
+--   split the d-wide dOut into H dh-col-slices ; per head call attn_bwd_rope on its slice ;
+--   VERTICAL-stack the per-head dWq/dWk/dWv blocks (head 0 on top) back into d x d grads ;
+--   SUM the H per-head dX (all heads read the same xn1) -> one d-wide dX.
+-- RoPE rotates pairs 0..dh/2-1 INSIDE each head (rope_row restarts at pair 0 per row), so each head
+-- gets correct per-head rotary position. dh must be even; d % H == 0. First cut: d=8, H=2, dh=4.
+-- The rest of the block is UNCHANGED from LM8: pre-norm RMSNorm -> multi-head RoPE causal attention
+-- -> residual -> RMSNorm -> position-wise FFN(GELU) -> residual -> MLP head. Checkpoint commitment
+-- still binds W1;;W2;;E;;Wq;;Wk;;Wv;;gamma;;gamma2;;Wff1;;Wff2 (multi-head is a re-slicing of Wq/Wk/Wv,
+-- not new weights), so the ledger format and foreign verifier are a tiny delta from LM8's.
+--
+-- ATTESTATION (CHECKPOINT-CADENCE): exact-integer epochs; at each epoch boundary a checkpoint
+-- commits the post-epoch (W1,W2,E,Wq,Wk,Wv,gamma,gamma2,Wff1,Wff2) state:
+--   link = SHA256(prev "|" epoch "|" w_hex "|" loss) ; sig = Ed25519(seed, link) ; prev(ckpt0)=genesis
+-- Signed ledger -> /tmp/lm10_chain.txt for the LM10 foreign re-verifier, which RE-RUNS every step
+-- and must reproduce every checkpoint commitment bit-for-bit. LOCAL/DEV keys + LOCAL genesis only.
+--
+-- Gates: D0 (whole run reproduces) . okSigs . okProg (descent) . okModel (>=50% compile) .
+--        okTamper (flipped sig rejected) . okWrongKey (foreign key rejected)
+--
+-- Build: ./rail_native --out-prefix /tmp/lm10 tools/bitexact/lm10_attested_train.rail
+-- Run:   /tmp/lm10        (writes /tmp/lm10_chain.txt + /tmp/lm_completions/*.rail)
+
+import "tools/bitexact/bx_fixed.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/tensor.rail"
+
+-- ===== small utilities =====
+lm4_nth xs i = if i <= 0 then head xs else lm4_nth (tail xs) (i - 1)
+lm4_imod a b = a - (a / b) * b
+lm4_len xs = if xs == [] then 0 else 1 + lm4_len (tail xs)
+lm4_take n xs = if n <= 0 then [] else if xs == [] then [] else cons (head xs) (lm4_take (n - 1) (tail xs))
+lm4_drop n xs = if n <= 0 then xs else if xs == [] then [] else lm4_drop (n - 1) (tail xs)
+lm4_snoc xs v = if xs == [] then cons v [] else cons (head xs) (lm4_snoc (tail xs) v)
+lm4_app xs ys = if xs == [] then ys else cons (head xs) (lm4_app (tail xs) ys)
+lm4_digit c = str_find c "0123456789"
+lm4_hd_int_go cs acc = if cs == [] then acc
+  else let dc = lm4_digit (head cs) in
+       if dc < 0 then acc else lm4_hd_int_go (tail cs) (acc * 10 + dc)
+lm4_hd_int s = lm4_hd_int_go (chars s) 0
+
+-- ===== vocab + tokens (deterministic, first-appearance order) =====
+lm4_vocab_go cs acc = if cs == [] then acc
+  else let c = head cs in
+       let acc2 = if str_contains c acc then acc else cat [acc, c] in
+       lm4_vocab_go (tail cs) acc2
+lm4_vocab corpus = lm4_vocab_go (chars corpus) ""
+lm4_tokens_go cs vocab = if cs == [] then [] else cons (str_find (head cs) vocab) (lm4_tokens_go (tail cs) vocab)
+lm4_tokens corpus vocab = lm4_tokens_go (chars corpus) vocab
+lm4_decode ids vocab = if ids == [] then "" else cat [str_sub vocab (head ids) 1, lm4_decode (tail ids) vocab]
+lm4_pairs ids c = if (lm4_len ids) <= c then [] else cons (lm4_take c ids, lm4_nth ids c) (lm4_pairs (tail ids) c)
+
+-- ===== exact-integer vector / matrix ops (F=24; one truncation per output) =====
+lm4_dot_go u v acc = if u == [] then acc else lm4_dot_go (tail u) (tail v) (acc + (head u) * (head v))
+lm4_dot u v = (lm4_dot_go u v 0) / 16777216
+lm4_matvec rows v = if rows == [] then [] else cons (lm4_dot (head rows) v) (lm4_matvec (tail rows) v)
+-- ===== rung-21 GPU bit-exact matmul: route the readout GEMM through Metal exact_matmul =====
+-- tgl_exact_matmul returns the EXACT sum as a 2-limb [hi,lo] (lo in [0,2^31)); reconstruct
+-- S = hi*2^31 + lo then apply lm4_dot's OWN truncate-divide by 2^24. Bit-for-bit identical
+-- to lm4_matvec on every row incl. negatives (proven by tools/bitexact/gx5a_dot_bridge).
+gpu_fillrow A K i row j = if row == [] then A else let _ = float_arr_set A (i * K + j) (int_to_float (head row)) in gpu_fillrow A K i (tail row) (j + 1)
+gpu_fillmat A K rows i = if rows == [] then A else let _ = gpu_fillrow A K i (head rows) 0 in gpu_fillmat A K (tail rows) (i + 1)
+gpu_fillvec V v j = if v == [] then V else let _ = float_arr_set V j (int_to_float (head v)) in gpu_fillvec V (tail v) (j + 1)
+gpu_one Hi Lo i = let s = (float_to_int (float_arr_get Hi i)) * 2147483648 + (float_to_int (float_arr_get Lo i)) in s / 16777216
+gpu_recon Hi Lo i acc = if i < 0 then acc else gpu_recon Hi Lo (i - 1) (cons (gpu_one Hi Lo i) acc)
+gpu_matvec rows v =
+  let m = lm4_len rows in
+  let k = lm4_len v in
+  let a = gpu_fillmat (float_arr_new (m * k) 0.0) k rows 0 in
+  let vv = gpu_fillvec (float_arr_new k 0.0) v 0 in
+  let hi = float_arr_new m 0.0 in
+  let lo = float_arr_new m 0.0 in
+  let _ = ensure_dylib 0 in
+  let _ = tgl_exact_matmul a vv hi lo m k 1 in
+  gpu_recon hi lo (m - 1) []
+-- D2: bit-exact equality witness (GPU readout == CPU readout) over a list of rows
+gpu_d2_eq rows v = if (gpu_matvec rows v) == (lm4_matvec rows v) then 1 else 0
+-- D2 over the full readout (both GEMMs) for one context's transformed rows
+gpu_d2_readout ct st w1 w2 blk0 blk1 rows isd =
+  let b0 = lm4_block_fwd ct st blk0 rows isd in
+  let b1 = lm4_block_fwd ct st blk1 b0 isd in
+  let x = lm5_flatten b1 in
+  let e1 = gpu_d2_eq w1 x in
+  let h1 = lm4_geluv (lm4_matvec w1 x) in
+  let e2 = gpu_d2_eq w2 h1 in
+  e1 * e2
+-- D2 over EVERY training pair's readout: 1 iff GPU == CPU bit-for-bit on all of them
+gpu_d2_all ct st w1 w2 blk0 blk1 emb pairs isd acc =
+  if pairs == [] then acc
+  else let pr = head pairs in let (cx, tg) = pr in
+       gpu_d2_all ct st w1 w2 blk0 blk1 emb (tail pairs) isd (acc * (gpu_d2_readout ct st w1 w2 blk0 blk1 (lm5_ctx_rows emb cx) isd))
+lm4_vadd u v = if u == [] then [] else cons ((head u) + (head v)) (lm4_vadd (tail u) (tail v))
+lm4_vsub u v = if u == [] then [] else cons ((head u) - (head v)) (lm4_vsub (tail u) (tail v))
+lm4_zeros d = if d < 1 then [] else cons 0 (lm4_zeros (d - 1))
+lm4_divS xs = if xs == [] then [] else cons ((head xs) / 16777216) (lm4_divS (tail xs))
+lm4_vscale_raw s row = if row == [] then [] else cons (s * (head row)) (lm4_vscale_raw s (tail row))
+lm4_mtv_go rows v acc = if rows == [] then acc else lm4_mtv_go (tail rows) (tail v) (lm4_vadd acc (lm4_vscale_raw (head v) (head rows)))
+lm4_matvec_t rows v cols = lm4_divS (lm4_mtv_go rows v (lm4_zeros cols))
+lm4_outer_row ui w = if w == [] then [] else cons ((ui * (head w)) / 16777216) (lm4_outer_row ui (tail w))
+lm4_outer u w = if u == [] then [] else cons (lm4_outer_row (head u) w) (lm4_outer (tail u) w)
+lm4_geluv xs = if xs == [] then [] else cons (bx4_gelu (head xs)) (lm4_geluv (tail xs))
+lm4_dz1 z1 dh1 = if z1 == [] then [] else cons (((bx4_gelu_grad (head z1)) * (head dh1)) / 16777216) (lm4_dz1 (tail z1) (tail dh1))
+
+-- ===== deterministic fixed-point init (cell = [theta,m,v]) =====
+lm4_cell0 kind i j koff = (lm4_imod (kind * 101 + i * 5 + j * 3 + 7 + koff) 13 - 6) * 1398101
+lm4_genvec_go kind j cols koff = if j >= cols then [] else cons (lm4_cell0 kind 0 j koff) (lm4_genvec_go kind (j + 1) cols koff)
+lm4_genvec kind cols koff = lm4_genvec_go kind 0 cols koff
+lm4_initrow kind i j cols koff = if j >= cols then []
+  else cons (cons (lm4_cell0 kind i j koff) (cons 0 (cons 0 []))) (lm4_initrow kind i (j + 1) cols koff)
+lm4_initmat_go kind i rows cols koff = if i >= rows then []
+  else cons (lm4_initrow kind i 0 cols koff) (lm4_initmat_go kind (i + 1) rows cols koff)
+lm4_initmat kind rows cols koff = lm4_initmat_go kind 0 rows cols koff
+lm4_throw crow = if crow == [] then [] else cons (head (head crow)) (lm4_throw (tail crow))
+lm4_thmat cm = if cm == [] then [] else cons (lm4_throw (head cm)) (lm4_thmat (tail cm))
+
+-- ===== TRAINED embeddings: E[vsize][d] of Adam cells, row id init kind=id+1 (== LM2 frozen) =====
+lm4_emb_initrow id d = lm4_initrow (id + 1) 0 0 d 0
+lm4_emb_initmat_go i vsize d = if i >= vsize then [] else cons (lm4_emb_initrow i d) (lm4_emb_initmat_go (i + 1) vsize d)
+lm4_emb_initmat vsize d = lm4_emb_initmat_go 0 vsize d
+lm4_emb_gather emb id = lm4_nth emb id
+lm4_ctx_vec emb ctx = if ctx == [] then [] else lm4_app (lm4_emb_gather emb (head ctx)) (lm4_ctx_vec emb (tail ctx))
+lm4_onehot_go k i v = if i >= v then [] else cons (if i == k then 16777216 else 0) (lm4_onehot_go k (i + 1) v)
+lm4_onehot k v = lm4_onehot_go k 0 v
+
+-- ===== embedding-gradient scatter: dx (length C*d) -> dE (vsize x d), repeats SUM =====
+lm4_chunk xs k d = lm4_take d (lm4_drop (k * d) xs)
+lm4_zeros_mat rows cols = if rows <= 0 then [] else cons (lm4_zeros cols) (lm4_zeros_mat (rows - 1) cols)
+lm4_addrow_go mat idx vec i = if mat == [] then []
+  else cons (if i == idx then lm4_vadd (head mat) vec else head mat) (lm4_addrow_go (tail mat) idx vec (i + 1))
+lm4_addrow_at mat idx vec = lm4_addrow_go mat idx vec 0
+lm4_scatter dEmb ctx dx d k = if ctx == [] then dEmb
+  else let ch = lm4_chunk dx k d in
+       let nd = lm4_addrow_at dEmb (head ctx) ch in
+       lm4_scatter nd (tail ctx) dx d (k + 1)
+
+-- ===== cross-entropy core (rung 15): fixed-point ln + softmax + CE loss + CE grad =====
+-- Ported bit-for-bit from the proven sm_list kernel (validates vs /tmp/sm_golden.out). s (=S)
+-- and s2 (=2S) are threaded as RUNTIME values (array-cell origin in main) -- a large int literal
+-- in COMPARISON-operand position fails to assemble. The softmax/cegrad path is s-FREE (16777216
+-- only in multiply/divide operand position); only the LOSS path (celoss -> fxln) carries s. ln
+-- range-reduction uses mutual-recursion pairs to dodge the self-loop cross-dep-arg miscompile.
+ln_up_a m k s = if m >= s then k else ln_up_b (m + m) (k - 1) s
+ln_up_b m k s = if m >= s then k else ln_up_a (m + m) (k - 1) s
+ln_upm_a m s = if m >= s then m else ln_upm_b (m + m) s
+ln_upm_b m s = if m >= s then m else ln_upm_a (m + m) s
+ln_dn_a m k s2 = if m < s2 then k else ln_dn_b (m / 2) (k + 1) s2
+ln_dn_b m k s2 = if m < s2 then k else ln_dn_a (m / 2) (k + 1) s2
+ln_dnm_a m s2 = if m < s2 then m else ln_dnm_b (m / 2) s2
+ln_dnm_b m s2 = if m < s2 then m else ln_dnm_a (m / 2) s2
+ln_mant m =
+  let num = (m - 16777216) * 16777216 in
+  let den = m + 16777216 in
+  let t = num / den in
+  let t2 = (t * t) / 16777216 in
+  let a0 = t in
+  let tp3 = (t * t2) / 16777216 in
+  let a1 = a0 + tp3 / 3 in
+  let tp5 = (tp3 * t2) / 16777216 in
+  let a2 = a1 + tp5 / 5 in
+  let tp7 = (tp5 * t2) / 16777216 in
+  let a3 = a2 + tp7 / 7 in
+  let tp9 = (tp7 * t2) / 16777216 in
+  let a4 = a3 + tp9 / 9 in
+  let tp11 = (tp9 * t2) / 16777216 in
+  let a5 = a4 + tp11 / 11 in
+  let tp13 = (tp11 * t2) / 16777216 in
+  let a6 = a5 + tp13 / 13 in
+  a6 + a6
+fxln x s =
+  if x < 1 then 0
+  else
+    let s2 = s + s in
+    let k0 = ln_up_a x 0 s in
+    let m0 = ln_upm_a x s in
+    let k1 = ln_dn_a m0 k0 s2 in
+    let m1 = ln_dnm_a m0 s2 in
+    k1 * 11629080 + ln_mant m1
+l_vmax_go xs m = if xs == [] then m else let v = head xs in if v > m then l_vmax_go (tail xs) v else l_vmax_go (tail xs) m
+l_vmax xs = l_vmax_go (tail xs) (head xs)
+l_exps xs m = if xs == [] then [] else cons (bx4_fxexp (head xs - m)) (l_exps (tail xs) m)
+l_vsum xs = if xs == [] then 0 else (head xs) + l_vsum (tail xs)
+l_smnorm es z = if es == [] then [] else cons ((head es * 16777216) / z) (l_smnorm (tail es) z)
+l_softmax xs = let m = l_vmax xs in let es = l_exps xs m in let z = l_vsum es in l_smnorm es z
+l_nth xs i = if i == 0 then head xs else l_nth (tail xs) (i - 1)
+l_celoss xs tgt s = let m = l_vmax xs in let es = l_exps xs m in let z = l_vsum es in m + (fxln z s) - (l_nth xs tgt)
+l_cegrad_go sm i tgt =
+  if sm == [] then []
+  else
+    let ind = if i == tgt then 1 else 0 in
+    let oh = ind * 16777216 in
+    cons ((head sm) - oh) (l_cegrad_go (tail sm) (i + 1) tgt)
+l_cegrad xs tgt = l_cegrad_go (l_softmax xs) 0 tgt
+
+-- ===== rung-17 RoPE: precomputed cos/sin tables (idx = p*4+i, p=pos 0..7, i=pair 0..3) =====
+-- 32 angles; big literals live ONLY in arr_set value position (big-literal-safe) and are read out
+-- by arr_get, then used only as multiply operands. Identical integers in the foreign re-verifier.
+rt_set_cos t =
+  let _ = arr_set t 0 16777216 in let _ = arr_set t 1 16777216 in let _ = arr_set t 2 16777216 in let _ = arr_set t 3 16777216 in
+  let _ = arr_set t 4 9064768 in let _ = arr_set t 5 16693400 in let _ = arr_set t 6 16776377 in let _ = arr_set t 7 16777208 in
+  let _ = arr_set t 8 (0 - 6981785) in let _ = arr_set t 9 16442789 in let _ = arr_set t 10 16773861 in let _ = arr_set t 11 16777182 in
+  let _ = arr_set t 12 (0 - 16609318) in let _ = arr_set t 13 16027887 in let _ = arr_set t 14 16769667 in let _ = arr_set t 15 16777141 in
+  let _ = arr_set t 16 (0 - 10966320) in let _ = arr_set t 17 15452839 in let _ = arr_set t 18 16763796 in let _ = arr_set t 19 16777082 in
+  let _ = arr_set t 20 4759062 in let _ = arr_set t 21 14723392 in let _ = arr_set t 22 16756249 in let _ = arr_set t 23 16777006 in
+  let _ = arr_set t 24 16108984 in let _ = arr_set t 25 13846834 in let _ = arr_set t 26 16747026 in let _ = arr_set t 27 16776914 in
+  let _ = arr_set t 28 12648381 in let _ = arr_set t 29 12831923 in let _ = arr_set t 30 16736129 in let _ = arr_set t 31 16776805 in
+  0
+rt_set_sin t =
+  let _ = arr_set t 0 0 in let _ = arr_set t 1 0 in let _ = arr_set t 2 0 in let _ = arr_set t 3 0 in
+  let _ = arr_set t 4 14117540 in let _ = arr_set t 5 1674927 in let _ = arr_set t 6 167769 in let _ = arr_set t 7 16777 in
+  let _ = arr_set t 8 15255479 in let _ = arr_set t 9 3333118 in let _ = arr_set t 10 335522 in let _ = arr_set t 11 33554 in
+  let _ = arr_set t 12 2367601 in let _ = arr_set t 13 4958006 in let _ = arr_set t 14 503241 in let _ = arr_set t 15 50332 in
+  let _ = arr_set t 16 (0 - 12697039) in let _ = arr_set t 17 6533356 in let _ = arr_set t 18 670910 in let _ = arr_set t 19 67109 in
+  let _ = arr_set t 20 (0 - 16088080) in let _ = arr_set t 21 8043426 in let _ = arr_set t 22 838511 in let _ = arr_set t 23 83886 in
+  let _ = arr_set t 24 (0 - 4687814) in let _ = arr_set t 25 9473129 in let _ = arr_set t 26 1006029 in let _ = arr_set t 27 100663 in
+  let _ = arr_set t 28 11022406 in let _ = arr_set t 29 10808179 in let _ = arr_set t 30 1173446 in let _ = arr_set t 31 117440 in
+  0
+
+-- RoPE forward on one length-8 row at position p (4 pairs). pair i uses (C,Sn)=(cos,sin)[p*4+i].
+-- y_2i = td(x0*C,S) - td(x1*Sn,S) ; y_2i+1 = td(x0*Sn,S) + td(x1*C,S).
+rope_pair ct st p i x0 x1 fn =
+  let C = arr_get ct (p * 4 + i) in
+  let Sn = arr_get st (p * 4 + i) in
+  if fn == 0 then (x0 * C) / 16777216 - (x1 * Sn) / 16777216
+  else (x0 * Sn) / 16777216 + (x1 * C) / 16777216
+rope_row ct st x p =
+  let a0 = l_nth x 0 in let a1 = l_nth x 1 in let a2 = l_nth x 2 in let a3 = l_nth x 3 in
+  let a4 = l_nth x 4 in let a5 = l_nth x 5 in let a6 = l_nth x 6 in let a7 = l_nth x 7 in
+  let y0 = rope_pair ct st p 0 a0 a1 0 in let y1 = rope_pair ct st p 0 a0 a1 1 in
+  let y2 = rope_pair ct st p 1 a2 a3 0 in let y3 = rope_pair ct st p 1 a2 a3 1 in
+  let y4 = rope_pair ct st p 2 a4 a5 0 in let y5 = rope_pair ct st p 2 a4 a5 1 in
+  let y6 = rope_pair ct st p 3 a6 a7 0 in let y7 = rope_pair ct st p 3 a6 a7 1 in
+  cons y0 (cons y1 (cons y2 (cons y3 (cons y4 (cons y5 (cons y6 (cons y7 [])))))))
+-- RoPE backward (transpose rotation = exact gradient of the orthogonal rotation).
+-- dx_2i = td(d0*C,S) + td(d1*Sn,S) ; dx_2i+1 = -td(d0*Sn,S) + td(d1*C,S).
+rope_bpair ct st p i d0 d1 fn =
+  let C = arr_get ct (p * 4 + i) in
+  let Sn = arr_get st (p * 4 + i) in
+  if fn == 0 then (d0 * C) / 16777216 + (d1 * Sn) / 16777216
+  else (0 - (d0 * Sn) / 16777216) + (d1 * C) / 16777216
+rope_bwd_row ct st dxp p =
+  let a0 = l_nth dxp 0 in let a1 = l_nth dxp 1 in let a2 = l_nth dxp 2 in let a3 = l_nth dxp 3 in
+  let a4 = l_nth dxp 4 in let a5 = l_nth dxp 5 in let a6 = l_nth dxp 6 in let a7 = l_nth dxp 7 in
+  let y0 = rope_bpair ct st p 0 a0 a1 0 in let y1 = rope_bpair ct st p 0 a0 a1 1 in
+  let y2 = rope_bpair ct st p 1 a2 a3 0 in let y3 = rope_bpair ct st p 1 a2 a3 1 in
+  let y4 = rope_bpair ct st p 2 a4 a5 0 in let y5 = rope_bpair ct st p 2 a4 a5 1 in
+  let y6 = rope_bpair ct st p 3 a6 a7 0 in let y7 = rope_bpair ct st p 3 a6 a7 1 in
+  cons y0 (cons y1 (cons y2 (cons y3 (cons y4 (cons y5 (cons y6 (cons y7 [])))))))
+-- rope every row of a list; position = list index (0,1,2,...). NOT tail-recursive (cons-wrapped).
+rope_rows_go ct st xs p = if xs == [] then [] else cons (rope_row ct st (head xs) p) (rope_rows_go ct st (tail xs) (p + 1))
+rope_rows ct st xs = rope_rows_go ct st xs 0
+rope_bwd_rows_go ct st xs p = if xs == [] then [] else cons (rope_bwd_row ct st (head xs) p) (rope_bwd_rows_go ct st (tail xs) (p + 1))
+rope_bwd_rows ct st xs = rope_bwd_rows_go ct st xs 0
+
+-- ===== rung-16 single-head self-attention: forward + backward (VALIDATED bit-exact) =====
+-- Grafted verbatim from /tmp/rung16_attn.rail (fwd) + /tmp/rung16_attn_bwd.rail (bwd, 75/75).
+-- Shared softmax (l_softmax/l_vmax/l_exps/l_vsum/l_smnorm) reuses the CE core above (identical).
+-- Bare-named helpers below do NOT collide with lm4_*/l_* (verified). Accumulation loops that
+-- permute/cross-use args are MUTUAL-RECURSION PAIRS to dodge the self-loop miscompile.
+fxm a b = (a * b) / 16777216
+dot_go a b acc = if a == [] then acc else dot_go (tail a) (tail b) (acc + (head a) * (head b))
+fx_dot a b = (dot_go a b 0) / 16777216
+ptdot_go a b acc = if a == [] then acc else ptdot_go (tail a) (tail b) (acc + fxm (head a) (head b))
+ptdot a b = ptdot_go a b 0
+matvec W x = if W == [] then [] else cons (fx_dot (head W) x) (matvec (tail W) x)
+project W xs = if xs == [] then [] else cons (matvec W (head xs)) (project W (tail xs))
+nth_l xs i = if i == 0 then head xs else nth_l (tail xs) (i - 1)
+len_l xs = if xs == [] then 0 else 1 + len_l (tail xs)
+zeros n = if n == 0 then [] else cons 0 (zeros (n - 1))
+vadd a b = if a == [] then [] else cons ((head a) + (head b)) (vadd (tail a) (tail b))
+scalevec w v = if v == [] then [] else cons (fxm w (head v)) (scalevec w (tail v))
+vscale_acc acc w v = if v == [] then [] else cons ((head acc) + fxm w (head v)) (vscale_acc (tail acc) w (tail v))
+vscale_add acc w v = if v == [] then [] else cons ((head acc) + (w * (head v)) / 16777216) (vscale_add (tail acc) w (tail v))
+madd_go A B = if A == [] then [] else cons (vadd (head A) (head B)) (madd_go (tail A) (tail B))
+madd A B = madd_go A B
+zmat r c = if r == 0 then [] else cons (zeros c) (zmat (r - 1) c)
+scores_row qi K isd = if K == [] then [] else cons (((fx_dot qi (head K)) * isd) / 16777216) (scores_row qi (tail K) isd)
+probs_go Q K isd = if Q == [] then [] else cons (l_softmax (scores_row (head Q) K isd)) (probs_go (tail Q) K isd)
+wsum_go attn V acc = if attn == [] then acc else wsum_go (tail attn) (tail V) (vscale_add acc (head attn) (head V))
+attn_out_row qi K V isd = let sc = scores_row qi K isd in let aw = l_softmax sc in let dk = len_l (head V) in wsum_go aw V (zeros dk)
+attn_all_go Q K V isd = if Q == [] then [] else cons (attn_out_row (head Q) K V isd) (attn_all_go (tail Q) K V isd)
+attention Wq Wk Wv xs isd = let Q = project Wq xs in let K = project Wk xs in let V = project Wv xs in attn_all_go Q K V isd
+dvcol_a P dO j acc = if P == [] then acc else dvcol_b (tail P) (tail dO) j (vscale_acc acc (nth_l (head P) j) (head dO))
+dvcol_b P dO j acc = if P == [] then acc else dvcol_a (tail P) (tail dO) j (vscale_acc acc (nth_l (head P) j) (head dO))
+dv_all_go P dO j T dk = if j == T then [] else cons (dvcol_a P dO j (zeros dk)) (dv_all_go P dO (j + 1) T dk)
+dv_all P dO dk = dv_all_go P dO 0 (len_l P) dk
+dprow_go dOi V = if V == [] then [] else cons (ptdot dOi (head V)) (dprow_go dOi (tail V))
+dp_all_go dO V = if dO == [] then [] else cons (dprow_go (head dO) V) (dp_all_go (tail dO) V)
+dp_all dO V = dp_all_go dO V
+ddot_row_go Pi dPi rd isd = if Pi == [] then [] else
+  let ds = fxm (head Pi) ((head dPi) - rd) in
+  cons (fxm ds isd) (ddot_row_go (tail Pi) (tail dPi) rd isd)
+ddot_row Pi dPi isd = let rd = ptdot Pi dPi in ddot_row_go Pi dPi rd isd
+dqrow_a dd K acc = if dd == [] then acc else dqrow_b (tail dd) (tail K) (vscale_acc acc (head dd) (head K))
+dqrow_b dd K acc = if dd == [] then acc else dqrow_a (tail dd) (tail K) (vscale_acc acc (head dd) (head K))
+dkcontrib_go dd qi = if dd == [] then [] else cons (scalevec (head dd) qi) (dkcontrib_go (tail dd) qi)
+dkcontrib dd qi = dkcontrib_go dd qi
+outer_go u x = if u == [] then [] else cons (scalevec (head u) x) (outer_go (tail u) x)
+outer u x = outer_go u x
+-- rung-20: terminate on W (the matrix rows), NOT dU. For multi-head, dQ/dKg are d-wide (rope pads
+-- to 8) but Wqh/Wkh are only dh rows; the extra dU entries are trailing zeros. Walking dU overran W
+-- (head []=0, tail 0=[]) and COLLAPSED the d-wide acc to 1 element, corrupting dX. Walking W stops
+-- after dh rows with acc intact. Identical to lm8 where len(dU)==len(W)==d.
+tmv_a dU W acc = if W == [] then acc else tmv_b (tail dU) (tail W) (vscale_acc acc (head dU) (head W))
+tmv_b dU W acc = if W == [] then acc else tmv_a (tail dU) (tail W) (vscale_acc acc (head dU) (head W))
+dq_all_go P dP Q K isd =
+  if P == [] then []
+  else
+    let dd = ddot_row (head P) (head dP) isd in
+    let dkk = len_l (head Q) in
+    cons (dqrow_a dd K (zeros dkk)) (dq_all_go (tail P) (tail dP) (tail Q) K isd)
+dq_all P dP Q K isd = dq_all_go P dP Q K isd
+dk_fold_a P dP Q isd acc = if P == [] then acc else
+  let dd = ddot_row (head P) (head dP) isd in
+  dk_fold_b (tail P) (tail dP) (tail Q) isd (madd acc (dkcontrib dd (head Q)))
+dk_fold_b P dP Q isd acc = if P == [] then acc else
+  let dd = ddot_row (head P) (head dP) isd in
+  dk_fold_a (tail P) (tail dP) (tail Q) isd (madd acc (dkcontrib dd (head Q)))
+dw_fold_a dU xs acc = if dU == [] then acc else dw_fold_b (tail dU) (tail xs) (madd acc (outer (head dU) (head xs)))
+dw_fold_b dU xs acc = if dU == [] then acc else dw_fold_a (tail dU) (tail xs) (madd acc (outer (head dU) (head xs)))
+dx_all_go dQ dKg dV Wq Wk Wv d =
+  if dQ == [] then []
+  else
+    let a = tmv_a (head dQ) Wq (zeros d) in
+    let b = tmv_a (head dKg) Wk a in
+    let c = tmv_a (head dV) Wv b in
+    cons c (dx_all_go (tail dQ) (tail dKg) (tail dV) Wq Wk Wv d)
+dx_all dQ dKg dV Wq Wk Wv d = dx_all_go dQ dKg dV Wq Wk Wv d
+attn_bwd Wq Wk Wv xs isd dOut =
+  let Q = project Wq xs in
+  let K = project Wk xs in
+  let V = project Wv xs in
+  let T = len_l xs in
+  let d = len_l (head xs) in
+  let dk = len_l (head V) in
+  let P = probs_go Q K isd in
+  let dP = dp_all dOut V in
+  let dV = dv_all P dOut dk in
+  let dQ = dq_all P dP Q K isd in
+  let dKg = dk_fold_a P dP Q isd (zmat T (len_l (head K))) in
+  let dWq = dw_fold_a dQ xs (zmat (len_l (head Q)) d) in
+  let dWk = dw_fold_a dKg xs (zmat (len_l (head K)) d) in
+  let dWv = dw_fold_a dV xs (zmat dk d) in
+  let dX = dx_all dQ dKg dV Wq Wk Wv d in
+  cons dWq (cons dWk (cons dWv (cons dX [])))
+
+-- ===== rung-17 causal + RoPE attention: rotate Q/K, mask j>i, un-rotate dQr/dKr =====
+-- Causal probability row for query i: softmax over scores[0..i], 0-pad to length T. The 0-pad makes
+-- every masked entry exactly 0 so LM8's dv/dp/dq/dk/dw/dx backward runs UNCHANGED on Qr/Kr.
+causal_prob_row qi Kr isd i T =
+  let Kact = lm4_take (i + 1) Kr in
+  let sc = scores_row qi Kact isd in
+  let aw = l_softmax sc in
+  lm4_app aw (lm4_zeros (T - (i + 1)))
+cprobs_go Qr Kr isd i T = if Qr == [] then [] else cons (causal_prob_row (head Qr) Kr isd i T) (cprobs_go (tail Qr) Kr isd (i + 1) T)
+cprobs Qr Kr isd T = cprobs_go Qr Kr isd 0 T
+attn_out_from_probs Pi V = let dk = len_l (head V) in wsum_go Pi V (zeros dk)
+attn_outs_go P V = if P == [] then [] else cons (attn_out_from_probs (head P) V) (attn_outs_go (tail P) V)
+attention_rope ct st Wq Wk Wv xs isd =
+  let Q = project Wq xs in
+  let K = project Wk xs in
+  let V = project Wv xs in
+  let Qr = rope_rows ct st Q in
+  let Kr = rope_rows ct st K in
+  let T = len_l xs in
+  let P = cprobs Qr Kr isd T in
+  attn_outs_go P V
+attn_bwd_rope ct st Wq Wk Wv xs isd dOut =
+  let Q = project Wq xs in
+  let K = project Wk xs in
+  let V = project Wv xs in
+  let Qr = rope_rows ct st Q in
+  let Kr = rope_rows ct st K in
+  let T = len_l xs in
+  let d = len_l (head xs) in
+  let dk = len_l (head V) in
+  let P = cprobs Qr Kr isd T in
+  let dP = dp_all dOut V in
+  let dV = dv_all P dOut dk in
+  let dQr = dq_all P dP Qr Kr isd in
+  let dKr = dk_fold_a P dP Qr isd (zmat T (len_l (head K))) in
+  let dQ = rope_bwd_rows ct st dQr in
+  let dKg = rope_bwd_rows ct st dKr in
+  let dWq = dw_fold_a dQ xs (zmat (len_l (head Q)) d) in
+  let dWk = dw_fold_a dKg xs (zmat (len_l (head K)) d) in
+  let dWv = dw_fold_a dV xs (zmat dk d) in
+  let dX = dx_all dQ dKg dV Wq Wk Wv d in
+  cons dWq (cons dWk (cons dWv (cons dX [])))
+
+-- ===== rung-20 MULTI-HEAD: split the d x d Wq/Wk/Wv into H=lm10_nh row-blocks of (dh x d) and run
+-- the EXISTING (bit-exact) attention_rope/attn_bwd_rope per head, then concat (fwd) / vertical-stack
+-- dW + sum dX (bwd). Heads packed as row-blocks of one matrix -> the weight bundle, checkpoint,
+-- chain AND w_hex are UNCHANGED from lm8. Each head reads the FULL d-row, emits dh; RoPE rotates
+-- pairs 0..dh/2-1 within each head (rope_row restarts at pair 0 per row -> correct per-head RoPE).
+-- dh must be even and d % lm10_nh == 0. First cut: d=8, lm10_nh=2, dh=4. =====
+lm10_nh = 2
+mh_slice xs start n = lm4_take n (lm4_drop start xs)
+mh_emptyrows t = if t == 0 then [] else cons [] (mh_emptyrows (t - 1))
+mh_rowcat A B = if A == [] then [] else cons (lm4_app (head A) (head B)) (mh_rowcat (tail A) (tail B))
+mh_colslice M start n = if M == [] then [] else cons (mh_slice (head M) start n) (mh_colslice (tail M) start n)
+-- forward: O = concat_h attention_rope(Wq[h*dh:],Wk[..],Wv[..]) ; head 0 fills the leftmost dh cols.
+mh_attn_fwd_go ct st Wq Wk Wv xs isd h dh =
+  if h >= lm10_nh then mh_emptyrows (len_l xs)
+  else
+    let Wqh = mh_slice Wq (h * dh) dh in
+    let Wkh = mh_slice Wk (h * dh) dh in
+    let Wvh = mh_slice Wv (h * dh) dh in
+    let Oh = attention_rope ct st Wqh Wkh Wvh xs isd in
+    mh_rowcat Oh (mh_attn_fwd_go ct st Wq Wk Wv xs isd (h + 1) dh)
+mh_attn_fwd ct st Wq Wk Wv xs isd = mh_attn_fwd_go ct st Wq Wk Wv xs isd 0 ((len_l (head xs)) / lm10_nh)
+-- backward: per head, attn_bwd_rope on dOut's dh-col-slice -> [dWqh(dh x d),dWkh,dWvh,dXh(T x d)].
+-- Stack dWqh blocks in head order (head 0 on top) -> d x d ; SUM dXh over heads -> dXn1 (T x d).
+mh_attn_bwd_go ct st Wq Wk Wv xs isd dOut h dh d =
+  if h >= lm10_nh then cons [] (cons [] (cons [] (cons (lm4_zeros_mat (len_l xs) d) [])))
+  else
+    let dOh = mh_colslice dOut (h * dh) dh in
+    let Wqh = mh_slice Wq (h * dh) dh in
+    let Wkh = mh_slice Wk (h * dh) dh in
+    let Wvh = mh_slice Wv (h * dh) dh in
+    let abh = attn_bwd_rope ct st Wqh Wkh Wvh xs isd dOh in
+    let rest = mh_attn_bwd_go ct st Wq Wk Wv xs isd dOut (h + 1) dh d in
+    cons (lm4_app (lm4_nth abh 0) (lm4_nth rest 0))
+      (cons (lm4_app (lm4_nth abh 1) (lm4_nth rest 1))
+        (cons (lm4_app (lm4_nth abh 2) (lm4_nth rest 2))
+          (cons (lm8_madd (lm4_nth abh 3) (lm4_nth rest 3)) [])))
+mh_attn_bwd ct st Wq Wk Wv xs isd dOut d = mh_attn_bwd_go ct st Wq Wk Wv xs isd dOut 0 (d / lm10_nh) d
+
+-- ===== rung-18 RMSNorm (pre-norm, shared gamma) + residual. Q.24 fixed-point. =====
+-- xhat_i=(x_i*S)/rms ; y_i=(xhat_i*gamma_i)/S ; rms=sqrt(mean(x^2)+eps). Backward is the analytic
+-- gradient; CORE validated bit-exact (Rail==Py) + integrated float grad-check 8.7e-11.
+-- mutual-recursion (_a/_b) for cross-dep accumulators; cons-wrapped walks elsewhere (not self-loops).
+rn_mss_a acc xs = if xs == [] then acc else let xi = head xs in rn_mss_b (acc + (xi * xi) / 16777216) (tail xs)
+rn_mss_b acc xs = if xs == [] then acc else let xi = head xs in rn_mss_a (acc + (xi * xi) / 16777216) (tail xs)
+rn_mss xs = rn_mss_a 0 xs
+rn_rms x = let dd = len_l x in let ms = (rn_mss x) / dd in bx4_fxsqrt (ms + 16777)
+rn_xhat_go xs rms = if xs == [] then [] else cons ((head xs * 16777216) / rms) (rn_xhat_go (tail xs) rms)
+rn_apply_go xhs gs = if xhs == [] then [] else cons ((head xhs * head gs) / 16777216) (rn_apply_go (tail xhs) (tail gs))
+rn_fwd_row x gamma = let rms = rn_rms x in rn_apply_go (rn_xhat_go x rms) gamma
+rn_fwd_rows rows gamma = if rows == [] then [] else cons (rn_fwd_row (head rows) gamma) (rn_fwd_rows (tail rows) gamma)
+rn_vadd a b = if a == [] then [] else cons (head a + head b) (rn_vadd (tail a) (tail b))
+rn_resid_go att rows = if att == [] then [] else cons (rn_vadd (head att) (head rows)) (rn_resid_go (tail att) (tail rows))
+rn_dgamma_go dys xhs = if dys == [] then [] else cons ((head dys * head xhs) / 16777216) (rn_dgamma_go (tail dys) (tail xhs))
+rn_gsum_a acc gs xhs dys = if gs == [] then acc else let term = (((head gs * head xhs) / 16777216) * head dys) / 16777216 in rn_gsum_b (acc + term) (tail gs) (tail xhs) (tail dys)
+rn_gsum_b acc gs xhs dys = if gs == [] then acc else let term = (((head gs * head xhs) / 16777216) * head dys) / 16777216 in rn_gsum_a (acc + term) (tail gs) (tail xhs) (tail dys)
+rn_gsum gs xhs dys = rn_gsum_a 0 gs xhs dys
+rn_dx_go gs xhs dys invrms gdr = if gs == [] then [] else
+  let term1 = (((head gs * invrms) / 16777216) * head dys) / 16777216 in
+  let term2 = (head xhs * gdr) / 16777216 in
+  cons (term1 - term2) (rn_dx_go (tail gs) (tail xhs) (tail dys) invrms gdr)
+rn_bwd_row x gamma dy =
+  let dd = len_l x in
+  let rms = rn_rms x in
+  let xhat = rn_xhat_go x rms in
+  let invrms = 281474976710656 / rms in
+  let dgamma = rn_dgamma_go dy xhat in
+  let bigG = rn_gsum gamma xhat dy in
+  let gdr = ((bigG / dd) * 16777216) / rms in
+  let dx = rn_dx_go gamma xhat dy invrms gdr in
+  cons dx (cons dgamma [])
+-- rows-level bwd: rows gamma dXn(attn grad) dH(residual skip) -> [dRows, dgamma(accum d-vec)].
+-- dRows_i = dRn_i + dH_i (residual). cons-wrapped (not a self-loop) so cross-dep dgacc is safe.
+rn_bwd_rows_go rows gamma dXn dH dgacc =
+  if rows == [] then cons [] (cons dgacc [])
+  else
+    let rb = rn_bwd_row (head rows) gamma (head dXn) in
+    let dRow = rn_vadd (head rb) (head dH) in
+    let rest = rn_bwd_rows_go (tail rows) gamma (tail dXn) (tail dH) (rn_vadd dgacc (head (tail rb))) in
+    cons (cons dRow (head rest)) (cons (head (tail rest)) [])
+rn_bwd_rows rows gamma dXn dH = rn_bwd_rows_go rows gamma dXn dH (lm4_zeros (len_l (head rows)))
+
+-- ===== lm5 glue: ctx -> emb rows (list, not concat); flatten rows -> vec; reshape vec -> rows =====
+lm5_ctx_rows emb ctx = if ctx == [] then [] else cons (lm4_emb_gather emb (head ctx)) (lm5_ctx_rows emb (tail ctx))
+lm5_flatten rows = if rows == [] then [] else lm4_app (head rows) (lm5_flatten (tail rows))
+lm5_reshape xs d = if xs == [] then [] else cons (lm4_take d xs) (lm5_reshape (lm4_drop d xs) d)
+lm5_qkv_init kind d = lm4_initmat kind d d 0
+-- rung-18 gamma init: shared d-vector, each entry 1.0 (=S in Q.24); stored as a 1-row cell matrix.
+rn_grow_go i d = if i >= d then [] else cons (cons 16777216 (cons 0 (cons 0 []))) (rn_grow_go (i + 1) d)
+rn_gamma_init d = cons (rn_grow_go 0 d) []
+
+-- rung-19: position-wise FFN sublayer (per row: d -> ff -> d, tanh-GELU) + matrix-add for grad accumulation.
+-- ffn_row x = Wff2 . gelu(Wff1 . x). Applied independently to each (already pre-normed) row.
+lm8_ffn_row wff1 wff2 row = lm4_matvec wff2 (lm4_geluv (lm4_matvec wff1 row))
+lm8_ffn_rows wff1 wff2 rows = if rows == [] then [] else cons (lm8_ffn_row wff1 wff2 (head rows)) (lm8_ffn_rows wff1 wff2 (tail rows))
+lm8_madd a b = if a == [] then [] else cons (rn_vadd (head a) (head b)) (lm8_madd (tail a) (tail b))
+-- FFN backward folded over rows: returns [dWff1 (ffh x d), dWff2 (d x ffh), dXn2-list (T x d)].
+-- cons-wrapped recursion (NOT a self-loop) so the per-row matrix sums accumulate safely.
+lm8_ffn_bwd_go wff1 wff2 xns dBs ffh d =
+  if xns == [] then cons (lm4_zeros_mat ffh d) (cons (lm4_zeros_mat d ffh) (cons [] []))
+  else
+    let xn2 = head xns in
+    let dB = head dBs in
+    let zf = lm4_matvec wff1 xn2 in
+    let hf = lm4_geluv zf in
+    let dWff2_r = lm4_outer dB hf in
+    let dhf = lm4_matvec_t wff2 dB ffh in
+    let dzf = lm4_dz1 zf dhf in
+    let dWff1_r = lm4_outer dzf xn2 in
+    let dXn2 = lm4_matvec_t wff1 dzf d in
+    let rest = lm8_ffn_bwd_go wff1 wff2 (tail xns) (tail dBs) ffh d in
+    cons (lm8_madd dWff1_r (lm4_nth rest 0)) (cons (lm8_madd dWff2_r (lm4_nth rest 1)) (cons (cons dXn2 (lm4_nth rest 2)) []))
+
+-- ===== forward (emb rows -> attention -> concat -> MLP) + CE loss + reverse-mode gradients =====
+-- Forward is identical to rung 14; argmax(z2) = argmax(softmax z2) so greedy decode is unchanged.
+-- Loss switches MSE -> cross-entropy; the upstream gradient switches dz2 = z2 - onehot  ->
+-- dz2 = softmax(z2) - onehot = l_cegrad z2 tgt (bounded in [-S,S], so no clip needed on dz2;
+-- the deeper dx still gets lm4_clipg in Adam). Everything downstream of dz2 is byte-identical.
+-- rung-18: pre-norm RMSNorm before attention, residual add of the RAW rows after (h_i=att_i+rows_i).
+-- rung-20 increment-2: stack N=2 independent-weight transformer blocks.
+-- A block's weights are bundled positionally: blk = [wq, wk, wv, gamma, gamma2, wff1, wff2]
+-- (gamma/gamma2 are scalars, the rest matrices). Bundling keeps every threading function at
+-- one arg per block (NOT 7), so forward/grads stay well under the >=30-arg corruption cliff.
+-- lm4_block_fwd : the pre-norm RMSNorm + multi-head RoPE causal attn + residual, then
+-- pre-norm + position-wise FFN(GELU) + residual -- returns the block's output rows.
+lm4_block_fwd ct st blk rows isd =
+  let wq = lm4_nth blk 0 in
+  let wk = lm4_nth blk 1 in
+  let wv = lm4_nth blk 2 in
+  let gamma = lm4_nth blk 3 in
+  let gamma2 = lm4_nth blk 4 in
+  let wff1 = lm4_nth blk 5 in
+  let wff2 = lm4_nth blk 6 in
+  let xn1 = rn_fwd_rows rows gamma in
+  let att = mh_attn_fwd ct st wq wk wv xn1 isd in
+  let a = rn_resid_go att rows in
+  let xn2 = rn_fwd_rows a gamma2 in
+  let ff = lm8_ffn_rows wff1 wff2 xn2 in
+  rn_resid_go ff a
+-- lm4_block_bwd : recompute this block's forward from its input `rows`, then backprop the
+-- upstream gradient dOut (grad w.r.t. the block output b) through it. Returns the 7 weight
+-- grads PLUS dRows (grad w.r.t. the block input) as element 7 -- dRows is exactly the dOut
+-- of the block below, so stacking is just block_bwd chained on dRows.
+lm4_block_bwd ct st blk rows isd dOut d =
+  let wq = lm4_nth blk 0 in
+  let wk = lm4_nth blk 1 in
+  let wv = lm4_nth blk 2 in
+  let gamma = lm4_nth blk 3 in
+  let gamma2 = lm4_nth blk 4 in
+  let wff1 = lm4_nth blk 5 in
+  let wff2 = lm4_nth blk 6 in
+  let xn1 = rn_fwd_rows rows gamma in
+  let att = mh_attn_fwd ct st wq wk wv xn1 isd in
+  let a = rn_resid_go att rows in
+  let xn2 = rn_fwd_rows a gamma2 in
+  let dB = dOut in
+  let ffh = lm4_len wff1 in
+  let fb = lm8_ffn_bwd_go wff1 wff2 xn2 dB ffh d in
+  let dWff1 = lm4_nth fb 0 in
+  let dWff2 = lm4_nth fb 1 in
+  let dXn2 = lm4_nth fb 2 in
+  let rb2 = rn_bwd_rows a gamma2 dXn2 dB in
+  let dA = head rb2 in
+  let dgamma2 = head (tail rb2) in
+  let ab = mh_attn_bwd ct st wq wk wv xn1 isd dA d in
+  let dWq = lm4_nth ab 0 in
+  let dWk = lm4_nth ab 1 in
+  let dWv = lm4_nth ab 2 in
+  let dXn1 = lm4_nth ab 3 in
+  let rb1 = rn_bwd_rows rows gamma dXn1 dA in
+  let dRows = head rb1 in
+  let dgamma1 = head (tail rb1) in
+  cons dWq (cons dWk (cons dWv (cons dgamma1 (cons dgamma2 (cons dWff1 (cons dWff2 (cons dRows [])))))))
+-- forward = block0 -> block1 -> readout MLP. argmax(z2) unchanged so greedy decode is the same.
+lm4_forward ct st w1 w2 blk0 blk1 rows isd =
+  let b0 = lm4_block_fwd ct st blk0 rows isd in
+  let b1 = lm4_block_fwd ct st blk1 b0 isd in
+  lm4_matvec w2 (lm4_geluv (lm4_matvec w1 (lm5_flatten b1)))
+lm4_celoss_fwd ct st w1 w2 blk0 blk1 rows isd tgt s = l_celoss (lm4_forward ct st w1 w2 blk0 blk1 rows isd) tgt s
+-- grads: readout backward -> block1 backward (input b0) -> block0 backward (input rows).
+-- dB1 = grad w.r.t. block1 output; block1's dRows is the upstream for block0.
+-- Returns 17 grads in weight order: [dW1, dW2, dxe, block0(7), block1(7)].
+lm4_grads ct st w1 w2 blk0 blk1 rows isd tgt hidden indim d =
+  let b0 = lm4_block_fwd ct st blk0 rows isd in
+  let b1 = lm4_block_fwd ct st blk1 b0 isd in
+  let x = lm5_flatten b1 in
+  let z1 = gpu_matvec w1 x in
+  let h1 = lm4_geluv z1 in
+  let z2 = gpu_matvec w2 h1 in
+  let dz2 = l_cegrad z2 tgt in
+  let dW2 = lm4_outer dz2 h1 in
+  let dh1 = lm4_matvec_t w2 dz2 hidden in
+  let dz1 = lm4_dz1 z1 dh1 in
+  let dW1 = lm4_outer dz1 x in
+  let dx = lm4_matvec_t w1 dz1 indim in
+  let dB1 = lm5_reshape dx d in
+  let g1 = lm4_block_bwd ct st blk1 b0 isd dB1 d in
+  let dRows1 = lm4_nth g1 7 in
+  let g0 = lm4_block_bwd ct st blk0 rows isd dRows1 d in
+  let dxe = lm5_flatten (lm4_nth g0 7) in
+  cons dW1 (cons dW2 (cons dxe (cons (lm4_nth g0 0) (cons (lm4_nth g0 1) (cons (lm4_nth g0 2) (cons (lm4_nth g0 3) (cons (lm4_nth g0 4) (cons (lm4_nth g0 5) (cons (lm4_nth g0 6) (cons (lm4_nth g1 0) (cons (lm4_nth g1 1) (cons (lm4_nth g1 2) (cons (lm4_nth g1 3) (cons (lm4_nth g1 4) (cons (lm4_nth g1 5) (cons (lm4_nth g1 6) []))))))))))))))))
+
+-- ===== gradient clipping (prevents the g*g overflow in Adam's v-update) =====
+-- The embedding gradient dx = W1^T . dz1 is the largest (two matmuls deep); squaring it in
+-- g2=(g*g)/S overflows int63 (g ~ 1e11 fixed -> g*g ~ 1e22 >> 2^62) -> garbage Adam step ->
+-- divergence cascade. Cap each component to +/-2^30 (cap=16777216*64, arithmetic-operand so no
+-- big-literal codegen trap): g*g <= 2^60 < 2^62 (4x margin). Bit-exact integer clamp.
+lm4_clipg g = let cap = 16777216 * 64 in
+  if g > cap then cap else (if g < (0 - cap) then (0 - cap) else g)
+
+-- ===== exact-integer Adam (incremental bias correction passed in) =====
+lm4_adam th m v g beta1 beta2 lr eps bc1 bc2 =
+  let m2 = ((beta1 * m) / 16777216) + (((16777216 - beta1) * g) / 16777216) in
+  let g2 = (g * g) / 16777216 in
+  let v2 = ((beta2 * v) / 16777216) + (((16777216 - beta2) * g2) / 16777216) in
+  let mhat = (m2 * 16777216) / bc1 in
+  let vhat = (v2 * 16777216) / bc2 in
+  let denom = (bx4_fxsqrt vhat) + eps in
+  let step = (lr * mhat) / denom in
+  cons (th - step) (cons m2 (cons v2 []))
+lm4_updcell cell g beta1 beta2 lr eps bc1 bc2 =
+  lm4_adam (head cell) (head (tail cell)) (head (tail (tail cell))) (lm4_clipg g) beta1 beta2 lr eps bc1 bc2
+lm4_updrow crow grow beta1 beta2 lr eps bc1 bc2 =
+  if crow == [] then []
+  else cons (lm4_updcell (head crow) (head grow) beta1 beta2 lr eps bc1 bc2) (lm4_updrow (tail crow) (tail grow) beta1 beta2 lr eps bc1 bc2)
+lm4_updmat cm gm beta1 beta2 lr eps bc1 bc2 =
+  if cm == [] then []
+  else cons (lm4_updrow (head cm) (head gm) beta1 beta2 lr eps bc1 bc2) (lm4_updmat (tail cm) (tail gm) beta1 beta2 lr eps bc1 bc2)
+
+-- ===== canonical serialization (for the checkpoint commitments) =====
+-- O(N) canon: build a flat piece-list then a SINGLE cat (right-nested cat re-measured
+-- the growing suffix at every level -> O(N^2), ~180 calls/run dominated wall time).
+-- Output is byte-identical (trailing " " per element, trailing ";" per row) -> same SHA256.
+lm4_canon_row_p xs = if xs == [] then [] else cons (show (head xs)) (cons " " (lm4_canon_row_p (tail xs)))
+lm4_canon_row xs = cat (lm4_canon_row_p xs)
+lm4_canon_mat_p m = if m == [] then [] else cons (lm4_canon_row (head m)) (cons ";" (lm4_canon_mat_p (tail m)))
+lm4_canon_mat m = cat (lm4_canon_mat_p m)
+
+-- ===== dataset total loss (for okProg + per-checkpoint loss) =====
+lm4_dsloss_go ct st pairs w1 w2 emb blk0 blk1 isd v s acc = if pairs == [] then acc
+  else let pr = head pairs in let (ctx, tgt) = pr in
+       lm4_dsloss_go ct st (tail pairs) w1 w2 emb blk0 blk1 isd v s (acc + (lm4_celoss_fwd ct st w1 w2 blk0 blk1 (lm5_ctx_rows emb ctx) isd tgt s))
+lm4_dsloss ct st pairs w1 w2 emb blk0 blk1 isd v s = lm4_dsloss_go ct st pairs w1 w2 emb blk0 blk1 isd v s 0
+
+-- ===== training: one exact-integer step (updates W1, W2 AND E) =====
+-- one exact-integer step over the 17-config bundle wp. blk0/blk1 are materialized weight
+-- bundles (gamma/gamma2 as scalars) fed to lm4_grads; the 17 grads come back in weight order.
+lm4_mkblk wqc wkc wvc gammac gamma2c wff1c wff2c =
+  cons (lm4_thmat wqc) (cons (lm4_thmat wkc) (cons (lm4_thmat wvc) (cons (head (lm4_thmat gammac)) (cons (head (lm4_thmat gamma2c)) (cons (lm4_thmat wff1c) (cons (lm4_thmat wff2c) []))))))
+lm4_step ct st wp pair d hidden v indim isd beta1 beta2 lr eps pow1 pow2 =
+  let (ctx, tgt) = pair in
+  let w1c = lm4_nth wp 0 in
+  let w2c = lm4_nth wp 1 in
+  let ec = lm4_nth wp 2 in
+  let emb = lm4_thmat ec in
+  let rows = lm5_ctx_rows emb ctx in
+  let w1 = lm4_thmat w1c in
+  let w2 = lm4_thmat w2c in
+  let blk0 = lm4_mkblk (lm4_nth wp 3) (lm4_nth wp 4) (lm4_nth wp 5) (lm4_nth wp 6) (lm4_nth wp 7) (lm4_nth wp 8) (lm4_nth wp 9) in
+  let blk1 = lm4_mkblk (lm4_nth wp 10) (lm4_nth wp 11) (lm4_nth wp 12) (lm4_nth wp 13) (lm4_nth wp 14) (lm4_nth wp 15) (lm4_nth wp 16) in
+  let gs = lm4_grads ct st w1 w2 blk0 blk1 rows isd tgt hidden indim d in
+  let dW1 = lm4_nth gs 0 in
+  let dW2 = lm4_nth gs 1 in
+  let dxe = lm4_nth gs 2 in
+  let dEmb = lm4_scatter (lm4_zeros_mat v d) ctx dxe d 0 in
+  let np1 = (pow1 * beta1) / 16777216 in
+  let np2 = (pow2 * beta2) / 16777216 in
+  let bc1 = 16777216 - np1 in
+  let bc2 = 16777216 - np2 in
+  let nw1 = lm4_updmat w1c dW1 beta1 beta2 lr eps bc1 bc2 in
+  let nw2 = lm4_updmat w2c dW2 beta1 beta2 lr eps bc1 bc2 in
+  let nec = lm4_updmat ec dEmb beta1 beta2 lr eps bc1 bc2 in
+  let nb0wq = lm4_updmat (lm4_nth wp 3) (lm4_nth gs 3) beta1 beta2 lr eps bc1 bc2 in
+  let nb0wk = lm4_updmat (lm4_nth wp 4) (lm4_nth gs 4) beta1 beta2 lr eps bc1 bc2 in
+  let nb0wv = lm4_updmat (lm4_nth wp 5) (lm4_nth gs 5) beta1 beta2 lr eps bc1 bc2 in
+  let nb0g = lm4_updmat (lm4_nth wp 6) (cons (lm4_nth gs 6) []) beta1 beta2 lr eps bc1 bc2 in
+  let nb0g2 = lm4_updmat (lm4_nth wp 7) (cons (lm4_nth gs 7) []) beta1 beta2 lr eps bc1 bc2 in
+  let nb0wff1 = lm4_updmat (lm4_nth wp 8) (lm4_nth gs 8) beta1 beta2 lr eps bc1 bc2 in
+  let nb0wff2 = lm4_updmat (lm4_nth wp 9) (lm4_nth gs 9) beta1 beta2 lr eps bc1 bc2 in
+  let nb1wq = lm4_updmat (lm4_nth wp 10) (lm4_nth gs 10) beta1 beta2 lr eps bc1 bc2 in
+  let nb1wk = lm4_updmat (lm4_nth wp 11) (lm4_nth gs 11) beta1 beta2 lr eps bc1 bc2 in
+  let nb1wv = lm4_updmat (lm4_nth wp 12) (lm4_nth gs 12) beta1 beta2 lr eps bc1 bc2 in
+  let nb1g = lm4_updmat (lm4_nth wp 13) (cons (lm4_nth gs 13) []) beta1 beta2 lr eps bc1 bc2 in
+  let nb1g2 = lm4_updmat (lm4_nth wp 14) (cons (lm4_nth gs 14) []) beta1 beta2 lr eps bc1 bc2 in
+  let nb1wff1 = lm4_updmat (lm4_nth wp 15) (lm4_nth gs 15) beta1 beta2 lr eps bc1 bc2 in
+  let nb1wff2 = lm4_updmat (lm4_nth wp 16) (lm4_nth gs 16) beta1 beta2 lr eps bc1 bc2 in
+  cons nw1 (cons nw2 (cons nec (cons nb0wq (cons nb0wk (cons nb0wv (cons nb0g (cons nb0g2 (cons nb0wff1 (cons nb0wff2 (cons nb1wq (cons nb1wk (cons nb1wv (cons nb1g (cons nb1g2 (cons nb1wff1 (cons nb1wff2 (cons np1 (cons np2 []))))))))))))))))))
+
+-- re-cons the first 17 elements of a list (the 17 weight-configs, dropping trailing pow1/pow2)
+lm4_first17 l = cons (lm4_nth l 0) (cons (lm4_nth l 1) (cons (lm4_nth l 2) (cons (lm4_nth l 3) (cons (lm4_nth l 4) (cons (lm4_nth l 5) (cons (lm4_nth l 6) (cons (lm4_nth l 7) (cons (lm4_nth l 8) (cons (lm4_nth l 9) (cons (lm4_nth l 10) (cons (lm4_nth l 11) (cons (lm4_nth l 12) (cons (lm4_nth l 13) (cons (lm4_nth l 14) (cons (lm4_nth l 15) (cons (lm4_nth l 16) []))))))))))))))))
+lm4_epoch ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 =
+  if pairs == [] then cons (lm4_nth wp 0) (cons (lm4_nth wp 1) (cons (lm4_nth wp 2) (cons (lm4_nth wp 3) (cons (lm4_nth wp 4) (cons (lm4_nth wp 5) (cons (lm4_nth wp 6) (cons (lm4_nth wp 7) (cons (lm4_nth wp 8) (cons (lm4_nth wp 9) (cons (lm4_nth wp 10) (cons (lm4_nth wp 11) (cons (lm4_nth wp 12) (cons (lm4_nth wp 13) (cons (lm4_nth wp 14) (cons (lm4_nth wp 15) (cons (lm4_nth wp 16) (cons pow1 (cons pow2 []))))))))))))))))))
+  else let r = lm4_step ct st wp (head pairs) d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
+       lm4_epoch ct st (lm4_first17 r) (tail pairs) d hidden v indim isd beta1 beta2 lr eps (lm4_nth r 17) (lm4_nth r 18)
+
+-- ===== one signed CHECKPOINT at the post-epoch weights (binds W1, W2 AND E) =====
+-- ===== wp helpers: build the 2 block weight-bundles, the dataset loss, and the 17-matrix w_hex
+-- (factored so the signed checkpoint and the D0 link-only re-derive use byte-identical canon) =====
+lm4_blk0_of wp = lm4_mkblk (lm4_nth wp 3) (lm4_nth wp 4) (lm4_nth wp 5) (lm4_nth wp 6) (lm4_nth wp 7) (lm4_nth wp 8) (lm4_nth wp 9)
+lm4_blk1_of wp = lm4_mkblk (lm4_nth wp 10) (lm4_nth wp 11) (lm4_nth wp 12) (lm4_nth wp 13) (lm4_nth wp 14) (lm4_nth wp 15) (lm4_nth wp 16)
+lm4_loss_wp ct st pairs wp isd v s =
+  lm4_dsloss ct st pairs (lm4_thmat (lm4_nth wp 0)) (lm4_thmat (lm4_nth wp 1)) (lm4_thmat (lm4_nth wp 2)) (lm4_blk0_of wp) (lm4_blk1_of wp) isd v s
+lm4_cm wp i = lm4_canon_mat (lm4_thmat (lm4_nth wp i))
+lm4_canon17 wp =
+  sha256_hex (cat [lm4_cm wp 0, ";;", lm4_cm wp 1, ";;", lm4_cm wp 2, ";;",
+    lm4_cm wp 3, ";;", lm4_cm wp 4, ";;", lm4_cm wp 5, ";;", lm4_cm wp 6, ";;", lm4_cm wp 7, ";;", lm4_cm wp 8, ";;", lm4_cm wp 9, ";;",
+    lm4_cm wp 10, ";;", lm4_cm wp 11, ";;", lm4_cm wp 12, ";;", lm4_cm wp 13, ";;", lm4_cm wp 14, ";;", lm4_cm wp 15, ";;", lm4_cm wp 16])
+lm4_ckpt ct st wp pairs d v isd s seed pk prev_hex epoch_i =
+  let loss = lm4_loss_wp ct st pairs wp isd v s in
+  let w_hex = lm4_canon17 wp in
+  let loss_str = show loss in
+  let link_str = cat [prev_hex, "|", show epoch_i, "|", w_hex, "|", loss_str] in
+  let link_b = sha256 link_str in
+  let link_hex = bytes_to_hex link_b 32 in
+  let sig = ed25519_sign seed link_b 32 in
+  let sig_hex = bytes_to_hex sig 64 in
+  let ok = ed25519_verify pk link_b 32 sig in
+  let line = cat [show epoch_i, " ", w_hex, " ", loss_str, " ", prev_hex, " ", link_hex, " ", sig_hex] in
+  cons link_hex (cons line (cons ok (cons loss [])))
+
+-- ===== checkpoint-cadence attested training: one epoch then one signed checkpoint =====
+-- ARITY: the weight-configs are bundled into one list `wp` (now 17 entries for N=2 blocks)
+-- so lm4_chain stays at 23 args -- the trailing string args (pk, prev_hex) never approach the
+-- >=30-arg calling-convention corruption cliff that bit lm8. wp is returned as a single nested
+-- element so the result list is just [all_ok, acc, prev_hex, wp].
+lm4_chain ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk epochs i prev_hex acc all_ok =
+  if i >= epochs then cons all_ok (cons acc (cons prev_hex (cons wp [])))
+  else lm4_chain_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk epochs i prev_hex acc all_ok
+lm4_chain_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk epochs i prev_hex acc all_ok =
+    let e = lm4_epoch ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
+    let nwp = lm4_first17 e in
+    let np1 = lm4_nth e 17 in
+    let np2 = lm4_nth e 18 in
+    let ck = lm4_ckpt ct st nwp pairs d v isd s seed pk prev_hex i in
+    let link_hex = lm4_nth ck 0 in
+    let line = lm4_nth ck 1 in
+    let ok = lm4_nth ck 2 in
+    lm4_chain ct st nwp pairs d hidden v indim isd s beta1 beta2 lr eps np1 np2 seed pk epochs (i + 1) link_hex (cat [acc, line, "\n"]) (all_ok * ok)
+
+-- ===== D0 re-run: re-derive the trajectory + link chain WITHOUT re-signing =====
+lm4_link_only ct st wp pairs d v isd s prev_hex epoch_i =
+  let loss = lm4_loss_wp ct st pairs wp isd v s in
+  let w_hex = lm4_canon17 wp in
+  let link_str = cat [prev_hex, "|", show epoch_i, "|", w_hex, "|", show loss] in
+  bytes_to_hex (sha256 link_str) 32
+-- D0 mirror of lm4_chain (must reproduce the signed chain bit-for-bit, no re-sign): same wp
+-- bundle, same lm4_loss_wp/lm4_canon17 helpers. Returns [prev_hex, wp].
+lm4_chain_d0 ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 epochs i prev_hex =
+  if i >= epochs then cons prev_hex (cons wp [])
+  else lm4_chain_d0_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 epochs i prev_hex
+lm4_chain_d0_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 epochs i prev_hex =
+    let e = lm4_epoch ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
+    let nwp = lm4_first17 e in
+    let np1 = lm4_nth e 17 in
+    let np2 = lm4_nth e 18 in
+    let link_hex = lm4_link_only ct st nwp pairs d v isd s prev_hex i in
+    lm4_chain_d0 ct st nwp pairs d hidden v indim isd s beta1 beta2 lr eps np1 np2 epochs (i + 1) link_hex
+
+-- ===== ALLOCATOR DISCIPLINE (rung-21): bounded-memory bit-exact optimizer-state round-trip =====
+-- Serialize the FULL 17-config bundle wp (each cell = [theta,m,v], incl Adam moments) to a flat
+-- decimal string, then parse it back EXACTLY (signed). Lets a per-segment arena_reset free a whole
+-- segment's training garbage to disk and resume bit-identically. Round-trip proven in isolation
+-- (/tmp/cm_roundtrip_test.rail: theta/m/v incl negatives + 2^40 reproduce). O(N): cat each cell
+-- once, cat the row-strings once (mirrors lm4_canon_mat, which already serializes 19x/run).
+bnd_cell_str c = cat [show (lm4_nth c 0), " ", show (lm4_nth c 1), " ", show (lm4_nth c 2), " "]
+bnd_row_p r = if r == [] then [] else cons (bnd_cell_str (head r)) (bnd_row_p (tail r))
+bnd_row_str r = cat (bnd_row_p r)
+bnd_mat_p m = if m == [] then [] else cons (bnd_row_str (head m)) (bnd_mat_p (tail m))
+bnd_mat_str m = cat (bnd_mat_p m)
+bnd_nc m = if m == [] then 0 else lm4_len (head m)
+bnd_cm_ser cm = cat [show (lm4_len cm), " ", show (bnd_nc cm), " ", bnd_mat_str cm]
+bnd_wp_ser_p wp = if wp == [] then [] else cons (bnd_cm_ser (head wp)) (bnd_wp_ser_p (tail wp))
+bnd_wp_ser wp = cat [show (lm4_len wp), " ", cat (bnd_wp_ser_p wp)]
+-- recursive-descent deserialize: thread [val, rest] pairs; signed (parse_int can't do leading '-')
+bnd_skip_sp cs = if cs == [] then [] else if (char_to_int (head cs)) == 32 then bnd_skip_sp (tail cs) else cs
+bnd_rd_digits cs acc = if cs == [] then (cons acc (cons [] []))
+  else let dd = (char_to_int (head cs)) - 48 in
+       if dd < 0 then (cons acc (cons cs []))
+       else if dd > 9 then (cons acc (cons cs []))
+       else bnd_rd_digits (tail cs) (acc * 10 + dd)
+bnd_rd_tok cs0 =
+  let cs = bnd_skip_sp cs0 in
+  if cs == [] then (cons 0 (cons [] []))
+  else if (char_to_int (head cs)) == 45
+       then let r = bnd_rd_digits (tail cs) 0 in cons (0 - (lm4_nth r 0)) (cons (lm4_nth r 1) [])
+       else bnd_rd_digits cs 0
+bnd_rd_cell cs =
+  let t0 = bnd_rd_tok cs in
+  let t1 = bnd_rd_tok (lm4_nth t0 1) in
+  let t2 = bnd_rd_tok (lm4_nth t1 1) in
+  cons (cons (lm4_nth t0 0) (cons (lm4_nth t1 0) (cons (lm4_nth t2 0) []))) (cons (lm4_nth t2 1) [])
+bnd_rd_row cs nc = if nc == 0 then (cons [] (cons cs []))
+  else let rc = bnd_rd_cell cs in
+       let rr = bnd_rd_row (lm4_nth rc 1) (nc - 1) in
+       cons (cons (lm4_nth rc 0) (lm4_nth rr 0)) (cons (lm4_nth rr 1) [])
+bnd_rd_mat cs nr nc = if nr == 0 then (cons [] (cons cs []))
+  else let rr = bnd_rd_row cs nc in
+       let rm = bnd_rd_mat (lm4_nth rr 1) (nr - 1) nc in
+       cons (cons (lm4_nth rr 0) (lm4_nth rm 0)) (cons (lm4_nth rm 1) [])
+bnd_rd_cm cs =
+  let t0 = bnd_rd_tok cs in
+  let t1 = bnd_rd_tok (lm4_nth t0 1) in
+  bnd_rd_mat (lm4_nth t1 1) (lm4_nth t0 0) (lm4_nth t1 0)
+bnd_rd_wp cs n = if n == 0 then (cons [] (cons cs []))
+  else let rm = bnd_rd_cm cs in
+       let rw = bnd_rd_wp (lm4_nth rm 1) (n - 1) in
+       cons (cons (lm4_nth rm 0) (lm4_nth rw 0)) (cons (lm4_nth rw 1) [])
+bnd_wp_deser str =
+  let cs = chars str in
+  let t = bnd_rd_tok cs in
+  lm4_nth (bnd_rd_wp (lm4_nth t 1) (lm4_nth t 0)) 0
+-- D0 chain that also RETURNS the final Adam powers [prev_hex, wp, pow1, pow2] so a segment can resume.
+lm4_chain_d0_pw ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 epochs i prev_hex =
+  if i >= epochs then cons prev_hex (cons wp (cons pow1 (cons pow2 [])))
+  else lm4_chain_d0_pw_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 epochs i prev_hex
+lm4_chain_d0_pw_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 epochs i prev_hex =
+    let e = lm4_epoch ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
+    let nwp = lm4_first17 e in
+    let np1 = lm4_nth e 17 in
+    let np2 = lm4_nth e 18 in
+    let link_hex = lm4_link_only ct st nwp pairs d v isd s prev_hex i in
+    lm4_chain_d0_pw ct st nwp pairs d hidden v indim isd s beta1 beta2 lr eps np1 np2 epochs (i + 1) link_hex
+
+-- ===== greedy decode -> per-task prompt completion -> emit MODEL completions =====
+lm4_argmax_go xs i best bi = if xs == [] then bi
+  else if (head xs) > best then lm4_argmax_go (tail xs) (i + 1) (head xs) i
+       else lm4_argmax_go (tail xs) (i + 1) best bi
+lm4_argmax xs = lm4_argmax_go (tail xs) 1 (head xs) 0
+lm4_gen ct st w1 w2 emb blk0 blk1 isd ctx c g acc = if g <= 0 then acc
+  else let nid = lm4_argmax (lm4_forward ct st w1 w2 blk0 blk1 (lm5_ctx_rows emb ctx) isd) in
+       lm4_gen ct st w1 w2 emb blk0 blk1 isd (tail (lm4_snoc ctx nid)) c (g - 1) (lm4_snoc acc nid)
+lm4_lastc ids c = let n = lm4_len ids in if n <= c then ids else lm4_lastc (tail ids) c
+lm4_finish full =
+  let k = str_find " in 0" full in
+  if k < 0 then full else cat [str_sub full 0 (k + 5), "\n"]
+lm4_complete ct st w1 w2 emb blk0 blk1 isd vocab c prompt gcap =
+  let pids = lm4_tokens prompt vocab in
+  let seedp = lm4_lastc pids c in
+  let gen_ids = lm4_gen ct st w1 w2 emb blk0 blk1 isd seedp c gcap [] in
+  lm4_finish (cat [prompt, lm4_decode gen_ids vocab])
+lm4_emit ct st w1 w2 emb blk0 blk1 isd vocab c id prompt gcap =
+  write_file (cat ["/tmp/lm_completions/", id, ".rail"]) (lm4_complete ct st w1 w2 emb blk0 blk1 isd vocab c prompt gcap)
+-- ARENA: bracket EACH completion in mark/reset. Generation (lm4_gen: gcap forward passes)
+-- allocs transient garbage; without per-completion reset it climbs from the ~3.5GB training
+-- base toward the 8GB cap -> conservative GC starts scanning the whole arena every alloc ->
+-- progressive thrash (~1 min/completion, watchdog-killed at 29/30). Weights arrive as args
+-- (alloc'd before this inner mark) so they survive each reset; only gen garbage is freed.
+lm4_emit_all ct st w1 w2 emb blk0 blk1 isd vocab c ids prompt gcap =
+  if ids == [] then 0
+  else let imk = arena_mark 0 in
+       let _ = lm4_emit ct st w1 w2 emb blk0 blk1 isd vocab c (head ids) prompt gcap in
+       let _ = arena_reset imk in
+       lm4_emit_all ct st w1 w2 emb blk0 blk1 isd vocab c (tail ids) prompt gcap
+
+-- ===== UTTERANCE ATTESTATION (the attested-utterance reward) =====
+-- Canonical serialization of the model's generated token-id list (comma-joined decimals).
+-- The foreign verifier reproduces this exact string from its own re-generated ids, so the
+-- SHA-256 of it (t_hex) is a content commitment to WHAT THE MODEL SAID.
+utt_ids_canon ids = if ids == [] then "" else cat [show (head ids), ",", utt_ids_canon (tail ids)]
+-- Forged-weights control: a DIFFERENT weight set cannot reproduce the signed saying. Zero the
+-- readout matrix (overflow-free, deterministic): logits collapse to 0 -> greedy argmax picks
+-- token 0 every step -> the words change -> t_hex diverges from the signed utterance.
+utt_zero_row r = if r == [] then [] else cons 0 (utt_zero_row (tail r))
+utt_zero_mat m = if m == [] then [] else cons (utt_zero_row (head m)) (utt_zero_mat (tail m))
+
+main =
+  let d = 8 in
+  let hidden = 64 in
+  let cwin = 8 in
+  let epochs = 19 in
+  let gcap = 48 in
+  let beta1 = 15099494 in
+  let beta2 = 16760439 in
+  let lr = 209715 in
+  let eps = 16777 in
+  let sc = arr_new 1 0 in
+  let _ = arr_set sc 0 16777216 in
+  let s = arr_get sc 0 in
+  let isdc = arr_new 1 0 in
+  let _ = arr_set isdc 0 5931642 in
+  let isd = arr_get isdc 0 in
+  -- RoPE cos/sin tables (32 entries = 8 positions x 4 pairs; precomputed F=24 fixed-point)
+  let ct = arr_new 32 0 in
+  let _ = rt_set_cos ct in
+  let st = arr_new 32 0 in
+  let _ = rt_set_sin st in
+  -- corpus pin: the model learns a single minimal Rail program -> it speaks Rail
+  let corpus = read_file "tools/bitexact/lm10_corpus.txt" in
+  let chash = sha256_hex corpus in
+  let vocab = lm4_vocab corpus in
+  let vsize = lm4_len (chars vocab) in
+  let ids = lm4_tokens corpus vocab in
+  let pairs = lm4_pairs ids cwin in
+  let npairs = lm4_len pairs in
+  let indim = cwin * d in
+  let w1c0 = lm4_initmat 0 hidden indim 0 in
+  let w2c0 = lm4_initmat 1 vsize hidden 0 in
+  let ec0 = lm4_emb_initmat vsize d in
+  let ff = d * 4 in
+  let wqc0 = lm5_qkv_init 30 d in
+  let wkc0 = lm5_qkv_init 31 d in
+  let wvc0 = lm5_qkv_init 32 d in
+  let gammac0 = rn_gamma_init d in
+  let gamma2c0 = rn_gamma_init d in
+  let wff1c0 = lm4_initmat 33 ff d 0 in
+  let wff2c0 = lm4_initmat 34 d ff 0 in
+  let b1wqc0 = lm5_qkv_init 35 d in
+  let b1wkc0 = lm5_qkv_init 36 d in
+  let b1wvc0 = lm5_qkv_init 37 d in
+  let b1gammac0 = rn_gamma_init d in
+  let b1gamma2c0 = rn_gamma_init d in
+  let b1wff1c0 = lm4_initmat 38 ff d 0 in
+  let b1wff2c0 = lm4_initmat 39 d ff 0 in
+  -- EPHEMERAL LOCAL DEV KEY + LOCAL genesis (never a prod sign surface / live pulse)
+  let seed = sha256 "lm10.local.ephemeral.dev.seed.v1" in
+  let pk = ed25519_pk_from_sk seed in
+  let pk_hex = bytes_to_hex pk 32 in
+  let genesis_hex = sha256_hex "LM10.LOCAL.BEACON.GENESIS.dev" in
+  -- falsification probes (tamper / wrong-key) computed pre-training -> integer immediates
+  let pmsg = sha256 "lm10.tamper.probe" in
+  let psig = ed25519_sign seed pmsg 32 in
+  let okGood = ed25519_verify pk pmsg 32 psig in
+  let tsig = arr_new 64 0 in
+  let _ = sha_copy_bytes psig tsig 0 0 64 in
+  let _ = arr_set tsig 5 (bit_xor (arr_get tsig 5) 1) in
+  let okBad = ed25519_verify pk pmsg 32 tsig in
+  let seed2 = sha256 "lm10.other.key" in
+  let wsig = ed25519_sign seed2 pmsg 32 in
+  let okW = ed25519_verify pk pmsg 32 wsig in
+  -- wp0 = 17 configs: [W1, W2, E, block0(Wq,Wk,Wv,gamma,gamma2,Wff1,Wff2), block1(same 7)]
+  let wp0 = cons w1c0 (cons w2c0 (cons ec0 (cons wqc0 (cons wkc0 (cons wvc0 (cons gammac0 (cons gamma2c0 (cons wff1c0 (cons wff2c0 (cons b1wqc0 (cons b1wkc0 (cons b1wvc0 (cons b1gammac0 (cons b1gamma2c0 (cons b1wff1c0 (cons b1wff2c0 [])))))))))))))))) in
+  let mk = arena_mark 0 in
+  -- ===== attested training (checkpoint-cadence; 2 stacked multi-head transformer blocks) =====
+  let res = lm4_chain ct st wp0 pairs d hidden vsize indim isd s beta1 beta2 lr eps 16777216 16777216 seed pk epochs 0 genesis_hex "" 1 in
+  let all_ok = lm4_nth res 0 in
+  let body = lm4_nth res 1 in
+  let head_link = lm4_nth res 2 in
+  let fwp = lm4_nth res 3 in
+  let fw1 = lm4_thmat (lm4_nth fwp 0) in
+  let fw2 = lm4_thmat (lm4_nth fwp 1) in
+  let femb = lm4_thmat (lm4_nth fwp 2) in
+  let fblk0 = lm4_blk0_of fwp in
+  let fblk1 = lm4_blk1_of fwp in
+  let ds0 = lm4_dsloss ct st pairs (lm4_thmat w1c0) (lm4_thmat w2c0) (lm4_thmat ec0) (lm4_blk0_of wp0) (lm4_blk1_of wp0) isd vsize s in
+  let dsK = lm4_dsloss ct st pairs fw1 fw2 femb fblk0 fblk1 isd vsize s in
+  -- ===== THE MODEL SPEAKS: deterministic greedy decode from the attested final weights =====
+  let pr = "main = let _ = print (show (" in
+  let pids = lm4_tokens pr vocab in
+  let seedp = lm4_lastc pids cwin in
+  let gen_ids = lm4_gen ct st fw1 fw2 femb fblk0 fblk1 isd seedp cwin gcap [] in
+  let utter_text = lm4_finish (cat [pr, lm4_decode gen_ids vocab]) in
+  -- ===== ATTEST THE UTTERANCE: commit spoken tokens, bind to final weights, chain + sign =====
+  let w_hex_final = lm4_canon17 fwp in
+  let prompt_hex = sha256_hex pr in
+  let t_hex = sha256_hex (utt_ids_canon gen_ids) in
+  let ulink_str = cat [head_link, "|UTTER|", prompt_hex, "|", show cwin, "|", show gcap, "|", w_hex_final, "|", t_hex] in
+  let ulink_b = sha256 ulink_str in
+  let ulink_hex = bytes_to_hex ulink_b 32 in
+  let usig = ed25519_sign seed ulink_b 32 in
+  let usig_hex = bytes_to_hex usig 64 in
+  let uok = ed25519_verify pk ulink_b 32 usig in
+  let utt_line = cat ["UTTER ", prompt_hex, " ", show cwin, " ", show gcap, " ", w_hex_final, " ", t_hex, " ", head_link, " ", ulink_hex, " ", usig_hex] in
+  -- forged-COMMITMENT control: tamper the weight-hash by 1 char -> recorded sig must NOT verify
+  let w_hex_forged = cat ["0", w_hex_final] in
+  let flink_str = cat [head_link, "|UTTER|", prompt_hex, "|", show cwin, "|", show gcap, "|", w_hex_forged, "|", t_hex] in
+  let flink_b = sha256 flink_str in
+  let okForgeChain = if (ed25519_verify pk flink_b 32 usig) == 0 then 1 else 0 in
+  -- forged-WEIGHTS control: generate from a DIFFERENT weight set (zeroed readout) -> different words
+  let fw2_forged = utt_zero_mat fw2 in
+  let gen_ids_f = lm4_gen ct st fw1 fw2_forged femb fblk0 fblk1 isd seedp cwin gcap [] in
+  let t_hex_f = sha256_hex (utt_ids_canon gen_ids_f) in
+  let okForgeWeights = if t_hex_f == t_hex then 0 else 1 in
+  -- persist the signed ledger (training checkpoints + the UTTER record)
+  let header = cat ["# LM10v1 ", pk_hex, " ", genesis_hex, " ", show epochs, " ", chash,
+                    " d=", show d, " hidden=", show hidden, " vsize=", show vsize, " cwin=", show cwin,
+                    " beta1=", show beta1, " beta2=", show beta2, " lr=", show lr, " eps=", show eps, " isd=", show isd,
+                    " nheads=", show lm10_nh, " nblocks=2", "\n"] in
+  let _ = write_file "out/utterance_chain.txt" (cat [header, body, utt_line, "\n"]) in
+  let _ = write_file "out/utterance.txt" (cat [utter_text, "\n# tokens=", utt_ids_canon gen_ids, "\n# t_hex=", t_hex, "\n# utterance_link=", ulink_hex, "\n"]) in
+  -- ===== INDEPENDENT RE-RUN (Rail): re-train + re-generate must reproduce the words bit-for-bit
+  -- persist only the heap strings that must outlive the arena reset (frees training garbage)
+  let _ = write_file "out/u_head.txt" head_link in
+  let _ = write_file "out/u_thex.txt" t_hex in
+  let _ = write_file "out/u_text.txt" utter_text in
+  let _ = write_file "out/u_ulink.txt" ulink_hex in
+  let _ = write_file "out/u_pk.txt" pk_hex in
+  let _ = arena_reset mk in
+  let head_link = read_file "out/u_head.txt" in
+  let t_hex = read_file "out/u_thex.txt" in
+  let utter_text = read_file "out/u_text.txt" in
+  let ulink_hex = read_file "out/u_ulink.txt" in
+  let pk_hex = read_file "out/u_pk.txt" in
+  let res2 = lm4_chain_d0 ct st wp0 pairs d hidden vsize indim isd s beta1 beta2 lr eps 16777216 16777216 epochs 0 genesis_hex in
+  let head2 = lm4_nth res2 0 in
+  let fwp2 = lm4_nth res2 1 in
+  let okD0 = if head_link == head2 then 1 else 0 in
+  let pids2 = lm4_tokens pr vocab in
+  let seedp2 = lm4_lastc pids2 cwin in
+  let fw1b = lm4_thmat (lm4_nth fwp2 0) in
+  let fw2b = lm4_thmat (lm4_nth fwp2 1) in
+  let fembb = lm4_thmat (lm4_nth fwp2 2) in
+  let fblk0b = lm4_blk0_of fwp2 in
+  let fblk1b = lm4_blk1_of fwp2 in
+  let gen_ids2 = lm4_gen ct st fw1b fw2b fembb fblk0b fblk1b isd seedp2 cwin gcap [] in
+  let t_hex2 = sha256_hex (utt_ids_canon gen_ids2) in
+  let okUtterRepro = if t_hex == t_hex2 then 1 else 0 in
+  -- ===== gates =====
+  let okSigs = if all_ok == 1 then 1 else 0 in
+  let okProg = if dsK < ds0 then 1 else 0 in
+  let okTamper = if okGood == 1 then (if okBad == 0 then 1 else 0) else 0 in
+  let okWrongKey = if okW == 0 then 1 else 0 in
+  let okUtterSig = if uok == 1 then 1 else 0 in
+  let all = okSigs * okProg * okTamper * okWrongKey * okD0 * okUtterSig * okUtterRepro * okForgeChain * okForgeWeights in
+  let _ = print "================ RAIL SPEAKS, ATTESTED ================" in
+  let _ = print (cat ["corpus pin: SHA-256 ", chash]) in
+  let _ = print (cat ["model: vocab=", show vsize, " d=", show d, " nheads=", show lm10_nh, " nblocks=2 hidden=", show hidden, " ctx=", show cwin, " epochs=", show epochs, " pairs=", show npairs, " (exact-integer Q.24)"]) in
+  let _ = print (cat ["loss descent: ", show ds0, " -> ", show dsK, "  (descent=", show okProg, ")"]) in
+  let _ = print "------ the model's first attested words ------" in
+  let _ = print utter_text in
+  let _ = print (cat ["utterance tokens t_hex = ", t_hex]) in
+  let _ = print (cat ["utterance link         = ", ulink_hex]) in
+  let _ = print (cat ["pubkey                 = ", pk_hex]) in
+  let _ = print (cat ["training chain head    = ", head_link]) in
+  let _ = print "------ verification ------" in
+  let _ = print (cat ["per-checkpoint sigs verify       = ", show okSigs]) in
+  let _ = print (cat ["training reproduces (D0)         = ", show okD0]) in
+  let _ = print (cat ["UTTERANCE signature verifies     = ", show okUtterSig]) in
+  let _ = print (cat ["UTTERANCE reproduces bit-for-bit = ", show okUtterRepro, "  (independent re-train + re-decode -> same t_hex)"]) in
+  let _ = print (cat ["tamper-reject (flipped sig)      = ", show okTamper]) in
+  let _ = print (cat ["wrong-key-reject                 = ", show okWrongKey]) in
+  let _ = print (cat ["FORGED-commitment rejected       = ", show okForgeChain, "  (sig fails against tampered weight-hash)"]) in
+  let _ = print (cat ["FORGED-weights cannot reproduce  = ", show okForgeWeights, "  (different weights -> different words -> t_hex diverges)"]) in
+  let _ = print (cat ["signed ledger: out/utterance_chain.txt  (", show epochs, " checkpoints + 1 UTTER record)"]) in
+  let _ = print (if all == 1
+    then "PASS: a Rail-native transformer trained itself, SPOKE a Rail program, bound the utterance into its own Ed25519 hash-chain, and an independent re-run reproduced the words bit-for-bit. Forgery rejected."
+    else "FAIL") in
+  if all == 1 then 0 else 1
+
