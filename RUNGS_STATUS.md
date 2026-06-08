@@ -4,8 +4,21 @@
 
 ## Tally
 
-**12 of 15 genuinely GREEN (2026-06-07 push: 6 -> 12)** — 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
-+ 23. Remaining RED: **22, 24, 25**.
+**14 of 15 genuinely GREEN (2026-06-07/08: 6 -> 14)** — 22, 23, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+34, 35, 36. Remaining: **24** (re-running with the eval fix below).
+
+THE SYSTEMIC BUG (cracked 2026-06-08): r22, r25, and r24's "deep/capacity" failures were ONE bug --
+`lm4_forward` was called with NINE args (a stray `emb` wedged between `w2` and `blk0`:
+`lm4_forward ct st w1 w2 emb blk0 blk1 (rows) isd`) in every GENERATION/EVAL path. lm4_forward takes
+EIGHT (`ct st w1 w2 blk0 blk1 rows isd`). Rail OVER-APPLIES silently: it shifts every later arg
+(blk0<-emb, blk1<-blk0, rows<-blk1, isd<-rows) -> garbage logits -> garbled, NON-deterministic
+generation (proven by a SAMETEST: two same-arena samples gave different hashes). The training LOSS
+path used the correct 8-arg form, so training was fine -- only generation/eval was corrupted. Fixed
+in all 5 files (rungs/r25, tools/bitexact/utterance_cross_isa{,_falsify}, rungs/r24 + _r24_extension).
+- **22** -> LOCAL GATES GREEN (utterance reproduces + foreign + falsifier; x86/Pi exec stays walled).
+- **25** -> GATE PASS (Rail + foreign both reproduce the sampled words bit-for-bit).
+- **24** -> its generalization metric was measured THROUGH the garbled generation; re-running with the
+  fix to measure REAL generalization (the lone remaining rung; capacity still the open question).
 
 2026-06-07 second pass drove 6 more to green:
 - **23** segmented training — ran clean (segmented head == one-shot, byte-for-bit across 4 arena-reset segments).
