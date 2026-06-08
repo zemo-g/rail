@@ -5,7 +5,12 @@
 ## Tally
 
 **14 of 15 genuinely GREEN (2026-06-07/08: 6 -> 14)** — 22, 23, 25, 26, 27, 28, 29, 30, 31, 32, 33,
-34, 35, 36. Remaining: **24** (re-running with the eval fix below).
+34, 35, 36. Remaining: **24** — INFRA FIXED 2026-06-08 (completes 2m25s, was 4h+/never; bit-exact
+[D0=1 + byte-identical diff]; constant ~2.3GB memory via CPU-matvec + disk-only segmented arena).
+But **honest capacity FAIL**: the d=8/2-block model scores `0/4` held-out echo at BOTH 40 and 200
+epochs (full-acc 19/54 identical, loss plateaued = converged) — a genuine capacity wall, NOT a
+training-time issue. Green needs a larger model / more data (changes the "smallest honest instance"
+claim) — Reilly's call. Full writeup: `rungs/r24/FIX_NOTES.md`.
 
 THE SYSTEMIC BUG (cracked 2026-06-08): r22, r25, and r24's "deep/capacity" failures were ONE bug --
 `lm4_forward` was called with NINE args (a stray `emb` wedged between `w2` and `blk0`:
