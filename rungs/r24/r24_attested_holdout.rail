@@ -587,9 +587,9 @@ lm4_grads ct st w1 w2 blk0 blk1 rows isd tgt hidden indim d =
   let b0 = lm4_block_fwd ct st blk0 rows isd in
   let b1 = lm4_block_fwd ct st blk1 b0 isd in
   let x = lm5_flatten b1 in
-  let z1 = gpu_matvec w1 x in
+  let z1 = lm4_matvec w1 x in
   let h1 = lm4_geluv z1 in
-  let z2 = gpu_matvec w2 h1 in
+  let z2 = lm4_matvec w2 h1 in
   let dz2 = l_cegrad z2 tgt in
   let dW2 = lm4_outer dz2 h1 in
   let dh1 = lm4_matvec_t w2 dz2 hidden in
@@ -730,6 +730,7 @@ lm4_chain ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 see
   if i >= epochs then cons all_ok (cons acc (cons prev_hex (cons wp [])))
   else lm4_chain_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk epochs i prev_hex acc all_ok
 lm4_chain_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk epochs i prev_hex acc all_ok =
+    let _ = print (cat ["[chain] epoch ", show i]) in
     let e = lm4_epoch ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
     let nwp = lm4_first17 e in
     let np1 = lm4_nth e 17 in
@@ -752,6 +753,7 @@ lm4_chain_d0 ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 
   if i >= epochs then cons prev_hex (cons wp [])
   else lm4_chain_d0_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 epochs i prev_hex
 lm4_chain_d0_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 epochs i prev_hex =
+    let _ = print (cat ["[d0] epoch ", show i]) in
     let e = lm4_epoch ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
     let nwp = lm4_first17 e in
     let np1 = lm4_nth e 17 in
@@ -817,12 +819,89 @@ lm4_chain_d0_pw ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 po
   if i >= epochs then cons prev_hex (cons wp (cons pow1 (cons pow2 [])))
   else lm4_chain_d0_pw_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 epochs i prev_hex
 lm4_chain_d0_pw_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 epochs i prev_hex =
+    let _ = print (cat ["[d0] epoch ", show i]) in
     let e = lm4_epoch ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
     let nwp = lm4_first17 e in
     let np1 = lm4_nth e 17 in
     let np2 = lm4_nth e 18 in
     let link_hex = lm4_link_only ct st nwp pairs d v isd s prev_hex i in
     lm4_chain_d0_pw ct st nwp pairs d hidden v indim isd s beta1 beta2 lr eps np1 np2 epochs (i + 1) link_hex
+
+-- ===== SEGMENTED bounded-memory training (rung-23 proven pattern: segmented head/body == one-shot,
+-- byte-for-byte). lm4_chain_pw mirrors lm4_chain but ALSO returns final Adam powers, so a per-segment
+-- arena_reset (serialize wp+state to disk -> reset -> deser) resumes bit-for-bit. Needed because the
+-- 40-epoch d=8 run accumulates >2GB/epoch with no per-epoch reset -> fills any arena -> GC thrash. =====
+lm4_chain_pw ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk epochs i prev_hex acc all_ok =
+  if i >= epochs then cons all_ok (cons acc (cons prev_hex (cons wp (cons pow1 (cons pow2 [])))))
+  else lm4_chain_pw_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk epochs i prev_hex acc all_ok
+lm4_chain_pw_step ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk epochs i prev_hex acc all_ok =
+    let _ = print (cat ["[chain] epoch ", show i]) in
+    let e = lm4_epoch ct st wp pairs d hidden v indim isd beta1 beta2 lr eps pow1 pow2 in
+    let nwp = lm4_first17 e in
+    let np1 = lm4_nth e 17 in
+    let np2 = lm4_nth e 18 in
+    let ck = lm4_ckpt ct st nwp pairs d v isd s seed pk prev_hex i in
+    let link_hex = lm4_nth ck 0 in
+    let line = lm4_nth ck 1 in
+    let ok = lm4_nth ck 2 in
+    lm4_chain_pw ct st nwp pairs d hidden v indim isd s beta1 beta2 lr eps np1 np2 seed pk epochs (i + 1) link_hex (cat [acc, line, "\n"]) (all_ok * ok)
+-- signed-int string parse (persisted powers/all_ok return as decimal strings)
+sti_go cs acc = if cs == [] then acc
+  else let dd = (char_to_int (head cs)) - 48 in
+       if dd < 0 then acc else if dd > 9 then acc else sti_go (tail cs) (acc * 10 + dd)
+str_to_int_signed sx =
+  let cs = chars sx in
+  if cs == [] then 0
+  else if (char_to_int (head cs)) == 45 then (0 - sti_go (tail cs) 0) else sti_go cs 0
+-- signed segment driver: run epochs [emin,emax) of lm4_chain_pw, then ser->disk->arena_reset->disk->deser.
+seg_run ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk emin emax prev_hex acc all_ok =
+  lm4_chain_pw ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk emax emin prev_hex acc all_ok
+-- DISK-ONLY state carrier: ALL resume state lives on disk; each iteration reads it AFTER the mark,
+-- trains, writes it back, then arena_reset frees EVERYTHING (deser garbage + wp + train garbage).
+-- Nothing survives the reset -> constant memory for ANY epoch count (no per-segment survivor leak).
+seg_loop ct st pairs d hidden v indim isd s beta1 beta2 lr eps seed pk seg_epochs nsegs si epochs =
+  if si >= nsegs then 0
+  else
+    let emin = si * seg_epochs in
+    let emax0 = emin + seg_epochs in
+    let emax = if emax0 > epochs then epochs else emax0 in
+    let smk = arena_mark 0 in
+    let wp = bnd_wp_deser (read_file "rungs/r24/out/seg_wp.txt") in
+    let prev_hex = read_file "rungs/r24/out/seg_prev.txt" in
+    let acc = read_file "rungs/r24/out/seg_body.txt" in
+    let pow1 = str_to_int_signed (read_file "rungs/r24/out/seg_p1.txt") in
+    let pow2 = str_to_int_signed (read_file "rungs/r24/out/seg_p2.txt") in
+    let all_ok = str_to_int_signed (read_file "rungs/r24/out/seg_allok.txt") in
+    let r = seg_run ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 seed pk emin emax prev_hex acc all_ok in
+    let _ = write_file "rungs/r24/out/seg_wp.txt" (bnd_wp_ser (lm4_nth r 3)) in
+    let _ = write_file "rungs/r24/out/seg_prev.txt" (lm4_nth r 2) in
+    let _ = write_file "rungs/r24/out/seg_body.txt" (lm4_nth r 1) in
+    let _ = write_file "rungs/r24/out/seg_p1.txt" (show (lm4_nth r 4)) in
+    let _ = write_file "rungs/r24/out/seg_p2.txt" (show (lm4_nth r 5)) in
+    let _ = write_file "rungs/r24/out/seg_allok.txt" (show (lm4_nth r 0)) in
+    let _ = arena_reset smk in
+    seg_loop ct st pairs d hidden v indim isd s beta1 beta2 lr eps seed pk seg_epochs nsegs (si + 1) epochs
+-- D0 segmented driver (link-only; mirrors seg_loop using the pre-existing lm4_chain_d0_pw).
+seg_run_d0 ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 emin emax prev_hex =
+  lm4_chain_d0_pw ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 emax emin prev_hex
+seg_loop_d0 ct st pairs d hidden v indim isd s beta1 beta2 lr eps seg_epochs nsegs si epochs =
+  if si >= nsegs then 0
+  else
+    let emin = si * seg_epochs in
+    let emax0 = emin + seg_epochs in
+    let emax = if emax0 > epochs then epochs else emax0 in
+    let smk = arena_mark 0 in
+    let wp = bnd_wp_deser (read_file "rungs/r24/out/seg_d0_wp.txt") in
+    let prev_hex = read_file "rungs/r24/out/seg_d0_prev.txt" in
+    let pow1 = str_to_int_signed (read_file "rungs/r24/out/seg_d0_p1.txt") in
+    let pow2 = str_to_int_signed (read_file "rungs/r24/out/seg_d0_p2.txt") in
+    let r = seg_run_d0 ct st wp pairs d hidden v indim isd s beta1 beta2 lr eps pow1 pow2 emin emax prev_hex in
+    let _ = write_file "rungs/r24/out/seg_d0_wp.txt" (bnd_wp_ser (lm4_nth r 1)) in
+    let _ = write_file "rungs/r24/out/seg_d0_prev.txt" (lm4_nth r 0) in
+    let _ = write_file "rungs/r24/out/seg_d0_p1.txt" (show (lm4_nth r 2)) in
+    let _ = write_file "rungs/r24/out/seg_d0_p2.txt" (show (lm4_nth r 3)) in
+    let _ = arena_reset smk in
+    seg_loop_d0 ct st pairs d hidden v indim isd s beta1 beta2 lr eps seg_epochs nsegs (si + 1) epochs
 
 -- ===== greedy decode -> per-task prompt completion -> emit MODEL completions =====
 lm4_argmax_go xs i best bi = if xs == [] then bi
@@ -1025,6 +1104,8 @@ main =
   let hidden = 64 in
   let cwin = 8 in
   let epochs = 40 in
+  let seg_epochs = 1 in
+  let nsegs = (epochs + seg_epochs - 1) / seg_epochs in
   let beta1 = 15099494 in
   let beta2 = 16760439 in
   let lr = 209715 in
@@ -1124,11 +1205,17 @@ main =
   let okCkpt0Abort = if ckpt0_ge_T == 0 then 1 else 0 in
   -- ===== attested training (checkpoint-cadence) -> final weights =====
   let mk = arena_mark 0 in
-  let res = lm4_chain ct st wp0 pairs d hidden vsize indim isd s beta1 beta2 lr eps 16777216 16777216 seed pk epochs 0 split_link "" 1 in
-  let all_ok = lm4_nth res 0 in
-  let body = lm4_nth res 1 in
-  let head_link = lm4_nth res 2 in
-  let fwp = lm4_nth res 3 in
+  let _ = write_file "rungs/r24/out/seg_wp.txt" (bnd_wp_ser wp0) in
+  let _ = write_file "rungs/r24/out/seg_prev.txt" split_link in
+  let _ = write_file "rungs/r24/out/seg_body.txt" "" in
+  let _ = write_file "rungs/r24/out/seg_p1.txt" "16777216" in
+  let _ = write_file "rungs/r24/out/seg_p2.txt" "16777216" in
+  let _ = write_file "rungs/r24/out/seg_allok.txt" "1" in
+  let _ = seg_loop ct st pairs d hidden vsize indim isd s beta1 beta2 lr eps seed pk seg_epochs nsegs 0 epochs in
+  let all_ok = str_to_int_signed (read_file "rungs/r24/out/seg_allok.txt") in
+  let body = read_file "rungs/r24/out/seg_body.txt" in
+  let head_link = read_file "rungs/r24/out/seg_prev.txt" in
+  let fwp = bnd_wp_deser (read_file "rungs/r24/out/seg_wp.txt") in
   let fw1 = lm4_thmat (lm4_nth fwp 0) in
   let fw2 = lm4_thmat (lm4_nth fwp 1) in
   let femb = lm4_thmat (lm4_nth fwp 2) in
@@ -1177,8 +1264,12 @@ main =
   let _ = arena_reset mk in
   let head_link = read_file "rungs/r24/out/u_head.txt" in
   let split_link2 = read_file "rungs/r24/out/u_split.txt" in
-  let res2 = lm4_chain_d0 ct st wp0 pairs d hidden vsize indim isd s beta1 beta2 lr eps 16777216 16777216 epochs 0 split_link2 in
-  let head2 = lm4_nth res2 0 in
+  let _ = write_file "rungs/r24/out/seg_d0_wp.txt" (bnd_wp_ser wp0) in
+  let _ = write_file "rungs/r24/out/seg_d0_prev.txt" split_link2 in
+  let _ = write_file "rungs/r24/out/seg_d0_p1.txt" "16777216" in
+  let _ = write_file "rungs/r24/out/seg_d0_p2.txt" "16777216" in
+  let _ = seg_loop_d0 ct st pairs d hidden vsize indim isd s beta1 beta2 lr eps seg_epochs nsegs 0 epochs in
+  let head2 = read_file "rungs/r24/out/seg_d0_prev.txt" in
   let okD0 = if head_link == head2 then 1 else 0 in
   -- ===== gates =====
   let okSigs = if all_ok == 1 then 1 else 0 in
