@@ -111,6 +111,47 @@ class_witness() {
 }
 
 # ============================================================================
+# CLASS: frame_attest — frame side-car fresh (pulse-lag age) + digest coherent
+# ============================================================================
+# Added 2026-06-09: the frame publisher was dead 2026-05-28..06-09 and nothing
+# alarmed, because no walker checked the side-car's age. Age axis is pulse-lag
+# (beacon ~30s/pulse), not wall-clock — the side-car carries no timestamp, and
+# pulse_id is the house clock anyway. Publisher ticks every 30s ~= 1 pulse;
+# 20 pulses (~10 min) behind = dead publisher.
+class_frame_attest() {
+  local payload att_pulse cur_pulse frame_sha wit_sha lag
+  payload=$(curl -sf "$BASE/entropy/frame/latest.attestation.json")
+  if [[ -z "$payload" ]]; then
+    log "FAIL: latest.attestation.json unreachable"
+    verdict frame_attest FAIL; return
+  fi
+  # Publisher emits python-default JSON ('": "' separators) — json_int/json_str
+  # are compact-only, so extract space-tolerantly here.
+  att_pulse=$(grep -oE '"pulse_id"[[:space:]]*:[[:space:]]*[0-9]+' <<<"$payload" | grep -oE '[0-9]+$' | head -1)
+  frame_sha=$(grep -oE '"sha256"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' <<<"$payload" | grep -oE '[0-9a-f]{64}' | head -1)
+  wit_sha=$(grep -oE '"digest_sha256"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' <<<"$payload" | grep -oE '[0-9a-f]{64}' | head -1)
+  cur_pulse=$(json_int "$(curl -sf "$BASE/entropy/pulse")" pulse_id)
+  if [[ -z "$att_pulse" || -z "$cur_pulse" || -z "$frame_sha" ]]; then
+    log "FAIL: missing fields (att_pulse=$att_pulse cur_pulse=$cur_pulse sha=${frame_sha:0:8})"
+    verdict frame_attest FAIL; return
+  fi
+  lag=$(( cur_pulse - att_pulse ))
+  log "attestation pulse=$att_pulse current=$cur_pulse lag=${lag} pulses; sha=${frame_sha:0:12}"
+  if (( lag < 0 )); then
+    log "FAIL: attestation pulse ahead of beacon ($att_pulse > $cur_pulse)"
+    verdict frame_attest FAIL
+  elif (( lag > 20 )); then
+    log "FAIL: frame attestation stale (lag=${lag} pulses > 20 ~= publisher dead)"
+    verdict frame_attest FAIL
+  elif [[ -n "$wit_sha" && "$wit_sha" != "$frame_sha" ]]; then
+    log "FAIL: witness digest ($wit_sha) != frame sha ($frame_sha)"
+    verdict frame_attest FAIL
+  else
+    verdict frame_attest PASS
+  fi
+}
+
+# ============================================================================
 # CLASS: fleet — status.json fresh AND pi-alive matches our own probe
 # ============================================================================
 class_fleet() {
@@ -309,6 +350,7 @@ class_dda() {
 
 header beacon;          class_beacon
 header witness;         class_witness
+header frame_attest;    class_frame_attest
 header fleet;           class_fleet
 header builds_badge;    class_builds_badge
 header selfhost_badge;  class_selfhost_badge
