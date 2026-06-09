@@ -689,119 +689,25 @@ sample_greedy2 x w_e w_o wb1 wb2 ln_g ln_b seq V d d_ff vocab =
       let ids = collect_predictions probs_data seq V
       decode vocab ids
 
--- ── DATA-SCALE FORCING: windowed training over a pool too large to memorize ──
--- Tokenize the whole pool once into an indexable float_arr of ids.
-ids_to_arr_loop arr ids i =
-  if ids == [] then 0
-  else
-    let _ = float_arr_set arr i (int_to_float (head ids))
-    ids_to_arr_loop arr (tail ids) (i + 1)
-ids_to_arr ids n =
-  let arr = float_arr_new n 0.0
-  let _ = ids_to_arr_loop arr ids 0
-  arr
-
--- O(n) tokenizer: walk the char list ONCE writing ids straight to arr. Uses
--- `cs == []` (O(1)) not `length cs == 0` (O(n)) — the generic encode_loop is
--- O(n^2) and hangs on a 349K-char pool. Returns count written.
-fast_fill_ids arr cs vocab i =
-  if cs == [] then i
-  else
-    let _ = float_arr_set arr i (int_to_float (char_id vocab (head cs)))
-    fast_fill_ids arr (tail cs) vocab (i + 1)
-
--- One-hot fill for a window [off, off+wlen) read from the id_arr (O(1) indexed).
--- NOTE: mutual recursion (not self-recursion) — a 6-arg self-loop here hangs
--- (Rail self-loop cross-dep-args miscompile corrupts the i>=wlen test).
-fill_onehot_win dst id_arr off V wlen i =
-  if i >= wlen then 0
-  else fill_onehot_win_b dst id_arr off V wlen i
-fill_onehot_win_b dst id_arr off V wlen i =
-  let c = float_to_int (float_arr_get id_arr (off + i))
-  let _ = float_arr_set dst (i * V + c) 1.0
-  fill_onehot_win dst id_arr off V wlen (i + 1)
--- Labels = next id: label[i] = id_arr[off+i+1].
-fill_labels_win arr id_arr off wlen i =
-  if i >= wlen then 0
-  else fill_labels_win_b arr id_arr off wlen i
-fill_labels_win_b arr id_arr off wlen i =
-  let _ = float_arr_set arr i (float_arr_get id_arr (off + i + 1))
-  fill_labels_win arr id_arr off wlen (i + 1)
-
--- 4-digit echo scorer: at each "-- " marker, compare the 4 predicted echo digits
--- (hpred, shifted +1 for next-token) against the actual (htext). Sum matched digits.
-force_score_at htext hpred m =
-  let c0 = if (r37_chr hpred (m + 2)) == (r37_chr htext (m + 3)) then 1 else 0
-  let c1 = if (r37_chr hpred (m + 3)) == (r37_chr htext (m + 4)) then 1 else 0
-  let c2 = if (r37_chr hpred (m + 4)) == (r37_chr htext (m + 5)) then 1 else 0
-  let c3 = if (r37_chr hpred (m + 5)) == (r37_chr htext (m + 6)) then 1 else 0
-  c0 + c1 + c2 + c3
-force_score_loop htext hpred hplen from acc =
-  let remlen = (r37_slen htext) - from
-  let rel = if remlen <= 0 then (0 - 1) else str_find "-- " (str_sub htext from remlen)
-  if rel < 0 then acc
-  else
-    let m = from + rel
-    let s = if (m + 6) < hplen then force_score_at htext hpred m else 0
-    force_score_loop htext hpred hplen (m + 3) (acc + s)
-force_score htext hpred = force_score_loop htext hpred (r37_slen hpred) 0 0
-
--- Windowed training loop. Each step trains on a DIFFERENT window of the pool, so
--- low train-window loss can only come from generalizing (copy rule), not memorizing
--- barely-seen lines. wsh=[w_e,w_o,ln_g,ln_b]; ash=[st_we,st_wo].
-force_loop id_arr dims wsh ash wb1 wb2 st_wb1 st_wb2 hx htext vocab dlog_buf lr step =
-  let V = list_nth 0 dims
-  let d = list_nth 1 dims
-  let d_ff = list_nth 2 dims
-  let wlen = list_nth 3 dims
-  let nwin = list_nth 4 dims
-  let max_steps = list_nth 5 dims
-  let eval_every = list_nth 6 dims
-  if step >= max_steps then 0
-  else
-    let w_e = list_nth 0 wsh
-    let w_o = list_nth 1 wsh
-    let ln_g = list_nth 2 wsh
-    let ln_b = list_nth 3 wsh
-    let st_we = list_nth 0 ash
-    let st_wo = list_nth 1 ash
-    let off = (step % nwin) * wlen
-    let mk = arena_mark 0
-    let x_data = float_arr_new ((wlen + 0) * V) 0.0
-    let _ = fill_onehot_win x_data id_arr off V wlen 0
-    let x = Tensor x_data (cons wlen (cons V [])) (compute_strides (cons wlen (cons V [])))
-    let labels_data = float_arr_new (wlen + 0) 0.0
-    let _ = fill_labels_win labels_data id_arr off wlen 0
-    let labels = Tensor labels_data (cons wlen []) (cons 1 [])
-    let loss = train_step2 x labels w_e w_o wb1 wb2 ln_g ln_b wlen V d d_ff dlog_buf st_we st_wo st_wb1 st_wb2 lr
-    let _ = arena_reset mk
-    let _ = if step % eval_every == 0 then
-      let mk2 = arena_mark 0
-      let hseq = match hx | Tensor _ shp _ -> head shp
-      let hpred = sample_greedy2 hx w_e w_o wb1 wb2 ln_g ln_b hseq V d d_ff vocab
-      let sc = force_score htext hpred
-      let _ = print (cat ["step ", show step, "  twloss=", show_float loss, "  HELDOUT=", show sc, "/64"])
-      let _ = arena_reset mk2
-      0
-    else 0
-    force_loop id_arr dims wsh ash wb1 wb2 st_wb1 st_wb2 hx htext vocab dlog_buf lr (step + 1)
-
 main =
-  let _ = print "=== DATA-SCALE FORCING: 2-block RoPE, windowed over 9984 distinct 4-digit numbers ==="
-  let text = read_file "rungs/r24/force_train_4d.txt"
-  let vocab = build_vocab (str_sub text 0 2000)
+  let _ = print "=== 2-block RoPE transformer (induction-depth test) ==="
+  let text = read_file "rungs/r24/r24_train_corpus.txt"
+  let vocab = build_vocab text
   let V = vocab_size vocab
-  let cs = chars text
-  let total = length cs
-  let id_arr = float_arr_new total 0.0
-  let _ = fast_fill_ids id_arr cs vocab 0
-  let _ = print (cat ["pool chars=", show total, "  vocab=", show V])
+  let ids = encode vocab text
+  let total = length ids
+  let seq = total - 1
+  let _ = print (cat ["corpus=", show total, " chars, vocab=", show V, ", seq=", show seq])
 
-  let d = 32
-  let d_ff = 128
-  let wlen = 350
-  let nwin = (total - 1) / wlen
-  let _ = print (cat ["window=", show wlen, " chars (10 lines), nwin=", show nwin])
+  let x_data = float_arr_new (seq * V) 0.0
+  let _ = fill_onehot x_data ids V seq 0
+  let x = Tensor x_data (cons seq (cons V [])) (compute_strides (cons seq (cons V [])))
+  let labels_data = float_arr_new seq 0.0
+  let _ = fill_labels labels_data (tail ids) seq 0
+  let labels = Tensor labels_data (cons seq []) (cons 1 [])
+
+  let d = 64
+  let d_ff = 256
 
   let w_e = mk_mat V d 1
   let w_o = mk_mat d V 5
@@ -818,29 +724,34 @@ main =
   let st_wo = adam_state (d * V)
   let st_wb1 = mk_adam_block d d_ff
   let st_wb2 = mk_adam_block d d_ff
-  let dlbsz = wlen * V
-  let dlog_buf = float_arr_new dlbsz 0.0
+  let dlog_buf = float_arr_new (seq * V) 0.0
 
-  -- Held-out: 16 unseen 4-digit numbers (never in the training pool).
-  let htext = read_file "rungs/r24/force_holdout_4d.txt"
+  let max_steps = 4000
+  let loss0 = eval_loss2 x labels w_e w_o wb1 wb2 ln_g ln_b seq V d d_ff
+  let _ = print (cat ["initial loss=", show_float loss0, "  uniform=", show_float (log (int_to_float V))])
+  let _ = loop2 x labels w_e w_o wb1 wb2 ln_g ln_b seq V d d_ff dlog_buf st_we st_wo st_wb1 st_wb2 0.006 200 max_steps 0
+  let loss1 = eval_loss2 x labels w_e w_o wb1 wb2 ln_g ln_b seq V d d_ff
+  let _ = print (cat ["final loss=", show_float loss1])
+
+  let _ = print "\n--- Greedy predictions (train) ---"
+  let sample_str = sample_greedy2 x w_e w_o wb1 wb2 ln_g ln_b seq V d d_ff vocab
+  let _ = print sample_str
+  let _ = print "--- end sample ---"
+
+  -- held-out echo (the deciding generalization test)
+  let htext = read_file "rungs/r24/r24_holdout_corpus.txt"
   let hids = encode vocab htext
   let htotal = length hids
   let hseq = htotal - 1
   let hx_data = float_arr_new (hseq * V) 0.0
   let _ = fill_onehot hx_data hids V hseq 0
   let hx = Tensor hx_data (cons hseq (cons V [])) (compute_strides (cons hseq (cons V [])))
-
-  let wsh = cons w_e (cons w_o (cons ln_g (cons ln_b [])))
-  let ash = cons st_we (cons st_wo [])
-  let max_steps = 6000
-  let dims = cons V (cons d (cons d_ff (cons wlen (cons nwin (cons max_steps (cons 250 []))))))
-  let _ = print "(twloss = loss on each fresh window; low twloss => generalizing copy, not memorizing)"
-  let _ = force_loop id_arr dims wsh ash wb1 wb2 st_wb1 st_wb2 hx htext vocab dlog_buf 0.002 0
-
   let hpred = sample_greedy2 hx w_e w_o wb1 wb2 ln_g ln_b hseq V d d_ff vocab
-  let sc = force_score htext hpred
-  let _ = print (cat ["FINAL HELDOUT_DIGITS=", show sc, "/64  (>=48 = GENERALIZES copy rule)"])
-  let _ = print (cat ["predict sample: ", str_sub hpred 0 70])
+  let _ = print "=== R37 HELD-OUT ECHO (2-block float RoPE) ==="
+  let _ = print (cat ["holdout : ", htext])
+  let _ = print (cat ["predict : ", hpred])
+  let escore = r37_score htext hpred
+  let _ = print (cat ["R37_ECHO=", show escore, "/4  (>=2 = GENERALIZES the copy rule)"])
   0
 
 main_old =

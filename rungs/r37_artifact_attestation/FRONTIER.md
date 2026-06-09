@@ -1,5 +1,12 @@
 # Research Frontier — what r37 established, and the valid pathway forward
 
+> **UPDATE 2026-06-08/09 — the "depth is the wall" conclusion below was a CONFOUND, now corrected.**
+> Building the actual 2-block float RoPE model showed it trains to the copy floor (0.147) once given
+> Glorot init + a non-decaying LR — the earlier plateau was bad init + cosine-LR-to-zero, not depth.
+> The real wall is the memorize-vs-generalize gap (16 examples -> memorizes, 0/4). See
+> **`TWO_BLOCK_FINDINGS.md`** for the full corrected picture + the grokking (weight-decay) experiment.
+
+
 *2026-06-08. Written after building + running the r37 bricks (B1–B7). This is the evidence-based
 research frontier the build earned, replacing the speculative "float will fix it" hypothesis.*
 
