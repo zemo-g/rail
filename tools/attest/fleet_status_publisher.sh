@@ -24,7 +24,10 @@ FLEET_TOKEN_FILE=${FLEET_TOKEN_FILE:-$HOME/.fleet/token}
 BEACON_TOKEN_FILE=${BEACON_TOKEN_FILE:-$HOME/.ledatic/entropy/beacon_token}
 WITNESS_HOST_FILE=${WITNESS_HOST_FILE:-$HOME/.ledatic/witness/host}
 WITNESS_HOST=${WITNESS_HOST:-$(cat "$WITNESS_HOST_FILE" 2>/dev/null || echo "")}
-SIGNER=${SIGNER:-<HOME>/.ledatic/witness/sign_fleet_bundle.sh}
+# Remote-relative: sshd resolves it against the witness account's home.
+# (sign_fleet_bundle.sh never existed on the witness; the attestation signer
+# is the real surface -- digest pulse_id value_hex.)
+SIGNER=${SIGNER:-.ledatic/witness/sign_attestation.sh}
 SITE=${SITE:-https://ledatic.org}
 BEACON_URL=${BEACON_URL:-https://ledatic.org/entropy/pulse}
 NODES_FILE=${NODES_FILE:-$HOME/.ledatic/fleet/nodes}
@@ -97,11 +100,14 @@ PY
 
 digest=$(printf '%s' "$canonical" | shasum -a 256 | awk '{print $1}')
 
+# Fail-loud, never fail-open: an unsigned fleet status is worse than a stale
+# one (staleness is self-evident via asof_unix/pulse_id; an unsigned publish
+# silently downgrades the trust surface). stderr NOT swallowed.
 inner=$(ssh -o ConnectTimeout=4 -o BatchMode=yes "$WITNESS_HOST" \
-  "<HOME>/.ledatic/witness/sign_attestation.sh $digest $pulse_id $value_hex" 2>/dev/null || true)
+  "$SIGNER $digest $pulse_id $value_hex" || true)
 if [ -z "$inner" ]; then
-  echo "witness signer unreachable; publishing unsigned" >&2
-  inner='{"kind":"attestation","version":1,"sig":null,"pk_fp":null,"witness":"none"}'
+  echo "FLEET-ATTEST-FAIL: witness signer returned nothing (host=$WITNESS_HOST signer=$SIGNER); refusing unsigned publish" >&2
+  exit 5
 fi
 
 # Final published bundle = canonical + witness inner.  Consumers reconstruct

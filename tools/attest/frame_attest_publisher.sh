@@ -22,7 +22,8 @@ BEACON_TOKEN_FILE=${BEACON_TOKEN_FILE:-$HOME/.ledatic/entropy/beacon_token}
 WITNESS_HOST_FILE=${WITNESS_HOST_FILE:-$HOME/.ledatic/witness/host}
 WITNESS_HOST=${WITNESS_HOST:-$(cat "$WITNESS_HOST_FILE" 2>/dev/null || echo "")}
 [ -n "$WITNESS_HOST" ] || { echo "no witness host (set WITNESS_HOST or write $WITNESS_HOST_FILE)" >&2; exit 4; }
-SIGNER=${SIGNER:-<HOME>/.ledatic/witness/sign_attestation.sh}
+# Remote-relative: sshd resolves it against the witness account's home.
+SIGNER=${SIGNER:-.ledatic/witness/sign_attestation.sh}
 SITE=${SITE:-https://ledatic.org}
 
 [ -f "$FRAME_PATH" ] || { echo "no frame at $FRAME_PATH" >&2; exit 2; }
@@ -51,11 +52,13 @@ print(json.dumps({"width": w, "height": h, "channels": c, "frame_id": fid}))
 PY
 )
 
+# stderr deliberately NOT swallowed: a bad signer path must show up in the
+# err log, not vanish (the 2026-05-28..06-09 outage hid behind 2>/dev/null).
 inner=$(ssh -o ConnectTimeout=4 -o BatchMode=yes "$WITNESS_HOST" \
-  "$SIGNER $digest $pulse_id $value_hex" 2>/dev/null || true)
+  "$SIGNER $digest $pulse_id $value_hex" || true)
 if [ -z "$inner" ]; then
-  echo "witness unreachable; skipping this tick" >&2
-  exit 0
+  echo "FRAME-ATTEST-FAIL: witness signer returned nothing (host=$WITNESS_HOST signer=$SIGNER); not publishing" >&2
+  exit 5
 fi
 
 published=$(python3 - "$digest" "$size" "$pulse_id" "$value_hex" "$header" "$inner" <<'PY'
