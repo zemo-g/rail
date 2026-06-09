@@ -112,7 +112,19 @@ memorize-vs-generalize + capacity, both now resolved.
 - Deterministic re-run reproduced **HELDOUT 62/64 bit-identically** (step-0 twloss 14.2270829487696 matched to the digit).
 - Quantized to Q.24, committed embed+readout (3456 exact-int weights) → **SHA-256 `35eadeabdf9d78ab9701ce663882e137b628c0439a468db47b2171fdda01dd63`** (`r37_force_weights_q24.txt`).
 - **R37_FORCE_ECHO_Q24 = 62/64** == float echo → the Q.24 commitment is faithful (generalization survives quantization).
-- **B6 foreign-verify PASS**: independent Python re-derived the SHA bit-for-bit (`r37_foreign_check.py` pattern). Attested + trainable + generalizing, closed and cross-checked.
+- **B6 foreign-verify PASS** — with scope honestly stated: the v1 checker re-derived the SHA of the
+  *embed+readout commitment only* (3,456 of 93,696 weights, hash-only, no signature, no metric
+  re-derivation). **The model result is closed; the v1 attestation wrapper was partial.**
+- **v2 gate-grade closure (2026-06-09, post-PAOS-audit):** full pipeline rebuilt to the rung-26
+  standard — split SHAs pre-registered, ckpt-0 abort control, ALL 14 tensors quantized + committed
+  (93,696 Q.24 ints, canonical order in the signed message), twin-run artifact-level determinism,
+  Ed25519 dev-key signature bound to pre/post beacon pulses, and a foreign verifier
+  (`r37_foreign_check_v2.py`) that re-implements the full forward in numpy float64 and re-derives
+  the 62/64 metric from the committed weights alone. Record: `out/r37_attestation.txt`.
+- **Bracket corrected (audit finding):** the strongest lookup-table memorizer scores **exactly
+  48/64** on this split (16 holdout numbers x best 1-digit-neighbor match; pool is 99.84% dense) —
+  equal to the old T=48, so the old threshold did NOT separate model from lookup. Corrected
+  **T' = 55** (lookup 48 < 55 <= model 62), embedded in the signed message.
 
 ## Reusable engineering lessons (earned)
 1. **Deep stacks need `1/sqrt(fan_in)` init.** Without it a 2-block model starts at loss ~14-17
