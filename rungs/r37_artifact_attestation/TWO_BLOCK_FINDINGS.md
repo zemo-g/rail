@@ -125,6 +125,16 @@ memorize-vs-generalize + capacity, both now resolved.
   48/64** on this split (16 holdout numbers x best 1-digit-neighbor match; pool is 99.84% dense) —
   equal to the old T=48, so the old threshold did NOT separate model from lookup. Corrected
   **T' = 55** (lookup 48 < 55 <= model 62), embedded in the signed message.
+- **v3 exact-int eval (2026-06-09, same day): float is OUT of the verification path.**
+  `eval=xint-q24-v1` (`r37_xint_spec.md`) re-derives the metric as a pure integer function of
+  (committed weights, committed splits, spec constants) — Q.24 + truncating div + bitexact
+  fxexp/fxsqrt/sin/cos primitives, RoPE tables derived not committed. Rail evaluator
+  (`r37_xint_eval.rail`, 0.63s) and pure-int Python verifier both produce **62/64** with an
+  **identical SHA-256 over the full 559-char prediction trace** (`7169ef76…c741e2`) — every
+  argmax decision matches cross-language. Overflow audit: max_acc_bits=60 < 62 (Rail int63
+  provably cannot wrap). v3 signed msg adds `pred=<sha>` (binds the whole output trace) +
+  `eval=xint-q24-v1`. `R37_FOREIGN_V3=PASS` 12/12. Record: `out/r37_attestation_v3.txt`.
+  The triad is fully real: **train float → attest weights → eval exact-int.**
 
 ## Reusable engineering lessons (earned)
 1. **Deep stacks need `1/sqrt(fan_in)` init.** Without it a 2-block model starts at loss ~14-17
