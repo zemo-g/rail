@@ -62,4 +62,13 @@ Canonical config unchanged (d=8, hidden=64, 2 blocks, 2 heads, 40 epochs). Backu
 - Do NOT move T, train on holdout, or fake the metric (forbidden by the rung design + the
   no-synthetic-evidence rule).
 
+## RESOLVED-BY-r37 (2026-06-09)
+The capacity wall was taken with the "larger model" option under r37's artifact-attestation
+frame (`rungs/r37_artifact_attestation/`): d=64/2-block, trained in float, quantized to Q.24,
+full 93,696-weight artifact committed + Ed25519-signed, scores **62/64 held-out** — far above
+the corrected bracket (strongest lookup baseline = exactly 48/64; T' = 55). The d=8 result
+stands as the honest negative: the "smallest honest instance" claim is retired, the
+generalization claim moved to r37. r24 itself remains the bit-exact INFRA reference
+(segmented arena, CPU-matvec, D0=1).
+
 _State: branch `reward/first-utterance`, UNPUSHED. Canonical r24 fix is local-only pending review._

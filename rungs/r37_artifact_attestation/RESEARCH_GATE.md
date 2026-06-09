@@ -109,3 +109,37 @@ eliminated scale/tuning; this gate isolates (or confirms) numerics; the fallback
 - `rungs/r37_artifact_attestation/r37_foreign_check.py` — B6
 - `rungs/r37_artifact_attestation/r37_gate.rail` + `validate.sh` — B7
 - Reuses verbatim: the r24 SPLIT record, echo mask, lookup baseline, corpora (`31`,`75` holdout).
+
+---
+
+## GATE CLOSED — 2026-06-09 (scaled instance)
+
+**Scope note (honest):** the criteria above were written for the original d=8 r24 instance
+(holdout `31`,`75`, T=2/4). They are scored here against the **scaled instance that actually
+took the wall**: d=64/d_ff=256/lr=0.003, windowed data-scale forcing over 9,984 distinct
+4-digit numbers, 16-number sealed holdout, metric = held-out echo digits /64. Same gate
+*shape*, larger honest instance (see TWO_BLOCK_FINDINGS.md B' and the bracket correction).
+
+| Criterion | Verdict | Evidence |
+|---|---|---|
+| okGeneralize | **PASS** | foreign-reproduced **62/64** ≥ T′=55 (twins A+B both; `out/run_A.log` FINAL) |
+| okBracket | **PASS** | strongest lookup memorizer = exactly **48**/64 (`r37_lookup_baseline.py`); 48 < T′=55 ≤ 62. Old T=48 did NOT separate — corrected, T′ embedded in signed msg |
+| okSplitSig (F1/F3) | **PASS** | train/holdout SHAs pre-registered + in signed msg; verifier re-derives both; split is a complete 10,000-number partition, 0 overlap |
+| okWeightSig | **PASS** | ALL 93,696 Q.24 weights committed (14 tensors, canonical order) → SHA `b033287e…d9b` in signed msg; v1 partial commit (3,456) superseded |
+| okDeterminism | **PASS** | twin runs A (repo) + B (isolated mirror) → byte-identical artifact SHA; loss bit-identical to 15 digits through training |
+| okForeign | **PASS** | `r37_foreign_check_v2.py` (numpy float64) re-implements the forward and re-derives **62/64 from the committed weights alone** + verifies Ed25519 (RFC 8032 reimpl), msg_sha, both split SHAs, full-artifact SHA, 93,696 count, fixed ln_g/ln_b |
+| okCkpt0Abort | **PASS** | ckpt-0 abort control wired in pipeline (smoke-proven 2026-06-09); aborted run publishes nothing |
+
+**Signature:** Ed25519 **dev key** (`pk 079ad478…4e02`, seed = sha256 of a local dev string —
+NEVER the prod Pi-witness surface; okDevKey scoping per rung-ladder convention).
+Msg: `r37|v2|train=f9ec1b1a…|holdout=893f259d…|weights=b033287e…|metric=62/64|T=55|order=…|q=Q.24|pulse_pre=1905363|pulse_post=1906779`
+Sig `fab5b5ef…bd06`, self-verify 1, foreign-verify PASS. Record: `out/r37_attestation.txt`.
+
+**Outcome (per the decision table above):** float CROSSES T — numerics was the wall for
+*trainability*; capacity (d=64) + data-scale forcing were the gates for *generalization*.
+The artifact-attestation frame (train float → quantize Q.24 → commit ALL weights → sign →
+foreign re-derive) is hereby the **PAOS Stage-2 template**, realized end to end.
+
+**Roadmap remainder (not gate-blocking, recorded honestly):** exact-int Q.24 *forward* for
+eval (today: float forward on grid-aligned weights, faithful by Q24GRID==float echo check);
+prod-witness counter-signature (rung 29 wall); cross-ISA foreign run (rung 22 wall).

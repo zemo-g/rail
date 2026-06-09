@@ -4,13 +4,23 @@
 
 ## Tally
 
-**14 of 15 genuinely GREEN (2026-06-07/08: 6 -> 14)** — 22, 23, 25, 26, 27, 28, 29, 30, 31, 32, 33,
-34, 35, 36. Remaining: **24** — INFRA FIXED 2026-06-08 (completes 2m25s, was 4h+/never; bit-exact
-[D0=1 + byte-identical diff]; constant ~2.3GB memory via CPU-matvec + disk-only segmented arena).
-But **honest capacity FAIL**: the d=8/2-block model scores `0/4` held-out echo at BOTH 40 and 200
-epochs (full-acc 19/54 identical, loss plateaued = converged) — a genuine capacity wall, NOT a
-training-time issue. Green needs a larger model / more data (changes the "smallest honest instance"
-claim) — Reilly's call. Full writeup: `rungs/r24/FIX_NOTES.md`.
+**Honest rollup (corrected 2026-06-09 per the PAOS deep audit — the earlier "14 of 15
+genuinely GREEN" rounded walled rungs up; each rung's own code was already telling the
+truth, this rollup now matches it):**
+
+| Bucket | Rungs | Count |
+|---|---|---|
+| **Genuinely green** — gates pass, re-verified | 26, 27, 30, 32, 35, 36 | **6** |
+| Runnable, compute-deferred — code + fixtures done, full run not executed | 23, 25 | 2 |
+| Capacity-walled at d=8, **RESOLVED BY r37** — d=64 artifact-attestation scores 62/64 held-out vs lookup baseline 48 (corrected bracket T'=55) | 24 | 1 |
+| **Walled** — external host / remote HW / open research; the rung's code marks the limit honestly (okDevKey gates, LOCAL/DEV-key comments, modelled witnesses) | 22 (x86 cross-ISA exec), 28 (live-beacon prod surface), 29 (real Pi countersign), 31 (Freivalds soundness margin), 33 (FROST mod-L math), 34 (VDF) | 6 |
+
+r24 history: INFRA FIXED 2026-06-08 (completes 2m25s, was 4h+/never; bit-exact
+[D0=1 + byte-identical diff]; constant ~2.3GB memory via CPU-matvec + disk-only segmented
+arena). The remaining capacity FAIL (d=8/2-block scored `0/4` held-out at both 40 and 200
+epochs — converged, genuine capacity wall) was resolved by going to d=64 under r37's
+artifact-attestation frame (train float, attest quantized artifact). Full writeups:
+`rungs/r24/FIX_NOTES.md`, `rungs/r37_artifact_attestation/TWO_BLOCK_FINDINGS.md`.
 
 THE SYSTEMIC BUG (cracked 2026-06-08): r22, r25, and r24's "deep/capacity" failures were ONE bug --
 `lm4_forward` was called with NINE args (a stray `emb` wedged between `w2` and `blk0`:
