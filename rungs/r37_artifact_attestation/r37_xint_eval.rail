@@ -1,0 +1,263 @@
+-- r37_xint_eval.rail — EXACT-INTEGER evaluator for the r37 committed artifact.
+-- Spec: r37_xint_spec.md (eval=xint-q24-v1). Python mirror: r37_foreign_check_v3.py.
+--
+-- Loads the SHA-committed Q.24 weight artifact (raw ints, used as-is — no float
+-- anywhere), derives the RoPE tables from bx_fixed integer trig (nothing committed),
+-- runs the 2-block pre-norm forward in pure int63 arithmetic, and prints the metric.
+-- Every divide is Rail `/` = truncate-toward-zero (ARM sdiv) = the spec's td.
+-- The Python verifier's overflow audit measured max_acc_bits=60 on this artifact,
+-- so no intermediate here can wrap Rail's 63-bit tagged ints.
+--
+-- Rail traps honored:
+--   * big int literals (>=32768) appear only as OPERANDS (rail-bug-value-literal-tag-mov)
+--   * loops whose tail-args cross-depend use MUTUAL recursion (rail-bug-self-loop-cross-dep-args)
+--   * no lambdas to map/filter — every loop is a named recursion
+--   * `xs == []`, never `length xs == 0` (O(N) trap)
+--
+-- Run from repo root:  ./rail_native rungs/r37_artifact_attestation/r37_xint_eval.rail
+--                      /tmp/rail_out
+import "stdlib/tokenizer.rail"
+import "stdlib/sha256.rail"
+import "tools/bitexact/bx_fixed.rail"
+
+-- ===== list utilities =====
+xint_nth i xs = if i == 0 then head xs else xint_nth (i - 1) (tail xs)
+xint_take n xs = if n == 0 then [] else cons (head xs) (xint_take (n - 1) (tail xs))
+xint_drop n xs = if n == 0 then xs else xint_drop (n - 1) (tail xs)
+xint_chunk xs cols n =
+  if n == 0 then []
+  else cons (xint_take cols xs) (xint_chunk (xint_drop cols xs) cols (n - 1))
+xint_heads rows = if rows == [] then [] else cons (head (head rows)) (xint_heads (tail rows))
+xint_tails rows = if rows == [] then [] else cons (tail (head rows)) (xint_tails (tail rows))
+xint_transpose rows =
+  if rows == [] then []
+  else if (head rows) == [] then []
+  else cons (xint_heads rows) (xint_transpose (xint_tails rows))
+xint_sum xs acc = if xs == [] then acc else xint_sum (tail xs) (acc + head xs)
+xint_add xs ys = if xs == [] then [] else cons ((head xs) + (head ys)) (xint_add (tail xs) (tail ys))
+xint_all_eq xs v = if xs == [] then 1 else if (head xs) == v then xint_all_eq (tail xs) v else 0
+
+-- ===== weight-file parser: one pass over the char list =====
+-- codes: ',' = 44  '-' = 45  digits 48..57. File is digits/comma/minus only
+-- (verified), every int is comma-terminated. Tail-args cross-depend (acc reads
+-- cur) -> mutual recursion.
+xint_parse_a cs cur neg acc =
+  if cs == [] then reverse acc
+  else
+    let k = char_to_int (head cs)
+    if k == 44 then
+      let v = if neg == 1 then 0 - cur else cur
+      xint_parse_b (tail cs) 0 0 (cons v acc)
+    else if k == 45 then xint_parse_b (tail cs) cur 1 acc
+    else xint_parse_b (tail cs) (cur * 10 + (k - 48)) neg acc
+xint_parse_b cs cur neg acc =
+  if cs == [] then reverse acc
+  else
+    let k = char_to_int (head cs)
+    if k == 44 then
+      let v = if neg == 1 then 0 - cur else cur
+      xint_parse_a (tail cs) 0 0 (cons v acc)
+    else if k == 45 then xint_parse_a (tail cs) cur 1 acc
+    else xint_parse_a (tail cs) (cur * 10 + (k - 48)) neg acc
+xint_parse cs = xint_parse_a cs 0 0 []
+
+-- ===== exact-int forward primitives (spec section: Forward pass) =====
+-- dot: exact integer sum, ONE truncation by S at the end.
+xint_dot xs ws acc =
+  if xs == [] then acc / 16777216
+  else xint_dot (tail xs) (tail ws) (acc + (head xs) * (head ws))
+-- matvec against a transposed weight (list of columns).
+xint_mv x cols = if cols == [] then [] else cons (xint_dot x (head cols) 0) (xint_mv x (tail cols))
+
+-- layernorm, d=64, gamma=S beta=0 (checked at load; td(y*S,S)==y exactly).
+xint_sub_mu xs mu = if xs == [] then [] else cons ((head xs) - mu) (xint_sub_mu (tail xs) mu)
+xint_sumsq xs acc =
+  if xs == [] then acc
+  else
+    let v = head xs
+    xint_sumsq (tail xs) (acc + (v * v) / 16777216)
+xint_ln_div xs den = if xs == [] then [] else cons (((head xs) * 16777216) / den) (xint_ln_div (tail xs) den)
+xint_lnorm xs =
+  let mu = (xint_sum xs 0) / 64
+  let dxs = xint_sub_mu xs mu
+  let var = (xint_sumsq dxs 0) / 64
+  let den = bx4_fxsqrt (var + 168)
+  xint_ln_div dxs den
+
+-- rope on a row: adjacent pairs (2j, 2j+1), tables walked in lockstep.
+xint_rope xs cts sts =
+  if xs == [] then []
+  else
+    let x0 = head xs
+    let xs1 = tail xs
+    let x1 = head xs1
+    let c = head cts
+    let s = head sts
+    let y0 = (x0 * c) / 16777216 - (x1 * s) / 16777216
+    let y1 = (x0 * s) / 16777216 + (x1 * c) / 16777216
+    cons y0 (cons y1 (xint_rope (tail xs1) (tail cts) (tail sts)))
+
+-- RoPE tables, integer-DERIVED (spec section: RoPE tables):
+--   x_j = td(j*LN10000_q, 32); THETA_j = fxexp(-x_j); ANG = reduce2pi(p*THETA_j).
+xint_thetas j = if j >= 32 then [] else cons (bx4_fxexp (0 - ((j * 154526885) / 32))) (xint_thetas (j + 1))
+xint_ct_row p ths = if ths == [] then [] else cons (bx4_cos (bx4_reduce2pi (p * (head ths)))) (xint_ct_row p (tail ths))
+xint_st_row p ths = if ths == [] then [] else cons (bx4_sin (bx4_reduce2pi (p * (head ths)))) (xint_st_row p (tail ths))
+xint_cts p tmax ths = if p >= tmax then [] else cons (xint_ct_row p ths) (xint_cts (p + 1) tmax ths)
+xint_sts p tmax ths = if p >= tmax then [] else cons (xint_st_row p ths) (xint_sts (p + 1) tmax ths)
+
+-- ===== attention =====
+-- scores for query row qi against the first cnt rows of ks:
+--   sc_j = td( td(sum q*k, S) * ISD_q, S ),  ISD_q = 2097152 = S/8 (d=64).
+xint_scores qi ks cnt =
+  if cnt == 0 then []
+  else
+    let d1 = xint_dot qi (head ks) 0
+    cons ((d1 * 2097152) / 16777216) (xint_scores qi (tail ks) (cnt - 1))
+xint_max xs m = if xs == [] then m else if (head xs) > m then xint_max (tail xs) (head xs) else xint_max (tail xs) m
+xint_exps xs m = if xs == [] then [] else cons (bx4_fxexp ((head xs) - m)) (xint_exps (tail xs) m)
+xint_wts es z = if es == [] then [] else cons (((head es) * 16777216) / z) (xint_wts (tail es) z)
+-- weighted sum down one V column, per-term truncation (lm10 form):
+--   o = sum_j td(w_j * V[j][c], S). ws has i+1 entries; vcol is the full column.
+xint_wsum ws vcol acc =
+  if ws == [] then acc
+  else xint_wsum (tail ws) (tail vcol) (acc + ((head ws) * (head vcol)) / 16777216)
+xint_attn_out ws vt = if vt == [] then [] else cons (xint_wsum ws (head vt) 0) (xint_attn_out ws (tail vt))
+-- per-query driver: causal by construction (prefix j <= i only). z >= fxexp(0) = S > 0.
+xint_attn_rows hs qs ks vt i =
+  if hs == [] then []
+  else
+    let sc = xint_scores (head qs) ks (i + 1)
+    let m = xint_max (tail sc) (head sc)
+    let es = xint_exps sc m
+    let z = xint_sum es 0
+    let ws = xint_wts es z
+    let o = xint_attn_out ws vt
+    cons (xint_add (head hs) o) (xint_attn_rows (tail hs) (tail qs) ks vt (i + 1))
+
+-- ===== FFN =====
+xint_relu xs = if xs == [] then [] else cons (if (head xs) > 0 then head xs else 0) (xint_relu (tail xs))
+xint_ffn_rows hs f1t f2t =
+  if hs == [] then []
+  else
+    let l2 = xint_lnorm (head hs)
+    let f2 = xint_mv (xint_relu (xint_mv l2 f1t)) f2t
+    cons (xint_add (head hs) f2) (xint_ffn_rows (tail hs) f1t f2t)
+
+-- ===== block =====
+xint_ln_rows hs = if hs == [] then [] else cons (xint_lnorm (head hs)) (xint_ln_rows (tail hs))
+xint_qk_rows lns wt cts sts =
+  if lns == [] then []
+  else cons (xint_rope (xint_mv (head lns) wt) (head cts) (head sts)) (xint_qk_rows (tail lns) wt (tail cts) (tail sts))
+xint_v_rows lns wt = if lns == [] then [] else cons (xint_mv (head lns) wt) (xint_v_rows (tail lns) wt)
+xint_block hs wqt wkt wvt f1t f2t cts sts =
+  let lns = xint_ln_rows hs
+  let qs = xint_qk_rows lns wqt cts sts
+  let ks = xint_qk_rows lns wkt cts sts
+  let vs = xint_v_rows lns wvt
+  let vt = xint_transpose vs
+  let h1 = xint_attn_rows hs qs ks vt 0
+  xint_ffn_rows h1 f1t f2t
+
+-- ===== readout: argmax, first max wins (strict >). Mutual recursion: bi' = i is
+-- a cross-dep tail-arg. =====
+xint_amax_a ls bv bi i =
+  if ls == [] then bi
+  else if (head ls) > bv then xint_amax_b (tail ls) (head ls) i (i + 1)
+  else xint_amax_b (tail ls) bv bi (i + 1)
+xint_amax_b ls bv bi i =
+  if ls == [] then bi
+  else if (head ls) > bv then xint_amax_a (tail ls) (head ls) i (i + 1)
+  else xint_amax_a (tail ls) bv bi (i + 1)
+xint_argmax ls = xint_amax_a (tail ls) (head ls) 0 1
+
+xint_pred_chars hs wot vocab acc =
+  if hs == [] then reverse acc
+  else
+    let c = id_char vocab (xint_argmax (xint_mv (head hs) wot))
+    xint_pred_chars (tail hs) wot vocab (cons c acc)
+
+-- ===== embedding: row select (exact) =====
+xint_embed ids wer = if ids == [] then [] else cons (xint_nth (head ids) wer) (xint_embed (tail ids) wer)
+
+-- ===== force_score — copied VERBATIM from float_lm_force_d64.rail =====
+r37_chr s i = str_sub s i 1
+r37_slen s = length (chars s)
+force_score_at htext hpred m =
+  let c0 = if (r37_chr hpred (m + 2)) == (r37_chr htext (m + 3)) then 1 else 0
+  let c1 = if (r37_chr hpred (m + 3)) == (r37_chr htext (m + 4)) then 1 else 0
+  let c2 = if (r37_chr hpred (m + 4)) == (r37_chr htext (m + 5)) then 1 else 0
+  let c3 = if (r37_chr hpred (m + 5)) == (r37_chr htext (m + 6)) then 1 else 0
+  c0 + c1 + c2 + c3
+force_score_loop htext hpred hplen from acc =
+  let remlen = (r37_slen htext) - from
+  let rel = if remlen <= 0 then (0 - 1) else str_find "-- " (str_sub htext from remlen)
+  if rel < 0 then acc
+  else
+    let m = from + rel
+    let s = if (m + 6) < hplen then force_score_at htext hpred m else 0
+    force_score_loop htext hpred hplen (m + 3) (acc + s)
+force_score htext hpred = force_score_loop htext hpred (r37_slen hpred) 0 0
+
+-- ===== main =====
+xint_run ints =
+  -- segment in the SIGNED order: w_e,w_o,wq1,wk1,wv1,wf11,wf21,wq2,wk2,wv2,wf12,wf22,ln_g,ln_b
+  let wer = xint_chunk (xint_take 1728 ints) 64 27
+  let r01 = xint_drop 1728 ints
+  let wot = xint_transpose (xint_chunk (xint_take 1728 r01) 27 64)
+  let r02 = xint_drop 1728 r01
+  let wq1t = xint_transpose (xint_chunk (xint_take 4096 r02) 64 64)
+  let r03 = xint_drop 4096 r02
+  let wk1t = xint_transpose (xint_chunk (xint_take 4096 r03) 64 64)
+  let r04 = xint_drop 4096 r03
+  let wv1t = xint_transpose (xint_chunk (xint_take 4096 r04) 64 64)
+  let r05 = xint_drop 4096 r04
+  let wf11t = xint_transpose (xint_chunk (xint_take 16384 r05) 256 64)
+  let r06 = xint_drop 16384 r05
+  let wf21t = xint_transpose (xint_chunk (xint_take 16384 r06) 64 256)
+  let r07 = xint_drop 16384 r06
+  let wq2t = xint_transpose (xint_chunk (xint_take 4096 r07) 64 64)
+  let r08 = xint_drop 4096 r07
+  let wk2t = xint_transpose (xint_chunk (xint_take 4096 r08) 64 64)
+  let r09 = xint_drop 4096 r08
+  let wv2t = xint_transpose (xint_chunk (xint_take 4096 r09) 64 64)
+  let r10 = xint_drop 4096 r09
+  let wf12t = xint_transpose (xint_chunk (xint_take 16384 r10) 256 64)
+  let r11 = xint_drop 16384 r10
+  let wf22t = xint_transpose (xint_chunk (xint_take 16384 r11) 64 256)
+  let r12 = xint_drop 16384 r11
+  let lng = xint_take 64 r12
+  let lnb = xint_take 64 (xint_drop 64 r12)
+  let g_ok = xint_all_eq lng 16777216
+  let b_ok = xint_all_eq lnb 0
+  if g_ok == 0 then print "R37_XINT_FATAL=ln_g_not_identity"
+  else if b_ok == 0 then print "R37_XINT_FATAL=ln_b_not_zero"
+  else
+    -- vocab + holdout ids (first-appearance over train[:2000], == training call)
+    let text = read_file "rungs/r24/force_train_4d.txt"
+    let vocab = build_vocab (str_sub text 0 2000)
+    let vsz = vocab_size vocab
+    if vsz == 27 then
+      let htext = read_file "rungs/r24/force_holdout_4d.txt"
+      let hids = encode vocab htext
+      let tlen = (length hids) - 1
+      let ids = xint_take tlen hids
+      let ths = xint_thetas 0
+      let cts = xint_cts 0 tlen ths
+      let sts = xint_sts 0 tlen ths
+      let h0 = xint_embed ids wer
+      let h1 = xint_block h0 wq1t wk1t wv1t wf11t wf21t cts sts
+      let h2 = xint_block h1 wq2t wk2t wv2t wf12t wf22t cts sts
+      let hpred = cat (xint_pred_chars h2 wot vocab [])
+      let sc = force_score htext hpred
+      let _ = print (cat ["R37_XINT_T=", show tlen])
+      let _ = print (cat ["R37_XINT_PRED_SAMPLE=", str_sub hpred 0 70])
+      let _ = print (cat ["R37_XINT_PRED_SHA=", sha256_hex hpred])
+      print (cat ["R37_XINT_METRIC=", show sc, "/64 eval=xint-q24-v1 (T'=55, lookup=48)"])
+    else print (cat ["R37_XINT_FATAL=vocab_", show vsz])
+
+main =
+  let raw = read_file "rungs/r37_artifact_attestation/out/r37_force_weights_q24_full.txt"
+  let ints = xint_parse (chars raw)
+  let n = length ints
+  if n == 93696 then xint_run ints
+  else print (cat ["R37_XINT_FATAL=weight_count_", show n])

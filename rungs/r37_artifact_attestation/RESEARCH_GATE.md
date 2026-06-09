@@ -140,6 +140,41 @@ Sig `fab5b5ef…bd06`, self-verify 1, foreign-verify PASS. Record: `out/r37_atte
 The artifact-attestation frame (train float → quantize Q.24 → commit ALL weights → sign →
 foreign re-derive) is hereby the **PAOS Stage-2 template**, realized end to end.
 
-**Roadmap remainder (not gate-blocking, recorded honestly):** exact-int Q.24 *forward* for
-eval (today: float forward on grid-aligned weights, faithful by Q24GRID==float echo check);
-prod-witness counter-signature (rung 29 wall); cross-ISA foreign run (rung 22 wall).
+**Roadmap remainder (not gate-blocking, recorded honestly):** ~~exact-int Q.24 *forward* for
+eval~~ (**DONE — v3 below, 2026-06-09 same day**); prod-witness counter-signature (rung 29
+wall); cross-ISA foreign run (rung 22 wall).
+
+---
+
+## v3 ADDENDUM — okForeign upgraded float-empirical → integer-deterministic (2026-06-09)
+
+v2's okForeign rested on numpy float64 argmax *empirically* matching Rail's float forward on
+this artifact — a different libm/BLAS could in principle flip a borderline argmax. v3 removes
+float from the verification path entirely: **`eval=xint-q24-v1`** (normative spec:
+`r37_xint_spec.md`) makes the metric a **deterministic integer function of (committed weights,
+committed splits, spec constants)** — Q.24 fixed-point, truncating division, integer layernorm/
+RoPE/softmax via the proven `tools/bitexact` primitives (bx4 fxexp/sin/cos/reduce2pi, bx7
+fxsqrt). RoPE tables are *derived*, not committed (pure integer function of the spec).
+
+| v3 evidence | Result |
+|---|---|
+| Rail evaluator (`r37_xint_eval.rail`, pure Rail, 0.63s) | **62/64** |
+| Python verifier (`r37_foreign_check_v3.py --forward-only`, pure int, no numpy) | **62/64** |
+| Full 559-char prediction trace SHA-256, cross-language | **IDENTICAL** `7169ef76…c741e2` — every argmax decision matches, not just the 64 scored digits |
+| Overflow audit (every accumulator + fxsqrt arg, sum-of-\|terms\| bound) | max_acc_bits = **60** < 62 → Rail int63 provably cannot wrap on this artifact |
+| Metric continuity | xint 62/64 == float 62/64 (quantized-eval semantics preserve the result exactly) |
+
+**Signed message (v3)** adds `pred=<sha>` — the signature binds the ENTIRE eval output trace,
+so "metric reproduced" is a corollary of "output reproduced":
+`r37|v3|train=f9ec1b1a…|holdout=893f259d…|weights=b033287e…|metric=62/64|pred=7169ef76…|T=55|order=…|q=Q.24|eval=xint-q24-v1|pulse_pre=1908326|pulse_post=1908329`
+— dev key `079ad478…4e02` (same dev-key discipline), msg_sha `0bdfec86…a3e6`, self-verify 1.
+Record: `out/r37_attestation_v3.txt`. Wrapper: `r37_attest_v3.sh` (pulse sandwich brackets the
+eval; fail-loud cross-witness gate requires Rail==Python on metric AND pred SHA before signing).
+Foreign verification: `R37_FOREIGN_V3=PASS` — 12/12 (sig + splits + artifact + exact-int metric
++ pred trace + bracket + overflow bound + max_acc_bits echo).
+
+**Status of the three eval grades:** float forward (training-time, v1/v2) → grid-aligned float
+(v2 faithfulness check) → **exact-int (v3, canonical)**. The float metric remains the
+training-time result; the v3 metric is the machine-checkable one any implementation reproduces
+bit-for-bit. The artifact-attestation triad is now fully realized: **train float → attest
+weights → eval exact-int.**
