@@ -44,6 +44,20 @@ if [ -z "$TB_IP" ]; then
   exit 0
 fi
 
+# ── Optional pinned membership ──────────────────────────────────────────────
+# ~/.fleet/tb-members (same path resolution as tb-ip): explicit
+# space-separated member list, e.g. "en5 en19".  Pinning exists because the
+# CHANNEL_IO heuristic bridges ALL live TB virtual interfaces — including
+# parallel ghost channels of the same physical cable.  When both ends bridge
+# both channels, frames circulate (L2 loop), MAC learning corrupts, and
+# unicast silently blackholes (2026-06-10: Studio learned Air's MAC on the
+# Mini-facing port; Air↔Mini TCP died while ICMP mostly worked).  Rule:
+# one bridged interface per physical link per node.
+TB_MEMBERS_FILE=""
+for f in /var/root/.fleet/tb-members /Users/*/.fleet/tb-members; do
+  [ -f "$f" ] && TB_MEMBERS_FILE="$f" && break
+done
+
 # ── Classify candidate interfaces ───────────────────────────────────────────
 # Real TB peer:
 #   flags include UP and RUNNING (PROMISC is set *by* bridge addition —
@@ -51,6 +65,16 @@ fi
 #   AND media is `autoselect` OR (media is `none` AND options contain CHANNEL_IO)
 # Skip en0/en1 (Wi-Fi / built-in).
 real_peers=""
+if [ -n "$TB_MEMBERS_FILE" ]; then
+  for iface in $(cat "$TB_MEMBERS_FILE" 2>/dev/null); do
+    if ifconfig "$iface" >/dev/null 2>&1; then
+      real_peers="$real_peers $iface"
+      log "$iface real reason=pinned file=$TB_MEMBERS_FILE"
+    else
+      log "$iface pinned-but-missing skip"
+    fi
+  done
+else
 for iface in $(ifconfig -l | tr ' ' '\n' | grep -E '^en[0-9]+$'); do
   case "$iface" in
     en0|en1) continue ;;
@@ -90,6 +114,7 @@ for iface in $(ifconfig -l | tr ' ' '\n' | grep -E '^en[0-9]+$'); do
       ;;
   esac
 done
+fi
 real_peers=$(printf '%s' "$real_peers" | awk '{$1=$1};1')
 
 # ── Snapshot current bridge0 members ────────────────────────────────────────
