@@ -45,9 +45,9 @@ bash tools/attest/verify.sh releases/vX.Y.Z/compile.rail       releases/vX.Y.Z/c
 bash tools/attest/publish.sh releases/vX.Y.Z
 # → 5 ok, 0 fail
 
-# 5. Commit + push (see gotcha #1)
+# 5. Commit + push (gotcha #1: verify the attestation JSON was picked up)
 git add releases/vX.Y.Z
-git add -f releases/vX.Y.Z/rail_native.attestation.json    # see gotcha #1
+git status releases/vX.Y.Z    # confirm rail_native.attestation.json is staged
 git commit -m "attest: vX.Y.Z release artifacts + attestations"
 git push origin master
 ```
@@ -64,11 +64,11 @@ attestation. Existing tracked attestations are grandfathered, so prior
 releases look fine — but the new release ships without its rail_native
 attestation file in-tree.
 
-**Workaround:** explicit `git add -f releases/vX.Y.Z/rail_native.attestation.json`
-on every release.
-
-**Real fix (TODO):** add `!releases/**/rail_native.attestation.json` to
-`.gitignore` whitelist.
+**Fixed in v5.0.1:** `.gitignore` now whitelists
+`!releases/**/rail_native.attestation.json`, so a plain
+`git add releases/vX.Y.Z` picks the file up. Still worth a
+`git status releases/vX.Y.Z` after adding to confirm the attestation
+JSON is staged — if it isn't, the whitelist has regressed.
 
 ### #2 — `~/.ledatic/witness/signer_url` format
 
@@ -90,21 +90,22 @@ ld to succeed.
 **Symptom:** fresh worktree off master gives `ld: file cannot be open()ed,
 errno=2 path=runtime/llm.o`.
 
-**Workaround:** seed from any working worktree:
+**Workaround:** seed from any working worktree or clone:
 ```bash
-mkdir -p runtime && cp ~/projects/rail/runtime/llm.o runtime/
+mkdir -p runtime && cp <existing-worktree>/runtime/llm.o runtime/
 ```
 
 (The .o is built from `tools/llm_runtime.c` somewhere — find and
 canonicalize that build step in a follow-up.)
 
-### #4 — Plasma beacon owns `/tmp/rail_out`
+### #4 — A local process may own `/tmp/rail_out`
 
-`com.ledatic.mhd` LaunchAgent runs the plasma beacon, which compiles to
-`/tmp/rail_out` and execs it. Long-running. Any subsequent compile that
-also writes to `/tmp/rail_out` works (macOS unlinks + creates), but you
-**cannot** `./rail_native run /tmp/rail_out` against the beacon binary —
-that re-execs the daemon. Use explicit output paths when smoke-testing.
+A long-running local process may be executing a binary previously
+compiled to `/tmp/rail_out` (the default output path). Any subsequent
+compile that also writes to `/tmp/rail_out` works (macOS unlinks +
+creates), but you **cannot** `./rail_native run /tmp/rail_out` against
+the existing binary — that re-execs whatever daemon owns it. Compile
+with a distinct output path when smoke-testing.
 
 ### #5 — `./rail_native run` captures stdout
 

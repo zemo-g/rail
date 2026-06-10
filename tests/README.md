@@ -2,7 +2,7 @@
 
 Rail's test suite runs inside the compiler binary. Source is in
 `tools/compile.rail` — each test is a `run_test "name" ...` call
-inside the `test_main` function.
+inside the `run_tests` function.
 
 ```bash
 ./rail_native test
@@ -22,7 +22,7 @@ diff rail_native /tmp/rail_self   # must be empty (fixed point)
 
 ## Test categories
 
-The 170 cases are grouped in `tools/compile.rail` under `test_main`:
+The 170 cases are grouped in `tools/compile.rail` under `run_tests`:
 
 - parse / lex / error paths
 - ints, floats, mixed-float promotion

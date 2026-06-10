@@ -1,5 +1,7 @@
 # HTTPS in Rail — Design Debate
 
+> Design document. Shipped in v3.0.0 — see `stdlib/tls.rail` / `stdlib/https_client.rail`.
+
 **Branch:** `track-h-https`
 **Parent:** `next-v2.10` (includes `char_from_int`, `stdlib/http_client.rail`, chunked-transfer decoder)
 **Status:** SHIPPED — TLS 1.3 landed in v3.0.0 as `stdlib/tls.rail` + `stdlib/https_client.rail`
@@ -34,7 +36,7 @@ This blocks Option A (pure Rail) until compile.rail is extended.
 ### Option A — Pure Rail (add compiler primitives, implement all crypto)
 
 1. Extend `tools/compile.rail` with primitives: `bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`, `rotr`, `rotl`. ARM64 codegen via `and`/`orr`/`eor`/`lsl`/`lsr`/`ror`. Register in `infer_is_heap_builtin` with type signature `(int, int) -> int`. ~80 lines.
-2. Rebuild + 2-pass self-compile + verify fixed point + 116/116.
+2. Rebuild + 2-pass self-compile + verify fixed point + full test suite.
 3. Implement SHA-256 in `stdlib/crypto/sha256.rail` — ~80 lines, testable against RFC 6234 vectors.
 4. Implement HMAC-SHA256 (~20 lines), HKDF (~30 lines).
 5. Implement X25519 (~100 lines of modular arithmetic over GF(2^255-19)).
@@ -103,7 +105,7 @@ Day 2: wire into `http_client.rail` as `https_get` / `https_post_json`. Day 3: c
 Today's deliverable target, scoped to 3-4 hours:
 
 - Extend `tools/compile.rail` with `bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`, `rotr`, `rotl` primitives. ARM64 codegen.
-- Run 116/116 + 2-pass self-compile fixed point. Commit.
+- Run the full test suite + 2-pass self-compile fixed point. Commit.
 - Implement SHA-256 in `stdlib/crypto/sha256.rail`. Test against NIST vectors (empty string, "abc", long).
 - Commit. Defer HMAC + everything else to later sessions.
 
@@ -124,7 +126,7 @@ These are post-merge concerns, if ever.
 
 Before this branch merges to `next-v2.10`:
 
-- 116/116 core tests still pass
+- All core tests still pass
 - 2-pass self-compile byte-identical (fixed point)
 - `https_get` against api.anthropic.com returns a real 200 or 405 (MLX-style test)
 - `http_client.rail`'s existing HTTP (non-S) API is 100% byte-compatible

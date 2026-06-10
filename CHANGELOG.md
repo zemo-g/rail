@@ -489,7 +489,8 @@ branches to 4.
   policy lives in `SECURITY.md`).
 
 Kept: docs referenced from CHANGELOG (`notes/bootstrap_convergence_audit_*`,
-`notes/phase3_external_pilot_pitch_v0`); `jit/` code + README + CHANGELOG;
+the phase-3 pilot pitch (internal planning note, not in repo)); `jit/`
+code + README + CHANGELOG;
 `docs/sessions/` versioned handoffs (CHANGELOG-linked).
 
 ### Dead-code pruning (B4)
@@ -517,7 +518,7 @@ Kept: docs referenced from CHANGELOG (`notes/bootstrap_convergence_audit_*`,
   `rail-plasma.md`, `railgpt-from-scratch.md`,
   `self-improving-playbook.md`.
 - Flattened `docs/handoffs/` (down to a single entry after B3 prune):
-  `docs/handoffs/2026-05-02.md` → `docs/handoff-2026-05-02.md`.
+  `docs/handoffs/2026-05-02.md` → `docs/archive/handoff-2026-05-02.md`.
 
 ### README polish (B6)
 
@@ -566,7 +567,7 @@ the compiled binary is identical to v4.0.0.
   not a build artifact; the MCP server still runs locally with a
   per-user `.mcp.json` outside the repo.
 - **Slack channel IDs / DM names** in `CHANGELOG.md`, `README.md`,
-  `stdlib/slack_client.rail` docblock, `docs/sessions/HANDOFF_v3_6.md` —
+  `stdlib/slack_client.rail` docblock, `docs/archive/HANDOFF_v3_6.md` —
   `D0ATHQ1BQD7` and `brockbro2` replaced with `<DM_CHANNEL_ID>` and
   `<test-dm>`. Slack IDs don't grant access on their own, but these
   were the only remaining specific-channel references in the public surface.
@@ -793,8 +794,8 @@ defensible without hand-waving.
 
 ### What is honestly not yet ready
 
-- **Phase 3 outreach** has not been sent. The pitch v0 at
-  `notes/phase3_external_pilot_pitch_v0.md` includes the JIT proof-point and the
+- **Phase 3 outreach** has not been sent. The pitch v0 (internal
+  planning note, not in repo) includes the JIT proof-point and the
   five-artifact substrate-honesty bundle, but no candidate partner has been
   contacted from Ledatic.
 - **Playground deployment** is staged (16-gated dry-run-able), not live.

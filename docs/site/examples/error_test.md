@@ -5,9 +5,10 @@ This program is *supposed* to fail — it references an undefined variable `y`. 
 **Source** (`examples/error_test.rail`):
 
 ```rail
--- Error test: demonstrates line:col in error messages
--- Run with: rail run examples/error_test.rail
--- Check with: rail check examples/error_test.rail
+-- Error test: intentionally references an undefined variable `y`.
+-- Run with: ./rail_native run examples/error_test.rail
+-- Expected failure: an `ld: Undefined symbols` link error — the unbound
+-- identifier passes parse-check and is only caught at link time.
 
 bad_func x =
   x + y

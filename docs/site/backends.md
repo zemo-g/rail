@@ -69,9 +69,9 @@ Compiling examples/hello.rail (244 chars)...
   Try: scp /tmp/rail_x86.s <user>@<host>:~ && ssh <user>@<host> 'gcc -o rail_x86 rail_x86.s && ./rail_x86'
 ```
 
-Rail emits the GAS assembly directly; assemble on the target with `gcc -o prog /tmp/rail_x86.s`. This is intentional — the x86_64 backend was bootstrapped for the Razer WSL test fleet rather than for cross-tools-on-mac. The x86 runtime asm lives at `tools/x86_rt.s`.
+Rail emits the GAS assembly directly; assemble on the target with `gcc -o prog /tmp/rail_x86.s`. This is intentional — the x86_64 backend was bootstrapped against a remote x86_64 Linux (WSL) host rather than for cross-tools-on-mac. The x86 runtime asm lives at `tools/x86_rt.s`.
 
-**Conformance:** `bash tools/test/x86_conformance.sh` (requires Docker + `linux/amd64` image, e.g., Colima/Rosetta) currently passes **71/79** representative tests covering ints, strings, lists, ADTs, closures, floats, FFI, TCO, and arena ops. The 8 remaining failures are 3 ELF-prefix ffi-libc tests and 5 missing str-runtime symbols, all classified in `~/.claude/projects/-Users-user/memory/x86_backend_status.md`.
+**Conformance:** `bash tools/test/x86_conformance.sh` (requires Docker + `linux/amd64` image, e.g., Colima/Rosetta) currently passes **71/79** representative tests covering ints, strings, lists, ADTs, closures, floats, FFI, TCO, and arena ops. The 8 remaining failures are 3 ELF-prefix ffi-libc tests and 5 missing str-runtime symbols.
 
 ## WebAssembly
 

@@ -1,5 +1,7 @@
 # rail-safe: Sandboxed Rail-to-WASM Compiler
 
+> Design document. Shipped in v2.0.0 — see `tools/safe_server.rail`, `tools/build_safe.sh`, and the `safe` subcommand in `tools/compile.rail`.
+
 **Status**: DESIGN v2 — security review incorporated
 **Date**: 2026-04-04
 **Security review**: 8.5/10 — four high-severity gaps identified and addressed below
