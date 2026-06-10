@@ -2,14 +2,16 @@
 """
 spec_in_context_probe_full.py — substrate hard-bench probe.
 
-All 30 bench prompts (6 bands × 5) × N=10 reranks against Studio's 122B
-teacher at 10.42.0.2:8082. Compile-grade each generation via rail_native.
+All 30 bench prompts (6 bands × 5) × N=10 reranks against a local
+OpenAI-compatible inference server (set TEACHER_ENDPOINT).
+Compile-grade each generation via rail_native.
 Pass = ANY of the N completions compiles cleanly (exit 0).
 
 Output: per-prompt PASS/FAIL, per-band totals, overall score and wall-clock.
 """
 from __future__ import annotations
 import json
+import os
 import subprocess
 import sys
 import time
@@ -17,7 +19,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-ENDPOINT = "http://10.42.0.2:8082/v1/chat/completions"
+ENDPOINT = os.environ.get("TEACHER_ENDPOINT", "http://127.0.0.1:8080/v1/chat/completions")
 MODEL = "mlx-community/Qwen3.5-122B-A10B-heretic-v2-2.34bit-msq"
 N_RERANK = 20
 MAX_TOKENS = 256
