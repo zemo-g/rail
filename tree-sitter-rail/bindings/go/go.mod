@@ -1,4 +1,4 @@
-module github.com/tree-sitter/tree-sitter-rail
+module github.com/zemo-g/rail/tree-sitter-rail/bindings/go
 
 go 1.22
 
