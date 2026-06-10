@@ -69,10 +69,10 @@ Ten lines including the comment. Functions are `name args = body`. `main` is the
 
 ```
 ... (long test log) ...
-140/140 tests passed
+170/170 tests passed
 ```
 
-The test suite covers parser, codegen, type inference, the runtime allocator, and the standard library. The count fluctuates a little if concurrent sessions race on `/tmp/rail_out`. 140 is the canonical green count — re-run if you see a lower number.
+The test suite covers parser, codegen, type inference, the runtime allocator, and the standard library. The count fluctuates a little if concurrent sessions race on `/tmp/rail_out`. 170 is the canonical green count — re-run if you see a lower number.
 
 ## 5. Self-compile
 
@@ -174,7 +174,7 @@ For a local-only smoke equivalent: the LSP server at `tools/lsp_server.rail` and
 ```
 
 ```
-140/140 tests passed
+170/170 tests passed
 ```
 
 is the local equivalent of a signed bench: the test suite is reproducible, deterministic, and the seed binary's SHA-256 is checked into `rail_safe.sha256` for tamper detection.
@@ -184,5 +184,5 @@ is the local equivalent of a signed bench: the test suite is reproducible, deter
 You now have a working Rail toolchain on local hardware. Next steps:
 
 - Skim [examples/](examples/) — 22 runnable programs with explanations.
-- Skim [stdlib.md](stdlib.md) — 1,617 functions across 80 modules.
+- Skim [stdlib.md](stdlib.md) — every top-level function across 94 stdlib modules (`ls stdlib/*.rail | wc -l`).
 - Read [backends.md](backends.md) if you want to target Linux ARM64, x86_64, RISC-V, or WASM-in-a-browser.

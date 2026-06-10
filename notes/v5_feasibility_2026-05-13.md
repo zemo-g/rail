@@ -2,7 +2,8 @@
 
 **Date:** 2026-05-13
 **Target:** Rail produces its own Mach-O and ELF binaries. `as` and `ld` are no longer build-time dependencies.
-**Status:** Scoping — no code committed.
+**Status:** SHIPPED — v5.0.0 delivered the self-hosted toolchain (Mach-O + ELF emission,
+no `as`/`ld`); see `CHANGELOG.md`. This note is the original feasibility study, kept as-is.
 
 ## 1. The head start exists (against earlier reports)
 

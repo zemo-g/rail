@@ -1,8 +1,12 @@
 # HANDOFF — Pillar 3: attested numerics (source-to-source AD)
 
+> **Archived.** Session handoff from 2026-06-01. The work described here (and
+> the reverse-mode follow-up) has since merged to master — see `CHANGELOG.md`.
+> Kept as development archaeology; statuses below are frozen as written.
+
 **Read this to resume the `#grad` / forward-mode AD work.** Companion to
-`notes/HANDOFF_increment_B_float_inference.md` (the float-typing substrate this
-sits on) and the memory `rail-p3-attested-numerics.md`.
+`docs/archive/HANDOFF_increment_B_float_inference.md` (the float-typing
+substrate this sits on).
 
 ## One-line status (verified 2026-06-01)
 
@@ -30,8 +34,7 @@ function `f` desugars at compile time into a **synthesized Rail function
 `f__grad`** — the gradient is itself ordinary Rail source, so it is
 re-compilable and **re-attestable** (same provenance machinery as any other Rail
 program). "The gradient is a Rail program." The moat is attestation, not the AD
-algorithm. Endgame: [[paos-specialist-models]] (attested numerics under
-training).
+algorithm. Endgame: attested numerics under training.
 
 ## What's built (the desugar)
 
@@ -115,9 +118,7 @@ emit a tape/Wengert list, or a closure-based pullback? Forward-mode (C0-C3)
 keeps working as the differential oracle to validate reverse-mode against.
 
 ## Pointers
-- Substrate: `notes/HANDOFF_increment_B_float_inference.md`, `notes/TYPE_CORE_PLAYBOOK.md`
-- Thesis: memory [[rail-innovation-thesis-verifiable-language]], [[rail-type-core-arc]]
-- This arc's memory: [[rail-p3-attested-numerics]]
+- Substrate: `docs/archive/HANDOFF_increment_B_float_inference.md`
 - Diagnose-first is mandatory on this track (it disproved the "needs joint
   fixpoint" fear twice already) — minimal repro before big surgery; the
   bootstrap fixed point is sacred.

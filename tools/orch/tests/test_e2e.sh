@@ -7,7 +7,7 @@
 #   2. launch_arm.sh (concurrent, 2 arms via mkdir compile-lock)
 #   3. poll.sh detects exit + transitions running→completed
 #   4. run_bench.sh --dry-run writes bench_result.meta + transitions completed→benched
-#   5. update_leaderboard.sh emits LEADERBOARD.md (sorted)
+#   5. update_leaderboard.sh emits tools/orch/LEADERBOARD.md (sorted)
 #   6. condense.sh emits ENSEMBLE.md
 #   7. write_handoff.sh emits HANDOFF.md (with leader, paste-ready prompt)
 #
@@ -25,7 +25,7 @@ cleanup() {
   for arm in "${ARMS[@]}"; do
     rm -rf "runs/$arm"
   done
-  rm -f LEADERBOARD.md ENSEMBLE.md HANDOFF.md
+  rm -f tools/orch/LEADERBOARD.md ENSEMBLE.md HANDOFF.md
   rm -rf /tmp/rail_orch_compile.lock.d
 }
 trap cleanup EXIT
@@ -75,7 +75,7 @@ done
 
 echo "=== STEP 6: leaderboard ==="
 tools/orch/update_leaderboard.sh
-[ -f LEADERBOARD.md ] && echo "  LEADERBOARD.md OK ($(wc -l < LEADERBOARD.md) lines)" || { echo "  LEADERBOARD.md MISSING"; exit 1; }
+[ -f tools/orch/LEADERBOARD.md ] && echo "  LEADERBOARD.md OK ($(wc -l < tools/orch/LEADERBOARD.md) lines)" || { echo "  LEADERBOARD.md MISSING"; exit 1; }
 
 echo "=== STEP 7: condense ==="
 tools/orch/condense.sh
@@ -88,7 +88,7 @@ tools/orch/write_handoff.sh --reason "e2e smoke"
 echo ""
 echo "=== ARTIFACTS ==="
 echo "--- LEADERBOARD.md (head) ---"
-head -15 LEADERBOARD.md
+head -15 tools/orch/LEADERBOARD.md
 echo ""
 echo "--- ENSEMBLE.md (head) ---"
 head -15 ENSEMBLE.md

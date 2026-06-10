@@ -1,7 +1,7 @@
 # tools/orch — autonomous training-arm orchestrator
 
 Pure-Rail tooling driven by Claude Code's `ScheduleWakeup` + `Bash`.
-Reads `EXPERIMENT_PLAN.md` (repo root), launches arms in parallel up to
+Reads `tools/orch/EXPERIMENT_PLAN.md`, launches arms in parallel up to
 budget, polls every 30 min, kills laggards, benches winners, writes
 LEADERBOARD.md + HANDOFF.md. Commits after every arm.
 
@@ -113,7 +113,7 @@ NOT a wake event:
 After **every** arm finalizes:
 
 ```bash
-git add runs/<id>/run_card.json LEADERBOARD.md
+git add runs/<id>/run_card.json tools/orch/LEADERBOARD.md
 git commit -m "orch: <id> <status> bench=<X/30> val=<Y>"
 ```
 

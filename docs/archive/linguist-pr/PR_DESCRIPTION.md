@@ -7,7 +7,7 @@ This file is the draft of the PR description that will be submitted to `github-l
 When you're happy with it:
 1. Review the content below
 2. Edit the **[HUMAN:]** sections in your own words
-3. Run: `gh pr create --repo github-linguist/linguist --base main --head zemo-g:add-rail-language --title "Add Rail programming language" --body-file docs/linguist-pr/PR_DESCRIPTION.md` (will probably need to strip this header first, or use `--body` directly)
+3. Run: `gh pr create --repo github-linguist/linguist --base main --head zemo-g:add-rail-language --title "Add Rail programming language" --body-file docs/archive/linguist-pr/PR_DESCRIPTION.md` (will probably need to strip this header first, or use `--body` directly)
 4. Monitor the PR for maintainer feedback
 
 **Do NOT submit before human review.** The fork branch is ready at:
