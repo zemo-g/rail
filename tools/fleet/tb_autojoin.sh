@@ -16,7 +16,14 @@ set -u
 
 LOG="/var/log/tb_autojoin.log"
 LOG_MAX=1048576                  # 1 MiB
-TB_IP_FILE="~/.fleet/tb-ip"
+# Resolve the per-node tb-ip file.  launchd runs us as root, so a bare ~
+# would be /var/root — and a *quoted* tilde never expands at all (the bug
+# that dead-skipped every pass 2026-04-19 → 2026-06-10).  Search root's
+# home first, then the console users' homes.
+TB_IP_FILE=""
+for f in /var/root/.fleet/tb-ip /Users/*/.fleet/tb-ip; do
+  [ -f "$f" ] && TB_IP_FILE="$f" && break
+done
 
 # ── Rotate log if oversized ─────────────────────────────────────────────────
 if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ]; then
