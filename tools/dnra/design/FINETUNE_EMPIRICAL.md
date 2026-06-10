@@ -2,7 +2,7 @@
 
 **Status:** v0 scope. Pre-training, no code, no run.
 **Base:** Llama 3.2 1B (LoRA). Production graduation: 3B if 1B mode-separates cleanly.
-**Hardware:** Mac Mini M4 Pro (24 GB unified, MLX preferred, PyTorch-MPS fallback). Studio is locked on spurarm; do not plan around it.
+**Hardware:** Apple Silicon (24 GB unified, MLX preferred, PyTorch-MPS fallback).
 **Sibling specs:** Deductive + Adversarial (separate files, same recipe family, divergent corpora).
 
 ---
@@ -102,11 +102,11 @@ Split by niche:
 
 ### 2.4 Sources (all locally reachable)
 
-- **Already on disk:** `~/projects/rail-training/training/git_harvest.jsonl`, `claude_rail.jsonl`, `builtin_examples.jsonl`, `real_programs.jsonl`. Repurpose for the run-then-cite shape: for each Rail example, execute via `rail_native run` and append the observed stdout as the target's evidence line.
+- **Already on disk (private training repo):** `training/git_harvest.jsonl`, `claude_rail.jsonl`, `builtin_examples.jsonl`, `real_programs.jsonl`. Repurpose for the run-then-cite shape: for each Rail example, execute via `rail_native run` and append the observed stdout as the target's evidence line.
 - **Compiler oracle traces:** drive `./rail_native run` over a synthesised problem bank; capture (source, stdout, exit) tuples. This is the most reliable factory for genuine empirical pairs in our environment.
 - **REPL transcripts** from CPython, Node, Rail (`tools/repl.rail`). Captured locally; no scraping.
 - **Test logs from this repo:** `./rail_native test` output across recent git history surfaces version-skew observations.
-- **rail-training golden / bench writeups:** `training/rail_native/BENCH_*.md`, `MODEL_CARD_*.md` already contain "we measured X, got Y" prose -- mine it for shape, not content.
+- **Golden / bench writeups (private training repo):** `training/rail_native/BENCH_*.md`, `MODEL_CARD_*.md` already contain "we measured X, got Y" prose -- mine it for shape, not content.
 - **Manual curation** of well-known impl-defined corners (Python, JS, Rail, C, SQL, TLS). Curator pulls from memory + a one-line REPL check; we are not scraping the web.
 
 Do **not** propose to scrape Stack Overflow, GitHub issues at scale, or vendor docs. Anything we cannot regenerate locally is not in scope.
@@ -139,7 +139,7 @@ Conventions cribbed from the Llama-3 small-LoRA community (HF PEFT defaults + th
 | Optimizer | AdamW (or MLX's Adam) | bf16 if available else fp16. |
 | Eval cadence | Every 100 steps | Cheap on 40-problem set. |
 | Save cadence | Every 200 steps | Keep last 3. |
-| Wall-clock budget | < 6 hours on Mini | If it exceeds, drop epochs to 2 and re-evaluate. |
+| Wall-clock budget | < 6 hours on the train host | If it exceeds, drop epochs to 2 and re-evaluate. |
 
 Sources: HF PEFT LoRA defaults, the QLoRA paper's small-model recipe, the MLX-LM examples folder. Convention-driven, not load-tested for this specific corpus.
 
@@ -247,7 +247,7 @@ The recipe in §3 is convention. Loss curves at the first checkpoint (step 200) 
 5. Confirm Llama 3.2 1B weights are local (`ls ~/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B*` or equivalent) and MLX-LM is installed. If not, fetch + smoke-test inference on the base model.
 6. Write `tools/dnra/impl/train_empirical.py` (Python, not Rail -- training is the one place we use Python). Wraps MLX-LM `lora.py` with the §3 recipe and our corpus path. Loss curve + eval cadence to a sidecar log.
 7. Scale up to corpus v0.2 (3,000-5,000 pairs) once v0.1 spot-check passes. Same generators; just run them longer.
-8. Kick off the run on Mini with `nohup` (per the detached-pipeline rule). Expected wall clock < 6 h. First eval at step 200; abort and re-tune if step-200 eval auto-grade is < 10 / 40 (proxy for "training is wrong direction").
+8. Kick off the run with `nohup` (per the detached-pipeline rule). Expected wall clock < 6 h. First eval at step 200; abort and re-tune if step-200 eval auto-grade is < 10 / 40 (proxy for "training is wrong direction").
 9. At step 1100 (end of training), run §4.1 + §4.2 + §4.3 in sequence. Sign the eval JSON; chain-append a `kind: "ledatic.dnra.eval"` entry referencing the model checkpoint hash.
 10. If all three pass conditions hit, draft the Deductive + Adversarial finetune specs (same shape, different niche). If any fail, write the failure mode into the ledger and iterate corpus before re-training.
 
@@ -257,6 +257,6 @@ The recipe in §3 is convention. Loss curves at the first checkpoint (step 200) 
 
 - Convener routing (when does E even get asked?) -- separate ticket.
 - Arbiter weighting by mode-accuracy -- arbiter v1, post-finetune.
-- Multi-node panelist deployment -- single-Mini POC first.
+- Multi-node panelist deployment -- single-node POC first.
 - Cross-family panel composition -- plan B, only if shared-base collapses.
 - Production graduation to 3B -- gated on this 1B run passing §4.4.

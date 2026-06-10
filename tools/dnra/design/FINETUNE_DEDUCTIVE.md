@@ -1,7 +1,7 @@
 # Finetune Spec — Deductive Panelist
 
 **Status:** scope-only. No training code. No training run.
-**Target:** Llama 3.2 1B base, LoRA, Mini-hosted (M4 Pro, 24GB unified).
+**Target:** Llama 3.2 1B base, LoRA, hosted on a 24GB Apple Silicon node.
 **Graduation:** Llama 3.2 3B if 1B clears the gate.
 **Gate:** see Success Criteria below.
 
@@ -148,7 +148,7 @@ Production graduation to 3B: same corpus, no enlargement needed unless
 mode-separation falters at the larger capacity (3B can absorb more
 without overfitting; may benefit from doubling).
 
-### 2.4 Sources usable from Mini
+### 2.4 Sources usable locally
 
 - **Public specs**: C11 draft N1570 (public PDF), POSIX.1-2017 (Open
   Group), RFCs (ietf.org), Python language reference, Rust reference,
@@ -165,7 +165,7 @@ without overfitting; may benefit from doubling).
   formal language, type theory, IEEE 754. Acceptable for paraphrased
   targets, not direct quote.
 
-Not usable on Mini: anything requiring scraping behind auth
+Not usable locally: anything requiring scraping behind auth
 (IEEE Xplore, ACM DL, ISO direct). Skip those; the open-source
 spec corpus is ample for 1.5-3k pairs.
 
@@ -190,13 +190,13 @@ Three discipline rules:
 | Param | Value | Source |
 |---|---|---|
 | Base | Llama 3.2 1B Instruct | locked |
-| Framework | MLX (mlx-lm `lora.py`) | Mini-native; no CUDA |
+| Framework | MLX (mlx-lm `lora.py`) | Apple Silicon native; no CUDA |
 | Rank (r) | 16 | convention for 1B style transfer |
 | Alpha | 32 | r * 2, standard |
 | Dropout | 0.05 | standard |
 | Target modules | q_proj, k_proj, v_proj, o_proj | attention-only first; expand to MLP if undertrained |
 | Learning rate | 1e-4 | mlx-lm default for LoRA |
-| Batch size | 4 | Mini 24GB RAM limit at 1B |
+| Batch size | 4 | 24GB RAM limit at 1B |
 | Grad accum | 4 (effective 16) | for stable updates on tiny batches |
 | Warmup steps | 50 | ~3% of 1500-step run |
 | Total steps | ~1500 | one effective epoch over 1.5k pairs at eff-batch 16 = ~94 steps/epoch; train 16 epochs |
@@ -205,7 +205,7 @@ Three discipline rules:
 | Optimizer | AdamW (mlx default) | standard |
 | Weight decay | 0.0 | LoRA convention |
 
-Rough wall-clock estimate on Mini (M4 Pro, 24GB): 2-4 hours for the
+Rough wall-clock estimate on a 24GB Apple Silicon node: 2-4 hours for the
 1B run. 3B graduation: 12-24 hours, batch 1-2, accum 8-16.
 
 Caveat on numbers: rank/alpha are convention not measurement. The
@@ -401,7 +401,7 @@ Phi-3 fallback (MIT) sidesteps this entirely.
    commit as `falsification_v0_frozen_for_finetune`. No more edits to
    v0a/b/c until after the LoRA pass/fail is known.
 2. Build the corpus collection skeleton at
-   `~/projects/rail-training/dnra/corpus_deductive/`. Single JSONL
+   `dnra/corpus_deductive/` in the private training repo. Single JSONL
    file `train.jsonl`, schema: `{id, source_doc, source_section,
    prompt, target}`.
 3. Source-partition check: enumerate every document section cited in
@@ -414,7 +414,7 @@ Phi-3 fallback (MIT) sidesteps this entirely.
 5. Build the held-out eval set (100 prompts) in parallel with corpus
    curation, in a separate file `eval.jsonl`. Source-partitioned the
    same way.
-6. Pull Llama 3.2 1B Instruct via `mlx-lm` to Mini:
+6. Pull Llama 3.2 1B Instruct via `mlx-lm` to the train host:
    `mlx_lm.convert --hf-path meta-llama/Llama-3.2-1B-Instruct`. Verify
    it runs with a single sample prompt before training.
 7. Run base-Llama zero-shot against the 30-prompt mode-separation

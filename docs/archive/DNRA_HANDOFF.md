@@ -21,13 +21,13 @@ Thesis: **the structure of how the system reasons IS the uncertainty signal.** M
 ### Architecture
 - Three layers: **Panelists** (epistemically distinct reasoners), **Convener** (triage + routing + halting), **Arbiter** (synthesis via debate-as-code on Rail substrate)
 - ~~Four panelist modes~~ **Three panelist modes (revised 2026-05-22 16:40 after T4 v0.a finding): Deductive · Empirical · Adversarial.** First Principles dropped — honest curation showed FP converges with Deductive on most code/system problems; the two are epistemic siblings, not orthogonals.
-- Hardware: panelists colocated on Mini, Convener/Arbiter deterministic Rail. Studio is in-use for spurarm; do not plan around its availability.
+- Hardware: panelists colocated on the 24GB node, Convener/Arbiter deterministic Rail.
 - Public surface: none yet (Dream Fleet halt-state model)
 
 ### Models
 - **Primary base:** Llama 3.2 (Meta), American open-weight, fine-tunable
-- **Prototype size:** 1B for first finetune (Mini-based LoRA, hours per panelist, cheapest mode-separation falsification)
-- **Production size:** 3B (Mini-based LoRA, 1–2 days per panelist) — graduate here if 1B proves modes can be instantiated
+- **Prototype size:** 1B for first finetune (local LoRA, hours per panelist, cheapest mode-separation falsification)
+- **Production size:** 3B (local LoRA, 1–2 days per panelist) — graduate here if 1B proves modes can be instantiated
 - **Cross-family fallback:** Llama + Gemma + Phi-3 mixed panel, if shared-base mode-collapses
 - **Convener:** deterministic Rail v0, no model (promote to Llama 3.2 1B only if heuristics fail)
 - **Arbiter:** Rail + capability sandbox does the structural work; tiny synthesis model only if needed
@@ -67,7 +67,7 @@ Thesis: **the structure of how the system reasons IS the uncertainty signal.** M
 ## Resume protocol (for any future session)
 
 1. **Read this file first.** Then `TaskList` to see current ticket states.
-2. **Check fleet state.** Studio is in-use for spurarm; do not assume it's free.
+2. **Check fleet state** before assuming a node is free.
 3. **Re-read locked decisions above** before changing architecture. Push back if a change is needed; do not silently revise.
 4. **Layout:**
    - Source: `~/projects/rail/tools/dnra/{spec,impl,sets}/`
@@ -110,7 +110,7 @@ Thesis: **the structure of how the system reasons IS the uncertainty signal.** M
 
 - **2026-05-22 15:35 UTC** — Initial scaffold. Decisions locked. T1 started. Storage pivoted from SQLite to JSONL hash-chain after research surfaced Rail sqlite stdlib limitations.
 - **2026-05-22 15:38 UTC** — T1 (schema spec) completed → `spec/SCHEMA.md`. T2 (ledger.rail impl) started.
-- **2026-05-22 15:40 UTC** — Confirmed lab chain prior art exists on Studio at `~/projects/rail/tools/lab/` (chain.rail 960 lines, entry.rail 953 lines). Mini-local mirrors: `tools/attest/` (Rail+Ed25519), `~/.ledatic/dream/` (hash-chain pattern). Wrote `spec/LEDGER.spec.md` — phased v0.1→v0.4 plan (encoder+hash → sign → verify → accessors). Dispatched deep-read agent on Studio lab files (background) to extract canonical-JSON encoder + chain I/O patterns for cribbing.
+- **2026-05-22 15:40 UTC** — Confirmed lab chain prior art exists at `tools/lab/` (chain.rail 960 lines, entry.rail 953 lines). Local mirrors: `tools/attest/` (Rail+Ed25519) and a hash-chain pattern elsewhere in the estate. Wrote `spec/LEDGER.spec.md` — phased v0.1→v0.4 plan (encoder+hash → sign → verify → accessors). Dispatched deep-read agent on the lab files (background) to extract canonical-JSON encoder + chain I/O patterns for cribbing.
 - **Critical gotcha logged from rail CLAUDE.md**: stdlib/json.rail has a lambda-destructure parse error when imported alongside other deps — lab carries its own scoped encoder. DNRA ledger.rail will too.
 - **2026-05-22 15:50 UTC** — Agent returned with full lab pattern map. **Key finding**: lab's `entry.rail` is lab-domain-specific (goal/hypothesis/kill_target/counters/cmd/result fields) and its `chain.rail` index maps are coupled to those fields. Cannot import-as-is. Wrote v0.1 `impl/ledger.rail` (~180 lines, single file) — small, dedicated, copies the patterns (canonical-via-file sha256, parent integrity, envelope-line format) but with DNRA envelope. v0.1 limitations explicit in file header: no signing, no lock, no full verify. Next: compile + smoke-test.
 - **2026-05-22 15:55 UTC** — Smoke test PASSED on first compile. Two distinct ids, parent linkage verified on-disk via Python JSON parse. Refactored: ledger.rail → pure library (no main); smoke runner moved to `ledger_demo.rail`; isolated test runner at `test_ledger.rail` (uses /tmp/, doesn't pollute runtime chain).
@@ -333,14 +333,14 @@ This is "peer panelist → triggered specialist" — closer to Convener-routing-
 **Next session pickup:**
 - Read this HANDOFF.md first, then `TaskList`.
 - Active open: ticket #4 (arbiter v1, deferred until post-finetune data exists).
-- Major next: the finetune gate itself. Read `~/projects/rail-training/CLAUDE.md` (if present) for the training pipeline state. 4× → 3× Llama 3.2 1B LoRA, one per mode (Deductive/Empirical/Adversarial). Mini-based, ~hours per panelist.
+- Major next: the finetune gate itself. The training pipeline state lives in the private training repo. 4× → 3× Llama 3.2 1B LoRA, one per mode (Deductive/Empirical/Adversarial). Local, ~hours per panelist.
 - Alternative milestone: add the **Convener** (T6 in the original roadmap — never opened as a ticket). Currently deterministic placeholder; would route question.category to fast vs deliberate paths and choose the panel composition.
 
 **Session stopping point — 2026-05-22 17:55 UTC.** T5 shipped end-to-end (3 versions in one pass). 7/7 acceptance. Substrate production-shaped for POC; finetune gate unblocked. Resume on finetune or Convener.
 
 - **2026-05-22 — multi-front design pass + T6 Convener v0 shipped.** Four sub-agents dispatched in parallel produced scoping specs for the next phase (committed in `ed8b161`):
     - `design/CONVENER.v0.spec.md` — deterministic 5-branch router (R0..R5) keyed on category + complexity_hint + cheap substring matching over question.text. Encodes T4 findings: D mandatory (lost_alone=0), A gated out on convention questions (14/40 lost_alone), E gated in on runtime / impl-defined markers.
-    - `design/FINETUNE_DEDUCTIVE.md` (448 lines) — 1.5-3k pairs "cite then derive", LoRA r=16/a=32 attn-only, ~1500 steps, ~2-4h on Mini. **Hard pre-gate**: D-vs-base edit-distance >= 0.25 on a 30-prompt probe BEFORE training E and A. Below threshold, multi-panel plan is dead.
+    - `design/FINETUNE_DEDUCTIVE.md` (448 lines) — 1.5-3k pairs "cite then derive", LoRA r=16/a=32 attn-only, ~1500 steps, ~2-4h on a 24GB node. **Hard pre-gate**: D-vs-base edit-distance >= 0.25 on a 30-prompt probe BEFORE training E and A. Below threshold, multi-panel plan is dead.
     - `design/FINETUNE_EMPIRICAL.md` (262 lines) — 3-5k pairs observation-leading, 35% spec-silent material to force off D's attractor.
     - `design/FINETUNE_ADVERSARIAL.md` (334 lines) — 2-4k pairs with structured `{where_break, mechanism, applies_to_prompt, prediction}`; 35-40% pairs marked "real break but doesn't apply" to teach LOCATING breaks, not disagreeing.
 
@@ -380,7 +380,7 @@ This is "peer panelist → triggered specialist" — closer to Convener-routing-
 **Next session pickup options (user choice):**
 - **R-X1: Complete the synthetic_triage curation** (30 more cases per the spec distribution). Multi-session work. Surfacing curator-bias problems before the rule goes live.
 - **R-X2: Stand up the D-vs-base probe before any finetune.** Per FINETUNE_DEDUCTIVE's pre-gate, this is the cheapest "is multi-panel plausible?" experiment. ~2 hours including writing the 30 probe prompts.
-- **R-X3: Stand up the MLX-LoRA training pipeline scaffold in ~/projects/rail-training/.** Pipeline-first approach; corpus + training runs slot in once it exists.
+- **R-X3: Stand up the MLX-LoRA training pipeline scaffold in the private training repo.** Pipeline-first approach; corpus + training runs slot in once it exists.
 - **R-X4: Open T7 (the arbiter v1 with lost-alone-rate confidence discount)**, deferred-but-pending per the original handoff.
 
 **Session stopping point — 2026-05-22 (later).** Convener v0 implemented + passing on the spike. Multi-front design phase closed. 4 parallel agent deliverables landed. Next sub-session likely R-X2 (cheapest falsification of the finetune-gate viability).
@@ -407,13 +407,13 @@ This is "peer panelist → triggered specialist" — closer to Convener-routing-
 **Updated next-session options:**
 - **R-X2a: Authorize the 1B model download + run the base probe.** ~5 min download, ~3-5 min generation. Banks the "before" baseline for the eventual D-vs-trained-D comparison. Self-contained, no further dependencies.
 - **R-X1: Complete the synthetic_triage curation** (30 more cases). Still deferred / multi-session.
-- **R-X3: Stand up the MLX-LoRA training pipeline scaffold in `~/projects/rail-training/`.** Required before any D LoRA can train.
+- **R-X3: Stand up the MLX-LoRA training pipeline scaffold in the private training repo.** Required before any D LoRA can train.
 - **R-X4: Open T7 (arbiter v1)**. Still deferred-pending.
 
 - **2026-05-22 21:30 UTC — D corpus v0.a + smoke-train loop CLOSED.** Five commits this sub-session:
     - `480c1a7` — `sets/corpus_d_v0a.jsonl` (19 hand-verified cite-then-derive pairs across 14 source documents) + `impl/gen_corpus_d.py` (generator with assertions at emit) + `impl/qc_corpus_d.py` (discipline gate) + `impl/corpus_to_mlx.py` (chat-template converter).  Production target 1.5-3k pairs; this 19 is the format-validation slice.
     - `835a47b` — `sets/lora_d_v0a/{train,valid,test}.jsonl` (15/1/3 split, Llama 3.2 chat-template) + recursive `!tools/dnra/sets/**/*.jsonl` whitelist in `.gitignore`.
-    - **Smoke LoRA train** (uncommitted adapter at `~/projects/rail-training/adapters/d_v0a_smoke/adapters.safetensors`): 100 iters, batch_size=1, lr=1e-4, ~17s wall, 5.636M trainable params (0.456% of 1.236B). Train loss 2.91 -> 0.22, val loss 3.33 -> 4.40 (INCREASING = overfit, exactly as designed for a 19-pair slice).
+    - **Smoke LoRA train** (uncommitted adapter at `adapters/d_v0a_smoke/adapters.safetensors` in the private training repo): 100 iters, batch_size=1, lr=1e-4, ~17s wall, 5.636M trainable params (0.456% of 1.236B). Train loss 2.91 -> 0.22, val loss 3.33 -> 4.40 (INCREASING = overfit, exactly as designed for a 19-pair slice).
     - `a05bd77` — `sets/probe_responses_d_v0a_smoke.jsonl` (30 probe responses with the trained adapter) + the load-bearing finding below.
 
 **FINDING (architecture-relevant, surfaced 21:30 UTC):**
@@ -445,7 +445,7 @@ The edit-distance gate as currently specified CANNOT distinguish productive styl
 - **R-X3b: Implement gate hardening (ticket #13).** Add response-length ratio + spurious-Cite detector to score_probe.py. <30 min of work. Then re-score the smoke artifacts; expect the hardened gate to flag the smoke run as QUALITY COLLAPSE rather than productive.  Validates the hardening.
 - **R-X3c: Scale the corpus v0.a -> v0.b** (target +50 pairs to ~70).  Multi-session curation.  Same discipline: 2/doc cap, half-inverted, every target cites.  Potentially agent-batchable IF citation verification is automated (a separate ticket).
 - **R-X1: Complete the synthetic_triage curation** (30 more cases).  Still deferred.
-- **R-X3 (full): MLX-LoRA pipeline scaffold in `~/projects/rail-training/`.**  Already partially exercised via the smoke train; full scaffold = config files + helpers + per-run notebooks.
+- **R-X3 (full): MLX-LoRA pipeline scaffold in the private training repo.**  Already partially exercised via the smoke train; full scaffold = config files + helpers + per-run notebooks.
 
 **Updated branch state:** `release-v5.1.0` is **11 DNRA commits ahead of origin/master**. Push deferred.
 

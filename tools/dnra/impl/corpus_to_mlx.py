@@ -111,7 +111,7 @@ def main():
         f"      --iters 1500 --batch-size 4 \\\n"
         f"      --lora-rank 16 --lora-alpha 32 \\\n"
         f"      --learning-rate 1e-4 \\\n"
-        f"      --adapter-path ~/projects/rail-training/adapters/d_v0a_smoke/"
+        f"      --adapter-path adapters/<run>/"
     )
     print()
     print(

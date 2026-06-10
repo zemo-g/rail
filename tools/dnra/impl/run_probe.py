@@ -16,7 +16,7 @@ Usage:
     # real run against trained-D LoRA adapter (post-training)
     /opt/homebrew/bin/python3.11 tools/dnra/impl/run_probe.py \\
         --model mlx-community/Llama-3.2-1B-Instruct-4bit \\
-        --adapter ~/projects/rail-training/adapters/d_v0/ \\
+        --adapter adapters/<run>/ \\
         --tag d_v0_trained
 
 Output:

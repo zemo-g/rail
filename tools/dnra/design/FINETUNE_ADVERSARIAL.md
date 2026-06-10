@@ -3,7 +3,7 @@
 **Status:** scoping draft. Pre-training. No code written, no run launched.
 **Mode under spec:** Adversarial ("where does this break?").
 **Base model:** Llama 3.2 1B (Meta open-weight). Production graduation target: 3B if 1B passes the gate.
-**Train host:** Mac Mini M4 Pro, 24GB unified RAM. MLX or PyTorch-MPS only. Studio is locked on spurarm; do not plan around it.
+**Train host:** Apple Silicon, 24GB unified RAM. MLX or PyTorch-MPS only.
 **Adapter style:** LoRA. Hours per panelist, not days.
 **Output target:** signed deliberation entries appended to the existing `~/.ledatic/dnra/chain/deliberations.jsonl` ledger.
 
@@ -166,7 +166,7 @@ The targets are deliberately verbose. At inference time the panelist emits this 
 
 ## 3. LoRA recipe
 
-Numbers below are conventions for Llama 3.2 1B + small-domain LoRA finetune on MLX or PyTorch-MPS. Adjust by halving if Mini RAM tops out.
+Numbers below are conventions for Llama 3.2 1B + small-domain LoRA finetune on MLX or PyTorch-MPS. Adjust by halving if host RAM tops out.
 
 | Param | Value | Source |
 |---|---|---|
@@ -177,7 +177,7 @@ Numbers below are conventions for Llama 3.2 1B + small-domain LoRA finetune on M
 | Target modules | q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj | attention + MLP; the full set for embodiment, not just attention |
 | Learning rate | 2e-4 | LoRA standard; AdamW |
 | Optimizer | AdamW, beta1=0.9, beta2=0.999, weight_decay=0.0 | standard |
-| Batch size | 4 effective (grad accum if needed) | Mini RAM budget; bf16 |
+| Batch size | 4 effective (grad accum if needed) | 24GB RAM budget; bf16 |
 | Seq length | 1024 | Adversarial targets are ~200-400 tokens; 1024 leaves headroom |
 | Warmup steps | 100 | ~5% of total |
 | Total steps | ~2000 | derived from 3000-example corpus * 3 epochs / batch 4 |
@@ -319,7 +319,7 @@ Rail's bf16-stable-10k finding is from training Rail's own transformer in stdlib
 
 ## 7. Concrete next steps
 
-1. Confirm Llama 3.2 1B-Instruct base weights are downloadable on Mini (HF account, ~2.5GB bf16).
+1. Confirm Llama 3.2 1B-Instruct base weights are downloadable on the train host (HF account, ~2.5GB bf16).
 2. Decide MLX vs PyTorch-MPS for the LoRA harness. MLX is faster on Apple silicon; PyTorch-MPS is more documented. Pick one and stick.
 3. Build the corpus extraction pipeline (Python is fine here — corpus build is one-shot, not in the request path). Sources from Section 2.3, target template from Section 2.1.
 4. Hand-curate the first 200 pairs; verify the `applies_to_prompt: no` ratio is 35-40% and that every `mechanism` field cites a primary source. Reject the unverifiable ones.

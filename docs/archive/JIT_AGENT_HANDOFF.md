@@ -2,8 +2,7 @@
 
 ## Branch + files
 
-- **Branch:** `feat/agent-jit-loop` (worktree
-  `~/projects/rail/.claude/worktrees/agent-a5a8afdc5111183af`).
+- **Branch:** `feat/agent-jit-loop` (worktree `<worktree>`).
   Local commit only; not pushed.
 - **Files (all new):**
   - `tools/agent/jit_loop.rail` — agent main (~210 lines).
@@ -62,15 +61,15 @@ an online run (not exercisable on this host — see below).
 
 ## Online round-trip: NOT RUN
 
-No `ANTHROPIC_API_KEY` is set on this Studio session and there is no
-key at the default file path `~/.fleet/anthropic_key`.
+No `ANTHROPIC_API_KEY` was set in this session and there is no
+key at the default file path `anthropic_key.txt`.
 The online code path is wired (`call_llm` -> `anthropic_chat` from
 `stdlib/anthropic_client.rail`) and reads the key from any of:
 
 1. `--key-path FILE`
 2. `ANTHROPIC_API_KEY` env var (written to `/tmp/rail_jit_agent_key` at
    runtime so the file-based client can consume it)
-3. The legacy default `~/.fleet/anthropic_key`
+3. The default `anthropic_key.txt` (file containing your API key, cwd-relative)
 
 To exercise online once a key is available (rough recipe; see
 `DEMO_TRANSCRIPT.md` Demo 6):

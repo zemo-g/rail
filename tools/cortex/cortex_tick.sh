@@ -18,7 +18,8 @@ if pgrep -f '^/tmp/rail_out$' >/dev/null; then
   exit 0
 fi
 
-cd ~/projects/rail-https || exit 1
+# Run from the repo root (this script lives at tools/cortex/).
+cd "$(dirname "$0")/../.." || exit 1
 
 ./rail_native run tools/cortex/cortex.rail &
 RAIL_PID=$!
