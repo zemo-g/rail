@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # frame_attest_ot256_publisher.sh — publish + attest the 256² OT MHD frame
 #
-# Counterpart to frame_attest_publisher.sh (Mini, 128²) — runs on Studio,
+# Counterpart to frame_attest_publisher.sh (128²) — runs on the GPU node,
 # reads /tmp/plasma_ot256.bin produced by com.ledatic.mhd_ot256, and:
 #
 #   1. PUTs the raw frame bytes to https://ledatic.org/entropy/frame/ot256/current

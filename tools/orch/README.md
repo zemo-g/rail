@@ -117,8 +117,7 @@ git add runs/<id>/run_card.json tools/orch/LEADERBOARD.md
 git commit -m "orch: <id> <status> bench=<X/30> val=<Y>"
 ```
 
-Push is **not** automated (per workspace memory: git proxied through
-Mini).
+Push is **not** automated.
 
 ## Smoke test
 

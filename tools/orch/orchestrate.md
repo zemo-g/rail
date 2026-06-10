@@ -65,7 +65,7 @@ Per wake-up (every `poll_interval_min`, default 30 min):
 `wake_user "<reason>"` fires an `osascript` notification + writes a marker file:
 
 ```bash
-osascript -e "display notification \"$reason\" with title \"Spur orchestrator\" sound name \"Glass\""
+osascript -e "display notification \"$reason\" with title \"Rail orchestrator\" sound name \"Glass\""
 date > /tmp/spur_orch_wake.txt
 ```
 
@@ -129,7 +129,7 @@ tools/orch/write_handoff.sh --reason "manual checkpoint"
 | Trainer compile error                           | launch_arm.sh exits 6              | Inspect `runs/<id>/compile.log`; fix template; re-launch |
 | Trainer crash mid-run                           | poll detects pid dead, log empty   | Status → failed; bench skipped; visible on LEADERBOARD   |
 | Two arms try to compile concurrently            | flock-on-mkdir handles it          | (no manual action — built in)                            |
-| Studio kernel panic mid-tick                    | wakeup never fires                 | Next session re-reads run cards from disk; resumes      |
+| Host kernel panic mid-tick                      | wakeup never fires                 | Next session re-reads run cards from disk; resumes      |
 | Compile lock dir orphaned (process killed)      | future launches hang ≤120s         | `rmdir /tmp/rail_orch_compile.lock.d` to clear          |
 | `lm_v54` template gets renamed/refactored       | seed_trainer.sh exits 3 (no match) | Update `trainer_template:` in plan to new path          |
 

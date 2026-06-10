@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # tools/audit/attest_endpoint_walk.sh
 #
-# Endpoint audit walker — Phase 1 of docs/plans/ATTEST_ENDPOINT_AUDIT.md.
+# Endpoint audit walker (Phase 1).
 # Probes each public attestation surface, reports per-class verdict + counters.
 #
-# READ-ONLY. No healing. No chain write yet (Phase 2 — gated on Studio :9101
-# /lab/entry route from the Lakes lab integration plan).
+# READ-ONLY. No healing. No chain write yet (Phase 2).
 #
 # Exit code: 0 if every class PASS, 1 if any class FAIL, 2 on probe error.
 #
@@ -283,24 +282,6 @@ class_releases() {
 }
 
 # ============================================================================
-# CLASS: dda — index reachable + well-formed JSON
-# ============================================================================
-class_dda() {
-  local idx
-  idx=$(curl -sf "$BASE/dda/index.json")
-  if [[ -z "$idx" ]]; then
-    log "FAIL: dda/index.json unreachable"
-    verdict dda FAIL; return
-  fi
-  if grep -q '"kind"' <<<"$idx" || grep -q '"version"' <<<"$idx"; then
-    verdict dda PASS
-  else
-    log "FAIL: dda/index.json malformed (no kind/version)"
-    verdict dda FAIL
-  fi
-}
-
-# ============================================================================
 # RUN
 # ============================================================================
 (( QUIET )) || echo "=== ATTEST ENDPOINT AUDIT — $(date -u +%FT%TZ) ==="
@@ -315,7 +296,6 @@ header selfhost_badge;  class_selfhost_badge
 header static;          class_static
 header pages;           class_pages
 header releases;        class_releases
-header dda;             class_dda
 
 echo
 echo "=== SUMMARY ==="

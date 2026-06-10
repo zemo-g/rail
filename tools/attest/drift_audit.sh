@@ -43,7 +43,7 @@ for arg in "$@"; do
   esac
 done
 
-REPO=${REPO:-$HOME/projects/rail-https}
+REPO=${REPO:-$HOME/projects/rail}
 SITE=${SITE:-$HOME/projects/ledatic-site}
 SLACK_TOKEN_FILE=${SLACK_TOKEN_FILE:-$HOME/.fleet/slack_token}
 SLACK_CHANNEL_FILE=${SLACK_CHANNEL_FILE:-$HOME/.fleet/slack_channel}
@@ -108,8 +108,13 @@ check_tag_vs_site() {
     [ "$page" = "index.html" ] && url="https://ledatic.org/"
     local banners
     banners=$(curl -fsS --max-time 5 "$url" 2>/dev/null \
-      | grep -oE 'v3\.[0-9]+\.[0-9]+' | sort -u)
-    [ -z "$banners" ] && continue
+      | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+    # Fail-loud: a page with no version banner at all is itself drift
+    # (fetch failure or page structure changed) — never a silent pass.
+    if [ -z "$banners" ]; then
+      alert "tag/site: $page has no vN.N.N banner (fetch failed or page structure changed)"
+      continue
+    fi
     local highest
     highest=$(echo "$banners" | sort -V | tail -1)
     if [ "$highest" != "$latest_tag" ]; then
@@ -296,9 +301,7 @@ check_witness() {
 }
 
 # ── slack ──────────────────────────────────────────────────────────
-# Direct to slack.com (TLS 1.3 via macOS LibreSSL). The legacy socat
-# proxy at :8444 is from the pre-Rail-TLS era and currently has a TLS
-# version mismatch with modern Slack — bypassing it altogether.
+# Direct to slack.com (TLS 1.3 via macOS LibreSSL).
 slack_post() {
   local msg="$1"
   [ "$DRY" = "1" ] && { log "[DRY] would slack: $msg"; return; }

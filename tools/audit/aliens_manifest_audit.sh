@@ -4,8 +4,6 @@
 # /pursue manifest re-hash audit. Picks the smallest record, verifies
 # size + sha256 against what the manifest claims.
 #
-# See docs/plans/ALIENS_MANIFEST_AUDIT.md.
-#
 # Exit 0 if all checks PASS, 1 if drift, 2 on probe error.
 
 set -u

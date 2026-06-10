@@ -5,8 +5,6 @@
 # Checks: monotonic pulse_id, prev_hex linkage on consecutive gap=1 pairs,
 # gap-shape statistics over the sampled window.
 #
-# See docs/plans/BEACON_CHAIN_AUDIT.md.
-#
 # Args: -n N  number of records to sample from tail of Pi log (default 200)
 #       -q    quiet (only summary + failures)
 # Exit: 0 if all kill_targets PASS, 1 if FALSIFIED, 2 on probe error.

@@ -32,7 +32,7 @@ The full prompt list is in `tools/bench/substrate_hard_bench.rail`
 The prompt **bodies** (the user-message fragments handed to the LLM)
 are embedded in the two probes:
 
-- `tools/train/spec_in_context_probe_full.py` (Studio-internal, MLX)
+- `tools/train/spec_in_context_probe_full.py` (local teacher, OpenAI-compatible)
 - `tools/bench/repro_anthropic.py` (external partners, Anthropic API)
 
 Both probes carry the **same** spec v3 (~1.4KB Rail cheat-sheet) and the
@@ -43,7 +43,7 @@ same N=20 rerank loop.
 **30/30 (100%) is achievable with a 100B+ open-weight model using Rail's
 substrate (compiler + 1KB Rail spec) at N=20 reranks.**
 
-Documented: memory entry `substrate_30_of_30_2026-05-09`. Conditions:
+Conditions of the 2026-05-09 result:
 - N=20 sampling per prompt
 - Spec v3 (HOF-in-main worked examples included)
 - Naked Qwen-122B (no fine-tuning) as the original teacher
@@ -88,19 +88,17 @@ late-2025 pricing of ~$15/M input + ~$75/M output):
 Smaller models will hit lower scores and may need more tokens. The bench is
 a property of the substrate, not of any one model.
 
-### Path B — local 100B+ open-weight (Studio-internal default)
+### Path B — local 100B+ open-weight
 
 For users running their own MLX or vLLM endpoint with a 100B+ model:
 
 ```bash
-# Default endpoint: http://10.42.0.2:8082 (Studio-internal)
-bash tools/bench/repro_30of30.sh
-
-# Override:
-MLX_ENDPOINT=http://your-host:8082 bash tools/bench/repro_30of30.sh
+# TEACHER_ENDPOINT — point at any OpenAI-compatible server.
+# Default: http://127.0.0.1:8080
+TEACHER_ENDPOINT=http://your-host:8080 bash tools/bench/repro_30of30.sh
 ```
 
-The script probes `${MLX_ENDPOINT}/v1/models` first; if reachable, it
+The script probes `${TEACHER_ENDPOINT}/v1/models` first; if reachable, it
 runs `tools/train/spec_in_context_probe_full.py` directly.
 
 To run a 100B+ model locally:
@@ -151,8 +149,7 @@ Honest scope:
 
 ## Provenance
 
-The 2026-05-09 result is documented in memory entry
-`substrate_30_of_30_2026-05-09.md`. Witness-signed manifest URLs are at
+The 2026-05-09 result is witness-signed; manifest URLs are at
 `https://ledatic.org/provenance/manifest/<id>` (browser-verify at
 `https://ledatic.org/verify/<id>`). The signing pipeline lives at
 `tools/attest/report_attestation_publisher.sh` — partners can re-attest
@@ -161,7 +158,7 @@ their own results with the same toolchain.
 ## Gotchas
 
 - **`rail_native` is ARM64 by default** (macOS / Linux ARM64). On Linux
-  x86_64 (Razer / WSL), build the x86 binary first via
+  x86_64 (including WSL), build the x86 binary first via
   `./rail_native x86 tools/compile.rail` per `CLAUDE.md > Rail Compiler`.
 - **Network**: the Anthropic probe makes 600 sequential requests. If you
   hit rate limits, lower `--n` for a smaller smoke; the result then is
@@ -172,10 +169,10 @@ their own results with the same toolchain.
 - **`split` is single-character in Rail.** The `count_lines` and
   `first_line` prompts deliberately exercise this; the spec does not
   paper over it.
-- **MLX endpoint is hardcoded to Studio-internal `10.42.0.2:8082`** in
-  `tools/train/spec_in_context_probe_full.py`. Override the env var
-  `MLX_ENDPOINT` for the auto-detect probe in `repro_30of30.sh`; for the
-  Python file directly, edit the `ENDPOINT` constant.
+- **The local-teacher endpoint is configured via `TEACHER_ENDPOINT`**
+  (point at any OpenAI-compatible server; default `http://127.0.0.1:8080`).
+  Both `repro_30of30.sh` and `tools/train/spec_in_context_probe_full.py`
+  read the same env var.
 
 ## File map
 

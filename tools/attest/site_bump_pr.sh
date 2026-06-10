@@ -5,11 +5,15 @@
 #
 # What it touches:
 #   - Hero eyebrow:       "Language — vX.Y.Z"
-#   - Visor mini:         "vX.Y.Z // 137/137"
-#   - Footer:             "RAIL vX.Y.Z · 137/137"
+#   - Visor mini:         "vX.Y.Z // N/N"
+#   - Footer:             "RAIL vX.Y.Z · N/N"
 #   - index.html stat:    "Current Rail" tile
 #   - "now.html" pill:    "<pill shipped>vX.Y.Z</pill>"
-#   - Hero subtitle on index.html: "Rail vX.Y.Z · 137 tests green"
+#   - Hero subtitle on index.html: "Rail vX.Y.Z · N tests green"
+#
+# The test count N/N is detected from the live page; override the value
+# written with RAIL_TEST_COUNT (e.g. parse it from a fresh run:
+#   RAIL_TEST_COUNT="$(./rail_native test | tail -1 | grep -oE '[0-9]+/[0-9]+')").
 #
 # What it does NOT touch (intentional — editorial):
 #   - changelog.html release cards (each is a historical anchor)
@@ -21,7 +25,7 @@
 # Idempotent: if the target branch already exists locally OR on origin,
 # print the PR URL (if any) and exit 0. Safe to invoke from drift_audit.
 #
-# Stash-isolates: Reilly's dirty CSS/JS in the working tree are
+# Stash-isolates: the operator's dirty CSS/JS in the working tree are
 # stashed before sed, popped after commit, so they don't sneak into
 # the auto-PR.
 #
@@ -53,7 +57,7 @@ if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 SITE=${SITE:-$HOME/projects/ledatic-site}
-RAIL_REPO=${RAIL_REPO:-$HOME/projects/rail-https}
+RAIL_REPO=${RAIL_REPO:-$HOME/projects/rail}
 PAGES=(index.html rail.html entropy.html fleet.html aliens.html manifesto.html plasma.html changelog.html)
 BRANCH="auto/site-bump-$VERSION"
 
@@ -83,8 +87,8 @@ if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
   git branch -D "$BRANCH" >/dev/null 2>&1 || true
 fi
 
-# 3. Stash dirty working tree so we don't pull Reilly's in-flight work
-#    into the bump PR. (feedback_stash_isolate_hunks)
+# 3. Stash dirty working tree so we don't pull the operator's in-flight
+#    work into the bump PR.
 STASHED=0
 if ! git diff --quiet || ! git diff --cached --quiet; then
   log "stashing dirty working tree before bump"
@@ -97,7 +101,7 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 # Restore-on-exit guarantee — even if sed errors, we don't leave
-# Reilly's work stranded.
+# the operator's work stranded.
 restore_stash() {
   if [ "$STASHED" = "1" ]; then
     log "popping stash"
@@ -114,7 +118,7 @@ if [ "$DRY" = "0" ]; then
 fi
 
 # 5. Find the current banner version (whatever the site currently shows).
-CURRENT=$(grep -oE 'v3\.[0-9]+\.[0-9]+' rail.html 2>/dev/null \
+CURRENT=$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' rail.html 2>/dev/null \
   | head -1)
 if [ -z "$CURRENT" ]; then
   log "ERROR: could not detect current version in rail.html"
@@ -125,7 +129,24 @@ if [ "$CURRENT" = "$VERSION" ]; then
   exit 0
 fi
 
-log "bump $CURRENT -> $VERSION across ${#PAGES[@]} pages"
+# 5b. Find the current test-count banner ("N/N"). The new count comes
+# from RAIL_TEST_COUNT if set (see header for how to parse it from a
+# fresh `./rail_native test` run), else the page's count is kept.
+TESTS_CURRENT=$(grep -oE "RAIL $CURRENT &middot; [0-9]+/[0-9]+" rail.html 2>/dev/null \
+  | grep -oE '[0-9]+/[0-9]+' | head -1)
+if [ -z "$TESTS_CURRENT" ]; then
+  log "ERROR: could not detect test-count banner ('RAIL $CURRENT &middot; N/N') in rail.html"
+  exit 1
+fi
+TESTS_NEW=${RAIL_TEST_COUNT:-$TESTS_CURRENT}
+if ! [[ "$TESTS_NEW" =~ ^[0-9]+/[0-9]+$ ]]; then
+  log "ERROR: RAIL_TEST_COUNT '$TESTS_NEW' must look like N/N"
+  exit 2
+fi
+TESTS_N_CURRENT=${TESTS_CURRENT%%/*}
+TESTS_N_NEW=${TESTS_NEW%%/*}
+
+log "bump $CURRENT -> $VERSION (tests $TESTS_CURRENT -> $TESTS_NEW) across ${#PAGES[@]} pages"
 
 # 6. Create branch.
 [ "$DRY" = "0" ] && git checkout -b "$BRANCH" >/dev/null 2>&1
@@ -166,17 +187,17 @@ for page in "${PAGES[@]}"; do
       # Hero eyebrow + visor + footer
       sed_in_place "$page" "Language &mdash; $CURRENT" "Language &mdash; $VERSION"
       sed_in_place "$page" "<span class=\"visor-value\">$CURRENT" "<span class=\"visor-value\">$VERSION"
-      sed_in_place "$page" "RAIL $CURRENT &middot; 137/137" "RAIL $VERSION &middot; 137/137"
+      sed_in_place "$page" "RAIL $CURRENT &middot; $TESTS_CURRENT" "RAIL $VERSION &middot; $TESTS_NEW"
       ;;
     index.html)
       # Hero subtitle + stat tile + footer
-      sed_in_place "$page" "Rail $CURRENT &middot; 137 tests green" "Rail $VERSION &middot; 137 tests green"
+      sed_in_place "$page" "Rail $CURRENT &middot; $TESTS_N_CURRENT tests green" "Rail $VERSION &middot; $TESTS_N_NEW tests green"
       sed_in_place "$page" "<div class=\"value\">$CURRENT</div>" "<div class=\"value\">$VERSION</div>"
-      sed_in_place "$page" "RAIL $CURRENT &middot; 137/137" "RAIL $VERSION &middot; 137/137"
+      sed_in_place "$page" "RAIL $CURRENT &middot; $TESTS_CURRENT" "RAIL $VERSION &middot; $TESTS_NEW"
       ;;
     *)
       # All other pages: just the footer banner
-      sed_in_place "$page" "RAIL $CURRENT &middot; 137/137" "RAIL $VERSION &middot; 137/137"
+      sed_in_place "$page" "RAIL $CURRENT &middot; $TESTS_CURRENT" "RAIL $VERSION &middot; $TESTS_NEW"
       ;;
   esac
 
@@ -209,8 +230,8 @@ if [ "$DRY" = "1" ]; then
   exit 0
 fi
 
-# Stage ONLY the pages we edited — never `git add .` (memory: never use
-# `git add -A` because of secrets/binaries/Reilly's-untracked-pages).
+# Stage ONLY the pages we edited — never `git add .` or `git add -A`
+# (secrets, binaries, and the operator's untracked pages must not ride in).
 # Filter PAGES to only files that actually exist on disk. With multi-file
 # pathspecs, `git add` is all-or-nothing: a single missing file aborts the
 # stage with a "fatal: pathspec ... did not match" and stages NOTHING.
@@ -286,7 +307,7 @@ $bumped of ${#PAGES[@]} pages updated.
 
 - [ ] Review the diff (should only be 5–8 single-line replacements per page).
 - [ ] Add the \`$VERSION\` release card to \`changelog.html\` and \`rail.html\` from CHANGELOG.md.
-- [ ] Deploy: \`CF_TOKEN=\$(cat ~/Desktop/rings) ./deploy.sh\`
+- [ ] Deploy: \`CF_TOKEN=\$(cat "\$CF_TOKEN_FILE") ./deploy.sh\` (CF_TOKEN_FILE = path to your Cloudflare API token file)
 
 ## Seeded from CHANGELOG.md
 

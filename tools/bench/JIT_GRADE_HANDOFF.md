@@ -2,7 +2,6 @@
 
 Date: 2026-05-13
 Branch: `feat/bench-jit-grade-fastpath` (based on `next` @ `def1bcd`)
-Worktree: `~/projects/rail/.claude/worktrees/agent-ade4053173276da49`
 
 ## TL;DR
 
@@ -42,7 +41,7 @@ shell-only:    101.75s
 jit-fast:       86.18s     (1.18x speedup)
 ```
 
-Run on Studio (2× concurrent worktree agents also running rail_native
+Run on an M1 Ultra (2x concurrent agents also running rail_native
 during the measurement; both paths likely degraded equally). No
 Anthropic API was used — `time_jit_grade.py` synthesizes deterministic
 completions per prompt so the measurement is pure grading throughput.

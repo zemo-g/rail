@@ -22,7 +22,7 @@
 
 set -uo pipefail
 
-REPO="${REPO:-$HOME/projects/rail-https}"
+REPO="${REPO:-$HOME/projects/rail}"
 SITE_BASE="${SITE_BASE:-https://ledatic.org}"
 JSON=0
 TARGET_TAG=""

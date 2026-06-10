@@ -1,22 +1,25 @@
 #!/bin/bash
 # security_status.sh — one-screen security posture check for the fleet.
-# Read-only.  Run from Mini.
+# Read-only.  Run from the coordinating node.
 #
 #   bash tools/fleet/security_status.sh
+#
+# Edit NODES below for your fleet: the first entry is always the local
+# machine; the rest are `name:ssh-target` pairs for each remote node.
 
 set -u
 
 NODES=(
-  "mini:localhost"
-  "studio:studio"
-  "air:<peer-user>@<peer-host>"
-  # "pi:<witness-user>@<witness-host>"   # Pi has no pf / different surface; skipped
+  "local:localhost"
+  "node-1:<peer-user>@<peer-host>"
+  "node-2:<peer-user>@<peer-host>"
+  # "witness:<witness-user>@<witness-host>"   # witness node has no pf / different surface; skipped
 )
 
 hr() { printf '%s\n' "────────────────────────────────────────────────────────"; }
 
 run_local() {
-  echo "─── MINI ───"
+  echo "─── LOCAL ───"
   printf 'pf status:  '; sudo pfctl -s info 2>/dev/null | awk -F': +' '/Status/ {print $2; exit}'
   printf 'pf rules:   '; sudo pfctl -s rules 2>/dev/null | grep -c 9101
   echo "  (lines mentioning port 9101)"

@@ -182,7 +182,7 @@ done
   echo "## Paste-ready next-session prompt"
   echo ""
   echo '```'
-  echo "Resuming Spur orchestrator session. Current state:"
+  echo "Resuming orchestrator session. Current state:"
   echo ""
   if [ "$LEADER_PASS" -ge 0 ]; then
     echo "- Leader: $LEADER_ARM @ $LEADER_PASS/30 (val=$LEADER_VL, ckpt=$LEADER_CKPT)"
