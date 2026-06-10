@@ -23,8 +23,8 @@
 # Usage:
 #   ./install_witness.sh                     # uses current $USER, hostname as node
 #   WITNESS_NAME=fleet0 ./install_witness.sh # override node name
-#   TOKEN_SRC=studio:.ledatic/entropy/beacon_token ./install_witness.sh
-#                                            # scp the token from Studio first
+#   TOKEN_SRC=<beacon-host>:.ledatic/entropy/beacon_token ./install_witness.sh
+#                                            # scp the token from the beacon host first
 
 set -euo pipefail
 
@@ -72,7 +72,7 @@ if [ ! -s upload_token ]; then
   else
     echo "  upload_token missing — populate one of these ways and re-run:"
     echo "    a) cat <token> > $WITNESS_DIR/upload_token && chmod 600 \$_"
-    echo "    b) TOKEN_SRC=studio:.ledatic/entropy/beacon_token ./install_witness.sh"
+    echo "    b) TOKEN_SRC=<beacon-host>:.ledatic/entropy/beacon_token ./install_witness.sh"
     exit 3
   fi
 else
@@ -81,7 +81,7 @@ fi
 
 step "Install systemd unit files"
 # Patch ExecStart and User= to match the actual install location and
-# user, since the bundled service files assume <HOME>.
+# user, since the bundled .service.example files ship with placeholders.
 for unit in witness.service witness_push.service; do
   tmp=$(mktemp)
   sed -e "s|~/\.ledatic/witness|$WITNESS_DIR|g" \

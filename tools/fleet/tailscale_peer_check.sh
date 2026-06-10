@@ -1,14 +1,15 @@
 #!/bin/bash
 # tailscale_peer_check.sh — detect unexpected peers on the tailnet.
 #
-# Runs hourly on Mini via com.ledatic.tailscale_peer_check LaunchAgent.
+# Runs hourly on the coordinating node via the
+# com.ledatic.tailscale_peer_check LaunchAgent.
 # Compares `tailscale status` against ~/.fleet/allowed_tailnet_peers.
 # On drift: posts Slack DM + logs; does not modify anything.
 #
 # Baseline file format (one Tailscale hostname per line):
-#   mini
-#   studio
-#   homem1air-2
+#   node-1
+#   node-2
+#   node-3
 #   fleet0
 #
 # To reset the baseline after an intended fleet change:

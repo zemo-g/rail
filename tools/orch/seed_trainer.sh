@@ -1,7 +1,7 @@
 #!/bin/bash
 # seed_trainer.sh — clone a trainer template with new seed + ckpt prefix.
 #
-# The Spur trainers hardcode seed at `let rng = lcg_state_new <N>` and ckpt
+# The trainers hardcode seed at `let rng = lcg_state_new <N>` and ckpt
 # paths at `let ckpt_best = "training/rail_native/checkpoints/<prefix>_best"`
 # (and matching `_step3000`). This script does an exact textual substitution
 # so each orchestrator arm gets its own trainer.rail with isolated ckpt

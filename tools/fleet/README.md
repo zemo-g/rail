@@ -1,11 +1,12 @@
 # tools/fleet
 
-Fleet-wide daemons and orchestration for the Rail compute fleet
-(Mini hub + Studio/Air spokes + Pi).
+Fleet-wide daemons and orchestration for a Rail compute fleet — a small
+set of nodes reachable over any private network (Thunderbolt bridge,
+LAN, or an overlay VPN), plus an optional low-power witness node.
 
 ## tb_autojoin — walk-away Thunderbolt bridge reconciler
 
-`tb_autojoin.sh` + `com.ledatic.tb_autojoin.plist`.
+`tb_autojoin.sh` + `com.ledatic.tb_autojoin.plist.example`.
 
 Runs as root under launchd every 30 s on each TB-cabled node. Enumerates
 `en<N>` interfaces, classifies each as a real TB peer or a stub (USB-C
@@ -23,8 +24,13 @@ within 30 s. Walk-away.
 ### Install (per node)
 
 ```bash
-echo "10.42.0.X" > ~/.fleet/tb-ip           # Mini=.1, Studio=.2, Air=.3
-sudo cp tools/fleet/com.ledatic.tb_autojoin.plist /Library/LaunchDaemons/
+# This node's bridge IP — pick one address per node from your own
+# private subnet (192.0.2.x below is the RFC 5737 documentation range).
+echo "192.0.2.1" > ~/.fleet/tb-ip
+
+# Copy the example plist, then edit the script path inside it to point
+# at your checkout (launchd does not expand ~).
+sudo cp tools/fleet/com.ledatic.tb_autojoin.plist.example /Library/LaunchDaemons/com.ledatic.tb_autojoin.plist
 sudo chown root:wheel /Library/LaunchDaemons/com.ledatic.tb_autojoin.plist
 sudo chmod 644        /Library/LaunchDaemons/com.ledatic.tb_autojoin.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.ledatic.tb_autojoin.plist
@@ -59,41 +65,11 @@ sudo rm /Library/LaunchDaemons/com.ledatic.tb_autojoin.plist
   (should stay empty)
 - `sudo launchctl print system/com.ledatic.tb_autojoin` — launchd state
 
-## security_bootstrap — one-shot hardening
+## security_bootstrap — not yet shipped
 
-`security_bootstrap.sh` + `pf_ledatic_fleet.conf`.
-
-Run once per node. Locks down the fleet control plane (`:9101`) and
-local TLS proxies (`:8443/:8444/:8445`) to loopback + Tailscale + the
-TB mesh only, and forces SSH into key-only mode.
-
-### Install (per node)
-
-```bash
-sudo bash tools/fleet/security_bootstrap.sh
-```
-
-Idempotent — re-run anytime to re-apply. The sshd step validates the
-config with `sshd -t` before restart so a typo can't lock you out.
-
-### Verify
-
-```bash
-sudo pfctl -s rules | grep 9101
-sudo pfctl -s info   | head -2                    # Status: Enabled
-# From a LAN IP that isn't on Tailscale:
-curl -m 3 http://<node-lan-ip>:9101/health        # should time out / be dropped
-# From the same node:
-curl -s http://127.0.0.1:9101/health              # should respond
-```
-
-### Rollback
-
-```bash
-sudo sed -i '' '/^# Fleet control-plane firewall/,/load anchor "ledatic_fleet"/d' /etc/pf.conf
-sudo rm /etc/pf.anchors/ledatic_fleet
-sudo pfctl -f /etc/pf.conf
-# sshd: revert via System Settings → General → Sharing → Remote Login options,
-# or edit /etc/ssh/sshd_config back and kickstart sshd.
-```
+A one-shot hardening script (pf anchor scoping the fleet agent port to
+loopback + the private mesh, key-only SSH) runs on the original fleet
+but has not been extracted for public release. Until it ships, scope
+the agent port with your firewall of choice: allow loopback and your
+private subnets, drop everything else.
 

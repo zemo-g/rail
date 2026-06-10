@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/audit/system_page_audit.sh
 #
-# /system page substrate audit — Phase 1 of docs/plans/SYSTEM_PAGE_AUDIT.md.
+# /system page substrate audit (Phase 1).
 #
 # Covers static substrate-dependent strings in ledatic.org/system. The
 # live JS-fetched values are covered by tools/audit/attest_endpoint_walk.sh.

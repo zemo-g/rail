@@ -2,9 +2,9 @@
 # repro_30of30.sh — one-line reproduction of the canonical 30/30 substrate result.
 #
 # Auto-detects an environment that can run the bench:
-#   1. If the local MLX teacher (Studio-internal http://10.42.0.2:8082) is
-#      reachable, runs the canonical probe at
-#      tools/train/spec_in_context_probe_full.py.
+#   1. If a local teacher endpoint is reachable (TEACHER_ENDPOINT, default
+#      http://127.0.0.1:8080 — point at any OpenAI-compatible server), runs
+#      the canonical probe at tools/train/spec_in_context_probe_full.py.
 #   2. Else, if ANTHROPIC_API_KEY is set, runs tools/bench/repro_anthropic.py
 #      against claude-opus-4-7 via the Anthropic API.
 #   3. Else, prints reproduction instructions for both paths and exits.
@@ -21,7 +21,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RAIL_NATIVE="$REPO_ROOT/rail_native"
 MLX_PROBE="$REPO_ROOT/tools/train/spec_in_context_probe_full.py"
 ANTHROPIC_PROBE="$REPO_ROOT/tools/bench/repro_anthropic.py"
-MLX_ENDPOINT="${MLX_ENDPOINT:-http://10.42.0.2:8082}"
+# Local teacher endpoint — point at any OpenAI-compatible server.
+# Accepts either the base URL or the full /v1/chat/completions URL.
+TEACHER_ENDPOINT="${TEACHER_ENDPOINT:-http://127.0.0.1:8080}"
+TEACHER_BASE="${TEACHER_ENDPOINT%/v1/chat/completions}"
 
 usage() {
     cat <<'USAGE'
@@ -36,14 +39,13 @@ rerank). Auto-detects which backend to use:
 
       ANTHROPIC_API_KEY=... tools/bench/repro_30of30.sh
 
-  Path B (local MLX — Studio-internal):
-    Requires the MLX teacher reachable at http://10.42.0.2:8082 (override
-    via MLX_ENDPOINT env var). No external cost, ~15 min wall-clock.
+  Path B (local teacher):
+    Requires an OpenAI-compatible server reachable at TEACHER_ENDPOINT
+    (default http://127.0.0.1:8080). No external cost, ~15 min wall-clock.
 
-      tools/bench/repro_30of30.sh
+      TEACHER_ENDPOINT=http://your-host:8080 tools/bench/repro_30of30.sh
 
 Background: tools/bench/README.md
-Memory:     substrate_30_of_30_2026-05-09
 USAGE
 }
 
@@ -73,9 +75,11 @@ echo "[preflight] rail_native compiles main=0: OK"
 # Pick backend.
 PROBE=""
 LABEL=""
-if curl -sS --max-time 2 "$MLX_ENDPOINT/v1/models" >/dev/null 2>&1; then
+if curl -sS --max-time 2 "$TEACHER_BASE/v1/models" >/dev/null 2>&1; then
     PROBE="python3 $MLX_PROBE"
-    LABEL="Path B (local MLX @ $MLX_ENDPOINT)"
+    LABEL="Path B (local teacher @ $TEACHER_BASE)"
+    # The probe expects the full chat-completions URL.
+    export TEACHER_ENDPOINT="$TEACHER_BASE/v1/chat/completions"
 elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
     PROBE="python3 $ANTHROPIC_PROBE"
     LABEL="Path A (Anthropic API)"
@@ -88,10 +92,10 @@ else
     echo "    bash $0"
     echo "    (~600 calls, ~\$15-20, ~15-25 min)"
     echo
-    echo "  Path B (local MLX teacher):"
-    echo "    Run a 100B+ open-weight model (e.g. Qwen-122B) on an MLX or vLLM"
-    echo "    endpoint. By default this script probes http://10.42.0.2:8082."
-    echo "    Override: MLX_ENDPOINT=http://your-host:port bash $0"
+    echo "  Path B (local teacher):"
+    echo "    Run a 100B+ open-weight model on any OpenAI-compatible endpoint"
+    echo "    (MLX, vLLM, etc). By default this script probes http://127.0.0.1:8080."
+    echo "    Override: TEACHER_ENDPOINT=http://your-host:port bash $0"
     echo
     echo "  See tools/bench/README.md for full setup."
     exit 3
