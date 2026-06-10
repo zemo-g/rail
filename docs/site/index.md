@@ -1,6 +1,6 @@
 # Rail
 
-Rail is a self-hosted ARM64 language with six backends (macOS ARM64, Linux ARM64, Linux x86_64, WebAssembly, Cortex-M4, RISC-V rv32imc), an LLM training substrate, and a verifiable provenance layer. The compiler is ~6,719 lines of Rail compiling itself byte-identically at gen2; the runtime is ARM64 assembly embedded in the compiler. Zero C dependencies. One binary.
+Rail is a self-hosted ARM64 language with six backends (macOS ARM64, Linux ARM64, Linux x86_64, WebAssembly, Cortex-M4, RISC-V rv32imc), an LLM training substrate, and a verifiable provenance layer. The compiler is 8,049 lines of Rail (`wc -l tools/compile.rail`) compiling itself byte-identically at gen2; the runtime is ARM64 assembly embedded in the compiler. Zero C dependencies. One binary.
 
 ## Quickstart
 
@@ -28,7 +28,7 @@ For Apple Silicon you're done. Other targets need cross-toolchains — see [back
 ## What's here
 
 - **[quickstart.md](quickstart.md)** — ten steps from `git clone` to a signed bench result. Real commands, real outputs.
-- **[stdlib.md](stdlib.md)** — auto-generated reference for every top-level function in `stdlib/*.rail` (80 files, 1,706 functions). Regenerate with `./rail_native run tools/docs/gen_stdlib_ref.rail`.
+- **[stdlib.md](stdlib.md)** — auto-generated reference for every top-level function in `stdlib/*.rail` (94 modules — `ls stdlib/*.rail | wc -l`). Regenerate with `./rail_native run tools/docs/gen_stdlib_ref.rail`.
 - **[backends.md](backends.md)** — one-page-per-backend with the literal command line you'd type.
 - **[jit.md](jit.md)** — a self-hosted JIT in pure Rail. ARM64 emit + `mmap`-executable, called via a `pthread_create` trampoline. ~6,600 LoC across 20 files.
 - **[examples/](examples/)** — 22 runnable programs with source, command, and real captured output. Start with [hello](examples/hello.md), [pattern_matching](examples/pattern_matching.md), [calculator](examples/calculator.md).

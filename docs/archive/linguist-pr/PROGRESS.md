@@ -1,8 +1,11 @@
 # Linguist PR — Add Rail Language
 
+> **Archived.** Submitted as github-linguist/linguist PR #7905; closed unmerged.
+> Materials kept here for a future resubmission.
+
 **Goal:** Get `github-linguist/linguist` to recognize `.rail` files as "Rail" so GitHub's language bar shows Rail instead of defaulting to Haskell.
 
-**Status:** Work-in-progress. Do NOT submit until human review.
+**Status:** Closed unmerged (PR #7905) — see note above.
 
 ## Checklist
 

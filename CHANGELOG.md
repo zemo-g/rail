@@ -2,14 +2,189 @@
 
 All notable changes to Rail are documented here.
 
+## Post-v5.1.0 (unreleased) — Public-surface sanitization: internal ops docs removed
+
+Commit `7e21320` (2026-06-03). Follow-up to the v4.0.1 hygiene pass.
+Removes `docs/plans/` from the public tree — 12 internal audit/strategy
+documents (live-infrastructure service audits, a closed client-engagement
+closeout, a recruitment-path strategy doc) that were operational recon,
+not substrate documentation. The directory is now gitignored so it can't
+be re-committed. Also switches the public site contact rendered by
+`tools/deploy/gen_site.rail` to the business address. 13 files changed,
+−1,503 lines (`git show 7e21320 --stat`). No code or behavior change.
+
+## Post-v5.1.0 (unreleased) — `#grad`: compile-time automatic differentiation, forward + reverse
+
+Merged 2026-06-01 (PR #9, merge `1dc7e84`; PR #10, merge `59b0f04`).
+Mark a float function `#grad f` and the compiler synthesizes its
+derivatives at compile time — emitted as ordinary Rail AST, not an
+opaque tape. The gradient IS a Rail program you can read, hash, and
+attest (the Zygote/Dex model, not Enzyme).
+
+```rail
+#grad f
+f x y = (x *. y) +. (3.0 *. x)
+
+-- forward mode: one directional partial per call, selected by index
+f__grad 2.0 5.0 0      -- df/dx at (2,5) = 8
+f__grad 2.0 5.0 1      -- df/dy at (2,5) = 2
+
+-- reverse mode: ALL partials in one backward sweep
+let go = float_arr_new 2 0.0
+let _ = f__rgrad 2.0 5.0 go   -- go[0]=8, go[1]=2
+```
+
+`f__rgrad` writes every partial into a caller-supplied `float_arr` in
+one sweep — cost independent of input count, the gradient-descent
+workhorse.
+
+### Coverage, increment by increment
+
+- `ea61a48` (C0) forward desugar: `+ - * /` and constants; `cf098b4`
+  (C1) multi-input indexed `f__grad`
+- `99c996b` (C2) transcendentals via the chain rule:
+  sin/cos/exp/tanh/sqrt/log
+- `710a2eb` (C3) let-bound shared subexpressions — DAG nodes
+  differentiated once, no expression blowup
+- `179586b` / `2bf17b4` / `5e9b8c5` (C4.0–C4.2) reverse mode
+  (`f__rgrad`), through let-DAGs and transcendentals
+- `f834f9a` / `c133cbb` (C5.0–C5.1) `if` control flow, both modes.
+  Before C5.0 relu's gradient was identically zero — a silent miscompile
+  that would make any net untrainable.
+- `3e823b2` (C5.2) `match` on non-binding discriminants, both modes
+
+Anything outside the supported grammar punts to a conservative
+fallback — never a wrong nonzero gradient. relu/abs/clamp, piecewise
+functions, and match-dispatched models differentiate correctly in both
+modes.
+
+### Verification
+
+Every increment gated by a three-witness differential oracle: the
+synthesized gradient vs an independent symbolic differentiator
+(`tools/ad/diff.rail`, bit-identical) vs numeric central finite
+difference — 9 oracle harnesses under `tools/ad/` (final:
+`./rail_native run tools/ad/grad_match_oracle_test.rail` → 33/33) —
+plus the byte-identical self-host fixed point (`./rail_native self`)
+and a 20/20 diff-fuzzer run (`tools/fuzz/diff_fuzz.rail`) per commit.
+Embedded tests t153–t164. Suite now 170/170 (`./rail_native test`;
+gate count recorded per commit, final in `3e823b2`).
+
+## Post-v5.1.0 (unreleased) — `auth` types: authenticated data structures synthesized by the compiler
+
+Merged 2026-05-31 (PR #8, merge `71261fc`; increments B0–B4 =
+`9bc9f49` `23d9b4b` `79a5a68` `2d01f1b` `2f33ad5` `ef7dee8` `dae4985`;
+hand-written Stage A oracle vendored in `d0fed83`). One keyword turns a
+plain ADT into an authenticated data structure:
+
+```rail
+import "stdlib/sha256.rail"
+type Tree = | Tip s | Bin auth Tree auth Tree
+
+fetch t path = match unauth t
+  | Tip s -> s
+  | Bin l r -> if head path == 0 then fetch l (tail path) else fetch r (tail path)
+```
+
+Write the traversal once; the compiler derives the full lambda-auth
+construction: Merkle projections + digests (`digest_Tree`), a prover
+clone (`fetch__prove`) that emits a proof stream of shallow node
+projections, and a verifier clone (`fetch__verify`) that holds ONLY the
+64-hex root digest and replays the proof, rejecting on any sha256
+mismatch. An untrusted party can serve query results over your data
+structure with cryptographic proofs; a client verifies against a single
+root hash with constant-size state. Forging an answer requires a sha256
+collision.
+
+- Tamper tests in-suite: forged leaf REJECT (t146), bad root REJECT
+  (t147), forged internal node REJECT (t148), wrong-key binding REJECT
+  (t150), tampered dict leaf REJECT (t151).
+- B3 (`ef7dee8`) proves the synthesizer generalizes unchanged to an
+  asymmetric string-keyed BST dictionary (`tools/auth/authdict.rail`).
+- B4 (`dae4985`) closed a real soundness gap found in the oracle
+  itself: ':'-joined field framing silently truncated a value containing
+  ':' yet ACCEPTED. Replaced with length-prefix framing `<len>#<bytes>`;
+  regression t152 locks a ':'-bearing value (`accept:ap:ple`). Gate at
+  B4: 158/158.
+- Inert by construction: auth-free programs — including the compiler
+  itself — compile byte-identically. Every increment shipped with the
+  byte-identical self-host fixed point and a 20/20 diff-fuzzer run.
+
+Stage A oracle: `./rail_native run tools/auth/authkit.rail`. Embedded
+tests t141–t152 (full `auth` syntax visible in the test source,
+`tools/compile.rail` ~5081–5124).
+
+## Post-v5.1.0 (unreleased) — Float type-inference: five float-scalar miscompiles fixed
+
+Merged 2026-05-30 (PR #7, merge `a55e4fa`; follow-up `cd4c18d` landed
+inside the PR #9 lineage). Before this arc, float scalars as ordinary
+function parameters were a minefield:
+
+- `d653a72` — comparison-only float params: `a < b` fell to a runtime
+  helper that dereferenced float bits as a heap pointer →
+  data-dependent segfault. Broke `stdlib/mhd_kernel.rail`'s `minmod`
+  and the whole MUSCL solver. Locked by t136.
+- `f6231c8` (Increment A) — arithmetic float params: `mul2 3.0 4.0`
+  returned 4.94e-324 denormal garbage, now 12. t137/t138.
+- `f042b6b` (int-param dual) — `0.0 + int_param` produced 5.43e-323,
+  now 5 via scvtf promotion. t139.
+- `4cf64de` (Increment B) — a float fn result bound to a let-local then
+  passed on was 5.3e+36 garbage; now composes. t140.
+- `cd4c18d` — a fn float only via its params (no literal anchor) was
+  mis-inferred int-returning; callers read raw double bits as a tagged
+  int (−2.2e-308 where 6 expected). t158.
+
+Mechanism: whole-program call-site agreement — a param is marked float
+iff every call site proves it (monotone-safe lub, so int code is never
+mismarked). Each fix locked by a regression test and gated on the
+byte-identical self-host fixed point + diff-fuzzer.
+
+The payoff is naturally-written ML code:
+
+```rail
+neuron w1 x1 w2 x2 b = relu (w1 * x1 + w2 * x2 + b)
+```
+
+— no `float_arr` boxing, no out-cell threading. Float scalars flow
+through params, comparisons, let-locals, and returns correctly.
+`examples/mlp_natural.rail` (`ee25340`) is a 2-layer MLP forward pass
+with 5-float-param neurons and chained activations: it SEGFAULTS on the
+pre-type-layer compiler and prints `mlp(1.0, 2.0)  = 1.125` after.
+Reproduce: `./rail_native run examples/mlp_natural.rail`. This arc is
+also what makes `#grad` (above) usable — synthesized gradients are
+ordinary float functions.
+
+## Post-v5.1.0 (unreleased) — `stdlib/socket`: linear-time receive path + parse-brick fix
+
+Landed on master via the PR #7 branch base and the PR #11 cleanup merge
+(`9515c94`, 2026-06-01). Three fixes to the pure-Rail TCP layer:
+
+- `e3ecde7` — `tcp_bytes_to_str` went from O(N²) string accumulation to
+  O(N) list-then-join (benched on a 4 KB header burst through
+  `recv_http_request`).
+- `548dcd7` — the O(N) rewrite had shipped with a latent parse error: a
+  `:` infix cons that Rail's parser doesn't have. `stdlib/socket.rail`
+  failed to import, bricking compilation of every socket-importing
+  program (HTTP client, HTTPS/TLS client, HTTP server). The compiler's
+  own test suite imports no stdlib modules, so the non-parsing module
+  passed "no regression" — the motivating case for consumer-compile
+  smoke checks. Behavior-identical swap to the `cons` function.
+- `ad0f876` — the in-tree TCP server example
+  (`tools/fleet/fleet_agent_v3.rail`) reads its bind address from a
+  local config file at startup (default `0.0.0.0`) instead of a
+  compile-time literal, so one compiled binary deploys across hosts.
+
+Socket-importing Rail programs compile and run again, with linear-time
+receive-path byte handling.
+
 ## v5.1.0 — 2026-05-15 — Rail emits its own GPU kernels
 
 Major release.  Rail now generates Metal Shading Language source from
 its op-DAG, JIT-compiles it via Metal's `newLibraryWithSource:`, and
 dispatches the kernel at runtime.  Every kernel the GPU executes is
 emitted by an attested Rail binary — the substrate piece needed for
-end-to-end attested GPU training (see
-[`rail-jit-fused-kernels-plan`](.) for the multi-month roadmap).
+end-to-end attested GPU training — the first rung of a multi-month
+fused-kernel roadmap (deeper fusion: attention, full-layer).
 
 This release bundles the full GPU substrate that the auto-emission
 pipeline rests on: per-op Metal kernels, the bf16 numerics regime that
@@ -63,14 +238,14 @@ hand-fused kernels, and the DAG matcher + emitter that drive them.
 
 Per-op wins translated to ~2% per-step at training shapes — confirms
 fusion (not per-op throughput) is the real ceiling, which is why the
-JIT pipeline above is the load-bearing thesis.  See
-`rail-gpu-fused-ops-2026-05-14` for the bench breakdown.
+JIT pipeline above is the load-bearing thesis.  Bench harnesses live
+in `tools/metal/` and `tools/bench/`.
 
 ### bf16 numerics regime
 
 - `tgl_matmul_bf16` + `matmul_bf16` Rail wrapper.  bf16 has f32's
   exponent range, so it sidesteps fp16's step-2759 NaN cliff
-  (`rail-bf16-stable-10k-2026-05-14`).  Training scripts default to
+  (measured: fp16 training NaNs at step 2759; bf16 ran 10k steps stable).  Training scripts default to
   forward bf16 with f64 on embedding + LM-head + backward.
 
 ### Training scripts (chunked-corpus sampler, 2-block d=64)
@@ -83,8 +258,8 @@ JIT pipeline above is the load-bearing thesis.  See
   converge.  Wall-clock bench (3×3 alternating runs): **2.85%
   step-throughput improvement** over baseline at seq=512 d=64 d_ff=192.
 - `tools/train/lm_v3_chunked_fp16_attn_f64_long.rail` — falsification
-  experiment ruling out attention as the fp16 culprit
-  (`rail-fp16-attn-f64-falsified-2026-05-14`).
+  experiment ruling out attention as the fp16 culprit — the NaN cliff
+  persisted with attention pinned to f64, so the failure lives elsewhere.
 
 ### Tests + benches
 
@@ -375,10 +550,10 @@ the compiled binary is identical to v4.0.0.
   `tools/fleet/fleet_display.rail`, `tools/apps/control.rail` — replaced
   with `<witness-user>@<witness-host>` / `<peer-user>@<peer-host>`
   placeholders. Callers must supply real values via environment.
-- **Tailscale IPs** (`100.87.231.45`, `100.79.50.108`, `100.120.203.70`,
-  `100.109.107.54`, `100.109.63.37`) replaced with role placeholders
-  (`<witness-tailscale-ip>` etc.). Tailscale CGNAT-range addresses aren't
-  reachable from the public internet, but they were operational recon.
+- **Tailscale IPs** (five CGNAT-range addresses) replaced with role
+  placeholders (`<witness-tailscale-ip>` etc.). Tailscale CGNAT-range
+  addresses aren't reachable from the public internet, but they were
+  operational recon.
 - **Home-directory paths** (`/Users/ledaticempire/`, `/Users/user/`,
   `/home/zemog/`) replaced with `~/` or `<HOME>` placeholders across
   source, docs, `docs/plans/`, training fixtures, and Objective-C dispatchers.
@@ -1241,8 +1416,8 @@ v2.x Rail spoke HTTP. TLS rode on `socat` — a C program outside the
 language. Rail could send bytes into a TLS tunnel but couldn't reason
 about the tunnel. For a language whose tag line is *Rail runs on Rail,
 the rest runs on physics*, that was the last external dependency on
-the network path. v3.0.0 closes it. The `~/.fleet/tls_proxies.sh`
-socat daemons are no longer on any critical path.
+the network path. v3.0.0 closes it. The local socat proxy daemons
+are no longer on any critical path.
 
 ### What shipped
 
@@ -1547,7 +1722,7 @@ v2.22.x (Python transport + Rail CGI handler) until this lands.
 
 ### Public-vs-private split
 
-Private infra pieces (fleet control-plane v3, DDA-specific `mlx_query`
+Private infra pieces (fleet control-plane v3, a client-specific `mlx_query`
 CLI adapter, workspace-specific Slack/Anthropic clients) are kept on
 an internal branch. Public `v2.23.0` ships the generic foundation
 only — anyone can build their own fleet/ops/client layer on top of

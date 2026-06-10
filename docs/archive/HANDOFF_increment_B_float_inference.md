@@ -81,7 +81,7 @@ this with out-cells and tag-string dispatch. Increment B lets them return floats
 ## 1. Starting state (verify first)
 
 - Machine: the type-layer work lives in `~/projects/rail` (this checkout). `hostname` to confirm
-  Mini vs Studio if it matters; the binary is per-machine.
+  which machine if it matters; the binary is per-machine.
 - Branch: **`feat/type-layer`**, HEAD should be **`ee25340`**. Verify:
   ```bash
   cd ~/projects/rail && git log --oneline -6 && git status -s

@@ -1,11 +1,14 @@
 # Pillar 3 (Attested Numerics) — diagnose-first, 2026-05-31
 
+> **Archived.** Diagnosis doc from 2026-05-31. The AD work it scopes has since
+> merged to master (forward + reverse mode) — see `CHANGELOG.md`. Frozen as written.
+
 ## What Pillar 3 is (canonical, from the thesis)
 Two facets:
 1. **Source-to-source AD** — emit the gradient AS a re-attestable Rail program (Zygote/Dex
    model, NOT Enzyme). The moat is attestation ("the gradient is a Rail program"), not ergonomics.
 2. **Deterministic-reduction GPU kernels** — bit-reproducible training as a compiler guarantee.
-   Highest effort, Studio/Metal. (Out of scope for a first increment.)
+   Highest effort, Metal GPU. (Out of scope for a first increment.)
 
 ## State of the board (evidence, not memory)
 - **A first cut already exists, but is NOT on master.** It lives on `feat/verifiable-language @ 337d66a`:

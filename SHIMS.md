@@ -2,7 +2,9 @@
 
 Rail aims at zero non-Rail dependencies in the user program. The compiler is written in Rail and emits its own assembly; stdlib is Rail; tooling is Rail. The files below exist because kernel boundaries, GPU drivers, framework C ABIs, and bare-metal CPU bringup demand a small irreducible surface in another language. Each entry names the boundary, the byte cost, and what would let us delete it.
 
-Totals: **31 in-tree files**, ~407 KB. Plus 8 gitignored UAV files (~213 KB) called out in their own section. Anything not listed is Rail.
+Totals: **31 in-tree files**, 407,818 bytes (~408 KB). Inventory command: `git ls-files | grep -E '\.(c|m|s|h)$'`.
+
+Scope is the build/runtime path in C / ObjC / asm. That inventory command also surfaces files deliberately out of scope here: the generated tree-sitter parser (`tree-sitter-rail/src/parser.c` + headers — generator output, not hand-written), and the Mach-O reference fixture `notes/v5_macho_ref/exit42.s` (documentation, not build input). Also non-Rail but not shims: WASM text-format runtime/fixtures (`*.wat`), MSL kernel sources (`*.metal` — GPU programs driven by the hosts listed in §2/§3), and Python dev tooling. Everything else in the repo is Rail.
 
 ---
 
@@ -13,7 +15,7 @@ The Rail runtime makes raw Linux syscalls. macOS uses dyld + libc indirectly via
 | Path | Lang | Bytes | Reason it must exist | To retire |
 |---|---|---|---|---|
 | `tools/linux_libc.s` | asm-arm64 | 35,459 | Pure-syscall libc (write/read/openat/close/lseek/exit/mmap, string ops) for cross-compiled Linux ARM64 binaries — no glibc dependency. | Never — this IS the Linux ABI boundary. |
-| `tools/linux_data.s` | asm-arm64 | 683 | Runtime data symbols for cross-compiled Linux binaries when the generated `.s` omits its own `.data` (Pi memory-pressure path). | When chunked `.s` writer lands; see `feedback_rail_compile_traps.md`. |
+| `tools/linux_data.s` | asm-arm64 | 683 | Runtime data symbols for cross-compiled Linux binaries when the generated `.s` omits its own `.data` (low-memory device path). | When a chunked `.s` writer lands for large compile outputs. |
 | `tools/x86_libc.s` | asm-x86_64 | 6,220 | Pure-syscall libc for Rail x86_64 Linux (no glibc, no dynamic linking). | Never — kernel boundary. |
 | `tools/x86_rt.s` | asm-x86_64 | 59,385 | Rail x86_64 Linux runtime (glibc-linked variant): GC inner loop, list ops, string ops, tagged-int math in hand-written x86_64 asm. | Partial: GC + list ops can be ported to Rail-emitted asm; the glibc trampolines stay. |
 
@@ -29,7 +31,7 @@ Apple's Metal API is Objective-C. Rail can call C ABI but cannot speak ObjC sele
 
 | Path | Lang | Bytes | Reason | To retire |
 |---|---|---|---|---|
-| `tools/metal/tensor_gpu_lib.m` | ObjC | 92,147 | Metal tensor kernels (23 ops: matmul, rmsnorm, rope, silu, etc.) as a dylib that Rail's `stdlib/tensor.rail` FFIs into. | When Rail emits MSL + drives the Metal driver itself — Phase 3 of `rail-jit-fused-kernels-plan.md`. |
+| `tools/metal/tensor_gpu_lib.m` | ObjC | 92,147 | Metal tensor kernels (23 ops: matmul, rmsnorm, rope, silu, etc.) as a dylib that Rail's `stdlib/tensor.rail` FFIs into. | When Rail-emitted MSL covers the full op set — `stdlib/jit_emit.rail` already emits fused kernels; extending it retires this. |
 | `tools/metal/tensor_gpu.m` | ObjC | 29,318 | Persistent stdin-protocol Metal compute server (predecessor of the dylib path). | Superseded by `tensor_gpu_lib.m`; kept while Rail self-train scripts still spawn the server. |
 | `tools/metal/tensor_daemond.m` | ObjC | 20,321 | Unix-socket daemon that keeps Metal device + pipelines warm across Rail invocations (avoids ~200 ms cold-start per call). | When Rail has a long-lived process model that owns the Metal handle directly. |
 | `tools/metal/libtensor_gpu_linux_stub.c` | C | 1,807 | No-op stub exporting the ~25 `tgl_*` symbols so Linux ELF programs that `import "stdlib/tensor.rail"` link — Metal is macOS-only. | When linker-level optional symbols land in the Rail backend. |
@@ -121,42 +123,20 @@ Note: the conservative mark-sweep GC itself is **not** here — it is hand-writt
 
 ---
 
-## 7. UAV / ZEMOG (gitignored — private repo `Ledatic-Empire/zemog`)
-
-Listed here because the `find` walk surfaces them, but `tools/uav/` is gitignored and lives in a separate private repo (`feedback_drone_private.md` — drone code is never in public repos). Not part of the Rail public-thesis surface. The files are the live ZEMOG flight controller + 3D simulator + brain inference; they predate Rail and have not been ported.
-
-| Path | Lang | Bytes | Reason |
-|---|---|---|---|
-| `tools/uav/zemog.h` | C header | 90,521 | Dual-mode quadrotor physics (TRAINING / RESEARCH). |
-| `tools/uav/zemog_3d.c` | C | 47,256 | SDL2 + OpenGL 3D viewer with motor-level sim. |
-| `tools/uav/zemog_brain.c` | C | 12,403 | Headless brain training driver. |
-| `tools/uav/zemog_flight.c` | C | 11,789 | Real-world Pi Zero 2 W flight controller (MSP UART → Betaflight). |
-| `tools/uav/failsafe.h` | C header | 19,601 | Safety-critical failsafe state machine (NOMINAL → HOVER_HOLD → LAND → DISARM). |
-| `tools/uav/msp.h` | C header | 15,391 | MSP v1 (MultiWii Serial Protocol) header-only library. |
-| `tools/uav/aigp/old/pilot_impl.c` | C | 14,267 | Old Python-ctypes pilot shim (dead — superseded by Rail native brain). |
-| `tools/uav/aigp/old/pilot_ffi.h` | C header | 2,386 | Old pilot FFI ABI. |
-
-Plus ~17 files under `tools/uav/archive/` (ES, GRU/MapGRU eval kernels, weight I/O) — all dead, gitignored, retained for paper-archaeology.
-
-**Sub-total (gitignored):** 8 in-tree files / ~213 KB; archive ~12 KB more. Not part of the public Rail surface.
-
----
-
 ## Tally
 
 | Category | Files | Bytes |
 |---|---|---|
 | 1. Kernel / syscall | 4 | 101,747 |
-| 2. GPU driver interop (active) | 7 | 147,084 |
+| 2. GPU driver interop (active) | 7 | 148,084 |
 | 2. GPU driver (test scaffolds) | 5 | 29,831 |
 | 3. Framework bridges | 6 | 101,183 |
 | 4. CPU bringup (M4 + RISC-V) | 2 | 4,086 |
 | 4. v5 assembler fixtures | 5 | 1,997 |
 | 5. External device drivers | 1 | 4,571 |
 | 6. GC / concurrent runtime | 1 | 16,319 |
-| **In-tree total** | **31** | **406,818** |
-| 7. UAV (gitignored, private) | 8 | ~213,000 |
+| **In-tree total** | **31** | **407,818** |
 
 Public-thesis count: **31 non-Rail files**. Everything else in this repo — the compiler, the stdlib (94 modules), the deploy tooling, the JIT tracer, the v5 assembler, the test harness, the package manager, the docs generator — is Rail.
 
-Removable on next cleanup pass (no live caller, scaffolding only): `tensor_gpu_lib_stub.m`, `test_dylib.c`, `bench_matmul.m`, `fp16_probe.m`, `_dormant/plasma_3d_host.m`. Net would drop to 26 files / ~377 KB.
+Removable on next cleanup pass (no live caller, scaffolding only): `tensor_gpu_lib_stub.m`, `test_dylib.c`, `bench_matmul.m`, `fp16_probe.m`, `_dormant/plasma_3d_host.m`. Net would drop to 26 files / 379,573 bytes (~380 KB).

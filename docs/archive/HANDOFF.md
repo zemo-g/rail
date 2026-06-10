@@ -1,5 +1,9 @@
 # track-h-https — Handoff Prompt
 
+> **Archived.** Session handoff from the TLS 1.3 build. The work shipped in
+> v3.0.0 (`stdlib/tls.rail`, `stdlib/https_client.rail`) — see `CHANGELOG.md`.
+> Statuses and paths below are frozen as written.
+
 Copy-paste everything below this line into the next session to pick up the torch.
 
 ---
@@ -99,7 +103,7 @@ Don't merge to `next-v2.10` until ALL pass:
 - 2-pass self-compile byte-identical (fixed point).
 - `https_get` against `api.anthropic.com` returns a real HTTP status line.
 - Existing HTTP (non-S) API 100% byte-compatible.
-- socat removed from `~/.fleet/tls_proxies.sh`'s critical path (or kept as a fallback).
+- socat removed from the local TLS-proxy fallback's critical path (or kept as a fallback).
 
 ## Hard-earned lessons (READ THIS)
 

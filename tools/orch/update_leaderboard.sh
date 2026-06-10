@@ -1,5 +1,5 @@
 #!/bin/bash
-# update_leaderboard.sh — regenerate LEADERBOARD.md from all benched run cards.
+# update_leaderboard.sh — regenerate tools/orch/LEADERBOARD.md from all benched run cards.
 #
 # Reads runs/*/run_card.meta + runs/*/bench_result.meta, sorts by bench_pass
 # desc, emits a markdown table to LEADERBOARD.md. Idempotent — overwrites
@@ -12,7 +12,7 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 cd "$REPO_ROOT"
 
-LB=LEADERBOARD.md
+LB=tools/orch/LEADERBOARD.md
 TMP=$(mktemp)
 
 cat > "$TMP" <<'EOF'

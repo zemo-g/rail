@@ -1,9 +1,9 @@
 # HTTPS in Rail — Design Debate
 
 **Branch:** `track-h-https`
-**Worktree:** `~/projects/rail-https`
 **Parent:** `next-v2.10` (includes `char_from_int`, `stdlib/http_client.rail`, chunked-transfer decoder)
-**Status:** SCAFFOLD — no implementation yet. Debate first, then build.
+**Status:** SHIPPED — TLS 1.3 landed in v3.0.0 as `stdlib/tls.rail` + `stdlib/https_client.rail`
+(pure Rail, no socat). This document is the original design debate, kept as-is for the record.
 
 ## The goal
 
@@ -128,4 +128,4 @@ Before this branch merges to `next-v2.10`:
 - 2-pass self-compile byte-identical (fixed point)
 - `https_get` against api.anthropic.com returns a real 200 or 405 (MLX-style test)
 - `http_client.rail`'s existing HTTP (non-S) API is 100% byte-compatible
-- socat dependency is removed from `~/.fleet/tls_proxies.sh`'s critical path (or kept as a fallback, not required)
+- socat dependency is removed from the local TLS-proxy fallback's critical path (or kept as a fallback, not required)

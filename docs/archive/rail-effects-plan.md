@@ -295,7 +295,7 @@ effect HotReload
 
 ## CRITICAL BUG FIX (2026-03-14): HandleContext Memory Explosion
 
-The effects example crashed the Mac Mini due to exponential memory growth.
+The effects example crashed the dev machine due to exponential memory growth.
 
 **Root cause**: `HandleContext` stored `body: Expr` — every `resume` deep-cloned the entire AST. With recursive handlers, each resume doubled the allocation, causing exponential memory growth.
 
@@ -422,8 +422,5 @@ Fix both bugs BEFORE starting effects work — they're small parser/precedence f
 - **Best params**: grammar_style=example_heavy, num_examples=10, temp=0.5, builtins=true, gotchas=false
 - **36 tasks**: 9 easy (100%), 15 medium (86.7%), 12 hard (100%)
 - **2 failures**: fizzbuzz_15 (precedence bug), count_down (parser bug) — both language bugs, not model weakness
-- **27B model** (Qwen3.5-27B-Claude-Opus-Distilled-4bit) hitting same ceiling as 9B — confirms these are language bugs
-- **Autoresearch script**: `~/projects/rail-https/tools/autoresearch.py`
-- **Results**: `~/projects/rail-https/tools/autoresearch_results/results.jsonl`
-- **MLX 27B**: on :8082 (PID 97009), idle, ready for 50-100 iteration overnight run
-- **Timing**: ~20 min/iteration on 27B, so 50 iterations ≈ 17 hours, 100 ≈ 33 hours
+- **27B model** hitting the same ceiling as the 9B — confirms these are language bugs, not model weakness
+- Autoresearch script + results lived in a local dev worktree; not committed here

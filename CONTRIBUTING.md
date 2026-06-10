@@ -8,7 +8,7 @@ Rail is a real project with a narrow but honest feature set. Contributions are w
 git clone https://github.com/zemo-g/rail
 cd rail
 
-./rail_native test       # 140/140 core tests
+./rail_native test       # 170/170 core tests
 ./rail_native self       # self-compile → /tmp/rail_self
 ./rail_native self && cmp rail_native /tmp/rail_self
 # ↑ may print a one-byte-or-more difference on a clean tree; that is
@@ -42,7 +42,7 @@ The compiler is `tools/compile.rail` (~6,719 lines of Rail). It compiles itself.
 cp /tmp/rail_self ./rail_native
 
 # 4. Verify the test suite still passes.
-./rail_native test                        # must be 140/140
+./rail_native test                        # must be 170/170
 
 # 5. Verify the fixed-point property (≥2 cycles).
 ./rail_native self && cp /tmp/rail_self ./rail_native
