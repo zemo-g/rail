@@ -1,6 +1,6 @@
 # Security
 
-Rail v3.0.0 ships a pure-Rail TLS 1.3 + X.509 stack. This file documents what that means for security-minded users, and how to report issues.
+Rail has shipped a pure-Rail TLS 1.3 + X.509 stack since v3.0.0 (current release: v5.1.0). This file documents what that means for security-minded users, and how to report issues.
 
 ## Security posture (read this before deploying)
 
@@ -18,7 +18,7 @@ Rail v3.0.0 ships a pure-Rail TLS 1.3 + X.509 stack. This file documents what th
 - Fine for fleet-to-fleet traffic you control.
 - **Not** fine for handling third-party user traffic, client-certificate authentication, or anything where a sophisticated adversary can observe your process.
 
-If you're evaluating this for any kind of production deployment, use OpenSSL / rustls / boringssl instead. Rail v3.0.0's HTTPS is for *Rail* — for the language itself to talk to the world. It is not a general-purpose TLS library.
+If you're evaluating this for any kind of production deployment, use OpenSSL / rustls / boringssl instead. Rail's HTTPS is for *Rail* — for the language itself to talk to the world. It is not a general-purpose TLS library.
 
 ## Cryptographic primitives shipped
 
@@ -45,7 +45,7 @@ Every one is validated against NIST or RFC test vectors. See `tools/tls/*.rail`.
 If you find a real security issue:
 
 1. **Do not open a public GitHub issue.**
-2. Email the maintainer at `zemo-g@users.noreply.github.com`. A plaintext email is fine — Rail's threat model doesn't yet include encrypted reports as a hard requirement.
+2. Email the maintainer at `z3m0g@icloud.com` (a monitored mailbox). A plaintext email is fine — Rail's threat model doesn't yet include encrypted reports as a hard requirement.
 3. Include a minimal reproducer. A Rail program that exhibits the bug is ideal; a test vector + expected-vs-actual output is next best.
 4. Expect an acknowledgement within a few days. Fixes land on `master` and get tagged as a point release.
 
@@ -53,7 +53,7 @@ Non-security bugs (including crypto correctness issues that aren't exploitable) 
 
 ## Scope
 
-Rail v3.0.0's TLS is in scope for security reports. So is the cert chain walker, the `/etc/ssl/cert.pem` loader, and the URL-parser surface in `stdlib/https_client.rail`.
+Rail's TLS stack — v3.0.0 through the current v5.1.0 — is in scope for security reports. So is the cert chain walker, the `/etc/ssl/cert.pem` loader, and the URL-parser surface in `stdlib/https_client.rail`. The latest tagged release (v5.1.0) is the supported version; older tags get fixes only by re-tagging forward.
 
 Out of scope:
 

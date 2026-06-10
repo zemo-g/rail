@@ -257,7 +257,7 @@ Things Rail **doesn't** do, so you don't hit them as surprises:
 
 ## License
 
-[Business Source License 1.1](LICENSE). Free for non-production use; the Additional Use Grant covers research, education, and personal projects. Converts to Apache 2.0 on 2030-04-06.
+[Business Source License 1.1](LICENSE). Free to copy, modify, and use for non-production purposes; the Additional Use Grant permits production use as long as it doesn't include offering Rail to third parties on a hosted or embedded basis competitive with the Licensor's products. Converts to the MIT License on 2030-03-14. The LICENSE file is authoritative.
 
 ## Notes
 
