@@ -46,7 +46,8 @@
 (escape_sequence) @string.escape
 
 ; Identifiers
-(func_decl name: (identifier) @function)
+; func_decl declares no fields; the first named child is the function name
+(func_decl . (identifier) @function)
 (constructor_name) @type
 (type_name) @type
 (return_type) @type.builtin

@@ -16,7 +16,7 @@ labels: bug
 **Environment**
 
 - OS + arch (e.g. `macOS 15 / ARM64`):
-- `./rail_native --version` or commit SHA of `rail_native`:
+- Commit (`git rev-parse --short HEAD`) and release tag, if any:
 - Test suite status (`./rail_native test`):
 - Self-compile fixed point (`./rail_native self && cmp rail_native /tmp/rail_self`):
 

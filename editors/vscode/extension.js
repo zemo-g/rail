@@ -13,8 +13,9 @@ function activate(context) {
 
     // Try to find the LSP server. Priority:
     // 1. Explicit rail.lspPath setting
-    // 2. Python LSP server relative to extension (tools/lsp_server.py)
-    // 3. Fall back to `rail lsp` command
+    // 2. Python LSP server relative to workspace or extension (tools/lsp_server.py)
+    // If neither is found, syntax highlighting still works; the LSP
+    // client is simply not started.
     let serverOptions;
 
     const explicitLspPath = config.get('lspPath', '');
@@ -56,13 +57,12 @@ function activate(context) {
                 transport: TransportKind.stdio
             };
         } else {
-            // Fall back to rail binary with lsp subcommand
-            const railPath = config.get('path', 'rail');
-            serverOptions = {
-                command: railPath,
-                args: ['lsp'],
-                transport: TransportKind.stdio
-            };
+            // No LSP server found. There is no `rail lsp` subcommand —
+            // the server lives at tools/lsp_server.py in the rail repo.
+            vscode.window.showWarningMessage(
+                'Rail LSP server not found. Set "rail.lspPath" to the path of tools/lsp_server.py from the rail repository. Syntax highlighting works without it.'
+            );
+            return;
         }
     }
 
