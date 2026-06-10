@@ -169,6 +169,31 @@ for m in $members; do
 done
 removed=$(printf '%s' "$removed" | awk '{$1=$1};1')
 
+# ── Optional jumbo frames ───────────────────────────────────────────────────
+# ~/.fleet/tb-mtu (same path resolution as tb-ip): desired MTU for the TB
+# fabric, e.g. 9000.  Applied to each bridged peer, then bridge0.  No file →
+# no-op (kernel default 1500).  Reconciled every pass, so it survives reboots
+# and re-cables.  Rollout order matters on the chain: raise the MIDDLE node
+# first — TCP MSS keeps frames ≤1500 until both endpoints raise, but a 1500
+# middle drops jumbo frames it must forward.
+TB_MTU_FILE=""
+for f in /var/root/.fleet/tb-mtu /Users/*/.fleet/tb-mtu; do
+  [ -f "$f" ] && TB_MTU_FILE="$f" && break
+done
+TB_MTU=$(cat "$TB_MTU_FILE" 2>/dev/null | tr -d '[:space:]')
+if [ -n "$TB_MTU" ]; then
+  for i in $real_peers bridge0; do
+    cur=$(ifconfig "$i" 2>/dev/null | awk 'NR==1 {for(j=1;j<=NF;j++) if($j=="mtu") print $(j+1)}')
+    if [ -n "$cur" ] && [ "$cur" != "$TB_MTU" ]; then
+      if ifconfig "$i" mtu "$TB_MTU" >/dev/null 2>&1; then
+        log "$i mtu $cur->$TB_MTU"
+      else
+        log "$i mtu set failed (wanted $TB_MTU, still $cur)"
+      fi
+    fi
+  done
+fi
+
 # ── Unstick TB Bridge service if bridge0 is inactive ────────────────────────
 # Rate-limited via a touchfile to avoid thrashing on genuinely unplugged
 # nodes.  Only toggle once every 5 minutes.
