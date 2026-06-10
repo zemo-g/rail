@@ -5122,13 +5122,13 @@ import "stdlib/<name>.rail"
 
 ## `stdlib/parallel.rail`
 
-### `parallel_default_conc_mini`
+### `parallel_default_conc_shared`
 
 > Default concurrency. Tune per host via the explicit max_conc arg;
 > e.g. 10 on a machine that also runs a GPU inference server (leave
 > headroom), 16 on a 16-P-core machine (matches the P-core budget).
 
-### `parallel_default_conc_studio`
+### `parallel_default_conc_dedicated`
 
 
 ### `parallel_default_timeout`
