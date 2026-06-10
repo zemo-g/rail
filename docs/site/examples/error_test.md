@@ -26,12 +26,14 @@ main =
 **Output:**
 
 ```
-Compiling examples/error_test.rail (206 chars)...
+Compiling examples/error_test.rail (318 chars)...
   as: OK
   ld: Undefined symbols for architecture arm64:
-/bin/sh: /tmp/rail_out: No such file or directory
+  "_RAIL_UNDEFINED_IDENT_y", referenced from:
+      _bad_func in rail_build_XXXXXX.o
+ld: symbol(s) not found for architecture arm64
 ```
 
-The assembler accepts the code (because Rail emits a label reference for `y` without checking), and the linker (`ld`) is the one that catches the missing symbol. The trailing `/bin/sh: /tmp/rail_out: ...` is the driver trying to execute a binary that was never produced.
+The assembler accepts the code (because Rail emits a label reference for `y` without checking), and the linker (`ld`) is the one that catches the missing symbol — note the symbol name itself tells you what went wrong: `_RAIL_UNDEFINED_IDENT_y`, i.e. the undefined identifier was `y`, referenced from `bad_func`.
 
 In normal practice, parse errors are caught earlier with `file:line:col: error:` formatting before assembly. This example demonstrates the late-stage "undefined symbol" path.
