@@ -30,7 +30,7 @@ Linux ARM64 and Linux x86_64 work as cross-compile targets; WASM too. See `./rai
 
 ## The bar for a compiler patch
 
-The compiler is `tools/compile.rail` (~6,719 lines of Rail). It compiles itself. Every change goes through this loop:
+The compiler is `tools/compile.rail` (~8,049 lines of Rail — `wc -l` to reproduce). It compiles itself. Every change goes through this loop:
 
 ```bash
 # 1. Edit tools/compile.rail.
@@ -94,8 +94,8 @@ For bigger changes, opening an issue first to talk about the approach saves time
 
 ## Reporting security issues
 
-See [SECURITY.md](SECURITY.md). Rail v3.0.0 is **not** constant-time and has no side-channel-resistance guarantees. Don't deploy the crypto to side-channel-sensitive environments; that's not what it's for.
+See [SECURITY.md](SECURITY.md). Rail's crypto/TLS stack is **not** constant-time and has no side-channel-resistance guarantees. Don't deploy the crypto to side-channel-sensitive environments; that's not what it's for.
 
 ## License
 
-By contributing, you agree your contributions are licensed under the same terms as Rail (Business Source License 1.1, converts to Apache 2.0 on 2030-04-06). See [LICENSE](LICENSE).
+By contributing, you agree your contributions are licensed under the same terms as Rail (Business Source License 1.1, converts to the MIT License on 2030-03-14). See [LICENSE](LICENSE) — it is the authoritative text.

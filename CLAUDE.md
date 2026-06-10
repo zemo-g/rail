@@ -2,20 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Output Discipline
-
-- Keep responses concise to avoid hitting the 500 output token limit; chunk long outputs across multiple turns.
-- Avoid verbose explanations and large code dumps in chat — prefer bullet points and structured reports.
-- When delivering reports/handoffs, or pasting prompt content/artifacts, write to a file rather than dumping inline.
-
-## Environment
-
-This machine is the Mac Studio (not the Mini). When working on Thunderbolt bridge / Studio↔Mini coordination, confirm host with `hostname` before assuming a side. Parallel session prompts labeled for other lanes (Stream 4, Session B, Mini-side) should be declined unless explicitly retargeted.
-
 ## Project Conventions
 
 - This is a Rail-on-Rail project: write tooling and helpers in pure Rail, not Python or other languages, unless explicitly asked.
-- Before assuming you're on Mini vs Studio, check `hostname` — sessions often run on Studio.
+- Training infrastructure and the website live in separate repositories; this repo is the compiler, stdlib, and core tools.
 
 ## Verification Discipline
 
@@ -27,17 +17,12 @@ Before declaring a hypothesis confirmed, run the falsification test (e.g., for f
 - Read the actual runtime artifact (asm, logs, sentinel files like .no_gpu) before theorizing about exotic causes.
 - When a benchmark or measurement looks like a breakthrough, suspect a measurement bug first.
 
-## Session Resumption
-
-- At session start, check for a handoff doc (HANDOFF.md, NEXT_SESSION.md, or recent commit messages) before exploring.
-- Verify branch state with `git log --oneline -10` and `git status` before claiming what's merged — don't trust stale memory.
-
 ## Rail Compiler
 
 Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64, x86_64, and Linux ARM64.
 
-- **Compiler source**: `tools/compile.rail` (~6,719 lines, 335 functions)
-- **Seed binary**: `rail_native` (729K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
+- **Compiler source**: `tools/compile.rail` (~8,049 lines, ~583 functions)
+- **Seed binary**: `rail_native` (~1.2 MB ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
 - **Native floats (v2.0)**: unboxed IEEE 754 doubles in ARM64 d-registers. No heap allocation. `fadd`/`fmul`/`fdiv`/`fcmp` directly. Float arrays, foreign float calls (`sin`/`cos`/`tanh`/`sqrt`), auto int→float promotion.
 - **REPL**: `./rail_native run tools/repl.rail` — interactive, persistent definitions
 - **HTTP server**: `stdlib/http_server.rail` + `tools/http_demo.rail` — compile handler binary, serve via `tools/http_server.py`
@@ -48,15 +33,15 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 - **Effect handlers**: `try body handler` — setjmp/longjmp non-local error recovery. Deep unwinding, nested handlers.
 - **Type checker**: Forward inference pass emits warnings (not errors) for: head/tail on non-list, arithmetic on non-numeric, wrong arity, calling non-functions.
 - **Package manager**: `import math` (bare imports), `rail get github.com/...`, `rail pkg` reads `rail.toml`.
-- **Tests**: `./rail_native test` — 170 tests, should be 170/170. Count fluctuates only when concurrent sessions collide on `/tmp/rail_out` — rerun to confirm. (Was 137 prior to 2026-05-12; t132/t133/t134 cover 3-/4-movk integer literal codegen. t135 added 2026-05-22 — `float_user_fn_sqrt_arg`, locks the conservative mark_float_params pass.)
+- **Tests**: `./rail_native test` — the suite must fully pass (currently 170 tests). Count fluctuates only when concurrent sessions collide on `/tmp/rail_out` — rerun to confirm.
 - **Checkpoints**: `stdlib/checkpoint.rail` — `save_checkpoint prefix weights adams step best_val` + `load_checkpoint` / in-place `load_model_into` / `load_adam_states_into`. Atomic via `<prefix>.committed` sentinel. `corpus_split text val_pct` for eval splits. `tools/train/lm_transformer.rail:run_segments` wires resume + periodic checkpoint into the training loop.
 - **Performance**: Tail-recursive loops match C -O2 (5 instructions/iteration). Self-loop optimization, untagged register params, bottom-test with `subs`.
-- **Targets**: macOS ARM64 (native), Linux ARM64 (Pi Zero), Linux x86_64 (cross-compile)
+- **Targets**: macOS ARM64 (native), Linux ARM64, Linux x86_64, Metal GPU, WASM, Cortex-M4, RISC-V
 
 ### Key Commands
 
 ```bash
-./rail_native test                    # run 170-test suite
+./rail_native test                    # run the full test suite (currently 170 tests)
 ./rail_native self                    # self-compile → /tmp/rail_self (must be byte-identical)
 ./rail_native run file.rail           # compile + execute
 ./rail_native file.rail               # compile only → /tmp/rail_out
@@ -142,7 +127,7 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 After editing `tools/compile.rail`:
 1. `./rail_native self` — self-compile
 2. `cp /tmp/rail_self rail_native` — install new binary
-3. `./rail_native test` — verify 170/170
+3. `./rail_native test` — verify the suite fully passes (currently 170 tests)
 4. `./rail_native self && cmp rail_native /tmp/rail_self` — verify fixed point. **Needs ≥2 cycles**: gen0's shipped runtime asm doesn't necessarily match what gen0's source emits, so cycle 1 typically differs. Cycle 2 always lands the byte-identical fixed point (gen2 == gen3 == gen4). See `notes/bootstrap_convergence_audit_2026-05-13.md` for the empirical proof. Verify by running self twice after installing and `cmp`-ing the two outputs.
 
 **NOTE**: Self-compile works cleanly since the 256MB stack fix. No gen2_head bootstrap needed.
@@ -186,7 +171,7 @@ Seven foundation tools landed via parallel-v0 workflow. **Use them. Don't redo t
 | Pkg manifest | `tools/pkg/` — `pkg_resolve.rail`, `pkg_link.rail`, INI manifest `rail.toml` | Multi-package projects. Local-path deps only in v0. Spec in `tools/pkg/SPEC.md` |
 | Stdlib docs | `./rail_native run tools/docs/gen_stdlib_ref.rail` | After any stdlib edit, regen `docs/site/stdlib.md` |
 
-Public docs: **https://ledatic.org/rail/docs/** — md→html build + deploy recipe in memory entry `docs_deploy_rail.md`.
+Public docs: **https://ledatic.org/rail/docs/**
 
 ### Recent emit-class gotchas surfaced by foundations work
 
@@ -195,19 +180,11 @@ Public docs: **https://ledatic.org/rail/docs/** — md→html build + deploy rec
 - **3-movk codegen** (FIXED 2026-05-12, `feat/c-3-movk-literals`): `emit_load_int` at `compile.rail:829` now emits movz + up to 3 movk chunks (bits 0-15, 16-31, 32-47, 48-63), with zero chunks at >=#32 skipped. Both positive (`movz`+`movk`) and negative (`movn`+`movk` with inverted bits) paths handle the full 64-bit range. Regression tests: t132 (3-movk), t133 (4-movk), t134 (4-movk negative). Note: `k16/k32/k48` constants computed via `shl 1 N` so `opt` constant-folding doesn't bake them as 64-bit literals the seed can't emit.
 - **Stale FFI dylib at link time** (FIXED 2026-05-16): when ld errors point to an unrelated Rail function (e.g. `_mul_acc in rail_build_XXXXXX.o` referenced from when the real undefined symbol is `_tgl_matmul_bf16`), the "referenced from" is the nearest preceding label, not the actual call site. Root cause is usually a stale `tools/metal/libtensor_gpu.dylib` (or sibling) that lacks symbols added to the `.m`/`.c` source since last rebuild. `compile.rail`'s `ensure_fresh_dylib` helper now auto-rebuilds when source mtime exceeds dylib mtime; manual rebuild scripts live at `tools/metal/build_tensor_gpu.sh`, `tools/runtime/build_concurrent.sh`, `tools/desk/build_quartz_bridge.sh`, `jit/build_trampoline.sh`. All four dylibs are gitignored (per-machine artifacts).
 
-## Related repos
-
-Rail is the compiler + stdlib. A few things that used to live here moved out on 2026-04-20:
-
-- **Training infrastructure** → [`Ledatic-Empire/rail-training`](https://github.com/Ledatic-Empire/rail-training) (private). Flywheel orchestrator, dataset pipeline, model cards, small corpora. Weights kept on disk, not in git. Depends on `rail_native` + stdlib from this repo.
-- **Website source** → [`Ledatic-Empire/ledatic-site`](https://github.com/Ledatic-Empire/ledatic-site) (public). Hand-rolled HTML/CSS/JS/GLSL for ledatic.org, plus the Cloudflare Worker. Dynamic pages (mission control, changelog, plasma landing) still generated from `tools/deploy/gen_*.rail` here.
-- **UAV / AIGP** → [`Ledatic-Empire/zemog`](https://github.com/Ledatic-Empire/zemog) (private). Nested at `tools/uav/` in the working tree (gitignored).
-
 ## Self-training (in tree)
 
 `tools/train/self_train.rail` is a compiler-verified self-training loop: an LLM generates Rail, `rail_native` compiles it, passes get harvested. 25 levels, auto-advances at 80%+ for 3 rounds, falls back on 2 zero rounds. `stdlib/llm.rail` + `stdlib/anthropic_client.rail` + `stdlib/mlx_client.rail` provide the LLM clients over pure-Rail TLS.
 
-Runners and data live in `Ledatic-Empire/rail-training`; the library code that makes them possible lives here (`stdlib/autograd.rail`, `stdlib/transformer.rail`, `stdlib/optim.rail`, `stdlib/checkpoint.rail`, `stdlib/bpe.rail`, `stdlib/tokenizer.rail`).
+Training runners and data live in a separate repository; the library code that makes them possible lives here (`stdlib/autograd.rail`, `stdlib/transformer.rail`, `stdlib/optim.rail`, `stdlib/checkpoint.rail`, `stdlib/bpe.rail`, `stdlib/tokenizer.rail`).
 
 ## Site generation (dynamic pages)
 
@@ -219,7 +196,7 @@ Runners and data live in `Ledatic-Empire/rail-training`; the library code that m
 ./rail_native run tools/deploy/daily_deploy.rail           # cron orchestrator
 ```
 
-Pure-static pages live in `Ledatic-Empire/ledatic-site` and deploy with a shell script there.
+Pure-static pages live in the separate website repository and deploy with a shell script there.
 
 ## Cross-compile (Linux ARM64 for Pi Zero / similar)
 
