@@ -1729,7 +1729,7 @@ import "stdlib/<name>.rail"
 ### `dns_set_recv_timeout fd secs`
 
 > Set SO_RCVTIMEO on the UDP socket so a missing reply doesn't hang
-> the process forever (Tailscale's MagicDNS occasionally drops UDP
+> the process forever (some VPN/DNS setups occasionally drop UDP
 > packets; without this, dns_resolve_a blocks indefinitely on retry
 > queries).  macOS BSD: SOL_SOCKET = 0xFFFF, SO_RCVTIMEO = 0x1006.
 > Argument is `struct timeval { time_t tv_sec; suseconds_t tv_usec; }`

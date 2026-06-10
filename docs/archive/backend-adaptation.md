@@ -1,10 +1,6 @@
----
-name: backend-adaptation
-description: How Rail's compiler adapts to new hardware — the codegen architecture and porting playbook
-type: reference
----
-
 ## Rail Backend Adaptation Playbook
+
+> **Status (2026-06):** retrospective. The x86_64 backend described here as future work shipped — it lives in tools/compile.rail (x86_64 BACKEND section). Kept as a porting case study.
 
 ### Compiler Architecture (compile.rail)
 
@@ -78,8 +74,8 @@ The compiler is a 4-stage pipeline. Only stage 3 and 4 are hardware-specific:
 2. **Start with subset**: integer arithmetic, print, function calls, if/else
 3. **Emit AT&T syntax x86_64 assembly** (GAS format, same as ARM64 uses GAS)
 4. **Use `tools/x86_libc.s`** — syscall-based libc (same pattern as linux_libc.s but x86_64 syscall numbers)
-5. **Cross-assemble**: install `x86_64-elf-as` + `x86_64-elf-ld` (or use Razer's native `as`)
-6. **Test**: `scp /tmp/rail_x86 <retired-host>:~ && ssh <retired-host> "./rail_x86"`
+5. **Cross-assemble**: install `x86_64-elf-as` + `x86_64-elf-ld` (or any x86_64 Linux host's native `as`)
+6. **Test**: copy `/tmp/rail_x86` to any x86_64 Linux host and run it
 7. **Expand**: strings, lists, closures, ADTs, I/O — one feature at a time
 8. **Integrate**: add `build_x86` to compile.rail, dispatch via `./rail_native x86 file.rail`
 
@@ -92,6 +88,3 @@ The compiler is a 4-stage pipeline. Only stage 3 and 4 are hardware-specific:
 - **PIC/PIE** — use `[rip+symbol]` for position-independent code
 - **Format strings** — `%ld` → `%ld` (same), but `_printf` → `printf` (no underscore on Linux)
 - **Syscall numbers differ** — Linux x86_64: write=1, read=0, exit=60 (vs ARM64: write=64, read=63, exit=93)
-
-**Why:** This playbook makes any future backend a mechanical translation, not a research project.
-**How to apply:** When starting x86_64, follow the map line by line. Each ARM64 pattern has an exact x86_64 equivalent.
