@@ -111,7 +111,7 @@ _rail_print:
 
 ### Why strings work *most* of the time
 
-Rail string literals are emitted as `.asciz` followed by `.p2align 2`. That puts them at 4-byte aligned addresses, which have `LSB=0` and `bit 1 = 0`. Good — the heap path fires, the first 8 bytes of "/Users/l..." are 0x6C2F73726573552F which ≠ 6, and `printf("%s")` runs.
+Rail string literals are emitted as `.asciz` followed by `.p2align 2`. That puts them at 4-byte aligned addresses, which have `LSB=0` and `bit 1 = 0`. Good — the heap path fires, the first 8 bytes of "/Users/l..." are 0x6C2F73726573552F which ≠ 6, and `printf("%s")` runs. <!-- leak-guard-allow: quoted captured bytes from the original debug session -->
 
 `read_file`, `shell`, `cat`, `join` and friends all go through `_rail_alloc` / `_malloc` which return 8-byte-aligned pointers. LSB always 0. Always takes the heap path. Always works.
 

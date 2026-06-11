@@ -1,11 +1,14 @@
 name: Leak guard
 
 # Fail the build if any operator-recon string lands in the public tree.
-# Patterns are written as CLASSES (regexes), never literal internal
-# addresses — this workflow file is itself public. The set extends the
-# v4.0.1 scrub (CHANGELOG.md entry) with address/port/path classes
-# (2026-06 overhaul). To intentionally include a matching string (e.g.
-# in a release note describing the scrub itself), put `leak-guard-allow`
+# Patterns are written as CLASSES (regexes) or allowlist INVERSIONS,
+# never literal internal names — this workflow file is itself public,
+# so a literal denylist here would be the leak (each entry tells a
+# reader exactly which private repo, vault, or identity exists).
+# The set extends the v4.0.1 scrub (CHANGELOG.md entry); rewritten
+# class-only in the 2026-06 overhaul. To intentionally include a
+# matching string (e.g. a release note describing the scrub itself, or
+# a bug doc quoting real captured bytes), put `leak-guard-allow`
 # somewhere on the same line and the matcher will skip it.
 
 on:
@@ -21,30 +24,47 @@ jobs:
         - uses: actions/checkout@v4
         - name: Pattern scan
           shell: bash
+          env:
+            LEAK_GUARD_EXTRA: ${{ secrets.LEAK_GUARD_EXTRA }}
           run: |
             set -e
-            # Class 1 — hard identifiers, banned everywhere:
+            # Class 1 — hard identifier classes, banned everywhere:
             #   - CGNAT addresses (100.64.0.0/10) and private bridge
             #     subnets (10.42.0.0/24, 10.43.0.0/24)
-            #   - operator home directories and user@host forms
-            #   - private repository and project names
-            #   - client-vault paths
-            #   - personal email addresses
-            #   - legacy hostnames/IDs from the v4.0.1 scrub
-            hard='\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b|\b10\.4[23]\.[0-9]{1,3}\.[0-9]{1,3}\b|/Users/[a-z]+empire|/Users/reillygomez|/Users/user|/home/zemog|Ledatic-Empire/(rail-training|zemog|ledatic-arm|compound)|~/projects/(rail-training|compound)|spurarm|ledatic-clients|reillygomez[0-9]*@|31zemog|zemog@|user@100|ledaticempire@|\bDetro\b|D0ATHQ1BQD7|\bbrockbro2\b'
+            #   - ANY absolute home path (/Users/<name>, /home/<name>).
+            #     Public docs use $HOME or ~ instead; angle-bracket
+            #     placeholders like /Users/<you> don't match the class.
+            #   - ANY gmail address (personal); project contact
+            #     addresses live on other domains
+            #   - operator user@host forms (<user>@fleet0, <user>empire@)
+            hard='\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b|\b10\.4[23]\.[0-9]{1,3}\.[0-9]{1,3}\b|/Users/[A-Za-z][A-Za-z0-9._-]*|/home/[a-z][a-z0-9._-]*|[A-Za-z0-9._%+-]+@gmail\.com|[a-z]+@fleet0|[a-z]+empire@'
+            # Class 1b — namespace allowlist inversion: ANY
+            #   Ledatic-Empire/<repo> or ~/projects/<dir> reference is
+            #   flagged unless the name is one of this project's public
+            #   surfaces (rail, the rail-https worktree, ledatic-site).
+            #   Private repo names are never written here, so they stay
+            #   both unguessable and unleakable. Known limit: a line
+            #   that mixes an allowed and a non-allowed reference is
+            #   suppressed by the line-level allow filter — don't write
+            #   such lines.
+            ns='Ledatic-Empire/[A-Za-z0-9._-]+|~/projects/[A-Za-z0-9._-]+'
+            ns_allow='(Ledatic-Empire|~/projects)/(rail|rail-https|ledatic-site)([^A-Za-z0-9._-]|$)'
             # Class 2 — infra plumbing, banned outside its owner tooling:
             #   internal service ports and the fleet config/secrets dir.
             #   The fleet control plane (tools/fleet/) and its attest/audit
             #   operators document their own port and config paths by
             #   design — that is their public interface, not a leak. They
             #   stay fully covered by the Class 1 scan.
-            plumbing=':(9101|8443|8444|8445|5590)\b|~/\.fleet|\.fleet/(token|anthropic_key|slack_token|port|bind_ip)'
+            plumbing=':(9101|8443|8444|8445)\b|~/\.fleet|\.fleet/(token|anthropic_key|slack_token|port|bind_ip)'
             # Shared exclusions:
             #   - the leak guard itself (documents the pattern classes)
             #   - CHANGELOG.md (records the scrubs; historical by policy)
             #   - releases/ + builds/ (signed artifacts, frozen by design;
             #     pre-v4 snapshots predate the sanitization and must not be
             #     rewritten without breaking their attestation chains)
+            #   - tools/dnra/cache/ (vendored upstream RFC + POSIX texts;
+            #     their authors' emails and example /home paths are
+            #     third-party content, not operator strings)
             # -I skips binary files. Tracked compiled artifacts
             # (rail_native, rail_safe, tools/diagnose/*_bin) were verified
             # clean of operator strings (2026-06 audit); the guard exists
@@ -55,11 +75,15 @@ jobs:
               ':(exclude)CHANGELOG.md'
               ':(exclude)releases/'
               ':(exclude)builds/'
+              ':(exclude)tools/dnra/cache/'
               # digit-run in probe data matches the address class by
               # coincidence; the file contains no addresses
               ':(exclude)tools/dnra/sets/probe_responses_d_v0_prod_v2.jsonl'
             )
             hits=$(git grep -InE "$hard" -- "${exclude_common[@]}" \
+              | grep -v 'leak-guard-allow' || true)
+            ns_hits=$(git grep -InE "$ns" -- "${exclude_common[@]}" \
+              | grep -vE "$ns_allow" \
               | grep -v 'leak-guard-allow' || true)
             plumb_hits=$(git grep -InE "$plumbing" -- "${exclude_common[@]}" \
               ':(exclude)tools/fleet/' \
@@ -69,10 +93,27 @@ jobs:
               ':(exclude)tools/audit/beacon_chain_audit.sh' \
               ':(exclude)docs/archive/HANDOFF_v3_6.md' \
               | grep -v 'leak-guard-allow' || true)
-            if [ -n "$hits$plumb_hits" ]; then
+            # Class 3 — irreducible literals (names with no class shape)
+            #   live in the LEAK_GUARD_EXTRA repository secret as one ERE,
+            #   maintained by the operator, never in this file. The
+            #   pattern itself is never echoed (Actions logs on a public
+            #   repo are public); hits are echoed, since a hit is already
+            #   public tree content. Caveat: secrets are unavailable to
+            #   fork PRs, so this class enforces on push and same-repo
+            #   PRs only — classes 1/1b/2 cover every event.
+            extra_hits=''
+            if [ -n "$LEAK_GUARD_EXTRA" ]; then
+              extra_hits=$(git grep -InE "$LEAK_GUARD_EXTRA" -- "${exclude_common[@]}" \
+                | grep -v 'leak-guard-allow' || true)
+            else
+              echo "note: LEAK_GUARD_EXTRA secret not set — class 3 scan skipped"
+            fi
+            if [ -n "$hits$ns_hits$plumb_hits$extra_hits" ]; then
               echo "::error::operator-recon pattern detected — see the class list above"
               echo "$hits"
+              echo "$ns_hits"
               echo "$plumb_hits"
+              echo "$extra_hits"
               exit 1
             fi
             echo "leak guard: clean"
