@@ -11,11 +11,11 @@ the command that reproduces it.
 
 | Entry | Purpose |
 |---|---|
-| `tools/` | Everything Rail-source-but-not-compiler-or-stdlib. The compiler itself lives here (`tools/compile.rail` — `wc -l` → 8,049 lines), plus 38 subdirectories cataloged in the next table, plus root-level tools: the REPL (`repl.rail`, `repl_jit.rail`), LSP (`lsp.rail`, `lsp_server.rail`), package manager driver (`pkg.rail`), HTTP demo, sandbox server, and the runtime `.s` shims listed in `SHIMS.md`. The kitchen. |
+| `tools/` | Everything Rail-source-but-not-compiler-or-stdlib. The compiler itself lives here (`tools/compile.rail` — `wc -l` → 8,049 lines), plus 39 subdirectories cataloged in the next table, plus root-level tools: the REPL (`repl.rail`, `repl_jit.rail`), LSP (`lsp.rail`, `lsp_server.rail`), package manager driver (`pkg.rail`), HTTP demo, sandbox server, and the runtime `.s` shims listed in `SHIMS.md`. The kitchen. |
 | `stdlib/` | Rail's standard library — 94 modules (`ls stdlib/*.rail \| wc -l`). Everything `import`-able. |
-| `examples/` | Hand-curated `.rail` programs that demonstrate language features — 24 files (`ls examples/*.rail \| wc -l`), plus `wasm/` demo assets. |
+| `examples/` | Hand-curated `.rail` programs that demonstrate language features — 24 files (`ls examples/*.rail \| wc -l`), plus `wasm/` demo assets, `readme/` (the README's code blocks as compilable, receipt-checked files), and `examples/README.md` (per-example receipt table — including the known-broken ones). |
 | `tests/` | Placeholder dir; the actual test corpus is embedded in `tools/compile.rail` as `run_test` calls. See `tests/README.md`. |
-| `docs/` | Current-truth documentation — `site/` (rendered docs: quickstart, stdlib, backends, JIT), design docs, and `docs/archive/` for dated retros, closed investigations, and the GitHub Linguist submission materials (`archive/linguist-pr/`). |
+| `docs/` | Current-truth documentation — `VERIFY.md` (the trust manual: what an attestation proves and does not, how to verify offline), `RELEASE_LEDGER.md` (generated all-tags table, `tools/attest/gen_release_ledger.sh`), `site/` (rendered docs: quickstart, stdlib, backends, JIT), design docs, and `docs/archive/` for dated retros, closed investigations, and the GitHub Linguist submission materials (`archive/linguist-pr/`). |
 | `grammar/` | EBNF grammar (`rail.ebnf`) derived from `tools/compile.rail`'s parser, for grammar-constrained LLM decoding. One file. |
 | `editors/` | Editor integrations (`vscode/` — TextMate grammar + language configuration). |
 | `tree-sitter-rail/` | Tree-sitter grammar for syntax highlighting. `src/parser.c` is generated output, not hand-written C. |
@@ -23,12 +23,12 @@ the command that reproduces it.
 | `notes/` | Durable technical references — bootstrap-convergence audit, v5 feasibility, x86 conformance classification, the `v5_macho_ref/` Mach-O layout bundle used by the self-hosted emitter. Dated session handoffs live in `docs/archive/` per the convention below. |
 | `releases/` | One subdirectory per attested ref — 47 entries (`ls releases \| wc -l`), mostly tagged releases plus a few attested dev builds and the pinned witness-node key — holding the Ed25519 attestation JSONs + `index.json`. The signed bytes (`rail_native` + `compile.rail`) are recoverable from each git tag, so HEAD keeps only the proof. Published to `ledatic.org/releases/`. |
 | `builds/` | One subdirectory per attested intermediate build — 13 entries (`ls builds \| wc -l`) — `result.json` plus, for all but one entry, its attestation; no binary. The build-time analogue of `releases/`, for non-tagged commits. |
-| `selfhost/` | Self-host fixed-point attestation artifacts — 12 entries (`ls selfhost \| wc -l`) — proof that a given `rail_native` 2-pass-compiles itself byte-identically. |
+| `selfhost/` | Self-host fixed-point attestation artifacts — 12 record dirs plus `README.md` — proof that a given `rail_native` 2-pass-compiles itself byte-identically. Never edited or re-signed; see `selfhost/README.md`. |
 | `archive/` | **Gitignored.** Local-only retention for stale artifacts moved out of the public tree. |
 
 ## tools/ subdirectories
 
-All 38, one line each (`ls -d tools/*/`).
+All 39, one line each (`ls -d tools/*/`).
 
 | Entry | Purpose |
 |---|---|
@@ -62,6 +62,7 @@ All 38, one line each (`ls -d tools/*/`).
 | `tools/pkg/` | Package manager internals (`pkg_resolve.rail`, `pkg_link.rail`) + `SPEC.md`. |
 | `tools/plasma/` | MHD plasma simulations — Metal compute hosts, WASM renderer, beacon daemons, live viewers. |
 | `tools/playground/` | Public Rail playground: sanitizer + compile server (HTTP handler). |
+| `tools/prove/` | `prove.sh` — the claim→receipt runner. One shell function per public claim (`R01`…); `--list` regenerates root `PROOFS.md`. |
 | `tools/railml/` | ML data/eval pipeline for Rail code generation (Python tooling + MSL kernels). |
 | `tools/runtime/` | Concurrent runtime shim — C channels + pthreads behind `stdlib/concurrent.rail` (see `SHIMS.md` §6). |
 | `tools/test/` | Standalone `.rail` test programs (69 entries) beyond the embedded suite. |
@@ -76,6 +77,7 @@ All 38, one line each (`ls -d tools/*/`).
 | Entry | Purpose |
 |---|---|
 | `README.md` | Project intro. The first thing a stranger reads. |
+| `PROOFS.md` | Generated claim→receipt table (`bash tools/prove/prove.sh --list`). Do not hand-edit. |
 | `CHANGELOG.md` | Per-version release notes. Canonical — tag annotations and commit messages reference this. |
 | `CLAUDE.md` | Briefing for Claude Code sessions working in this repo. Project conventions, bootstrap pattern, current test count. |
 | `CONTRIBUTING.md` | How to send a patch. |

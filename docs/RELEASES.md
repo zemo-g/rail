@@ -1,4 +1,8 @@
-# Releases — operational runbook
+# Releases — cutting + signing runbook (operators)
+
+> **Verifying a release?** You want [`docs/VERIFY.md`](VERIFY.md) (the trust
+> manual) and [`docs/RELEASE_LEDGER.md`](RELEASE_LEDGER.md) (the generated
+> all-tags table). This page is the operator-side recipe for *cutting* one.
 
 Every Rail release is signed against a live entropy beacon by the
 fleet0 witness. This page is the recipe — read it before cutting a
@@ -6,7 +10,7 @@ release, and especially before cutting one from a fresh worktree.
 
 ## What a release looks like
 
-For a tag `vX.Y.Z`:
+For a tag `vX.Y.Z`, the signing flow produces five files:
 
 ```
 releases/vX.Y.Z/
@@ -17,7 +21,16 @@ releases/vX.Y.Z/
   index.json                           ← pins git commit + per-artifact pulse_id
 ```
 
-Five files. They're all published to `https://ledatic.org/releases/vX.Y.Z/<file>`
+**What the git tree tracks is three of them** — the receipt JSONs. The two
+signed binaries (`rail_native`, `compile.rail`) are deliberately gitignored
+(`.gitignore` lines 93–94) and recoverable at any time via
+`git show vX.Y.Z:rail_native` / `git show vX.Y.Z:tools/compile.rail` — the
+attestation's sha256 binds the recovered bytes. The convention:
+
+> **Tree carries receipts. History carries bytes. ledatic.org carries
+> published copies.**
+
+All five are published to `https://ledatic.org/releases/vX.Y.Z/<file>`
 via Cloudflare KV.
 
 ## Cutting a release
@@ -153,3 +166,36 @@ trivially true.
 
 Backfilled in May 2026: v4.0.0 (pulse 987510), v4.0.1 (pulse 987510),
 v4.1.0 (pulse 987511).
+
+## Release contract (forward-only — first executed at the NEXT release)
+
+The contract below applies to every release cut after v5.1.0. Existing
+release dirs are never retro-fitted — signatures bind bytes.
+
+1. **Step 0: the headline is a claim.** Before tagging, add or refresh the
+   release headline's `tools/prove/prove.sh` receipt function and pick its
+   tier. A release whose headline can't be receipted isn't ready to tag.
+2. **One push carries the whole record:**
+   - the `CHANGELOG.md` entry (canonical — commit and tag messages reference
+     it; NEW entries gain a trailing "Verify:" block with the receipt
+     one-liner; old entries are never retro-edited),
+   - `releases/vX.Y.Z/` with **index.json schema v2** = the v1 fields plus
+     `prev_tag` + `prev_index_sha256` — a forward-only hash chain over the
+     release indexes. Genesis link = the sha256 of v5.1.0's existing
+     `index.json`:
+     ```
+     shasum -a 256 releases/v5.1.0/index.json
+     # a09579c6a609e36595b0479d0da658e2e747956de0e2012fa4d5aab6a0ca36ba
+     ```
+     (Pin by recomputing at cut time: `shasum -a 256 releases/v5.1.0/index.json`.
+     Old indexes are NOT retro-fitted.)
+   - both artifact attestations signed by the live fleet0 witness,
+   - the commit-matched `selfhost/<short>/` fixed-point record, cross-linked
+     from `index.json`.
+3. **Attested prove transcript:** at the tag commit, run
+   `bash tools/prove/prove.sh | tee releases/vX.Y.Z/prove.txt` and attest
+   `prove.txt` through the same `attest.rail` flow — the release carries a
+   signed "these N claims replayed green at tag time" transcript (an
+   additive artifacts-array entry; no schema break).
+4. **Pre-push gate:** prove.sh fast tier green + an R10-style offline verify
+   against the new tag's artifacts.
