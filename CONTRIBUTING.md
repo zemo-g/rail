@@ -83,12 +83,21 @@ Rail codebases tend to use a terse functional style:
 - Single-line comments with `-- ` prefix.
 - Named predicates preferred over lambdas in `filter` (lambdas in filter have segfault history).
 
+## Claims carry receipts
+
+A public claim without a receipt is a bug. A PR that adds a claim (to README.md,
+docs/VERIFY.md, or any public-facing doc) adds its `tools/prove/prove.sh` function —
+or a GATED label with the reason — in the same PR. `bash tools/prove/prove.sh`
+(fast tier) must be green before merge. Timing numbers never gate: they print,
+a human judges.
+
 ## Submitting changes
 
 1. Fork and make a feature branch.
 2. Run `./rail_native test` and, if you touched the compiler, the fixed-point dance.
-3. Open a PR with a clear description of what changed and why.
-4. If you added crypto, point at the RFC section your test vector is from.
+3. Run `bash tools/prove/prove.sh` — the fast receipt tier must pass.
+4. Open a PR with a clear description of what changed and why.
+5. If you added crypto, point at the RFC section your test vector is from.
 
 For bigger changes, opening an issue first to talk about the approach saves time.
 
