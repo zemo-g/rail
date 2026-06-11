@@ -5,9 +5,13 @@
 # ("attest|v1|<digest>|<pulse_id>|<value_hex>|<witnessed_at>"), and
 # verifies the Ed25519 signature against the fleet0 pubkey.
 #
-# Optional pubkey path; defaults to ~/.ledatic/witness/fleet0.pub.pem
-# which the script will create on first run by fetching the DER pubkey
-# from the Pi over SSH (one-time bootstrap).
+# Optional pubkey path. Default resolution order:
+#   1. explicit third argument
+#   2. the tree-pinned key at releases/witness-fleet0/fleet0.pub.pem
+#      (resolved relative to this script's repo root) — verification is
+#      fully offline from a bare clone
+#   3. ~/.ledatic/witness/fleet0.pub.pem, fetched from
+#      https://ledatic.org/attest/fleet0.pub.pem on first run
 #
 # Usage: verify.sh <input_path> <attestation_path> [pubkey_pem]
 
@@ -17,7 +21,12 @@ set -euo pipefail
 
 input=$1
 att=$2
-pub=${3:-$HOME/.ledatic/witness/fleet0.pub.pem}
+intree_pub="$(cd "$(dirname "$0")/../.." && pwd)/releases/witness-fleet0/fleet0.pub.pem"
+if [ -f "$intree_pub" ]; then
+  pub=${3:-$intree_pub}
+else
+  pub=${3:-$HOME/.ledatic/witness/fleet0.pub.pem}
+fi
 
 [ -f "$input" ] || { echo "no input: $input" >&2; exit 3; }
 [ -f "$att" ]   || { echo "no attestation: $att" >&2; exit 3; }
