@@ -1,6 +1,6 @@
-# Quickstart: from `git clone` to a signed bench
+# Quickstart: from `git clone` to a verified attestation
 
-Ten numbered steps. Each one is a real command with its real captured output. If any step does not behave like this on your machine, that's a bug.
+Eleven numbered steps. Each one is a real command with its real captured output. If any step does not behave like this on your machine, that's a bug.
 
 This guide assumes Apple Silicon macOS (the primary target). For other hosts, see [backends.md](backends.md).
 
@@ -72,7 +72,7 @@ Ten lines including the comment. Functions are `name args = body`. `main` is the
 170/170 tests passed
 ```
 
-The test suite covers parser, codegen, type inference, the runtime allocator, and the standard library. The count fluctuates a little if concurrent sessions race on `/tmp/rail_out`. 170 is the canonical green count — re-run if you see a lower number.
+The test suite covers parser, codegen, type inference, the runtime allocator, and the standard library. The full run takes ~17 minutes on an Apple M-series. The count fluctuates a little if concurrent sessions race on `/tmp/rail_out`. 170 is the canonical green count — re-run if you see a lower number.
 
 ## 5. Self-compile
 
@@ -80,7 +80,7 @@ The test suite covers parser, codegen, type inference, the runtime allocator, an
 ./rail_native self
 ```
 
-The compiler compiles itself to `/tmp/rail_self`. On a clean checkout the first cycle may differ — the seed's shipped runtime asm doesn't always match what its own source emits. Install gen1 and re-run to confirm convergence at gen2:
+The compiler compiles itself to `/tmp/rail_self` — ~5.5 minutes per cycle on an Apple M-series. On a clean checkout the first cycle may differ — the seed's shipped runtime asm doesn't always match what its own source emits. Install gen1 and re-run to confirm convergence at gen2:
 
 ```bash
 cp /tmp/rail_self ./rail_native
@@ -163,26 +163,40 @@ wrote: docs/site/stdlib.md (124876 bytes)
 
 The reference at [stdlib.md](stdlib.md) is auto-generated from the actual stdlib source. The walker is a 250-line Rail program that reads each `stdlib/*.rail`, extracts top-level function signatures with their leading comments, and emits markdown. Read it: `tools/docs/gen_stdlib_ref.rail`.
 
-## 10. Generate a signed provenance report
+## 10. Verify a release attestation — offline, in Rail
 
-The provenance tier signs benchmarks with Ed25519 keys held on the fleet. The website endpoint is at https://ledatic.org/provenance — see the [Provenance Tier session entry](https://ledatic.org/changelog#provenance-tier-shipped) for the design.
-
-For a local-only smoke equivalent: the LSP server at `tools/lsp_server.rail` and the test harness already include hash-based artifact verification. Running:
+The v5.1.0 release was witnessed by an independent node (fleet0) that signed the artifact digest with Ed25519. The signature, the witness public key, and the verifier are all in this repo — so a bare clone verifies the release fully offline, and the verifier is itself a Rail program:
 
 ```bash
-./rail_native test 2>&1 | tail -1
+git show v5.1.0:tools/compile.rail > /tmp/rail_v510_src.rail
+./rail_native run tools/attest/verify.rail /tmp/rail_v510_src.rail \
+    releases/v5.1.0/compile.rail.attestation.json
 ```
 
 ```
-170/170 tests passed
+ok  artifact=compile.rail  pulse_id=1004626  pk_fp=cac5f21a70564aeb
 ```
 
-is the local equivalent of a signed bench: the test suite is reproducible, deterministic, and the seed binary's SHA-256 is checked into `rail_safe.sha256` for tamper detection.
+(~4 s. The verifier's compile prints two spurious typechecker warnings — `'malloc' is not defined`, `'free' is not defined` — before the `ok`; the warning system is itself running. Fix tracked in [TODO.md](TODO.md).) The pinned witness key is `releases/witness-fleet0/fleet0.pub.pem`; what the signature covers and how to check the key fingerprint out-of-band is in [docs/VERIFY.md](../VERIFY.md).
+
+## 11. Replay the whole claim ledger
+
+Every public claim in the README carries a receipt ID (`[R04]`, `[R10]`, ...). One script replays them all:
+
+```bash
+bash tools/prove/prove.sh
+```
+
+```
+16/16 receipts verified, 6 skipped (gated)
+```
+
+The fast tier runs in seconds. `--core` adds the fixed point (step 5) and the full suite (step 4). Gated tiers (`--net`, `--gpu`, `--key`, `--hw`) print SKIP with the reason unless you opt in. The full claim table is [PROOFS.md](../../PROOFS.md).
 
 ---
 
 You now have a working Rail toolchain on local hardware. Next steps:
 
-- Skim [examples/](examples/) — 22 runnable programs with explanations.
+- Skim [examples/](examples/) — 23 program walkthroughs with explanations.
 - Skim [stdlib.md](stdlib.md) — every top-level function across 94 stdlib modules (`ls stdlib/*.rail | wc -l`).
 - Read [backends.md](backends.md) if you want to target Linux ARM64, x86_64, RISC-V, or WASM-in-a-browser.

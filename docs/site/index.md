@@ -21,17 +21,18 @@ hello, rail
 42
 ```
 
-The seed binary (`rail_native`, ~1.0 MB ARM64) is checked into the repo and self-compiles to a byte-identical fixed point at gen2 (the first cycle may differ; gen2 == gen3 always). No build step before "hello, world".
+The seed binary (`rail_native`, 1,193,744 bytes — ~1.2 MB ARM64) is checked into the repo and self-compiles to a byte-identical fixed point at gen2 (the first cycle may differ; gen2 == gen3 always). No build step before "hello, world".
 
 For Apple Silicon you're done. Other targets need cross-toolchains — see [backends.md](backends.md).
 
 ## What's here
 
-- **[quickstart.md](quickstart.md)** — ten steps from `git clone` to a signed bench result. Real commands, real outputs.
+- **[quickstart.md](quickstart.md)** — eleven steps from `git clone` to a verified release attestation. Real commands, real outputs.
+- **[PROOFS.md](../../PROOFS.md)** — the claim ledger. Every public claim in the README carries a receipt ID; `bash tools/prove/prove.sh` replays them from a bare clone.
 - **[stdlib.md](stdlib.md)** — auto-generated reference for every top-level function in `stdlib/*.rail` (94 modules — `ls stdlib/*.rail | wc -l`). Regenerate with `./rail_native run tools/docs/gen_stdlib_ref.rail`.
 - **[backends.md](backends.md)** — one-page-per-backend with the literal command line you'd type.
 - **[jit.md](jit.md)** — a self-hosted JIT in pure Rail. ARM64 emit + `mmap`-executable, called via a `pthread_create` trampoline. ~6,600 LoC across 20 files.
-- **[examples/](examples/)** — 22 runnable programs with source, command, and real captured output. Start with [hello](examples/hello.md), [pattern_matching](examples/pattern_matching.md), [calculator](examples/calculator.md).
+- **[examples/](examples/)** — 23 program walkthroughs with source, command, and real captured output. Start with [hello](examples/hello.md), [pattern_matching](examples/pattern_matching.md), [calculator](examples/calculator.md).
 - **[TODO.md](TODO.md)** — what's deferred for v0 and why.
 
 ## Language at a glance
