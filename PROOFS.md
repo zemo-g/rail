@@ -25,7 +25,7 @@ reason unless their tier flag is passed. Est times are estimates and never gate.
 | R06 | fast | RUN | ~5s | #grad autodiff agrees with the three-witness gradient oracle |
 | R07 | fast | RUN | ~3s | mlp_natural.rail: the #grad-trained MLP computes mlp(1.0,2.0)=1.125 |
 | R08 | fast | RUN | ~8s | auth types: compiler-synthesized Merkle prover/verifier run (authkit + authdict) |
-| R09 | fast | RUN | ~6s | tail calls compile to loops: tco_test runs 2M-deep recursion (disassembly display-only) |
+| R09 | fast | RUN | ~6s | tail calls compile to loops: tco_test runs two 1M-deep calls + disassembly shows zero bl in the loop body |
 | R10 | fast | SIGNED | ~8s | v5.1.0 compile.rail matches index.json sha256 and its attestation verifies offline in Rail |
 | R10b | fast | SIGNED | ~30s | v5.1.0 rail_native binary verified by BOTH verify.sh and verify.rail (cross-witness) |
 | R12 | fast | RUN | ~15s | cross backends emit artifacts from this clone (linux ELF + x86_64 asm gated; others reported) |
@@ -37,4 +37,4 @@ reason unless their tier flag is passed. Est times are estimates and never gate.
 | R18 | fast | RUN | ~4s | Rail's sha256 agrees with system shasum on the same string |
 | R19 | fast | RUN | ~4s | bug receipt: examples/native_closures.rail segfaults exactly as documented |
 | R20 | fast | RUN | ~2s | docs/RELEASE_LEDGER.md regenerates identically (gen_release_ledger.sh --check) |
-| R21 | gpu | GATED | ~20s | self-emitted JIT-fused Metal kernels run (perf numbers display-only) |
+| R21 | gpu | GATED | ~40s | self-emitted JIT-fused Metal kernels run (perf numbers display-only) |
