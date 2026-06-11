@@ -101,7 +101,7 @@ This is the fixed-point property: the compiler's output is its own input. The bo
 ```
 
 ```
-Compiling examples/quicksort.rail (911 chars)...
+Compiling examples/quicksort.rail (1089 chars)...
   as: OK
   ld: OK
 Input:
@@ -125,12 +125,13 @@ The source is 36 lines including comments. Cross-reference with [examples/quicks
 Compiling examples/wasm/hello.rail to WASM...
   WAT: 51277 bytes
   wat2wasm: OK
-  Binary: /tmp/rail_out.wasm
+Hello from Rail!
+Running as WebAssembly.
 ```
 
-`./rail_native wasm` emits a `.wat` file, runs the WebAssembly Binary Toolkit `wat2wasm` on it, and produces `/tmp/rail_out.wasm` (~12 KB). Load it in any WASM runtime that provides the `env.print` import (the live playground at ledatic.org does this).
+`./rail_native wasm` emits a `.wat` file, runs the WebAssembly Binary Toolkit `wat2wasm` on it, and produces `/tmp/rail_out.wasm` (4,489 bytes for this program). If `wasmtime` is on `PATH`, the compiler runs the module immediately — that's the two program lines above. Without `wasmtime` it stops at `  Binary: /tmp/rail_out.wasm`; load that in any WASM runtime that provides the `env.print` import (the live playground at ledatic.org does this).
 
-You need `wat2wasm` on `PATH` for this step. On macOS: `brew install wabt`.
+You need `wat2wasm` on `PATH` for this step. On macOS: `brew install wabt`. Optional: `brew install wasmtime` to run modules directly.
 
 ## 8. Try the Cortex-M4 backend
 
@@ -157,11 +158,11 @@ You need `clang` with the `thumbv7em-none-eabi` target on `PATH`. On macOS: `bre
 ```
 
 ```
-files processed: 80
-wrote: docs/site/stdlib.md (124876 bytes)
+files processed: 94
+wrote: docs/site/stdlib.md (159878 bytes)
 ```
 
-The reference at [stdlib.md](stdlib.md) is auto-generated from the actual stdlib source. The walker is a 250-line Rail program that reads each `stdlib/*.rail`, extracts top-level function signatures with their leading comments, and emits markdown. Read it: `tools/docs/gen_stdlib_ref.rail`.
+The reference at [stdlib.md](stdlib.md) is auto-generated from the actual stdlib source. The walker is a 222-line Rail program (`wc -l`) that reads each `stdlib/*.rail`, extracts top-level function signatures with their leading comments, and emits markdown. Read it: `tools/docs/gen_stdlib_ref.rail`.
 
 ## 10. Verify a release attestation — offline, in Rail
 

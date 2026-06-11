@@ -62,14 +62,20 @@ brew install aarch64-elf-binutils
 ./rail_native x86 examples/hello.rail
 ```
 
+With `x86_64-elf-as` / `x86_64-elf-ld` installed (`brew install x86_64-elf-binutils`):
+
 ```
-Compiling examples/hello.rail (244 chars)...
-  Assembly: /tmp/rail_x86.s (1495 chars)
-  No local x86_64 assembler. scp to target and build with: gcc -o prog /tmp/rail_x86.s
-  Try: scp /tmp/rail_x86.s <user>@<host>:~ && ssh <user>@<host> 'gcc -o rail_x86 rail_x86.s && ./rail_x86'
+Compiling examples/hello.rail → x86_64 (244 chars)...
+  Assembly: /tmp/rail_x86.s (60880 chars)
+  Assembler: /opt/homebrew/bin/x86_64-elf-as
+  as: OK
+  ld: /opt/homebrew/bin/x86_64-elf-ld: cannot find -lc: Invalid argument
+  Binary: /tmp/rail_x86
 ```
 
-Rail emits the GAS assembly directly; assemble on the target with `gcc -o prog /tmp/rail_x86.s`. This is intentional — the x86_64 backend was bootstrapped against a remote x86_64 Linux (WSL) host rather than for cross-tools-on-mac. The x86 runtime asm lives at `tools/x86_rt.s`.
+Honest reading of that transcript: the assembly and the `.o` are good; the final link **fails on a Mac** because the cross-`ld` has no Linux libc to link against — and the driver still prints `Binary:` and exits 0 (known display lie, tracked in [TODO.md](TODO.md)). The supported path is the `.s`: copy `/tmp/rail_x86.s` to a Linux x86_64 host and `gcc -o prog rail_x86.s`. Without cross-binutils the driver says exactly that (`tools/compile.rail`, `dispatch_x86`): `No local x86_64 assembler. Install x86_64-elf-as / x86_64-elf-ld, or copy /tmp/rail_x86.s to a Linux x86_64 host and assemble there.`
+
+The x86_64 backend was bootstrapped against a remote x86_64 Linux (WSL) host rather than for cross-tools-on-mac. The x86 runtime asm lives at `tools/x86_rt.s`.
 
 **Conformance:** `bash tools/test/x86_conformance.sh` (requires Docker + `linux/amd64` image, e.g., Colima/Rosetta) currently passes **71/79** representative tests covering ints, strings, lists, ADTs, closures, floats, FFI, TCO, and arena ops. The 8 remaining failures are 3 ELF-prefix ffi-libc tests and 5 missing str-runtime symbols.
 
@@ -83,10 +89,11 @@ Rail emits the GAS assembly directly; assemble on the target with `gcc -o prog /
 Compiling examples/wasm/hello.rail to WASM...
   WAT: 51277 bytes
   wat2wasm: OK
-  Binary: /tmp/rail_out.wasm
+Hello from Rail!
+Running as WebAssembly.
 ```
 
-Requires `wat2wasm` from the WebAssembly Binary Toolkit (`brew install wabt`). The output is `/tmp/rail_out.wasm` — drop into any WASM runtime that provides the `env.print` import. The live playground at https://ledatic.org embeds exactly this output.
+Requires `wat2wasm` from the WebAssembly Binary Toolkit (`brew install wabt`). The output is `/tmp/rail_out.wasm` (4,489 bytes for this program). With `wasmtime` on `PATH` the driver runs the module immediately — the two program lines above; without it, the driver stops at `  Binary: /tmp/rail_out.wasm` — drop that into any WASM runtime that provides the `env.print` import. The live playground at https://ledatic.org embeds exactly this output.
 
 Known WASM-backend limits (see CLAUDE.md): no `filter`/`map`/`fold` as WASM builtins, 1 MB linear memory. Closures, ADTs, pattern matching, and string ops all work.
 

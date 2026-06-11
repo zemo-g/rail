@@ -201,11 +201,11 @@ The compiler is the fitness function: an LLM generates Rail, `rail_native` compi
 
 ## Why Rail
 
-- **Zero C transitive dependency.** No glibc, no OpenSSL, no runtime C at all — the GC is ~300 lines of ARM64 assembly inside the compiler. The whole OS edge is 8 libSystem imports, enumerable from the clone [R03].
+- **Zero C transitive dependency.** No glibc, no OpenSSL, no runtime C at all — the GC is ~540 lines of ARM64 assembly inside the compiler (the `rt_gc_*` constants in `tools/compile.rail`). The whole OS edge is 8 libSystem imports, enumerable from the clone [R03].
 - **Byte-identical self-compile.** `./rail_native self` produces output identical to the binary that produced it. The compiler's own source is the regression suite [R01].
 - **The compiler is the source of truth.** Training loops, tests, HTTPS clients, gradient synthesis — all compiled by the same binary you cloned. If it compiles, it runs.
 - **94 stdlib modules** (`ls stdlib/*.rail | wc -l`) — json, http, TLS 1.3, sqlite, regex, tensor, autograd, transformer, ed25519, and the v3.0.0 crypto stack [R05]. Every primitive NIST- or RFC-vector-validated.
-- **Six backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), Linux x86_64, WebAssembly, Cortex-M4 (Thumb-2), and RISC-V rv32imc — the same compiler cross-compiles to all of them; artifact receipts run from this clone [R12].
+- **Six backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), Linux x86_64, WebAssembly, Cortex-M4 (Thumb-2), and RISC-V rv32imc — the same compiler cross-compiles to all of them. The receipt gates the Linux ARM64 ELF and x86_64 assembly artifacts from this clone (`test -s`, never the `Binary:` line) and prints honest SKIPs for backends whose toolchain is absent [R12].
 
 ## The language
 
@@ -311,7 +311,7 @@ https_get_url "https://www.amazon.com/"
 
 ### v2.0.0 — 2026-04-06 — *Rail becomes a self-improving system*
 
-Native floats in ARM64 d-registers, effect handlers via setjmp/longjmp, GC in assembly, four backends (macOS ARM64 / Linux ARM64 / Linux x86_64 / WASM), and three independent training lineages — all driven by the same compiler as the binary fitness function. 121 commits. 92/92 tests. [**Full details in CHANGELOG.md →**](CHANGELOG.md).
+Native floats in ARM64 d-registers, effect handlers via setjmp/longjmp, GC in assembly, four backends (macOS ARM64 / Linux ARM64 / Linux x86_64 / WASM), and three independent training lineages — all driven by the same compiler as the binary fitness function. 121 commits. A 92-test suite, all green. [**Full details in CHANGELOG.md →**](CHANGELOG.md).
 
 ### History *(abridged — 45 tags total, `git tag | wc -l`; every release in [CHANGELOG.md](CHANGELOG.md); every attested tag in [docs/RELEASE_LEDGER.md](docs/RELEASE_LEDGER.md))*
 
@@ -360,9 +360,9 @@ Sample transcript (2026-06-10, Apple M-series):
 
 ```
 R01s PASS (4s) - the v5.1.0 fixed point is recorded in selfhost/94afdd1 and Ed25519-verified offline
-R03  PASS (0s) - zero C dependencies: one linked dylib (libSystem) and exactly 8 undefined symbols
-R10  PASS (4s) - v5.1.0 compile.rail matches index.json sha256 and its attestation verifies offline in Rail
-R13  SKIP (gated: net - live HTTPS GET needs network; run with --net)
+R03 PASS (0s) - zero C dependencies: one linked dylib (libSystem) and exactly 8 undefined symbols
+R10 PASS (3s) - v5.1.0 compile.rail matches index.json sha256 and its attestation verifies offline in Rail
+R13 SKIP (gated: net - live HTTPS GET needs network; run with --net) - pure-Rail TLS 1.3 performs a live strict-chain HTTPS GET
 ...
 16/16 receipts verified, 6 skipped (gated)
 ```

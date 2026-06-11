@@ -31,7 +31,7 @@ For Apple Silicon you're done. Other targets need cross-toolchains — see [back
 - **[PROOFS.md](../../PROOFS.md)** — the claim ledger. Every public claim in the README carries a receipt ID; `bash tools/prove/prove.sh` replays them from a bare clone.
 - **[stdlib.md](stdlib.md)** — auto-generated reference for every top-level function in `stdlib/*.rail` (94 modules — `ls stdlib/*.rail | wc -l`). Regenerate with `./rail_native run tools/docs/gen_stdlib_ref.rail`.
 - **[backends.md](backends.md)** — one-page-per-backend with the literal command line you'd type.
-- **[jit.md](jit.md)** — a self-hosted JIT in pure Rail. ARM64 emit + `mmap`-executable, called via a `pthread_create` trampoline. ~6,600 LoC across 20 files.
+- **[jit.md](jit.md)** — a self-hosted JIT in pure Rail. ARM64 emit + `mmap`-executable, called via a `pthread_create` trampoline. 5,900 LoC across 19 files (`wc -l stdlib/jit*.rail`, tests excluded; 7,293 across 32 counting tests).
 - **[examples/](examples/)** — 23 program walkthroughs with source, command, and real captured output. Start with [hello](examples/hello.md), [pattern_matching](examples/pattern_matching.md), [calculator](examples/calculator.md).
 - **[TODO.md](TODO.md)** — what's deferred for v0 and why.
 
