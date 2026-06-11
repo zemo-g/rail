@@ -13,8 +13,8 @@ path. The flag goes **before** the subcommand.)
 
 Three of these examples are wired into the claim ledger — see
 [PROOFS.md](../PROOFS.md) and run `bash tools/prove/prove.sh` to check them
-mechanically: hello (R04), mlp_natural (R07), tco_test (R09), plus the two
-bug receipts below (R19).
+mechanically: hello (R04), mlp_natural (R07), tco_test (R09), plus the first
+of the two bug receipts below (native_closures, R19).
 
 ## Working examples
 

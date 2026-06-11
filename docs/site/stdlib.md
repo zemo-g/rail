@@ -6173,6 +6173,7 @@ import "stdlib/<name>.rail"
 
 ### `gpu_binary_path`
 
+> Relative to cwd: callers are expected to run from the repo root.
 
 ### `gpu_flag_arr`
 

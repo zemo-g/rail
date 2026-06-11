@@ -32,6 +32,17 @@ receipts R19 and the gated tiers) — see [PROOFS.md](../../PROOFS.md).
   Both are FFI symbols that assemble and link fine — the warning pass
   doesn't know the FFI surface. Cosmetic, but it fronts every attestation
   verify run.
+- **JIT fused-kernel dispatch crashes on the capture host** (found
+  2026-06-10 while un-vacuuming receipt R21). `tools/bench/
+  jit_fused_qkv_bench.rail` now compiles from a fresh clone (it was
+  missing `import "stdlib/transformer.rail"` — fixed), and
+  `jit_compile_rmsnorm_qkv` returns `kid=0` OK, but the **first**
+  `jit_run_rmsnorm_qkv` dispatch dies with SIGBUS/SEGV (exit 138/139).
+  Reproduced with two independently built `tools/metal` dylibs and with
+  a minimal 8×4-shape probe, so it is not bench-specific. Not yet
+  root-caused; needs a dedicated GPU session. Until then receipt R21 is
+  gated (`--gpu`) and **fails honestly** when opted in, rather than
+  passing vacuously — that is by design.
 - **Cross-backend "success-ish" output is a display lie in two places**:
   `./rail_native x86` prints `Binary: /tmp/rail_x86` and exits 0 even when
   `ld` failed and no binary exists (same exit-0 swallow on `cortexm` /
@@ -49,8 +60,9 @@ to become a default-tier receipt:
 - **R14/R15 (key)** — live LLM call + self-training loop run. Need an API
   key by design; the loop's *compile* is already a fast receipt.
 - **R21 (gpu)** — self-emitted JIT-fused Metal kernels. Needs Apple Silicon
-  GPU; runs anywhere the repo's primary target runs, so a mac CI runner
-  would un-gate it.
+  GPU — but un-gating is currently blocked on a real bug: the first JIT
+  dispatch crashes on the capture host (see the bug entry above). Fix the
+  crash first; then a mac CI runner would un-gate it.
 - **hw tier** — Cortex-M4/Apollo2 on real hardware. QEMU
   (`qemu-system-arm -M mps2-an386`) is the documented verification path;
   SWD-flash to a real board has not been attempted in any pass yet.
@@ -66,7 +78,8 @@ to become a default-tier receipt:
 - **RISC-V**: emits `.s` (`/tmp/rail_rv32.s`); assemble/link need brew llvm
   + lld. QEMU execution not re-verified in the latest pass.
 - **WASM**: end-to-end green where `wat2wasm` (+ optionally `wasmtime`) is
-  installed — hello compiles to a 4,553-byte `.wasm` and runs. Artifacts
+  installed — `examples/hello.rail` compiles to a 4,553-byte `.wasm`,
+  `examples/wasm/hello.rail` to a 4,489-byte one, and both run. Artifacts
   land at the fixed paths `/tmp/rail_out.wat` / `/tmp/rail_out.wasm`.
 
 ## Examples with caveats in `docs/site/examples/`
