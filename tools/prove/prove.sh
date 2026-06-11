@@ -53,7 +53,7 @@ claim R05  fast RUN    no  1    "counts cited in README.md/STRUCTURE.md match th
 claim R06  fast RUN    yes 5    "#grad autodiff agrees with the three-witness gradient oracle"
 claim R07  fast RUN    yes 3    "mlp_natural.rail: the #grad-trained MLP computes mlp(1.0,2.0)=1.125"
 claim R08  fast RUN    yes 8    "auth types: compiler-synthesized Merkle prover/verifier run (authkit + authdict)"
-claim R09  fast RUN    yes 6    "tail calls compile to loops: tco_test runs 2M-deep recursion (disassembly display-only)"
+claim R09  fast RUN    yes 6    "tail calls compile to loops: tco_test runs two 1M-deep calls + disassembly shows zero bl in the loop body"
 claim R10  fast SIGNED yes 8    "v5.1.0 compile.rail matches index.json sha256 and its attestation verifies offline in Rail"
 claim R10b fast SIGNED yes 30   "v5.1.0 rail_native binary verified by BOTH verify.sh and verify.rail (cross-witness)"
 claim R12  fast RUN    yes 15   "cross backends emit artifacts from this clone (linux ELF + x86_64 asm gated; others reported)"
@@ -65,7 +65,7 @@ claim R17  fast RUN    no  1    "every [Rnn] anchor in README.md/docs/VERIFY.md 
 claim R18  fast RUN    yes 4    "Rail's sha256 agrees with system shasum on the same string"
 claim R19  fast RUN    yes 4    "bug receipt: examples/native_closures.rail segfaults exactly as documented"
 claim R20  fast RUN    no  2    "docs/RELEASE_LEDGER.md regenerates identically (gen_release_ledger.sh --check)"
-claim R21  gpu  GATED  yes 20   "self-emitted JIT-fused Metal kernels run (perf numbers display-only)"
+claim R21  gpu  GATED  yes 40   "self-emitted JIT-fused Metal kernels run (perf numbers display-only)"
 
 greason R13 "gated: net - live HTTPS GET needs network; run with --net"
 greason R14 "gated: key - needs a reader-supplied API key; run with --key"
@@ -95,21 +95,32 @@ commafy() { # 8049 -> 8,049 (pure bash; BSD sed BRE has no alternation)
   printf '%s%s' "$n" "$out"
 }
 verify_ok() { hase '^ok[[:space:]]' && hasf "pk_fp=$PIN_PK_FP"; }
+pin_key_ok() { # the tree-pinned key FILE must hash to the pinned fingerprint.
+  # verify.rail/verify.sh both derive pk_fp from the key bytes, but this
+  # check is independent of either verifier - openssl straight on the pem.
+  cap "openssl pkey -in $PIN_PUBKEY -pubin -outform DER 2>/dev/null | shasum -a 256 | cut -c1-16"
+  hasf "$PIN_PK_FP" || { MSG="key file $PIN_PUBKEY fingerprint != pinned $PIN_PK_FP"; return 1; }
+}
 
 # ---- one function per claim ----
 r01() {
   say "warning: est ~11 min - two full self-compile cycles (Apple M-series)"
+  # pre-clean both cycles: a stale /tmp/rail_self from an earlier run would
+  # otherwise make gen1==gen2 pass trivially even if both compiles failed
+  cap "rm -f /tmp/rail_self"
   cap_log "./rail_native self" /tmp/rail_prove_R01_cycle1.log
   cap "cp /tmp/rail_self /tmp/rail_prove_R01_gen1"
-  [ -s /tmp/rail_prove_R01_gen1 ] || { MSG="cycle 1 left no binary at /tmp/rail_self"; return 1; }
+  [ "$RC" -eq 0 ] && [ -s /tmp/rail_prove_R01_gen1 ] || { MSG="cycle 1 left no binary at /tmp/rail_self"; return 1; }
+  cap "rm -f /tmp/rail_self"
   cap_log "/tmp/rail_prove_R01_gen1 self" /tmp/rail_prove_R01_cycle2.log
   cap "cp /tmp/rail_self /tmp/rail_prove_R01_gen2"
-  [ -s /tmp/rail_prove_R01_gen2 ] || { MSG="cycle 2 left no binary at /tmp/rail_self"; return 1; }
+  [ "$RC" -eq 0 ] && [ -s /tmp/rail_prove_R01_gen2 ] || { MSG="cycle 2 left no binary at /tmp/rail_self"; return 1; }
   cap "cmp /tmp/rail_prove_R01_gen1 /tmp/rail_prove_R01_gen2"
   [ "$RC" -eq 0 ] || { MSG="cmp: gen1 and gen2 differ - no fixed point"; return 1; }
 }
 
 r01s() {
+  pin_key_ok || return 1
   cap "./rail_native --out-prefix /tmp/rail_prove_R01s_v run tools/attest/verify.rail selfhost/94afdd1/result.json selfhost/94afdd1/result.json.attestation.json $PIN_PUBKEY"
   verify_ok || { MSG="verify.rail did not print ok + pk_fp=$PIN_PK_FP"; return 1; }
 }
@@ -162,6 +173,20 @@ r05() {
   [ "$RC" -eq 0 ] || { MSG="STRUCTURE.md does not cite $PIN_STDLIB_MODULES modules"; return 1; }
   cap "grep -c '$PIN_TEST_COUNT/$PIN_TEST_COUNT' README.md"
   [ "$RC" -eq 0 ] || { MSG="README.md does not cite $PIN_TEST_COUNT/$PIN_TEST_COUNT tests"; return 1; }
+  # contradiction scan: presence of the pinned value is not enough - a STALE
+  # value elsewhere would pass the checks above. Every match of each claim
+  # pattern must carry the pinned number (release-history prose is excluded
+  # by pattern: it phrases old counts differently on purpose).
+  local bad
+  show "grep -ohE '[0-9][0-9,]* lines of Rail' README.md STRUCTURE.md (every match must be the pin)"
+  bad=$(grep -ohE '[0-9][0-9,]* lines of Rail' README.md STRUCTURE.md | grep -vE "^($PIN_COMPILE_LINES|$(commafy "$PIN_COMPILE_LINES")) " || true)
+  [ -z "$bad" ] || { MSG="contradicting 'lines of Rail' claim(s): $bad"; return 1; }
+  show "grep -ohE '[0-9]+ (stdlib )?modules' README.md STRUCTURE.md (every match must be the pin)"
+  bad=$(grep -ohE '[0-9]+ (stdlib )?modules' README.md STRUCTURE.md | grep -vE "^$PIN_STDLIB_MODULES " || true)
+  [ -z "$bad" ] || { MSG="contradicting 'modules' claim(s): $bad"; return 1; }
+  show "grep -ohE '[0-9]+/[0-9]+ tests' README.md STRUCTURE.md (every match must be the pin)"
+  bad=$(grep -ohE '[0-9]+/[0-9]+ tests' README.md STRUCTURE.md | grep -vF "$PIN_TEST_COUNT/$PIN_TEST_COUNT tests" || true)
+  [ -z "$bad" ] || { MSG="contradicting 'N/N tests' claim(s): $bad"; return 1; }
 }
 
 r06() {
@@ -184,14 +209,20 @@ r08() {
 r09() {
   cap "./rail_native --out-prefix /tmp/rail_prove_R09_run run examples/tco_test.rail"
   hasf "$CAPT_R09" || { MSG="output missing pinned functional token: $CAPT_R09"; return 1; }
+  # depth alone does not prove TCO (1M frames could fit the 256MB stack);
+  # the structural gate is the disassembly: count_down must contain ZERO
+  # bl instructions - the self-call must have been compiled into a loop.
   cap "./rail_native --out-prefix /tmp/rail_prove_R09_bin examples/tco_test.rail"
-  if [ -s /tmp/rail_prove_R09_bin ]; then
-    cap "objdump -d /tmp/rail_prove_R09_bin | sed -n '/count_down/,/ret/p' | head -20"
-  fi
-  say "note: the disassembly and any insn-count/perf comparison are display-only - timing never gates"
+  cap "test -s /tmp/rail_prove_R09_bin"
+  [ "$RC" -eq 0 ] || { MSG="no binary for disassembly at /tmp/rail_prove_R09_bin"; return 1; }
+  cap "objdump -d /tmp/rail_prove_R09_bin | sed -n '/<_count_down>:/,/<_sum_acc>:/p'"
+  local calls; calls=$(printf '%s\n' "$CAP" | grep -cE '\bbl\b')
+  [ "$calls" -eq 0 ] || { MSG="count_down body contains $calls bl instruction(s) - self-call not compiled to a loop"; return 1; }
+  say "note: structural gate passed (0 call instructions in the loop body); timing never gates"
 }
 
 r10() {
+  pin_key_ok || return 1
   cap "git show v5.1.0:tools/compile.rail > /tmp/rail_prove_R10.rail"
   [ "$RC" -eq 0 ] || { MSG="git show v5.1.0:tools/compile.rail failed"; return 1; }
   cap "shasum -a 256 /tmp/rail_prove_R10.rail"
@@ -202,6 +233,7 @@ r10() {
 }
 
 r10b() {
+  pin_key_ok || return 1
   cap "git show v5.1.0:rail_native > /tmp/rail_prove_R10b"
   [ "$RC" -eq 0 ] || { MSG="git show v5.1.0:rail_native failed"; return 1; }
   cap "shasum -a 256 /tmp/rail_prove_R10b"
@@ -321,8 +353,15 @@ r20() {
 }
 
 r21() {
-  cap "./rail_native --out-prefix /tmp/rail_prove_R21 run tools/bench/jit_fused_qkv_bench.rail"
-  [ -n "$CAP" ] || { MSG="GPU bench produced no output"; return 1; }
+  # compile separately + exec directly (run-mode would swallow a crash);
+  # gate on the headline line, which prints only AFTER both dispatch loops
+  # complete - a kernel that compiles but crashes on dispatch fails here.
+  cap "./rail_native --out-prefix /tmp/rail_prove_R21 tools/bench/jit_fused_qkv_bench.rail"
+  cap "test -s /tmp/rail_prove_R21"
+  [ "$RC" -eq 0 ] || { MSG="bench did not compile to a nonzero binary"; return 1; }
+  cap "DYLD_LIBRARY_PATH=tools/metal /tmp/rail_prove_R21"
+  hasf "=== headline: fused / unfused wall ratio" \
+    || { MSG="bench did not reach the post-dispatch headline - kernels did not run to completion (known: fails in a fresh clone as of 2026-06-10, see docs/site/TODO.md)"; return 1; }
   say "note: the perf numbers above are display-only - timing never gates"
 }
 
