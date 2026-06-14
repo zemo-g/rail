@@ -1,0 +1,170 @@
+-- GX6: the capstone -- a REAL transformer op (scaled dot-product attention) made fully
+-- exact-integer, with both matmuls on the GPU exact kernel, proven CPU==GPU BIT-FOR-BIT
+-- at non-toy shapes. Extends the headline (GX5b, a 2-layer MLP) to attention -- the
+-- characteristic transformer reduction -- and shows the exact-integer scheme is not
+-- shape-specific: same bits on two different (L, d_k) at once.
+--
+-- Attention(Q,K,V) = softmax( (Q K^T) / sqrt(d_k) ) V, every step a FIXED INTEGER algorithm:
+--   scores = Q K^T            -- matmul, ON GPU (exact kernel), one truncate-divide / output
+--   scale  = scores / sqrt(d_k) -- fixed-point multiply by fxrsqrt(d_k)
+--   P      = softmax_rows(scores) -- exact-integer: max, bx4_fxexp (fixed poly), sum, divide
+--   out    = P V              -- matmul, ON GPU (exact kernel)
+-- The two MATMULs (the order-sensitive reductions) run on the GPU via the GX5a/GX5b bridge
+-- (reconstruct exact S = hi*2^31 + lo, THEN BX10's truncate-toward-zero divide). The softmax
+-- is a row reduction with transcendentals -- not a matmul -- so it stays scalar CPU, exact via
+-- bx4_fxexp. Inputs carry negatives, so QK^T is a SIGNED reduction (the negative-S path).
+--
+-- D2 gate: the CPU exact attention and the GPU exact attention must produce a BIT-IDENTICAL
+-- integer output array (per-stage AND end-to-end), at L=64/d_k=64 and L=96/d_k=48. Plus D0
+-- (GPU run-twice identical) and non-vacuity (signed scores actually present).
+--
+-- Build: ./rail_native --out-prefix /tmp/gx6 tools/bitexact/gx6_exact_attention_gpu.rail
+-- Run:   /tmp/gx6
+
+import "stdlib/tensor.rail"
+import "tools/bitexact/bx_fixed.rail"
+
+gx6_imod a b = a - (a / b) * b
+
+-- ===== deterministic fixed-point Q/K/V with NEGATIVES (|v| < 2^31, fits int32 buffer) =====
+gx6_fillQKV A n kind i =
+  if i >= n then A
+  else
+    let v = ((gx6_imod (i * 7 + kind * 131 + 3) 23) - 11) * 131071 in
+    let _ = arr_set A i v in
+    gx6_fillQKV A n kind (i + 1)
+gx6_mkQKV n kind = gx6_fillQKV (arr_new n 0) n kind 0
+
+-- ===== exact-integer CPU matmul reference: C[i][j] = (sum_p A[i][p]*B[p][j]) / S =====
+-- dot accumulator is MUTUAL recursion (rail-bug-self-loop-cross-dep-args dodge).
+gx6_dot_a A B base j K N p acc =
+  if p >= K then acc
+  else gx6_dot_b A B base j K N (p + 1) (acc + (arr_get A (base + p)) * (arr_get B (p * N + j)))
+gx6_dot_b A B base j K N p acc =
+  if p >= K then acc
+  else gx6_dot_a A B base j K N (p + 1) (acc + (arr_get A (base + p)) * (arr_get B (p * N + j)))
+gx6_mm_j A B C i j M K N =
+  if j >= N then C
+  else
+    let _ = arr_set C (i * N + j) ((gx6_dot_a A B (i * K) j K N 0 0) / 16777216) in
+    gx6_mm_j A B C i (j + 1) M K N
+gx6_mm_i A B C i M K N =
+  if i >= M then C
+  else
+    let _ = gx6_mm_j A B C i 0 M K N in
+    gx6_mm_i A B C (i + 1) M K N
+gx6_cpu_matmul A B M K N = gx6_mm_i A B (arr_new (M * N) 0) 0 M K N
+
+-- ===== transpose K (L x dk) -> Kt (dk x L): Kt[p*L + i] = K[i*dk + p] =====
+gx6_tr_j K Kt L dk i j =
+  if j >= dk then Kt
+  else let _ = arr_set Kt (j * L + i) (arr_get K (i * dk + j)) in gx6_tr_j K Kt L dk i (j + 1)
+gx6_tr_i K Kt L dk i =
+  if i >= L then Kt
+  else let _ = gx6_tr_j K Kt L dk i 0 in gx6_tr_i K Kt L dk (i + 1)
+gx6_transpose K L dk = gx6_tr_i K (arr_new (dk * L) 0) L dk 0
+
+-- ===== fixed-point scale: each entry *= scaleq / S =====
+gx6_scale A n scaleq i =
+  if i >= n then A
+  else let _ = arr_set A i (((arr_get A i) * scaleq) / 16777216) in gx6_scale A n scaleq (i + 1)
+
+-- ===== exact-integer row-wise softmax (max, bx4_fxexp, sum, divide) =====
+gx6_rowmax A base L j m =
+  if j >= L then m
+  else let v = arr_get A (base + j) in gx6_rowmax A base L (j + 1) (if v > m then v else m)
+gx6_exp_row A E base L m j sum =
+  if j >= L then sum
+  else
+    let e = bx4_fxexp ((arr_get A (base + j)) - m) in
+    let _ = arr_set E (base + j) e in
+    gx6_exp_row A E base L m (j + 1) (sum + e)
+gx6_norm_row E P base L sum j =
+  if j >= L then P
+  else
+    let _ = arr_set P (base + j) (((arr_get E (base + j)) * 16777216) / sum) in
+    gx6_norm_row E P base L sum (j + 1)
+gx6_softmax_i A E P base L =
+  let m = gx6_rowmax A base L 1 (arr_get A base) in
+  let sum = gx6_exp_row A E base L m 0 0 in
+  gx6_norm_row E P base L sum 0
+gx6_softmax_rows A E P L i =
+  if i >= L then P
+  else
+    let _ = gx6_softmax_i A E P (i * L) L in
+    gx6_softmax_rows A E P L (i + 1)
+
+-- ===== GPU exact matmul on int arrays (marshal -> tgl_exact_matmul -> bridge reconstruct) =====
+gx6_i2f src dst n i =
+  if i >= n then dst
+  else let _ = float_arr_set dst i (int_to_float (arr_get src i)) in gx6_i2f src dst n (i + 1)
+gx6_int_to_fa A n = gx6_i2f A (float_arr_new n 0.0) n 0
+gx6_read_div_arr Hi Lo C n i =
+  if i >= n then C
+  else
+    let s = (float_to_int (float_arr_get Hi i)) * 2147483648 + (float_to_int (float_arr_get Lo i)) in
+    let _ = arr_set C i (s / 16777216) in
+    gx6_read_div_arr Hi Lo C n (i + 1)
+gx6_gpu_matmul A B M K N =
+  let Af = gx6_int_to_fa A (M * K) in
+  let Bf = gx6_int_to_fa B (K * N) in
+  let Hi = float_arr_new (M * N) 0.0 in
+  let Lo = float_arr_new (M * N) 0.0 in
+  let _ = tgl_exact_matmul Af Bf Hi Lo M K N in
+  gx6_read_div_arr Hi Lo (arr_new (M * N) 0) (M * N) 0
+
+-- ===== full attention forward (CPU all-exact, GPU = matmuls on device, same softmax) =====
+gx6_attn_cpu Q K V L dk scaleq =
+  let Kt = gx6_transpose K L dk in
+  let scores = gx6_cpu_matmul Q Kt L dk L in
+  let _ = gx6_scale scores (L * L) scaleq 0 in
+  let P = gx6_softmax_rows scores (arr_new (L * L) 0) (arr_new (L * L) 0) L 0 in
+  gx6_cpu_matmul P V L L dk
+gx6_attn_gpu Q K V L dk scaleq =
+  let Kt = gx6_transpose K L dk in
+  let scores = gx6_gpu_matmul Q Kt L dk L in
+  let _ = gx6_scale scores (L * L) scaleq 0 in
+  let P = gx6_softmax_rows scores (arr_new (L * L) 0) (arr_new (L * L) 0) L 0 in
+  gx6_gpu_matmul P V L L dk
+
+-- ===== D2 helpers =====
+gx6_arr_eq A B n i bad =
+  if i >= n then bad
+  else gx6_arr_eq A B n (i + 1) (if (arr_get A i) == (arr_get B i) then bad else bad + 1)
+gx6_count_neg A n i neg =
+  if i >= n then neg
+  else gx6_count_neg A n (i + 1) (if (arr_get A i) < 0 then neg + 1 else neg)
+pf b = if b == 1 then "PASS" else "FAIL"
+
+-- ===== one D2 run at a given shape; returns 1 if all gates pass =====
+gx6_run L dk =
+  let Q = gx6_mkQKV (L * dk) 0 in
+  let K = gx6_mkQKV (L * dk) 1 in
+  let V = gx6_mkQKV (L * dk) 2 in
+  let scaleq = bx4_fxrsqrt (dk * 16777216) in
+  -- per-stage: raw QK^T scores, GPU vs CPU
+  let Kt = gx6_transpose K L dk in
+  let sC = gx6_cpu_matmul Q Kt L dk L in
+  let sG = gx6_gpu_matmul Q Kt L dk L in
+  let badScores = gx6_arr_eq sC sG (L * L) 0 0 in
+  let negS = gx6_count_neg sC (L * L) 0 0 in
+  -- end-to-end attention, GPU vs CPU
+  let outC = gx6_attn_cpu Q K V L dk scaleq in
+  let outG = gx6_attn_gpu Q K V L dk scaleq in
+  let badOut = gx6_arr_eq outC outG (L * dk) 0 0 in
+  -- D0: GPU attention run twice -> identical
+  let outG2 = gx6_attn_gpu Q K V L dk scaleq in
+  let badD0 = gx6_arr_eq outG outG2 (L * dk) 0 0 in
+  let ok = if badScores == 0 then (if badOut == 0 then (if badD0 == 0 then (if negS > 0 then 1 else 0) else 0) else 0) else 0 in
+  let _ = print (cat ["GX6 L=", show L, " dk=", show dk, ": QK^T D2 mism=", show badScores, " | attn-out D2 mism=", show badOut, " | GPU-D0 mism=", show badD0, " | signed-scores=", show negS, "/", show (L * L), "   ", pf ok]) in
+  ok
+
+main =
+  let _ = ensure_dylib 0 in
+  let okA = gx6_run 64 64 in
+  let okB = gx6_run 96 48 in
+  let allok = if okA == 1 then okB else 0 in
+  let _ = print (if allok == 1
+    then "GX6 PASS: exact-integer scaled-dot-product ATTENTION reproduces BIT-FOR-BIT CPU==GPU at two shapes -- both matmuls (QK^T, P V) on the GPU exact kernel via the reconstruct-exact-S bridge, softmax exact via bx4_fxexp. A real transformer reduction, signed, order-free, device-agnostic to the bit. The frontier scheme is not shape-specific."
+    else "GX6 FAIL: GPU attention diverged from CPU exact reference -- inspect the per-shape line (QK^T vs attn-out) to localize") in
+  if allok == 1 then 0 else 1

@@ -1,0 +1,187 @@
+-- Rung 24: CHECKPOINT save/resume wired into the synthesized-grad training loop.
+--
+-- Rungs 1-23 proved the COMPILER-SYNTHESIZED gradient (net__rgrad, emitted from the
+-- `#grad net` directive) is correct, survivable, and routable to the GPU. A real
+-- training run must also survive a process restart: save state to disk, come back,
+-- and continue the SAME trajectory. This rung wires stdlib/checkpoint.rail's atomic
+-- save_checkpoint / load_checkpoint around the rung-22 net__rgrad loop and proves the
+-- resume is faithful at the BIT level.
+--
+-- Design (isolates "does load reconstruct the saved state" from "does f32 cost matter"):
+--   Phase 1  train N steps on W1,W2 (raw float_arr weights wrapped as Tensors), then
+--            save_checkpoint (atomic: clear .committed -> write payloads -> mark .committed).
+--            Checkpoint payloads are f32 (the stdlib format), so immediately reload in
+--            place (load_model_into) to quantize the live weights -- this is the honest
+--            f32 boundary cost, reported below.
+--   Phase 2  REFERENCE: continue M steps on those (now f32-quantized) weights -> loss_cont.
+--   Phase 3  RESUME: load_checkpoint into FRESH arrays (simulating a new process), continue
+--            M steps -> loss_resume.
+-- Because both phases start the M steps from the identical f32-quantized state and run the
+-- identical deterministic net__rgrad updates, a faithful checkpoint makes loss_resume EXACTLY
+-- equal loss_cont. That bit-identical equality is the load-bearing gate.
+--
+-- Gates (all must hold):
+--   1. .committed sentinel present after save (atomic-commit path ran)
+--   2. step counter round-trips (loaded step == N)
+--   3. best_val (loss) meta round-trips
+--   4. fresh-loaded weights are bit-identical to the in-place-reloaded weights (same .f32 files)
+--   5. loss_resume == loss_cont (bit-identical continuation) -- THE faithful-resume gate
+--   6. loss_cont < loss at the checkpoint (resume is a real mid-training continuation, not a no-op)
+-- Float gates use `<.` (fcmp, NaN-safe); never polymorphic `==` on a float.
+--
+-- Build: ./rail_native --out-prefix /tmp/r24 tools/ad/nn/rung24_checkpoint_resume_test.rail
+-- Run:   /tmp/r24
+
+import "stdlib/float_arr.rail"
+import "stdlib/tensor.rail"
+import "stdlib/optim.rail"
+import "stdlib/checkpoint.rail"
+
+#grad sq
+sq z = z *. z
+
+#grad net
+net W1 W2 x g =
+  let h1 = float_arr_map sq (float_mat_vec W1 x)
+  let y  = float_arr_map sq (float_mat_vec W2 h1)
+  float_dot y g
+
+fwd W1 W2 x =
+  let h1 = float_arr_map sq (float_mat_vec W1 x)
+  float_arr_map sq (float_mat_vec W2 h1)
+
+sub2 a b = a -. b
+twodiff a b = 2.0 *. (a -. b)
+
+sqsum_go a n i acc =
+  if i >= n then acc
+  else sqsum_go a n (i + 1) (acc +. ((float_arr_get a i) *. (float_arr_get a i)))
+mse y t =
+  let d = float_arr_map2 sub2 y t
+  sqsum_go d (float_arr_len d) 0 0.0
+
+axpy_go W dW lr n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set W i ((float_arr_get W i) -. (lr *. (float_arr_get dW i)))
+    axpy_go W dW lr n (i + 1)
+
+step W1 W2 x t lr =
+  let y   = fwd W1 W2 x
+  let g   = float_arr_map2 twodiff y t
+  let dW1 = net__rgrad W1 W2 x g 1.0 0
+  let dW2 = net__rgrad W1 W2 x g 1.0 1
+  let _ = axpy_go W1 dW1 lr (float_arr_len W1) 0
+  let _ = axpy_go W2 dW2 lr (float_arr_len W2) 0
+  0
+loop W1 W2 x t lr k i =
+  if i >= k then 0
+  else
+    let _ = step W1 W2 x t lr
+    loop W1 W2 x t lr k (i + 1)
+
+absf v = if v <. 0.0 then (0.0 -. v) else v
+maxdiff_go X Y n i acc =
+  if i >= n then acc
+  else
+    let d = absf ((float_arr_get X i) -. (float_arr_get Y i))
+    maxdiff_go X Y n (i + 1) (if acc <. d then d else acc)
+maxdiff X Y n = maxdiff_go X Y n 0 0.0
+
+-- wrap a raw weight float_arr (by reference) as a 2-D Tensor for the checkpoint API
+as_tensor W r c = Tensor W (cons r (cons c [])) (compute_strides (cons r (cons c [])))
+tdata t = match t | Tensor data _ _ -> data
+
+mkW1 =
+  let W = float_arr_new 6 0.0
+  let _ = float_arr_set W 0 0.5
+  let _ = float_arr_set W 1 0.2
+  let _ = float_arr_set W 2 (0.0 -. 0.1)
+  let _ = float_arr_set W 3 0.4
+  let _ = float_arr_set W 4 0.3
+  let _ = float_arr_set W 5 (0.0 -. 0.2)
+  W
+mkW2 =
+  let W = float_arr_new 6 0.0
+  let _ = float_arr_set W 0 0.4
+  let _ = float_arr_set W 1 (0.0 -. 0.1)
+  let _ = float_arr_set W 2 0.2
+  let _ = float_arr_set W 3 0.1
+  let _ = float_arr_set W 4 0.3
+  let _ = float_arr_set W 5 (0.0 -. 0.2)
+  W
+mkX =
+  let x = float_arr_new 2 0.0
+  let _ = float_arr_set x 0 0.5
+  let _ = float_arr_set x 1 (0.0 -. 0.3)
+  x
+mkT =
+  let t = float_arr_new 2 0.0
+  let _ = float_arr_set t 0 0.30
+  let _ = float_arr_set t 1 0.10
+  t
+
+main =
+  let _ = shell "rm -f /tmp/r24ckpt.*"
+  let pfx = "/tmp/r24ckpt"
+  let nn = 10
+  let mm = 10
+  let lr = 0.5
+  let x  = mkX
+  let t  = mkT
+  let W1 = mkW1
+  let W2 = mkW2
+
+  -- Phase 1: train N steps, then atomically checkpoint
+  let _ = loop W1 W2 x t lr nn 0
+  let lossN = mse (fwd W1 W2 x) t
+  let weights = cons (as_tensor W1 3 2) (cons (as_tensor W2 2 3) [])
+  let _ = save_checkpoint pfx weights [] nn lossN
+  -- quantize live weights to the f32 boundary state (honest cost of the format)
+  let _ = load_model_into pfx weights
+  let lossNq = mse (fwd W1 W2 x) t
+  let trunc = absf (lossN -. lossNq)
+
+  -- Phase 2: reference continuation on the quantized weights
+  let _ = loop W1 W2 x t lr mm 0
+  let loss_cont = mse (fwd W1 W2 x) t
+
+  -- Phase 3: resume from disk into FRESH arrays (new-process simulation)
+  let okExists = if ckpt_exists pfx then 1 else 0
+  let ck = load_checkpoint pfx
+  let wl = head ck
+  let step_loaded = head (tail (tail ck))
+  let best_loaded = head (tail (tail (tail ck)))
+  let W1r = tdata (head wl)
+  let W2r = tdata (head (tail wl))
+  -- W1/W2 have moved on M steps, so compare the freshly loaded weights against an
+  -- independent in-place reload of the SAME checkpoint (must be bit-identical .f32):
+  let W1c = mkW1
+  let W2c = mkW2
+  let wchk = cons (as_tensor W1c 3 2) (cons (as_tensor W2c 2 3) [])
+  let _ = load_model_into pfx wchk
+  let wdiff2 = if (maxdiff W1c W1r 6) <. (maxdiff W2c W2r 6) then (maxdiff W2c W2r 6) else (maxdiff W1c W1r 6)
+  let _ = loop W1r W2r x t lr mm 0
+  let loss_resume = mse (fwd W1r W2r x) t
+
+  -- Gates
+  let okStep   = if step_loaded == nn then 1 else 0
+  let okBest   = if (absf (best_loaded -. lossN)) <. 0.000001 then 1 else 0
+  let okWtRT   = if wdiff2 <. 0.000000001 then 1 else 0
+  let okResume = if (absf (loss_resume -. loss_cont)) <. 0.000000001 then 1 else 0
+  let okProg   = if loss_cont <. lossNq then 1 else 0
+  let all = okExists * okStep * okBest * okWtRT * okResume * okProg
+
+  let _ = print (cat ["Rung 24 checkpoint resume: N=", show nn, " M=", show mm, " lr=", show_float lr])
+  let _ = print (cat ["  loss@N=", show_float lossN, "  loss@N(f32 reload)=", show_float lossNq,
+                      "  f32-trunc gap=", show_float trunc])
+  let _ = print (cat ["  committed=", show okExists, "  step_loaded=", show step_loaded,
+                      " (want ", show nn, ")  best_loaded=", show_float best_loaded])
+  let _ = print (cat ["  fresh-load vs reload max|dW|=", show_float wdiff2, "  (bit-RT ", show okWtRT, ")"])
+  let _ = print (cat ["  loss_cont=", show_float loss_cont, "  loss_resume=", show_float loss_resume,
+                      "  |diff|=", show_float (absf (loss_resume -. loss_cont))])
+  let _ = print (cat ["  progress past ckpt (loss_cont<loss@N): ", show okProg])
+  let _ = print (if all == 1
+                 then "RUNG 24 PASS: atomic checkpoint round-trips the synthesized-grad training state; resume is bit-identical to uninterrupted continuation"
+                 else "RUNG 24 FAIL")
+  if all == 1 then 0 else 1

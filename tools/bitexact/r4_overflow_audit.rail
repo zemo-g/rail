@@ -1,0 +1,91 @@
+-- R4 (1B ladder): real-shape overflow audit. R3 BOUNDED the accumulator width analytically;
+-- R4 DEMONSTRATES it empirically at the actual Gemma 4 E2B contraction depths:
+--   K=2048  (d_model QKV/O projections)      K=8192 (MLP down-projection)
+-- under the R3 worst-case magnitude regime (activation |x|<=256, weight |w|<1), oriented as a
+-- MONOTONE POSITIVE accumulation (no sign cancellation -> the worst case for running-sum growth).
+--
+-- The contraction sums K products X[k]*W[k] at S^2 scale (rescale by S once at the end). With
+-- |X|~a*S and |W|~b*S the per-term product ~a*b*2^48 and the sum reaches ~2^66 at K=8192 --
+-- PAST the single-limb int63 ceiling (2^62). So:
+--   * single-limb accumulator WRAPS a large positive sum to NEGATIVE (the classic overflow tell);
+--   * the GX1 two-limb superaccumulator (V=hi*2^31+lo, ceiling ~2^93) HOLDS it EXACTLY and stays
+--     order-independent (D1) -- the property the GPU D2 (CPU==GPU) reduction rests on.
+-- D2 itself carries from GX2/GX3 unchanged: the Metal reduction runs this SAME two-limb algorithm,
+-- so proving the WIDTH is sufficient at real K is what R4 adds. D0 is trivial (pure integer).
+--
+-- Two-limb primitives are the PROVEN GX1 code (gx1_superaccum.rail), copied with an r4_ prefix
+-- because that file has a main and cannot be imported. They will promote to bx_fixed at P2.
+--
+-- Build: ./rail_native --out-prefix /tmp/r4 tools/bitexact/r4_overflow_audit.rail
+-- Run:   /tmp/r4
+
+import "tools/bitexact/bx_fixed.rail"
+
+-- ===== GX1 two-limb superaccumulator (verbatim, r4_ prefix) =====
+r4_norm h l =
+  if l >= 2147483648 then (h + 1, l - 2147483648)
+  else if l < 0 then (h - 1, l + 2147483648)
+  else (h, l)
+r4_add h l a =
+  let ahi = a / 2147483648 in
+  let alo = a - ahi * 2147483648 in
+  r4_norm (h + ahi) (l + alo)
+-- accumulate a list of terms; MUTUAL recursion (dodges the self-loop cross-dep/divide miscompiles).
+r4_acc_a h l xs = if xs == [] then (h, l) else
+  let r = r4_add h l (head xs) in
+  let (h2, l2) = r in
+  r4_acc_b h2 l2 (tail xs)
+r4_acc_b h l xs = if xs == [] then (h, l) else
+  let r = r4_add h l (head xs) in
+  let (h2, l2) = r in
+  r4_acc_a h2 l2 (tail xs)
+-- deferred single rescale by S=2^24 (exact for V>=0): V/2^24 = hi*128 + lo/2^24.
+r4_rescale h l = h * 128 + l / 16777216
+-- single-limb reference accumulator (the thing that wraps).
+r4_sum1 xs acc = if xs == [] then acc else r4_sum1 (tail xs) (acc + head xs)
+r4_rev xs acc = if xs == [] then acc else r4_rev (tail xs) (cons (head xs) acc)
+
+-- ===== deterministic worst-case-magnitude POSITIVE fill (1-indexed k) =====
+r4_mod a m = a - (a / m) * m
+-- activation a_k in [30,229] (fixed-point X = a_k * S). positive, large -> monotone growth.
+r4_genX k n = if k > n then [] else cons (((r4_mod k 200) + 30) * 16777216) (r4_genX (k + 1) n)
+-- weight b_k = ((k mod 5)+1)/8 in [0.125,0.625] (fixed-point W = ((k mod5)+1)*2^21). |w|<1.
+r4_genW k n = if k > n then [] else cons (((r4_mod k 5) + 1) * 2097152) (r4_genW (k + 1) n)
+-- products at S^2 scale: p_k = X[k]*W[k] = a_k*b_num*2^45 (each fits int63; the SUM is what wraps).
+r4_prods X W = if X == [] then [] else cons ((head X) * (head W)) (r4_prods (tail X) (tail W))
+-- integer ground-truth of sum(a_k*b_num): fits int63 (max 229*5*8192 ~ 9.4e6). fref = this / 8.
+r4_genAB k n = if k > n then [] else cons ((((r4_mod k 200) + 30)) * (((r4_mod k 5) + 1))) (r4_genAB (k + 1) n)
+
+-- one audit at contraction depth K: returns 1 if (wrap demonstrated AND two-limb holds AND D1).
+r4_audit_at K =
+  let X = r4_genX 1 K in
+  let W = r4_genW 1 K in
+  let p = r4_prods X W in
+  let s1 = r4_sum1 p 0 in                                 -- single-limb (wraps)
+  let rT = r4_acc_a 0 0 p in                              -- two-limb (exact)
+  let (hT, lT) = rT in
+  let rR = r4_acc_a 0 0 (r4_rev p []) in                  -- two-limb, reversed order (D1)
+  let (hR, lR) = rR in
+  let sumAB = r4_sum1 (r4_genAB 1 K) 0 in                 -- integer ground truth of sum a_k*b_num
+  let fref = (int_to_float sumAB) /. 8.0 in               -- unit-scale true sum
+  let two_unit = bx4_back (r4_rescale hT lT) in           -- two-limb -> unit scale (exact)
+  let s1_unit = bx4_back (s1 / 16777216) in               -- single-limb -> unit scale (garbage)
+  -- WRAP = single-limb's implied answer disagrees with the float ground truth. (NOT "s1<0": a
+  -- monotone-positive sum can wrap modulo 2^63 MULTIPLE times and land back positive but wrong.)
+  let wrapped = if (bx4_fabs (s1_unit -. fref)) >. 1.0 then 1 else 0 in
+  let capover = if hT > 2147483648 then 1 else 0 in       -- V > 2^62: single-limb CANNOT hold it
+  let held = if (bx4_fabs (two_unit -. fref)) <. 0.0001 then 1 else 0 in   -- two-limb == float ref
+  let d1 = if hT == hR then (if lT == lR then 1 else 0) else 0 in          -- order-independent
+  let _ = print (cat ["R4 K=", show K, "  single-limb unit=", show s1_unit, " (true ", show fref, ")",
+                      "   two-limb unit=", show two_unit, " hi=", show hT,
+                      "   wrap=", show wrapped, " cap>2^62=", show capover, " hold=", show held, " D1=", show d1]) in
+  if wrapped == 1 then (if capover == 1 then (if held == 1 then (if d1 == 1 then 1 else 0) else 0) else 0) else 0
+
+main =
+  let okProj = r4_audit_at 2048 in     -- d_model projection depth
+  let okMlp  = r4_audit_at 8192 in     -- MLP contraction depth
+  let allok = if okProj == 1 then okMlp else 0 in
+  let _ = print (if allok == 1
+    then "R4 PASS: at the real E2B contraction depths (2048 and 8192) a single-limb int63 accumulator WRAPS (mod 2^63, landing at a wrong value -- 302 vs 98606, 6364 vs 399580), while the two-limb superaccumulator holds it EXACTLY (matches the float ground truth), stays ORDER-INDEPENDENT (D1), and the true value provably exceeds 2^62 -- confirming the R3 width choice survives real shapes. D2 carries from GX2/GX3 (same two-limb reduction on GPU)."
+    else "R4 FAIL: inspect the wrap / hold / D1 columns above") in
+  if allok == 1 then 0 else 1

@@ -1,0 +1,153 @@
+-- Rung 5 gate oracle: full matrix x matrix matmul forward + the two backward
+-- atoms, every gradient cross-checked against central finite differences.
+--   C = A . B          A is [m,k] row-major, B is [k,n], C is [m,n]
+--   L = sum_ij Up[i,j] * C[i,j]   (Up = a fixed non-constant upstream cotangent)
+--   dA = dC . B^T  with dC = Up   ->  dA[i,p] = sum_j Up[i,j] * B[p,j]
+--   dB = A^T . dC  with dC = Up   ->  dB[p,j] = sum_i A[i,p] * Up[i,j]
+-- This is the de-risk TEMPLATE: it fixes the standalone-float_arr FD convention
+-- that the parallel atom rungs replicate. m=2, k=3, n=2 (non-square throughout).
+-- Run: ./rail_native run tools/ad/nn/rung5_matmul_oracle_test.rail
+
+import "stdlib/float_arr.rail"
+
+-- forward: C[i*n+j] = sum_p A[i*k+p] * B[p*n+j]
+mm_dot A B k n i j p acc =
+  if p >= k then acc
+  else mm_dot A B k n i j (p + 1) (acc +. ((float_arr_get A (i * k + p)) *. (float_arr_get B (p * n + j))))
+
+mm_fill A B m k n C idx =
+  if idx >= m * n then C
+  else
+    let i = idx / n
+    let j = idx - (i * n)
+    let v = mm_dot A B k n i j 0 0.0
+    let _ = float_arr_set C idx v
+    mm_fill A B m k n C (idx + 1)
+
+matmul A B m k n =
+  let C = float_arr_new (m * n) 0.0
+  mm_fill A B m k n C 0
+
+-- scalar readout L = sum_ij Up[i,j] * C[i,j]
+mml_go C Up t idx acc =
+  if idx >= t then acc
+  else mml_go C Up t (idx + 1) (acc +. ((float_arr_get C idx) *. (float_arr_get Up idx)))
+
+mm_loss A B Up m k n =
+  let C = matmul A B m k n
+  mml_go C Up (m * n) 0 0.0
+
+-- backward dA = Up . B^T  ->  dA[i*k+p] = sum_j Up[i*n+j] * B[p*n+j]
+mmda_dot Up B n i p j acc =
+  if j >= n then acc
+  else mmda_dot Up B n i p (j + 1) (acc +. ((float_arr_get Up (i * n + j)) *. (float_arr_get B (p * n + j))))
+
+mmda_fill Up B m k n dA idx =
+  if idx >= m * k then dA
+  else
+    let i = idx / k
+    let p = idx - (i * k)
+    let v = mmda_dot Up B n i p 0 0.0
+    let _ = float_arr_set dA idx v
+    mmda_fill Up B m k n dA (idx + 1)
+
+mm_dA Up B m k n =
+  let dA = float_arr_new (m * k) 0.0
+  mmda_fill Up B m k n dA 0
+
+-- backward dB = A^T . Up  ->  dB[p*n+j] = sum_i A[i*k+p] * Up[i*n+j]
+mmdb_dot A Up m k n p j i acc =
+  if i >= m then acc
+  else mmdb_dot A Up m k n p j (i + 1) (acc +. ((float_arr_get A (i * k + p)) *. (float_arr_get Up (i * n + j))))
+
+mmdb_fill A Up m k n dB idx =
+  if idx >= k * n then dB
+  else
+    let p = idx / n
+    let j = idx - (p * n)
+    let v = mmdb_dot A Up m k n p j 0 0.0
+    let _ = float_arr_set dB idx v
+    mmdb_fill A Up m k n dB (idx + 1)
+
+mm_dB A Up m k n =
+  let dB = float_arr_new (k * n) 0.0
+  mmdb_fill A Up m k n dB 0
+
+fabs1 d = if d <. 0.0 then 0.0 -. d else d
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+
+fd_A A B Up m k n idx =
+  let h = 0.0001
+  let orig = float_arr_get A idx
+  let _ = float_arr_set A idx (orig +. h)
+  let fp = mm_loss A B Up m k n
+  let _ = float_arr_set A idx (orig -. h)
+  let fm = mm_loss A B Up m k n
+  let _ = float_arr_set A idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+fd_B A B Up m k n idx =
+  let h = 0.0001
+  let orig = float_arr_get B idx
+  let _ = float_arr_set B idx (orig +. h)
+  let fp = mm_loss A B Up m k n
+  let _ = float_arr_set B idx (orig -. h)
+  let fm = mm_loss A B Up m k n
+  let _ = float_arr_set B idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+chkA dA A B Up m k n cnt idx acc =
+  if idx >= cnt then acc
+  else
+    let gi = float_arr_get dA idx
+    let fi = fd_A A B Up m k n idx
+    chkA dA A B Up m k n cnt (idx + 1) (acc + (fnear gi fi))
+
+chkB dB A B Up m k n cnt idx acc =
+  if idx >= cnt then acc
+  else
+    let gi = float_arr_get dB idx
+    let fi = fd_B A B Up m k n idx
+    chkB dB A B Up m k n cnt (idx + 1) (acc + (fnear gi fi))
+
+mkA =
+  let A = float_arr_new 6 0.0
+  let _ = float_arr_set A 0 0.5
+  let _ = float_arr_set A 1 0.2
+  let _ = float_arr_set A 2 (0.0 -. 0.1)
+  let _ = float_arr_set A 3 0.4
+  let _ = float_arr_set A 4 0.3
+  let _ = float_arr_set A 5 (0.0 -. 0.2)
+  A
+
+mkB =
+  let B = float_arr_new 6 0.0
+  let _ = float_arr_set B 0 0.3
+  let _ = float_arr_set B 1 0.2
+  let _ = float_arr_set B 2 (0.0 -. 0.1)
+  let _ = float_arr_set B 3 0.4
+  let _ = float_arr_set B 4 0.25
+  let _ = float_arr_set B 5 (0.0 -. 0.15)
+  B
+
+mkUp =
+  let U = float_arr_new 4 0.0
+  let _ = float_arr_set U 0 1.0
+  let _ = float_arr_set U 1 (0.0 -. 0.5)
+  let _ = float_arr_set U 2 0.3
+  let _ = float_arr_set U 3 0.7
+  U
+
+main =
+  let _ = print "=== Rung 5 GATE: matmul fwd + dA/dB backward (vs finite-diff, non-square 2x3x2) ==="
+  let A = mkA
+  let B = mkB
+  let Up = mkUp
+  let dA = mm_dA Up B 2 3 2
+  let dB = mm_dB A Up 2 3 2
+  let cA = chkA dA A B Up 2 3 2 6 0 0
+  let cB = chkB dB A B Up 2 3 2 6 0 0
+  let total = cA + cB
+  let _ = print (cat [show cA, "/6 dA  ", show cB, "/6 dB"])
+  let _ = print (cat [show total, "/12 matmul backward checks passed"])
+  if total == 12 then 0 else 1

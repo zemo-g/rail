@@ -1,0 +1,152 @@
+-- R5a (1B ladder): exact-integer WEIGHT DECODER -- IEEE-754 bf16/f32 bytes -> fixed-point, NO float.
+-- This is the load-bearing half of R5 (safetensors -> fixed-point, verified round-trip): the part
+-- that brings REAL model weights into the exact-integer regime. A trained weight on disk is an
+-- IEEE-754 bf16 or f32 bit pattern; this decoder turns those raw bytes DIRECTLY into the fixed-point
+-- integer X = round(value * 2^24) using only integer div/mod by powers of two -- it never materializes
+-- a float. So the conversion is itself a fixed integer algorithm: bit-identical on any device, and it
+-- composes seamlessly with the BX/GX/P exact-integer forward (the decoded X is exactly what those
+-- kernels consume). Decoding to fixed-point with zero float is the philosophically-aligned move: the
+-- weights enter the bit-exact world at the file boundary, not after a lossy float detour.
+--
+-- GATES:
+--   ACC (round-trip): for a table of canonical bf16+f32 byte patterns spanning weight scale (|w|<1),
+--     activation scale (256), both signs, AND a non-dyadic value (0.1f, which has >24 fractional bits
+--     so fixed-point must round), the decoder reproduces the CORRECTLY-ROUNDED fixed-point integer
+--     EXACTLY (0 mismatches). The residual dequant error is then just the inherent <=0.5/S ~ 3e-8
+--     that R3 already bounded -- uniform, magnitude-independent. Integer-exact gate: NO float
+--     reference (so no float-codegen poison can corrupt the check).
+--   LE-len: reconstruct the safetensors 8-byte little-endian header-length prefix from packed bytes.
+--     This is the mechanism `read_file` CANNOT provide -- a header length < 256 has 0x00 at byte 1,
+--     so read_file (strlen-terminated) truncates to 1 byte. byte_at over a length-tagged string
+--     (built with char_from_int + cat, which preserve interior nulls) reads it correctly.
+--   D0: decode the whole table twice -> bit-identical (determinism ritual; trivially true for pure
+--     integer, but it is the D0 contract every rung carries).
+--
+-- DEFERRED to R5b (honestly labeled -- two real prerequisites, neither silently takeable):
+--   (1) Reading a REAL packed multi-tensor .safetensors file end-to-end needs a binary-safe whole-file
+--       byte reader. `read_file` is strlen-terminated (proven: _rail_wrap_str copies up to the first
+--       0x00); `float_arr_from_f32_file` reads only f32 from offset 0. The clean fix is a small
+--       `read_file_bytes path -> byte buffer` runtime builtin in compile.rail (a SURFACED compiler
+--       edit gated by the full self-compile fixed-point, per the human-in-loop compiler track).
+--   (2) Exercising the loader on actual Gemma 4 E2B weights needs the model downloaded (multi-GB; not
+--       on disk -- the HF caches here are stubs). A heavyweight action to confirm explicitly, not
+--       assume. Once both land, R5b swaps the in-memory byte source for `read_file_bytes` and parses
+--       the JSON header (str_find/str_sub/parse_int) -- the SAME decoder below consumes the bytes.
+--
+-- Build: ./rail_native --out-prefix /tmp/r5 tools/bitexact/r5_weight_loader.rail
+-- Run:   /tmp/r5
+
+import "tools/bitexact/bx_fixed.rail"
+
+-- ===== pure-integer IEEE-754 -> fixed-point (S = 2^24) =====
+-- f32: 4 little-endian bytes. bits = b0 + b1*2^8 + b2*2^16 + b3*2^24.
+--   sign = bits[31], exp = bits[30:23] (8 bits), mant = bits[22:0] (23 bits).
+--   value = (-1)^sign * (2^23 + mant) * 2^(exp-127-23).
+--   X = round(value * 2^24) = (-1)^sign * (2^23 + mant) * 2^(exp-126).
+-- exp==0 (zero / subnormal, |v| < 2^-126 ~ 1e-38) flushes to 0: far below 0.5/S, within R3's bound.
+-- (exp==255 inf/NaN does not occur in trained weights; not special-cased.)
+r5_f32_fixed b0 b1 b2 b3 =
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in
+  let sign = bits / 2147483648 in
+  let rest = bits - sign * 2147483648 in
+  let exp  = rest / 8388608 in
+  let mant = rest - exp * 8388608 in
+  if exp == 0 then 0
+  else
+    let mag = 8388608 + mant in                 -- 2^23 + mant (restore implicit leading 1)
+    let sh = exp - 126 in                        -- X = mag * 2^sh
+    let xabs = if sh >= 0 then mag * (bx4_pow2 sh)
+               else (let d = bx4_pow2 (0 - sh) in (mag + d / 2) / d) in   -- round-half-up
+    if sign == 1 then 0 - xabs else xabs
+
+-- bf16: 2 little-endian bytes = the TOP 16 bits of the f32. As f32 LE bytes that is (0, 0, lo, hi).
+r5_bf16_fixed lo hi = r5_f32_fixed 0 0 lo hi
+
+-- ===== little-endian header-length prefix (6 low bytes; safetensors headers are tiny, < 2^48) =====
+r5_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+
+-- build an n-th little-endian byte of v as a 1-char string (char_from_int preserves a 0x00 byte)
+r5_byte v k = char_from_int (r5_mod (v / (bx4_pow2 (k * 8))) 256)
+r5_mod a m = a - (a / m) * m
+-- 8-byte little-endian string for a length value (interior nulls preserved through cat)
+r5_le_str v = cat [r5_byte v 0, r5_byte v 1, r5_byte v 2, r5_byte v 3,
+                   r5_byte v 4, r5_byte v 5, r5_byte v 6, r5_byte v 7]
+
+-- ===== round-trip table (integer-exact gate) =====
+-- parallel arrays: f32 entries (b0,b1,b2,b3 -> expected fixed X); decode and count mismatches.
+r5_chk_f32 B0 B1 B2 B3 EX n i bad =
+  if i >= n then bad
+  else
+    let x = r5_f32_fixed (arr_get B0 i) (arr_get B1 i) (arr_get B2 i) (arr_get B3 i) in
+    let nb = if x == arr_get EX i then bad else bad + 1 in
+    r5_chk_f32 B0 B1 B2 B3 EX n (i + 1) nb
+r5_chk_bf16 LO HI EX n i bad =
+  if i >= n then bad
+  else
+    let x = r5_bf16_fixed (arr_get LO i) (arr_get HI i) in
+    let nb = if x == arr_get EX i then bad else bad + 1 in
+    r5_chk_bf16 LO HI EX n (i + 1) nb
+
+pf ok = if ok == 1 then "PASS" else "FAIL"
+
+main =
+  -- f32 table: 1.0, 0.5, 2.0, 0.25, -0.375, 0.1 (non-dyadic -> rounds), 256.0 (activation scale)
+  let B0 = arr_new 7 0 in
+  let B1 = arr_new 7 0 in
+  let B2 = arr_new 7 0 in
+  let B3 = arr_new 7 0 in
+  let EX = arr_new 7 0 in
+  -- 1.0f = 0x3F800000  -> bytes 00 00 80 3F
+  let _ = arr_set B2 0 128 in let _ = arr_set B3 0 63 in  let _ = arr_set EX 0 16777216 in
+  -- 0.5f = 0x3F000000  -> 00 00 00 3F
+  let _ = arr_set B3 1 63 in  let _ = arr_set EX 1 8388608 in
+  -- 2.0f = 0x40000000  -> 00 00 00 40
+  let _ = arr_set B3 2 64 in  let _ = arr_set EX 2 33554432 in
+  -- 0.25f = 0x3E800000 -> 00 00 80 3E
+  let _ = arr_set B2 3 128 in let _ = arr_set B3 3 62 in  let _ = arr_set EX 3 4194304 in
+  -- -0.375f = 0xBEC00000 -> 00 00 C0 BE
+  let _ = arr_set B2 4 192 in let _ = arr_set B3 4 190 in let _ = arr_set EX 4 (0 - 6291456) in
+  -- 0.1f = 0x3DCCCCCD -> CD CC CC 3D   (round(0.1*S) = 1677722)
+  let _ = arr_set B0 5 205 in let _ = arr_set B1 5 204 in let _ = arr_set B2 5 204 in let _ = arr_set B3 5 61 in
+  let _ = arr_set EX 5 1677722 in
+  -- 256.0f = 0x43800000 -> 00 00 80 43   (256*S = 4294967296)
+  let _ = arr_set B2 6 128 in let _ = arr_set B3 6 67 in  let _ = arr_set EX 6 4294967296 in
+  let badf = r5_chk_f32 B0 B1 B2 B3 EX 7 0 0 in
+  -- D0: decode the f32 table a second time, must match bit-for-bit
+  let badf2 = r5_chk_f32 B0 B1 B2 B3 EX 7 0 0 in
+  let d0f = if badf == badf2 then 1 else 0 in
+
+  -- bf16 table: 1.0 (0x3F80), 0.5 (0x3F00), -0.375 (0xBEC0)
+  let LO = arr_new 3 0 in
+  let HI = arr_new 3 0 in
+  let BX = arr_new 3 0 in
+  let _ = arr_set LO 0 128 in let _ = arr_set HI 0 63 in  let _ = arr_set BX 0 16777216 in
+  let _ = arr_set HI 1 63 in  let _ = arr_set BX 1 8388608 in
+  let _ = arr_set LO 2 192 in let _ = arr_set HI 2 190 in let _ = arr_set BX 2 (0 - 6291456) in
+  let badb = r5_chk_bf16 LO HI BX 3 0 0 in
+  let badb2 = r5_chk_bf16 LO HI BX 3 0 0 in
+  let d0b = if badb == badb2 then 1 else 0 in
+
+  -- LE-len: pack a header length the way safetensors does, read it back via byte_at over the
+  -- length-tagged string. 100 = 0x64,0,0,0,0,0,0,0 -> read_file would truncate at byte 1; byte_at
+  -- over a string built from char_from_int + cat preserves the interior nulls and reconstructs it.
+  let hdrlen = 100 in
+  let buf = r5_le_str hdrlen in
+  let got = r5_le_len buf 0 in
+  -- and a larger one that uses byte 1 (300 = 0x2C,0x01) to prove multi-byte LE reassembly
+  let buf2 = r5_le_str 300 in
+  let got2 = r5_le_len buf2 0 in
+  let lelen_ok = if got == hdrlen then (if got2 == 300 then 1 else 0) else 0 in
+
+  let accok = if badf == 0 then (if badb == 0 then 1 else 0) else 0 in
+  let d0ok  = if d0f == 1 then d0b else 0 in
+  let allok = if accok == 1 then (if d0ok == 1 then lelen_ok else 0) else 0 in
+
+  let _ = print (cat ["R5a weight decoder  f32 mism=", show badf, "/7  bf16 mism=", show badb,
+                      "/3   ACC(round-trip, integer-exact)=", pf accok,
+                      "   D0(decode-twice)=", pf d0ok,
+                      "   LE-len(100->", show got, ", 300->", show got2, ")=", pf lelen_ok]) in
+  let _ = print (if allok == 1
+    then "R5a PASS: IEEE-754 bf16/f32 weight bytes decode straight to fixed-point (X=round(v*2^24)) with PURE integer ops -- no float -- reproducing the correctly-rounded fixed-point EXACTLY across weight scale, activation scale, both signs, and a non-dyadic value (0.1f rounds to 1677722). The decode is itself a fixed integer algorithm, so weights enter the bit-exact regime deterministically at the file boundary and feed the BX/GX/P exact-integer forward unchanged. The safetensors 8-byte LE header length -- which read_file CANNOT read (strlen-truncated at the first 0x00) -- reconstructs via byte_at over a length-tagged buffer. Remaining R5b (honestly deferred): a read_file_bytes runtime builtin (surfaced compile.rail edit) + a real Gemma 4 E2B download to parse a packed multi-tensor file end-to-end."
+    else "R5a FAIL: inspect the ACC / D0 / LE-len columns above") in
+  if allok == 1 then 0 else 1

@@ -1,0 +1,80 @@
+-- Rung 17 gate oracle: gradient accumulation across a batch, verified by
+-- EQUIVALENCE to the sum of per-example gradients.
+--   Given B example-gradient vectors g_0..g_{B-1}, each length n, accumulate
+--   gacc[i] += g_b[i]. The result MUST equal sum_b g_b[i] for every i.
+-- PATH A: streaming accumulation. Each example's gradient is materialized in a
+--         FRESH float_arr inside an arena_mark/arena_reset window (so the B
+--         transient per-example arrays do not pile up), then added into gacc.
+-- PATH B: independent double-loop reference. For each i, recompute sum_b g_b[i]
+--         directly via a recursive accumulator threaded through a PARAMETER
+--         (codegen-safe; no float-let surviving across a call).
+-- Compared with fnear (tol 0.005 abs + 0.01 rel).
+-- Run: /tmp/rail_atoms --out-prefix /tmp/r17 run tools/ad/nn/rung17_batch_accum_verify_test.rail
+--
+-- arena builtins: arena_mark / arena_reset FOUND (compile.rail builtins, used in
+-- stdlib/bpe.rail). Per-example work is wrapped; results are bit-for-bit
+-- unaffected by the reset (gacc lives OUTSIDE the window).
+
+import "stdlib/float_arr.rail"
+
+fabs1 d = if d <. 0.0 then 0.0 -. d else d
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+
+-- gval b i : the i-th component of example b's gradient. A fixed, fully
+-- reproducible 2-D pattern. Every return is a literal float expression, so no
+-- float ever has to survive in a let across a call boundary.
+--   g_b[i] = 0.1*(b+1) - 0.05*i + (b - i)*0.02
+gval b i =
+  let bb = int_to_float (b + 1)
+  let ib = int_to_float i
+  let diff = int_to_float (b - i)
+  ((0.1 *. bb) -. (0.05 *. ib)) +. (diff *. 0.02)
+
+-- materialize example b's gradient vector into a fresh length-n array.
+make_grad n b j out =
+  if j >= n then out
+  else
+    let _ = float_arr_set out j (gval b j)
+    make_grad n b (j + 1) out
+
+-- add a length-n array src into gacc elementwise (gacc[j] += src[j]).
+add_into gacc src n j =
+  if j >= n then 0
+  else
+    let _ = float_arr_set gacc j ((float_arr_get gacc j) +. (float_arr_get src j))
+    add_into gacc src n (j + 1)
+
+-- PATH A: stream B examples into gacc, each inside an arena window.
+accum_batch gacc n bcount b =
+  if b >= bcount then gacc
+  else
+    let mk = arena_mark 0
+    let g = float_arr_new n 0.0
+    let _ = make_grad n b 0 g
+    let _ = add_into gacc g n 0
+    let _ = arena_reset mk
+    accum_batch gacc n bcount (b + 1)
+
+-- PATH B: independent reference. sum_ref i bcount b acc = sum over b of gval b i.
+-- acc threaded through a PARAMETER (safe accumulator pattern).
+sum_ref i bcount b acc =
+  if b >= bcount then acc
+  else sum_ref i bcount (b + 1) (acc +. (gval b i))
+
+-- compare gacc[i] against the independent sum for every i.
+chk_accum gacc n bcount i acc =
+  if i >= n then acc
+  else
+    let va = float_arr_get gacc i
+    let vb = sum_ref i bcount 0 0.0
+    chk_accum gacc n bcount (i + 1) (acc + (fnear va vb))
+
+main =
+  let _ = print "=== Rung 17 GATE: batch gradient accumulation (streaming + arena vs sum-of-grads ref) ==="
+  let n = 5
+  let bcount = 6
+  let gacc = float_arr_new n 0.0
+  let _ = accum_batch gacc n bcount 0
+  let c = chk_accum gacc n bcount 0 0
+  let _ = print (cat [show c, "/", show n, " accumulated components match sum_b g_b[i]"])
+  if c == n then 0 else 1

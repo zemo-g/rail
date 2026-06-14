@@ -1,0 +1,102 @@
+-- GX1: multi-limb (two-limb) superaccumulator that lifts the single-limb int63
+-- ceiling GX0 quantified (K=16383 unit 2^48 products before the running sum wraps
+-- negative). The two-limb value V = hi*BASE + lo with BASE=2^31 represents sums up
+-- to ~2^93 exactly, so a GPU reduction over millions of raw fixed-point products
+-- stays an EXACT integer reduction -- the property the whole D2 (CPU==GPU) claim
+-- rests on. Deferred single rescale: divide by S=2^24 exactly ONCE at the end via
+-- gx1_rescale (BASE = 2^24 * 2^7, so V/2^24 = hi*128 + lo/2^24, exact for V>=0).
+--
+-- Carries dodge the self-loop cross-dep-args miscompile (rail-bug-self-loop-cross-
+-- dep-args) the SAME way GX0 did: the accumulator loop is MUTUAL recursion
+-- (gx1_acc_a/gx1_acc_b ping-pong), never a self-tail-call whose acc arg depends on
+-- a passed-through arg. Big literals stay in operand/arg positions only (never a
+-- bound/returned bare const) to dodge rail-bug-value-literal-tag-mov.
+
+-- one-step normalize: bring lo back into [0, 2^31) with a single carry or borrow.
+-- invariant between adds: 0 <= lo < 2^31 and |alo| < 2^31, so one step suffices.
+gx1_norm h l =
+  if l >= 2147483648 then (h + 1, l - 2147483648)
+  else if l < 0 then (h - 1, l + 2147483648)
+  else (h, l)
+
+-- add a single (signed) int63 term into the two-limb accumulator.
+gx1_add h l a =
+  let ahi = a / 2147483648 in
+  let alo = a - ahi * 2147483648 in
+  gx1_norm (h + ahi) (l + alo)
+
+-- accumulate a list of terms; MUTUAL recursion (cross-dep miscompile dodge).
+gx1_acc_a h l xs = if xs == [] then (h, l) else
+  let r = gx1_add h l (head xs) in
+  let (h2, l2) = r in
+  gx1_acc_b h2 l2 (tail xs)
+gx1_acc_b h l xs = if xs == [] then (h, l) else
+  let r = gx1_add h l (head xs) in
+  let (h2, l2) = r in
+  gx1_acc_a h2 l2 (tail xs)
+
+-- reconstruct the exact integer (only valid when it fits a single int63 limb).
+gx1_recon h l = h * 2147483648 + l
+-- deferred single rescale by S=2^24 (exact for V>=0): hi*2^7 + lo/2^24.
+gx1_rescale h l = h * 128 + l / 16777216
+
+-- single-limb references (the thing GX0 proved overflows past K=16383).
+gx1_sum1 xs acc = if xs == [] then acc else gx1_sum1 (tail xs) (acc + head xs)
+gx1_rev xs acc = if xs == [] then acc else gx1_rev (tail xs) (cons (head xs) acc)
+
+-- GX0's exact test vectors: u_k = k.0, v_k = (k+1).0 (F=24); products k*(k+1)*S^2.
+gx1_mku k n = if k > n then [] else cons (k * 16777216) (gx1_mku (k + 1) n)
+gx1_mkv k n = if k > n then [] else cons ((k + 1) * 16777216) (gx1_mkv (k + 1) n)
+gx1_prods u v = if u == [] then [] else cons ((head u) * (head v)) (gx1_prods (tail u) (tail v))
+
+-- past-ceiling stress vectors: c_k = (k mod 251)+1 in [1,251], product c_k * 2^48.
+-- non-constant, non-palindrome -> reversed is a genuine reordering.
+gx1_mod a m = a - (a / m) * m
+gx1_genP k n = if k > n then [] else cons (((gx1_mod k 251) + 1) * 281474976710656) (gx1_genP (k + 1) n)
+gx1_genC k n = if k > n then [] else cons ((gx1_mod k 251) + 1) (gx1_genC (k + 1) n)
+
+main =
+  -- Gate A: below-ceiling exactness -- two-limb reconstruct == single-limb sum.
+  let u = gx1_mku 1 16 in
+  let v = gx1_mkv 1 16 in
+  let p16 = gx1_prods u v in
+  let s1 = gx1_sum1 p16 0 in
+  let rA = gx1_acc_a 0 0 p16 in
+  let (hA, lA) = rA in
+  let reconA = gx1_recon hA lA in
+  let gateA = if reconA == s1 then 1 else 0 in
+  -- Gate B: deferred single rescale matches the once-at-end dot divide.
+  let dotRef = s1 / 16777216 in
+  let dotTwo = gx1_rescale hA lA in
+  let gateB = if dotTwo == dotRef then 1 else 0 in
+  -- Gate signed: add a term then its negation -> back to exact zero.
+  let rP = gx1_add 0 0 1407374883553280 in
+  let (hP, lP) = rP in
+  let rZ = gx1_add hP lP (0 - 1407374883553280) in
+  let (hZ, lZ) = rZ in
+  let reconZ = gx1_recon hZ lZ in
+  let gateS = if reconZ == 0 then 1 else 0 in
+  -- Gate C: past-ceiling exactness + order-independence on 40000 big products.
+  let pN = gx1_genP 1 40000 in
+  let cN = gx1_genC 1 40000 in
+  let sumc = gx1_sum1 cN 0 in
+  let rN = gx1_acc_a 0 0 pN in
+  let (hN, lN) = rN in
+  let rR = gx1_acc_a 0 0 (gx1_rev pN []) in
+  let (hRv, lRv) = rR in
+  let expH = sumc * 131072 in
+  let gateCx = if hN == expH then (if lN == 0 then 1 else 0) else 0 in
+  let gateCo = if hN == hRv then (if lN == lRv then 1 else 0) else 0 in
+  let gatePc = if hN > 2147483648 then 1 else 0 in
+  let s1wrap = gx1_sum1 pN 0 in
+  let _ = print (join "" ["GX1 gate A below-ceiling exact: two-limb recon=", show reconA, " single-limb=", show s1, " -> ", if gateA == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["GX1 gate B deferred rescale: two-limb dot=", show dotTwo, " ref dot=", show dotRef, " -> ", if gateB == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["GX1 gate signed add+negate->zero: recon=", show reconZ, " -> ", if gateS == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["GX1 gate C past-ceiling exact (N=40000): hi=", show hN, " lo=", show lN, " expected hi=sumc*2^17=", show expH, " -> ", if gateCx == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["GX1 gate C order-independent (nat vs rev past ceiling): natHi=", show hN, " revHi=", show hRv, " -> ", if gateCo == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["GX1 past-ceiling proof: single-limb WRAPPED to ", show s1wrap, " (garbage); two-limb true hi=", show hN, " > 2^31 so V > 2^62 -> ", if gatePc == 1 then "PASS" else "FAIL"]) in
+  let allok = if gateA == 1 then (if gateB == 1 then (if gateS == 1 then (if gateCx == 1 then (if gateCo == 1 then (if gatePc == 1 then 1 else 0) else 0) else 0) else 0) else 0) else 0 in
+  let _ = print (if allok == 1
+    then "GX1 PASS: two-limb superaccumulator is exact below AND far past the single-limb ceiling, order-independent, deferred-rescale-correct -> the GPU reduction can sum millions of raw fixed-point products as a pure exact-integer problem"
+    else "GX1 FAIL: superaccumulator not exact/order-independent -- fix before any Metal exact-accum kernel") in
+  0

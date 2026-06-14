@@ -1,0 +1,104 @@
+-- Rung 13 gate oracle: token-embedding gather forward, FD-checked on the table.
+--   E shape [V, d] row-major, length V*d.  ids = fixed int list of length T.
+--   gathered[t,q] = E[ids[t]*d + q]    shape [T, d]
+--   Readout L = sum_{t,q} Up[t*d+q] * gathered[t,q],  Up fixed non-constant.
+--   d L / d E[v*d+q] = sum over t where ids[t]==v of Up[t*d+q]   (scatter-add).
+--   Unreferenced E rows have grad 0; that is a valid check (row 3 below).
+-- V=4, d=2, T=3, ids=[2,0,1] (row 3 never referenced). Floats stay in params.
+-- Run: /tmp/rail_atoms --out-prefix /tmp/rung13 run tools/ad/nn/rung13_embed_gather_oracle_test.rail
+
+import "stdlib/float_arr.rail"
+
+-- recursive nth on a plain Rail int list (idiomatic; ids are small)
+nth_id ids i = if i <= 0 then head ids else nth_id (tail ids) (i - 1)
+
+-- forward: G[t*d+q] = E[ids[t]*d + q]
+gather_fill E ids d G idx =
+  if idx >= (float_arr_len G) then G
+  else
+    let t = idx / d
+    let q = idx - (t * d)
+    let v = nth_id ids t
+    let _ = float_arr_set G idx (float_arr_get E (v * d + q))
+    gather_fill E ids d G (idx + 1)
+
+gather E ids d T =
+  let G = float_arr_new (T * d) 0.0
+  gather_fill E ids d G 0
+
+-- scalar readout L = sum Up*G
+gatherl_go G Up t idx acc =
+  if idx >= t then acc
+  else gatherl_go G Up t (idx + 1) (acc +. ((float_arr_get G idx) *. (float_arr_get Up idx)))
+
+gather_loss E ids Up d T =
+  let G = gather E ids d T
+  gatherl_go G Up (T * d) 0 0.0
+
+-- analytic dE = scatter-add of Up back into table shape: walk every gathered
+-- slot (t,q) and accumulate Up[t*d+q] into dE[ids[t]*d + q].
+dembed_scatter Up ids d T dE idx =
+  if idx >= (T * d) then dE
+  else
+    let t = idx / d
+    let q = idx - (t * d)
+    let v = nth_id ids t
+    let prev = float_arr_get dE (v * d + q)
+    let _ = float_arr_set dE (v * d + q) (prev +. (float_arr_get Up idx))
+    dembed_scatter Up ids d T dE (idx + 1)
+
+embed_dE Up ids d T V =
+  let dE = float_arr_new (V * d) 0.0
+  dembed_scatter Up ids d T dE 0
+
+fabs1 d = if d <. 0.0 then 0.0 -. d else d
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+
+fd_E E ids Up d T idx =
+  let h = 0.0001
+  let orig = float_arr_get E idx
+  let _ = float_arr_set E idx (orig +. h)
+  let fp = gather_loss E ids Up d T
+  let _ = float_arr_set E idx (orig -. h)
+  let fm = gather_loss E ids Up d T
+  let _ = float_arr_set E idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+chkE dE E ids Up d T cnt idx acc =
+  if idx >= cnt then acc
+  else
+    let gi = float_arr_get dE idx
+    let fi = fd_E E ids Up d T idx
+    chkE dE E ids Up d T cnt (idx + 1) (acc + (fnear gi fi))
+
+mkE =
+  let E = float_arr_new 8 0.0
+  let _ = float_arr_set E 0 0.5
+  let _ = float_arr_set E 1 (0.0 -. 0.2)
+  let _ = float_arr_set E 2 0.3
+  let _ = float_arr_set E 3 0.7
+  let _ = float_arr_set E 4 (0.0 -. 0.4)
+  let _ = float_arr_set E 5 0.1
+  let _ = float_arr_set E 6 0.8
+  let _ = float_arr_set E 7 (0.0 -. 0.65)
+  E
+
+mkUp =
+  let U = float_arr_new 6 0.0
+  let _ = float_arr_set U 0 1.0
+  let _ = float_arr_set U 1 (0.0 -. 0.5)
+  let _ = float_arr_set U 2 0.3
+  let _ = float_arr_set U 3 0.7
+  let _ = float_arr_set U 4 (0.0 -. 0.2)
+  let _ = float_arr_set U 5 0.9
+  U
+
+main =
+  let _ = print "=== Rung 13 GATE: embedding gather fwd + dE backward (vs finite-diff, V=4 d=2 T=3) ==="
+  let E = mkE
+  let Up = mkUp
+  let ids = [2, 0, 1]
+  let dE = embed_dE Up ids 2 3 4
+  let cE = chkE dE E ids Up 2 3 8 0 0
+  let _ = print (cat [show cE, "/8 dE checks passed (incl. unreferenced row 3 = 0)"])
+  if cE == 8 then 0 else 1

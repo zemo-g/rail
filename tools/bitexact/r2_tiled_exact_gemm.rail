@@ -1,0 +1,155 @@
+-- R2 (1B ladder): THREADGROUP-TILED exact-integer GEMM. GX2/BX3 proved an
+-- UNTILED exact-integer Metal matmul (one thread per output, each doing its own
+-- sequential 2-limb accumulation) is bit-for-bit == the CPU reference. R2 proves
+-- the SAME bit-exactness survives the standard GEMM performance optimization:
+-- staging the A and B operands through threadgroup (shared) memory in 16x16 tiles.
+--
+-- WHY IT STAYS EXACT (by construction, not by luck): tiling changes only WHERE a
+-- thread reads its operands (threadgroup memory vs global memory), never the ORDER
+-- in which output (i,j) accumulates them. Each output is still owned by exactly one
+-- thread that sweeps p = 0,1,...,K-1 in increasing order through the identical
+-- plo0/plo/phi/lon/carry 2-limb steps. Integer add is associative AND here the order
+-- is literally unchanged, so the per-output [hi,lo] limbs are a pure function of the
+-- exact integer sum -- independent of tile schedule (D1) and identical to the CPU
+-- reference (D2). The point of the rung: bit-exactness does not force the slow
+-- untiled kernel; the real optimization is compatible with reproducibility.
+--
+-- GATES (at real Gemma 4 E2B contraction depths K=2048 QKV/O, K=8192 MLP-down):
+--   tiled == untiled : new tiled kernel limbs == the PROVEN exact_matmul limbs, bit-for-bit.
+--   tiled == CPU (D2): new tiled kernel limbs == the CPU 2-limb reference, bit-for-bit.
+--   D0 (run-twice)   : tiled kernel decoded twice -> bit-identical [hi,lo].
+--   ragged case (M,N,K none a multiple of 16) exercises the bounds-guarded padding
+--   lanes; deep-K cases drive the accumulator past 2^31 so the hi-limb carry path is
+--   genuinely used (hi_nonzero count reported -- a non-degenerate test).
+--
+-- Build: ./rail_native --out-prefix /tmp/r2 tools/bitexact/r2_tiled_exact_gemm.rail
+-- Run:   /tmp/r2
+
+import "stdlib/tensor.rail"
+
+imod a m = a - (a / m) * m
+-- deterministic int32-safe operand fills (both < 2^27, so products < 2^54 and a
+-- K=8192 sum reaches ~2^67 -> exceeds a single 2^31 limb, exercising the carry).
+aval t = ((imod t 977) + 1) * 100003
+bval t = ((imod t 613) + 1) * 200003
+fill_ai A n i =
+  if i >= n then A
+  else
+    let _ = arr_set A i (aval i)
+    fill_ai A n (i + 1)
+fill_bi B n i =
+  if i >= n then B
+  else
+    let _ = arr_set B i (bval i)
+    fill_bi B n (i + 1)
+-- parallel exact-integer float copies (the GPU input buffers)
+to_farr src dst n i =
+  if i >= n then dst
+  else
+    let _ = float_arr_set dst i (int_to_float (arr_get src i))
+    to_farr src dst n (i + 1)
+
+-- ---- CPU exact reference: 2-limb integer accumulator (verbatim from bx3/bx2) ----
+acc_add acc p =
+  let lo = arr_get acc 1
+  let hi = arr_get acc 0
+  let plo0 = p - ((p / 2147483648) * 2147483648)
+  let plo = if plo0 < 0 then plo0 + 2147483648 else plo0
+  let phi = (p - plo) / 2147483648
+  let lon = lo + plo
+  let carry = if lon >= 2147483648 then 1 else 0
+  let _ = arr_set acc 1 (lon - (carry * 2147483648))
+  let _ = arr_set acc 0 (hi + phi + carry)
+  0
+edot Aq Bq k n i j p acc =
+  if p >= k then 0
+  else
+    let _ = acc_add acc ((arr_get Aq (i * k + p)) * (arr_get Bq (p * n + j)))
+    edot Aq Bq k n i j (p + 1) acc
+cpu_hilo_go Aq Bq Hi Lo m k n i j =
+  if i >= m then 0
+  else if j >= n then cpu_hilo_go Aq Bq Hi Lo m k n (i + 1) 0
+  else
+    let acc = arr_new 2 0
+    let _ = edot Aq Bq k n i j 0 acc
+    let _ = arr_set Hi (i * n + j) (arr_get acc 0)
+    let _ = arr_set Lo (i * n + j) (arr_get acc 1)
+    cpu_hilo_go Aq Bq Hi Lo m k n i (j + 1)
+
+-- ---- limb bit-equality: CPU int arrays vs GPU exact-int-double arrays (from bx3) ----
+limb_bad Hic Loc Hif Lof n i bad =
+  if i >= n then bad
+  else
+    let hg = float_to_int (float_arr_get Hif i)
+    let lg = float_to_int (float_arr_get Lof i)
+    let b2 = if hg == (arr_get Hic i)
+             then (if lg == (arr_get Loc i) then bad else bad + 1)
+             else bad + 1
+    limb_bad Hic Loc Hif Lof n (i + 1) b2
+-- limb bit-equality: two GPU float-limb arrays (tiled vs untiled, tiled vs tiled)
+limb_bad_ff Hu Lu Ht Lt n i bad =
+  if i >= n then bad
+  else
+    let hu = float_to_int (float_arr_get Hu i)
+    let ht = float_to_int (float_arr_get Ht i)
+    let lu = float_to_int (float_arr_get Lu i)
+    let lt = float_to_int (float_arr_get Lt i)
+    let b2 = if hu == ht then (if lu == lt then bad else bad + 1) else bad + 1
+    limb_bad_ff Hu Lu Ht Lt n (i + 1) b2
+-- count outputs whose hi-limb is nonzero (proves the >2^31 carry path is exercised)
+count_hinz H n i acc =
+  if i >= n then acc
+  else
+    let v = float_to_int (float_arr_get H i)
+    count_hinz H n (i + 1) (if v == 0 then acc else acc + 1)
+
+pf b = if b == 1 then "PASS" else "FAIL"
+
+run_case M K N =
+  let nA = M * K
+  let nB = K * N
+  let nC = M * N
+  let Ai = fill_ai (arr_new nA 0) nA 0
+  let Bi = fill_bi (arr_new nB 0) nB 0
+  let Af = to_farr Ai (float_arr_new nA 0.0) nA 0
+  let Bf = to_farr Bi (float_arr_new nB 0.0) nB 0
+  -- untiled (PROVEN exact_matmul) -> Hu, Lu
+  let Hu = float_arr_new nC 0.0
+  let Lu = float_arr_new nC 0.0
+  let _ = tgl_exact_matmul Af Bf Hu Lu M K N
+  -- tiled (NEW exact_matmul_tiled) -> Ht, Lt
+  let Ht = float_arr_new nC 0.0
+  let Lt = float_arr_new nC 0.0
+  let _ = tgl_exact_matmul_tiled Af Bf Ht Lt M K N
+  -- tiled a second time -> Ht2, Lt2 (D0)
+  let Ht2 = float_arr_new nC 0.0
+  let Lt2 = float_arr_new nC 0.0
+  let _ = tgl_exact_matmul_tiled Af Bf Ht2 Lt2 M K N
+  -- CPU 2-limb reference (forward order) -> Hic, Loc
+  let Hic = arr_new nC 0
+  let Loc = arr_new nC 0
+  let _ = cpu_hilo_go Ai Bi Hic Loc M K N 0 0
+  let equiv = if (limb_bad_ff Hu Lu Ht Lt nC 0 0) == 0 then 1 else 0
+  let d2 = if (limb_bad Hic Loc Ht Lt nC 0 0) == 0 then 1 else 0
+  let d0 = if (limb_bad_ff Ht Lt Ht2 Lt2 nC 0 0) == 0 then 1 else 0
+  let hinz = count_hinz Ht nC 0 0
+  let ok = equiv * d2 * d0
+  let _ = print (cat ["  M=", show M, " K=", show K, " N=", show N,
+                      "  tiled==untiled=", pf equiv, "  tiled==CPU(D2)=", pf d2,
+                      "  D0=", pf d0, "  hi!=0:", show hinz, "/", show nC, "   ", pf ok])
+  ok
+
+main =
+  let _ = ensure_dylib 0
+  let _ = print "R2 threadgroup-tiled exact-integer GEMM == proven untiled == CPU 2-limb, at real E2B depths:"
+  -- ragged shape: M,N,K none a multiple of 16 -> exercises padding-lane bounds guards
+  let okA = run_case 20 100 20
+  -- real QKV/O projection contraction depth (128 K-tiles)
+  let okB = run_case 8 2048 8
+  -- real MLP down-projection depth (512 K-tiles; sum > 2^63 -> 2-limb carry path)
+  let okC = run_case 8 8192 8
+  let allok = okA * okB * okC
+  let _ = print (if allok == 1
+    then "R2 PASS: the threadgroup-TILED exact-integer Metal GEMM is bit-for-bit identical to the PROVEN untiled exact_matmul AND to the CPU 2-limb reference -- at real Gemma 4 E2B contraction depths (2048 and 8192), on a ragged shape, with run-twice determinism, and with the >2^31 hi-limb carry path genuinely exercised. Tiling (the standard GEMM optimization: stage A/B operands through threadgroup memory) preserves bit-exactness BY CONSTRUCTION because each output keeps its own sequential p=0..K-1 accumulation -- so D1 schedule-independence and D2 GPU==CPU hold unchanged. Bit-exact training does not have to give up the real performance optimization."
+    else "R2 FAIL: inspect the tiled==untiled / tiled==CPU / D0 columns above")
+  if allok == 1 then 0 else 1

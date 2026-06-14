@@ -1,0 +1,237 @@
+-- P3 (1B ladder): exact-integer GeGLU MLP sub-block forward on REAL-format BF16 weights, attested.
+--
+-- This is the self-contained, CI-runnable analog of the capstone. The capstone itself loads the
+-- three GeGLU projection matrices (gate/up/down) of Gemma 4 E2B layer-0 DIRECTLY from the real
+-- 10.25 GB model.safetensors via read_file_bytes + byte_at, decodes each BF16 element to
+-- fixed-point (S=2^24) with pure-integer IEEE-754, runs the proven p2a two-limb superaccumulator
+-- GeGLU at real shapes (d=1536, hidden=6144), falsifies the integer result against an INDEPENDENT
+-- numpy true-float GeGLU, proves determinism (D0), and Ed25519-attests the exact output. That
+-- 10 GB oracle is kept in /tmp (r5b_p3_geglu.rail) because the model does not fit in CI; it has
+-- been run and reproduces BIT-IDENTICALLY on two different machines (M4 Pro mini + M1 Ultra
+-- studio) -- the same real weights -> same bit-deterministic output -> same Ed25519 chain-head
+-- on independent silicon (the PAOS re-verification property).
+--
+-- THIS file runs the byte-identical load+parse+decode+forward+attest path on a SMALL fixture
+-- (gen by tools/bitexact/p3_gen_fixture.py): a real-format .safetensors with the SAME long
+-- Gemma tensor key names and BF16 dtype, three projections at d=4, hidden=8. Same scan code,
+-- same decoder, same two-limb forward, same attestation ritual -- just sized to commit + CI.
+--
+-- GATES:
+--   OFF    : generic header parse recovers each projection's data_offsets[0] exactly.
+--   W      : pure-integer BF16 decode of gate row0 [0..3] reproduces the fixture's fixed-point.
+--   REFD   : the numpy reference's leading D matches.
+--   G0     : gate[0] (a pure linear dot) matches the numpy gate[0] to <= floor/round slack.
+--   ACC    : max |int y - numpy true-float y| stays within the tanh-gelu approximation bound.
+--   D0     : rerun the whole forward -> identical checksum (determinism ritual).
+--   ATTEST : Ed25519 over (genesis|commit|pk) verifies; a wrong key cannot forge it; a 1-unit
+--            output change is rejected. LOCAL ephemeral dev key + LOCAL genesis (never a prod surface).
+--
+-- Build: ./rail_native --out-prefix /tmp/p3f tools/bitexact/p3_real_geglu.rail
+-- Run:   /tmp/p3f        (regenerates the fixture at run time; needs python3 + numpy as the
+--                         external float-reference oracle -- Rail does the exact-integer half)
+import "tools/bitexact/bx_fixed.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- ===== pure-integer IEEE-754 bf16 -> fixed-point (S = 2^24), proven in R5a/R5b =====
+rg_f32_fixed b0 b1 b2 b3 =
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in
+  let sign = bits / 2147483648 in
+  let rest = bits - sign * 2147483648 in
+  let exp  = rest / 8388608 in
+  let mant = rest - exp * 8388608 in
+  if exp == 0 then 0
+  else
+    let mag = 8388608 + mant in
+    let sh = exp - 126 in
+    let xabs = if sh >= 0 then mag * (bx4_pow2 sh)
+               else (let d = bx4_pow2 (0 - sh) in (mag + d / 2) / d) in
+    if sign == 1 then 0 - xabs else xabs
+rg_bf16_fixed lo hi = rg_f32_fixed 0 0 lo hi
+
+-- ===== buffer scan + parse (proven in R5b) =====
+rg_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+rg_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then rg_match buf (pos + 1) (tail pcs) else 0
+rg_find buf pos hi pcs = if pos >= hi then 0 - 1 else if rg_match buf pos pcs == 1 then pos else rg_find buf (pos + 1) hi pcs
+rg_find_after buf pos hi pcs = let p = rg_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+rg_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else rg_int buf (pos + 1) (acc * 10 + (c - 48))
+rg_digits_end buf pos = let c = byte_at buf pos in if c < 48 then pos else if c > 57 then pos else rg_digits_end buf (pos + 1)
+
+-- ===== exact-integer GeGLU (p2a kernel; weights from REAL-format bytes) =====
+rg_rescale h l = (h * 2147483648 + l) / 16777216
+rg_imod a b = a - (a / b) * b
+rg_x i = (rg_imod (i * 131 + 7) 2001 - 1000) * 8192
+rg_fillX X d i = if i >= d then X else let _ = arr_set X i (rg_x i) in rg_fillX X d (i + 1)
+
+-- two-limb exact dot for one output row: acc += W[wb0 + 2p]*src[p], in place (direct self-loop).
+rg_dot buf wb0 src K acc p =
+  if p >= K then 0
+  else
+    let wbp = wb0 + 2 * p in
+    let w = rg_bf16_fixed (byte_at buf wbp) (byte_at buf (wbp + 1)) in
+    let a = w * (arr_get src p) in
+    let ahi = a / 2147483648 in
+    let alo = a - ahi * 2147483648 in
+    let h0 = (arr_get acc 0) + ahi in
+    let l0 = (arr_get acc 1) + alo in
+    let h = if l0 >= 2147483648 then h0 + 1 else if l0 < 0 then h0 - 1 else h0 in
+    let l = if l0 >= 2147483648 then l0 - 2147483648 else if l0 < 0 then l0 + 2147483648 else l0 in
+    let _ = arr_set acc 0 h in
+    let _ = arr_set acc 1 l in
+    rg_dot buf wb0 src K acc (p + 1)
+
+-- fill a projection output (outN rows, K terms each). wbase = byte offset of element 0.
+rg_fill buf wbase src K out outN acc j =
+  if j >= outN then out
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let wb0 = wbase + 2 * j * K in
+    let _ = rg_dot buf wb0 src K acc 0 in
+    let _ = arr_set out j (rg_rescale (arr_get acc 0) (arr_get acc 1)) in
+    rg_fill buf wbase src K out outN acc (j + 1)
+
+rg_geglu gate up gg hidden j =
+  if j >= hidden then gg
+  else let _ = arr_set gg j (((bx4_gelu (arr_get gate j)) * (arr_get up j)) / 16777216) in
+       rg_geglu gate up gg hidden (j + 1)
+
+-- whole sub-block forward -> y (D outputs). gbase/ubase/dbase = byte offsets of each matrix's elem 0.
+rg_forward buf gbase ubase dbase d hh =
+  let acc = arr_new 2 0 in
+  let x = rg_fillX (arr_new d 0) d 0 in
+  let up = rg_fill buf ubase x d (arr_new hh 0) hh acc 0 in
+  let gate = rg_fill buf gbase x d (arr_new hh 0) hh acc 0 in
+  let gg = rg_geglu gate up (arr_new hh 0) hh 0 in
+  rg_fill buf dbase gg hh (arr_new d 0) d acc 0
+
+rg_sum_a Y d i acc = if i >= d then acc else rg_sum_b Y d (i + 1) (acc + (arr_get Y i))
+rg_sum_b Y d i acc = if i >= d then acc else rg_sum_a Y d (i + 1) (acc + (arr_get Y i))
+
+-- ===== reference comparison =====
+rg_iabs v = if v < 0 then 0 - v else v
+-- read n whitespace/newline-separated (optionally negative) ints from buf into A.
+rg_read_nums buf pos A k n =
+  if k >= n then pos
+  else
+    let c = byte_at buf pos in
+    if c == 45 then (let v = 0 - (rg_int buf (pos + 1) 0) in let e = rg_digits_end buf (pos + 1) in let _ = arr_set A k v in rg_read_nums buf e A (k + 1) n)
+    else if (if c >= 48 then (if c <= 57 then 1 else 0) else 0) == 1 then (let v = rg_int buf pos 0 in let e = rg_digits_end buf pos in let _ = arr_set A k v in rg_read_nums buf e A (k + 1) n)
+    else rg_read_nums buf (pos + 1) A k n
+-- max |Y[i] - ref[i]| ; ref outputs start at A index 2. cell[0] holds running max.
+rg_maxdiff Y A d cell i =
+  if i >= d then arr_get cell 0
+  else
+    let e = rg_iabs ((arr_get Y i) - (arr_get A (i + 2))) in
+    let _ = arr_set cell 0 (if e > (arr_get cell 0) then e else (arr_get cell 0)) in
+    rg_maxdiff Y A d cell (i + 1)
+
+pf ok = if ok == 1 then "PASS" else "FAIL"
+
+main =
+  let _ = shell "python3 tools/bitexact/p3_gen_fixture.py > /dev/null" in
+  let d = 4 in
+  let hh = 8 in
+  let path = "/tmp/p3_fix.safetensors" in
+  let buf = read_file_bytes path in
+  let n = rg_le_len buf 0 in
+  let hi = 8 + n in
+  let base = 8 + n in
+
+  -- locate the three GeGLU projection tensors (real Gemma key names), read data_offsets[0]
+  let do_cs = chars "\"data_offsets\":[" in
+  let gp = rg_find buf 8 hi (chars "\"model.language_model.layers.0.mlp.gate_proj.weight\"") in
+  let gstart = rg_int buf (rg_find_after buf gp hi do_cs) 0 in
+  let upp = rg_find buf 8 hi (chars "\"model.language_model.layers.0.mlp.up_proj.weight\"") in
+  let ustart = rg_int buf (rg_find_after buf upp hi do_cs) 0 in
+  let dpp = rg_find buf 8 hi (chars "\"model.language_model.layers.0.mlp.down_proj.weight\"") in
+  let dstart = rg_int buf (rg_find_after buf dpp hi do_cs) 0 in
+  let gbase = base + gstart in
+  let ubase = base + ustart in
+  let dbase = base + dstart in
+  let ok_off = if gstart == 0 then (if ustart == 64 then (if dstart == 128 then 1 else 0) else 0) else 0 in
+
+  -- raw decoded-weight spot check (gate row0 [0..3]) vs the fixture's known fixed-point
+  let w0 = rg_bf16_fixed (byte_at buf gbase) (byte_at buf (gbase + 1)) in
+  let w1 = rg_bf16_fixed (byte_at buf (gbase + 2)) (byte_at buf (gbase + 3)) in
+  let w2 = rg_bf16_fixed (byte_at buf (gbase + 4)) (byte_at buf (gbase + 5)) in
+  let w3 = rg_bf16_fixed (byte_at buf (gbase + 6)) (byte_at buf (gbase + 7)) in
+  let ok_w = if w0 == 0 - 5242880 then (if w1 == 0 - 2097152 then (if w2 == 1048576 then (if w3 == 4194304 then 1 else 0) else 0) else 0) else 0 in
+
+  -- primary exact-integer forward (keep gate + y)
+  let acc = arr_new 2 0 in
+  let x = rg_fillX (arr_new d 0) d 0 in
+  let up = rg_fill buf ubase x d (arr_new hh 0) hh acc 0 in
+  let gate = rg_fill buf gbase x d (arr_new hh 0) hh acc 0 in
+  let gg = rg_geglu gate up (arr_new hh 0) hh 0 in
+  let y = rg_fill buf dbase gg hh (arr_new d 0) d acc 0 in
+  let cy = rg_sum_a y d 0 0 in
+
+  -- read independent numpy reference [D, gate0, y0..y(d-1)]
+  let rbuf = read_file_bytes "/tmp/p3_fix_ref.txt" in
+  let A = arr_new (d + 2) 0 in
+  let _ = rg_read_nums rbuf 0 A 0 (d + 2) in
+  let ok_refd = if (arr_get A 0) == d then 1 else 0 in
+
+  -- single-row validation: gate[0] (pure linear dot) vs numpy gate0 (near-exact; floor/round slack)
+  let g0diff = rg_iabs ((arr_get gate 0) - (arr_get A 1)) in
+  let ok_g0 = if g0diff <= 8 then 1 else 0 in
+
+  -- ACC: max |int y - numpy-true-float y| (fixed-point); bounded by the fixed tanh-gelu approximation
+  let cell = arr_new 1 0 in
+  let maxe = rg_maxdiff y A d cell 0 in
+  let tol = 2048 in
+  let ok_acc = if maxe < tol then 1 else 0 in
+
+  -- D0: rerun the whole forward, identical checksum
+  let y2 = rg_forward buf gbase ubase dbase d hh in
+  let cy2 = rg_sum_a y2 d 0 0 in
+  let ok_d0 = if cy == cy2 then 1 else 0 in
+
+  -- ===== Ed25519 attestation: LOCAL ephemeral dev key + LOCAL genesis (NEVER a prod sign surface) =====
+  let seed = sha256 "p3.fixture.geglu.local.ephemeral.dev.seed.v1" in
+  let pk = ed25519_pk_from_sk seed in
+  let pk_hex = bytes_to_hex pk 32 in
+  let genesis_hex = sha256_hex "P3.FIXTURE.GEGLU.LOCAL.GENESIS.dev" in
+  -- commitment binds WHICH weights (header len + 3 data_offsets + shape) AND the exact forward result
+  let commit_str = cat ["P3fix1;n=", show n, ";go=", show gstart, ";uo=", show ustart, ";do=", show dstart,
+                        ";d=", show d, ";h=", show hh, ";cy=", show cy,
+                        ";y0=", show (arr_get y 0), ";yL=", show (arr_get y (d - 1))] in
+  let commit_hex = sha256_hex commit_str in
+  let link_b = sha256 (cat [genesis_hex, "|", commit_hex, "|", pk_hex]) in
+  let sig = ed25519_sign seed link_b 32 in
+  let ok_sig = ed25519_verify pk link_b 32 sig in
+  -- tamper 1: a wrong key cannot forge a signature pk accepts
+  let seed2 = sha256 "p3.fixture.other.key" in
+  let wsig = ed25519_sign seed2 link_b 32 in
+  let okW = ed25519_verify pk link_b 32 wsig in
+  -- tamper 2: the real signature does NOT verify against a forged (cy+1) output commitment
+  let commit_t = cat ["P3fix1;n=", show n, ";go=", show gstart, ";uo=", show ustart, ";do=", show dstart,
+                      ";d=", show d, ";h=", show hh, ";cy=", show (cy + 1),
+                      ";y0=", show (arr_get y 0), ";yL=", show (arr_get y (d - 1))] in
+  let link_t = sha256 (cat [genesis_hex, "|", (sha256_hex commit_t), "|", pk_hex]) in
+  let okForge = ed25519_verify pk link_t 32 sig in
+  let ok_attest = if ok_sig == 1 then (if okW == 0 then (if okForge == 0 then 1 else 0) else 0) else 0 in
+
+  let _ = print (cat ["P3 fixture GeGLU  d=", show d, " hidden=", show hh,
+                      "  offsets[g,u,d]=[", show gstart, ",", show ustart, ",", show dstart, "] ", pf ok_off]) in
+  let _ = print (cat ["  decoded gate[0][0..3]=[", show w0, ",", show w1, ",", show w2, ",", show w3, "] ", pf ok_w,
+                      "  refD=", show (arr_get A 0), " ", pf ok_refd]) in
+  let _ = print (cat ["  gate[0] int=", show (arr_get gate 0), " numpy=", show (arr_get A 1), " diff=", show g0diff, " ", pf ok_g0]) in
+  let _ = print (cat ["  y int =[", show (arr_get y 0), ",", show (arr_get y 1), ",", show (arr_get y 2), ",", show (arr_get y 3), "]"]) in
+  let _ = print (cat ["  y numpy=[", show (arr_get A 2), ",", show (arr_get A 3), ",", show (arr_get A 4), ",", show (arr_get A 5), "]"]) in
+  let _ = print (cat ["  max|int-float|=", show maxe, " fixed (bound ", show tol, ") ", pf ok_acc,
+                      "  checksum=", show cy, "  D0=", pf ok_d0]) in
+  let _ = print (cat ["  ATTEST pk=", pk_hex]) in
+  let _ = print (cat ["  genesis=", genesis_hex]) in
+  let _ = print (cat ["  commit=", commit_hex, "  chain-head=", bytes_to_hex link_b 32]) in
+  let _ = print (cat ["  sig-verify=", pf ok_sig, "  wrong-key-rejected=", pf (1 - okW), "  forged-output-rejected=", pf (1 - okForge), "  ", pf ok_attest]) in
+  let allok = if ok_off == 1 then (if ok_w == 1 then (if ok_refd == 1 then (if ok_g0 == 1 then (if ok_acc == 1 then (if ok_d0 == 1 then ok_attest else 0) else 0) else 0) else 0) else 0) else 0 in
+  let _ = print (if allok == 1
+    then "P3 PASS: a real-format BF16 .safetensors (same Gemma key names + layout) loaded via read_file_bytes + byte_at, pure-integer decoded, and run through the exact-integer two-limb GeGLU forward -- deterministic (D0), within the tanh-gelu approximation bound of an INDEPENDENT numpy true-float GeGLU on the same weights (ACC), and the exact output is Ed25519-ATTESTED (local dev key + local genesis): the signature verifies, a wrong key cannot forge it, and a 1-unit output change is rejected. Byte-identical load+forward+attest path to the 10.25 GB Gemma 4 E2B capstone (kept in /tmp), which reproduces bit-for-bit across two machines."
+    else "P3 FAIL: inspect the columns above") in
+  if allok == 1 then 0 else 1

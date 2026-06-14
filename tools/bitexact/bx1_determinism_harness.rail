@@ -1,0 +1,147 @@
+-- BX1: Determinism harness D0-D3 -- the falsification gate that precedes all model
+-- work on the bit-exact-transformer-at-scale plan. It does NOT try to make anything
+-- pass yet. Its job is to STAND UP THE RED TEST: a STRICT bit-equality check that
+-- reproduces the existing f32 Metal matmul's ~1.6e-6 divergence from the CPU reference,
+-- and to demonstrate the underlying enemy (float reduction order is not associative).
+--
+-- STRICT EQUALITY (no tolerance): two float arrays are "bit-same" iff their max
+-- absolute element difference is EXACTLY 0.0. We test that with fcmp: for d = max|X-Y|
+-- (always >= 0), `is_zero d = not (0.0 <. d)`. Numeric identity through fcmp; the only
+-- bit-distinctions it cannot see are +0.0 vs -0.0 and NaN payloads, neither of which a
+-- matmul of finite inputs produces. We NEVER use polymorphic `==` on a float (it reads
+-- the f64 bits as a tagged pointer -> segfault); the gate is `<.` only.
+--
+-- The four legs (each prints its own line):
+--   D0  run-twice, same machine, same kernel  -> MUST be bit-identical (GPU determinism
+--       precondition; if this fails, nothing downstream is reproducible).
+--   D1  cross-schedule (reduction-order proxy): single-shot C = P.Q   vs   split-K
+--       C = P[:, :k1].Q[:k1, :] + P[:, k1:].Q[k1:, :]. Same math, different float
+--       accumulation grouping. Expected to DIFFER -> demonstrates enemy #1 directly,
+--       in pure Rail, the reason GPU tile/threadgroup config changes the bits.
+--   D2  cross-device: CPU scalar f64 reference  vs  GPU f32 matmul. THE RED TEST.
+--       Strict gate expected to FAIL at ~1.6e-6 -- the gap BX3 (exact-integer Metal
+--       matmul) must drive to EXACTLY 0.0.
+--   D3  foreign: a pure-Python (no-numpy) re-impl of the SAME matmul reproduces the
+--       reference bits. Stands up the cross-implementation witness the thesis rests on.
+--
+-- Build: ./rail_native --out-prefix /tmp/bx1 tools/bitexact/bx1_determinism_harness.rail
+-- Run:   /tmp/bx1
+-- (Uses tools/metal/libtensor_gpu.dylib; ensure_dylib builds it on first run.)
+
+import "stdlib/tensor.rail"
+
+gmm A B m k n = gpu_matmul_dispatch A B m k n
+
+-- ---- CPU scalar f64 reference matmul (left-to-right accumulation) ----
+cpu_dot A B k n i j p acc =
+  if p >= k then acc
+  else cpu_dot A B k n i j (p + 1) (acc +. ((float_arr_get A (i * k + p)) *. (float_arr_get B (p * n + j))))
+cpu_mm_fill A B C m k n i j =
+  if i >= m then C
+  else if j >= n then cpu_mm_fill A B C m k n (i + 1) 0
+  else
+    let _ = float_arr_set C (i * n + j) (cpu_dot A B k n i j 0 0.0)
+    cpu_mm_fill A B C m k n i (j + 1)
+cpu_mm A B m k n = cpu_mm_fill A B (float_arr_new (m * n) 0.0) m k n 0 0
+
+-- ---- strict bit-equality (max abs diff is EXACTLY 0.0) ----
+absf v = if v <. 0.0 then (0.0 -. v) else v
+maxdiff_go X Y n i acc =
+  if i >= n then acc
+  else
+    let d = absf ((float_arr_get X i) -. (float_arr_get Y i))
+    maxdiff_go X Y n (i + 1) (if acc <. d then d else acc)
+maxdiff X Y n = maxdiff_go X Y n 0 0.0
+is_zero d = if 0.0 <. d then 0 else 1
+yn b = if b == 1 then "YES" else "NO"
+pf b = if b == 1 then "PASS" else "FAIL"
+
+-- ---- D1 split-K helpers (slice columns of A, rows of B) ----
+scol_go A D m k c0 w i j =
+  if i >= m then D
+  else if j >= w then scol_go A D m k c0 w (i + 1) 0
+  else
+    let _ = float_arr_set D (i * w + j) (float_arr_get A (i * k + (c0 + j)))
+    scol_go A D m k c0 w i (j + 1)
+slice_cols A m k c0 c1 = scol_go A (float_arr_new (m * (c1 - c0)) 0.0) m k c0 (c1 - c0) 0 0
+srow_go B D off cnt i =
+  if i >= cnt then D
+  else
+    let _ = float_arr_set D i (float_arr_get B (off + i))
+    srow_go B D off cnt (i + 1)
+slice_rows B r0 r1 n = srow_go B (float_arr_new ((r1 - r0) * n) 0.0) (r0 * n) ((r1 - r0) * n) 0
+addv_go X Y D n i =
+  if i >= n then D
+  else
+    let _ = float_arr_set D i ((float_arr_get X i) +. (float_arr_get Y i))
+    addv_go X Y D n (i + 1)
+addv X Y n = addv_go X Y (float_arr_new n 0.0) n 0
+
+-- ---- deterministic input fill (same pattern as the rung-23 bench, for a comparable gap) ----
+fillpat W sz scale i =
+  if i >= sz then W
+  else
+    let _ = float_arr_set W i (scale *. (int_to_float (((i * 13 + 5) - ((((i * 13 + 5)) / 17) * 17)) - 8)))
+    fillpat W sz scale (i + 1)
+mkarr sz scale = fillpat (float_arr_new sz 0.0) sz scale 0
+
+-- ---- D3 dump a float_arr as newline-separated decimals for the foreign witness ----
+dump_go arr n i acc =
+  if i >= n then acc
+  else dump_go arr n (i + 1) (cat [acc, show_float (float_arr_get arr i), "\n"])
+dump_arr arr n = dump_go arr n 0 ""
+
+main =
+  let _ = ensure_dylib 0
+  let d = 256
+  let P = mkarr (d * d) 0.02
+  let Q = mkarr (d * d) 0.02
+
+  -- ----- D0: GPU run-twice, same kernel -> must be bit-identical -----
+  let G1 = gmm P Q d d d
+  let G2 = gmm P Q d d d
+  let d0 = is_zero (maxdiff G1 G2 (d * d))
+  let _ = print (cat ["D0 run-twice (GPU==GPU same kernel) bit-identical: ", yn d0, "   ", pf d0])
+
+  -- ----- D1: reduction-order proxy (single-shot vs split-K) -----
+  let k1 = d / 2
+  let AL = slice_cols P d d 0 k1
+  let AR = slice_cols P d d k1 d
+  let BT = slice_rows Q 0 k1 d
+  let BB = slice_rows Q k1 d d
+  let CL = gmm AL BT d k1 d
+  let CR = gmm AR BB d (d - k1) d
+  let Csplit = addv CL CR (d * d)
+  let Cfull = gmm P Q d d d
+  let d1gap = maxdiff Cfull Csplit (d * d)
+  let d1diff = if 0.0 <. d1gap then 1 else 0
+  let _ = print (cat ["D1 reduction-order changes bits (single-shot vs split-K): ", yn d1diff,
+                      "   max|d|=", show_float d1gap, "   (demonstrates enemy #1)"])
+
+  -- ----- D2: CPU f64 reference vs GPU f32 -- THE RED TEST -----
+  let Cc = cpu_mm P Q d d d
+  let Cg = gmm P Q d d d
+  let d2gap = maxdiff Cc Cg (d * d)
+  let d2 = is_zero d2gap
+  let _ = print (cat ["D2 CPU(f64) == GPU(f32) STRICT bit-equality: ", pf d2,
+                      "   max|d|=", show_float d2gap, "   <- RED TEST (BX3 must drive to 0)"])
+
+  -- ----- D3: foreign pure-Python witness (no numpy) -----
+  let dd = 32
+  let P2 = mkarr (dd * dd) 0.02
+  let Q2 = mkarr (dd * dd) 0.02
+  let _ = write_file "/tmp/bx1_P.txt" (dump_arr P2 (dd * dd))
+  let _ = write_file "/tmp/bx1_Q.txt" (dump_arr Q2 (dd * dd))
+  let _ = write_file "/tmp/bx1_railf64.txt" (dump_arr (cpu_mm P2 Q2 dd dd dd) (dd * dd))
+  let _ = write_file "/tmp/bx1_railgpu.txt" (dump_arr (gmm P2 Q2 dd dd dd) (dd * dd))
+  let d3 = shell "python3 tools/bitexact/bx1_foreign_check.py 32 2>&1"
+  let _ = print (cat ["D3 foreign (pure-Python re-impl): ", d3])
+
+  -- ----- verdict: rung 1 is correctly stood up when D0 holds, D1 shows sensitivity,
+  -- and D2 reproduces the small nonzero gap as a STRICT failure (gate==0, gap>0) -----
+  let redok = if d2 == 0 then (if 0.0 <. d2gap then 1 else 0) else 0
+  let stood = d0 * d1diff * redok
+  let _ = print (if stood == 1
+                 then cat ["BX1 HARNESS STOOD UP: GPU is run-twice deterministic, reduction order is proven to change bits, and the CPU-vs-GPU red test reproduces (max|d|=", show_float d2gap, "). Strict gate is in place; BX3 must drive D2 to 0.0."]
+                 else "BX1 HARNESS NOT STOOD UP (unexpected: check D0/D1/D2 lines above)")
+  if stood == 1 then 0 else 1
