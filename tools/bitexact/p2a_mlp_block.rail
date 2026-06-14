@@ -1,0 +1,254 @@
+-- P2a (1B ladder, Phase 2): exact-integer GeGLU MLP sub-block forward at REAL Gemma 4 E2B shapes
+-- -- d_model=2048, mlp_hidden=8192 -- proving the exact-integer forward COMPOSES at the real
+-- contraction depths (K=2048 up/gate, K=8192 down) and stays within QUANTIZATION TOLERANCE of the
+-- true real-valued GeGLU MLP it represents. R6 proved each projection matmul is device-agnostic to
+-- the bit; P2a is the next rung -- it COMPOSES the proven atoms into a real sub-block and bounds the
+-- accuracy cost of going exact-integer at the deepest real depth (K=8192).
+--
+-- The sub-block (Gemma GeGLU MLP, pre-norm + residual), one position (seq=1; the MLP is
+-- position-independent -- cross-position mixing is attention's job, deferred to P2b):
+--   xn   = RMSNorm(x)                  (bx4_fxsqrt; d=2048)
+--   up   = W_up   . xn   (K=2048)      (two-limb exact dot = the R6 atom)
+--   gate = W_gate . xn   (K=2048)
+--   h    = gelu(gate) (*) up           (bx4_gelu; elementwise; hidden=8192)
+--   down = W_down . h    (K=8192)      (two-limb exact dot)
+--   y    = x + down                    (residual)
+-- Weights are generated ON-THE-FLY by a deterministic integer formula -- no 16.7M-int dense weight
+-- ever materializes, so the whole block fits in a handful of small arrays. Fixed-point F=24, S=2^24.
+-- The int path and the float reference draw weights/input from the SAME integer source (W_real=W/S),
+-- so the only difference measured is the exact-integer scheme's own cost (quantization + the fixed
+-- transcendental algorithms), not a data mismatch.
+--
+-- GATES:
+--   D0  -- run the whole sub-block twice -> bit-identical output checksum (determinism / no hidden
+--          arena nondeterminism). The int forward is pure, so this is a cheap sanity floor.
+--   ACC -- max | dequant(exact_int y[i]) - y_float[i] | over the d outputs, vs a TRUE real-valued
+--          GeGLU MLP (libm sqrt/tanh, true gelu constants). Bounds the cost of the exact-integer
+--          scheme at the deepest real contraction depth (K=8192). This is the load-bearing falsifier.
+--   D2  -- spot-check: 4 down-projection cells (K=8192) recomputed via the GPU exact_matmul
+--          (tgl_exact_matmul), reconstructed + rescaled, == the CPU two-limb composed down value
+--          BIT-FOR-BIT (the R6 device-agnostic atom still binds on the composed layer's real operands).
+--
+-- Build: ./rail_native --out-prefix /tmp/p2a tools/bitexact/p2a_mlp_block.rail
+-- Run:   /tmp/p2a
+
+import "stdlib/tensor.rail"
+import "tools/bitexact/bx_fixed.rail"
+
+-- ===== GX1 two-limb superaccumulator, IN-PLACE in a 2-cell int array (acc[0]=hi, acc[1]=lo) =====
+-- No per-iteration tuple: at ~18K output cells x K terms the tuple-carrying form (R6's, fine for
+-- its 16 cells) would churn ~100M tuples/forward. The in-place form allocates nothing in the hot loop.
+-- reconstruct exact signed sum then BX10/GX5a truncate-divide (|S|<2^62 in this regime -> safe).
+p2_rescale h l = (h * 2147483648 + l) / 16777216
+
+p2_imod a b = a - (a / b) * b
+
+-- ===== deterministic fixed-point data (identical integer source for int + float paths) =====
+-- input activation x_i in ~[-0.5,0.5] (pre-norm).
+p2_x i = (p2_imod (i * 131 + 7) 2001 - 1000) * 8192
+-- weight W[kind][row][col] in ~[-0.031,0.031] (~1/sqrt(d) scale; signed -> reductions cancel).
+p2_w kind row col = (p2_imod (kind * 7919 + row * 131 + col * 17 + 1) 1021 - 510) * 1024
+-- gamma (RMSNorm scale) in ~[0.95,1.05].
+p2_g kind col = 16777216 + (p2_imod (kind * 53 + col * 11 + 3) 401 - 200) * 4096
+
+p2_fillX X d i = if i >= d then X else let _ = arr_set X i (p2_x i) in p2_fillX X d (i + 1)
+
+-- ===== exact-integer path =====
+-- RMSNorm sum-of-squares (mutual recursion: int acc reads X[i]; R6 dot idiom).
+p2_ssq_a X d i acc = if i >= d then acc else p2_ssq_b X d (i + 1) (acc + ((arr_get X i) * (arr_get X i)) / 16777216)
+p2_ssq_b X d i acc = if i >= d then acc else p2_ssq_a X d (i + 1) (acc + ((arr_get X i) * (arr_get X i)) / 16777216)
+p2_rms X d =
+  let ss = p2_ssq_a X d 0 0 in
+  let meansq = ss / d in
+  bx4_fxsqrt (meansq + 17)                              -- eps = 17/S ~ 1e-6 (Gemma norm_eps)
+-- normalize+scale (direct self-loop: single counter i, writes xn[i]).
+p2_normapply X xn d rms gkind i =
+  if i >= d then xn
+  else
+    let _ = arr_set xn i (((((arr_get X i) * 16777216) / rms) * (p2_g gkind i)) / 16777216) in
+    p2_normapply X xn d rms gkind (i + 1)
+
+-- exact two-limb dot for output `row` over K terms: acc += W[kind][row][p]*src[p], in place.
+-- direct self-loop: only p advances; acc is a constant ref mutated by side effect (r6_genA-safe).
+p2_dot kind row src K acc p =
+  if p >= K then 0
+  else
+    let a = (p2_w kind row p) * (arr_get src p) in
+    let ahi = a / 2147483648 in
+    let alo = a - ahi * 2147483648 in
+    let h0 = (arr_get acc 0) + ahi in
+    let l0 = (arr_get acc 1) + alo in
+    let h = if l0 >= 2147483648 then h0 + 1 else if l0 < 0 then h0 - 1 else h0 in
+    let l = if l0 >= 2147483648 then l0 - 2147483648 else if l0 < 0 then l0 + 2147483648 else l0 in
+    let _ = arr_set acc 0 h in
+    let _ = arr_set acc 1 l in
+    p2_dot kind row src K acc (p + 1)
+-- fill a projection output (direct self-loop: single counter j, writes out[j]; reuses the acc cell).
+p2_fill kind src K out outN acc j =
+  if j >= outN then out
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = p2_dot kind j src K acc 0 in
+    let _ = arr_set out j (p2_rescale (arr_get acc 0) (arr_get acc 1)) in
+    p2_fill kind src K out outN acc (j + 1)
+
+-- GeGLU elementwise h[j] = gelu(gate[j]) * up[j] / S  (direct self-loop).
+p2_geglu gate up gg hidden j =
+  if j >= hidden then gg
+  else
+    let _ = arr_set gg j (((bx4_gelu (arr_get gate j)) * (arr_get up j)) / 16777216) in
+    p2_geglu gate up gg hidden (j + 1)
+
+-- residual y[i] = x[i] + down[i]  (direct self-loop).
+p2_resid X down y d i =
+  if i >= d then y
+  else let _ = arr_set y i ((arr_get X i) + (arr_get down i)) in p2_resid X down y d (i + 1)
+
+-- packaged whole sub-block (for the D0 run-twice check); returns y.
+p2_block_int X d hidden =
+  let acc = arr_new 2 0 in
+  let rms = p2_rms X d in
+  let xn = p2_normapply X (arr_new d 0) d rms 6 0 in
+  let up = p2_fill 0 xn d (arr_new hidden 0) hidden acc 0 in
+  let gate = p2_fill 1 xn d (arr_new hidden 0) hidden acc 0 in
+  let gg = p2_geglu gate up (arr_new hidden 0) hidden 0 in
+  let down = p2_fill 2 gg hidden (arr_new d 0) d acc 0 in
+  p2_resid X down (arr_new d 0) d 0
+
+-- checksum (mutual recursion: int acc reads Y[i]).
+p2_sum_a Y d i acc = if i >= d then acc else p2_sum_b Y d (i + 1) (acc + (arr_get Y i))
+p2_sum_b Y d i acc = if i >= d then acc else p2_sum_a Y d (i + 1) (acc + (arr_get Y i))
+
+-- ===== true real-valued float reference (libm sqrt/tanh; true GeGLU constants) =====
+p2_xf X xf d i = if i >= d then xf else let _ = float_arr_set xf i (bx4_back (arr_get X i)) in p2_xf X xf d (i + 1)
+-- sum of squares into a float_arr[1] cell (int-only loop -> dodges the float-acc-reads-index segfault).
+p2_fssq xf d cell i =
+  if i >= d then 0
+  else let _ = float_arr_set cell 0 ((float_arr_get cell 0) +. (float_arr_get xf i) *. (float_arr_get xf i)) in
+       p2_fssq xf d cell (i + 1)
+p2_frms xf d =
+  let cell = float_arr_new 1 0.0 in
+  let _ = p2_fssq xf d cell 0 in
+  let meansq = (float_arr_get cell 0) /. (int_to_float d) in
+  sqrt (meansq +. ((int_to_float 17) /. 16777216.0))    -- same eps as the int path
+p2_fnorm xf xnf d rms gkind i =
+  if i >= d then xnf
+  else let _ = float_arr_set xnf i (((float_arr_get xf i) /. rms) *. (bx4_back (p2_g gkind i))) in
+       p2_fnorm xf xnf d rms gkind (i + 1)
+-- float dot into a cell (int-only loop), weight dequantized from the SAME integer source.
+p2_fdot kind row src_f K cell p =
+  if p >= K then 0
+  else let _ = float_arr_set cell 0 ((float_arr_get cell 0) +. (bx4_back (p2_w kind row p)) *. (float_arr_get src_f p)) in
+       p2_fdot kind row src_f K cell (p + 1)
+p2_ffill kind src_f K out_f outN cell j =
+  if j >= outN then out_f
+  else
+    let _ = float_arr_set cell 0 0.0 in
+    let _ = p2_fdot kind j src_f K cell 0 in
+    let _ = float_arr_set out_f j (float_arr_get cell 0) in
+    p2_ffill kind src_f K out_f outN cell (j + 1)
+-- true gelu: 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))) -- the formula bx4_gelu approximates.
+p2_gelu_f x =
+  let x3 = x *. x *. x in
+  let inner = 0.7978845608 *. (x +. 0.044715 *. x3) in
+  0.5 *. x *. (1.0 +. (tanh inner))
+p2_fgeglu gate_f up_f gg_f hidden j =
+  if j >= hidden then gg_f
+  else let _ = float_arr_set gg_f j ((p2_gelu_f (float_arr_get gate_f j)) *. (float_arr_get up_f j)) in
+       p2_fgeglu gate_f up_f gg_f hidden (j + 1)
+p2_fresid xf down_f yf d i =
+  if i >= d then yf
+  else let _ = float_arr_set yf i ((float_arr_get xf i) +. (float_arr_get down_f i)) in
+       p2_fresid xf down_f yf d (i + 1)
+p2_block_float X d hidden =
+  let xf = p2_xf X (float_arr_new d 0.0) d 0 in
+  let rms = p2_frms xf d in
+  let xnf = p2_fnorm xf (float_arr_new d 0.0) d rms 6 0 in
+  let cell = float_arr_new 1 0.0 in
+  let upf = p2_ffill 0 xnf d (float_arr_new hidden 0.0) hidden cell 0 in
+  let gatef = p2_ffill 1 xnf d (float_arr_new hidden 0.0) hidden cell 0 in
+  let ggf = p2_fgeglu gatef upf (float_arr_new hidden 0.0) hidden 0 in
+  let downf = p2_ffill 2 ggf hidden (float_arr_new d 0.0) d cell 0 in
+  p2_fresid xf downf (float_arr_new d 0.0) d 0
+
+-- max abs (dequant(int) - float) into a cell (int-only loop -> float-acc-reads-index safe).
+p2_maxerr Y yf d cell i =
+  if i >= d then 0
+  else
+    let e = bx4_fabs ((bx4_back (arr_get Y i)) -. (float_arr_get yf i)) in
+    let _ = float_arr_set cell 0 (if e >. (float_arr_get cell 0) then e else (float_arr_get cell 0)) in
+    p2_maxerr Y yf d cell (i + 1)
+
+-- ===== GPU D2 spot-check (down projection, K=8192) =====
+p2_i2f src dst n i = if i >= n then dst else let _ = float_arr_set dst i (int_to_float (arr_get src i)) in p2_i2f src dst n (i + 1)
+p2_int_to_fa A n = p2_i2f A (float_arr_new n 0.0) n 0
+-- B is K x Ncheck with B[p*Ncheck + c] = W_down[c][p] (so GPU C[0][c] = sum_p gg[p]*W_down[c][p]).
+p2_fillB B size Ncheck idx =
+  if idx >= size then B
+  else
+    let p = idx / Ncheck in
+    let c = idx - p * Ncheck in
+    let _ = arr_set B idx (p2_w 2 c p) in
+    p2_fillB B size Ncheck (idx + 1)
+-- compare GPU reconstruct+rescale to CPU composed down[c], bit-for-bit (mutual recursion).
+p2_d2_a down Hi Lo Ncheck c acc =
+  if c >= Ncheck then acc
+  else
+    let hG = float_to_int (float_arr_get Hi c) in
+    let lG = float_to_int (float_arr_get Lo c) in
+    let cGpu = (hG * 2147483648 + lG) / 16777216 in
+    p2_d2_b down Hi Lo Ncheck (c + 1) (acc + (if cGpu == (arr_get down c) then 0 else 1))
+p2_d2_b down Hi Lo Ncheck c acc =
+  if c >= Ncheck then acc
+  else
+    let hG = float_to_int (float_arr_get Hi c) in
+    let lG = float_to_int (float_arr_get Lo c) in
+    let cGpu = (hG * 2147483648 + lG) / 16777216 in
+    p2_d2_a down Hi Lo Ncheck (c + 1) (acc + (if cGpu == (arr_get down c) then 0 else 1))
+
+main =
+  let d = 2048 in
+  let hidden = 8192 in
+  let _ = ensure_dylib 0 in
+  let X = p2_fillX (arr_new d 0) d 0 in
+  -- ---- primary exact-integer forward (keep all intermediates for ACC + D2) ----
+  let acc = arr_new 2 0 in
+  let rms = p2_rms X d in
+  let xn = p2_normapply X (arr_new d 0) d rms 6 0 in
+  let up = p2_fill 0 xn d (arr_new hidden 0) hidden acc 0 in
+  let gate = p2_fill 1 xn d (arr_new hidden 0) hidden acc 0 in
+  let gg = p2_geglu gate up (arr_new hidden 0) hidden 0 in
+  let down = p2_fill 2 gg hidden (arr_new d 0) d acc 0 in
+  let y = p2_resid X down (arr_new d 0) d 0 in
+  let cy = p2_sum_a y d 0 0 in
+  -- ---- D0: run the packaged block again -> identical checksum ----
+  let y2 = p2_block_int X d hidden in
+  let cy2 = p2_sum_a y2 d 0 0 in
+  let d0 = if cy == cy2 then 0 else 1 in
+  -- ---- ACC: vs the true real-valued GeGLU MLP ----
+  let yf = p2_block_float X d hidden in
+  let ecell = float_arr_new 1 0.0 in
+  let _ = p2_maxerr y yf d ecell 0 in
+  let maxe = float_arr_get ecell 0 in
+  let accok = if maxe <. 0.01 then 1 else 0 in
+  -- ---- D2: GPU exact_matmul spot-check on 4 down cells (K=8192) ----
+  let Ncheck = 4 in
+  let B = p2_fillB (arr_new (hidden * Ncheck) 0) (hidden * Ncheck) Ncheck 0 in
+  let ggf = p2_int_to_fa gg hidden in
+  let Bf = p2_int_to_fa B (hidden * Ncheck) in
+  let Hi = float_arr_new Ncheck 0.0 in
+  let Lo = float_arr_new Ncheck 0.0 in
+  let _ = tgl_exact_matmul ggf Bf Hi Lo 1 hidden Ncheck in
+  let d2mis = p2_d2_a down Hi Lo Ncheck 0 0 in
+  let d2ok = if d2mis == 0 then 1 else 0 in
+  -- ---- report ----
+  let _ = print (cat ["P2a MLP block  d=", show d, " hidden=", show hidden,
+                      "   D0(run-twice)=", (if d0 == 0 then "PASS" else "FAIL"),
+                      "   max|deq(int)-float|=", show maxe, " (bound 0.01) ", (if accok == 1 then "PASS" else "FAIL"),
+                      "   D2(GPU==CPU down, ", show Ncheck, " cells)=mism ", show d2mis, " ", (if d2ok == 1 then "PASS" else "FAIL")]) in
+  let allok = d0 + (1 - accok) + (1 - d2ok) in
+  let _ = print (if allok == 0
+    then "P2a PASS: the exact-integer GeGLU MLP sub-block composes at REAL Gemma 4 E2B depth (d=2048, hidden=8192, K up to 8192) -- deterministic (D0), within quantization tolerance of the true real-valued GeGLU MLP it represents (ACC), and the deepest composed contraction matches the GPU exact_matmul bit-for-bit (D2, the R6 atom). Composition of the proven exact-integer atoms holds at scale; P2b adds attention."
+    else "P2a FAIL: inspect the D0 / ACC / D2 column above") in
+  if allok == 0 then 0 else 1

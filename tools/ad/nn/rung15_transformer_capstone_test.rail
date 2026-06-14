@@ -1,0 +1,706 @@
+-- Rung 15 CAPSTONE: a complete tiny transformer block (embed -> self-attention
+-- -> residual -> RMSNorm -> MLP -> residual -> RMSNorm -> LM head -> cross-entropy)
+-- with a fully composed analytic BACKWARD, every gradient cross-checked against
+-- central finite differences of the scalar loss. This is the top of the 20-rung
+-- attested-autodiff ladder: the backward is FD-VERIFIED end to end, so the oracle
+-- prints "N/N capstone checks passed" and exits 0 ONLY if every analytic gradient
+-- matches finite differences. All backward formulas are the proven rung atoms:
+--   matmul       (rung5):  dW += outer(ct_out, in) ; dx = W^T . ct_out
+--   cross-entropy(rung4):  ct_logits = softmax(logits) - onehot(target)
+--   RMSNorm      (rung7):  dgamma_i = up_i*x_i*r ;
+--                          dx_j = up_j*gamma_j*r - (r^3*x_j/N)*sum_i up_i*gamma_i*x_i
+--   attention    (rung9):  dV = A^T.Up ; dA = Up.V^T ;
+--                          dscore = invs*A.*(dA - rowdot(dA,A)) ; dQ=dS.K ; dK=dS^T.Q
+--   residual     (rung6):  fan-out cotangent = skip cotangent + sublayer cotangent
+--   embedding    (rung14): scatter-add dE[ids[t]] += ct_x_t (accumulate on repeats)
+-- Config: d_model d=4, seq T=2, vocab Vc=5, single head dh=d, MLP hidden dff=8,
+-- activation sq(z)=z*z (derivative 2z; FD-clean, unlike relu's kink). eps=1e-5.
+-- Run: /tmp/rail_r15 --out-prefix /tmp/r15out run tools/ad/nn/rung15_transformer_capstone_test.rail
+
+import "stdlib/float_arr.rail"
+
+foreign exp x -> float
+foreign log x -> float
+foreign sqrt x -> float
+
+sq z = z *. z
+sqd z = 2.0 *. z
+mul2 a b = a *. b
+add2 a b = a +. b
+
+-- ===================== config constants =====================
+cfg_d = 4
+cfg_T = 2
+cfg_Vc = 5
+cfg_dff = 8
+
+-- ids and targets (fixed). nth_idx walks an int list.
+nth_idx ids i = if i <= 0 then head ids else nth_idx (tail ids) (i - 1)
+the_ids = [2, 0]
+the_tgt = [1, 3]
+
+-- ===================== small vector helpers =====================
+-- copy length-d slice src[base..base+d) into a fresh length-d array.
+slice_d src base d =
+  let o = float_arr_new d 0.0
+  slice_fill src base d o 0
+slice_fill src base d o k =
+  if k >= d then o
+  else
+    let _ = float_arr_set o k (float_arr_get src (base + k))
+    slice_fill src base d o (k + 1)
+
+-- write length-d vector v into dst[base..base+d).
+put_d v dst base d k =
+  if k >= d then dst
+  else
+    let _ = float_arr_set dst (base + k) (float_arr_get v k)
+    put_d v dst base d (k + 1)
+
+-- add length-n vector b into a (in place on a), return a.
+addinto a b n k =
+  if k >= n then a
+  else
+    let _ = float_arr_set a k ((float_arr_get a k) +. (float_arr_get b k))
+    addinto a b n (k + 1)
+
+-- ===================== RMSNorm forward (length-d vector) =====================
+sq_acc x n i acc =
+  if i >= n then acc
+  else
+    let v = float_arr_get x i
+    sq_acc x n (i + 1) (acc +. (v *. v))
+
+rms_r x n =
+  let ms = (sq_acc x n 0 0.0) /. (int_to_float n)
+  1.0 /. (sqrt (ms +. 0.00001))
+
+rms_fwd x gam n =
+  let r = rms_r x n
+  let y = float_arr_new n 0.0
+  rms_fwd_fill x gam n r y 0
+rms_fwd_fill x gam n r y k =
+  if k >= n then y
+  else
+    let v = ((float_arr_get x k) *. r) *. (float_arr_get gam k)
+    let _ = float_arr_set y k v
+    rms_fwd_fill x gam n r y (k + 1)
+
+-- ===================== RMSNorm backward (rung7) =====================
+-- dgamma_i = up_i * x_i * r
+rms_dgam x gam up n =
+  let r = rms_r x n
+  let dg = float_arr_new n 0.0
+  rms_dgam_fill x up n r dg 0
+rms_dgam_fill x up n r dg k =
+  if k >= n then dg
+  else
+    let v = (float_arr_get up k) *. ((float_arr_get x k) *. r)
+    let _ = float_arr_set dg k v
+    rms_dgam_fill x up n r dg (k + 1)
+
+-- sum_i up_i*gamma_i*x_i
+rms_proj x gam up n i acc =
+  if i >= n then acc
+  else
+    let v = ((float_arr_get up i) *. (float_arr_get gam i)) *. (float_arr_get x i)
+    rms_proj x gam up n (i + 1) (acc +. v)
+
+-- dx_j = up_j*gamma_j*r - (r^3*x_j/N)*proj
+rms_dx x gam up n =
+  let r = rms_r x n
+  let proj = rms_proj x gam up n 0 0.0
+  let dx = float_arr_new n 0.0
+  rms_dx_fill x gam up n r proj dx 0
+rms_dx_fill x gam up n r proj dx k =
+  if k >= n then dx
+  else
+    let t1 = ((float_arr_get up k) *. (float_arr_get gam k)) *. r
+    let coef = ((r *. r) *. r) /. (int_to_float n)
+    let t2 = (coef *. (float_arr_get x k)) *. proj
+    let _ = float_arr_set dx k (t1 -. t2)
+    rms_dx_fill x gam up n r proj dx (k + 1)
+
+-- ===================== attention forward (T positions, single head) =====================
+-- Q/K/V are flat T*d = (per position) projection of the input x[t].
+-- proj_all W xs T d : returns T*d, row t = W . x_t  (W is d*d flat).
+proj_all W xs T d =
+  let out = float_arr_new (T * d) 0.0
+  proj_all_go W xs T d out 0
+proj_all_go W xs T d out t =
+  if t >= T then out
+  else
+    let xt = slice_d xs (t * d) d
+    let zt = float_mat_vec W xt
+    let _ = put_d zt out (t * d) d 0
+    proj_all_go W xs T d out (t + 1)
+
+-- scores[t,u] = dot(Q_t, K_u) / sqrt(d).  S is T*T.
+attn_scores Q K T d =
+  let invs = 1.0 /. (sqrt (int_to_float d))
+  let S = float_arr_new (T * T) 0.0
+  attn_sc_go Q K T d invs S 0
+attn_sc_go Q K T d invs S idx =
+  if idx >= T * T then S
+  else
+    let t = idx / T
+    let u = idx - (t * T)
+    let raw = qk_dot Q K d t u 0 0.0
+    let _ = float_arr_set S idx (raw *. invs)
+    attn_sc_go Q K T d invs S (idx + 1)
+qk_dot Q K d t u p acc =
+  if p >= d then acc
+  else qk_dot Q K d t u (p + 1) (acc +. ((float_arr_get Q (t * d + p)) *. (float_arr_get K (u * d + p))))
+
+-- softmax over u per row (stable). A is T*T.
+attn_softmax S T =
+  let A = float_arr_new (T * T) 0.0
+  attn_sm_rows S A T 0
+attn_sm_rows S A T t =
+  if t >= T then A
+  else
+    let m = sm_rowmax S T t 0 (0.0 -. 1.0e30)
+    let Z = sm_rowsum S T t m 0 0.0
+    let _ = sm_rowfill S A T t m Z 0
+    attn_sm_rows S A T (t + 1)
+sm_rowmax S T t u acc =
+  if u >= T then acc
+  else
+    let v = float_arr_get S (t * T + u)
+    let na = if v >. acc then v else acc
+    sm_rowmax S T t (u + 1) na
+sm_rowsum S T t m u acc =
+  if u >= T then acc
+  else sm_rowsum S T t m (u + 1) (acc +. (exp ((float_arr_get S (t * T + u)) -. m)))
+sm_rowfill S A T t m Z u =
+  if u >= T then A
+  else
+    let e = exp ((float_arr_get S (t * T + u)) -. m)
+    let _ = float_arr_set A (t * T + u) (e /. Z)
+    sm_rowfill S A T t m Z (u + 1)
+
+-- attn_t = sum_u A[t,u] * V_u  -> ATT is T*d.
+attn_ctx A V T d =
+  let O = float_arr_new (T * d) 0.0
+  attn_ctx_go A V T d O 0
+attn_ctx_go A V T d O idx =
+  if idx >= T * d then O
+  else
+    let t = idx / d
+    let q = idx - (t * d)
+    let _ = float_arr_set O idx (ctx_dot A V T d t q 0 0.0)
+    attn_ctx_go A V T d O (idx + 1)
+ctx_dot A V T d t q u acc =
+  if u >= T then acc
+  else ctx_dot A V T d t q (u + 1) (acc +. ((float_arr_get A (t * T + u)) *. (float_arr_get V (u * d + q))))
+
+-- output projection o_t = Wo . attn_t.  Wo is d*d flat.  ATT is T*d -> O is T*d.
+out_proj Wo ATT T d = proj_all Wo ATT T d
+
+-- ===================== full FORWARD producing the scalar loss =====================
+-- weights packed individually; xs is the gathered embedding T*d.
+-- returns the scalar cross-entropy loss summed over positions.
+gather_x E ids T d =
+  let xs = float_arr_new (T * d) 0.0
+  gather_x_go E ids T d xs 0
+gather_x_go E ids T d xs t =
+  if t >= T then xs
+  else
+    let v = nth_idx ids t
+    let _ = crow E (v * d) xs (t * d) d 0
+    gather_x_go E ids T d xs (t + 1)
+crow src sb dst db d k =
+  if k >= d then dst
+  else
+    let _ = float_arr_set dst (db + k) (float_arr_get src (sb + k))
+    crow src sb dst db d (k + 1)
+
+-- residual add over flat T*d arrays: r = a + b (fresh).
+res_add a b T d =
+  let r = float_arr_new (T * d) 0.0
+  res_add_go a b (T * d) r 0
+res_add_go a b n r k =
+  if k >= n then r
+  else
+    let _ = float_arr_set r k ((float_arr_get a k) +. (float_arr_get b k))
+    res_add_go a b n r (k + 1)
+
+-- RMSNorm applied per position over flat T*d, with shared gamma (length d).
+rmsnorm_all xs gam T d =
+  let out = float_arr_new (T * d) 0.0
+  rmsnorm_all_go xs gam T d out 0
+rmsnorm_all_go xs gam T d out t =
+  if t >= T then out
+  else
+    let xt = slice_d xs (t * d) d
+    let yt = rms_fwd xt gam d
+    let _ = put_d yt out (t * d) d 0
+    rmsnorm_all_go xs gam T d out (t + 1)
+
+-- MLP per position over flat T*d:  m_t = W2 . sq(W1 . n1_t).  W1 dff*d, W2 d*dff.
+mlp_all xs W1 W2 T d dff =
+  let out = float_arr_new (T * d) 0.0
+  mlp_all_go xs W1 W2 T d dff out 0
+mlp_all_go xs W1 W2 T d dff out t =
+  if t >= T then out
+  else
+    let xt = slice_d xs (t * d) d
+    let hpre = float_mat_vec W1 xt
+    let hact = float_arr_map sq hpre
+    let mt = float_mat_vec W2 hact
+    let _ = put_d mt out (t * d) d 0
+    mlp_all_go xs W1 W2 T d dff out (t + 1)
+
+-- LM head logits per position: logits_t = Wlm . n2_t.  Wlm is Vc*d.  -> T*Vc.
+lmhead_all xs Wlm T d Vc =
+  let out = float_arr_new (T * Vc) 0.0
+  lmhead_all_go xs Wlm T d Vc out 0
+lmhead_all_go xs Wlm T d Vc out t =
+  if t >= T then out
+  else
+    let nt = slice_d xs (t * d) d
+    let lt = float_mat_vec Wlm nt
+    let _ = put_d lt out (t * Vc) Vc 0
+    lmhead_all_go xs Wlm T d Vc out (t + 1)
+
+-- cross-entropy at position t given its length-Vc logits + target id.
+ce_one z tgt Vc =
+  let mx = fmax_acc z Vc 0 (float_arr_get z 0)
+  let zsum = esum z Vc mx 0 0.0
+  (mx +. (log zsum)) -. (float_arr_get z tgt)
+fmax_acc z n i acc =
+  if i >= n then acc
+  else
+    let v = float_arr_get z i
+    if v >. acc then fmax_acc z n (i + 1) v
+    else fmax_acc z n (i + 1) acc
+esum z n mx i acc =
+  if i >= n then acc
+  else esum z n mx (i + 1) (acc +. (exp ((float_arr_get z i) -. mx)))
+
+-- L = sum_t CE(logits_t, tgt_t)
+total_ce LG T Vc tgts t acc =
+  if t >= T then acc
+  else
+    let zt = slice_d LG (t * Vc) Vc
+    let tg = nth_idx tgts t
+    total_ce LG T Vc tgts (t + 1) (acc +. (ce_one zt tg Vc))
+
+-- the scalar forward: takes all weights, recomputes everything end to end.
+fwd_loss E Wq Wk Wv Wo gam W1 W2 gam2 Wlm =
+  let d = cfg_d
+  let T = cfg_T
+  let Vc = cfg_Vc
+  let dff = cfg_dff
+  let xs = gather_x E the_ids T d
+  let Q = proj_all Wq xs T d
+  let K = proj_all Wk xs T d
+  let V = proj_all Wv xs T d
+  let S = attn_scores Q K T d
+  let A = attn_softmax S T
+  let ATT = attn_ctx A V T d
+  let O = out_proj Wo ATT T d
+  let r1 = res_add xs O T d
+  let n1 = rmsnorm_all r1 gam T d
+  let M = mlp_all n1 W1 W2 T d dff
+  let r2 = res_add n1 M T d
+  let n2 = rmsnorm_all r2 gam2 T d
+  let LG = lmhead_all n2 Wlm T d Vc
+  total_ce LG T Vc the_tgt 0 0.0
+
+-- ===================== softmax (stable) over length-n, for ct seed =====================
+softmax_vec z n =
+  let mx = fmax_acc z n 0 (float_arr_get z 0)
+  let den = esum z n mx 0 0.0
+  let s = float_arr_new n 0.0
+  softmax_fill z n mx den s 0
+softmax_fill z n mx den s k =
+  if k >= n then s
+  else
+    let _ = float_arr_set s k ((exp ((float_arr_get z k) -. mx)) /. den)
+    softmax_fill z n mx den s (k + 1)
+
+-- ===================== matmul-style backward atoms (rung5) over per-position W.x =====================
+-- For z = W . x (W is out*n flat), with cotangent ctz (length out):
+--   dW += outer(ctz, x)  (length out*n) ;  dx = W^T . ctz (length n).
+-- These are exactly float_outer + float_mat_vec_t.
+
+-- ===================== the composed BACKWARD =====================
+-- Strategy: recompute the forward intermediates (FD-safe, no cross-call lets needed
+-- since we recompute), then push cotangents from the loss back to every weight.
+-- Returns the gradient array for the requested parameter group `which`:
+--   0 dWq 1 dWk 2 dWv 3 dWo 4 dgam 5 dW1 6 dW2 7 dgam2 8 dWlm 9 dE
+backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm which =
+  let d = cfg_d
+  let T = cfg_T
+  let Vc = cfg_Vc
+  let dff = cfg_dff
+  -- ---- forward recompute (store everything we need) ----
+  let xs = gather_x E the_ids T d
+  let Q = proj_all Wq xs T d
+  let K = proj_all Wk xs T d
+  let V = proj_all Wv xs T d
+  let S = attn_scores Q K T d
+  let A = attn_softmax S T
+  let ATT = attn_ctx A V T d
+  let O = out_proj Wo ATT T d
+  let r1 = res_add xs O T d
+  let n1 = rmsnorm_all r1 gam T d
+  let M = mlp_all n1 W1 W2 T d dff
+  let r2 = res_add n1 M T d
+  let n2 = rmsnorm_all r2 gam2 T d
+  let LG = lmhead_all n2 Wlm T d Vc
+  -- ---- accumulators (zeroed) ----
+  let dWq = float_arr_new (d * d) 0.0
+  let dWk = float_arr_new (d * d) 0.0
+  let dWv = float_arr_new (d * d) 0.0
+  let dWo = float_arr_new (d * d) 0.0
+  let dgam = float_arr_new d 0.0
+  let dW1 = float_arr_new (dff * d) 0.0
+  let dW2 = float_arr_new (d * dff) 0.0
+  let dgam2 = float_arr_new d 0.0
+  let dWlm = float_arr_new (Vc * d) 0.0
+  let dE = float_arr_new (Vc * d) 0.0
+  -- cotangent on n1 accumulates across positions (fan-out via residual r2),
+  -- and cotangent on xs accumulates (fan-out via residual r1 -> embedding scatter).
+  -- We process position by position; per-position cotangents flow independently
+  -- through everything EXCEPT the shared weights (which accumulate) and gamma/gamma2.
+  -- ct_n1[t] and ct_x[t] are stored full T*d so attention (which couples positions)
+  -- can be handled after the per-position MLP/LM-head/norm sweep.
+  let ct_n1 = float_arr_new (T * d) 0.0
+  let ct_x = float_arr_new (T * d) 0.0
+  -- per-position sweep: LM head -> rmsnorm2 -> residual r2 -> MLP -> rmsnorm1 -> residual r1
+  let _ = sweep_pos gam W1 W2 gam2 Wlm r1 n1 r2 n2 LG dgam dW1 dW2 dgam2 dWlm ct_n1 ct_x T d Vc dff 0
+  -- ---- attention backward (couples positions); seeds dWo, dWq, dWk, dWv, and
+  --      adds attention's contribution to ct_x via Wq/Wk/Wv input grads ----
+  let _ = attn_backward Wq Wk Wv Wo xs Q K V A ATT dWq dWk dWv dWo ct_n1 ct_x T d
+  -- ---- embedding scatter-add: dE[ids[t]] += ct_x[t] ----
+  let _ = embed_scatter ct_x dE the_ids T d 0
+  if which == 0 then dWq
+  else if which == 1 then dWk
+  else if which == 2 then dWv
+  else if which == 3 then dWo
+  else if which == 4 then dgam
+  else if which == 5 then dW1
+  else if which == 6 then dW2
+  else if which == 7 then dgam2
+  else if which == 8 then dWlm
+  else dE
+
+-- ---- per-position backward sweep (no inter-position coupling here) ----
+-- For each position t: seed ct on logits = softmax(logits_t)-onehot(tgt_t);
+-- push through LM head (dWlm += outer(ctl, n2_t); ct_n2 = Wlm^T.ctl),
+-- rmsnorm2 (dgam2 += ; ct_r2 = rms_dx), residual r2 (ct_n1 += ct_r2 ; ct_M = ct_r2),
+-- MLP (dW2 += outer(ct_M, hact); ct_hact = W2^T.ct_M; ct_hpre = sqd(hpre).*ct_hact;
+--      dW1 += outer(ct_hpre, n1_t); ct_n1 += W1^T.ct_hpre via fan-out),
+-- rmsnorm1 (dgam += ; ct_r1 = rms_dx with up=ct_n1[t]), residual r1
+-- (ct_x[t] += ct_r1 ; ct_ATTout = ct_r1 stored into ct_x as attention's seed --
+--  we store ct_r1 into ct_n1 slot? no: r1 = xs + O. ct_r1 fans to BOTH xs and O.
+--  ct_x[t] += ct_r1 (skip path); attention output proj gets seed ct_O = ct_r1.)
+-- We store the attention-output cotangent (ct_O) into ct_x's MIRROR via a separate
+-- array threaded into attn_backward; here we store ct_r1 into ct_n1 AFTER it has
+-- served as the MLP/norm1 input cotangent? To avoid confusion we use a dedicated
+-- ct_O array. Simplify: per-position we compute ct_r1 and (a) add to ct_x (skip),
+-- (b) save into ct_n1 is WRONG. So sweep writes ct_O[t] = ct_r1 into ct_x's sibling.
+-- Implementation: sweep accumulates ct_x (skip) and writes ct_O (attn output seed)
+-- which we pass to attn_backward. ct_n1 here only holds the residual-r2 fan to n1.
+sweep_pos gam W1 W2 gam2 Wlm r1 n1 r2 n2 LG dgam dW1 dW2 dgam2 dWlm ct_n1 ct_x T d Vc dff t =
+  if t >= T then 0
+  else
+    -- logits cotangent seed
+    let zt = slice_d LG (t * Vc) Vc
+    let sm = softmax_vec zt Vc
+    let tg = nth_idx the_tgt t
+    let _ = float_arr_set sm tg ((float_arr_get sm tg) -. 1.0)
+    -- LM head backward
+    let n2t = slice_d n2 (t * d) d
+    let dWlm_t = float_outer sm n2t
+    let _ = addinto dWlm dWlm_t (Vc * d) 0
+    let ct_n2 = float_mat_vec_t Wlm sm
+    -- rmsnorm2 backward (input r2_t, gamma=gam2, up=ct_n2)
+    let r2t = slice_d r2 (t * d) d
+    let dgam2_t = rms_dgam r2t gam2 ct_n2 d
+    let _ = addinto dgam2 dgam2_t d 0
+    let ct_r2 = rms_dx r2t gam2 ct_n2 d
+    -- residual r2 = n1 + M : fan ct_r2 to n1 and M
+    -- ct on n1 from THIS path:
+    let ct_n1_resid = ct_r2
+    -- MLP backward (M = W2 . sq(W1 . n1_t))
+    let n1t = slice_d n1 (t * d) d
+    let hpre = float_mat_vec W1 n1t
+    let hact = float_arr_map sq hpre
+    -- dW2 += outer(ct_M, hact) ; ct_hact = W2^T . ct_M ; ct_M = ct_r2
+    let dW2_t = float_outer ct_r2 hact
+    let _ = addinto dW2 dW2_t (d * dff) 0
+    let ct_hact = float_mat_vec_t W2 ct_r2
+    -- ct_hpre = sqd(hpre) .* ct_hact
+    let dh = float_arr_map sqd hpre
+    let ct_hpre = float_arr_map2 mul2 dh ct_hact
+    let dW1_t = float_outer ct_hpre n1t
+    let _ = addinto dW1 dW1_t (dff * d) 0
+    let ct_n1_mlp = float_mat_vec_t W1 ct_hpre
+    -- total cotangent on n1_t = residual skip + MLP path
+    let ct_n1_t = float_arr_map2 add2 ct_n1_resid ct_n1_mlp
+    -- rmsnorm1 backward (input r1_t, gamma=gam, up=ct_n1_t)
+    let r1t = slice_d r1 (t * d) d
+    let dgam_t = rms_dgam r1t gam ct_n1_t d
+    let _ = addinto dgam dgam_t d 0
+    let ct_r1 = rms_dx r1t gam ct_n1_t d
+    -- residual r1 = xs + O : fan ct_r1 to xs (skip) and O (attention output)
+    -- skip path -> ct_x[t] += ct_r1 ; attention output seed stored in ct_n1[t]
+    -- (we reuse ct_n1 as the carrier for ct_O into attn_backward).
+    let _ = put_add ct_r1 ct_x (t * d) d 0
+    let _ = put_d ct_r1 ct_n1 (t * d) d 0
+    sweep_pos gam W1 W2 gam2 Wlm r1 n1 r2 n2 LG dgam dW1 dW2 dgam2 dWlm ct_n1 ct_x T d Vc dff (t + 1)
+
+-- put_add: dst[base+k] += v[k]  for k in 0..d
+put_add v dst base d k =
+  if k >= d then dst
+  else
+    let _ = float_arr_set dst (base + k) ((float_arr_get dst (base + k)) +. (float_arr_get v k))
+    put_add v dst base d (k + 1)
+
+-- ===================== attention backward (rung9, couples positions) =====================
+-- ct_O (carried in ct_n1, full T*d) is the cotangent on the attention-block OUTPUT O.
+-- O = Wo . ATT (per position).  ATT = A . V.  A = softmax(S).  S = QK^T/sqrt(d).
+-- Q=Wq.x, K=Wk.x, V=Wv.x.  We accumulate dWq/dWk/dWv/dWo and add to ct_x.
+attn_backward Wq Wk Wv Wo xs Q K V A ATT dWq dWk dWv dWo ct_O ct_x T d =
+  let invs = 1.0 /. (sqrt (int_to_float d))
+  -- ---- output projection: per position dWo += outer(ct_O_t, ATT_t); ct_ATT = Wo^T.ct_O ----
+  let ct_ATT = float_arr_new (T * d) 0.0
+  let _ = outproj_bwd Wo ATT ct_O dWo ct_ATT T d 0
+  -- ---- ATT = A . V : dV[u,q] = sum_t A[t,u]*ct_ATT[t,q] ; dA[t,u] = sum_q ct_ATT[t,q]*V[u,q] ----
+  let dV = float_arr_new (T * d) 0.0
+  let _ = dV_fill A ct_ATT T d dV 0
+  let dA = float_arr_new (T * T) 0.0
+  let _ = dA_fill ct_ATT V T d dA 0
+  -- ---- softmax backward per row: dS[t,u] = invs*A[t,u]*(dA[t,u] - sum_k dA[t,k]A[t,k]) ----
+  let dS = float_arr_new (T * T) 0.0
+  let _ = dS_rows dA A T invs dS 0
+  -- ---- scores backward: dQ[t,p] = sum_u dS[t,u]*K[u,p] ; dK[u,p] = sum_t dS[t,u]*Q[t,p] ----
+  let dQ = float_arr_new (T * d) 0.0
+  let _ = dQ_fill dS K T d dQ 0
+  let dK = float_arr_new (T * d) 0.0
+  let _ = dK_fill dS Q T d dK 0
+  -- ---- projection backward per position: each of Q/K/V was Wx . x_t ----
+  --   dWq += outer(dQ_t, x_t) ; ct_x[t] += Wq^T.dQ_t ; same for K,V ; V uses dV.
+  let _ = proj_bwd Wq xs dQ dWq ct_x T d 0
+  let _ = proj_bwd Wk xs dK dWk ct_x T d 0
+  let _ = proj_bwd Wv xs dV dWv ct_x T d 0
+  0
+
+-- per-position output-projection backward
+outproj_bwd Wo ATT ct_O dWo ct_ATT T d t =
+  if t >= T then 0
+  else
+    let ctOt = slice_d ct_O (t * d) d
+    let attt = slice_d ATT (t * d) d
+    let dWo_t = float_outer ctOt attt
+    let _ = addinto dWo dWo_t (d * d) 0
+    let ctATTt = float_mat_vec_t Wo ctOt
+    let _ = put_d ctATTt ct_ATT (t * d) d 0
+    outproj_bwd Wo ATT ct_O dWo ct_ATT T d (t + 1)
+
+-- dV[u*d+q] = sum_t A[t*T+u]*ct_ATT[t*d+q]
+dV_fill A ctA T d dV idx =
+  if idx >= T * d then dV
+  else
+    let u = idx / d
+    let q = idx - (u * d)
+    let _ = float_arr_set dV idx (dV_dot A ctA T d u q 0 0.0)
+    dV_fill A ctA T d dV (idx + 1)
+dV_dot A ctA T d u q t acc =
+  if t >= T then acc
+  else dV_dot A ctA T d u q (t + 1) (acc +. ((float_arr_get A (t * T + u)) *. (float_arr_get ctA (t * d + q))))
+
+-- dA[t*T+u] = sum_q ct_ATT[t*d+q]*V[u*d+q]
+dA_fill ctA V T d dA idx =
+  if idx >= T * T then dA
+  else
+    let t = idx / T
+    let u = idx - (t * T)
+    let _ = float_arr_set dA idx (dA_dot ctA V T d t u 0 0.0)
+    dA_fill ctA V T d dA (idx + 1)
+dA_dot ctA V T d t u q acc =
+  if q >= d then acc
+  else dA_dot ctA V T d t u (q + 1) (acc +. ((float_arr_get ctA (t * d + q)) *. (float_arr_get V (u * d + q))))
+
+-- per-row softmax backward
+dS_rows dA A T invs dS t =
+  if t >= T then dS
+  else
+    let rs = row_dasum dA A T t 0 0.0
+    let _ = dS_rowfill dA A T invs rs dS t 0
+    dS_rows dA A T invs dS (t + 1)
+row_dasum dA A T t u acc =
+  if u >= T then acc
+  else row_dasum dA A T t (u + 1) (acc +. ((float_arr_get dA (t * T + u)) *. (float_arr_get A (t * T + u))))
+dS_rowfill dA A T invs rs dS t u =
+  if u >= T then dS
+  else
+    let aij = float_arr_get A (t * T + u)
+    let v = aij *. ((float_arr_get dA (t * T + u)) -. rs)
+    let _ = float_arr_set dS (t * T + u) (v *. invs)
+    dS_rowfill dA A T invs rs dS t (u + 1)
+
+-- dQ[t*d+p] = sum_u dS[t*T+u]*K[u*d+p]
+dQ_fill dS K T d dQ idx =
+  if idx >= T * d then dQ
+  else
+    let t = idx / d
+    let p = idx - (t * d)
+    let _ = float_arr_set dQ idx (dQ_dot dS K T d t p 0 0.0)
+    dQ_fill dS K T d dQ (idx + 1)
+dQ_dot dS K T d t p u acc =
+  if u >= T then acc
+  else dQ_dot dS K T d t p (u + 1) (acc +. ((float_arr_get dS (t * T + u)) *. (float_arr_get K (u * d + p))))
+
+-- dK[u*d+p] = sum_t dS[t*T+u]*Q[t*d+p]
+dK_fill dS Q T d dK idx =
+  if idx >= T * d then dK
+  else
+    let u = idx / d
+    let p = idx - (u * d)
+    let _ = float_arr_set dK idx (dK_dot dS Q T d u p 0 0.0)
+    dK_fill dS Q T d dK (idx + 1)
+dK_dot dS Q T d u p t acc =
+  if t >= T then acc
+  else dK_dot dS Q T d u p (t + 1) (acc +. ((float_arr_get dS (t * T + u)) *. (float_arr_get Q (t * d + p))))
+
+-- per-position projection backward: z_t = W . x_t.  dW += outer(ctz_t, x_t) ;
+-- ct_x[t] += W^T . ctz_t.  ctz is the full T*d cotangent on the projected output.
+proj_bwd W xs ctz dW ct_x T d t =
+  if t >= T then 0
+  else
+    let ctzt = slice_d ctz (t * d) d
+    let xt = slice_d xs (t * d) d
+    let dW_t = float_outer ctzt xt
+    let _ = addinto dW dW_t (d * d) 0
+    let ctxt = float_mat_vec_t W ctzt
+    let _ = put_add ctxt ct_x (t * d) d 0
+    proj_bwd W xs ctz dW ct_x T d (t + 1)
+
+-- embedding scatter-add: dE[ids[t]*d+q] += ct_x[t*d+q]
+embed_scatter ct_x dE ids T d idx =
+  if idx >= T * d then dE
+  else
+    let t = idx / d
+    let q = idx - (t * d)
+    let v = nth_idx ids t
+    let prev = float_arr_get dE (v * d + q)
+    let _ = float_arr_set dE (v * d + q) (prev +. (float_arr_get ct_x idx))
+    embed_scatter ct_x dE ids T d (idx + 1)
+
+-- ===================== FD harness =====================
+fabs1 dd = if dd <. 0.0 then 0.0 -. dd else dd
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+
+-- generic FD on an arbitrary weight array `W` at index idx: perturb in place,
+-- recompute the full forward loss both ways, restore.  `which` selects which
+-- of the 10 weight arrays the perturbed array is (so fwd_loss sees the change).
+fd_at E Wq Wk Wv Wo gam W1 W2 gam2 Wlm Wp idx =
+  let h = 0.0001
+  let orig = float_arr_get Wp idx
+  let _ = float_arr_set Wp idx (orig +. h)
+  let fp = fwd_loss E Wq Wk Wv Wo gam W1 W2 gam2 Wlm
+  let _ = float_arr_set Wp idx (orig -. h)
+  let fm = fwd_loss E Wq Wk Wv Wo gam W1 W2 gam2 Wlm
+  let _ = float_arr_set Wp idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+-- check a parameter group: gr is analytic grad, Wp is the live weight array,
+-- which selects backward index, cnt = number of elements.
+chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm Wp gr cnt idx acc =
+  if idx >= cnt then acc
+  else
+    let gi = float_arr_get gr idx
+    let fi = fd_at E Wq Wk Wv Wo gam W1 W2 gam2 Wlm Wp idx
+    chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm Wp gr cnt (idx + 1) (acc + (fnear gi fi))
+
+-- ===================== fixed init weights (mix of signs) =====================
+-- filler: write a repeating small-magnitude signed pattern into a len-n array.
+mkw n =
+  let W = float_arr_new n 0.0
+  mkw_fill W n 0
+mkw_fill W n k =
+  if k >= n then W
+  else
+    let r = k - ((k / 9) * 9)
+    let v = pat r
+    let _ = float_arr_set W k v
+    mkw_fill W n (k + 1)
+-- 9-element signed pattern, all small magnitude.
+pat r =
+  if r == 0 then 0.5
+  else if r == 1 then (0.0 -. 0.3)
+  else if r == 2 then 0.2
+  else if r == 3 then 0.1
+  else if r == 4 then (0.0 -. 0.1)
+  else if r == 5 then 0.4
+  else if r == 6 then 0.25
+  else if r == 7 then (0.0 -. 0.15)
+  else 0.3
+
+-- gamma arrays initialize near 1 (mix), length d.
+mkgam =
+  let g = float_arr_new cfg_d 0.0
+  let _ = float_arr_set g 0 1.0
+  let _ = float_arr_set g 1 0.8
+  let _ = float_arr_set g 2 1.2
+  let _ = float_arr_set g 3 0.9
+  g
+mkgam2 =
+  let g = float_arr_new cfg_d 0.0
+  let _ = float_arr_set g 0 1.1
+  let _ = float_arr_set g 1 0.9
+  let _ = float_arr_set g 2 0.95
+  let _ = float_arr_set g 3 1.05
+  g
+
+main =
+  let _ = print "=== Rung 15 CAPSTONE: full transformer block fwd+bwd (vs finite-diff, d=4 T=2 Vc=5 dff=8) ==="
+  let d = cfg_d
+  let T = cfg_T
+  let Vc = cfg_Vc
+  let dff = cfg_dff
+  -- weights
+  let E = mkw (Vc * d)
+  let Wq = mkw (d * d)
+  let Wk = mkw (d * d)
+  let Wv = mkw (d * d)
+  let Wo = mkw (d * d)
+  let gam = mkgam
+  let W1 = mkw (dff * d)
+  let W2 = mkw (d * dff)
+  let gam2 = mkgam2
+  let Wlm = mkw (Vc * d)
+  -- analytic gradients
+  let gWq = backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm 0
+  let gWk = backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm 1
+  let gWv = backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm 2
+  let gWo = backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm 3
+  let gGam = backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm 4
+  let gW1 = backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm 5
+  let gW2 = backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm 6
+  let gGam2 = backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm 7
+  let gWlm = backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm 8
+  let gE = backward E Wq Wk Wv Wo gam W1 W2 gam2 Wlm 9
+  -- FD checks per group
+  let cWq = chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm Wq gWq (d * d) 0 0
+  let cWk = chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm Wk gWk (d * d) 0 0
+  let cWv = chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm Wv gWv (d * d) 0 0
+  let cWo = chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm Wo gWo (d * d) 0 0
+  let cGam = chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm gam gGam d 0 0
+  let cW1 = chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm W1 gW1 (dff * d) 0 0
+  let cW2 = chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm W2 gW2 (d * dff) 0 0
+  let cGam2 = chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm gam2 gGam2 d 0 0
+  let cWlm = chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm Wlm gWlm (Vc * d) 0 0
+  let cE = chk_group E Wq Wk Wv Wo gam W1 W2 gam2 Wlm E gE (Vc * d) 0 0
+  let _ = print (cat [show cWq, "/", show (d * d), " dWq   ", show cWk, "/", show (d * d), " dWk   ", show cWv, "/", show (d * d), " dWv"])
+  let _ = print (cat [show cWo, "/", show (d * d), " dWo   ", show cGam, "/", show d, " dgamma   ", show cGam2, "/", show d, " dgamma2"])
+  let _ = print (cat [show cW1, "/", show (dff * d), " dW1   ", show cW2, "/", show (d * dff), " dW2"])
+  let _ = print (cat [show cWlm, "/", show (Vc * d), " dWlm   ", show cE, "/", show (Vc * d), " dE"])
+  let total = cWq + cWk + cWv + cWo + cGam + cW1 + cW2 + cGam2 + cWlm + cE
+  let grand = (d * d) + (d * d) + (d * d) + (d * d) + d + (dff * d) + (d * dff) + d + (Vc * d) + (Vc * d)
+  let _ = print (cat [show total, "/", show grand, " capstone transformer backward checks passed"])
+  if total == grand then 0 else 1

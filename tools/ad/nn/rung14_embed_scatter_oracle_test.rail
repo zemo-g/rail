@@ -1,0 +1,114 @@
+-- Rung 14 gate oracle: embedding backward = scatter-add, FD-checked, INCLUDING
+-- a repeated-token-id case proving gradient accumulation.
+--   E shape [V, d] row-major.  ids length T WITH A REPEAT: [1, 0, 1].
+--   Upstream dOut shape [T, d].  Analytic backward:
+--     dE[v*d+q] = sum over t where ids[t]==v of dOut[t*d+q]   (accumulate).
+--   Token 1 appears at t=0 and t=2, so dE[1*d+q] = dOut[0*d+q] + dOut[2*d+q].
+--   FD-check uses Up == dOut: L = sum Up*gather(E); d L / d E must match scatter.
+--   Plus an explicit assert that row 1's grad is the SUM of the two upstream rows.
+-- V=2, d=2, T=3, ids=[1,0,1]. Floats stay in function parameters.
+-- Run: /tmp/rail_atoms --out-prefix /tmp/rung14 run tools/ad/nn/rung14_embed_scatter_oracle_test.rail
+
+import "stdlib/float_arr.rail"
+
+nth_id ids i = if i <= 0 then head ids else nth_id (tail ids) (i - 1)
+
+-- forward gather: G[t*d+q] = E[ids[t]*d + q]  (used only by the FD check)
+gather_fill E ids d G idx =
+  if idx >= (float_arr_len G) then G
+  else
+    let t = idx / d
+    let q = idx - (t * d)
+    let v = nth_id ids t
+    let _ = float_arr_set G idx (float_arr_get E (v * d + q))
+    gather_fill E ids d G (idx + 1)
+
+gather E ids d T =
+  let G = float_arr_new (T * d) 0.0
+  gather_fill E ids d G 0
+
+gatherl_go G Up t idx acc =
+  if idx >= t then acc
+  else gatherl_go G Up t (idx + 1) (acc +. ((float_arr_get G idx) *. (float_arr_get Up idx)))
+
+gather_loss E ids Up d T =
+  let G = gather E ids d T
+  gatherl_go G Up (T * d) 0 0.0
+
+-- analytic backward: scatter-add dOut into table shape. Accumulation is the
+-- whole point -- a repeated id writes into the same dE row twice.
+scatter_add dOut ids d T dE idx =
+  if idx >= (T * d) then dE
+  else
+    let t = idx / d
+    let q = idx - (t * d)
+    let v = nth_id ids t
+    let prev = float_arr_get dE (v * d + q)
+    let _ = float_arr_set dE (v * d + q) (prev +. (float_arr_get dOut idx))
+    scatter_add dOut ids d T dE (idx + 1)
+
+embed_dE dOut ids d T V =
+  let dE = float_arr_new (V * d) 0.0
+  scatter_add dOut ids d T dE 0
+
+fabs1 d = if d <. 0.0 then 0.0 -. d else d
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+
+fd_E E ids Up d T idx =
+  let h = 0.0001
+  let orig = float_arr_get E idx
+  let _ = float_arr_set E idx (orig +. h)
+  let fp = gather_loss E ids Up d T
+  let _ = float_arr_set E idx (orig -. h)
+  let fm = gather_loss E ids Up d T
+  let _ = float_arr_set E idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+chkE dE E ids Up d T cnt idx acc =
+  if idx >= cnt then acc
+  else
+    let gi = float_arr_get dE idx
+    let fi = fd_E E ids Up d T idx
+    chkE dE E ids Up d T cnt (idx + 1) (acc + (fnear gi fi))
+
+mkE =
+  let E = float_arr_new 4 0.0
+  let _ = float_arr_set E 0 0.5
+  let _ = float_arr_set E 1 (0.0 -. 0.2)
+  let _ = float_arr_set E 2 0.3
+  let _ = float_arr_set E 3 0.7
+  E
+
+-- dOut shape [T=3, d=2]. Distinct values per slot so the accumulation is visible.
+mkDOut =
+  let U = float_arr_new 6 0.0
+  let _ = float_arr_set U 0 1.0
+  let _ = float_arr_set U 1 (0.0 -. 0.5)
+  let _ = float_arr_set U 2 0.3
+  let _ = float_arr_set U 3 0.7
+  let _ = float_arr_set U 4 (0.0 -. 0.2)
+  let _ = float_arr_set U 5 0.9
+  U
+
+-- explicit accumulation assert: row 1 grad == dOut row0 + dOut row2, per column.
+-- ids=[1,0,1] -> contributions to v=1 come from t=0 and t=2.
+acc_check dE dOut d q acc =
+  if q >= d then acc
+  else
+    let got = float_arr_get dE (1 * d + q)
+    let want = (float_arr_get dOut (0 * d + q)) +. (float_arr_get dOut (2 * d + q))
+    acc_check dE dOut d (q + 1) (acc + (fnear got want))
+
+main =
+  let _ = print "=== Rung 14 GATE: embedding scatter-add backward (repeated id, vs finite-diff, V=2 d=2 T=3) ==="
+  let E = mkE
+  let dOut = mkDOut
+  let ids = [1, 0, 1]
+  let dE = embed_dE dOut ids 2 3 2
+  let cE = chkE dE E ids dOut 2 3 4 0 0
+  let cAcc = acc_check dE dOut 2 0 0
+  let _ = print (cat [show cE, "/4 dE checks passed (FD vs scatter-add)"])
+  let _ = print (cat [show cAcc, "/2 accumulation asserts: row1 grad == dOut[row0]+dOut[row2]"])
+  let total = cE + cAcc
+  let _ = print (cat [show total, "/6 scatter-add backward checks passed"])
+  if total == 6 then 0 else 1

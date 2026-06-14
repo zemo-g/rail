@@ -1,0 +1,93 @@
+-- BX7: bit-exact OPTIMIZER step (Adam) in exact-integer fixed-point.
+--
+-- The forward (BX5) and backward (BX6) are bit-exact; the optimizer closes the training step.
+-- optim.rail's Adam calls foreign pow (for the bias-correction 1-beta^t) and foreign sqrt (for
+-- sqrt(vhat)) -- both libm, both platform-divergent. BX7 replaces them with FIXED integer
+-- algorithms: pow by repeated fixed-point multiply, sqrt by the exact digit-by-digit isqrt
+-- (bx4_fxsqrt). Every number the update touches is then a fixed algorithm, so the WHOLE Adam
+-- trajectory reproduces bit-for-bit on any device.
+--
+--   m  = b1 m + (1-b1) g                 v  = b2 v + (1-b2) g^2
+--   mh = m / (1 - b1^t)                  vh = v / (1 - b2^t)
+--   theta = theta - lr * mh / (sqrt(vh) + eps)
+--
+-- The optimizer is fully ELEMENTWISE -- no cross-element reduction -- so D1 (reduction
+-- order-independence) is vacuous here; the reductions live in fwd/bwd (BX5/BX6, already D1-gated).
+-- Gates: D0 run-twice trajectory bit-identical; D3 a Python re-impl reproduces every theta/m/v
+-- integer after T steps bit-for-bit (bx7_foreign_check.py), which ALSO checks the fixed-point
+-- update agrees with a real float Adam (correctness).
+--
+-- Fixed-point F=24, S=2^24. eps is a representable fixed-point epsilon (1e-8 underflows at F=24);
+-- the float reference uses the same eps so the comparison isolates the arithmetic, not the constant.
+
+import "tools/bitexact/bx_fixed.rail"
+
+-- ===== deterministic fixed-point generator (initial theta + per-step gradients) =====
+bx7_imod a b = a - (a / b) * b
+bx7_cell kind i j = (bx7_imod (kind * 101 + i * 5 + j * 3 + 7) 13 - 6) * 1398101
+bx7_genrow kind i j cols = if j >= cols then [] else cons (bx7_cell kind i j) (bx7_genrow kind i (j + 1) cols)
+
+bx7_nth xs i = if i <= 0 then head xs else bx7_nth (tail xs) (i - 1)
+bx7_vsum xs = if xs == [] then 0 else (head xs) + bx7_vsum (tail xs)
+
+-- fixed-point power b^t (t a small non-negative int): repeated exact multiply.
+-- Mutual recursion (a/b ping-pong) keeps the recursing arg on a normal tagged call -- dodges the
+-- self-loop raw-register optimizer; the S seed is passed in ARGUMENT position (safe).
+bx7_powfx_a base acc t = if t <= 0 then acc else bx7_powfx_b base ((acc * base) / 16777216) (t - 1)
+bx7_powfx_b base acc t = if t <= 0 then acc else bx7_powfx_a base ((acc * base) / 16777216) (t - 1)
+bx7_powfx base t = bx7_powfx_a base 16777216 t
+
+-- one Adam step for a single scalar element. st = [theta, m, v] -> [theta', m', v'].
+bx7_step1 st g beta1 beta2 lr eps t =
+  let th = bx7_nth st 0 in
+  let m = bx7_nth st 1 in
+  let v = bx7_nth st 2 in
+  let m2 = ((beta1 * m) / 16777216) + (((16777216 - beta1) * g) / 16777216) in
+  let g2 = (g * g) / 16777216 in
+  let v2 = ((beta2 * v) / 16777216) + (((16777216 - beta2) * g2) / 16777216) in
+  let bc1 = 16777216 - (bx7_powfx beta1 t) in
+  let bc2 = 16777216 - (bx7_powfx beta2 t) in
+  let mhat = (m2 * 16777216) / bc1 in
+  let vhat = (v2 * 16777216) / bc2 in
+  let denom = (bx4_fxsqrt vhat) + eps in
+  let step = (lr * mhat) / denom in
+  cons (th - step) (cons m2 (cons v2 []))
+
+-- run T steps for one element (gradient at step t = cell t i 0, deterministic)
+bx7_traj_go st i beta1 beta2 lr eps t maxt =
+  if t > maxt then st
+  else
+    let g = bx7_cell t i 0 in
+    let st2 = bx7_step1 st g beta1 beta2 lr eps t in
+    bx7_traj_go st2 i beta1 beta2 lr eps (t + 1) maxt
+bx7_run_elem th0 i beta1 beta2 lr eps maxt = bx7_traj_go (cons th0 (cons 0 (cons 0 []))) i beta1 beta2 lr eps 1 maxt
+
+-- per-element final states, then extract theta / m / v columns
+bx7_states theta i d beta1 beta2 lr eps maxt =
+  if i >= d then []
+  else cons (bx7_run_elem (bx7_nth theta i) i beta1 beta2 lr eps maxt) (bx7_states theta (i + 1) d beta1 beta2 lr eps maxt)
+bx7_col states k = if states == [] then [] else cons (bx7_nth (head states) k) (bx7_col (tail states) k)
+
+-- D3 dump: theta row, m row, v row (space-separated integers)
+bx7_dumprow xs = if xs == [] then "\n" else join "" (cons (show (head xs)) (cons " " (cons (bx7_dumprow (tail xs)) [])))
+
+main =
+  let d = 4 in
+  let maxt = 8 in
+  let theta = bx7_genrow 8 0 0 d in
+  let states = bx7_states theta 0 d 15099494 16760439 167772 16777 maxt in
+  let th = bx7_col states 0 in
+  let mm = bx7_col states 1 in
+  let vv = bx7_col states 2 in
+  let chk1 = (bx7_vsum th) + (bx7_vsum mm) + (bx7_vsum vv) in
+  let states2 = bx7_states theta 0 d 15099494 16760439 167772 16777 maxt in
+  let chk2 = (bx7_vsum (bx7_col states2 0)) + (bx7_vsum (bx7_col states2 1)) + (bx7_vsum (bx7_col states2 2)) in
+  let d0 = if chk1 == chk2 then 0 else 1 in
+  let _ = print (join "" (cons "BX7 D0 (run-twice Adam trajectory identical): " (cons (if d0 == 0 then "PASS" else "FAIL") []))) in
+  let _ = print (join "" (cons "BX7 theta after 8 steps: " (cons (bx7_dumprow th) []))) in
+  let _ = print (join "" (cons "BX7 trajectory checksum: " (cons (show chk1) []))) in
+  let _ = write_file "/tmp/bx7_dump.txt" (join "" (cons (bx7_dumprow th) (cons (bx7_dumprow mm) (cons (bx7_dumprow vv) [])))) in
+  let _ = print (if d0 == 0
+    then "BX7 PASS: exact-integer Adam step deterministic (D0); pow/sqrt are fixed algorithms; dump for D3"
+    else "BX7 FAIL") in
+  0

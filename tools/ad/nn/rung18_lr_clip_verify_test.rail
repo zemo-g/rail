@@ -1,0 +1,119 @@
+-- Rung 18 gate oracle: LR warmup+inverse-sqrt decay schedule + global-norm
+-- gradient clipping, both verified by EQUIVALENCE to hand-computed references.
+--
+-- SCHEDULE  schedule(step) = peak*(step/warmup)        for step < warmup  (warmup ramp)
+--                         = peak*sqrt(warmup/step)     for step >= warmup (inverse-sqrt decay)
+--   Sampled at step in {1, warmup, 4*warmup} with peak=0.001, warmup=100:
+--     step 1   -> 0.001*(1/100)        = 0.00001
+--     step 100 -> 0.001*(100/100)      = 0.001
+--     step 400 -> 0.001*sqrt(100/400)  = 0.001*0.5 = 0.0005
+--   Checked against those literal hand values via fnear.
+--
+-- GLOBAL-NORM CLIP  gnorm = sqrt(sum g_i^2)
+--   if gnorm > maxnorm: scale = maxnorm/gnorm  else scale = 1.0 ; g_i *= scale
+--   Verify (maxnorm=1.0):
+--     - an OVER-norm vector, after clipping, has new global norm == maxnorm
+--     - an UNDER-norm vector is left UNCHANGED (norm and every element).
+--
+-- Run: /tmp/rail_atoms --out-prefix /tmp/r18 run tools/ad/nn/rung18_lr_clip_verify_test.rail
+
+import "stdlib/float_arr.rail"
+
+foreign sqrt x -> float
+
+fabs1 d = if d <. 0.0 then 0.0 -. d else d
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+-- a tighter comparator for the schedule (values are ~1e-3..1e-5, so the default
+-- 0.005 absolute floor would pass anything; use a small absolute + relative tol).
+fnear_s a b = if (fabs1 (a -. b)) <. (0.0000001 +. (0.001 *. (fabs1 b))) then 1 else 0
+
+-- ---------- LR schedule ----------
+-- integer step/warmup is INT division; we need the float ratio, so build it from
+-- int_to_float on each side. No float survives a let across a call here.
+lr_schedule peak warmup step =
+  if step < warmup then
+    peak *. ((int_to_float step) /. (int_to_float warmup))
+  else
+    peak *. (sqrt ((int_to_float warmup) /. (int_to_float step)))
+
+-- ---------- global-norm clip ----------
+-- sum of squares, accumulator threaded through a PARAMETER (codegen-safe).
+sumsq g n i acc =
+  if i >= n then acc
+  else sumsq g n (i + 1) (acc +. ((float_arr_get g i) *. (float_arr_get g i)))
+
+global_norm g n = sqrt (sumsq g n 0 0.0)
+
+scale_loop g s n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set g i ((float_arr_get g i) *. s)
+    scale_loop g s n (i + 1)
+
+-- clip_in_place: mutate g so its global norm <= maxnorm. Returns the scale used.
+-- (scale chosen as a parameter to the loop -- no cross-call float-let.)
+clip_in_place g n maxnorm =
+  let gn = global_norm g n
+  if gn >. maxnorm then
+    let _ = scale_loop g (maxnorm /. gn) n 0
+    maxnorm /. gn
+  else
+    1.0
+
+-- build a vector from a per-index generator, threading nothing float across calls.
+oval i =
+  if i == 0 then 3.0
+  else if i == 1 then (0.0 -. 4.0)
+  else if i == 2 then 12.0
+  else 0.0
+-- (3,-4,12,0): norm = sqrt(9+16+144) = sqrt(169) = 13.0 -> over maxnorm=1.0.
+
+uval i =
+  if i == 0 then 0.30
+  else if i == 1 then (0.0 -. 0.40)
+  else if i == 2 then 0.20
+  else 0.10
+-- norm = sqrt(0.09+0.16+0.04+0.01) = sqrt(0.30) ~= 0.5477 -> under maxnorm=1.0.
+
+fill_from gen g n i =
+  if i >= n then g
+  else
+    let _ = float_arr_set g i (gen i)
+    fill_from gen g n (i + 1)
+
+-- check the under-norm vector is element-wise unchanged after clipping.
+chk_unchanged g n i acc =
+  if i >= n then acc
+  else chk_unchanged g n (i + 1) (acc + (fnear (float_arr_get g i) (uval i)))
+
+main =
+  let _ = print "=== Rung 18 GATE: LR warmup+inv-sqrt schedule + global-norm clip (vs hand values) ==="
+  let peak = 0.001
+  let warmup = 100
+  -- schedule checks at {1, warmup, 4*warmup}
+  let s1 = fnear_s (lr_schedule peak warmup 1)   0.00001
+  let s2 = fnear_s (lr_schedule peak warmup 100) 0.001
+  let s3 = fnear_s (lr_schedule peak warmup 400) 0.0005
+  let csched = s1 + s2 + s3
+  let _ = print (cat [show csched, "/3 schedule samples match (1->1e-5, 100->1e-3, 400->5e-4)"])
+
+  -- clip checks
+  let n = 4
+  let maxnorm = 1.0
+  -- over-norm vector: after clip, global norm must equal maxnorm.
+  let go = float_arr_new n 0.0
+  let _ = fill_from oval go n 0
+  let _ = clip_in_place go n maxnorm
+  let cover = fnear (global_norm go n) maxnorm
+  -- under-norm vector: must be left unchanged.
+  let gu = float_arr_new n 0.0
+  let _ = fill_from uval gu n 0
+  let _ = clip_in_place gu n maxnorm
+  let cunch = chk_unchanged gu n 0 0
+  let cundernorm = if cunch == n then 1 else 0
+  let cclip = cover + cundernorm
+  let _ = print (cat [show cover, "/1 over-norm clipped to maxnorm  ", show cundernorm, "/1 under-norm unchanged"])
+
+  let total = csched + cclip
+  let _ = print (cat [show total, "/5 schedule + clip checks passed"])
+  if total == 5 then 0 else 1

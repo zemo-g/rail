@@ -1,0 +1,119 @@
+-- stdlib/float_arr.rail — functional combinators over native float arrays.
+-- Tape-free, attestable building blocks for vector autodiff (P3 V-series).
+-- float_arr_new / float_arr_get / float_arr_set / float_arr_len are compiler builtins.
+
+fam_go fn a out i n =
+  if i >= n then out
+  else
+    let _ = float_arr_set out i (fn (float_arr_get a i))
+    fam_go fn a out (i + 1) n
+
+-- float_arr_map fn a : apply fn elementwise, returning a fresh same-length array.
+float_arr_map fn a =
+  let n = float_arr_len a
+  let out = float_arr_new n 0.0
+  fam_go fn a out 0 n
+
+fam2_go fn a b out i n =
+  if i >= n then out
+  else
+    let _ = float_arr_set out i (fn (float_arr_get a i) (float_arr_get b i))
+    fam2_go fn a b out (i + 1) n
+
+-- float_arr_map2 fn a b : apply binary fn elementwise over two same-length arrays.
+float_arr_map2 fn a b =
+  let n = float_arr_len a
+  let out = float_arr_new n 0.0
+  fam2_go fn a b out 0 n
+
+-- fas_go: reduce-add over the array. acc is a float (threads via ordinary
+-- recursion -- float accumulators are not loop-optimized, which is correct here;
+-- depth = array length). Mirrors fmv_dot's accumulator convention.
+fas_go a n i acc =
+  if i >= n then acc
+  else fas_go a n (i + 1) (acc +. (float_arr_get a i))
+
+-- float_arr_sum a : sum of all elements. The scalar readout the P3 V-series AD
+-- detection keys on (f ... = float_arr_sum (float_arr_map g ...)); d(sum)/dx_i = 1.
+float_arr_sum a =
+  let n = float_arr_len a
+  fas_go a n 0 0.0
+
+-- ---- matvec layer primitives (P3 V5 slice 4) -------------------------------
+-- A weight matrix is a FLAT row-major float_arr of length out*n. The three ops
+-- below are the forward matvec and its two reverse atoms (transpose-matvec for
+-- the input grad, outer product for the weight grad). All pure Rail, no tape.
+
+-- fmv_dot: row j dotted with the input vector. acc is a float (threads via
+-- ordinary recursion -- float accumulators are not loop-optimized, which is
+-- correct here; depth = n, the input width).
+fmv_dot w xv n j i acc =
+  if i >= n then acc
+  else fmv_dot w xv n j (i + 1) (acc +. ((float_arr_get w (j * n + i)) *. (float_arr_get xv i)))
+
+fmv_go w xv out n j z =
+  if j >= out then z
+  else
+    let _ = float_arr_set z j (fmv_dot w xv n j 0 0.0)
+    fmv_go w xv out n (j + 1) z
+
+-- float_mat_vec w xv : (out x n) flat matrix times length-n vector -> length-out
+-- vector.  z_j = sum_i w[j*n + i] * xv_i.  n = len xv ; out = len w / n.
+float_mat_vec w xv =
+  let n = float_arr_len xv
+  let out = (float_arr_len w) / n
+  let z = float_arr_new out 0.0
+  fmv_go w xv out n 0 z
+
+-- fmvt_acc: column i of w^T dotted with ctz (sum over the out rows).
+fmvt_acc w ctz n out i j acc =
+  if j >= out then acc
+  else fmvt_acc w ctz n out i (j + 1) (acc +. ((float_arr_get ctz j) *. (float_arr_get w (j * n + i))))
+
+fmvt_go w ctz n out i r =
+  if i >= n then r
+  else
+    let _ = float_arr_set r i (fmvt_acc w ctz n out i 0 0.0)
+    fmvt_go w ctz n out (i + 1) r
+
+-- float_mat_vec_t w ctz : transpose-matvec.  r_i = sum_j ctz_j * w[j*n + i].
+-- out = len ctz ; n = len w / out.  Returns the length-n input-space gradient.
+float_mat_vec_t w ctz =
+  let out = float_arr_len ctz
+  let n = (float_arr_len w) / out
+  let r = float_arr_new n 0.0
+  fmvt_go w ctz n out 0 r
+
+-- fo_inner: fill row j of the outer product (a_j scaled across all of b).
+fo_inner a b nb j i r =
+  if i >= nb then r
+  else
+    let _ = float_arr_set r (j * nb + i) ((float_arr_get a j) *. (float_arr_get b i))
+    fo_inner a b nb j (i + 1) r
+
+fo_go a b na nb j r =
+  if j >= na then r
+  else
+    let _ = fo_inner a b nb j 0 r
+    fo_go a b na nb (j + 1) r
+
+-- float_outer a b : flat row-major outer product.  r[j*nb + i] = a_j * b_i.
+-- Length na*nb -- the natural shape of the matvec weight gradient outer(ct,x).
+float_outer a b =
+  let na = float_arr_len a
+  let nb = float_arr_len b
+  let r = float_arr_new (na * nb) 0.0
+  fo_go a b na nb 0 r
+
+-- fd_go: dot accumulator (float threads via ordinary recursion).
+fd_go a b n i acc =
+  if i >= n then acc
+  else fd_go a b n (i + 1) (acc +. ((float_arr_get a i) *. (float_arr_get b i)))
+
+-- float_dot a b : scalar inner product  sum_i a_i * b_i.  The generalized readout
+-- L = float_dot y g treats g as a fixed upstream cotangent on the net output y;
+-- its VJP wrt y is g, so net__rgrad seeds __cty_i = g_i * __gy. With g = ones this
+-- reduces to float_arr_sum (the proven slice-5b readout), so it strictly generalizes.
+float_dot a b =
+  let n = float_arr_len a
+  fd_go a b n 0 0.0

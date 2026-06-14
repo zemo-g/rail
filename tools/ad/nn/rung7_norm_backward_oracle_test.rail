@@ -1,0 +1,320 @@
+-- Rung 7 gate oracle: RMSNorm AND LayerNorm forward + backward, every gradient
+-- cross-checked against central finite differences. Standalone float_arr, no
+-- Tensor ADT.  eps = 1e-5.  Readout L = sum_i Up_i * y_i with a fixed Up.
+--
+--   RMSNorm:  y_i = (x_i / rms) * gamma_i,  rms = sqrt(mean(x^2) + eps)
+--     dgamma_i = Up_i * x_i / rms
+--     dx_j     = Up_j*gamma_j*r - (r^3 * x_j / N) * sum_i Up_i*gamma_i*x_i
+--                with r = 1/rms
+--
+--   LayerNorm: y_i = ((x_i - mean)/sqrt(var+eps)) * gamma_i + beta_i
+--     dbeta_i  = Up_i
+--     dgamma_i = Up_i * xhat_i,  xhat_i = (x_i-mean)*istd
+--     dx_i     = istd*(dy_i - mean(dy) - xhat_i*mean(dy*xhat)),  dy_i=Up_i*gamma_i
+--
+-- transformer.rail's norm backwards dispatch to tgl_* Metal GPU kernels over
+-- Tensor ADTs (not cleanly standalone-callable on float_arr), so these are
+-- clean self-derived standalone backwards, FD-verified here.
+-- Run: /tmp/rail_atoms --out-prefix /tmp/rung7 run tools/ad/nn/rung7_norm_backward_oracle_test.rail
+
+import "stdlib/float_arr.rail"
+
+foreign sqrt x -> float
+
+-- ---- shared reducers (float accumulators threaded via params) -------------
+sum_acc a n i acc =
+  if i >= n then acc
+  else sum_acc a n (i + 1) (acc +. (float_arr_get a i))
+
+-- sum of squares of x.
+sq_acc x n i acc =
+  if i >= n then acc
+  else
+    let v = float_arr_get x i
+    sq_acc x n (i + 1) (acc +. (v *. v))
+
+-- sum of (x_i - m)^2.
+var_acc x n m i acc =
+  if i >= n then acc
+  else
+    let d = (float_arr_get x i) -. m
+    var_acc x n m (i + 1) (acc +. (d *. d))
+
+-- ================= RMSNorm =================================================
+-- forward fill: y_i = x_i * r * gamma_i, r = 1/rms passed as param.
+rms_fill x gam n r y idx =
+  if idx >= n then y
+  else
+    let v = ((float_arr_get x idx) *. r) *. (float_arr_get gam idx)
+    let _ = float_arr_set y idx v
+    rms_fill x gam n r y (idx + 1)
+
+rms_fwd x gam n =
+  let ms = (sq_acc x n 0 0.0) /. (int_to_float n)
+  let rms = sqrt (ms +. 0.00001)
+  let r = 1.0 /. rms
+  let y = float_arr_new n 0.0
+  rms_fill x gam n r y 0
+
+-- readout L = sum_i Up_i * y_i.  y recomputed from x/gam every call (FD-safe).
+rms_loss x gam up n =
+  let y = rms_fwd x gam n
+  dot_acc y up n 0 0.0
+
+dot_acc a b n i acc =
+  if i >= n then acc
+  else dot_acc a b n (i + 1) (acc +. ((float_arr_get a i) *. (float_arr_get b i)))
+
+-- dgamma_i = Up_i * x_i * r.
+rms_dgam_fill x up n r dg idx =
+  if idx >= n then dg
+  else
+    let v = (float_arr_get up idx) *. ((float_arr_get x idx) *. r)
+    let _ = float_arr_set dg idx v
+    rms_dgam_fill x up n r dg (idx + 1)
+
+rms_dgamma x gam up n =
+  let ms = (sq_acc x n 0 0.0) /. (int_to_float n)
+  let r = 1.0 /. (sqrt (ms +. 0.00001))
+  let dg = float_arr_new n 0.0
+  rms_dgam_fill x up n r dg 0
+
+-- sum_i Up_i*gamma_i*x_i, threaded via float accumulator.
+rms_proj_acc x gam up n i acc =
+  if i >= n then acc
+  else
+    let v = ((float_arr_get up i) *. (float_arr_get gam i)) *. (float_arr_get x i)
+    rms_proj_acc x gam up n (i + 1) (acc +. v)
+
+-- dx_j = Up_j*gamma_j*r - (r^3 * x_j / N) * proj.
+rms_dx_fill x gam up n r proj dx idx =
+  if idx >= n then dx
+  else
+    let term1 = ((float_arr_get up idx) *. (float_arr_get gam idx)) *. r
+    let coef = ((r *. r) *. r) /. (int_to_float n)
+    let term2 = (coef *. (float_arr_get x idx)) *. proj
+    let _ = float_arr_set dx idx (term1 -. term2)
+    rms_dx_fill x gam up n r proj dx (idx + 1)
+
+rms_dx x gam up n =
+  let ms = (sq_acc x n 0 0.0) /. (int_to_float n)
+  let r = 1.0 /. (sqrt (ms +. 0.00001))
+  let proj = rms_proj_acc x gam up n 0 0.0
+  let dx = float_arr_new n 0.0
+  rms_dx_fill x gam up n r proj dx 0
+
+-- ================= LayerNorm ==============================================
+-- forward fill: y_i = (x_i - mean)*istd*gamma_i + beta_i. mean,istd params.
+ln_fill x gam bet n mean istd y idx =
+  if idx >= n then y
+  else
+    let xhat = ((float_arr_get x idx) -. mean) *. istd
+    let v = (xhat *. (float_arr_get gam idx)) +. (float_arr_get bet idx)
+    let _ = float_arr_set y idx v
+    ln_fill x gam bet n mean istd y (idx + 1)
+
+ln_fwd x gam bet n =
+  let mean = (sum_acc x n 0 0.0) /. (int_to_float n)
+  let var = (var_acc x n mean 0 0.0) /. (int_to_float n)
+  let istd = 1.0 /. (sqrt (var +. 0.00001))
+  let y = float_arr_new n 0.0
+  ln_fill x gam bet n mean istd y 0
+
+ln_loss x gam bet up n =
+  let y = ln_fwd x gam bet n
+  dot_acc y up n 0 0.0
+
+-- dbeta_i = Up_i.
+ln_dbeta_fill up n db idx =
+  if idx >= n then db
+  else
+    let _ = float_arr_set db idx (float_arr_get up idx)
+    ln_dbeta_fill up n db (idx + 1)
+
+ln_dbeta up n =
+  let db = float_arr_new n 0.0
+  ln_dbeta_fill up n db 0
+
+-- dgamma_i = Up_i * xhat_i.
+ln_dgam_fill x up n mean istd dg idx =
+  if idx >= n then dg
+  else
+    let xhat = ((float_arr_get x idx) -. mean) *. istd
+    let _ = float_arr_set dg idx ((float_arr_get up idx) *. xhat)
+    ln_dgam_fill x up n mean istd dg (idx + 1)
+
+ln_dgamma x gam bet up n =
+  let mean = (sum_acc x n 0 0.0) /. (int_to_float n)
+  let var = (var_acc x n mean 0 0.0) /. (int_to_float n)
+  let istd = 1.0 /. (sqrt (var +. 0.00001))
+  let dg = float_arr_new n 0.0
+  ln_dgam_fill x up n mean istd dg 0
+
+-- dy_i = Up_i*gamma_i.  We need mean(dy) and mean(dy*xhat) as scalars first.
+ln_dy_sum_acc gam up n i acc =
+  if i >= n then acc
+  else ln_dy_sum_acc gam up n (i + 1) (acc +. ((float_arr_get up i) *. (float_arr_get gam i)))
+
+ln_dyx_sum_acc x gam up n mean istd i acc =
+  if i >= n then acc
+  else
+    let xhat = ((float_arr_get x i) -. mean) *. istd
+    let dyi = (float_arr_get up i) *. (float_arr_get gam i)
+    ln_dyx_sum_acc x gam up n mean istd (i + 1) (acc +. (dyi *. xhat))
+
+-- dx_i = istd*(dy_i - meandy - xhat_i*meandyx).
+ln_dx_fill x gam up n mean istd meandy meandyx dx idx =
+  if idx >= n then dx
+  else
+    let xhat = ((float_arr_get x idx) -. mean) *. istd
+    let dyi = (float_arr_get up idx) *. (float_arr_get gam idx)
+    let inner = (dyi -. meandy) -. (xhat *. meandyx)
+    let _ = float_arr_set dx idx (istd *. inner)
+    ln_dx_fill x gam up n mean istd meandy meandyx dx (idx + 1)
+
+ln_dx x gam bet up n =
+  let mean = (sum_acc x n 0 0.0) /. (int_to_float n)
+  let var = (var_acc x n mean 0 0.0) /. (int_to_float n)
+  let istd = 1.0 /. (sqrt (var +. 0.00001))
+  let meandy = (ln_dy_sum_acc gam up n 0 0.0) /. (int_to_float n)
+  let meandyx = (ln_dyx_sum_acc x gam up n mean istd 0 0.0) /. (int_to_float n)
+  let dx = float_arr_new n 0.0
+  ln_dx_fill x gam up n mean istd meandy meandyx dx 0
+
+-- ================= FD harness =============================================
+fabs1 d = if d <. 0.0 then 0.0 -. d else d
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+
+-- RMSNorm finite diffs (perturb x, then gamma).
+fd_rms_x x gam up n idx =
+  let h = 0.0001
+  let orig = float_arr_get x idx
+  let _ = float_arr_set x idx (orig +. h)
+  let fp = rms_loss x gam up n
+  let _ = float_arr_set x idx (orig -. h)
+  let fm = rms_loss x gam up n
+  let _ = float_arr_set x idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+fd_rms_g x gam up n idx =
+  let h = 0.0001
+  let orig = float_arr_get gam idx
+  let _ = float_arr_set gam idx (orig +. h)
+  let fp = rms_loss x gam up n
+  let _ = float_arr_set gam idx (orig -. h)
+  let fm = rms_loss x gam up n
+  let _ = float_arr_set gam idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+-- LayerNorm finite diffs (perturb x, gamma, beta).
+fd_ln_x x gam bet up n idx =
+  let h = 0.0001
+  let orig = float_arr_get x idx
+  let _ = float_arr_set x idx (orig +. h)
+  let fp = ln_loss x gam bet up n
+  let _ = float_arr_set x idx (orig -. h)
+  let fm = ln_loss x gam bet up n
+  let _ = float_arr_set x idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+fd_ln_g x gam bet up n idx =
+  let h = 0.0001
+  let orig = float_arr_get gam idx
+  let _ = float_arr_set gam idx (orig +. h)
+  let fp = ln_loss x gam bet up n
+  let _ = float_arr_set gam idx (orig -. h)
+  let fm = ln_loss x gam bet up n
+  let _ = float_arr_set gam idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+fd_ln_b x gam bet up n idx =
+  let h = 0.0001
+  let orig = float_arr_get bet idx
+  let _ = float_arr_set bet idx (orig +. h)
+  let fp = ln_loss x gam bet up n
+  let _ = float_arr_set bet idx (orig -. h)
+  let fm = ln_loss x gam bet up n
+  let _ = float_arr_set bet idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+-- check loops: compare analytic g against FD fn result per element.
+chk_rx g x gam up n cnt idx acc =
+  if idx >= cnt then acc
+  else chk_rx g x gam up n cnt (idx + 1) (acc + (fnear (float_arr_get g idx) (fd_rms_x x gam up n idx)))
+
+chk_rg g x gam up n cnt idx acc =
+  if idx >= cnt then acc
+  else chk_rg g x gam up n cnt (idx + 1) (acc + (fnear (float_arr_get g idx) (fd_rms_g x gam up n idx)))
+
+chk_lx g x gam bet up n cnt idx acc =
+  if idx >= cnt then acc
+  else chk_lx g x gam bet up n cnt (idx + 1) (acc + (fnear (float_arr_get g idx) (fd_ln_x x gam bet up n idx)))
+
+chk_lg g x gam bet up n cnt idx acc =
+  if idx >= cnt then acc
+  else chk_lg g x gam bet up n cnt (idx + 1) (acc + (fnear (float_arr_get g idx) (fd_ln_g x gam bet up n idx)))
+
+chk_lb g x gam bet up n cnt idx acc =
+  if idx >= cnt then acc
+  else chk_lb g x gam bet up n cnt (idx + 1) (acc + (fnear (float_arr_get g idx) (fd_ln_b x gam bet up n idx)))
+
+-- ================= test data ==============================================
+mkX =
+  let x = float_arr_new 5 0.0
+  let _ = float_arr_set x 0 0.5
+  let _ = float_arr_set x 1 (0.0 -. 0.3)
+  let _ = float_arr_set x 2 1.1
+  let _ = float_arr_set x 3 (0.0 -. 0.7)
+  let _ = float_arr_set x 4 0.2
+  x
+
+mkGam =
+  let g = float_arr_new 5 0.0
+  let _ = float_arr_set g 0 1.0
+  let _ = float_arr_set g 1 0.8
+  let _ = float_arr_set g 2 1.2
+  let _ = float_arr_set g 3 0.9
+  let _ = float_arr_set g 4 1.1
+  g
+
+mkBet =
+  let b = float_arr_new 5 0.0
+  let _ = float_arr_set b 0 0.1
+  let _ = float_arr_set b 1 (0.0 -. 0.2)
+  let _ = float_arr_set b 2 0.05
+  let _ = float_arr_set b 3 0.3
+  let _ = float_arr_set b 4 (0.0 -. 0.1)
+  b
+
+mkUp =
+  let u = float_arr_new 5 0.0
+  let _ = float_arr_set u 0 1.0
+  let _ = float_arr_set u 1 (0.0 -. 0.5)
+  let _ = float_arr_set u 2 0.3
+  let _ = float_arr_set u 3 0.7
+  let _ = float_arr_set u 4 (0.0 -. 0.2)
+  u
+
+main =
+  let _ = print "=== Rung 7 GATE: RMSNorm + LayerNorm backward (vs finite-diff, N=5) ==="
+  let x = mkX
+  let gam = mkGam
+  let bet = mkBet
+  let up = mkUp
+  -- RMSNorm
+  let rdx = rms_dx x gam up 5
+  let rdg = rms_dgamma x gam up 5
+  let crx = chk_rx rdx x gam up 5 5 0 0
+  let crg = chk_rg rdg x gam up 5 5 0 0
+  -- LayerNorm
+  let ldx = ln_dx x gam bet up 5
+  let ldg = ln_dgamma x gam bet up 5
+  let ldb = ln_dbeta up 5
+  let clx = chk_lx ldx x gam bet up 5 5 0 0
+  let clg = chk_lg ldg x gam bet up 5 5 0 0
+  let clb = chk_lb ldb x gam bet up 5 5 0 0
+  let total = ((((crx + crg) + clx) + clg) + clb)
+  let _ = print (cat [show crx, "/5 rms dx  ", show crg, "/5 rms dgamma"])
+  let _ = print (cat [show clx, "/5 ln dx  ", show clg, "/5 ln dgamma  ", show clb, "/5 ln dbeta"])
+  let _ = print (cat [show total, "/25 norm backward checks passed"])
+  if total == 25 then 0 else 1

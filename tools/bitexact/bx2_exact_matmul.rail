@@ -1,0 +1,247 @@
+-- BX2: exact-accumulation matmul, CPU reference -- THE FRONTIER MOVE.
+--
+-- float `+` is NOT associative, so on GPU/threads the matmul reduction order changes
+-- the bits (BX1 measured 1.07e-6 from split-K alone). integer `+` IS associative. So:
+-- quantize inputs to FIXED-POINT integers, multiply to exact integer products, and sum
+-- them in a wide INTEGER superaccumulator. Now ANY reduction order -- forward, reversed,
+-- split into tiles and merged -- yields the IDENTICAL accumulator and therefore the
+-- identical float on convert-back. That single property is what turns "GPU =
+-- nondeterministic" into "GPU = bit-exact" at BX3. This file is the CPU spec that BX3's
+-- Metal kernel must reproduce bit-for-bit.
+--
+-- FIXED-POINT REGIME (documented knob): F = 24 fractional bits (scale 2^24). Inputs with
+-- |x| <= 32 are safe: a_q,b_q <= 32*2^24 = 2^29, product <= 2^58 < 2^62 (fits Rail int63).
+-- Quantize = round-half-away-from-zero (deterministic on any IEEE platform). Input
+-- quantization error ~2^-24 ~ 6e-8 per element is the ONLY approximation; the reduction
+-- itself is EXACT. (Strategy D -- float storage + exact superaccumulator over exact f32
+-- products -- is the future accuracy upgrade if F=24 ever starves training; noted, not
+-- needed yet.)
+--
+-- ACCUMULATOR: two Rail ints [hi, lo], value = hi*2^31 + lo, lo in [0, 2^31). Holds
+-- dot*2^48. Convert back: dot = hi/2^17 + lo/2^48 (one fixed IEEE-correctly-rounded
+-- sequence -> reproducible). hi stays well within int63 for any realistic dot length.
+--
+-- Build: ./rail_native --out-prefix /tmp/bx2 tools/bitexact/bx2_exact_matmul.rail
+-- Run:   /tmp/bx2
+
+import "stdlib/tensor.rail"
+
+-- ===== fixed-point exact-integer dot product =====
+-- deterministic round-half-away-from-zero quantize (float -> fixed-point int)
+quantf x =
+  let s = x *. 16777216.0
+  let r = if s <. 0.0 then s -. 0.5 else s +. 0.5
+  float_to_int r
+quant_arr_go src dst n i =
+  if i >= n then dst
+  else
+    let _ = arr_set dst i (quantf (float_arr_get src i))
+    quant_arr_go src dst n (i + 1)
+quant_arr src n = quant_arr_go src (arr_new n 0) n 0
+
+-- add a signed product p (|p| < 2^62) into accumulator [hi, lo]; robust to either
+-- integer-division convention (we correct plo into [0, 2^31) explicitly)
+acc_add acc p =
+  let lo = arr_get acc 1
+  let hi = arr_get acc 0
+  let plo0 = p - ((p / 2147483648) * 2147483648)
+  let plo = if plo0 < 0 then plo0 + 2147483648 else plo0
+  let phi = (p - plo) / 2147483648
+  let lon = lo + plo
+  let carry = if lon >= 2147483648 then 1 else 0
+  let _ = arr_set acc 1 (lon - (carry * 2147483648))
+  let _ = arr_set acc 0 (hi + phi + carry)
+  0
+
+-- merge accumulator src into dst (the multi-limb add a GPU tile-reduction performs)
+limb_add dst src =
+  let lo = (arr_get dst 1) + (arr_get src 1)
+  let carry = if lo >= 2147483648 then 1 else 0
+  let _ = arr_set dst 1 (lo - (carry * 2147483648))
+  let _ = arr_set dst 0 ((arr_get dst 0) + (arr_get src 0) + carry)
+  0
+
+acc_to_float acc =
+  (int_to_float (arr_get acc 0)) /. 131072.0 +. (int_to_float (arr_get acc 1)) /. 281474976710656.0
+
+-- three reduction orders over the SAME product set -- all must yield identical [hi, lo]
+edot Aq Bq k n i j p acc =
+  if p >= k then 0
+  else
+    let _ = acc_add acc ((arr_get Aq (i * k + p)) * (arr_get Bq (p * n + j)))
+    edot Aq Bq k n i j (p + 1) acc
+edot_rev Aq Bq k n i j p acc =
+  if p < 0 then 0
+  else
+    let _ = acc_add acc ((arr_get Aq (i * k + p)) * (arr_get Bq (p * n + j)))
+    edot_rev Aq Bq k n i j (p - 1) acc
+edot_rng Aq Bq k n i j p p1 acc =
+  if p >= p1 then 0
+  else
+    let _ = acc_add acc ((arr_get Aq (i * k + p)) * (arr_get Bq (p * n + j)))
+    edot_rng Aq Bq k n i j (p + 1) p1 acc
+
+fill_fwd Aq Bq k n i j acc = edot Aq Bq k n i j 0 acc
+fill_rev Aq Bq k n i j acc = edot_rev Aq Bq k n i j (k - 1) acc
+fill_split Aq Bq k n i j k1 acc =
+  let aL = arr_new 2 0
+  let aR = arr_new 2 0
+  let _ = edot_rng Aq Bq k n i j 0 k1 aL
+  let _ = edot_rng Aq Bq k n i j k1 k aR
+  let _ = limb_add aL aR
+  let _ = arr_set acc 0 (arr_get aL 0)
+  let _ = arr_set acc 1 (arr_get aL 1)
+  0
+
+-- mode: 0 forward, 1 reversed, 2 split-K (two tile accumulators merged)
+emm_go Aq Bq C m k n i j mode k1 =
+  if i >= m then C
+  else if j >= n then emm_go Aq Bq C m k n (i + 1) 0 mode k1
+  else
+    let acc = arr_new 2 0
+    let _ = if mode == 0 then fill_fwd Aq Bq k n i j acc
+            else if mode == 1 then fill_rev Aq Bq k n i j acc
+            else fill_split Aq Bq k n i j k1 acc
+    let _ = float_arr_set C (i * n + j) (acc_to_float acc)
+    emm_go Aq Bq C m k n i (j + 1) mode k1
+exact_mm_mode A B m k n mode k1 =
+  let Aq = quant_arr A (m * k)
+  let Bq = quant_arr B (k * n)
+  emm_go Aq Bq (float_arr_new (m * n) 0.0) m k n 0 0 mode k1
+exact_mm A B m k n = exact_mm_mode A B m k n 0 0
+
+-- ===== float CPU reference + float split-K (the contrast: order matters in float) =====
+cpu_dot_rng A B k n i j p p1 acc =
+  if p >= p1 then acc
+  else cpu_dot_rng A B k n i j (p + 1) p1 (acc +. ((float_arr_get A (i * k + p)) *. (float_arr_get B (p * n + j))))
+fmm_go A B C m k n i j k1 split =
+  if i >= m then C
+  else if j >= n then fmm_go A B C m k n (i + 1) 0 k1 split
+  else
+    let v = if split == 0 then cpu_dot_rng A B k n i j 0 k 0.0
+            else (cpu_dot_rng A B k n i j 0 k1 0.0) +. (cpu_dot_rng A B k n i j k1 k 0.0)
+    let _ = float_arr_set C (i * n + j) v
+    fmm_go A B C m k n i (j + 1) k1 split
+cpu_mm A B m k n = fmm_go A B (float_arr_new (m * n) 0.0) m k n 0 0 0 0
+cpu_mm_split A B m k n k1 = fmm_go A B (float_arr_new (m * n) 0.0) m k n 0 0 k1 1
+
+-- ===== strict bit-equality (max abs diff EXACTLY 0.0; fcmp only, never poly ==) =====
+absf v = if v <. 0.0 then (0.0 -. v) else v
+maxdiff_go X Y n i acc =
+  if i >= n then acc
+  else
+    let d = absf ((float_arr_get X i) -. (float_arr_get Y i))
+    maxdiff_go X Y n (i + 1) (if acc <. d then d else acc)
+maxdiff X Y n = maxdiff_go X Y n 0 0.0
+is_zero d = if 0.0 <. d then 0 else 1
+pf b = if b == 1 then "PASS" else "FAIL"
+
+fillpat W sz scale i =
+  if i >= sz then W
+  else
+    let _ = float_arr_set W i (scale *. (int_to_float (((i * 13 + 5) - ((((i * 13 + 5)) / 17) * 17)) - 8)))
+    fillpat W sz scale (i + 1)
+mkarr sz scale = fillpat (float_arr_new sz 0.0) sz scale 0
+
+-- per-output integer accumulator limbs (for the foreign-reproducibility check)
+emm_hilo_go Aq Bq Hi Lo m k n i j =
+  if i >= m then 0
+  else if j >= n then emm_hilo_go Aq Bq Hi Lo m k n (i + 1) 0
+  else
+    let acc = arr_new 2 0
+    let _ = edot Aq Bq k n i j 0 acc
+    let _ = arr_set Hi (i * n + j) (arr_get acc 0)
+    let _ = arr_set Lo (i * n + j) (arr_get acc 1)
+    emm_hilo_go Aq Bq Hi Lo m k n i (j + 1)
+dump_int_go arr n i acc =
+  if i >= n then acc
+  else dump_int_go arr n (i + 1) (cat [acc, show (arr_get arr i), "\n"])
+dump_int arr n = dump_int_go arr n 0 ""
+dump_arr_f_go arr n i acc =
+  if i >= n then acc
+  else dump_arr_f_go arr n (i + 1) (cat [acc, show_float (float_arr_get arr i), "\n"])
+dump_arr_f arr n = dump_arr_f_go arr n 0 ""
+
+main =
+  -- sanity: 2x2 known product [[1,2],[3,4]].[[5,6],[7,8]] = [[19,22],[43,50]]
+  let sA = float_arr_new 4 0.0
+  let _ = float_arr_set sA 0 1.0
+  let _ = float_arr_set sA 1 2.0
+  let _ = float_arr_set sA 2 3.0
+  let _ = float_arr_set sA 3 4.0
+  let sB = float_arr_new 4 0.0
+  let _ = float_arr_set sB 0 5.0
+  let _ = float_arr_set sB 1 6.0
+  let _ = float_arr_set sB 2 7.0
+  let _ = float_arr_set sB 3 8.0
+  let sK = float_arr_new 4 0.0
+  let _ = float_arr_set sK 0 19.0
+  let _ = float_arr_set sK 1 22.0
+  let _ = float_arr_set sK 2 43.0
+  let _ = float_arr_set sK 3 50.0
+  let sErr = maxdiff (exact_mm sA sB 2 2 2) sK 4
+  let okSanity = if sErr <. 0.001 then 1 else 0
+  let _ = print (cat ["sanity 2x2 known product: exact_mm err=", show_float sErr, "   ", pf okSanity])
+
+  let d = 256
+  let P = mkarr (d * d) 0.02
+  let Q = mkarr (d * d) 0.02
+  let k1 = d / 2
+
+  -- D0: exact_mm twice -> bit-identical
+  let E1 = exact_mm P Q d d d
+  let E2 = exact_mm P Q d d d
+  let d0 = is_zero (maxdiff E1 E2 (d * d))
+  let _ = print (cat ["D0 exact_mm run-twice bit-identical: ", pf d0])
+
+  -- D1a: forward vs REVERSED reduction order -> must be bit-identical
+  let Erev = exact_mm_mode P Q d d d 1 0
+  let g_rev = maxdiff E1 Erev (d * d)
+  let d1a = is_zero g_rev
+  let _ = print (cat ["D1a exact forward == reversed order, max|d|=", show_float g_rev, "   ", pf d1a])
+
+  -- D1b: single-shot vs SPLIT-K (two tile accumulators merged) -> must be bit-identical
+  let Esplit = exact_mm_mode P Q d d d 2 k1
+  let g_split = maxdiff E1 Esplit (d * d)
+  let d1b = is_zero g_split
+  let _ = print (cat ["D1b exact single-shot == split-K merge, max|d|=", show_float g_split, "   ", pf d1b])
+
+  -- THE CONTRAST: the SAME split-K in FLOAT diverges (BX1's enemy #1) ...
+  let Fc = cpu_mm P Q d d d
+  let Fs = cpu_mm_split P Q d d d k1
+  let g_float_split = maxdiff Fc Fs (d * d)
+  let _ = print (cat ["    contrast: float split-K diverges by max|d|=", show_float g_float_split,
+                      "  ->  exact split-K diverges by ", show_float g_split, "  (the whole point)"])
+
+  -- accuracy: exact (F=24 fixed-point) vs CPU f64 reference -- within quantization
+  let g_acc = maxdiff E1 Fc (d * d)
+  let okAcc = if g_acc <. 0.0001 then 1 else 0
+  let _ = print (cat ["accuracy: |exact_mm - cpu_f64| = ", show_float g_acc, "  (within F=24 fixed-point)   ", pf okAcc])
+
+  -- D3 (exact): an INDEPENDENT Python re-impl of the SAME fixed-point algorithm must
+  -- reproduce Rail's quantized ints AND per-output [hi,lo] limbs bit-for-bit. (BX1's D3
+  -- showed the FLOAT path was NOT foreign-reproducible: 5.55e-17 FMA gap. Exact-integer
+  -- is. Comparing integers sidesteps any decimal round-trip ambiguity in show_float.)
+  let dd = 32
+  let P2 = mkarr (dd * dd) 0.5
+  let Q2 = mkarr (dd * dd) 0.5
+  let Aq = quant_arr P2 (dd * dd)
+  let Bq = quant_arr Q2 (dd * dd)
+  let Hi = arr_new (dd * dd) 0
+  let Lo = arr_new (dd * dd) 0
+  let _ = emm_hilo_go Aq Bq Hi Lo dd dd dd 0 0
+  let _ = write_file "/tmp/bx2_P.txt" (dump_arr_f P2 (dd * dd))
+  let _ = write_file "/tmp/bx2_Q.txt" (dump_arr_f Q2 (dd * dd))
+  let _ = write_file "/tmp/bx2_Aq.txt" (dump_int Aq (dd * dd))
+  let _ = write_file "/tmp/bx2_Bq.txt" (dump_int Bq (dd * dd))
+  let _ = write_file "/tmp/bx2_Hi.txt" (dump_int Hi (dd * dd))
+  let _ = write_file "/tmp/bx2_Lo.txt" (dump_int Lo (dd * dd))
+  let d3 = shell "python3 tools/bitexact/bx2_foreign_check.py 32 2>&1"
+  let _ = print (cat ["D3 foreign exact re-impl (Python): ", d3])
+  let d3ok = if str_contains "FOREIGN-EXACT PASS" d3 then 1 else 0
+
+  let all = okSanity * d0 * d1a * d1b * okAcc * d3ok
+  let _ = print (if all == 1
+                 then "BX2 PASS: exact-integer matmul is order-INVARIANT (forward=reversed=split-K bit-for-bit) where float is not, matches f64 within fixed-point quantization, and is reproduced bit-for-bit by an independent Python re-impl. This is the CPU spec BX3's Metal kernel must reproduce."
+                 else "BX2 FAIL")
+  if all == 1 then 0 else 1

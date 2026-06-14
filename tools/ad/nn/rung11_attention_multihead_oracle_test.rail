@@ -1,0 +1,394 @@
+-- Rung 11 gate oracle: MULTI-HEAD split/concat attention fwd+bwd vs finite diff.
+--   d_model split into H heads of size dh = d_model/H. For head h, slice columns
+--   [h*dh,(h+1)*dh) out of each row of Q,K,V (giving [L,dh] tensors), run single-head
+--   scaled-dot-product attention on the slice, write the [L,dh] result back into the
+--   same columns of O. Backward routes each head's dQ/dK/dV slice back to its columns.
+--   Readout L = sum_{i,c} Up[i*dm+c]*O[i,c], Up fixed non-constant.
+--   FD-check dQ,dK,dV on the FULL [L,d_model] tensors. L=3, d_model=4, H=2, dh=2.
+-- Standalone; floats routed through params; results in heap float_arr. ASCII only.
+-- Run: /tmp/rail_atoms --out-prefix /tmp/rung11 run tools/ad/nn/rung11_attention_multihead_oracle_test.rail
+
+import "stdlib/float_arr.rail"
+
+foreign exp x -> float
+foreign sqrt x -> float
+
+fabs1 d = if d <. 0.0 then 0.0 -. d else d
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+
+-- ===== single-head core, operating on [L,d] slices (d = dh) =====
+qk_dot Q K d i j p acc =
+  if p >= d then acc
+  else qk_dot Q K d i j (p + 1) (acc +. ((float_arr_get Q (i * d + p)) *. (float_arr_get K (j * d + p))))
+
+sc_fill Q K L d invs S idx =
+  if idx >= L * L then S
+  else
+    let i = idx / L
+    let j = idx - (i * L)
+    let raw = qk_dot Q K d i j 0 0.0
+    let _ = float_arr_set S idx (raw *. invs)
+    sc_fill Q K L d invs S (idx + 1)
+
+scores_of Q K L d =
+  let invs = 1.0 /. (sqrt (to_float d))
+  let S = float_arr_new (L * L) 0.0
+  sc_fill Q K L d invs S 0
+
+row_max S L i j acc =
+  if j >= L then acc
+  else
+    let v = float_arr_get S (i * L + j)
+    let nacc = if v >. acc then v else acc
+    row_max S L i (j + 1) nacc
+
+row_esum S L i m j acc =
+  if j >= L then acc
+  else row_esum S L i m (j + 1) (acc +. (exp ((float_arr_get S (i * L + j)) -. m)))
+
+arow_fill S A L i m Z j =
+  if j >= L then A
+  else
+    let e = exp ((float_arr_get S (i * L + j)) -. m)
+    let _ = float_arr_set A (i * L + j) (e /. Z)
+    arow_fill S A L i m Z (j + 1)
+
+a_rows S A L i =
+  if i >= L then A
+  else
+    let m = row_max S L i 0 (0.0 -. 1.0e30)
+    let Z = row_esum S L i m 0 0.0
+    let _ = arow_fill S A L i m Z 0
+    a_rows S A L (i + 1)
+
+softmax_rows S L =
+  let A = float_arr_new (L * L) 0.0
+  a_rows S A L 0
+
+ov_dot A V L d i q j acc =
+  if j >= L then acc
+  else ov_dot A V L d i q (j + 1) (acc +. ((float_arr_get A (i * L + j)) *. (float_arr_get V (j * d + q))))
+
+ov_fill A V L d O idx =
+  if idx >= L * d then O
+  else
+    let i = idx / d
+    let q = idx - (i * d)
+    let _ = float_arr_set O idx (ov_dot A V L d i q 0 0.0)
+    ov_fill A V L d O (idx + 1)
+
+head_O Qh Kh Vh L d =
+  let S = scores_of Qh Kh L d
+  let A = softmax_rows S L
+  let O = float_arr_new (L * d) 0.0
+  ov_fill A Vh L d O 0
+
+-- single-head backward atoms (on dh-wide slices)
+dv_dot A Up L d j q i acc =
+  if i >= L then acc
+  else dv_dot A Up L d j q (i + 1) (acc +. ((float_arr_get A (i * L + j)) *. (float_arr_get Up (i * d + q))))
+
+dv_fill A Up L d dV idx =
+  if idx >= L * d then dV
+  else
+    let j = idx / d
+    let q = idx - (j * d)
+    let _ = float_arr_set dV idx (dv_dot A Up L d j q 0 0.0)
+    dv_fill A Up L d dV (idx + 1)
+
+da_dot Up V L d i j q acc =
+  if q >= d then acc
+  else da_dot Up V L d i j (q + 1) (acc +. ((float_arr_get Up (i * d + q)) *. (float_arr_get V (j * d + q))))
+
+da_fill Up V L d dA idx =
+  if idx >= L * L then dA
+  else
+    let i = idx / L
+    let j = idx - (i * L)
+    let _ = float_arr_set dA idx (da_dot Up V L d i j 0 0.0)
+    da_fill Up V L d dA (idx + 1)
+
+row_dasum dA A L i k acc =
+  if k >= L then acc
+  else row_dasum dA A L i (k + 1) (acc +. ((float_arr_get dA (i * L + k)) *. (float_arr_get A (i * L + k))))
+
+dsc_rowfill dA A L invs rs dS i j =
+  if j >= L then dS
+  else
+    let aij = float_arr_get A (i * L + j)
+    let v = aij *. ((float_arr_get dA (i * L + j)) -. rs)
+    let _ = float_arr_set dS (i * L + j) (v *. invs)
+    dsc_rowfill dA A L invs rs dS i (j + 1)
+
+dsc_rows dA A L invs dS i =
+  if i >= L then dS
+  else
+    let rs = row_dasum dA A L i 0 0.0
+    let _ = dsc_rowfill dA A L invs rs dS i 0
+    dsc_rows dA A L invs dS (i + 1)
+
+dscore_of dA A L d =
+  let invs = 1.0 /. (sqrt (to_float d))
+  let dS = float_arr_new (L * L) 0.0
+  dsc_rows dA A L invs dS 0
+
+dq_dot dS K L d i p j acc =
+  if j >= L then acc
+  else dq_dot dS K L d i p (j + 1) (acc +. ((float_arr_get dS (i * L + j)) *. (float_arr_get K (j * d + p))))
+
+dq_fill dS K L d dQ idx =
+  if idx >= L * d then dQ
+  else
+    let i = idx / d
+    let p = idx - (i * d)
+    let _ = float_arr_set dQ idx (dq_dot dS K L d i p 0 0.0)
+    dq_fill dS K L d dQ (idx + 1)
+
+dk_dot dS Q L d j p i acc =
+  if i >= L then acc
+  else dk_dot dS Q L d j p (i + 1) (acc +. ((float_arr_get dS (i * L + j)) *. (float_arr_get Q (i * d + p))))
+
+dk_fill dS Q L d dK idx =
+  if idx >= L * d then dK
+  else
+    let j = idx / d
+    let p = idx - (j * d)
+    let _ = float_arr_set dK idx (dk_dot dS Q L d j p 0 0.0)
+    dk_fill dS Q L d dK (idx + 1)
+
+-- ===== slice / scatter between [L,dm] and per-head [L,dh] =====
+-- gather columns [h*dh,(h+1)*dh) of a [L,dm] tensor into a fresh [L,dh] tensor
+slice_go X L dm dh h Xh idx =
+  if idx >= L * dh then Xh
+  else
+    let i = idx / dh
+    let c = idx - (i * dh)
+    let _ = float_arr_set Xh idx (float_arr_get X (i * dm + (h * dh + c)))
+    slice_go X L dm dh h Xh (idx + 1)
+
+slice_head X L dm dh h =
+  let Xh = float_arr_new (L * dh) 0.0
+  slice_go X L dm dh h Xh 0
+
+-- scatter a [L,dh] tensor back into columns [h*dh,(h+1)*dh) of a [L,dm] tensor
+scatter_go Xh Full L dm dh h idx =
+  if idx >= L * dh then Full
+  else
+    let i = idx / dh
+    let c = idx - (i * dh)
+    let _ = float_arr_set Full (i * dm + (h * dh + c)) (float_arr_get Xh idx)
+    scatter_go Xh Full L dm dh h (idx + 1)
+
+scatter_head Xh Full L dm dh h =
+  scatter_go Xh Full L dm dh h 0
+
+-- ===== multi-head forward: loop heads, slice -> head_O -> scatter into O =====
+mh_loop Q K V L dm dh H O h =
+  if h >= H then O
+  else
+    let Qh = slice_head Q L dm dh h
+    let Kh = slice_head K L dm dh h
+    let Vh = slice_head V L dm dh h
+    let Oh = head_O Qh Kh Vh L dh
+    let _ = scatter_head Oh O L dm dh h h
+    mh_loop Q K V L dm dh H O (h + 1)
+
+mh_O Q K V L dm dh H =
+  let O = float_arr_new (L * dm) 0.0
+  mh_loop Q K V L dm dh H O 0
+
+mh_loss Q K V Up L dm dh H =
+  let O = mh_O Q K V L dm dh H
+  loss_go O Up (L * dm) 0 0.0
+
+loss_go O Up t idx acc =
+  if idx >= t then acc
+  else loss_go O Up t (idx + 1) (acc +. ((float_arr_get O idx) *. (float_arr_get Up idx)))
+
+-- ===== multi-head backward: per head, slice grads then scatter into full =====
+-- head dV slice -> scatter into full dV
+mh_dv_loop Q K V Up L dm dh H dV h =
+  if h >= H then dV
+  else
+    let Qh = slice_head Q L dm dh h
+    let Kh = slice_head K L dm dh h
+    let Uh = slice_head Up L dm dh h
+    let S = scores_of Qh Kh L dh
+    let A = softmax_rows S L
+    let dVh = float_arr_new (L * dh) 0.0
+    let _ = dv_fill A Uh L dh dVh 0
+    let _ = scatter_head dVh dV L dm dh h h
+    mh_dv_loop Q K V Up L dm dh H dV (h + 1)
+
+mh_dV Q K V Up L dm dh H =
+  let dV = float_arr_new (L * dm) 0.0
+  mh_dv_loop Q K V Up L dm dh H dV 0
+
+-- head dQ slice -> scatter into full dQ
+mh_dq_loop Q K V Up L dm dh H dQ h =
+  if h >= H then dQ
+  else
+    let Qh = slice_head Q L dm dh h
+    let Kh = slice_head K L dm dh h
+    let Vh = slice_head V L dm dh h
+    let Uh = slice_head Up L dm dh h
+    let S = scores_of Qh Kh L dh
+    let A = softmax_rows S L
+    let dA = float_arr_new (L * L) 0.0
+    let _ = da_fill Uh Vh L dh dA 0
+    let dS = dscore_of dA A L dh
+    let dQh = float_arr_new (L * dh) 0.0
+    let _ = dq_fill dS Kh L dh dQh 0
+    let _ = scatter_head dQh dQ L dm dh h h
+    mh_dq_loop Q K V Up L dm dh H dQ (h + 1)
+
+mh_dQ Q K V Up L dm dh H =
+  let dQ = float_arr_new (L * dm) 0.0
+  mh_dq_loop Q K V Up L dm dh H dQ 0
+
+-- head dK slice -> scatter into full dK
+mh_dk_loop Q K V Up L dm dh H dK h =
+  if h >= H then dK
+  else
+    let Qh = slice_head Q L dm dh h
+    let Kh = slice_head K L dm dh h
+    let Vh = slice_head V L dm dh h
+    let Uh = slice_head Up L dm dh h
+    let S = scores_of Qh Kh L dh
+    let A = softmax_rows S L
+    let dA = float_arr_new (L * L) 0.0
+    let _ = da_fill Uh Vh L dh dA 0
+    let dS = dscore_of dA A L dh
+    let dKh = float_arr_new (L * dh) 0.0
+    let _ = dk_fill dS Qh L dh dKh 0
+    let _ = scatter_head dKh dK L dm dh h h
+    mh_dk_loop Q K V Up L dm dh H dK (h + 1)
+
+mh_dK Q K V Up L dm dh H =
+  let dK = float_arr_new (L * dm) 0.0
+  mh_dk_loop Q K V Up L dm dh H dK 0
+
+-- ===== finite difference on full [L,dm] tensors =====
+fd_Q Q K V Up L dm dh H idx =
+  let h = 0.0001
+  let orig = float_arr_get Q idx
+  let _ = float_arr_set Q idx (orig +. h)
+  let fp = mh_loss Q K V Up L dm dh H
+  let _ = float_arr_set Q idx (orig -. h)
+  let fm = mh_loss Q K V Up L dm dh H
+  let _ = float_arr_set Q idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+fd_K Q K V Up L dm dh H idx =
+  let h = 0.0001
+  let orig = float_arr_get K idx
+  let _ = float_arr_set K idx (orig +. h)
+  let fp = mh_loss Q K V Up L dm dh H
+  let _ = float_arr_set K idx (orig -. h)
+  let fm = mh_loss Q K V Up L dm dh H
+  let _ = float_arr_set K idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+fd_V Q K V Up L dm dh H idx =
+  let h = 0.0001
+  let orig = float_arr_get V idx
+  let _ = float_arr_set V idx (orig +. h)
+  let fp = mh_loss Q K V Up L dm dh H
+  let _ = float_arr_set V idx (orig -. h)
+  let fm = mh_loss Q K V Up L dm dh H
+  let _ = float_arr_set V idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+chkQ dQ Q K V Up L dm dh H n idx acc =
+  if idx >= n then acc
+  else chkQ dQ Q K V Up L dm dh H n (idx + 1) (acc + (fnear (float_arr_get dQ idx) (fd_Q Q K V Up L dm dh H idx)))
+
+chkK dK Q K V Up L dm dh H n idx acc =
+  if idx >= n then acc
+  else chkK dK Q K V Up L dm dh H n (idx + 1) (acc + (fnear (float_arr_get dK idx) (fd_K Q K V Up L dm dh H idx)))
+
+chkV dV Q K V Up L dm dh H n idx acc =
+  if idx >= n then acc
+  else chkV dV Q K V Up L dm dh H n (idx + 1) (acc + (fnear (float_arr_get dV idx) (fd_V Q K V Up L dm dh H idx)))
+
+-- L=3, d_model=4 => 12 elements per tensor
+mkQ =
+  let Q = float_arr_new 12 0.0
+  let _ = float_arr_set Q 0 0.5
+  let _ = float_arr_set Q 1 0.2
+  let _ = float_arr_set Q 2 (0.0 -. 0.3)
+  let _ = float_arr_set Q 3 0.4
+  let _ = float_arr_set Q 4 0.1
+  let _ = float_arr_set Q 5 (0.0 -. 0.25)
+  let _ = float_arr_set Q 6 0.35
+  let _ = float_arr_set Q 7 0.15
+  let _ = float_arr_set Q 8 (0.0 -. 0.2)
+  let _ = float_arr_set Q 9 0.3
+  let _ = float_arr_set Q 10 0.45
+  let _ = float_arr_set Q 11 (0.0 -. 0.1)
+  Q
+
+mkK =
+  let K = float_arr_new 12 0.0
+  let _ = float_arr_set K 0 0.1
+  let _ = float_arr_set K 1 0.6
+  let _ = float_arr_set K 2 0.3
+  let _ = float_arr_set K 3 (0.0 -. 0.2)
+  let _ = float_arr_set K 4 0.35
+  let _ = float_arr_set K 5 0.15
+  let _ = float_arr_set K 6 (0.0 -. 0.3)
+  let _ = float_arr_set K 7 0.25
+  let _ = float_arr_set K 8 0.4
+  let _ = float_arr_set K 9 (0.0 -. 0.15)
+  let _ = float_arr_set K 10 0.2
+  let _ = float_arr_set K 11 0.5
+  K
+
+mkV =
+  let V = float_arr_new 12 0.0
+  let _ = float_arr_set V 0 1.0
+  let _ = float_arr_set V 1 (0.0 -. 0.5)
+  let _ = float_arr_set V 2 0.25
+  let _ = float_arr_set V 3 0.75
+  let _ = float_arr_set V 4 (0.0 -. 0.4)
+  let _ = float_arr_set V 5 0.6
+  let _ = float_arr_set V 6 0.2
+  let _ = float_arr_set V 7 (0.0 -. 0.35)
+  let _ = float_arr_set V 8 0.55
+  let _ = float_arr_set V 9 0.3
+  let _ = float_arr_set V 10 (0.0 -. 0.45)
+  let _ = float_arr_set V 11 0.65
+  V
+
+mkUp =
+  let U = float_arr_new 12 0.0
+  let _ = float_arr_set U 0 1.0
+  let _ = float_arr_set U 1 (0.0 -. 0.5)
+  let _ = float_arr_set U 2 0.3
+  let _ = float_arr_set U 3 0.7
+  let _ = float_arr_set U 4 (0.0 -. 0.2)
+  let _ = float_arr_set U 5 0.9
+  let _ = float_arr_set U 6 0.4
+  let _ = float_arr_set U 7 (0.0 -. 0.6)
+  let _ = float_arr_set U 8 0.8
+  let _ = float_arr_set U 9 0.1
+  let _ = float_arr_set U 10 (0.0 -. 0.7)
+  let _ = float_arr_set U 11 0.55
+  U
+
+main =
+  let _ = print "=== Rung 11 GATE: MULTI-HEAD attention fwd+bwd dQ/dK/dV (finite-diff, L=3 dm=4 H=2 dh=2) ==="
+  let Q = mkQ
+  let K = mkK
+  let V = mkV
+  let Up = mkUp
+  let dV = mh_dV Q K V Up 3 4 2 2
+  let dQ = mh_dQ Q K V Up 3 4 2 2
+  let dK = mh_dK Q K V Up 3 4 2 2
+  let cQ = chkQ dQ Q K V Up 3 4 2 2 12 0 0
+  let cK = chkK dK Q K V Up 3 4 2 2 12 0 0
+  let cV = chkV dV Q K V Up 3 4 2 2 12 0 0
+  let total = cQ + cK + cV
+  let _ = print (cat [show cQ, "/12 dQ  ", show cK, "/12 dK  ", show cV, "/12 dV"])
+  let _ = print (cat [show total, "/36 multi-head attention backward checks passed"])
+  if total == 36 then 0 else 1

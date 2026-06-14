@@ -1,0 +1,127 @@
+-- Rung 12 gate oracle: Rotary Positional Encoding (RoPE) forward + backward,
+-- every gradient cross-checked against central finite differences.
+--   x shape [L, d] row-major, length L*d (d even). For row position p and
+--   dimension pair (2i, 2i+1):  angle = p * theta_i,  theta_i = base^(-(2i)/d)
+--     y[p,2i]   = x[p,2i]*cos(angle) - x[p,2i+1]*sin(angle)
+--     y[p,2i+1] = x[p,2i]*sin(angle) + x[p,2i+1]*cos(angle)
+--   This is an orthogonal rotation R(angle); backward dx = R^T dy:
+--     dx[p,2i]   =  dy[p,2i]*cos(angle) + dy[p,2i+1]*sin(angle)
+--     dx[p,2i+1] = -dy[p,2i]*sin(angle) + dy[p,2i+1]*cos(angle)
+--   Readout L = sum Up*y, Up = a fixed non-constant upstream cotangent.
+-- L=2, d=4, base=10000. Floats stay in function parameters (callee-saved trap).
+-- Run: /tmp/rail_atoms --out-prefix /tmp/rung12 run tools/ad/nn/rung12_rope_oracle_test.rail
+
+import "stdlib/float_arr.rail"
+
+foreign sin x -> float
+foreign cos x -> float
+foreign pow x y -> float
+
+-- theta_i = base^(-(2i)/d). pow handles the negative exponent directly.
+rope_theta base d twoi =
+  pow base ((0.0 -. (int_to_float twoi)) /. (int_to_float d))
+
+-- forward: fill Y[L,d] from X[L,d]. idx walks rows*pairs; each step writes both
+-- elements of one (2i, 2i+1) pair so the rotation is applied atomically.
+rope_fill X base L d Y idx =
+  if idx >= (L * (d / 2)) then Y
+  else
+    let p = idx / (d / 2)
+    let i = idx - (p * (d / 2))
+    let twoi = 2 * i
+    let th = rope_theta base d twoi
+    let angle = (int_to_float p) *. th
+    let c = cos angle
+    let s = sin angle
+    let x0 = float_arr_get X (p * d + twoi)
+    let x1 = float_arr_get X (p * d + twoi + 1)
+    let _ = float_arr_set Y (p * d + twoi) ((x0 *. c) -. (x1 *. s))
+    let _ = float_arr_set Y (p * d + twoi + 1) ((x0 *. s) +. (x1 *. c))
+    rope_fill X base L d Y (idx + 1)
+
+rope X base L d =
+  let Y = float_arr_new (L * d) 0.0
+  rope_fill X base L d Y 0
+
+-- scalar readout L = sum Up*Y
+ropel_go Y Up t idx acc =
+  if idx >= t then acc
+  else ropel_go Y Up t (idx + 1) (acc +. ((float_arr_get Y idx) *. (float_arr_get Up idx)))
+
+rope_loss X Up base L d =
+  let Y = rope X base L d
+  ropel_go Y Up (L * d) 0 0.0
+
+-- backward dx = R^T dy (here dy = Up). Same pair structure as forward.
+ropedx_fill Up base L d dX idx =
+  if idx >= (L * (d / 2)) then dX
+  else
+    let p = idx / (d / 2)
+    let i = idx - (p * (d / 2))
+    let twoi = 2 * i
+    let th = rope_theta base d twoi
+    let angle = (int_to_float p) *. th
+    let c = cos angle
+    let s = sin angle
+    let g0 = float_arr_get Up (p * d + twoi)
+    let g1 = float_arr_get Up (p * d + twoi + 1)
+    let _ = float_arr_set dX (p * d + twoi) ((g0 *. c) +. (g1 *. s))
+    let _ = float_arr_set dX (p * d + twoi + 1) ((0.0 -. (g0 *. s)) +. (g1 *. c))
+    ropedx_fill Up base L d dX (idx + 1)
+
+rope_dX Up base L d =
+  let dX = float_arr_new (L * d) 0.0
+  ropedx_fill Up base L d dX 0
+
+fabs1 d = if d <. 0.0 then 0.0 -. d else d
+fnear a b = if (fabs1 (a -. b)) <. (0.005 +. (0.01 *. (fabs1 b))) then 1 else 0
+
+fd_X X Up base L d idx =
+  let h = 0.0001
+  let orig = float_arr_get X idx
+  let _ = float_arr_set X idx (orig +. h)
+  let fp = rope_loss X Up base L d
+  let _ = float_arr_set X idx (orig -. h)
+  let fm = rope_loss X Up base L d
+  let _ = float_arr_set X idx orig
+  (fp -. fm) /. (2.0 *. h)
+
+chkX dX X Up base L d cnt idx acc =
+  if idx >= cnt then acc
+  else
+    let gi = float_arr_get dX idx
+    let fi = fd_X X Up base L d idx
+    chkX dX X Up base L d cnt (idx + 1) (acc + (fnear gi fi))
+
+mkX =
+  let X = float_arr_new 8 0.0
+  let _ = float_arr_set X 0 0.5
+  let _ = float_arr_set X 1 (0.0 -. 0.2)
+  let _ = float_arr_set X 2 0.3
+  let _ = float_arr_set X 3 0.7
+  let _ = float_arr_set X 4 (0.0 -. 0.4)
+  let _ = float_arr_set X 5 0.1
+  let _ = float_arr_set X 6 0.6
+  let _ = float_arr_set X 7 (0.0 -. 0.35)
+  X
+
+mkUp =
+  let U = float_arr_new 8 0.0
+  let _ = float_arr_set U 0 1.0
+  let _ = float_arr_set U 1 (0.0 -. 0.5)
+  let _ = float_arr_set U 2 0.3
+  let _ = float_arr_set U 3 0.7
+  let _ = float_arr_set U 4 (0.0 -. 0.2)
+  let _ = float_arr_set U 5 0.9
+  let _ = float_arr_set U 6 (0.0 -. 0.6)
+  let _ = float_arr_set U 7 0.4
+  U
+
+main =
+  let _ = print "=== Rung 12 GATE: RoPE fwd + dx backward (vs finite-diff, L=2 d=4) ==="
+  let X = mkX
+  let Up = mkUp
+  let dX = rope_dX Up 10000.0 2 4
+  let cX = chkX dX X Up 10000.0 2 4 8 0 0
+  let _ = print (cat [show cX, "/8 dx checks passed"])
+  if cX == 8 then 0 else 1

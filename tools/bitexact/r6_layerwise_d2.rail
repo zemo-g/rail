@@ -1,0 +1,197 @@
+-- R6 (1B ladder): LAYER-WISE D2 -- CPU exact-integer matmul == GPU exact-integer matmul,
+-- BIT-FOR-BIT, at the REAL Gemma 4 E2B projection contraction depths:
+--   K=2048 (d_model QKV/O projections, MLP up/gate)   K=8192 (MLP down-projection)
+-- in the OVERFLOW regime where the per-cell sum EXCEEDS single-limb int63 (2^62), so the
+-- two-limb superaccumulator is REQUIRED on BOTH sides. This is what R6 adds over GX6 (whose
+-- dk=48/64 kept the sum under the ceiling -- the two-limb path was present but never stressed).
+--
+-- WHY two limbs on the CPU too: at K=8192 with |operand|~2^29 a monotone cell sum reaches
+-- ~2^71, PAST int63. GX6's gx6_cpu_matmul used a NATIVE int63 accumulator -- it would WRAP
+-- here. R6's CPU reference is the GX1 two-limb superaccumulator (r6_ copies; gx1 has a main,
+-- cannot import), which holds it exactly -- matching the GPU exact kernel LIMB-FOR-LIMB.
+--
+-- The methodology P2 (full E2B forward) rests on: prove EACH projection matmul CPU==GPU exact;
+-- integer determinism COMPOSES, so a bit-exact stack needs no whole-model CPU reference.
+--
+-- Two regimes per depth:
+--   (1) OVERFLOW  -- big signed operands. Gate: GPU limbs (hi,lo) == CPU two-limb (hi,lo) for
+--       EVERY cell (limb-for-limb, no reconstruction -- the exact integer sum overflows int63
+--       and cannot be formed in a Rail int). Non-vacuity: >=1 cell's |hi|>2^31 (sum > int63,
+--       single-limb WRAPS) AND >=1 cell negative (signed reduction -- the GX5a negative-S path),
+--       plus a monotone-positive cell (0,0) where a single-limb native sum lands on a WRONG
+--       value (the R4 wrap tell, valid here because S>=0 dodges the signed-rescale trap).
+--   (2) REALISTIC -- small signed operands (|S|<2^62, the magnitude a real post-norm forward
+--       actually produces). Reconstruct exact S = hi*2^31+lo (fits int63), apply BX10's deferred
+--       truncate-divide (the GX5a CORRECT bridge), and gate the rescaled LAYER OUTPUT value
+--       CPU==GPU bit-for-bit -- extending GX5a/GX6's rescaled D2 from toy K to E2B depth.
+-- D0 (GPU run-twice identical) on the overflow regime. Limb marshalling is lossless: hi<2^52.
+--
+-- Build: ./rail_native --out-prefix /tmp/r6 tools/bitexact/r6_layerwise_d2.rail
+-- Run:   /tmp/r6
+
+import "stdlib/tensor.rail"
+
+-- ===== GX1 two-limb superaccumulator (verbatim, r6_ prefix) =====
+r6_norm h l =
+  if l >= 2147483648 then (h + 1, l - 2147483648)
+  else if l < 0 then (h - 1, l + 2147483648)
+  else (h, l)
+r6_add h l a =
+  let ahi = a / 2147483648 in
+  let alo = a - ahi * 2147483648 in
+  r6_norm (h + ahi) (l + alo)
+
+-- ===== deterministic int32 operands (|q| < 2^30, fits int32) =====
+r6_imod a b = a - (a / b) * b
+-- positive magnitude ~[200,900]*scale from a hash of the flat index.
+r6_mag t scale = ((r6_imod (t * 1103515245 + 12345) 701) + 200) * scale
+-- SIGN is STRUCTURAL: A by ROW parity, B by COLUMN parity. Then a cell (i,j)'s reduction is
+-- MONOTONE with sign rowSign(i)*colSign(j) -- guaranteeing both positive-overflow cells AND
+-- negative-overflow cells (signed reductions, the GX5a negative-S path), no cancellation that
+-- could keep |S| under the ceiling. Cell (0,0) is row-even*col-even = positive (the wrap tell).
+r6_genA A size K scale i =
+  if i >= size then A
+  else
+    let s = if (r6_imod (i / K) 2) == 0 then 1 else (0 - 1) in
+    let _ = arr_set A i (s * (r6_mag i scale)) in
+    r6_genA A size K scale (i + 1)
+r6_genB B size N scale i =
+  if i >= size then B
+  else
+    let s = if (r6_imod (r6_imod i N) 2) == 0 then 1 else (0 - 1) in
+    let _ = arr_set B i (s * (r6_mag i scale)) in
+    r6_genB B size N scale (i + 1)
+
+-- ===== CPU exact two-limb dot for cell (base->row, j->col): MUTUAL recursion =====
+-- carries (h,l) over K products A[base+p]*B[p*N+j]; products fit int63, the SUM overflows.
+r6_dot_a A B base j K N p h l =
+  if p >= K then (h, l)
+  else
+    let r = r6_add h l ((arr_get A (base + p)) * (arr_get B (p * N + j))) in
+    let (h2, l2) = r in
+    r6_dot_b A B base j K N (p + 1) h2 l2
+r6_dot_b A B base j K N p h l =
+  if p >= K then (h, l)
+  else
+    let r = r6_add h l ((arr_get A (base + p)) * (arr_get B (p * N + j))) in
+    let (h2, l2) = r in
+    r6_dot_a A B base j K N (p + 1) h2 l2
+
+-- single-limb native reference (int63 -- WRAPS past 2^62): MUTUAL recursion.
+r6_s1_a A B base j K N p acc =
+  if p >= K then acc
+  else r6_s1_b A B base j K N (p + 1) (acc + (arr_get A (base + p)) * (arr_get B (p * N + j)))
+r6_s1_b A B base j K N p acc =
+  if p >= K then acc
+  else r6_s1_a A B base j K N (p + 1) (acc + (arr_get A (base + p)) * (arr_get B (p * N + j)))
+
+-- ===== GPU exact matmul (marshal int->float, call kernel, leave limbs in Hi/Lo) =====
+r6_i2f src dst n i =
+  if i >= n then dst
+  else let _ = float_arr_set dst i (int_to_float (arr_get src i)) in r6_i2f src dst n (i + 1)
+r6_int_to_fa A n = r6_i2f A (float_arr_new n 0.0) n 0
+r6_gpu A B M K N Hi Lo =
+  let Af = r6_int_to_fa A (M * K) in
+  let Bf = r6_int_to_fa B (K * N) in
+  let _ = tgl_exact_matmul Af Bf Hi Lo M K N in
+  0
+
+-- ===== scans (single loop counter c; counters live in an int accumulator array) =====
+-- claim 1: limb-for-limb D2 + overflow/negative census. acc=[badLimb, nOver, nNeg].
+r6_scan1 A B Hi Lo M K N acc c =
+  if c >= M * N then 0
+  else
+    let i = c / N in
+    let j = c - i * N in
+    let r = r6_dot_a A B (i * K) j K N 0 0 0 in
+    let (hC, lC) = r in
+    let hG = float_to_int (float_arr_get Hi c) in
+    let lG = float_to_int (float_arr_get Lo c) in
+    let _ = arr_set acc 0 ((arr_get acc 0) + (if hC == hG then (if lC == lG then 0 else 1) else 1)) in
+    let _ = arr_set acc 1 ((arr_get acc 1) + (if hC > 2147483648 then 1 else (if hC < (0 - 2147483648) then 1 else 0))) in
+    let _ = arr_set acc 2 ((arr_get acc 2) + (if hC < 0 then 1 else 0)) in
+    r6_scan1 A B Hi Lo M K N acc (c + 1)
+-- claim 2: realistic regime -- reconstruct exact S (fits int63), rescaled value D2. acc=[badResc, nNeg].
+r6_scan2 A B Hi Lo M K N acc c =
+  if c >= M * N then 0
+  else
+    let i = c / N in
+    let j = c - i * N in
+    let r = r6_dot_a A B (i * K) j K N 0 0 0 in
+    let (hC, lC) = r in
+    let sCpu = hC * 2147483648 + lC in
+    let cCpu = sCpu / 16777216 in
+    let hG = float_to_int (float_arr_get Hi c) in
+    let lG = float_to_int (float_arr_get Lo c) in
+    let sGpu = hG * 2147483648 + lG in
+    let cGpu = sGpu / 16777216 in
+    let _ = arr_set acc 0 ((arr_get acc 0) + (if cCpu == cGpu then 0 else 1)) in
+    let _ = arr_set acc 1 ((arr_get acc 1) + (if sCpu < 0 then 1 else 0)) in
+    r6_scan2 A B Hi Lo M K N acc (c + 1)
+
+-- D0: GPU Hi/Lo limb arrays identical across two runs.
+r6_feq A B n i bad =
+  if i >= n then bad
+  else r6_feq A B n (i + 1) (if (float_to_int (float_arr_get A i)) == (float_to_int (float_arr_get B i)) then bad else bad + 1)
+
+-- ===== one depth: overflow regime (claim 1) + realistic regime (claim 2) =====
+r6_run_depth K =
+  let M = 4 in
+  let N = 4 in
+  -- ---- overflow regime: big operands, structural signs (cell (0,0) monotone-positive) ----
+  let Ao = r6_genA (arr_new (M * K) 0) (M * K) K 1048576 0 in
+  let Bo = r6_genB (arr_new (K * N) 0) (K * N) N 1048576 0 in
+  let HiO = float_arr_new (M * N) 0.0 in
+  let LoO = float_arr_new (M * N) 0.0 in
+  let _ = r6_gpu Ao Bo M K N HiO LoO in
+  let acc1 = arr_new 3 0 in
+  let _ = r6_scan1 Ao Bo HiO LoO M K N acc1 0 in
+  let badLimb = arr_get acc1 0 in
+  let nOver = arr_get acc1 1 in
+  let nNeg1 = arr_get acc1 2 in
+  -- wrap tell on monotone cell (0,0): single-limb native sum vs true (exact since S>=0)
+  let r00 = r6_dot_a Ao Bo 0 0 K N 0 0 0 in
+  let (h00, l00) = r00 in
+  let capover00 = if h00 > 2147483648 then 1 else 0 in
+  let true_resc = h00 * 128 + l00 / 16777216 in
+  let s1 = r6_s1_a Ao Bo 0 0 K N 0 0 in
+  let wrapped = if (s1 / 16777216) == true_resc then 0 else 1 in
+  -- D0 (overflow regime)
+  let HiO2 = float_arr_new (M * N) 0.0 in
+  let LoO2 = float_arr_new (M * N) 0.0 in
+  let _ = r6_gpu Ao Bo M K N HiO2 LoO2 in
+  let badD0 = (r6_feq HiO HiO2 (M * N) 0 0) + (r6_feq LoO LoO2 (M * N) 0 0) in
+  -- ---- realistic regime: small operands, reconstruct + rescaled D2 (incl. negative-S) ----
+  let Ar = r6_genA (arr_new (M * K) 0) (M * K) K 64 0 in
+  let Br = r6_genB (arr_new (K * N) 0) (K * N) N 64 0 in
+  let HiR = float_arr_new (M * N) 0.0 in
+  let LoR = float_arr_new (M * N) 0.0 in
+  let _ = r6_gpu Ar Br M K N HiR LoR in
+  let acc2 = arr_new 2 0 in
+  let _ = r6_scan2 Ar Br HiR LoR M K N acc2 0 in
+  let badResc = arr_get acc2 0 in
+  let nNeg2 = arr_get acc2 1 in
+  -- gates (0/1 flags, multiplied = AND; no short-circuit needed)
+  let g1 = if badLimb == 0 then 1 else 0 in
+  let g2 = if badResc == 0 then 1 else 0 in
+  let g3 = if badD0 == 0 then 1 else 0 in
+  let g4 = if nOver > 0 then 1 else 0 in
+  let g5 = if nNeg1 > 0 then 1 else 0 in
+  let g6 = if nNeg2 > 0 then 1 else 0 in
+  let ok = g1 * g2 * g3 * g4 * g5 * g6 * wrapped * capover00 in
+  let _ = print (cat ["R6 K=", show K, " (", show M, "x", show N, "): limb-D2-mism=", show badLimb,
+                      " rescaled-D2-mism=", show badResc, " GPU-D0-mism=", show badD0,
+                      " | over-int63=", show nOver, "/", show (M * N), " signed=", show nNeg1,
+                      " wrap(0,0)=", show wrapped, " cap>2^62=", show capover00,
+                      " realistic-signed=", show nNeg2, "   ", (if ok == 1 then "PASS" else "FAIL")]) in
+  ok
+
+main =
+  let _ = ensure_dylib 0 in
+  let okProj = r6_run_depth 2048 in
+  let okMlp = r6_run_depth 8192 in
+  let allok = if okProj == 1 then okMlp else 0 in
+  let _ = print (if allok == 1
+    then "R6 PASS: at the real E2B projection depths (2048, 8192) the GPU exact_matmul and the CPU two-limb superaccumulator agree LIMB-FOR-LIMB on every output cell -- including cells whose exact sum exceeds int63 (a single-limb accumulator WRAPS to a wrong value) and signed cells (the negative-S reduction). With realistic magnitudes the reconstructed + rescaled LAYER OUTPUT matches CPU==GPU bit-for-bit. Layer-wise D2 holds at E2B depth: each projection matmul is device-agnostic to the bit, so the full forward composes exactly -- no whole-model CPU reference needed. P2 can proceed."
+    else "R6 FAIL: inspect the per-depth line -- limb-D2 (overflow regime), rescaled-D2 (realistic), GPU-D0, or a non-vacuity counter (over-int63 / signed / wrap) is off") in
+  if allok == 1 then 0 else 1

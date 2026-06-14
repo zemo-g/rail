@@ -1,0 +1,243 @@
+-- BX3: Exact-accumulation matmul as a METAL GPU kernel -- the rung that drives
+-- BX1's D2 red test (CPU-f64 vs GPU-f32 = 1.5627e-6, a STRICT FAIL) to EXACTLY 0.0.
+--
+-- The enemy (BX1): the f32 Metal `matmul` kernel tiles the reduction across a
+-- threadgroup (TILE=16 shared memory), so its accumulation GROUPING differs from
+-- the CPU's left-to-right order. Float addition is not associative -> the bits
+-- diverge (~1.6e-6), and they change again with any tile/threadgroup reconfig.
+--
+-- The fix (this rung): a NEW Metal kernel `exact_matmul` (tools/metal/tensor_gpu.metal)
+-- runs ONE THREAD PER OUTPUT, each doing its own sequential 2-limb INTEGER
+-- accumulation -- no cross-thread reduction, no atomics. Integer addition IS
+-- associative, so the per-output [hi, lo] limbs are a pure function of the exact
+-- integer sum S = sum_p Aq[i,p]*Bq[p,j], independent of schedule/device. The kernel's
+-- per-step arithmetic (plo0/plo/phi/lon/carry, LIMB=2^31) is a line-for-line mirror
+-- of bx2's CPU `acc_add`. So GPU [hi,lo] == CPU [hi,lo] BIT-FOR-BIT.
+--
+-- THE GATE: on the SAME d=256 scale-0.02 inputs that gave BX1 D2 = 1.5627e-6, the
+-- exact path must give max|CPU_exact - GPU_exact| = 0.0 AND every (hi,lo) limb equal.
+--
+-- Build: ./rail_native --out-prefix /tmp/bx3 tools/bitexact/bx3_exact_matmul_gpu.rail
+-- Run:   /tmp/bx3   (ensure_dylib builds tools/metal/libtensor_gpu.dylib on first use.)
+
+import "stdlib/tensor.rail"
+
+gmm A B m k n = gpu_matmul_dispatch A B m k n
+
+-- ---- fixed-point quantize (must match bx2 quantf exactly) ----
+quantf x =
+  let s = x *. 16777216.0
+  let r = if s <. 0.0 then s -. 0.5 else s +. 0.5
+  float_to_int r
+
+-- int-array quantize (CPU reference operands) ----
+quant_arr_go src dst n i =
+  if i >= n then dst
+  else
+    let _ = arr_set dst i (quantf (float_arr_get src i))
+    quant_arr_go src dst n (i + 1)
+quant_arr src n = quant_arr_go src (arr_new n 0) n 0
+
+-- float-array quantize (exact-integer doubles; the GPU input buffers) ----
+quant_arr_f_go src dst n i =
+  if i >= n then dst
+  else
+    let _ = float_arr_set dst i (int_to_float (quantf (float_arr_get src i)))
+    quant_arr_f_go src dst n (i + 1)
+quant_arr_f src n = quant_arr_f_go src (float_arr_new n 0.0) n 0
+
+-- ---- CPU exact reference: 2-limb integer accumulator (mirrors bx2) ----
+acc_add acc p =
+  let lo = arr_get acc 1
+  let hi = arr_get acc 0
+  let plo0 = p - ((p / 2147483648) * 2147483648)
+  let plo = if plo0 < 0 then plo0 + 2147483648 else plo0
+  let phi = (p - plo) / 2147483648
+  let lon = lo + plo
+  let carry = if lon >= 2147483648 then 1 else 0
+  let _ = arr_set acc 1 (lon - (carry * 2147483648))
+  let _ = arr_set acc 0 (hi + phi + carry)
+  0
+edot Aq Bq k n i j p acc =
+  if p >= k then 0
+  else
+    let _ = acc_add acc ((arr_get Aq (i * k + p)) * (arr_get Bq (p * n + j)))
+    edot Aq Bq k n i j (p + 1) acc
+-- reversed reduction order (proves the GPU matches regardless of CPU order)
+edot_rev Aq Bq k n i j p acc =
+  if p < 0 then 0
+  else
+    let _ = acc_add acc ((arr_get Aq (i * k + p)) * (arr_get Bq (p * n + j)))
+    edot_rev Aq Bq k n i j (p - 1) acc
+
+-- CPU [hi,lo] per output, forward order
+cpu_hilo_go Aq Bq Hi Lo m k n i j =
+  if i >= m then 0
+  else if j >= n then cpu_hilo_go Aq Bq Hi Lo m k n (i + 1) 0
+  else
+    let acc = arr_new 2 0
+    let _ = edot Aq Bq k n i j 0 acc
+    let _ = arr_set Hi (i * n + j) (arr_get acc 0)
+    let _ = arr_set Lo (i * n + j) (arr_get acc 1)
+    cpu_hilo_go Aq Bq Hi Lo m k n i (j + 1)
+-- CPU [hi,lo] per output, REVERSED order
+cpu_hilo_rev_go Aq Bq Hi Lo m k n i j =
+  if i >= m then 0
+  else if j >= n then cpu_hilo_rev_go Aq Bq Hi Lo m k n (i + 1) 0
+  else
+    let acc = arr_new 2 0
+    let _ = edot_rev Aq Bq k n i j (k - 1) acc
+    let _ = arr_set Hi (i * n + j) (arr_get acc 0)
+    let _ = arr_set Lo (i * n + j) (arr_get acc 1)
+    cpu_hilo_rev_go Aq Bq Hi Lo m k n i (j + 1)
+
+-- ---- convert a 2-limb accumulator to the float result (hi/2^17 + lo/2^48) ----
+acc_to_float_f hd ld = hd /. 131072.0 +. ld /. 281474976710656.0
+recon_go Hi Lo E n i =
+  if i >= n then E
+  else
+    let _ = float_arr_set E i (acc_to_float_f (float_arr_get Hi i) (float_arr_get Lo i))
+    recon_go Hi Lo E n (i + 1)
+recon Hi Lo n = recon_go Hi Lo (float_arr_new n 0.0) n 0
+-- CPU float reconstruction from CPU int limbs
+recon_cpu_go Hi Lo E n i =
+  if i >= n then E
+  else
+    let _ = float_arr_set E i (acc_to_float_f (int_to_float (arr_get Hi i)) (int_to_float (arr_get Lo i)))
+    recon_cpu_go Hi Lo E n (i + 1)
+recon_cpu Hi Lo n = recon_cpu_go Hi Lo (float_arr_new n 0.0) n 0
+
+-- ---- CPU float reference (left-to-right f64) -- the BX1 D2 baseline ----
+cpu_dot A B k n i j p acc =
+  if p >= k then acc
+  else cpu_dot A B k n i j (p + 1) (acc +. ((float_arr_get A (i * k + p)) *. (float_arr_get B (p * n + j))))
+cpu_mm_go A B C m k n i j =
+  if i >= m then C
+  else if j >= n then cpu_mm_go A B C m k n (i + 1) 0
+  else
+    let _ = float_arr_set C (i * n + j) (cpu_dot A B k n i j 0 0.0)
+    cpu_mm_go A B C m k n i (j + 1)
+cpu_mm A B m k n = cpu_mm_go A B (float_arr_new (m * n) 0.0) m k n 0 0
+
+-- ---- strict bit-equality (max abs diff EXACTLY 0.0; fcmp only) ----
+absf v = if v <. 0.0 then (0.0 -. v) else v
+maxdiff_go X Y n i acc =
+  if i >= n then acc
+  else
+    let d = absf ((float_arr_get X i) -. (float_arr_get Y i))
+    maxdiff_go X Y n (i + 1) (if acc <. d then d else acc)
+maxdiff X Y n = maxdiff_go X Y n 0 0.0
+is_zero d = if 0.0 <. d then 0 else 1
+pf b = if b == 1 then "PASS" else "FAIL"
+
+-- ---- integer-limb bit-equality: CPU int arrays vs GPU exact-int-double arrays ----
+limb_bad Hic Loc Hif Lof n i bad =
+  if i >= n then bad
+  else
+    let hg = float_to_int (float_arr_get Hif i)
+    let lg = float_to_int (float_arr_get Lof i)
+    let b2 = if hg == (arr_get Hic i)
+             then (if lg == (arr_get Loc i) then bad else bad + 1)
+             else bad + 1
+    limb_bad Hic Loc Hif Lof n (i + 1) b2
+
+-- ---- deterministic input fill (same pattern as BX1/BX2 -> comparable D2 gap) ----
+fillpat W sz scale i =
+  if i >= sz then W
+  else
+    let _ = float_arr_set W i (scale *. (int_to_float (((i * 13 + 5) - ((((i * 13 + 5)) / 17) * 17)) - 8)))
+    fillpat W sz scale (i + 1)
+mkarr sz scale = fillpat (float_arr_new sz 0.0) sz scale 0
+
+main =
+  let _ = ensure_dylib 0
+
+  -- sanity: 2x2 known product [[1,2],[3,4]].[[5,6],[7,8]] = [[19,22],[43,50]]
+  let sA = float_arr_new 4 0.0
+  let _ = float_arr_set sA 0 1.0
+  let _ = float_arr_set sA 1 2.0
+  let _ = float_arr_set sA 2 3.0
+  let _ = float_arr_set sA 3 4.0
+  let sB = float_arr_new 4 0.0
+  let _ = float_arr_set sB 0 5.0
+  let _ = float_arr_set sB 1 6.0
+  let _ = float_arr_set sB 2 7.0
+  let _ = float_arr_set sB 3 8.0
+  let sAq = quant_arr_f sA 4
+  let sBq = quant_arr_f sB 4
+  let sHi = float_arr_new 4 0.0
+  let sLo = float_arr_new 4 0.0
+  let _ = tgl_exact_matmul sAq sBq sHi sLo 2 2 2
+  let sE = recon sHi sLo 4
+  let sK = float_arr_new 4 0.0
+  let _ = float_arr_set sK 0 19.0
+  let _ = float_arr_set sK 1 22.0
+  let _ = float_arr_set sK 2 43.0
+  let _ = float_arr_set sK 3 50.0
+  let sErr = maxdiff sE sK 4
+  let okSanity = if sErr <. 0.001 then 1 else 0
+  let _ = print (cat ["sanity 2x2 GPU exact_matmul err=", show_float sErr, "   ", pf okSanity])
+
+  let d = 256
+  let P = mkarr (d * d) 0.02
+  let Q = mkarr (d * d) 0.02
+  let nn = d * d
+
+  -- GPU exact: pack quantized float operands, dispatch, read back [hi,lo]
+  let Aqf = quant_arr_f P nn
+  let Bqf = quant_arr_f Q nn
+  let Hg1 = float_arr_new nn 0.0
+  let Lg1 = float_arr_new nn 0.0
+  let _ = tgl_exact_matmul Aqf Bqf Hg1 Lg1 d d d
+  let Eg = recon Hg1 Lg1 nn
+
+  -- D0: GPU exact_matmul run-twice -> bit-identical [hi,lo]
+  let Hg2 = float_arr_new nn 0.0
+  let Lg2 = float_arr_new nn 0.0
+  let _ = tgl_exact_matmul Aqf Bqf Hg2 Lg2 d d d
+  let d0 = is_zero (maxdiff Hg1 Hg2 nn)
+  let d0b = is_zero (maxdiff Lg1 Lg2 nn)
+  let d0all = if d0 == 1 then d0b else 0
+  let _ = print (cat ["D0 GPU exact run-twice bit-identical [hi,lo]: ", pf d0all])
+
+  -- CPU exact reference (forward order) -> [hi,lo] + reconstructed float
+  let Aq = quant_arr P nn
+  let Bq = quant_arr Q nn
+  let Hic = arr_new nn 0
+  let Loc = arr_new nn 0
+  let _ = cpu_hilo_go Aq Bq Hic Loc d d d 0 0
+  let Ec = recon_cpu Hic Loc nn
+
+  -- D2 (THE GATE): GPU exact [hi,lo] == CPU exact [hi,lo] BIT-FOR-BIT
+  let nbad = limb_bad Hic Loc Hg1 Lg1 nn 0 0
+  let d2int = if nbad == 0 then 1 else 0
+  let g_exact = maxdiff Ec Eg nn
+  let d2flt = is_zero g_exact
+  let d2 = if d2int == 1 then d2flt else 0
+  let _ = print (cat ["D2 GPU exact == CPU exact: limb_mismatches=", show nbad,
+                      "  max|float|=", show_float g_exact, "   ", pf d2, "   <- THE GATE (BX1 D2 -> 0)"])
+
+  -- HEADLINE: the SAME inputs on the FLOAT path still diverge (the red test) ...
+  let Ff64 = cpu_mm P Q d d d
+  let Fgpu = gmm P Q d d d
+  let g_red = maxdiff Ff64 Fgpu nn
+  let _ = print (cat ["    float path  CPU-f64 vs GPU-f32 : max|d|=", show_float g_red, "  (BX1's red test, still FAILs)"])
+  let _ = print (cat ["    EXACT path  CPU    vs GPU      : max|d|=", show_float g_exact, "  (driven to 0.0 -- the win)"])
+
+  -- BONUS: GPU exact (one schedule) == CPU exact in REVERSED order (order independence end-to-end)
+  let Hir = arr_new nn 0
+  let Lor = arr_new nn 0
+  let _ = cpu_hilo_rev_go Aq Bq Hir Lor d d d 0 0
+  let nbadr = limb_bad Hir Lor Hg1 Lg1 nn 0 0
+  let dRev = if nbadr == 0 then 1 else 0
+  let _ = print (cat ["bonus: GPU exact == CPU exact REVERSED order, limb_mismatches=", show nbadr, "   ", pf dRev])
+
+  -- VERDICT: rung 3 lands when the GPU exact path is run-twice deterministic,
+  -- matches the CPU exact limbs bit-for-bit (gate), and the float red test still
+  -- reproduces a nonzero gap on the SAME inputs (proving we didn't trivially pass).
+  let redok = if 0.0 <. g_red then 1 else 0
+  let stood = d0all * d2 * dRev * redok
+  let _ = print (if stood == 1
+                 then cat ["BX3 LANDED: GPU exact-integer matmul is bit-for-bit identical to the CPU reference (limbs AND float), schedule-independent, and drives BX1's D2 gap from ", show_float g_red, " to EXACTLY 0.0."]
+                 else "BX3 NOT LANDED (check D0/D2/red lines above)")
+  if stood == 1 then 0 else 1
