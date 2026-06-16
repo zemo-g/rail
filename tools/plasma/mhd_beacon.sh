@@ -39,8 +39,12 @@ trap "kill ${DAEMON_PID} 2>/dev/null" EXIT
 
 cd "${RAIL_DIR}"
 
+# --out-prefix lands the compiled beacon at a DEDICATED path, not the shared
+# /tmp/rail_out. Without it, `run` squats /tmp/rail_out as its running binary,
+# so every concurrent `rail_native <file>` compile on this host either
+# clobbers the beacon or gets ETXTBSY against it (the live binary is busy).
 while true; do
-    "${RAIL_BIN}" run "${BEACON_RAIL}"
+    "${RAIL_BIN}" --out-prefix /tmp/ledatic_mhd_out run "${BEACON_RAIL}"
     rc=$?
     echo "mhd_beacon: rail exited (rc=${rc}); restarting in 2s" >&2
     sleep 2
