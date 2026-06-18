@@ -266,14 +266,28 @@ asm_enc_add ops =
   let dst = asm_reg_num (head ops)
   let n = asm_reg_num (head (tail ops))
   let op2 = head (tail (tail ops))
+  let rest = tail (tail (tail ops))
   let c0 = head (chars op2)
-  if c0 == "#" then enc_add_imm dst n (asm_imm op2)
-  else if c0 == "x" || c0 == "w" then enc_add dst n (asm_reg_num op2)
-  else enc_add_imm dst n 0
+  let word =
+    if c0 == "#" then
+      let imm = asm_imm op2
+      -- NOTE: Rail && does NOT short-circuit, so `head rest` must be gated by a
+      -- NESTED if (rest != []), never `(rest != []) && (... head rest ...)`.
+      if rest != [] then
+        (if (asm_imm (asm_after_lsl (head rest))) == 12 then enc_add_imm_sh dst n imm 1
+         else enc_add_imm dst n imm)
+      else if (imm > 4095) && ((bit_and imm 4095) == 0) then enc_add_imm_sh dst n (shr imm 12) 1
+      else enc_add_imm dst n imm
+    else if c0 == "x" || c0 == "w" then
+      (if rest != [] then enc_add_sh dst n (asm_reg_num op2) (asm_imm (asm_after_lsl (head rest)))
+       else enc_add dst n (asm_reg_num op2))
+    else enc_add_imm dst n 0
+  if (asm_is_w (head ops)) == 1 then w32 word else word
 
 -- subs xD, xN, #imm   (flag-setting decrement — compile.rail's loop bottom-test)
 asm_enc_subs ops =
-  enc_subs_imm (asm_reg_num (head ops)) (asm_reg_num (head (tail ops))) (asm_imm (head (tail (tail ops))))
+  let word = enc_subs_imm (asm_reg_num (head ops)) (asm_reg_num (head (tail ops))) (asm_imm (head (tail (tail ops))))
+  if (asm_is_w (head ops)) == 1 then w32 word else word
 
 -- tbnz/tbz xR, #bit, LABEL
 asm_enc_tb ops cur_off labels enc_fn =
@@ -288,6 +302,19 @@ asm_enc_adr ops cur_off labels =
   if target < 0 then enc_adr (asm_reg_num (head ops)) 0
   else enc_adr (asm_reg_num (head ops)) (target - cur_off)
 
+-- mov xD, #imm  -> single-instruction movz/movn: small +ve = movz; small -ve
+-- (~imm fits 16b) = movn; a value occupying one 16-bit lane = movz with hw shift.
+-- (compile.rail only emits `mov #imm` for single-instruction-encodable values;
+--  multi-lane constants come as explicit movz+movk.)
+asm_mov_imm dst imm =
+  if imm < 0 then
+    (let inv = (0 - imm) - 1
+     if inv < 65536 then enc_movn dst inv 0 else enc_mov_imm16 dst imm)
+  else if imm < 65536 then enc_mov_imm16 dst imm
+  else if (bit_and (shr imm 16) 65535) == (shr imm 16) then enc_movz_hw dst (shr imm 16) 1
+  else if (bit_and (shr imm 32) 65535) == (shr imm 32) then enc_movz_hw dst (shr imm 32) 2
+  else enc_movz_hw dst (shr imm 48) 3
+
 -- mov xD, #imm     → movz   xD, #imm
 -- mov xD, xS       → orr    xD, xzr, xS  (enc_mov_reg)
 asm_enc_mov ops =
@@ -297,7 +324,7 @@ asm_enc_mov ops =
   if src_cs == [] then 0 - 1
   else if (head src_cs) == "#" then
     (if (asm_is_w dst_s) == 1 then enc_movzw_imm16 (asm_reg_num dst_s) (asm_imm src_s)
-     else enc_mov_imm16 (asm_reg_num dst_s) (asm_imm src_s))
+     else asm_mov_imm (asm_reg_num dst_s) (asm_imm src_s))
   else if src_s == "sp" then enc_add_imm (asm_reg_num dst_s) 31 0   -- mov xD, sp = add xD, sp, #0
   else if dst_s == "sp" then enc_add_imm 31 (asm_reg_num src_s) 0   -- mov sp, xN = add sp, xN, #0
   else enc_mov_reg (asm_reg_num dst_s) (asm_reg_num src_s)
@@ -312,7 +339,7 @@ asm_enc_movz ops =
     let shift_op = head (tail (tail ops))   -- e.g. "lsl #16"
     -- Extract "#N" past the "lsl "
     let shift_n = asm_imm (asm_after_lsl shift_op) / 16
-    enc_movk dst imm shift_n   -- approximation — movz with shift; treat as movk-like
+    enc_movz_hw dst imm shift_n   -- movz with hw shift (NOT movk — movz zeroes other lanes)
 
 -- movn xD, #imm[, lsl #N]  (move-NOT-wide; enc_movn from jit/arm64.rail)
 asm_enc_movn ops =
@@ -349,14 +376,23 @@ asm_enc_3reg ops enc_fn =
          (asm_reg_num (head (tail (tail ops))))
 
 -- cmp xA, xB   or   cmp xA, #imm
+-- 32-bit (W) variant of any data-processing word = clear the sf bit (bit 31).
+w32 word = bit_and word 2147483647
+
 asm_enc_cmp ops =
   let a = asm_reg_num (head ops)
   let b_s = head (tail ops)
   let b_cs = chars b_s
   if b_cs == [] then 0 - 1
   else if (head b_cs) == "#" then
-    (if (asm_is_w (head ops)) == 1 then enc_cmpw_imm a (asm_imm b_s) else enc_cmp_imm a (asm_imm b_s))
-  else enc_cmp a (asm_reg_num b_s)
+    (let imm = asm_imm b_s
+     let rest = tail (tail ops)
+     if (asm_is_w (head ops)) == 1 then enc_cmpw_imm a imm
+     else if rest != [] then
+       (if (asm_imm (asm_after_lsl (head rest))) == 12 then enc_cmp_imm_sh a imm 1 else enc_cmp_imm a imm)
+     else if (imm > 4095) && ((bit_and imm 4095) == 0) then enc_cmp_imm_sh a (shr imm 12) 1
+     else enc_cmp_imm a imm)
+  else (if (asm_is_w (head ops)) == 1 then w32 (enc_cmp a (asm_reg_num b_s)) else enc_cmp a (asm_reg_num b_s))
 
 -- bl / b / b.cond LABEL. An UNRESOLVED (external) symbol -> emit 0 offset
 -- (matches `as`; the linker fills it via a BRANCH26 reloc). Local labels resolve.
@@ -382,16 +418,16 @@ asm_enc_4reg ops enc_fn =
 asm_enc_tst ops =
   let a = asm_reg_num (head ops)
   let b_s = head (tail ops)
-  if (head (chars b_s)) == "#" then enc_tst_imm a (asm_imm b_s)
-  else enc_tst a (asm_reg_num b_s)
+  let word = if (head (chars b_s)) == "#" then enc_tst_imm a (asm_imm b_s) else enc_tst a (asm_reg_num b_s)
+  if (asm_is_w (head ops)) == 1 then w32 word else word
 
--- and/orr/eor/lsl/lsr/asr xD, xN, (xM -> reg_fn | #imm -> imm_fn)
+-- and/orr/eor/lsl/lsr/asr xD, xN, (xM -> reg_fn | #imm -> imm_fn). W-dest clears sf.
 asm_enc_ri ops reg_fn imm_fn =
   let dst = asm_reg_num (head ops)
   let n = asm_reg_num (head (tail ops))
   let op2 = head (tail (tail ops))
-  if (head (chars op2)) == "#" then imm_fn dst n (asm_imm op2)
-  else reg_fn dst n (asm_reg_num op2)
+  let word = if (head (chars op2)) == "#" then imm_fn dst n (asm_imm op2) else reg_fn dst n (asm_reg_num op2)
+  if (asm_is_w (head ops)) == 1 then w32 word else word
 
 -- width detector: 1 if operand names a w-register (32-bit), else 0.
 asm_is_w s =
@@ -464,8 +500,13 @@ asm_enc_mem ops is_ldr =
     let immf = asm_imm_from_brk (if rest == [] then "0" else head rest)
     (if is_ldr == 1 then enc_ldr_d (asm_dreg_num dst_s) base immf else enc_str_d (asm_dreg_num dst_s) base immf)
   else if asm_last_is base_s "]" then
-    let immp = if rest == [] then 0 else asm_imm (head rest)
-    (if is_ldr == 1 then enc_ldr_x_postidx (asm_reg_num dst_s) base immp else enc_str_x_postidx (asm_reg_num dst_s) base immp)
+    if rest == [] then
+      -- `[xN]` with NO displacement = zero-offset SCALED load, NOT post-index.
+      (if (asm_is_w dst_s) == 1 then (if is_ldr == 1 then enc_ldrw_imm (asm_reg_num dst_s) base 0 else enc_strw_imm (asm_reg_num dst_s) base 0)
+       else (if is_ldr == 1 then enc_ldr_imm (asm_reg_num dst_s) base 0 else enc_str_imm (asm_reg_num dst_s) base 0))
+    else
+      let immp = asm_imm (head rest)
+      (if is_ldr == 1 then enc_ldr_x_postidx (asm_reg_num dst_s) base immp else enc_str_x_postidx (asm_reg_num dst_s) base immp)
   else
     let off_s = if rest == [] then "0" else head rest
     let oc0 = head (chars off_s)
@@ -481,6 +522,9 @@ asm_enc_mem ops is_ldr =
       let immo = asm_imm_from_brk off_s
       if (asm_is_w dst_s) == 1 then
         (if is_ldr == 1 then enc_ldrw_imm (asm_reg_num dst_s) base immo else enc_strw_imm (asm_reg_num dst_s) base immo)
+      else if (immo < 0) || ((bit_and immo 7) != 0) then
+        -- negative or non-8-multiple offset: unscaled LDUR/STUR (imm9)
+        (if is_ldr == 1 then enc_ldur (asm_reg_num dst_s) base immo else enc_stur (asm_reg_num dst_s) base immo)
       else
         (if is_ldr == 1 then enc_ldr_imm (asm_reg_num dst_s) base immo else enc_str_imm (asm_reg_num dst_s) base immo)
 
@@ -527,8 +571,10 @@ asm_enc_pair ops is_ldp =
   let rest = tail (tail (tail ops))
   let base = asm_reg_after_bracket base_s
   if asm_last_is base_s "]" then
-    let imm = asm_imm (head rest)
-    enc_pair_base (if is_ldp == 1 then 2831155200 else 2826960896) d1 d2 base imm   -- post
+    if rest == [] then
+      enc_pair_base (if is_ldp == 1 then 2839543808 else 2835349504) d1 d2 base 0    -- [base] no-offset = offset form, imm 0
+    else
+      enc_pair_base (if is_ldp == 1 then 2831155200 else 2826960896) d1 d2 base (asm_imm (head rest))   -- post
   else
     let off_s = if rest == [] then "0" else head rest
     let imm = asm_imm_from_brk off_s
