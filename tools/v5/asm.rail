@@ -35,22 +35,27 @@ import "stdlib/macho.rail"
 -- ============================================================================
 
 -- Trim leading whitespace.
-asm_ltrim s = asm_ltrim_loop (chars s)
-asm_ltrim_loop cs =
-  if cs == [] then ""
-  else if (head cs) == " " || (head cs) == "\t" then asm_ltrim_loop (tail cs)
-  else join "" (asm_chars_to_strs cs)
+-- O(len): count leading whitespace, str_sub once (was join "" <chars> = O(len^2),
+-- the dominant linker-churn source on the long embedded-runtime .asciz lines).
+asm_ltrim s =
+  let cs = chars s
+  let k = asm_count_lead_ws cs 0
+  if k == 0 then s else str_sub s k ((length cs) - k)
+asm_count_lead_ws cs n =
+  if cs == [] then n
+  else if (head cs) == " " || (head cs) == "\t" then asm_count_lead_ws (tail cs) (n + 1)
+  else n
 
 asm_chars_to_strs cs =
   if cs == [] then []
   else cons (char_from_int (char_to_int (head cs))) (asm_chars_to_strs (tail cs))
 
 -- Drop trailing comment (anything from ';' onwards) — common in compile.rail output.
-asm_strip_comment s = asm_strip_loop (chars s) []
-asm_strip_loop cs acc =
-  if cs == [] then join "" (reverse acc)
-  else if (head cs) == ";" then join "" (reverse acc)
-  else asm_strip_loop (tail cs) (cons (char_from_int (char_to_int (head cs))) acc)
+-- O(len): find ';' and str_sub. Returns s unchanged when there is no comment
+-- (the common case) instead of rebuilding the whole string via join.
+asm_strip_comment s =
+  let i = str_find ";" s
+  if i < 0 then s else str_sub s 0 i
 
 -- True if s ends with `:` (= a label definition line).
 asm_is_label s =
@@ -61,16 +66,10 @@ asm_is_label s =
 
 -- Drop the trailing ':' from a label line.
 asm_label_name s =
-  let cs = chars s
-  asm_label_body cs []
-
-asm_label_body cs acc =
-  if cs == [] then join "" (reverse acc)
-  else if (tail cs) == [] then
-    -- last char; if ':' drop, else keep
-    if (head cs) == ":" then join "" (reverse acc)
-    else join "" (reverse (cons (char_from_int (char_to_int (head cs))) acc))
-  else asm_label_body (tail cs) (cons (char_from_int (char_to_int (head cs))) acc)
+  let n = length (chars s)
+  if n == 0 then s
+  else if (str_sub s (n - 1) 1) == ":" then str_sub s 0 (n - 1)
+  else s
 
 -- True if `s` begins with `.` (assembler directive — skip).
 asm_is_directive s =
@@ -83,14 +82,13 @@ asm_is_directive s =
 -- space.  Operand_string = everything after, leading whitespace trimmed.
 asm_split_mn_ops s =
   let cs = chars s
-  asm_split_loop cs []
-
-asm_split_loop cs acc =
-  if cs == [] then [join "" (reverse acc), ""]
-  else if (head cs) == " " || (head cs) == "\t" then
-    [join "" (reverse acc), asm_ltrim (join "" (asm_chars_to_strs (tail cs)))]
-  else
-    asm_split_loop (tail cs) (cons (char_from_int (char_to_int (head cs))) acc)
+  let i = asm_first_ws cs 0
+  if i < 0 then [s, ""]
+  else [str_sub s 0 i, asm_ltrim (str_sub s (i + 1) ((length cs) - i - 1))]
+asm_first_ws cs n =
+  if cs == [] then 0 - 1
+  else if (head cs) == " " || (head cs) == "\t" then n
+  else asm_first_ws (tail cs) (n + 1)
 
 -- ============================================================================
 -- Operand parsing
@@ -138,16 +136,21 @@ asm_hex_int cs acc =
     else acc
 
 -- Split operand string on commas, returning a list of trimmed pieces.
-asm_split_commas s = asm_split_c (chars s) [] []
-
-asm_split_c cs cur acc =
+-- O(len): split on commas by INDEX + str_sub (was join "" <rebuilt chars> per
+-- operand = O(len^2) + a fresh char alloc per char, on the per-instruction hot
+-- path). Matches the old emit rules exactly: an operand is emitted at each comma
+-- (even if empty, e.g. ",x0" -> ["","x0"]); a trailing run after the last comma
+-- is emitted only if non-empty (so "x0," -> ["x0"], "" -> []).
+asm_split_commas s =
+  let cs = chars s
+  if cs == [] then [] else asm_split_idx s cs 0 0 []
+asm_split_idx s cs i start acc =
   if cs == [] then
-    if cur == [] then reverse acc
-    else reverse (cons (asm_ltrim (join "" (reverse cur))) acc)
+    (if i > start then reverse (cons (asm_ltrim (str_sub s start (i - start))) acc)
+     else reverse acc)
   else if (head cs) == "," then
-    asm_split_c (tail cs) [] (cons (asm_ltrim (join "" (reverse cur))) acc)
-  else
-    asm_split_c (tail cs) (cons (char_from_int (char_to_int (head cs))) cur) acc
+    asm_split_idx s (tail cs) (i + 1) (i + 1) (cons (asm_ltrim (str_sub s start (i - start))) acc)
+  else asm_split_idx s (tail cs) (i + 1) start acc
 
 -- ============================================================================
 -- Pass 1 — split source into lines, count instructions, build label map.
@@ -958,6 +961,17 @@ asm_relocs src =
   asm_collect_relocs lines 0 1 (asm_build_labels lines) []
 
 asm_bytes_len src = asm_textlen (asm_lines src) 0 1
+
+-- lines/labels-taking variants: a caller (the linker) that already split the
+-- source into `lines` and built the label map once threads both through every
+-- pass instead of re-splitting src + rebuilding the 16384-bucket map per call
+-- (the map was built 4x and relocs computed 2x — each a full O(N) line-walk).
+asm_assemble_l lines labels capacity =
+  let buf = arr_new capacity 0
+  let _ = asm_pass2 lines buf 0 1 labels
+  buf
+asm_relocs_l lines labels = asm_collect_relocs lines 0 1 labels []
+asm_bytes_len_l lines = asm_textlen lines 0 1
 
 -- __text image size (section + inline-data + alignment aware; mirrors asm_pass1).
 asm_textlen lines off in_text =
