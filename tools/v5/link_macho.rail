@@ -270,6 +270,106 @@ lk_bake_pass lines buf off in_text datasyms textlabels lay nbad =
     else if kind == "align" then lk_bake_pass (tail lines) buf (off + (asm_seg_size off kind line)) 1 datasyms textlabels lay nbad
     else lk_bake_pass (tail lines) buf (off + 4) 1 datasyms textlabels lay (nbad + (lk_maybe_bake buf off line datasyms textlabels lay))
 
+-- ===========================================================================
+-- M3 — data image emission. Emit the __data bytes (resolving .quad/.long symbol
+-- pointers to absolute VM addresses + recording a rebase for each), the
+-- __mod_init_func ctor pointer, and the __bss (vmsize only, no file bytes).
+-- ===========================================================================
+lk_put_u8 buf off v = let _ = arr_set buf off (bit_and v 255) in off + 1
+lk_put_u32 buf off v =
+  let _ = arr_set buf off (bit_and v 255)
+  let _ = arr_set buf (off + 1) (bit_and (shr v 8) 255)
+  let _ = arr_set buf (off + 2) (bit_and (shr v 16) 255)
+  let _ = arr_set buf (off + 3) (bit_and (shr v 24) 255)
+  off + 4
+lk_put_u64 buf off v =
+  let o = lk_put_u32 buf off v
+  lk_put_u32 buf o (shr v 32)
+lk_read_u32 buf off =
+  bit_or (arr_get buf off) (bit_or (shl (arr_get buf (off + 1)) 8) (bit_or (shl (arr_get buf (off + 2)) 16) (shl (arr_get buf (off + 3)) 24)))
+lk_read_u64 buf off = bit_or (lk_read_u32 buf off) (shl (lk_read_u32 buf (off + 4)) 32)
+
+lk_is_symchar c = if (lk_is_ident c) == 1 then 1 else if c == "." then 1 else 0
+-- leading symbol identifier (incl '.') of an operand like "_sym + N" / ".Lfn_x_start"
+lk_lead_sym t = lk_lead_go (chars t) []
+lk_lead_go cs acc =
+  if cs == [] then join "" (reverse acc)
+  else if (lk_is_symchar (head cs)) == 1 then lk_lead_go (tail cs) (cons (head cs) acc)
+  else join "" (reverse acc)
+
+-- value of a .quad/.long operand + rebase flag (1 if it is an image pointer).
+-- numeric -> [value,0]; symbol [+ addend] -> [resolve(sym)+addend, 1].
+lk_operand_val operand datasyms textlabels lay =
+  let t = asm_ltrim operand
+  let cs = chars t
+  if cs == [] then [0, 0]
+  else if (lk_is_symchar (head cs)) == 1 then
+    (if (head cs) == "_" || (head cs) == "." then lk_operand_sym t datasyms textlabels lay
+     else [asm_imm t, 0])
+  else [asm_imm t, 0]
+lk_operand_sym t datasyms textlabels lay =
+  let sym = lk_lead_sym t
+  let plus = str_find "+" t
+  let addend = if plus < 0 then 0 else asm_imm (asm_ltrim (str_sub t (plus + 1) ((length (chars t)) - plus - 1)))
+  let base = lk_resolve sym datasyms textlabels lay
+  [base + addend, 1]
+
+-- emit the __data image; record rebase data-offsets (cons list, ascending built reversed).
+-- returns [data_buf_already_filled? -> we return the rebase-offset list].
+-- lk_demit_dir emits one data directive's bytes and returns [new_off, new_rebs]
+-- (NO recursion inside a paren-let — that mis-parses; the recursion lives in
+-- lk_demit, and each directive is a function-body helper whose body is a list).
+lk_demit lines sec off databuf datasyms textlabels lay rebs =
+  if lines == [] then reverse rebs
+  else
+    let line = head lines
+    let sw = lk_sec_of line
+    if sw >= 0 then lk_demit (tail lines) sw off databuf datasyms textlabels lay rebs
+    else if sec != 1 then lk_demit (tail lines) sec off databuf datasyms textlabels lay rebs
+    else
+      let cs = asm_skip_ws (chars line)
+      if cs == [] then lk_demit (tail lines) sec off databuf datasyms textlabels lay rebs
+      else if (asm_chars_end_colon cs) == 1 then lk_demit (tail lines) sec off databuf datasyms textlabels lay rebs
+      else
+        let r = lk_demit_dir line off databuf datasyms textlabels lay rebs
+        lk_demit (tail lines) sec (head r) databuf datasyms textlabels lay (head (tail r))
+
+lk_demit_dir line off databuf datasyms textlabels lay rebs =
+  let cs = asm_skip_ws (chars line)
+  if (asm_cprefix cs ".quad") == 1 then lk_dq line off databuf datasyms textlabels lay rebs
+  else if (asm_cprefix cs ".long") == 1 then lk_dl line off databuf datasyms textlabels lay rebs
+  else if (asm_cprefix cs ".byte") == 1 then lk_db line off databuf rebs
+  else if (asm_cprefix cs ".asciz") == 1 then lk_daz line off databuf rebs 1
+  else if (asm_cprefix cs ".ascii") == 1 then lk_daz line off databuf rebs 0
+  else if (asm_cprefix cs ".short") == 1 then lk_ds line off databuf datasyms textlabels lay rebs
+  else if (asm_cprefix cs ".p2align") == 1 then [asm_align_up off (asm_p2align_n line), rebs]
+  else [off, rebs]
+
+lk_dq line off databuf datasyms textlabels lay rebs =
+  let pv = lk_operand_val (asm_after_lsl (asm_ltrim line)) datasyms textlabels lay
+  let _ = lk_put_u64 databuf off (head pv)
+  let rebs2 = if (head (tail pv)) == 1 then cons off rebs else rebs
+  [off + 8, rebs2]
+lk_dl line off databuf datasyms textlabels lay rebs =
+  let _ = lk_put_u32 databuf off (head (lk_operand_val (asm_after_lsl (asm_ltrim line)) datasyms textlabels lay))
+  [off + 4, rebs]
+lk_ds line off databuf datasyms textlabels lay rebs =
+  let _ = lk_put_u32 databuf off (bit_and (head (lk_operand_val (asm_after_lsl (asm_ltrim line)) datasyms textlabels lay)) 65535)
+  [off + 2, rebs]
+lk_db line off databuf rebs =
+  let _ = lk_put_bytes databuf off (lk_byte_vals (asm_after_lsl (asm_ltrim line)))
+  [off + (lk_byte_count line), rebs]
+lk_daz line off databuf rebs addnull =
+  let _ = lk_put_str databuf off (asm_decode_str (asm_str_arg line) []) addnull
+  [off + (asm_asciz_len line) + addnull, rebs]
+
+lk_byte_vals operand = lk_bytevals_go (asm_split_commas operand)
+lk_bytevals_go xs = if xs == [] then [] else cons (asm_imm (asm_ltrim (head xs))) (lk_bytevals_go (tail xs))
+lk_put_bytes buf off vals = if vals == [] then off else lk_put_bytes buf (lk_put_u8 buf off (head vals)) (tail vals)
+lk_put_str buf off bytes addnull =
+  let o = lk_put_bytes buf off bytes
+  if addnull == 1 then lk_put_u8 buf o 0 else o
+
 main =
   let src = read_file "/tmp/link_src.s"
   let lines = asm_lines src
@@ -302,4 +402,19 @@ main =
   let nbad = lk_bake_pass lines buf 0 1 syms textlabels lay 0
   let _ = print "--- M2: @PAGE baking ---"
   let _ = print (cat ["  baked all @PAGE/@PAGEOFF; adrp self-verify mismatches = ", show nbad, "  (expect 0)"])
+  -- M3: emit the __data image + collect rebases
+  let databuf = arr_new (dataoff + 16) 0
+  let rebs = lk_demit lines 0 0 databuf syms textlabels lay []
+  let nreb = length rebs
+  let _ = print "--- M3: data image ---"
+  let foff = lk_lookup_sym "_fmt_int" syms
+  let _ = print (cat ["  _fmt_int bytes @0x", lk_hex foff, ": ", show (arr_get databuf foff), " ", show (arr_get databuf (foff+1)), " ", show (arr_get databuf (foff+2)), " ", show (arr_get databuf (foff+3)), " ", show (arr_get databuf (foff+4)), "  (expect 37 108 100 10 0)"])
+  let yboff = lk_lookup_sym "_rail_young_base" syms
+  let ybval = lk_read_u64 databuf yboff
+  let _ = print (cat ["  _rail_young_base slot -> 0x", lk_hex ybval, "  (expect resolve(_rail_young_a) = 0x", lk_hex (lk_resolve "_rail_young_a" syms textlabels lay), ")"])
+  let yeoff = lk_lookup_sym "_rail_young_end" syms
+  let _ = print (cat ["  _rail_young_end slot -> 0x", lk_hex (lk_read_u64 databuf yeoff), "  (expect young_a + 0x4000000)"])
+  let _ = print (cat ["  rebase records (data .quad pointers) = ", show nreb, "  (expect ~1270: GC table 634*2 + 5 young ptrs)"])
+  let modctor = lk_resolve "_rail_arena_init" syms textlabels lay
+  let _ = print (cat ["  __mod_init_func ctor _rail_arena_init -> 0x", lk_hex modctor, "  (+1 rebase, in __DATA_CONST)"])
   0
