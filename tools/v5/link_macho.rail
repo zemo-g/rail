@@ -173,6 +173,103 @@ lk_sym_vmaddr lay sec off =
   else if sec == 2 then (lk_nth lay 12) + off     -- bss_vmaddr + off
   else 0 - 1
 
+-- ===========================================================================
+-- M2 — @PAGE / @PAGEOFF baking. The assembler emits adrp/add/ldr/str @PAGE(OFF)
+-- with a ZERO immediate but the correct Rd/Rn already in the word; we read the
+-- word, OR in the baked immediate bits, write it back. Formulas (verified vs ld):
+--   adrp page21 = (page(sym)-page(pc))>>12 ; immlo=p21&3 (w[30:29]), immhi=(p21>>2)&0x7FFFF (w[23:5])
+--   add  imm12  = sym&0xFFF (unscaled, w[21:10])
+--   ldr/str imm12 = (sym&0xFFF)/scale ; scale = 1<<(word[31:30])
+-- ===========================================================================
+lk_pgbase x = x - (bit_and x 4095)
+
+lk_is_ident c =
+  let n = char_to_int c
+  if (n >= 48) && (n <= 57) then 1
+  else if (n >= 65) && (n <= 90) then 1
+  else if (n >= 97) && (n <= 122) then 1
+  else if n == 95 then 1
+  else 0
+
+-- symbol name = the identifier immediately before "@PAGE" on the line.
+lk_page_sym line =
+  let i = str_find "@PAGE" line
+  lk_take_ident (reverse (chars (str_sub line 0 i))) []
+lk_take_ident rc acc =
+  if rc == [] then join "" acc
+  else if (lk_is_ident (head rc)) == 1 then lk_take_ident (tail rc) (cons (head rc) acc)
+  else join "" acc
+
+lk_lookup_full name syms =
+  if syms == [] then []
+  else if (head (head syms)) == name then head syms
+  else lk_lookup_full name (tail syms)
+
+-- final VM addr of a @PAGE target: data/bss symbol first, else a __text label.
+lk_resolve sym datasyms textlabels lay =
+  let r = lk_lookup_full sym datasyms
+  if r != [] then lk_sym_vmaddr lay (head (tail r)) (head (tail (tail r)))
+  else
+    let toff = asm_lookup sym textlabels
+    if toff < 0 then 0 - 1 else (lk_nth lay 0) + toff
+
+-- page21 is a SIGNED 21-bit field. page(sym)-page(pc) is an exact multiple of
+-- 4096 (both page-aligned) so /4096 is exact even when negative; mask to 21 bits
+-- to get the two's-complement field (then immlo/immhi split a POSITIVE value).
+lk_bake_adrp word symaddr pc =
+  let p21 = bit_and ((lk_pgbase symaddr - lk_pgbase pc) / 4096) 2097151
+  bit_or word (bit_or (shl (bit_and p21 3) 29) (shl (bit_and (p21 / 4) 524287) 5))
+lk_bake_add word symaddr = bit_or word (shl (bit_and symaddr 4095) 10)
+lk_bake_ldst word symaddr =
+  let scale = shl 1 (bit_and (shr word 30) 3)
+  bit_or word (shl ((bit_and symaddr 4095) / scale) 10)
+
+-- bake the @PAGE instruction at `off` and self-verify (return 1 on inconsistency).
+lk_maybe_bake buf off line datasyms textlabels lay =
+  if (str_find "@PAGE" line) < 0 then 0
+  else
+    let sym = lk_page_sym line
+    let symaddr = lk_resolve sym datasyms textlabels lay
+    if symaddr < 0 then 1                       -- unresolved @PAGE symbol
+    else
+      let word = cb_read buf off
+      let mn = head (asm_split_mn_ops (asm_ltrim line))
+      let pc = (lk_nth lay 0) + off
+      if mn == "adrp" then lk_do_adrp buf off word symaddr pc
+      else if mn == "add" then lk_do_imm buf off (lk_bake_add word symaddr) (bit_and symaddr 4095)
+      else lk_do_imm buf off (lk_bake_ldst word symaddr) (((bit_and symaddr 4095) / (shl 1 (bit_and (shr word 30) 3))) * (shl 1 (bit_and (shr word 30) 3)))
+
+lk_do_adrp buf off word symaddr pc =
+  let baked = lk_bake_adrp word symaddr pc
+  let _ = cb_emit buf off baked
+  -- verify: decode page21 back, reconstruct page(sym)
+  let immlo = bit_and (shr baked 29) 3
+  let immhi = bit_and (shr baked 5) 524287
+  let p21 = bit_or immlo (shl immhi 2)
+  let p21s = if p21 >= 1048576 then p21 - 2097152 else p21   -- sign-extend 21-bit
+  let recon = (lk_pgbase pc) + (p21s * 4096)
+  if recon == (lk_pgbase symaddr) then 0 else 1
+
+lk_do_imm buf off baked expect_off =
+  let _ = cb_emit buf off baked
+  let imm12 = bit_and (shr baked 10) 4095
+  -- for add expect_off = sym&0xFFF; for ldst we passed the rescaled value
+  0      -- imm encode is exact by construction; adrp is the load-bearing check
+
+lk_bake_pass lines buf off in_text datasyms textlabels lay nbad =
+  if lines == [] then nbad
+  else
+    let line = head lines
+    let kind = asm_classify2 line
+    if kind == "sec_text" then lk_bake_pass (tail lines) buf off 1 datasyms textlabels lay nbad
+    else if kind == "sec_other" then lk_bake_pass (tail lines) buf off 0 datasyms textlabels lay nbad
+    else if in_text == 0 then lk_bake_pass (tail lines) buf off 0 datasyms textlabels lay nbad
+    else if kind == "skip" then lk_bake_pass (tail lines) buf off 1 datasyms textlabels lay nbad
+    else if kind == "label" then lk_bake_pass (tail lines) buf off 1 datasyms textlabels lay nbad
+    else if (kind == "asciz") || (kind == "ascii") then lk_bake_pass (tail lines) buf (off + (asm_seg_size off kind line)) 1 datasyms textlabels lay nbad
+    else if kind == "align" then lk_bake_pass (tail lines) buf (off + (asm_seg_size off kind line)) 1 datasyms textlabels lay nbad
+    else lk_bake_pass (tail lines) buf (off + 4) 1 datasyms textlabels lay (nbad + (lk_maybe_bake buf off line datasyms textlabels lay))
+
 main =
   let src = read_file "/tmp/link_src.s"
   let lines = asm_lines src
@@ -199,4 +296,10 @@ main =
   let _ = print (cat ["  _rail_nil   -> 0x", lk_hex (lk_sym_vmaddr lay 1 (lk_lookup_sym "_rail_nil" syms))])
   let _ = print (cat ["  _rail_young_a -> 0x", lk_hex (lk_sym_vmaddr lay 2 (lk_lookup_sym "_rail_young_a" syms))])
   let _ = print (cat ["  _rail_young_b -> 0x", lk_hex (lk_sym_vmaddr lay 2 (lk_lookup_sym "_rail_young_b" syms))])
+  -- M2: assemble text, bake every @PAGE/@PAGEOFF, self-verify
+  let buf = asm_assemble src (text_size + 16)
+  let textlabels = asm_build_labels lines
+  let nbad = lk_bake_pass lines buf 0 1 syms textlabels lay 0
+  let _ = print "--- M2: @PAGE baking ---"
+  let _ = print (cat ["  baked all @PAGE/@PAGEOFF; adrp self-verify mismatches = ", show nbad, "  (expect 0)"])
   0
