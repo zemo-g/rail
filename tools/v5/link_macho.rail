@@ -370,6 +370,111 @@ lk_put_str buf off bytes addnull =
   let o = lk_put_bytes buf off bytes
   if addnull == 1 then lk_put_u8 buf o 0 else o
 
+-- ===========================================================================
+-- M4 — dyld info. Import collection + classic LC_DYLD_INFO rebase/bind opcode
+-- streams. (Stubs/GOT/symtab + import-bl patching land in M5 with final offsets.)
+-- ===========================================================================
+
+-- distinct external imports (undefined bl/b targets), in first-encounter order.
+lk_imports src = lk_dedup_syms (asm_relocs src) []
+lk_dedup_syms recs seen =
+  if recs == [] then reverse seen
+  else
+    let sym = head (tail (head recs))
+    if (lk_mem sym seen) == 1 then lk_dedup_syms (tail recs) seen
+    else lk_dedup_syms (tail recs) (cons sym seen)
+lk_mem x xs = if xs == [] then 0 else if (head xs) == x then 1 else lk_mem x (tail xs)
+
+-- ULEB128
+lk_uleb buf off v =
+  if v < 128 then lk_put_u8 buf off v
+  else lk_uleb buf (lk_put_u8 buf off (bit_or (bit_and v 127) 128)) (shr v 7)
+lk_add_addr buf off delta = if delta == 0 then off else lk_uleb buf (lk_put_u8 buf off 48) delta
+
+-- classic REBASE opcode stream. modinit_doff = mod_init offset within __DATA_CONST
+-- (seg 2); data_rebs = ascending __DATA (seg 3) offsets. Per-pointer ADD_ADDR +
+-- DO_REBASE(1) — simple & correct (not minimal like ld, but dyld-equivalent).
+-- REBASE ops: SET_TYPE_IMM 0x10 | POINTER 1 ; SET_SEG_AND_OFF_ULEB 0x20|seg ;
+-- ADD_ADDR_ULEB 0x30 ; DO_REBASE_IMM_TIMES 0x50|count ; DONE 0x00.
+lk_emit_rebase buf off modinit_doff data_rebs =
+  let o1 = lk_put_u8 buf off 17
+  let o2 = lk_put_u8 buf o1 34
+  let o3 = lk_uleb buf o2 modinit_doff
+  let o4 = lk_put_u8 buf o3 81
+  let o5 = lk_put_u8 buf o4 35
+  let o6 = lk_uleb buf o5 (head data_rebs)
+  let o7 = lk_put_u8 buf o6 81
+  let o8 = lk_rebase_rest buf o7 (head data_rebs) (tail data_rebs)
+  lk_put_u8 buf o8 0
+lk_rebase_rest buf off prev rebs =
+  if rebs == [] then off
+  else lk_rebase_rest buf (lk_put_u8 buf (lk_add_addr buf off ((head rebs) - (prev + 8))) 81) (head rebs) (tail rebs)
+
+-- Decoder (round-trip validation): replay the rebase stream, collecting the
+-- (seg,off) of every DO_REBASE; returns a flat list [seg,off, seg,off, ...].
+lk_dec_rebase buf off endoff seg cur acc =
+  if off >= endoff then reverse acc
+  else
+    let op = arr_get buf off
+    let hi = bit_and op 240
+    let im = bit_and op 15
+    if op == 0 then reverse acc
+    else if hi == 16 then lk_dec_rebase buf (off + 1) endoff seg cur acc          -- SET_TYPE
+    else if hi == 32 then lk_dec_seg buf (off + 1) endoff im acc                   -- SET_SEG_AND_OFF_ULEB
+    else if hi == 48 then lk_dec_add buf (off + 1) endoff seg cur acc              -- ADD_ADDR_ULEB
+    else if hi == 80 then lk_dec_dorebase buf (off + 1) endoff seg cur im acc      -- DO_REBASE_IMM_TIMES
+    else reverse acc
+lk_dec_seg buf off endoff seg acc =
+  let r = lk_uleb_read buf off
+  lk_dec_rebase buf (head r) endoff seg (head (tail r)) acc
+lk_dec_add buf off endoff seg cur acc =
+  let r = lk_uleb_read buf off
+  lk_dec_rebase buf (head r) endoff seg (cur + (head (tail r))) acc
+lk_dec_dorebase buf off endoff seg cur n acc =
+  -- emit n rebases at cur, cur+8, ...; advance cur by 8*n
+  lk_dec_rebase buf off endoff seg (cur + (8 * n)) (lk_dec_emit seg cur n acc)
+lk_dec_emit seg cur n acc =
+  if n <= 0 then acc else lk_dec_emit seg (cur + 8) (n - 1) (cons cur (cons seg acc))
+lk_uleb_read buf off = lk_uleb_go buf off 0 0
+lk_uleb_go buf off shift acc =
+  let b = arr_get buf off
+  let acc2 = bit_or acc (shl (bit_and b 127) shift)
+  if (bit_and b 128) == 0 then [off + 1, acc2] else lk_uleb_go buf (off + 1) (shift + 7) acc2
+
+-- classic BIND opcode stream for N libSystem imports (all dylib ordinal 1, bound
+-- non-lazily into __DATA_CONST seg=2 starting at __got offset 0; DO_BIND advances
+-- the slot by 8 each time). Matches dyld_macho.rail's emit_bind generalized to N.
+-- 0x11 SET_DYLIB_ORDINAL_IMM|1 ; 0x40 SET_SYMBOL_TRAILING_FLAGS_IMM + name\0 ;
+-- 0x51 SET_TYPE_IMM POINTER ; 0x72 SET_SEG_AND_OFF_ULEB seg=2 + uleb(0) ; 0x90 DO_BIND
+-- ; [per next import: 0x40 + name\0 ; 0x90] ; 0x00 DONE.
+lk_str_bytes s = lk_strb_go (chars s)
+lk_strb_go cs = if cs == [] then [] else cons (char_to_int (head cs)) (lk_strb_go (tail cs))
+lk_put_cstr buf off s = lk_put_u8 buf (lk_put_bytes buf off (lk_str_bytes s)) 0
+lk_emit_bind buf off imports =
+  let o1 = lk_put_u8 buf off 17
+  let o2 = lk_put_u8 buf o1 64
+  let o3 = lk_put_cstr buf o2 (head imports)
+  let o4 = lk_put_u8 buf o3 81
+  let o5 = lk_put_u8 buf o4 114
+  let o6 = lk_uleb buf o5 0
+  let o7 = lk_put_u8 buf o6 144
+  let o8 = lk_bind_rest buf o7 (tail imports)
+  lk_put_u8 buf o8 0
+lk_bind_rest buf off imports =
+  if imports == [] then off
+  else lk_bind_rest buf (lk_put_u8 buf (lk_put_cstr buf (lk_put_u8 buf off 64) (head imports)) 144) (tail imports)
+-- count DO_BIND (0x90) opcodes in [off,end) — validation.
+lk_count_byte buf off endoff target =
+  if off >= endoff then 0
+  else (if (arr_get buf off) == target then 1 else 0) + (lk_count_byte buf (off + 1) endoff target)
+
+lk_dec_check decoded rebs = lk_dcc (tail (tail decoded)) rebs
+lk_dcc d r =
+  if r == [] then (if d == [] then 1 else 0)
+  else if d == [] then 0
+  else if (head (tail d)) == (head r) then lk_dcc (tail (tail d)) (tail r)
+  else 0
+
 main =
   let src = read_file "/tmp/link_src.s"
   let lines = asm_lines src
@@ -417,4 +522,21 @@ main =
   let _ = print (cat ["  rebase records (data .quad pointers) = ", show nreb, "  (expect ~1270: GC table 634*2 + 5 young ptrs)"])
   let modctor = lk_resolve "_rail_arena_init" syms textlabels lay
   let _ = print (cat ["  __mod_init_func ctor _rail_arena_init -> 0x", lk_hex modctor, "  (+1 rebase, in __DATA_CONST)"])
+  -- M4: imports + rebase opcode stream (round-trip validated)
+  let imports = lk_imports src
+  let _ = print "--- M4: dyld info ---"
+  let _ = print (cat ["  imports (", show (length imports), ", expect 8): ", join " " imports])
+  let rbuf = arr_new 16384 0
+  let rend = lk_emit_rebase rbuf 0 64 rebs
+  let decoded = lk_dec_rebase rbuf 0 rend 0 0 []
+  let ndec = (length decoded) / 2
+  let _ = print (cat ["  rebase stream = ", show rend, " bytes; encodes ", show ndec, " rebases (expect ", show (nreb + 1), ")"])
+  let _ = print (cat ["  round-trip: first data reb decoded seg=", show (head (tail decoded)), " off=0x", lk_hex (head decoded), " (after the modinit seg2 entry)"])
+  let dz = lk_dec_check decoded rebs
+  let _ = print (cat ["  decoded __DATA rebase offsets MATCH input list: ", (if dz == 1 then "YES" else "NO"), "  (falsification test)"])
+  -- bind opcode stream for the 8 imports
+  let bbuf = arr_new 512 0
+  let bend = lk_emit_bind bbuf 0 imports
+  let ndobind = lk_count_byte bbuf 0 bend 144
+  let _ = print (cat ["  bind stream = ", show bend, " bytes; DO_BIND opcodes = ", show ndobind, " (expect ", show (length imports), "); first=0x", lk_hex (arr_get bbuf 0), " (expect 0x11) last=0x", lk_hex (arr_get bbuf (bend - 1)), " (expect 0x0 DONE)"])
   0
