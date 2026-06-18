@@ -9,6 +9,7 @@
 --      with asm.rail's __text label map, every symbol gets a final VM address once
 --      section bases are assigned. Validated against `nm -n` of an as-built .o.
 import "tools/v5/asm.rail"
+import "stdlib/codesign.rail"
 
 -- ===========================================================================
 -- M1 — data / bss / mod_init section walker.
@@ -475,6 +476,212 @@ lk_dcc d r =
   else if (head (tail d)) == (head r) then lk_dcc (tail (tail d)) (tail r)
   else 0
 
+-- ===========================================================================
+-- M5 — full Mach-O assembly. All 14 load commands from the M1 layout, baked
+-- __text + computed __stubs/__got/__mod_init/__data, LINKEDIT (rebase/bind/
+-- symtab/dysymtab/indirect/strtab), ad-hoc signature. Reuses stdlib/macho.rail
+-- emitters + dyld_macho.rail's section64 pattern (copied — that file has a main).
+-- ===========================================================================
+lk_align8 n = asm_align_up n 3
+lk_align16 n = asm_align_up n 4
+
+-- section_64 (80 bytes)
+lk_section64 buf off sect seg addr size foff align flags r1 r2 =
+  let s1 = mw_str_padded buf off sect 16
+  let s2 = mw_str_padded buf s1 seg 16
+  let s3 = mw_u64 buf s2 addr
+  let s4 = mw_u64 buf s3 size
+  let s5 = mw_u32 buf s4 foff
+  let s6 = mw_u32 buf s5 align
+  let s7 = mw_u32 buf s6 0
+  let s8 = mw_u32 buf s7 0
+  let s9 = mw_u32 buf s8 flags
+  let s10 = mw_u32 buf s9 r1
+  let s11 = mw_u32 buf s10 r2
+  mw_u32 buf s11 0
+
+-- LINKEDIT subsection layout from linkedit_foff + sizes -> a flat list:
+-- [rebase_off rebase_sz bind_off bind_sz sym_off nsyms ind_off nind str_off str_sz cs_off sig_total file_size]
+lk_le_layout le_foff rebase_sz bind_sz n_imp str_sz =
+  let rebase_off = le_foff
+  let bind_off = lk_align8 (rebase_off + rebase_sz)
+  let sym_off = lk_align8 (bind_off + bind_sz)
+  let nsyms = n_imp + 2
+  let sym_sz = nsyms * 16
+  let ind_off = sym_off + sym_sz
+  let nind = n_imp * 2
+  let ind_sz = nind * 4
+  let str_off = ind_off + ind_sz
+  let cs_off = lk_align16 (str_off + str_sz)
+  let n_code_pages = (cs_off + 16383) / 16384
+  let sig_total = (cs_cd_size_n n_code_pages) + 40
+  [rebase_off, rebase_sz, bind_off, bind_sz, sym_off, nsyms, ind_off, nind, str_off, str_sz, cs_off, sig_total, cs_off + sig_total]
+
+-- strtab: 0x20,0x00, "__mh_execute_header\0", "_main\0", then each import "\0".
+-- returns the strx offsets list [mh_strx, main_strx, imp0_strx, imp1_strx, ...].
+lk_str_size imports = 2 + 20 + 6 + (lk_imp_namebytes imports)
+lk_imp_namebytes imports = if imports == [] then 0 else (length (chars (head imports))) + 1 + (lk_imp_namebytes (tail imports))
+lk_emit_strtab buf off imports =
+  let o1 = mw_u8 buf off 32
+  let o2 = mw_u8 buf o1 0
+  let o3 = mw_cstr buf o2 "__mh_execute_header"
+  let o4 = mw_cstr buf o3 "_main"
+  lk_emit_names buf o4 imports
+lk_emit_names buf off imports = if imports == [] then off else lk_emit_names buf (mw_cstr buf off (head imports)) (tail imports)
+
+-- nlist_64 (16B)
+lk_nlist buf off strx ntype nsect ndesc nval =
+  let o1 = mw_u32 buf off strx
+  let o2 = mw_u8 buf o1 ntype
+  let o3 = mw_u8 buf o2 nsect
+  let o4 = mw_u16 buf o3 ndesc
+  mw_u64 buf o4 nval
+-- emit the N+2 nlists: mh_header, _main, then imports. Returns next off.
+lk_emit_syms buf off imports main_vaddr =
+  let o1 = lk_nlist buf off 2 15 1 16 4294967296
+  let o2 = lk_nlist buf o1 22 15 1 0 main_vaddr
+  lk_emit_undef buf o2 28 imports
+lk_emit_undef buf off strx imports =
+  if imports == [] then off
+  else lk_emit_undef buf (lk_nlist buf off strx 1 0 256 0) (strx + (length (chars (head imports))) + 1) (tail imports)
+-- indirect symtab: 2N u32, [stub half: 2..2+N-1][got half: 2..2+N-1]
+lk_emit_indirect buf off n_imp =
+  let o = lk_emit_iota buf off 2 n_imp
+  lk_emit_iota buf o 2 n_imp
+lk_emit_iota buf off start n = if n <= 0 then off else lk_emit_iota buf (mw_u32 buf off start) (start + 1) (n - 1)
+
+-- __stubs bytes: per import i  adrp x16,got@PAGE ; ldr x16,[x16,#8i] ; br x16.
+lk_emit_stubs buf foff stubs_vmaddr got_vmaddr n_imp =
+  lk_stubs_go buf foff stubs_vmaddr got_vmaddr 0 n_imp
+lk_stubs_go buf foff stubs_vmaddr got_vmaddr i n =
+  if i >= n then 0
+  else
+    let pc = stubs_vmaddr + (12 * i)
+    let adrp = lk_bake_adrp 2415919120 got_vmaddr pc       -- 0x90000010 (adrp x16)
+    let _ = cb_emit buf (foff + (12 * i)) adrp
+    let _ = cb_emit buf (foff + (12 * i) + 4) (bit_or 4181721616 (shl i 10))   -- 0xF9400210 | i<<10
+    let _ = cb_emit buf (foff + (12 * i) + 8) 3592356352   -- 0xD61F0200 br x16
+    lk_stubs_go buf foff stubs_vmaddr got_vmaddr (i + 1) n
+
+-- patch every `bl _import` (text byte off) to branch to its __stubs entry.
+lk_patch_imports buf recs imports text_vmaddr stubs_vmaddr =
+  if recs == [] then 0
+  else
+    let off = head (head recs)
+    let sym = head (tail (head recs))
+    let i = lk_index_of sym imports 0
+    let stub_vaddr = stubs_vmaddr + (12 * i)
+    let bl_vaddr = text_vmaddr + off
+    let _ = cb_emit buf off (bit_or 2483027968 (bit_and ((stub_vaddr - bl_vaddr) / 4) 67108863))   -- 0x94000000 | imm26
+    lk_patch_imports buf (tail recs) imports text_vmaddr stubs_vmaddr
+lk_index_of x xs n = if xs == [] then 0 - 1 else if (head xs) == x then n else lk_index_of x (tail xs) (n + 1)
+
+-- LC_SEGMENT_64 fixed header (72 bytes); cmdsize includes nsects*80.
+lk_seg_hdr buf off segname vmaddr vmsize foff fsize maxp initp nsects flags =
+  let o1 = mw_u32 buf off 25
+  let o2 = mw_u32 buf o1 (72 + (80 * nsects))
+  let o3 = mw_str_padded buf o2 segname 16
+  let o4 = mw_u64 buf o3 vmaddr
+  let o5 = mw_u64 buf o4 vmsize
+  let o6 = mw_u64 buf o5 foff
+  let o7 = mw_u64 buf o6 fsize
+  let o8 = mw_u32 buf o7 maxp
+  let o9 = mw_u32 buf o8 initp
+  let o10 = mw_u32 buf o9 nsects
+  mw_u32 buf o10 flags
+
+-- __TEXT: __text + __stubs.  lay accessors: 0 text_vmaddr,1 text_foff,2 stubs_vmaddr,3 stubs_foff,4 text_seg_fsz
+lk_emit_seg_text buf off lay text_size n_imp =
+  let segbase = lk_text_vm_base
+  let o = lk_seg_hdr buf off "__TEXT" segbase (lk_nth lay 4) 0 (lk_nth lay 4) 5 5 2 0
+  let a = lk_section64 buf o "__text" "__TEXT" (lk_nth lay 0) text_size (lk_nth lay 1) 2 2147484672 0 0
+  lk_section64 buf a "__stubs" "__TEXT" (lk_nth lay 2) (12 * n_imp) (lk_nth lay 3) 2 2147484680 0 12
+
+-- __DATA_CONST: __got + __mod_init_func.  5 got_vmaddr,6 got_foff,7 modinit_vmaddr,8 modinit_foff,9 datac_seg_fsz
+lk_emit_seg_datac buf off lay n_imp modinit_size =
+  let o = lk_seg_hdr buf off "__DATA_CONST" (lk_nth lay 5) (lk_nth lay 9) (lk_nth lay 6) (lk_nth lay 9) 3 3 2 16
+  let a = lk_section64 buf o "__got" "__DATA_CONST" (lk_nth lay 5) (8 * n_imp) (lk_nth lay 6) 3 6 n_imp 0
+  lk_section64 buf a "__mod_init_func" "__DATA_CONST" (lk_nth lay 7) modinit_size (lk_nth lay 8) 3 9 0 0
+
+-- __DATA: __data + __bss.  10 data_vmaddr,11 data_foff,12 bss_vmaddr,13 data_seg_fsz,14 data_seg_vmsz
+lk_emit_seg_data buf off lay data_size bss_size =
+  let o = lk_seg_hdr buf off "__DATA" (lk_nth lay 10) (lk_nth lay 14) (lk_nth lay 11) (lk_nth lay 13) 3 3 2 0
+  let a = lk_section64 buf o "__data" "__DATA" (lk_nth lay 10) data_size (lk_nth lay 11) 3 0 0 0
+  lk_section64 buf a "__bss" "__DATA" (lk_nth lay 12) bss_size 0 3 1 0 0
+
+emit_dyld_info_rb buf off rebase_off rebase_sz bind_off bind_sz =
+  let o1 = mw_u32 buf off 2147483682     -- LC_DYLD_INFO_ONLY 0x80000022
+  let o2 = mw_u32 buf o1 48
+  let o3 = mw_u32 buf o2 rebase_off
+  let o4 = mw_u32 buf o3 rebase_sz
+  let o5 = mw_u32 buf o4 bind_off
+  let o6 = mw_u32 buf o5 bind_sz
+  let o7 = mw_u32 buf o6 0
+  let o8 = mw_u32 buf o7 0
+  let o9 = mw_u32 buf o8 0
+  let o10 = mw_u32 buf o9 0
+  let o11 = mw_u32 buf o10 0
+  mw_u32 buf o11 0
+
+emit_dysymtab_n buf off n_imp ind_off =
+  let o1 = mw_u32 buf off 11
+  let o2 = mw_u32 buf o1 80
+  let o3 = mw_u32 buf o2 0
+  let o4 = mw_u32 buf o3 0                -- ilocal/nlocal
+  let o5 = mw_u32 buf o4 0
+  let o6 = mw_u32 buf o5 2                -- iextdef=0 nextdef=2
+  let o7 = mw_u32 buf o6 2
+  let o8 = mw_u32 buf o7 n_imp            -- iundef=2 nundef=N
+  let o9 = mw_u32 buf o8 0
+  let o10 = mw_u32 buf o9 0
+  let o11 = mw_u32 buf o10 0
+  let o12 = mw_u32 buf o11 0
+  let o13 = mw_u32 buf o12 0
+  let o14 = mw_u32 buf o13 0
+  let o15 = mw_u32 buf o14 ind_off
+  let o16 = mw_u32 buf o15 (2 * n_imp)
+  let o17 = mw_u32 buf o16 0
+  let o18 = mw_u32 buf o17 0
+  let o19 = mw_u32 buf o18 0
+  mw_u32 buf o19 0
+
+emit_load_dylib_ls buf off =
+  let o1 = mw_u32 buf off 12
+  let o2 = mw_u32 buf o1 56
+  let o3 = mw_u32 buf o2 24
+  let o4 = mw_u32 buf o3 2
+  let o5 = mw_u32 buf o4 88866816
+  let o6 = mw_u32 buf o5 65536
+  let o7 = mw_cstr buf o6 "/usr/lib/libSystem.B.dylib"
+  mw_zeros buf o7 (off + 56 - o7)
+
+lk_copyn dst dst_off src src_off n =
+  if n <= 0 then 0
+  else
+    let _ = arr_set dst dst_off (arr_get src src_off)
+    lk_copyn dst (dst_off + 1) src (src_off + 1) (n - 1)
+
+-- all 14 load commands, offsets/addresses from the M1 layout (lay) + LINKEDIT layout (le).
+lk_emit_all_lc buf lay le imports n_imp text_size modinit_size data_size bss_size main_vaddr =
+  let le_foff = lk_nth lay 16
+  let le_fsz = (lk_nth le 12) - le_foff
+  let entryoff = main_vaddr - lk_text_vm_base
+  let p0 = emit_mach_header buf 0 14 1176 mh_flags_pie_exec
+  let p1 = emit_segment_64_nosects buf p0 "__PAGEZERO" 0 4294967296 0 0 0 0
+  let p2 = lk_emit_seg_text buf p1 lay text_size n_imp
+  let p3 = lk_emit_seg_datac buf p2 lay n_imp modinit_size
+  let p4 = lk_emit_seg_data buf p3 lay data_size bss_size
+  let p5 = emit_segment_64_nosects buf p4 "__LINKEDIT" (lk_nth lay 15) (lk_alignp le_fsz) le_foff le_fsz 1 1
+  let p6 = emit_dyld_info_rb buf p5 (lk_nth le 0) (lk_nth le 1) (lk_nth le 2) (lk_nth le 3)
+  let p7 = emit_symtab buf p6 (lk_nth le 4) (lk_nth le 5) (lk_nth le 8) (lk_nth le 9)
+  let p8 = emit_dysymtab_n buf p7 n_imp (lk_nth le 6)
+  let p9 = emit_load_dylinker buf p8
+  let p10 = emit_uuid buf p9
+  let p11 = emit_build_version buf p10 1703936 1703936
+  let p12 = emit_main buf p11 entryoff 0
+  let p13 = emit_load_dylib_ls buf p12
+  emit_code_signature_lc buf p13 (lk_nth le 10) (lk_nth le 11)
+
 main =
   let src = read_file "/tmp/link_src.s"
   let lines = asm_lines src
@@ -484,59 +691,39 @@ main =
   let modoff = head (tail (tail st))
   let syms = head (tail (tail (tail st)))
   let text_size = asm_bytes_len src
-  let _ = print (cat ["__text size = 0x", lk_hex text_size])
-  let _ = print (cat ["__data size = 0x", lk_hex dataoff, "  (expect 0x5138)"])
-  let _ = print (cat ["__bss  size = 0x", lk_hex bssoff, "  (expect 0x8000000)"])
-  let _ = print (cat ["__mod_init_func size = 0x", lk_hex modoff, "  (expect 0x8)"])
   let lay = lk_layout text_size 8 dataoff bssoff modoff
-  let _ = print "--- computed layout (VM addresses, self-consistent) ---"
-  let _ = print (cat ["  __text   vmaddr 0x", lk_hex (lk_nth lay 0), "  foff 0x", lk_hex (lk_nth lay 1)])
-  let _ = print (cat ["  __stubs  vmaddr 0x", lk_hex (lk_nth lay 2), "  foff 0x", lk_hex (lk_nth lay 3), "  (8 imports x12)"])
-  let _ = print (cat ["  __got    vmaddr 0x", lk_hex (lk_nth lay 5), "  foff 0x", lk_hex (lk_nth lay 6)])
-  let _ = print (cat ["  __modini vmaddr 0x", lk_hex (lk_nth lay 7), "  foff 0x", lk_hex (lk_nth lay 8)])
-  let _ = print (cat ["  __data   vmaddr 0x", lk_hex (lk_nth lay 10), "  foff 0x", lk_hex (lk_nth lay 11)])
-  let _ = print (cat ["  __bss    vmaddr 0x", lk_hex (lk_nth lay 12)])
-  let _ = print (cat ["  __LINKED vmaddr 0x", lk_hex (lk_nth lay 15), "  foff 0x", lk_hex (lk_nth lay 16)])
-  let _ = print "--- spot-check final symbol VM addresses ---"
-  let _ = print (cat ["  _rail_nil   -> 0x", lk_hex (lk_sym_vmaddr lay 1 (lk_lookup_sym "_rail_nil" syms))])
-  let _ = print (cat ["  _rail_young_a -> 0x", lk_hex (lk_sym_vmaddr lay 2 (lk_lookup_sym "_rail_young_a" syms))])
-  let _ = print (cat ["  _rail_young_b -> 0x", lk_hex (lk_sym_vmaddr lay 2 (lk_lookup_sym "_rail_young_b" syms))])
-  -- M2: assemble text, bake every @PAGE/@PAGEOFF, self-verify
-  let buf = asm_assemble src (text_size + 16)
+  let imports = lk_imports src
+  let n_imp = length imports
   let textlabels = asm_build_labels lines
-  let nbad = lk_bake_pass lines buf 0 1 syms textlabels lay 0
-  let _ = print "--- M2: @PAGE baking ---"
-  let _ = print (cat ["  baked all @PAGE/@PAGEOFF; adrp self-verify mismatches = ", show nbad, "  (expect 0)"])
-  -- M3: emit the __data image + collect rebases
+  -- text: assemble, bake @PAGE, patch import bl -> stubs
+  let textbuf = asm_assemble src (text_size + 16)
+  let _ = lk_bake_pass lines textbuf 0 1 syms textlabels lay 0
+  let _ = lk_patch_imports textbuf (asm_relocs src) imports (lk_nth lay 0) (lk_nth lay 2)
+  -- data image + rebases
   let databuf = arr_new (dataoff + 16) 0
   let rebs = lk_demit lines 0 0 databuf syms textlabels lay []
-  let nreb = length rebs
-  let _ = print "--- M3: data image ---"
-  let foff = lk_lookup_sym "_fmt_int" syms
-  let _ = print (cat ["  _fmt_int bytes @0x", lk_hex foff, ": ", show (arr_get databuf foff), " ", show (arr_get databuf (foff+1)), " ", show (arr_get databuf (foff+2)), " ", show (arr_get databuf (foff+3)), " ", show (arr_get databuf (foff+4)), "  (expect 37 108 100 10 0)"])
-  let yboff = lk_lookup_sym "_rail_young_base" syms
-  let ybval = lk_read_u64 databuf yboff
-  let _ = print (cat ["  _rail_young_base slot -> 0x", lk_hex ybval, "  (expect resolve(_rail_young_a) = 0x", lk_hex (lk_resolve "_rail_young_a" syms textlabels lay), ")"])
-  let yeoff = lk_lookup_sym "_rail_young_end" syms
-  let _ = print (cat ["  _rail_young_end slot -> 0x", lk_hex (lk_read_u64 databuf yeoff), "  (expect young_a + 0x4000000)"])
-  let _ = print (cat ["  rebase records (data .quad pointers) = ", show nreb, "  (expect ~1270: GC table 634*2 + 5 young ptrs)"])
-  let modctor = lk_resolve "_rail_arena_init" syms textlabels lay
-  let _ = print (cat ["  __mod_init_func ctor _rail_arena_init -> 0x", lk_hex modctor, "  (+1 rebase, in __DATA_CONST)"])
-  -- M4: imports + rebase opcode stream (round-trip validated)
-  let imports = lk_imports src
-  let _ = print "--- M4: dyld info ---"
-  let _ = print (cat ["  imports (", show (length imports), ", expect 8): ", join " " imports])
+  -- rebase + bind streams (temp buffers give their sizes)
   let rbuf = arr_new 16384 0
   let rend = lk_emit_rebase rbuf 0 64 rebs
-  let decoded = lk_dec_rebase rbuf 0 rend 0 0 []
-  let ndec = (length decoded) / 2
-  let _ = print (cat ["  rebase stream = ", show rend, " bytes; encodes ", show ndec, " rebases (expect ", show (nreb + 1), ")"])
-  let _ = print (cat ["  round-trip: first data reb decoded seg=", show (head (tail decoded)), " off=0x", lk_hex (head decoded), " (after the modinit seg2 entry)"])
-  let dz = lk_dec_check decoded rebs
-  let _ = print (cat ["  decoded __DATA rebase offsets MATCH input list: ", (if dz == 1 then "YES" else "NO"), "  (falsification test)"])
-  -- bind opcode stream for the 8 imports
-  let bbuf = arr_new 512 0
+  let bbuf = arr_new 1024 0
   let bend = lk_emit_bind bbuf 0 imports
-  let ndobind = lk_count_byte bbuf 0 bend 144
-  let _ = print (cat ["  bind stream = ", show bend, " bytes; DO_BIND opcodes = ", show ndobind, " (expect ", show (length imports), "); first=0x", lk_hex (arr_get bbuf 0), " (expect 0x11) last=0x", lk_hex (arr_get bbuf (bend - 1)), " (expect 0x0 DONE)"])
+  -- LINKEDIT layout + file size
+  let le = lk_le_layout (lk_nth lay 16) rend bend n_imp (lk_str_size imports)
+  let file_size = lk_nth le 12
+  let main_vaddr = lk_resolve "_main" syms textlabels lay
+  -- assemble the file
+  let buf = arr_new file_size 0
+  let _ = lk_emit_all_lc buf lay le imports n_imp text_size modoff dataoff bssoff main_vaddr
+  let _ = lk_copyn buf (lk_nth lay 1) textbuf 0 text_size
+  let _ = lk_emit_stubs buf (lk_nth lay 3) (lk_nth lay 2) (lk_nth lay 5) n_imp
+  let _ = lk_put_u64 buf (lk_nth lay 8) (lk_resolve "_rail_arena_init" syms textlabels lay)
+  let _ = lk_copyn buf (lk_nth lay 11) databuf 0 dataoff
+  let _ = lk_copyn buf (lk_nth le 0) rbuf 0 rend
+  let _ = lk_copyn buf (lk_nth le 2) bbuf 0 bend
+  let _ = lk_emit_syms buf (lk_nth le 4) imports main_vaddr
+  let _ = lk_emit_indirect buf (lk_nth le 6) n_imp
+  let _ = lk_emit_strtab buf (lk_nth le 8) imports
+  let _ = emit_signature_n buf (lk_nth le 10) (lk_nth le 10) 0 (lk_nth lay 4)
+  let _ = macho_write_file "/tmp/v5_rail" buf file_size
+  let _ = print (cat ["wrote /tmp/v5_rail (", show file_size, " bytes); imports=", show n_imp, " rebases=", show (length rebs), " main@0x", lk_hex main_vaddr])
   0
