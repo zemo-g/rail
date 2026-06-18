@@ -1,0 +1,1273 @@
+-- tok2.rail (FINAL) — Pure-Rail HF byte-level BPE tokenizer for SmolLM2-135M.
+-- Zero Python / MLX / PyTorch in the inference path.
+--
+-- MERGE-PRIORITY BPE encode (canonical GPT-2 algorithm: repeatedly merge the
+-- adjacent pair with the LOWEST merge rank). Validated against the real
+-- SmolLM2-135M-Instruct tokenizer.json: golden HF ids match exactly
+--   encode("Hello world")         == [19556, 905]
+--   encode("hello")               == [28120]
+--   encode(" the")                == [260]
+--   encode("The quick brown fox") == [504, 2365, 6354, 16438]
+--   detokenize([19556,905])       == "Hello world"
+--   detokenize([0,1,2])           == "<|endoftext|><|im_start|><|im_end|>"
+--
+-- Loads a HF tokenizer.json (model.vocab + model.merges; modern array-of-pairs
+-- AND older space-joined-string merges formats both handled) by STREAMING the
+-- byte buffer with read_file_bytes + byte_at (never materializing the multi-MB
+-- JSON as a Rail string -> avoids the O(N^2) char-list parse / arena OOM).
+--
+-- KEY DESIGN: byte-level (GPT-2) glyph un-mapping is pushed entirely into the
+-- LOADER. vocab[id] is stored as its RAW output byte string, so DETOKENIZE
+-- (tokens -> text) is a dumb O(1)-indexed concat and is correct for free for
+-- all 255 representable bytes (0x01..0xFF), including the space-glyph
+-- (G-dot = U+0120 -> byte 0x20) and newline-glyph (C-dot = U+010A -> byte 0x0A)
+-- conventions. The SOLE exception is raw byte 0x00 (GPT-2 glyph U+0100 = "Ā",
+-- SmolLM2 id 190): Rail strings are NUL-terminated, so a NUL byte cannot be
+-- carried through cat/join/print. Rather than silently drop it, the loader
+-- substitutes U+FFFD for byte 0x00 so the loss is VISIBLE (see SECTION 2's
+-- NUL-BYTE CAVEAT). Special/added tokens (ids 0/1/2 and the 14 StarCoder tags)
+-- are stored VERBATIM (never byte-unmapped).
+--
+-- DETOKENIZE is the hard correctness guarantee (mandatory + correct for every
+-- byte the runtime can represent; byte 0x00 -> U+FFFD is the one documented
+-- lossy case, forced by Rail's NUL-terminated string type).
+-- ENCODE is merge-priority BPE: it matches HF exactly on whitespace-delimited
+-- input (the dominant case; verified on the golden strings above). The full
+-- GPT-2 pre-tokenization regex (which splits punctuation/contractions into
+-- their own BPE runs so cross-boundary pairs can never merge) is NOT ported;
+-- for the rare inputs where that matters, prompt ids can be supplied offline.
+-- Special-token literals (<|im_start|> etc.) must be injected as their IDs
+-- directly via the ChatML frame builder, never byte-level-BPE-encoded as text.
+--
+-- O(1) lookups everywhere: id->bytes / id->glyph via arr_new (NOT the engine's
+-- O(N) nth_str); glyph->id and pair->rank via an open-addressing hash map.
+-- parse_int (never to_int) for every int; str_split/str_find (never single-char
+-- split) for multi-char delimiters; named predicates (never filter-lambda).
+--
+-- Build: ./rail_native --out-prefix /tmp/railml_build/tokenizer/FINAL_out \
+--          /tmp/railml_build/tokenizer/FINAL.rail
+-- Run:   /tmp/railml_build/tokenizer/FINAL_out
+
+-- ============================================================
+-- SECTION 0: small pure helpers
+-- ============================================================
+
+-- non-negative int -> string via parse_int's inverse not needed; use show.
+
+-- string equality is `==` in Rail.
+
+-- list nth (O(n)) — only for short lists.
+t2_nth n xs =
+  if n == 0 then head xs
+  else t2_nth (n - 1) (tail xs)
+
+-- ============================================================
+-- SECTION 1: GPT-2 byte un-map table (codepoint 256..323 -> raw byte)
+-- ============================================================
+-- 68 control/space bytes were remapped to U+0100..U+0143 by GPT-2's
+-- bytes_to_unicode. Build a 68-entry int array: index (cp-256) -> source byte.
+-- All other codepoints (< 256) pass through as their own byte (identity).
+
+t2_unmap_bytes = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,173]
+
+t2_build_unmap_arr =
+  let arr = arr_new 68 0
+  let _ = t2_fill_unmap arr t2_unmap_bytes 0
+  arr
+
+t2_fill_unmap arr lst i =
+  if lst == [] then arr
+  else
+    let _ = arr_set arr i (head lst)
+    t2_fill_unmap arr (tail lst) (i + 1)
+
+-- codepoint -> raw byte (single byte 0..255)
+t2_cp_to_byte unmap cp =
+  if cp < 256 then cp
+  else
+    let idx = cp - 256
+    if idx < 68 then arr_get unmap idx
+    else cp     -- out of remap window: shouldn't happen for valid glyphs
+
+-- closed-form (allocation-free) equivalent of t2_cp_to_byte. The 68 remapped
+-- codepoints U+0100..U+0143 partition into three contiguous runs:
+--   cp 256..288  -> byte cp-256   (bytes   0..32)
+--   cp     289   -> byte 127
+--   cp 290..322  -> byte cp-162   (bytes 128..160)
+--   cp     323   -> byte 173
+-- Kept as a self-test oracle (proves the table and the formula agree); the
+-- table form is what the hot load loop uses.  Nested ifs, no &&.
+t2_cp_to_byte_arith cp =
+  if cp < 256 then cp
+  else if cp <= 288 then cp - 256
+  else if cp == 289 then 127
+  else if cp <= 322 then cp - 162
+  else 173
+
+-- ============================================================
+-- SECTION 2: UTF-8 decode of a glyph string -> raw byte string
+-- ============================================================
+-- A glyph string (the JSON key after JSON-unescaping) is UTF-8 bytes. Rail
+-- `chars` splits per-byte. We decode codepoints, byte-unmap each, and emit the
+-- raw byte via char_from_int. Result is the literal output byte stream.
+-- Handles 1-, 2-, and 3-byte UTF-8 (glyphs are all in U+0000..U+0143).
+--
+-- NUL-BYTE CAVEAT (raw byte 0x00, GPT-2 glyph U+0100 = "Ā"): Rail strings are
+-- NUL-terminated, so a char_from_int 0 IS the empty string and cat/join/print
+-- all truncate at the first 0x00 — the runtime string type genuinely cannot
+-- carry an interior or single NUL byte through detokenize. Storing it as "" is
+-- a SILENT drop (the byte vanishes with no signal). To keep the loss VISIBLE
+-- (the same convention as the out-of-range U+FFFD unk fallback), we substitute
+-- the Unicode REPLACEMENT CHARACTER (U+FFFD) for byte 0x00 at unmap time. This
+-- is NOT byte-exact for 0x00 (no string-based detokenize can be, given the
+-- runtime), but it surfaces the unrepresentable byte instead of dropping it.
+-- For SmolLM2 exactly one token (id 190) hits this; its decode is the lone
+-- non-byte-exact id and it now renders as U+FFFD rather than "".
+
+-- decode the next codepoint from a byte-char list; returns (cp, rest_list).
+t2_utf8_next cs =
+  let b0 = char_to_int (head cs) in
+  if b0 < 128 then (b0, tail cs)               -- 1-byte ASCII
+  else if b0 < 224 then                         -- 2-byte: 110xxxxx 10xxxxxx
+    let rest = tail cs in
+    let b1 = char_to_int (head rest) in
+    ((b0 - 192) * 64 + (b1 - 128), tail rest)
+  else                                          -- 3-byte: 1110xxxx 10xx 10xx
+    let r1 = tail cs in
+    let b1 = char_to_int (head r1) in
+    let r2 = tail r1 in
+    let b2 = char_to_int (head r2) in
+    ((b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128), tail r2)
+
+-- glyph string -> list of raw-byte single-char strings (in order).
+-- byte 0x00 is unrepresentable in a Rail (NUL-terminated) string; emit U+FFFD
+-- so the byte surfaces visibly instead of silently collapsing to "" (see the
+-- NUL-BYTE CAVEAT above). All other bytes (0x01..0xFF) round-trip exactly.
+t2_glyph_to_bytestrs unmap cs acc =
+  if cs == [] then reverse acc
+  else
+    let nx = t2_utf8_next cs in
+    let (cp, rest) = nx in
+    let byte = t2_cp_to_byte unmap cp in
+    let bstr = if byte == 0 then t2_fffd else char_from_int byte in
+    t2_glyph_to_bytestrs unmap rest (cons bstr acc)
+
+-- glyph string -> raw output byte string (concatenated).
+t2_unmap_glyph unmap glyph =
+  join "" (t2_glyph_to_bytestrs unmap (chars glyph) [])
+
+-- ============================================================
+-- SECTION 3: JSON string unescape (key decode)
+-- ============================================================
+-- JSON keys may carry \", \\, \n, \t, \uXXXX. Glyphs in HF vocab are almost
+-- always raw UTF-8 already, but \u escapes appear for some control glyphs.
+-- We unescape into the raw glyph-UTF-8 byte stream BEFORE utf8-decode.
+
+t2_hex_val c =
+  let n = char_to_int c in
+  if n >= 48 then (if n <= 57 then n - 48
+    else if n >= 97 then (if n <= 102 then n - 87 else 0)
+    else if n >= 65 then (if n <= 70 then n - 55 else 0)
+    else 0)
+  else 0
+
+-- emit a codepoint cp as UTF-8 byte-char strings, consing onto acc (reversed).
+t2_emit_utf8 cp acc =
+  if cp < 128 then cons (char_from_int cp) acc
+  else if cp < 2048 then
+    let b0 = 192 + cp / 64 in
+    let b1 = 128 + (cp - (cp / 64) * 64) in
+    cons (char_from_int b1) (cons (char_from_int b0) acc)
+  else
+    let b0 = 224 + cp / 4096 in
+    let rem = cp - (cp / 4096) * 4096 in
+    let b1 = 128 + rem / 64 in
+    let b2 = 128 + (rem - (rem / 64) * 64) in
+    cons (char_from_int b2) (cons (char_from_int b1) (cons (char_from_int b0) acc))
+
+-- unescape a JSON string body (list of byte-chars) -> glyph-UTF-8 string.
+t2_json_unescape_chars cs acc =
+  if cs == [] then reverse acc
+  else
+    let c = head cs in
+    if c == "\\" then
+      let rest = tail cs in
+      if rest == [] then reverse (cons c acc)
+      else
+        let e = head rest in
+        if e == "n" then t2_json_unescape_chars (tail rest) (cons (char_from_int 10) acc)
+        else if e == "t" then t2_json_unescape_chars (tail rest) (cons (char_from_int 9) acc)
+        else if e == "r" then t2_json_unescape_chars (tail rest) (cons (char_from_int 13) acc)
+        else if e == "\"" then t2_json_unescape_chars (tail rest) (cons "\"" acc)
+        else if e == "\\" then t2_json_unescape_chars (tail rest) (cons "\\" acc)
+        else if e == "/" then t2_json_unescape_chars (tail rest) (cons "/" acc)
+        else if e == "u" then
+          let h = tail rest in
+          let d0 = t2_hex_val (head h) in
+          let h1 = tail h in
+          let d1 = t2_hex_val (head h1) in
+          let h2 = tail h1 in
+          let d2 = t2_hex_val (head h2) in
+          let h3 = tail h2 in
+          let d3 = t2_hex_val (head h3) in
+          let cp = ((d0 * 16 + d1) * 16 + d2) * 16 + d3 in
+          t2_json_unescape_chars (tail h3) (t2_emit_utf8 cp acc)
+        else t2_json_unescape_chars (tail rest) (cons e acc)
+    else t2_json_unescape_chars (tail cs) (cons c acc)
+
+t2_json_unescape s = join "" (t2_json_unescape_chars (chars s) [])
+
+-- ============================================================
+-- SECTION 4: buffer (read_file_bytes) streaming scan helpers
+-- ============================================================
+-- The buffer is indexed by byte_at buf off. We find substrings and walk
+-- JSON structure byte-by-byte; we never slice the whole buffer into a string.
+
+-- find the first occurrence of pattern `pat` (a Rail string) in buf at or
+-- after `start`; returns the index of the FIRST byte of the match, or -1.
+-- pat is short (< ~16 bytes) so this is fine.
+t2_buf_find buf blen pat start =
+  let pcs = chars pat in
+  let plen = length pcs in
+  t2_buf_find_loop buf blen pcs plen start
+
+t2_buf_find_loop buf blen pcs plen i =
+  if i + plen > blen then (0 - 1)
+  else if t2_match_at buf pcs i 0 plen then i
+  else t2_buf_find_loop buf blen pcs plen (i + 1)
+
+-- check pat-chars match buf at offset off (j is index into pcs).
+t2_match_at buf pcs off j plen =
+  if j >= plen then true
+  else
+    let pc = char_to_int (t2_nth j pcs) in
+    if byte_at buf (off + j) == pc then t2_match_at buf pcs off (j + 1) plen
+    else false
+
+-- read a non-negative decimal int from buf starting at off; returns (val, next_off).
+t2_buf_read_int buf blen off =
+  t2_buf_read_int_loop buf blen off 0 false
+
+t2_buf_read_int_loop buf blen off acc seen =
+  if off >= blen then (acc, off)
+  else
+    let b = byte_at buf off in
+    if b >= 48 then
+      if b <= 57 then t2_buf_read_int_loop buf blen (off + 1) (acc * 10 + (b - 48)) true
+      else (acc, off)
+    else (acc, off)
+
+-- ============================================================
+-- SECTION 5: string -> id hash map (open addressing)
+-- ============================================================
+-- For encode we need glyph-string -> id (vocab) and pair-string -> rank.
+-- Linear scan over 49K+ entries per lookup is too slow, so use a hash table:
+--   keys : arr_new cap ""   (the glyph string; "" = empty slot)
+--   vals : arr_new cap (-1) (the id / rank)
+-- cap is a power-of-two-ish prime-ish > 2*n.
+
+type SMap = | SMap keys vals cap
+
+t2_str_hash_loop cs h =
+  if cs == [] then h
+  else
+    let b = char_to_int (head cs) in
+    -- h = h*131 + b, kept positive via mod inside via arithmetic (Rail ints are 63-bit)
+    t2_str_hash_loop (tail cs) (h * 131 + b)
+
+-- positive hash mod cap.
+t2_str_hash s cap =
+  let h = t2_str_hash_loop (chars s) 7 in
+  let hm = h - (h / cap) * cap in
+  if hm < 0 then hm + cap else hm
+
+t2_smap_new cap =
+  let ks = arr_new cap "" in
+  let vs = arr_new cap (0 - 1) in
+  SMap ks vs cap
+
+-- insert key->val (linear probe). Assumes key not already present or overwrite ok.
+t2_smap_put m key val = match m
+  | SMap ks vs cap ->
+    let start = t2_str_hash key cap in
+    t2_smap_put_probe ks vs cap key val start 0
+
+t2_smap_put_probe ks vs cap key val slot tries =
+  if tries >= cap then 0   -- table full (shouldn't happen if cap > 2n)
+  else
+    let cur = arr_get ks slot in
+    if cur == "" then
+      let _ = arr_set ks slot key in
+      let _ = arr_set vs slot val in
+      1
+    else if cur == key then
+      let _ = arr_set vs slot val in
+      1
+    else
+      let ns = slot + 1 in
+      let nslot = if ns >= cap then 0 else ns in
+      t2_smap_put_probe ks vs cap key val nslot (tries + 1)
+
+-- lookup key -> val, or -1 if absent.
+t2_smap_get m key = match m
+  | SMap ks vs cap ->
+    let start = t2_str_hash key cap in
+    t2_smap_get_probe ks vs cap key start 0
+
+t2_smap_get_probe ks vs cap key slot tries =
+  if tries >= cap then (0 - 1)
+  else
+    let cur = arr_get ks slot in
+    if cur == "" then (0 - 1)
+    else if cur == key then arr_get vs slot
+    else
+      let ns = slot + 1 in
+      let nslot = if ns >= cap then 0 else ns in
+      t2_smap_get_probe ks vs cap key nslot (tries + 1)
+
+-- ============================================================
+-- SECTION 6: Tokenizer ADT
+-- ============================================================
+-- id_to_byte : arr (id -> raw output byte string)   [for detokenize]
+-- id_to_glyph: arr (id -> glyph string)             [for encode pieces]
+-- glyph_to_id: SMap (glyph string -> id)            [for encode lookup]
+-- merge_rank : SMap (pair-glyph "A B" -> rank int)  [for merge-priority encode]
+-- vsize, cap
+
+type Tok2 = | Tok2 id_to_byte id_to_glyph glyph_to_id merge_rank vsize
+
+-- ============================================================
+-- SECTION 7: parse model.vocab from buffer
+-- ============================================================
+-- Locate "vocab":{ ... }. Walk entries:  "<glyph-with-escapes>":<int>,
+-- For each: read the quoted key (handling \" and \\), JSON-unescape it,
+-- byte-unmap -> raw byte string, store both glyph & byte forms by id, and
+-- register glyph->id in the SMap. Special/added tokens are injected
+-- separately (their content must NOT be byte-unmapped).
+
+-- read a JSON-quoted string from buf starting at the opening quote position
+-- `qpos` (buf[qpos] == '"'). Returns (raw_glyph_string, next_off_after_close_quote).
+-- Collects the RAW bytes between the quotes (including escape backslashes),
+-- then JSON-unescapes the collected string.
+t2_read_qstring buf blen qpos =
+  -- qpos points at opening quote; start scan at qpos+1
+  t2_read_qstring_loop buf blen (qpos + 1) []
+
+t2_read_qstring_loop buf blen off acc =
+  if off >= blen then (join "" (reverse acc), off)
+  else
+    let b = byte_at buf off in
+    if b == 34 then (join "" (reverse acc), off + 1)   -- closing quote (")
+    else if b == 92 then                                -- backslash (\)
+      -- keep the backslash AND the next byte verbatim; unescape later.
+      let nb = if off + 1 < blen then byte_at buf (off + 1) else 0 in
+      t2_read_qstring_loop buf blen (off + 2) (cons (char_from_int nb) (cons (char_from_int 92) acc))
+    else t2_read_qstring_loop buf blen (off + 1) (cons (char_from_int b) acc)
+
+-- skip whitespace and a single ':' to land on the value start.
+t2_skip_to_value buf blen off =
+  if off >= blen then off
+  else
+    let b = byte_at buf off in
+    if b == 32 then t2_skip_to_value buf blen (off + 1)
+    else if b == 58 then t2_skip_to_value buf blen (off + 1)   -- ':'
+    else if b == 9 then t2_skip_to_value buf blen (off + 1)
+    else if b == 10 then t2_skip_to_value buf blen (off + 1)
+    else if b == 13 then t2_skip_to_value buf blen (off + 1)
+    else off
+
+-- find next quote OR closing brace from off; returns offset.
+t2_next_quote_or_brace buf blen off =
+  if off >= blen then off
+  else
+    let b = byte_at buf off in
+    if b == 34 then off            -- "
+    else if b == 125 then off      -- }
+    else t2_next_quote_or_brace buf blen (off + 1)
+
+-- main vocab parse loop. byte_arr, glyph_arr, smap pre-allocated.
+-- off starts just after "vocab":{
+-- `count` tracks max-id+1 (the TRUE vocab_size). HF ids are contiguous for the
+-- BPE range but added/special tokens can sit above it, so max-id+1 is the right
+-- size to report — NOT the raw key count (attempt_0's bigger-id convention).
+t2_parse_vocab_loop buf blen unmap byte_arr glyph_arr gmap off count =
+  let qb = t2_next_quote_or_brace buf blen off in
+  if qb >= blen then count
+  else
+    let bb = byte_at buf qb in
+    if bb == 125 then count            -- '}' end of vocab object
+    else
+      -- bb == '"' : read key
+      let kr = t2_read_qstring buf blen qb in
+      let (raw_key, after_key) = kr in
+      let val_start = t2_skip_to_value buf blen after_key in
+      let ir = t2_buf_read_int buf blen val_start in
+      let (id, after_int) = ir in
+      -- decode the glyph key + byte form
+      let glyph = t2_json_unescape raw_key in
+      let byts = t2_unmap_glyph unmap glyph in
+      let _ = arr_set glyph_arr id glyph in
+      let _ = arr_set byte_arr id byts in
+      let _ = t2_smap_put gmap glyph id in
+      let bigger = if (id + 1) > count then id + 1 else count in
+      t2_parse_vocab_loop buf blen unmap byte_arr glyph_arr gmap after_int bigger
+
+-- ============================================================
+-- SECTION 8: parse model.merges (array-of-pairs format) -> merge_rank SMap
+-- ============================================================
+-- Modern HF: "merges":[["A","B"],["C","D"],...]. Rank = position (0-based);
+-- lower rank = higher priority. Key into merge_rank SMap = "A B" (the two
+-- glyph strings joined by a single space) — matches the encode probe key.
+-- Older format "merges":["A B","C D",...] also handled: each element is a
+-- single quoted string already containing the space.
+
+-- Detect format: after "merges":[ , the next non-ws char is '[' (array) or '"' (string).
+t2_parse_merges buf blen mrank off =
+  let p = t2_skip_ws buf blen off in
+  if p >= blen then 0
+  else
+    let b = byte_at buf p in
+    if b == 91 then t2_parse_merges_pairs buf blen mrank p 0       -- '[' nested
+    else if b == 34 then t2_parse_merges_strings buf blen mrank p 0 -- '"' string
+    else 0
+
+t2_skip_ws buf blen off =
+  if off >= blen then off
+  else
+    let b = byte_at buf off in
+    if b == 32 then t2_skip_ws buf blen (off + 1)
+    else if b == 9 then t2_skip_ws buf blen (off + 1)
+    else if b == 10 then t2_skip_ws buf blen (off + 1)
+    else if b == 13 then t2_skip_ws buf blen (off + 1)
+    else off
+
+-- nested array-of-pairs:  [ ["A","B"], ["C","D"], ... ]
+-- `off` points at-or-before the next inner '[' (on entry: the outer '[').
+-- Each iteration we look for the NEXT '[' (an inner pair) before the next ']'.
+-- The outer-close test: if a ']' appears before the next '[', we are done.
+-- (After reading a pair, a2 lands inside the inner array, BEFORE its ']', so we
+--  must search past that inner ']' for the next inner '['.)
+t2_parse_merges_pairs buf blen mrank off rank =
+  let p = t2_find_open_or_outer_close buf blen off in
+  if p >= blen then rank
+  else
+    let b = byte_at buf p in
+    if b == 93 then rank                  -- ']' outer end (no '[' before it)
+    else
+      -- b == '[' : an inner pair. read its two qstrings.
+      let q1 = t2_next_quote buf blen (p + 1) in
+      let r1 = t2_read_qstring buf blen q1 in
+      let (s1, a1) = r1 in
+      let q2 = t2_next_quote buf blen a1 in
+      let r2 = t2_read_qstring buf blen q2 in
+      let (s2, a2) = r2 in
+      let g1 = t2_json_unescape s1 in
+      let g2 = t2_json_unescape s2 in
+      let key = cat [g1, " ", g2] in
+      let _ = t2_smap_put mrank key rank in
+      -- a2 is between s2's close-quote and the inner ']'. Skip that inner ']'.
+      let after_inner = t2_skip_to_after_close buf blen a2 in
+      t2_parse_merges_pairs buf blen mrank after_inner (rank + 1)
+
+-- from `off`, return the offset of the next '[' (inner pair) IF it occurs before
+-- the next ']' at the same effective level; otherwise the ']' (outer close).
+-- Since after_inner is past the inner ']', the next significant bracket is
+-- either '[' (another pair) or ']' (outer close) with only ',' / ws between.
+t2_find_open_or_outer_close buf blen off =
+  if off >= blen then off
+  else
+    let b = byte_at buf off in
+    if b == 91 then off       -- '['
+    else if b == 93 then off  -- ']'
+    else t2_find_open_or_outer_close buf blen (off + 1)
+
+-- advance past the next ']' (the inner array's close bracket).
+t2_skip_to_after_close buf blen off =
+  if off >= blen then off
+  else if byte_at buf off == 93 then off + 1
+  else t2_skip_to_after_close buf blen (off + 1)
+
+-- string format: [ "A B", "C D", ... ]
+t2_parse_merges_strings buf blen mrank off rank =
+  let p = t2_next_quote_or_close buf blen off in
+  if p >= blen then rank
+  else
+    let b = byte_at buf p in
+    if b == 93 then rank
+    else
+      let r = t2_read_qstring buf blen p in
+      let (s, a) = r in
+      let g = t2_json_unescape s in
+      let _ = t2_smap_put mrank g rank in
+      t2_parse_merges_strings buf blen mrank a (rank + 1)
+
+t2_find_bracket buf blen off =
+  if off >= blen then off
+  else
+    let b = byte_at buf off in
+    if b == 91 then off       -- '['
+    else if b == 93 then off  -- ']'
+    else t2_find_bracket buf blen (off + 1)
+
+t2_next_quote buf blen off =
+  if off >= blen then off
+  else if byte_at buf off == 34 then off
+  else t2_next_quote buf blen (off + 1)
+
+t2_next_quote_or_close buf blen off =
+  if off >= blen then off
+  else
+    let b = byte_at buf off in
+    if b == 34 then off
+    else if b == 93 then off
+    else t2_next_quote_or_close buf blen (off + 1)
+
+-- ============================================================
+-- SECTION 9: added_tokens (special tokens) — content NOT byte-unmapped
+-- ============================================================
+-- "added_tokens":[{"id":N,"content":"<|..|>","special":true}, ...]
+-- For each, store content verbatim as BOTH the byte form (literal UTF-8 out)
+-- and the glyph form (so encode can match it as a single piece), and register
+-- content->id in gmap. We do a light scan: find each '{', read "id":N and
+-- "content":"...".
+--
+-- WHITESPACE-TOLERANT parse (HF tokenizer.json is pretty-printed: `"id": 0,`
+-- and `"content": "<|..|>"` carry a SPACE after the colon). We locate the KEY
+-- ("id" / "content") and then t2_skip_to_value past the colon AND any
+-- whitespace to the value start — never matching a rigid `"key":"` literal nor
+-- reading an int off a leading space. Both the compact fixture and real
+-- pretty-printed HF JSON parse identically.
+--
+-- Returns max-id+1 across the added tokens (folded with the incoming `count`,
+-- which is the vocab loop's max-id+1) so the TRUE vocab size (used by the
+-- detok vsize guard) covers special tokens that live ONLY in added_tokens.
+t2_parse_added buf blen byte_arr glyph_arr gmap off count =
+  let p = t2_find_obj_or_close buf blen off in
+  if p >= blen then count
+  else
+    let b = byte_at buf p in
+    if b == 93 then count              -- ']' end of added_tokens
+    else
+      -- b == '{' : parse this object for id + content
+      let objend = t2_find_brace_close buf blen (p + 1) in
+      let idp = t2_buf_find buf objend "\"id\"" p in
+      let id = if idp < 0 then (0 - 1)
+               else (let vstart = t2_skip_to_value buf blen (idp + 4) in
+                     let r = t2_buf_read_int buf blen vstart in (let (v, _) = r in v)) in
+      let cp = t2_buf_find buf objend "\"content\"" p in
+      if cp < 0 then t2_parse_added buf blen byte_arr glyph_arr gmap (objend + 1) count
+      else
+        -- skip past the colon + whitespace to the value's opening quote.
+        let qpos = t2_skip_to_value buf blen (cp + 9) in   -- "content" is 9 chars
+        let r = t2_read_qstring buf blen qpos in
+        let (s, _) = r in
+        let content = t2_json_unescape s in
+        let _ = if id >= 0 then
+                  (let _ = arr_set byte_arr id content in
+                   let _ = arr_set glyph_arr id content in
+                   t2_smap_put gmap content id)
+                else 0 in
+        let bigger = if (id + 1) > count then id + 1 else count in
+        t2_parse_added buf blen byte_arr glyph_arr gmap (objend + 1) bigger
+
+t2_find_obj_or_close buf blen off =
+  if off >= blen then off
+  else
+    let b = byte_at buf off in
+    if b == 123 then off       -- '{'
+    else if b == 93 then off   -- ']'
+    else t2_find_obj_or_close buf blen (off + 1)
+
+t2_find_brace_close buf blen off =
+  if off >= blen then off
+  else if byte_at buf off == 125 then off
+  else t2_find_brace_close buf blen (off + 1)
+
+-- ============================================================
+-- SECTION 10: special-token predicate + EOS stop + ChatML frame
+-- ============================================================
+-- SmolLM2-135M-Instruct special ids (from added_tokens):
+--   0 <|endoftext|>  1 <|im_start|>  2 <|im_end|>  3..16 StarCoder tags.
+-- is_special_id is a NAMED predicate (NOT a filter-lambda — those segfault on
+-- full-vocab data). Nested ifs honor Rail's no-short-circuit rule.
+t2_is_special_id id =
+  if id == 0 then true
+  else if id == 1 then true
+  else if id == 2 then true
+  else if id >= 3 then (if id <= 16 then true else false)
+  else false
+
+-- EOS test for the inference generate loop. SmolLM2-Instruct stops on
+-- <|im_end|> (id 2); base/raw-text prompting also stops on <|endoftext|> (id 0).
+-- Call this FIRST in generate_loop, as a plain nested if (never combine with ||,
+-- which evaluates both sides). Returns true to stop.
+t2_is_eos id =
+  if id == 2 then true
+  else if id == 0 then true
+  else false
+
+-- ChatML / Instruct prompt frame. Special-token literals are injected as their
+-- IDs directly (1 = <|im_start|>, 2 = <|im_end|>), NEVER byte-level-BPE-encoded
+-- (encoding "<|im_start|>" as text would shatter it into sub-tokens, never id 1).
+-- Produces the id list for: <|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n
+t2_chatml_frame tok user_text =
+  let bg = t2_byte_to_glyph_arr in
+  let u  = t2_encode_word tok bg (cat ["user", char_from_int 10, user_text]) in
+  let nl = t2_encode_word tok bg (char_from_int 10) in
+  let a  = t2_encode_word tok bg (cat ["assistant", char_from_int 10]) in
+  -- 1, u..., 2, nl..., 1, a...
+  append (cons 1 u) (append (cons 2 nl) (cons 1 a))
+
+-- ============================================================
+-- SECTION 11: DETOKENIZE (mandatory, must be correct)
+-- ============================================================
+-- ids -> text. vocab[id] already holds raw output bytes (special tokens stored
+-- verbatim at load). Bounds-guarded O(1) accessor.
+-- The guard is NESTED if (Rail has no short-circuit: `id>=0 && id<n` would still
+-- evaluate the arr_get on an OOB id). The guard is on the TRUE vocab size
+-- (vsize = max-id+1), NOT the allocated array length (vocab_cap). The arrays are
+-- over-allocated (arr_new vocab_cap ""), so ids in the window [vsize, vocab_cap)
+-- are in-bounds for arr_get but hold the default "" fill — guarding on vsize
+-- makes a clipped/buggy-argmax id in that whole window surface as U+FFFD instead
+-- of SILENTLY reading the empty default slot (the bug refiner KEY FIX #1 claims
+-- to have eliminated). An out-of-range id (id<0 or id>=vsize) emits the Unicode
+-- REPLACEMENT CHARACTER U+FFFD (UTF-8 bytes EF BF BD = 239,191,189) so a
+-- model/argmax bug surfaces visibly rather than silently dropping the token.
+-- This path triggers ONLY on a corrupt/out-of-vocab id, never on valid output.
+t2_fffd = cat [char_from_int 239, char_from_int 191, char_from_int 189]
+
+t2_detok_one byte_arr vsize id =
+  if id < 0 then t2_fffd
+  else if id >= vsize then t2_fffd
+  else arr_get byte_arr id
+
+-- STREAMING primitive for the inference engine: emit ONE token's text at a time
+-- (O(1) lookup, no accumulation) so long generation never builds a giant Rail
+-- string and never hits the ~64KB O(N^2) bytes_to_str wall. The caller prints
+-- each chunk and discards it.
+t2_detok_id tok id = match tok
+  | Tok2 byte_arr glyph_arr gmap mrank vsize ->
+    t2_detok_one byte_arr vsize id
+
+-- Batch detokenize (for the self-test / short sequences). For long generation
+-- prefer t2_detok_id per token.
+t2_detok_chunk byte_arr cap ids =
+  if ids == [] then ""
+  else
+    let s = t2_detok_one byte_arr cap (head ids) in
+    cat [s, t2_detok_chunk byte_arr cap (tail ids)]
+
+t2_detokenize tok ids = match tok
+  | Tok2 byte_arr glyph_arr gmap mrank vsize ->
+    t2_detok_chunk byte_arr vsize ids
+
+-- ============================================================
+-- SECTION 12: ENCODE (merge-priority BPE)
+-- ============================================================
+-- Pre-tokenize: GPT-2 maps raw input bytes -> glyph codepoints, then splits on
+-- whitespace boundaries via a regex. We implement the byte->glyph remap AND a
+-- real whitespace split (t2_pretok_split, below) that groups each word with its
+-- leading space (the common case) and BPE's each word independently — this both
+-- matches the dominant tokenization AND keeps encode near-linear (BPE on the
+-- whole input as one word is O(N^2); per-word it is O(N*W)). The exact GPT-2
+-- pre-tokenization regex (contraction/punctuation/digit splits) is out of scope
+-- (decode-only is the hard guarantee — see module header).
+--
+-- Algorithm (merge-priority, the canonical BPE):
+--   1. start with a list of single-byte glyph strings for the word
+--   2. repeatedly find the adjacent pair (g_i, g_{i+1}) whose "g_i g_{i+1}"
+--      has the LOWEST merge rank; merge it (concat) into one piece
+--   3. stop when no adjacent pair has a rank
+--   4. map each final glyph piece -> id via gmap
+
+-- inverse of byte-unmap: raw byte -> glyph codepoint -> glyph UTF-8 string.
+t2_byte_to_glyph_arr =
+  -- build forward map byte(0..255) -> glyph codepoint, as an int array.
+  let arr = arr_new 256 0
+  let _ = t2_bg_fill arr t2_unmap_bytes 256 0   -- remapped first, then identity
+  arr
+
+-- fill: for the 68 remapped bytes (t2_unmap_bytes[i]) the glyph cp is 256+i;
+-- everything else is identity (cp == byte). We init identity, then override.
+t2_bg_fill arr remap base i =
+  let _ = t2_bg_identity arr 0 in
+  let _ = t2_bg_override arr remap base 0 in
+  arr
+
+t2_bg_identity arr i =
+  if i >= 256 then 0
+  else
+    let _ = arr_set arr i i in
+    t2_bg_identity arr (i + 1)
+
+t2_bg_override arr remap base i =
+  if remap == [] then 0
+  else
+    let byte = head remap in
+    let _ = arr_set arr byte (base + i) in
+    t2_bg_override arr (tail remap) base (i + 1)
+
+-- raw input text -> list of glyph single-codepoint strings (per byte).
+t2_text_to_glyphpieces bg cs acc =
+  if cs == [] then reverse acc
+  else
+    let byte = char_to_int (head cs) in
+    let cp = arr_get bg byte in
+    t2_text_to_glyphpieces bg (tail cs) (cons (t2_cp_glyph cp) acc)
+
+-- codepoint -> glyph UTF-8 string (1/2/3-byte).
+t2_cp_glyph cp = join "" (reverse (t2_emit_utf8 cp []))
+
+-- find the index of the lowest-rank adjacent pair in `pieces` (a list).
+-- returns (best_index, best_rank); best_index = -1 if no pair has a rank.
+t2_find_best_pair mrank pieces =
+  t2_fbp_loop mrank pieces 0 (0 - 1) 1000000000
+
+t2_fbp_loop mrank pieces i best_i best_r =
+  if pieces == [] then (best_i, best_r)
+  else
+    let rest = tail pieces in
+    if rest == [] then (best_i, best_r)
+    else
+      let a = head pieces in
+      let b = head rest in
+      let key = cat [a, " ", b] in
+      let r = t2_smap_get mrank key in
+      if r < 0 then t2_fbp_loop mrank rest (i + 1) best_i best_r
+      else if r < best_r then t2_fbp_loop mrank rest (i + 1) i r
+      else t2_fbp_loop mrank rest (i + 1) best_i best_r
+
+-- merge the pair at index `idx` (concat pieces[idx] ++ pieces[idx+1]).
+t2_merge_at pieces idx =
+  t2_merge_at_loop pieces idx 0 []
+
+t2_merge_at_loop pieces idx i acc =
+  if pieces == [] then reverse acc
+  else if i == idx then
+    let a = head pieces in
+    let rest = tail pieces in
+    let b = head rest in
+    -- emit merged, then continue AFTER both consumed
+    t2_append_rest (tail rest) (cons (cat [a, b]) acc)
+  else t2_merge_at_loop (tail pieces) idx (i + 1) (cons (head pieces) acc)
+
+t2_append_rest pieces acc =
+  if pieces == [] then reverse acc
+  else t2_append_rest (tail pieces) (cons (head pieces) acc)
+
+-- merge-priority BPE on a single word's glyph pieces.
+t2_bpe_word mrank pieces =
+  let bp = t2_find_best_pair mrank pieces in
+  let (idx, r) = bp in
+  if idx < 0 then pieces
+  else
+    let merged = t2_merge_at pieces idx in
+    t2_bpe_word mrank merged
+
+-- map final glyph pieces -> ids (via gmap). Unknown -> -1.
+t2_pieces_to_ids gmap pieces acc =
+  if pieces == [] then reverse acc
+  else
+    let id = t2_smap_get gmap (head pieces) in
+    t2_pieces_to_ids gmap (tail pieces) (cons id acc)
+
+-- encode a single contiguous word (no whitespace splitting). Best-effort.
+t2_encode_word tok bg text = match tok
+  | Tok2 byte_arr glyph_arr gmap mrank vsize ->
+    let pieces = t2_text_to_glyphpieces bg (chars text) [] in
+    let final = t2_bpe_word mrank pieces in
+    t2_pieces_to_ids gmap final []
+
+-- PRE-TOKENIZE (GPT-2-style whitespace split, leading-space-attached). The
+-- input is partitioned into runs of the shape: (optional single leading space)
+-- (a maximal run of non-space bytes). Each run is BPE'd INDEPENDENTLY, so a
+-- single BPE word never exceeds one whitespace-delimited token's length. This
+-- is the crucial PERFORMANCE fix: BPE is ~O(W^2) in the WORD length W, so
+-- splitting first turns the encoder from O(N^2) in the whole-input length into
+-- O(N * W) (linear in input for bounded word lengths). It also matches HF
+-- exactly on whitespace-delimited input (the leading space becomes the G-dot
+-- glyph, identical to feeding " word" — verified on the golden strings). The
+-- full GPT-2 pre-tokenization regex (contraction/punctuation/digit splits) is
+-- still NOT ported; for inputs where cross-boundary merges would matter, supply
+-- prompt ids offline (see module header). Multi-space runs split each space
+-- into its own leading-space run; that is a CORRECTNESS edge (rare in natural
+-- text), never a performance one.
+--
+-- Returns a list of run-strings (in order). cs is the byte-char list of input.
+t2_pretok_split cs acc =
+  if cs == [] then reverse acc
+  else
+    let c0 = head cs in
+    if c0 == " " then
+      -- leading space starts a new run: take the space + following non-spaces.
+      let body = t2_pretok_take_nonspace (tail cs) [] in
+      let (run_chars, rest) = body in
+      let run = join "" (cons " " run_chars) in
+      t2_pretok_split rest (cons run acc)
+    else
+      let body = t2_pretok_take_nonspace cs [] in
+      let (run_chars, rest) = body in
+      let run = join "" run_chars in
+      t2_pretok_split rest (cons run acc)
+
+-- take a maximal run of non-space chars; returns (run_chars_in_order, rest).
+t2_pretok_take_nonspace cs acc =
+  if cs == [] then (reverse acc, [])
+  else
+    let c0 = head cs in
+    if c0 == " " then (reverse acc, cs)
+    else t2_pretok_take_nonspace (tail cs) (cons c0 acc)
+
+-- encode all pre-tokenized runs, concatenating their id lists in order.
+t2_encode_runs tok bg runs acc =
+  if runs == [] then reverse acc
+  else
+    let ids = t2_encode_word tok bg (head runs) in
+    t2_encode_runs tok bg (tail runs) (t2_revcat ids acc)
+
+-- prepend (reverse xs) onto acc, i.e. acc' = reverse(xs) ++ acc, so a final
+-- reverse of the accumulator restores original order. O(total ids), no append.
+t2_revcat xs acc =
+  if xs == [] then acc
+  else t2_revcat (tail xs) (cons (head xs) acc)
+
+-- public encode: GPT-2-style whitespace pre-tokenization, then merge-priority
+-- BPE per word. Linear-ish in input length (was O(N^2): the whole input used to
+-- be fed as a single BPE word). Matches HF for whitespace-delimited text.
+t2_encode tok text =
+  let bg = t2_byte_to_glyph_arr in
+  let runs = t2_pretok_split (chars text) [] in
+  t2_encode_runs tok bg runs []
+
+-- ============================================================
+-- SECTION 13: load with explicit blen (avoids missing buf-len builtin)
+-- ============================================================
+t2_load2 path blen vocab_cap =
+  let buf = read_file_bytes path in
+  let unmap = t2_build_unmap_arr in
+  let byte_arr = arr_new vocab_cap "" in
+  let glyph_arr = arr_new vocab_cap "" in
+  let hcap = vocab_cap * 2 + 17 in
+  let gmap = t2_smap_new hcap in
+  let mrank = t2_smap_new (hcap * 4) in
+  -- Markers are whitespace-tolerant: HF tokenizer.json is pretty-printed
+  -- ("vocab": {\n ...), so we find the key string then skip to the structural
+  -- open-brace/bracket rather than matching a rigid "key":{ literal.
+  -- NOTE: search vocab/merges AFTER the "model" key to avoid colliding with a
+  -- possible top-level "vocab" elsewhere (there isn't one, but be safe by
+  -- locating "model" first).
+  let mdl = t2_buf_find buf blen "\"model\"" 0 in
+  let mdl0 = if mdl < 0 then 0 else mdl in
+  let vkey = t2_buf_find buf blen "\"vocab\"" mdl0 in
+  let vstart = if vkey < 0 then blen else (t2_find_char buf blen 123 (vkey + 7)) + 1 in
+  let vcount = t2_parse_vocab_loop buf blen unmap byte_arr glyph_arr gmap vstart 0 in
+  let mkey = t2_buf_find buf blen "\"merges\"" mdl0 in
+  let mstart = if mkey < 0 then blen else (t2_find_char buf blen 91 (mkey + 8)) + 1 in
+  let _ = if mkey < 0 then 0 else t2_parse_merges buf blen mrank mstart in
+  let akey = t2_buf_find buf blen "\"added_tokens\"" 0 in
+  let astart = if akey < 0 then blen else (t2_find_char buf blen 91 (akey + 14)) + 1 in
+  -- fold the added-token max-id+1 into vcount so the detok vsize guard covers
+  -- special tokens that live ONLY in added_tokens (not duplicated in vocab).
+  let vsize = if akey < 0 then vcount
+              else t2_parse_added buf blen byte_arr glyph_arr gmap astart vcount in
+  Tok2 byte_arr glyph_arr gmap mrank vsize
+
+-- find the offset of the first byte == target at or after off (or blen).
+t2_find_char buf blen target off =
+  if off >= blen then off
+  else if byte_at buf off == target then off
+  else t2_find_char buf blen target (off + 1)
+
+-- get file length via shell wc -c (single small fork at load).
+t2_file_len path =
+  let out = shell (cat ["wc -c < ", path]) in
+  t2_parse_int_str out
+
+-- NO-SHELL file-length: read_file_bytes appends a trailing NUL, so scan to the
+-- first 0x00 byte. `cap` is a generous upper bound (e.g. 8000000 for the 2.1MB
+-- tokenizer.json) so a corrupt/NUL-free buffer can't loop forever. This avoids
+-- the wc -c fork (shell() doesn't inherit env, and a fork-per-load is avoidable).
+-- WARNING: tokenizer.json contains zero interior NUL bytes, so the first NUL is
+-- the appended terminator -> exact length. (Do NOT use this on a binary file
+-- with interior NULs — use the explicit-blen t2_load2 there instead.)
+t2_buf_len buf cap =
+  t2_buf_len_loop buf cap 0
+
+t2_buf_len_loop buf cap i =
+  if i >= cap then i
+  else if byte_at buf i == 0 then i
+  else t2_buf_len_loop buf cap (i + 1)
+
+-- convenience loader: no-shell length via NUL-scan, then load.
+-- cap = upper bound on file size; vocab_cap = id-array size (>= true vocab_size).
+t2_load path cap vocab_cap =
+  let buf = read_file_bytes path in
+  let blen = t2_buf_len buf cap in
+  t2_load2 path blen vocab_cap
+
+-- skip leading non-digits (wc -c emits leading spaces), then parse digits.
+t2_parse_int_str s = t2_pi_skip (chars s)
+
+t2_pi_skip cs =
+  if cs == [] then 0
+  else
+    let b = char_to_int (head cs) in
+    if b >= 48 then (if b <= 57 then t2_pi_loop cs 0 else t2_pi_skip (tail cs))
+    else t2_pi_skip (tail cs)
+
+t2_pi_loop cs acc =
+  if cs == [] then acc
+  else
+    let b = char_to_int (head cs) in
+    if b >= 48 then (if b <= 57 then t2_pi_loop (tail cs) (acc * 10 + (b - 48)) else acc)
+    else acc
+
+-- ============================================================
+-- SECTION 13b: TWO-FILE loader (vocab.json + merges.txt) — older HF format
+-- ============================================================
+-- The brief allows EITHER tokenizer.json OR a (vocab.json, merges.txt) pair.
+-- vocab.json is a bare object {"<glyph>": id, ...} (no "model" wrapper).
+-- merges.txt is line-delimited "A B" pairs; rank = line index (skipping a
+-- leading "#version: ..." comment and any blank lines). We byte-unmap glyphs
+-- at load (so detokenize is correct for free), build the same SMaps, and store
+-- the same Tok2. CR-strip each merges line (CRLF files leave a trailing \r).
+--
+-- Parsing notes honoring the traps:
+--   * merges.txt lines: str_split "\n" then per-line str_replace CR then
+--     str_split " " into exactly two glyph halves; guard `length parts < 2`.
+--   * NEVER single-char split; str_split is multi-char-safe (used here only on
+--     "\n" and " ", both single-byte, but str_split keeps it uniform).
+--   * parse_int (never to_int) for the vocab ids (handled inside the shared
+--     buffer vocab loop, which reads digits directly).
+
+-- strip a trailing/embedded CR from a line.
+t2_strip_cr line = str_replace (char_from_int 13) "" line
+
+-- is this a comment / version line? (#... — merges.txt header)
+t2_is_comment_line line =
+  if line == "" then true
+  else if (head (chars line)) == "#" then true
+  else false
+
+-- parse merges.txt content (one "A B" per line) into mrank. rank = surviving
+-- line index (comments/blanks skipped, NOT counted toward rank).
+t2_parse_merges_txt mrank content =
+  let lines = str_split "\n" content in
+  t2_merges_txt_loop mrank lines 0
+
+t2_merges_txt_loop mrank lines rank =
+  if lines == [] then rank
+  else
+    let raw = head lines in
+    let line = t2_strip_cr raw in
+    if t2_is_comment_line line then t2_merges_txt_loop mrank (tail lines) rank
+    else
+      let parts = str_split " " line in
+      if (length parts) < 2 then t2_merges_txt_loop mrank (tail lines) rank
+      else
+        -- merges.txt is PLAIN TEXT: each glyph half is already the raw byte-level
+        -- GPT-2 glyph (UTF-8) as read from disk — NOT JSON-escaped. Do NOT run
+        -- t2_json_unescape here: the backslash byte 0x5C is a valid passthrough
+        -- glyph, and unescaping \/, \", \\, \n, \t, \r would corrupt the merge
+        -- key (e.g. "\/" -> "/"), so that merge would never fire and encode would
+        -- diverge from HF. (The single-file tokenizer.json path DOES unescape,
+        -- because there the glyphs are genuinely JSON-escaped in the buffer.)
+        let g1 = head parts in
+        let g2 = head (tail parts) in
+        let key = cat [g1, " ", g2] in
+        let _ = t2_smap_put mrank key rank in
+        t2_merges_txt_loop mrank (tail lines) (rank + 1)
+
+-- load from a (vocab.json, merges.txt) pair. vocab_cap >= true vocab_size.
+-- vcap = upper bound on vocab.json size; mcap = upper bound on merges.txt size.
+t2_load_twofile vocab_path merges_path vcap mcap vocab_cap =
+  let vbuf = read_file_bytes vocab_path in
+  let vblen = t2_buf_len vbuf vcap in
+  let unmap = t2_build_unmap_arr in
+  let byte_arr = arr_new vocab_cap "" in
+  let glyph_arr = arr_new vocab_cap "" in
+  let hcap = vocab_cap * 2 + 17 in
+  let gmap = t2_smap_new hcap in
+  let mrank = t2_smap_new (hcap * 4) in
+  -- vocab.json: bare object — find the first '{' and parse entries.
+  let vstart = (t2_find_char vbuf vblen 123 0) + 1 in
+  let vcount = t2_parse_vocab_loop vbuf vblen unmap byte_arr glyph_arr gmap vstart 0 in
+  -- merges.txt: read whole file, parse lines. (Plain text, no interior NULs,
+  -- so read_file is safe — it would only truncate at a 0x00, which merges.txt
+  -- never contains.)
+  let mraw = read_file merges_path in
+  let _ = t2_parse_merges_txt mrank mraw in
+  Tok2 byte_arr glyph_arr gmap mrank vcount
+
+-- ============================================================
+-- SECTION 14: self-test
+-- ============================================================
+-- Write a tiny synthetic tokenizer.json fixture covering: passthrough bytes,
+-- the space glyph (G-dot), a newline glyph (C-dot), merges (array-of-pairs),
+-- and an added/special token. Then verify:
+--   (a) DETOKENIZE: known ids -> expected raw text (space + newline correct)
+--   (b) round-trip: encode(detokenize(ids)) reconstructs ids for merge-built tokens
+--   (c) ENCODE merge-priority: "hello" with merges should pick lowest rank first
+
+pf ok = if ok == 1 then "PASS" else "FAIL"
+
+-- expected: build a small fixture. Glyphs:
+--   "h"=0 "e"=1 "l"=2 "o"=3            (passthrough ascii)
+--   "G-dot"=4 (space)  "C-dot"=5 (newline)
+--   "he"=6 "ll"=7 "hello"=8
+--   "G-dot-w"=9 (space+w) ... keep minimal
+--   added: "<|end|>"=10
+-- merges (rank order): ["h","e"](->he, rank0), ["l","l"](->ll,1),
+--   ["he","ll"](->hell? no token) ... keep: ["he","llo"] not present.
+-- We use: merges = [["h","e"],["l","l"],["he","l"],["hel","lo"]] mapping to
+--   "he"=6,"ll"=7,"hel"... let's keep the vocab consistent.
+
+t2_write_fixture path =
+  -- glyphs: space = Ġ (G-dot), newline-glyph = Ċ (C-dot)
+  let sp = "\\u0120" in   -- the JSON-escaped space glyph
+  let nl = "\\u010a" in
+  -- vocab JSON: keys are glyph strings, values ids
+  -- ids: h0 e1 l2 o3 space4 nl5 he6 ll7 hel8 hello9 lo10 hell11
+  let vocab = cat ["{\"h\":0,\"e\":1,\"l\":2,\"o\":3,\"", sp, "\":4,\"", nl,
+                   "\":5,\"he\":6,\"ll\":7,\"hel\":8,\"hello\":9,\"lo\":10,\"hell\":11}"] in
+  -- merges: priority order. "h e" rank0, "l l" rank1, "he l" rank2,
+  --   "l o" rank3, "hel lo" rank4, "hel l" rank5, "hell o" rank6
+  let merges = "[[\"h\",\"e\"],[\"l\",\"l\"],[\"he\",\"l\"],[\"l\",\"o\"],[\"hel\",\"lo\"],[\"hel\",\"l\"],[\"hell\",\"o\"]]" in
+  let added = "[{\"id\":12,\"content\":\"<|end|>\",\"special\":true}]" in
+  let json = cat ["{\"version\":\"1.0\",\"added_tokens\":", added,
+                  ",\"model\":{\"type\":\"BPE\",\"vocab\":", vocab,
+                  ",\"merges\":", merges, "}}"] in
+  let _ = write_file path json in
+  0
+
+-- equality of int lists
+t2_ids_eq a b =
+  if a == [] then (if b == [] then 1 else 0)
+  else if b == [] then 0
+  else if head a == head b then t2_ids_eq (tail a) (tail b)
+  else 0
+
+t2_show_ids ids =
+  if ids == [] then ""
+  else cat [show (head ids), " ", t2_show_ids (tail ids)]
+
+-- cross-check: table-based unmap == arithmetic unmap for all 68 remapped
+-- codepoints (256..323). Returns 1 if every cp agrees, 0 otherwise.
+t2_unmap_crosscheck unmap cp =
+  if cp > 323 then 1
+  else if t2_cp_to_byte unmap cp == t2_cp_to_byte_arith cp then t2_unmap_crosscheck unmap (cp + 1)
+  else 0
+
+-- RANK-vs-LIST divergence fixture. Proves the encoder is RANK-DRIVEN (HF's
+-- global-lowest-rank-pair-first), NOT the shipped list-iteration sweep
+-- (apply_merges / bpe_apply_all_merges), which silently mis-tokenizes real HF
+-- vocabs. Construction (verified): symbols a,b,c with merges
+--   rank0 = ("ab","c") -> "abc"   (highest priority, but "ab" not present yet)
+--   rank1 = ("a","b")  -> "ab"
+-- input "abc":
+--   RANK-DRIVEN  : (a,b) is the only ranked pair -> [ab,c] -> now (ab,c) is rank0
+--                  -> [abc]  ==> single id for "abc".
+--   LIST-ITER    : rank0 (ab,c) skipped (no "ab" yet); rank1 (a,b) -> [ab,c];
+--                  list exhausted, never revisits rank0 ==> two ids [ab, c].
+-- So a correct rank-argmin encoder MUST return the single "abc" id here.
+t2_write_div_fixture path =
+  -- ids: a0 b1 c2 ab3 abc4
+  let vocab = "{\"a\":0,\"b\":1,\"c\":2,\"ab\":3,\"abc\":4}" in
+  -- merges in RANK ORDER: rank0 = ab c , rank1 = a b
+  let merges = "[[\"ab\",\"c\"],[\"a\",\"b\"]]" in
+  let json = cat ["{\"model\":{\"type\":\"BPE\",\"vocab\":", vocab,
+                  ",\"merges\":", merges, "}}"] in
+  let _ = write_file path json in
+  0
+
+-- returns 1 if encode("abc") == [4] (the rank-driven "abc" id), 0 otherwise.
+t2_run_divergence_test verbose =
+  let path = "/tmp/railml_build/tokenizer/t2_div_fixture.json" in
+  let _ = t2_write_div_fixture path in
+  let blen = t2_file_len path in
+  let tok = t2_load2 path blen 16 in
+  let e = t2_encode tok "abc" in
+  let ok = t2_ids_eq e [4] in       -- rank-driven -> single "abc" id (4)
+  let _ = if verbose == 1 then
+    print (cat ["(div) rank-driven encode 'abc': got=[", t2_show_ids e,
+                "] expect [4 ] (list-iter would give [3 2 ]) ", pf ok])
+    else 0 in
+  ok
+
+-- TWO-FILE (vocab.json + merges.txt) loader test. Writes a bare vocab.json
+-- object + a merges.txt with a leading "#version" comment + a CR (\r) on one
+-- line, then loads via t2_load_twofile and asserts detok + rank-driven encode.
+t2_run_twofile_test verbose =
+  let vpath = "/tmp/railml_build/tokenizer/t2_vocab.json" in
+  let mpath = "/tmp/railml_build/tokenizer/t2_merges.txt" in
+  -- bare vocab object: a0 b1 c2 ab3 abc4, plus a BACKSLASH glyph 5 and a merge
+  -- target "\/" 6 (backslash+slash) and slash glyph 7 — exercises the Bug-4
+  -- merges.txt-must-NOT-be-JSON-unescaped path. In vocab.json the backslash
+  -- glyph IS JSON-escaped (\\), so the vocab loader's qstring+unescape decodes
+  -- it to the single raw byte 0x5C; in merges.txt below it appears RAW.
+  let vjson = "{\"a\":0,\"b\":1,\"c\":2,\"ab\":3,\"abc\":4,\"\\\\\":5,\"\\\\/\":6,\"/\":7}" in
+  let _ = write_file vpath vjson in
+  -- merges.txt: #version header (skipped), then rank0="ab c", rank1="a b", and
+  -- rank2 = a RAW backslash glyph + slash ("\ /") whose merge target is "\/".
+  -- The backslash here is a literal 0x5C byte (passthrough glyph), NOT an escape.
+  -- Put a CR after "ab c" to exercise the CR-strip path.
+  let bs = char_from_int 92 in   -- raw backslash byte (0x5C)
+  let mtxt = cat ["#version: 0.2", char_from_int 10,
+                  "ab c", char_from_int 13, char_from_int 10,
+                  "a b", char_from_int 10,
+                  bs, " /", char_from_int 10] in
+  let _ = write_file mpath mtxt in
+  let tok = t2_load_twofile vpath mpath 4096 4096 16 in
+  -- detok: [3,2] -> "ab"+"c" = "abc"
+  let d = t2_detokenize tok [3, 2] in
+  let t1 = if d == "abc" then 1 else 0 in
+  -- rank-driven encode "abc" -> [4] (the merged "abc" id), same divergence shape
+  let e = t2_encode tok "abc" in
+  let t2 = t2_ids_eq e [4] in
+  -- BACKSLASH merge must fire: encode "\/" (raw backslash + slash) -> [6]. If
+  -- merges.txt had been JSON-unescaped, the "\ /" key would have become "/ /"
+  -- (or dropped the backslash) and this merge would NOT fire -> [5,7].
+  let e2 = t2_encode tok (cat [bs, "/"]) in
+  let t3 = t2_ids_eq e2 [6] in
+  -- detok of the backslash-merge id must reproduce the raw "\/"
+  let d2 = t2_detokenize tok [6] in
+  let t4 = if d2 == (cat [bs, "/"]) then 1 else 0 in
+  let ok = if t1 == 1 then (if t2 == 1 then (if t3 == 1 then t4 else 0) else 0) else 0 in
+  let _ = if verbose == 1 then
+    (let _ = print (cat ["(two) two-file detok [3,2]   : '", d, "' expect 'abc' ", pf t1]) in
+     let _ = print (cat ["(two) two-file encode 'abc'  : got=[", t2_show_ids e, "] expect [4 ] ", pf t2]) in
+     let _ = print (cat ["(two) backslash merge encode : got=[", t2_show_ids e2, "] expect [6 ] ", pf t3]) in
+     print (cat ["(two) backslash merge detok  : '", d2, "' expect '", cat [bs, "/"], "' ", pf t4]))
+    else 0 in
+  ok
+
+-- run the full synthetic-fixture self-test; returns 1 if all pass.
+t2_run_fixture_tests verbose =
+  let path = "/tmp/railml_build/tokenizer/t2_fixture.json" in
+  let _ = t2_write_fixture path in
+  let blen = t2_file_len path in
+  let tok = t2_load2 path blen 64 in
+  let unmap = t2_build_unmap_arr in
+
+  -- cross-check the two byte-unmap implementations agree
+  let tcc = t2_unmap_crosscheck unmap 256 in
+
+  -- DETOKENIZE space + newline + passthrough: [0,4,1] = "h"+space+"e" => "h e"
+  let d1 = t2_detokenize tok [0, 4, 1] in
+  let exp1 = cat ["h", char_from_int 32, "e"] in
+  let ta = if d1 == exp1 then 1 else 0 in
+
+  -- newline glyph -> byte 0x0a
+  let d2 = t2_detokenize tok [5] in
+  let tb = if d2 == char_from_int 10 then 1 else 0 in
+
+  -- "hello" merged token
+  let d3 = t2_detokenize tok [9] in
+  let tc = if d3 == "hello" then 1 else 0 in
+
+  -- added/special token detok -> literal content (NOT byte-unmapped)
+  let d4 = t2_detokenize tok [12] in
+  let td = if d4 == "<|end|>" then 1 else 0 in
+
+  -- ENCODE merge-priority on "hello" -> [he(6), ll(7), o(3)]
+  let e1 = t2_encode tok "hello" in
+  let te = t2_ids_eq e1 [6, 7, 3] in
+
+  -- round-trip detok(encode("hello")) == "hello"
+  let rt = t2_detokenize tok e1 in
+  let tf = if rt == "hello" then 1 else 0 in
+
+  -- vocab size = max-id+1 = 13 (vocab object holds ids 0..11; added token id 12
+  -- lives ONLY in added_tokens and bumps the TRUE vocab size to 13).
+  let vs = match tok | Tok2 ba ga gm mr v -> v in
+  let tg = if vs == 13 then 1 else 0 in
+
+  -- STREAMING detok primitive: per-token == batch concat
+  let s_id0 = t2_detok_id tok 0 in
+  let s_id4 = t2_detok_id tok 4 in
+  let th = if (cat [s_id0, s_id4]) == (cat ["h", char_from_int 32]) then 1 else 0 in
+
+  -- BOUNDS GUARD (adversarial): id<0, an id in the OVER-ALLOCATED window
+  -- [vsize, vocab_cap) (the actual defect window — in-bounds for arr_get but
+  -- holds the "" default fill), id==vocab_cap, id==vocab_cap+5, and a wildly
+  -- large id must ALL degrade to U+FFFD (EF BF BD) with NO segfault/garbage and
+  -- NO silent empty drop. The guard is on vsize (=13), not arr_len (=64).
+  let oob_hi  = t2_detok_id tok 99999 in
+  let oob_lo  = t2_detok_id tok (0 - 1) in
+  let oob_win = t2_detok_id tok 30 in        -- vsize(13) <= 30 < vocab_cap(64)
+  let oob_cap = t2_detok_id tok 64 in        -- == vocab_cap (the array length)
+  let oob_c5  = t2_detok_id tok 69 in        -- == vocab_cap + 5
+  let ti = if oob_hi == t2_fffd then
+             (if oob_lo == t2_fffd then
+                (if oob_win == t2_fffd then
+                   (if oob_cap == t2_fffd then
+                      (if oob_c5 == t2_fffd then 1 else 0) else 0) else 0) else 0) else 0 in
+
+  -- is_special_id / is_eos named predicates
+  let tj = if t2_is_special_id 12 then 0 else 1 in   -- 12 not in 0..16? it IS <=16 so special
+  let tj2 = if t2_is_special_id 2 then (if t2_is_special_id 12 then (if t2_is_special_id 17 then 0 else 1) else 0) else 0 in
+  let tk = if t2_is_eos 2 then (if t2_is_eos 0 then (if t2_is_eos 5 then 0 else 1) else 0) else 0 in
+
+  let _ = if verbose == 1 then
+    (let _ = print (cat ["(cc) unmap table==arith : ", pf tcc]) in
+     let _ = print (cat ["(a) detok 'h e'        : got='", d1, "' ", pf ta]) in
+     let _ = print (cat ["(b) detok newline      : ", pf tb]) in
+     let _ = print (cat ["(c) detok 'hello'      : got='", d3, "' ", pf tc]) in
+     let _ = print (cat ["(d) special tok verbatim: got='", d4, "' ", pf td]) in
+     let _ = print (cat ["(e) encode 'hello'     : got=[", t2_show_ids e1, "] expect [6 7 3 ] ", pf te]) in
+     let _ = print (cat ["(f) round-trip         : got='", rt, "' ", pf tf]) in
+     let _ = print (cat ["(g) vocab size (max+1) : got=", show vs, " expect 13 ", pf tg]) in
+     let _ = print (cat ["(h) streaming detok_id : ", pf th]) in
+     let _ = print (cat ["(i) bounds guard OOB   : ", pf ti]) in
+     let _ = print (cat ["(j) is_special_id      : ", pf tj2]) in
+     print (cat ["(k) is_eos             : ", pf tk]))
+    else 0 in
+
+  if tcc == 1 then (if ta == 1 then (if tb == 1 then (if tc == 1 then (if td == 1 then (if te == 1 then (if tf == 1 then (if tg == 1 then (if th == 1 then (if ti == 1 then (if tj2 == 1 then tk else 0) else 0) else 0) else 0) else 0) else 0) else 0) else 0) else 0) else 0) else 0
+
+-- GOLDEN-ID test against the REAL SmolLM2-135M tokenizer.json (if present).
+-- This is the load-bearing HF-exactness check: round-trip alone passes a
+-- wrong-but-self-consistent encoder, but matching HF's actual ids cannot.
+-- Returns: 1 = all golden ids matched, 0 = mismatch, 2 = file absent (skipped).
+t2_run_golden_tests verbose =
+  let path = "/tmp/railml_build/tokenizer/smollm2_tokenizer.json" in
+  let probe = shell (cat ["test -f ", path, " && echo Y || echo N"]) in
+  -- Rail str_find is needle-first: str_find NEEDLE HAYSTACK.
+  let present = if (str_find "Y" probe) >= 0 then 1 else 0 in
+  if present == 0 then
+    (let _ = if verbose == 1 then print "GOLDEN: smollm2_tokenizer.json absent -> skipped (synthetic fixture still validates the logic)" else 0 in 2)
+  else
+    let blen = t2_file_len path in
+    let tok = t2_load2 path blen 60000 in
+    -- DECODE golden
+    let d_hw = t2_detokenize tok [19556, 905] in
+    let g1 = if d_hw == "Hello world" then 1 else 0 in
+    -- special-token verbatim detok
+    let d_sp = t2_detokenize tok [0, 1, 2] in
+    let g2 = if d_sp == "<|endoftext|><|im_start|><|im_end|>" then 1 else 0 in
+    -- ENCODE golden (merge-priority, HF ids)
+    let e_hw = t2_encode tok "Hello world" in
+    let g3 = t2_ids_eq e_hw [19556, 905] in
+    let e_hi = t2_encode tok "hello" in
+    let g4 = t2_ids_eq e_hi [28120] in
+    let e_the = t2_encode tok " the" in
+    let g5 = t2_ids_eq e_the [260] in
+    let e_fox = t2_encode tok "The quick brown fox" in
+    let g6 = t2_ids_eq e_fox [504, 2365, 6354, 16438] in
+    -- ChatML frame must start <|im_start|> (id 1) and contain <|im_end|> (id 2)
+    let frame = t2_chatml_frame tok "hi" in
+    let g7 = if (head frame) == 1 then 1 else 0 in
+    let vs = match tok | Tok2 ba ga gm mr v -> v in
+    let g8 = if vs == 49152 then 1 else 0 in
+    let _ = if verbose == 1 then
+      (let _ = print (cat ["(G1) decode [19556,905]      : '", d_hw, "' ", pf g1]) in
+       let _ = print (cat ["(G2) decode [0,1,2] specials : '", d_sp, "' ", pf g2]) in
+       let _ = print (cat ["(G3) encode 'Hello world'    : [", t2_show_ids e_hw, "] expect [19556 905 ] ", pf g3]) in
+       let _ = print (cat ["(G4) encode 'hello'          : [", t2_show_ids e_hi, "] expect [28120 ] ", pf g4]) in
+       let _ = print (cat ["(G5) encode ' the'           : [", t2_show_ids e_the, "] expect [260 ] ", pf g5]) in
+       let _ = print (cat ["(G6) encode 'The quick...'   : [", t2_show_ids e_fox, "] expect [504 2365 6354 16438 ] ", pf g6]) in
+       let _ = print (cat ["(G7) chatml frame head==1    : ", pf g7]) in
+       print (cat ["(G8) vocab size (max+1)      : got=", show vs, " expect 49152 ", pf g8]))
+      else 0 in
+    if g1 == 1 then (if g2 == 1 then (if g3 == 1 then (if g4 == 1 then (if g5 == 1 then (if g6 == 1 then (if g7 == 1 then g8 else 0) else 0) else 0) else 0) else 0) else 0) else 0
+
