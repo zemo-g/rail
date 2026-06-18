@@ -182,21 +182,42 @@ asm_starts_cs sc pc =
 --   "skip"/"label"/"insn" — as before.
 -- Classify on the comment-stripped prefix; but .asciz DECODING uses the RAW
 -- ltrimmed line — strings legitimately contain ';' (28 in the compiler's own .s).
--- LABELS FIRST: local labels are dotted (`.Lelse_0:`) so they'd be swallowed by
--- the directive check — the trailing ':' is the unambiguous discriminator.
+-- Classify WITHOUT rebuilding the line. asm_ltrim/asm_strip_comment do
+-- `join "" (...)` which is O(len^2) in Rail — fatal on the long embedded-runtime
+-- `.asciz` lines (a 40x-longer line was measured 4500x slower). We work on the
+-- raw char list (chars = one O(len) pass) and only ever inspect a short prefix /
+-- the last char, so classify is O(len), not O(len^2).
+-- LABELS via trailing ':' — local labels are dotted (`.Lelse_0:`) and would
+-- otherwise be swallowed by the directive check.
 asm_classify2 line =
-  let s = asm_ltrim (asm_strip_comment line)
-  if s == "" then "skip"
-  else if (asm_is_label s) == 1 then "label"
-  else if (asm_starts s ".section") then (if (str_contains "__TEXT,__text" s) then "sec_text" else "sec_other")
-  else if (asm_starts s ".text") then "sec_text"
-  else if (asm_starts s ".data") then "sec_other"
-  else if (asm_starts s ".zerofill") then "sec_other"
-  else if (asm_starts s ".asciz") then "asciz"
-  else if (asm_starts s ".ascii") then "ascii"
-  else if (asm_starts s ".p2align") then "align"
-  else if (asm_is_directive s) == 1 then "skip"
+  let cs = asm_skip_ws (chars line)
+  if cs == [] then "skip"
+  else if (head cs) == "." then asm_classify_dot cs line
+  else if (asm_chars_end_colon cs) == 1 then "label"
   else "insn"
+
+asm_skip_ws cs =
+  if cs == [] then []
+  else if (head cs) == " " || (head cs) == "\t" then asm_skip_ws (tail cs)
+  else cs
+
+-- char-list prefix test (reuses asm_starts_cs); cs already ws-stripped.
+asm_cprefix cs p = asm_starts_cs cs (chars p)
+asm_chars_end_colon cs = if (head (reverse cs)) == ":" then 1 else 0
+
+-- a '.'-led line: a known section/data directive, a dotted local label, else skip.
+-- Checking directive prefixes BEFORE the colon test avoids reverse-ing long
+-- `.asciz` lines (only short dotted labels reach the colon check).
+asm_classify_dot cs line =
+  if (asm_cprefix cs ".section") == 1 then (if str_contains "__TEXT,__text" line then "sec_text" else "sec_other")
+  else if (asm_cprefix cs ".text") == 1 then "sec_text"
+  else if (asm_cprefix cs ".data") == 1 then "sec_other"
+  else if (asm_cprefix cs ".zerofill") == 1 then "sec_other"
+  else if (asm_cprefix cs ".asciz") == 1 then "asciz"
+  else if (asm_cprefix cs ".ascii") == 1 then "ascii"
+  else if (asm_cprefix cs ".p2align") == 1 then "align"
+  else if (asm_chars_end_colon cs) == 1 then "label"
+  else "skip"
 
 -- ---- inline-data helpers ----
 -- chars of an .asciz/.ascii line AFTER the opening double-quote.
@@ -241,39 +262,68 @@ asm_align_up off n =
   r
 
 -- byte size a line contributes to the __text image (insn=4, asciz=len+1, align=pad).
+-- raw is the UNTRIMMED line: asciz uses asm_str_arg (skips to the quote, so leading
+-- ws is irrelevant — and we avoid an O(len^2) ltrim rebuild on long strings); align
+-- is a short line so its ltrim is cheap (and word-position parsing needs it).
 asm_seg_size off k raw =
   if k == "insn" then 4
   else if k == "asciz" then (asm_asciz_len raw) + 1
   else if k == "ascii" then asm_asciz_len raw
-  else if k == "align" then (asm_align_up off (asm_p2align_n raw)) - off
+  else if k == "align" then (asm_align_up off (asm_p2align_n (asm_ltrim raw))) - off
   else 0
+
+-- ---- keyed label map (hash buckets w/ separate chaining) ----
+-- The old flat cons-list + linear asm_lookup was O(N^2): the full compiler has
+-- ~12K labels and ~120K branch/adr lookups (23 min). A 16384-bucket hash table
+-- makes lookup O(1) amortized. NBUCKETS is a power of 2 so (h & (NBUCKETS-1)) = h
+-- mod NBUCKETS. The polynomial hash is masked to 30 bits each step — Rail's
+-- 63-bit tagged ints overflow multiplicative accumulation (CLAUDE.md PRNG note),
+-- and h*31 + c stays well under 2^63 before the mask.
+asm_nbuckets = 16384
+asm_hash_str s = asm_hash_loop (chars s) 0
+asm_hash_loop cs h =
+  if cs == [] then bit_and h (asm_nbuckets - 1)
+  else asm_hash_loop (tail cs) (bit_and ((h * 31) + (char_to_int (head cs))) 1073741823)
+
+asm_insert buckets name off =
+  let b = asm_hash_str name
+  let _ = arr_set buckets b (cons (cons name (cons off [])) (arr_get buckets b))
+  0
+
+-- Build the label map: walk lines (section + offset aware) inserting __text labels.
+asm_build_labels lines =
+  let buckets = arr_new asm_nbuckets []
+  let _ = asm_pass1 lines 0 1 buckets
+  buckets
 
 -- Pass 1: walk lines tracking the current section + byte offset; record __text
 -- labels with their offset. Inline data + alignment inside __text advance the
 -- offset too, so branch/adr targets resolve to the SAME offsets `as` computes.
-asm_pass1 lines off in_text label_map =
-  if lines == [] then label_map
+asm_pass1 lines off in_text buckets =
+  if lines == [] then buckets
   else
     let line = head lines
     let kind = asm_classify2 line
-    if kind == "sec_text" then asm_pass1 (tail lines) off 1 label_map
-    else if kind == "sec_other" then asm_pass1 (tail lines) off 0 label_map
-    else if in_text == 0 then asm_pass1 (tail lines) off 0 label_map
-    else if kind == "skip" then asm_pass1 (tail lines) off 1 label_map
+    if kind == "sec_text" then asm_pass1 (tail lines) off 1 buckets
+    else if kind == "sec_other" then asm_pass1 (tail lines) off 0 buckets
+    else if in_text == 0 then asm_pass1 (tail lines) off 0 buckets
+    else if kind == "skip" then asm_pass1 (tail lines) off 1 buckets
     else if kind == "label" then
-      let name = asm_label_name (asm_ltrim line)
-      asm_pass1 (tail lines) off 1 (cons name (cons off label_map))
+      let _ = asm_insert buckets (asm_label_name (asm_ltrim line)) off
+      asm_pass1 (tail lines) off 1 buckets
     else
-      asm_pass1 (tail lines) (off + (asm_seg_size off kind (asm_ltrim line))) 1 label_map
+      asm_pass1 (tail lines) (off + (asm_seg_size off kind line)) 1 buckets
 
--- Look up label name → offset in the flat list. Returns -1 if not found.
-asm_lookup name labels =
-  if labels == [] then 0 - 1
+-- Look up label name → offset via the hash buckets. Returns -1 if not found.
+asm_lookup name buckets =
+  asm_scan_bucket name (arr_get buckets (asm_hash_str name))
+
+asm_scan_bucket name bucket =
+  if bucket == [] then 0 - 1
   else
-    let n = head labels
-    let off = head (tail labels)
-    if n == name then off
-    else asm_lookup name (tail (tail labels))
+    let rec = head bucket
+    if (head rec) == name then (head (tail rec))
+    else asm_scan_bucket name (tail bucket)
 
 -- ============================================================================
 -- Pass 2 — emit bytes for each instruction.
@@ -810,9 +860,9 @@ asm_pass2 lines buf off in_text labels =
     else if in_text == 0 then asm_pass2 (tail lines) buf off 0 labels
     else if kind == "skip" || kind == "label" then asm_pass2 (tail lines) buf off 1 labels
     else if kind == "asciz" then
-      asm_pass2 (tail lines) buf (asm_emit_str buf off (asm_decode_str (asm_str_arg (asm_ltrim line)) []) 1) 1 labels
+      asm_pass2 (tail lines) buf (asm_emit_str buf off (asm_decode_str (asm_str_arg line) []) 1) 1 labels
     else if kind == "ascii" then
-      asm_pass2 (tail lines) buf (asm_emit_str buf off (asm_decode_str (asm_str_arg (asm_ltrim line)) []) 0) 1 labels
+      asm_pass2 (tail lines) buf (asm_emit_str buf off (asm_decode_str (asm_str_arg line) []) 0) 1 labels
     else if kind == "align" then
       asm_pass2 (tail lines) buf (asm_pad buf off (asm_align_up off (asm_p2align_n (asm_ltrim line)))) 1 labels
     else
@@ -866,7 +916,7 @@ asm_pad_zero buf off target =
 asm_assemble src capacity =
   let buf = arr_new capacity 0
   let lines = asm_lines src
-  let labels = asm_pass1 lines 0 1 []
+  let labels = asm_build_labels lines
   let nbytes = asm_pass2 lines buf 0 1 labels
   buf
 
@@ -901,11 +951,11 @@ asm_collect_relocs lines off in_text labels acc =
              else asm_collect_relocs (tail lines) (off + 4) 1 labels acc)
           else asm_collect_relocs (tail lines) (off + 4) 1 labels acc)
        else asm_collect_relocs (tail lines) (off + 4) 1 labels acc)
-    else asm_collect_relocs (tail lines) (off + (asm_seg_size off kind (asm_ltrim line))) 1 labels acc
+    else asm_collect_relocs (tail lines) (off + (asm_seg_size off kind line)) 1 labels acc
 
 asm_relocs src =
   let lines = asm_lines src
-  asm_collect_relocs lines 0 1 (asm_pass1 lines 0 1 []) []
+  asm_collect_relocs lines 0 1 (asm_build_labels lines) []
 
 asm_bytes_len src = asm_textlen (asm_lines src) 0 1
 
@@ -920,4 +970,4 @@ asm_textlen lines off in_text =
     else if in_text == 0 then asm_textlen (tail lines) off 0
     else if kind == "label" then asm_textlen (tail lines) off 1
     else if kind == "skip" then asm_textlen (tail lines) off 1
-    else asm_textlen (tail lines) (off + (asm_seg_size off kind (asm_ltrim line))) 1
+    else asm_textlen (tail lines) (off + (asm_seg_size off kind line)) 1
