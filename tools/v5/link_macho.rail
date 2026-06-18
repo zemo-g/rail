@@ -1,0 +1,202 @@
+-- tools/v5/link_macho.rail — the "ld half": turn a real .s into a runnable
+-- Mach-O executable with NO as/ld/codesign, generalizing tools/v5/dyld_macho.rail
+-- (N=1 import demo) to the full compiler. Spec: ~/.ledatic/ld_half_spec_2026-06-18.md.
+--
+-- Built verse by verse:
+--   M1 (this file, first pass): multi-section symbol table + layout engine.
+--      A data/bss/mod_init walker assigns every data & bss symbol its section-
+--      relative offset and computes __data/__bss/__mod_init_func sizes; combined
+--      with asm.rail's __text label map, every symbol gets a final VM address once
+--      section bases are assigned. Validated against `nm -n` of an as-built .o.
+import "tools/v5/asm.rail"
+
+-- ===========================================================================
+-- M1 — data / bss / mod_init section walker.
+-- Sections we model past __text: data=1, bss=2, modinit=3 (text=0, other=9).
+-- ===========================================================================
+
+-- Which data section a `.section`/`.data`/`.zerofill`/`.text` line switches to.
+-- Returns: 0 text, 1 __data, 2 (n/a — bss is per-.zerofill), 3 __mod_init_func, 9 other.
+lk_sec_of line =
+  let cs = asm_skip_ws (chars line)
+  if (asm_cprefix cs ".section") == 1 then
+    (if str_contains "__TEXT,__text" line then 0
+     else if str_contains "__DATA,__mod_init_func" line then 3
+     else if str_contains "__DATA,__data" line then 1
+     else 9)
+  else if (asm_cprefix cs ".text") == 1 then 0
+  else if (asm_cprefix cs ".data") == 1 then 1
+  else 0 - 1                       -- not a section-switch line
+
+-- data-directive byte size at the current offset (for .p2align, needs off).
+-- .quad->8 .long->4 .byte->count .asciz->len+1 .ascii->len .space->N .p2align->pad.
+lk_data_dir_size off line =
+  let cs = asm_skip_ws (chars line)
+  if (asm_cprefix cs ".quad") == 1 then 8
+  else if (asm_cprefix cs ".long") == 1 then 4
+  else if (asm_cprefix cs ".byte") == 1 then lk_byte_count line
+  else if (asm_cprefix cs ".asciz") == 1 then (asm_asciz_len line) + 1
+  else if (asm_cprefix cs ".ascii") == 1 then asm_asciz_len line
+  else if (asm_cprefix cs ".space") == 1 then asm_p2align_n line
+  else if (asm_cprefix cs ".short") == 1 then 2
+  else if (asm_cprefix cs ".p2align") == 1 then (asm_align_up off (asm_p2align_n line)) - off
+  else 0                            -- .global / blank / comment / unknown -> 0 bytes
+
+-- count of comma-separated values in a `.byte a, b, c` line.
+lk_byte_count line =
+  let rest = asm_after_lsl (asm_ltrim line)   -- drop ".byte ", trim
+  length (asm_split_commas rest)
+
+-- A `.zerofill __DATA,__bss,_sym,size,align` line -> [name, size, align]. The
+-- 5 fields after `.zerofill ` are seg, sect, name, size, align (comma-split).
+lk_zerofill_parts line =
+  let rest = asm_after_lsl (asm_ltrim line)   -- drop ".zerofill"
+  asm_split_commas rest
+
+-- ===========================================================================
+-- Walk the whole .s. Produce a flat symbol record list (cons of [name, sec, off])
+-- for data(1) + bss(2) symbols, plus the running data/bss/modinit sizes carried
+-- in a small state list [dataoff, bssoff, modoff]. We keep it functional: the
+-- walker returns [dataoff, bssoff, modoff, symlist].
+-- ===========================================================================
+
+lk_walk lines sec dataoff bssoff modoff syms =
+  if lines == [] then cons dataoff (cons bssoff (cons modoff (cons syms [])))
+  else
+    let line = head lines
+    let sw = lk_sec_of line
+    if sw >= 0 then lk_walk (tail lines) sw dataoff bssoff modoff syms
+    else
+      let cs = asm_skip_ws (chars line)
+      if cs == [] then lk_walk (tail lines) sec dataoff bssoff modoff syms
+      else if (asm_cprefix cs ".zerofill") == 1 then
+        -- bss symbol: align bss to 2^align, record at bssoff, advance by size.
+        lk_walk_zf line lines sec dataoff bssoff modoff syms
+      else if (asm_chars_end_colon cs) == 1 then
+        -- a label: record if in data(1) section (text labels come from asm.rail;
+        -- modinit/bss have no inline labels we resolve via @PAGE).
+        (if sec == 1 then lk_walk (tail lines) sec dataoff bssoff modoff (cons (cons (asm_label_name (asm_ltrim line)) (cons 1 (cons dataoff []))) syms)
+         else lk_walk (tail lines) sec dataoff bssoff modoff syms)
+      else
+        -- a directive contributing bytes to the current section.
+        (if sec == 1 then lk_walk (tail lines) sec (dataoff + (lk_data_dir_size dataoff line)) bssoff modoff syms
+         else if sec == 3 then lk_walk (tail lines) sec dataoff bssoff (modoff + (lk_data_dir_size modoff line)) syms
+         else lk_walk (tail lines) sec dataoff bssoff modoff syms)
+
+-- handle a .zerofill line: parts = [seg, sect, name, size, align]
+lk_walk_zf line lines sec dataoff bssoff modoff syms =
+  let parts = lk_zerofill_parts line
+  let name = head (tail (tail parts))
+  let size = asm_imm (head (tail (tail (tail parts))))
+  let algn = asm_imm (head (tail (tail (tail (tail parts)))))
+  let base = asm_align_up bssoff algn
+  lk_walk (tail lines) sec dataoff (base + size) modoff (cons (cons name (cons 2 (cons base []))) syms)
+
+-- ===========================================================================
+-- M1 validation main — print computed sizes + key data/bss symbol offsets,
+-- to diff against `nm -n` ground truth (data base = __text size).
+-- ===========================================================================
+
+lk_lookup_sym name syms =
+  if syms == [] then 0 - 1
+  else
+    let r = head syms
+    if (head r) == name then (head (tail (tail r)))
+    else lk_lookup_sym name (tail syms)
+
+lk_show_sym name syms =
+  let v = lk_lookup_sym name syms
+  print (cat ["  ", name, " @ data/bss-off 0x", lk_hex v])
+
+-- minimal hex printer (lowercase, no 0x)
+lk_hex n = if n == 0 then "0" else lk_hex_go n ""
+lk_hex_go n acc =
+  if n == 0 then acc
+  else lk_hex_go (n / 16) (cat [lk_hex_digit (n - ((n / 16) * 16)), acc])
+lk_hex_digit d =
+  if d < 10 then show d
+  else if d == 10 then "a" else if d == 11 then "b" else if d == 12 then "c"
+  else if d == 13 then "d" else if d == 14 then "e" else "f"
+
+-- ===========================================================================
+-- M1 — layout engine. Computes self-consistent, page-aligned VM addresses for
+-- every segment/section, given the assembled sizes + import count. (lc_end is
+-- finalized in M5 against the actually-emitted load commands; here we use the
+-- planned 14-command set. The layout need not match `ld` — only be internally
+-- consistent so adrp/add and the stubs resolve correctly at runtime.)
+-- Sections: __TEXT[__text,__stubs] __DATA_CONST[__got,__mod_init] __DATA[__data,__bss].
+-- ===========================================================================
+lk_page = 16384
+lk_text_vm_base = 4294967296          -- 0x100000000
+-- 14 load commands for the compiler exe:
+--   PAGEZERO72 TEXT232 DATA_CONST232 DATA232 LINKEDIT72 dyldinfo48 symtab24
+--   dysymtab80 dylinker32 uuid24 buildver32 main24 dylib56 codesig16 = 1176
+lk_sizeofcmds = 1176
+lk_lc_end = 1208                       -- 32 (header) + 1176
+
+lk_alignp n = ((n + lk_page - 1) / lk_page) * lk_page
+lk_align4 n = ((n + 3) / 4) * 4
+
+-- The layout returns a flat list (all u64 VM addrs / sizes the rest of the linker
+-- needs), indexed by name via lk_lay_* accessors below:
+--   [text_vmaddr text_foff stubs_vmaddr stubs_foff text_seg_fsz
+--    got_vmaddr got_foff modinit_vmaddr modinit_foff datac_seg_fsz
+--    data_vmaddr data_foff bss_vmaddr data_seg_fsz data_seg_vmsz
+--    linkedit_vmaddr linkedit_foff]
+lk_layout text_size n_imp data_size bss_size modinit_size =
+  let text_foff = lk_lc_end
+  let text_vmaddr = lk_text_vm_base + text_foff
+  let stubs_foff = lk_align4 (text_foff + text_size)
+  let stubs_vmaddr = lk_text_vm_base + stubs_foff
+  let stubs_size = 12 * n_imp
+  let text_seg_fsz = lk_alignp (stubs_foff + stubs_size)
+  let got_foff = text_seg_fsz
+  let got_vmaddr = lk_text_vm_base + got_foff
+  let got_size = 8 * n_imp
+  let modinit_foff = asm_align_up (got_foff + got_size) 3
+  let modinit_vmaddr = lk_text_vm_base + modinit_foff
+  let datac_seg_fsz = lk_alignp ((modinit_foff + modinit_size) - got_foff)
+  let data_foff = got_foff + datac_seg_fsz
+  let data_vmaddr = lk_text_vm_base + data_foff
+  let bss_vmaddr = asm_align_up (data_vmaddr + data_size) 3
+  let data_seg_fsz = lk_alignp data_size
+  let data_seg_vmsz = lk_alignp ((bss_vmaddr + bss_size) - data_vmaddr)
+  let linkedit_foff = data_foff + data_seg_fsz
+  let linkedit_vmaddr = lk_text_vm_base + (data_foff + data_seg_vmsz)
+  [text_vmaddr, text_foff, stubs_vmaddr, stubs_foff, text_seg_fsz, got_vmaddr, got_foff, modinit_vmaddr, modinit_foff, datac_seg_fsz, data_vmaddr, data_foff, bss_vmaddr, data_seg_fsz, data_seg_vmsz, linkedit_vmaddr, linkedit_foff]
+
+lk_nth xs n = if n == 0 then head xs else lk_nth (tail xs) (n - 1)
+
+-- final VM address of a data(1)/bss(2) symbol given the layout + its [sec,off].
+lk_sym_vmaddr lay sec off =
+  if sec == 1 then (lk_nth lay 10) + off          -- data_vmaddr + off
+  else if sec == 2 then (lk_nth lay 12) + off     -- bss_vmaddr + off
+  else 0 - 1
+
+main =
+  let src = read_file "/tmp/link_src.s"
+  let lines = asm_lines src
+  let st = lk_walk lines 0 0 0 0 []
+  let dataoff = head st
+  let bssoff = head (tail st)
+  let modoff = head (tail (tail st))
+  let syms = head (tail (tail (tail st)))
+  let text_size = asm_bytes_len src
+  let _ = print (cat ["__text size = 0x", lk_hex text_size])
+  let _ = print (cat ["__data size = 0x", lk_hex dataoff, "  (expect 0x5138)"])
+  let _ = print (cat ["__bss  size = 0x", lk_hex bssoff, "  (expect 0x8000000)"])
+  let _ = print (cat ["__mod_init_func size = 0x", lk_hex modoff, "  (expect 0x8)"])
+  let lay = lk_layout text_size 8 dataoff bssoff modoff
+  let _ = print "--- computed layout (VM addresses, self-consistent) ---"
+  let _ = print (cat ["  __text   vmaddr 0x", lk_hex (lk_nth lay 0), "  foff 0x", lk_hex (lk_nth lay 1)])
+  let _ = print (cat ["  __stubs  vmaddr 0x", lk_hex (lk_nth lay 2), "  foff 0x", lk_hex (lk_nth lay 3), "  (8 imports x12)"])
+  let _ = print (cat ["  __got    vmaddr 0x", lk_hex (lk_nth lay 5), "  foff 0x", lk_hex (lk_nth lay 6)])
+  let _ = print (cat ["  __modini vmaddr 0x", lk_hex (lk_nth lay 7), "  foff 0x", lk_hex (lk_nth lay 8)])
+  let _ = print (cat ["  __data   vmaddr 0x", lk_hex (lk_nth lay 10), "  foff 0x", lk_hex (lk_nth lay 11)])
+  let _ = print (cat ["  __bss    vmaddr 0x", lk_hex (lk_nth lay 12)])
+  let _ = print (cat ["  __LINKED vmaddr 0x", lk_hex (lk_nth lay 15), "  foff 0x", lk_hex (lk_nth lay 16)])
+  let _ = print "--- spot-check final symbol VM addresses ---"
+  let _ = print (cat ["  _rail_nil   -> 0x", lk_hex (lk_sym_vmaddr lay 1 (lk_lookup_sym "_rail_nil" syms))])
+  let _ = print (cat ["  _rail_young_a -> 0x", lk_hex (lk_sym_vmaddr lay 2 (lk_lookup_sym "_rail_young_a" syms))])
+  let _ = print (cat ["  _rail_young_b -> 0x", lk_hex (lk_sym_vmaddr lay 2 (lk_lookup_sym "_rail_young_b" syms))])
+  0
