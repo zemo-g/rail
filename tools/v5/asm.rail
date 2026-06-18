@@ -223,9 +223,9 @@ asm_encode_insn mnemonic ops_str cur_off labels =
   else if mnemonic == "b.ls" then asm_enc_branch ops cur_off labels enc_bls_byte_off
   else if mnemonic == "blr"  then enc_blr (asm_reg_num (head ops))
   else if mnemonic == "br"   then enc_br  (asm_reg_num (head ops))
-  else if mnemonic == "and"  then asm_enc_ri ops enc_and enc_and_imm
-  else if mnemonic == "orr"  then asm_enc_ri ops enc_orr enc_orr_imm
-  else if mnemonic == "eor"  then asm_enc_ri ops enc_eor enc_eor_imm
+  else if mnemonic == "and"  then asm_enc_logical ops 2449473536 enc_and
+  else if mnemonic == "orr"  then asm_enc_logical ops 2986344448 enc_orr
+  else if mnemonic == "eor"  then asm_enc_logical ops 3523215360 enc_eor
   else if mnemonic == "lsl"  then asm_enc_ri ops enc_lsl enc_lsl_imm
   else if mnemonic == "lsr"  then asm_enc_ri ops enc_lsr enc_lsr_imm
   else if mnemonic == "asr"  then asm_enc_ri ops enc_asr enc_asr_imm
@@ -323,7 +323,10 @@ asm_enc_mov ops =
   let src_cs = chars src_s
   if src_cs == [] then 0 - 1
   else if (head src_cs) == "#" then
-    (if (asm_is_w dst_s) == 1 then enc_movzw_imm16 (asm_reg_num dst_s) (asm_imm src_s)
+    (if (asm_is_w dst_s) == 1 then
+       (let wimm = asm_imm src_s
+        if wimm < 0 then enc_movnw_imm16 (asm_reg_num dst_s) ((0 - wimm) - 1)
+        else enc_movzw_imm16 (asm_reg_num dst_s) wimm)
      else asm_mov_imm (asm_reg_num dst_s) (asm_imm src_s))
   else if src_s == "sp" then enc_add_imm (asm_reg_num dst_s) 31 0   -- mov xD, sp = add xD, sp, #0
   else if dst_s == "sp" then enc_add_imm 31 (asm_reg_num src_s) 0   -- mov sp, xN = add sp, xN, #0
@@ -429,6 +432,30 @@ asm_enc_ri ops reg_fn imm_fn =
   let word = if (head (chars op2)) == "#" then imm_fn dst n (asm_imm op2) else reg_fn dst n (asm_reg_num op2)
   if (asm_is_w (head ops)) == 1 then w32 word else word
 
+-- and/orr/eor with a logical-immediate or register source. Two bit-63 tag masks
+-- exceed Rail's 63-bit tagged-int range so they CANNOT go through asm_imm; match
+-- them by literal string and emit the pre-computed N:immr:imms directly. For a
+-- w-register #imm, the 32-bit bitmask must encode with N=0 — replicate the value
+-- into both 32-bit halves so enc_logical_imm finds element-size 32 (N=0), then
+-- w32 clears the sf bit. (w32 only clears bit 31, never the N bit at 22, so an
+-- un-replicated 64-bit encoding would leave N=1 — illegal for the 32-bit form.)
+asm_enc_logical ops base reg_fn =
+  let dst = asm_reg_num (head ops)
+  let n = asm_reg_num (head (tail ops))
+  let op2 = head (tail (tail ops))
+  let isw = asm_is_w (head ops)
+  if (head (chars op2)) == "#" then
+    (if op2 == "#0x7fffffffffffffff" then bit_or base (bit_or 4194304 (bit_or 63488 (bit_or (shl n 5) dst)))
+     else if op2 == "#0x8000000000000000" then bit_or base (bit_or 4194304 (bit_or 65536 (bit_or (shl n 5) dst)))
+     else
+       (let raw = asm_imm op2
+        let v = if isw == 1 then bit_or raw (shl raw 32) else raw
+        let word = enc_logical_imm base dst n v
+        if isw == 1 then w32 word else word))
+  else
+    (let word = reg_fn dst n (asm_reg_num op2)
+     if isw == 1 then w32 word else word)
+
 -- width detector: 1 if operand names a w-register (32-bit), else 0.
 asm_is_w s =
   let cs = chars s
@@ -491,14 +518,36 @@ asm_enc_cset ops =
 -- Unified single-reg load/store. Handles: float (dD dest), post-index ([xN],#i),
 -- register-offset ([xN, xM, lsl #s]), pre-index ([xN, #i]!), and plain #imm
 -- offset (x or w width). Mirrors asm_enc_pair's mode detection.
+-- FP (d/s) load/store: [xN,#imm] offset (d scaled 8), [xN,xM,lsl#N] reg-offset,
+-- [xN,#imm]! pre-index, [xN] no-offset. (s [xN,#imm] offset not emitted by the
+-- compiler; not handled here.)
+asm_enc_fp_mem dst_s base_s rest base is_ldr =
+  let is_d = (head (chars dst_s)) == "d"
+  let reg = if is_d then asm_dreg_num dst_s else asm_sreg_num dst_s
+  if asm_last_is base_s "]" then
+    (if is_ldr == 1 then enc_ldr_d reg base 0 else enc_str_d reg base 0)
+  else
+    let off_s = if rest == [] then "0" else head rest
+    let oc0 = head (chars off_s)
+    if oc0 == "x" || oc0 == "w" then
+      let m = asm_reg_after_bracket off_s
+      let sh = if (tail rest) == [] then 0 else asm_imm (asm_after_lsl (head (tail rest)))
+      let s = if sh == 0 then 0 else 1
+      (if is_d then (if is_ldr == 1 then enc_regoff_b 4234176512 reg base m s else enc_regoff_b 4229982208 reg base m s)
+       else (if is_ldr == 1 then enc_regoff_b 3160434688 reg base m s else enc_regoff_b 3156240384 reg base m s))
+    else if asm_last_is off_s "!" then
+      let imm = asm_imm_from_brk off_s
+      (if is_ldr == 1 then enc_idx9_b 4232055808 reg base imm else enc_idx9_b 4227861504 reg base imm)
+    else
+      let imm = asm_imm_from_brk off_s
+      (if is_ldr == 1 then enc_ldr_d reg base imm else enc_str_d reg base imm)
+
 asm_enc_mem ops is_ldr =
   let dst_s = head ops
   let base_s = head (tail ops)
   let rest = tail (tail ops)
   let base = asm_reg_after_bracket base_s
-  if (head (chars dst_s)) == "d" then
-    let immf = asm_imm_from_brk (if rest == [] then "0" else head rest)
-    (if is_ldr == 1 then enc_ldr_d (asm_dreg_num dst_s) base immf else enc_str_d (asm_dreg_num dst_s) base immf)
+  if ((head (chars dst_s)) == "d") || ((head (chars dst_s)) == "s") then asm_enc_fp_mem dst_s base_s rest base is_ldr
   else if asm_last_is base_s "]" then
     if rest == [] then
       -- `[xN]` with NO displacement = zero-offset SCALED load, NOT post-index.
@@ -565,6 +614,21 @@ asm_imm_brk_loop cs acc =
 --   pre-index   stp x1,x2,[xN, #imm]!   imm token ends with "!"
 --   post-index  stp x1,x2,[xN], #imm    base token "[xN]" (ends with "]")
 asm_enc_pair ops is_ldp =
+  if (head (chars (head ops))) == "d" then asm_enc_pair_fp ops is_ldp
+  else asm_enc_pair_x ops is_ldp
+
+-- FP register pair (dA, dB) — offset form (the only FP-pair form the compiler emits).
+-- Bases: stp_d 0x6D000000 (1828716544), ldp_d 0x6D400000 (1832910848). imm scaled by 8.
+asm_enc_pair_fp ops is_ldp =
+  let d1 = asm_dreg_num (head ops)
+  let d2 = asm_dreg_num (head (tail ops))
+  let base_s = head (tail (tail ops))
+  let rest = tail (tail (tail ops))
+  let base = asm_reg_after_bracket base_s
+  let imm = if rest == [] then 0 else asm_imm_from_brk (head rest)
+  enc_pair_base (if is_ldp == 1 then 1832910848 else 1828716544) d1 d2 base imm
+
+asm_enc_pair_x ops is_ldp =
   let d1 = asm_reg_num (head ops)
   let d2 = asm_reg_num (head (tail ops))
   let base_s = head (tail (tail ops))
@@ -639,10 +703,9 @@ asm_enc_fmov ops =
   let src = head (tail ops)
   let src_cs = chars src
   if src_cs == [] then 0 - 1
-  else if (head src_cs) == "d" then
-    enc_fmov_d_d (asm_dreg_num dst) (asm_dreg_num src)
-  else
-    enc_fmov_d_x (asm_dreg_num dst) (asm_reg_num src)
+  else if (head (chars dst)) == "x" then enc_fmov_x_d (asm_reg_num dst) (asm_dreg_num src)   -- fmov xD, dN
+  else if (head src_cs) == "d" then enc_fmov_d_d (asm_dreg_num dst) (asm_dreg_num src)
+  else enc_fmov_d_x (asm_dreg_num dst) (asm_reg_num src)
 
 -- ============================================================================
 -- Pass 2 driver — walk lines, emit into buf at off++.
