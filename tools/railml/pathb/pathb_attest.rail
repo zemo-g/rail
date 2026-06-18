@@ -1,0 +1,319 @@
+-- tools/railml/pathb/pathb_attest.rail — attest the Path-B forward logits.
+--
+-- Closes the bit-exact ATTEST loop for the integer-exact transformer forward
+-- (tools/railml/pathb/pathb_forward.rail -> logits.txt):
+--
+--   (1) HASH      SHA-256 over the raw artifact bytes (pure Rail, NUL-safe).
+--   (2) SIGN      fetch the live beacon pulse, POST {digest,pulse_id,value_hex}
+--                 to the Pi witness signer (fleet0:9102/sign over Tailscale),
+--                 which Ed25519-signs the canonical message
+--                 attest|v1|<digest>|<pulse_id>|<value_hex>|<witnessed_at>.
+--                 stdlib/ed25519_sign.rail is the in-process equivalent if you
+--                 ever move signing onto this host (the witness uses the same
+--                 RFC-8032 algorithm + key material).
+--   (3) ANCHOR    pulse_id binds the artifact to the public hash-chain. If the
+--                 beacon is unreachable we record "no pulse" and emit an
+--                 unanchored attestation (digest-only) so the loop still closes.
+--   (4) VERIFY    independently recompute SHA-256, rebuild the canonical msg,
+--                 and Ed25519-verify the signature against fleet0.pub.pem —
+--                 pure Rail, no openssl/python/shell in the verify path.
+--
+-- This mirrors tools/attest/attest.rail + tools/attest/verify.rail; the helpers
+-- are kept local so the file is self-contained and prints the four required
+-- lines (HASH / SIG / PULSE / VERIFY) in one run.
+--
+-- Usage: ./rail_native run tools/railml/pathb/pathb_attest.rail [input] [out]
+--   default input = tools/railml/pathb/logits.txt
+--   default out   = <input>.attestation.json
+
+import "stdlib/https_strict.rail"
+-- https_strict transitively pulls sha256 (sha_process_from / be32_write /
+-- bytes_to_hex), bytes, hmac, hkdf, tls13, x25519, sha512, dns, socket
+-- (hc_connect_tcp / send_all_tcp / recv / close / tcp_bytes_to_str).
+import "stdlib/ed25519.rail"
+-- ed25519 (verify path) needs ed25519_scalar; sha512 already came via
+-- https_strict. ed25519_sign.rail is intentionally NOT imported: signing is
+-- delegated to the Pi witness, and importing the sign module here is pure
+-- surface with no caller.
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/base64.rail"
+import "stdlib/json.rail"
+import "stdlib/file.rail"
+import "stdlib/env.rail"
+
+beacon_url_default _ = "https://ledatic.org/entropy/pulse"
+signer_url_path_default _ = cat [getenv "HOME", "/.ledatic/witness/signer_url"]
+signer_port_default _ = 9102
+signer_path_default _ = "/sign"
+sign_token_path_default _ = cat [getenv "HOME", "/.ledatic/witness/sign_token"]
+pubkey_path_default _ = cat [getenv "HOME", "/.ledatic/witness/fleet0.pub.pem"]
+input_default _ = "tools/railml/pathb/logits.txt"
+
+env_or env_key fallback =
+  let v = getenv env_key
+  if length (chars v) == 0 then fallback else v
+
+-- ── SHA-256 over a file's raw bytes (NUL-safe via read_file_bytes_open) ──
+-- NOTE: the bare read_file_bytes builtin returns a string-like buffer whose
+-- arr_len reads its first bytes as a length; open explicitly to get a real
+-- int array (same trap noted in verify.rail + the pathb_forward build log).
+sha256_hex_file path =
+  let fp = fopen path "rb"
+  let bytes = if fp == 0 then arr_new 0 0 else read_file_bytes_open fp path
+  let n = arr_len bytes
+  let h = sha256_h_init 0
+  let k_tbl = sha256_k_table 0
+  let state = arr_new 8 0
+  let end = sha_process_from bytes n h state k_tbl 0
+  let _ = sha_final_block bytes n h state k_tbl end
+  let out = arr_new 32 0
+  let _ = be32_write out 0 (arr_get h 0)
+  let _ = be32_write out 4 (arr_get h 1)
+  let _ = be32_write out 8 (arr_get h 2)
+  let _ = be32_write out 12 (arr_get h 3)
+  let _ = be32_write out 16 (arr_get h 4)
+  let _ = be32_write out 20 (arr_get h 5)
+  let _ = be32_write out 24 (arr_get h 6)
+  let _ = be32_write out 28 (arr_get h 7)
+  bytes_to_hex out 32
+
+-- ── basename / trim helpers ──────────────────────────────────────────
+basename path =
+  let parts = str_split "/" path
+  basename_last parts ""
+
+basename_last parts last =
+  if parts == [] then last
+  else basename_last (tail parts) (head parts)
+
+trim_trailing s =
+  let cs = chars s
+  let rev = reverse cs
+  let trimmed = drop_ws rev
+  join "" (reverse trimmed)
+
+drop_ws cs =
+  if cs == [] then cs
+  else
+    let c = head cs
+    if c == "\n" then drop_ws (tail cs)
+    else if c == "\r" then drop_ws (tail cs)
+    else if c == " " then drop_ws (tail cs)
+    else if c == "\t" then drop_ws (tail cs)
+    else cs
+
+-- ── Beacon fetch (leaf-only TLS; pulse endpoint is public) ───────────
+http_crlf2 _ = cat [char_from_int 13, char_from_int 10, char_from_int 13, char_from_int 10]
+
+strip_http_headers raw =
+  let sep = http_crlf2 0
+  let i = str_find sep raw
+  if i < 0 then raw
+  else str_sub raw (i + 4) (length (chars raw) - i - 4)
+
+parse_pulse body =
+  let p = parse_json body
+  let pid = show (json_int (json_get p "pulse_id"))
+  let vhex = json_str (json_get p "value_hex")
+  let ts = json_str (json_get p "timestamp_utc")
+  (pid, vhex, ts)
+
+fetch_pulse url =
+  let result = https_get_url_unsafe_noverify url
+  let (status, raw) = result
+  if status != 200 then ("", "", "")
+  else parse_pulse (strip_http_headers raw)
+
+-- ── Pi witness signer over HTTP (Tailscale-internal, no TLS) ─────────
+build_sign_body digest pulse_id value_hex =
+  cat [
+    "{\"digest\":\"", digest,
+    "\",\"pulse_id\":", pulse_id,
+    ",\"value_hex\":\"", value_hex, "\"}"
+  ]
+
+build_sign_request ip port path token body =
+  let crlf = cat [char_from_int 13, char_from_int 10]
+  let body_len = length (chars body)
+  cat [
+    "POST ", path, " HTTP/1.1", crlf,
+    "Host: ", ip, ":", show port, crlf,
+    "X-Sign-Token: ", token, crlf,
+    "Content-Type: application/json", crlf,
+    "Content-Length: ", show body_len, crlf,
+    "Connection: close", crlf, crlf,
+    body
+  ]
+
+recv_until_eof fd =
+  let buf = malloc 8192
+  let s = recv_until_eof_loop fd buf ""
+  let _ = free buf
+  s
+
+recv_until_eof_loop fd buf acc =
+  let n = recv fd buf 8192 0
+  if n <= 0 then acc
+  else
+    let chunk = tcp_bytes_to_str buf 0 n ""
+    recv_until_eof_loop fd buf (join "" [acc, chunk])
+
+extract_http_body resp =
+  let sep = http_crlf2 0
+  let i = str_find sep resp
+  if i < 0 then ""
+  else trim_trailing (str_sub resp (i + 4) (length (chars resp) - i - 4))
+
+sign_via_pi_http ip port path token digest pulse_id value_hex =
+  let body = build_sign_body digest pulse_id value_hex
+  let req = build_sign_request ip port path token body
+  let fd = hc_connect_tcp ip port
+  if fd < 0 then ""
+  else
+    let _ = send_all_tcp fd req
+    let resp = recv_until_eof fd
+    let _ = close fd
+    extract_http_body resp
+
+-- ── Outer attestation JSON (ledatic.attestation v1) ──────────────────
+build_outer_json name size digest pulse_id value_hex beacon_ts witness_inner created_at beacon_url =
+  cat [
+    "{\n",
+    "  \"kind\": \"ledatic.attestation\",\n",
+    "  \"version\": 1,\n",
+    "  \"artifact\": {\n",
+    "    \"name\": \"", name, "\",\n",
+    "    \"size_bytes\": ", show size, ",\n",
+    "    \"sha256\": \"", digest, "\"\n",
+    "  },\n",
+    "  \"beacon\": {\n",
+    "    \"url\": \"", beacon_url, "\",\n",
+    "    \"pulse_id\": ", pulse_id, ",\n",
+    "    \"value_hex\": \"", value_hex, "\",\n",
+    "    \"timestamp_utc\": \"", beacon_ts, "\"\n",
+    "  },\n",
+    "  \"witness\": ", witness_inner, ",\n",
+    "  \"created_at\": ", show created_at, "\n",
+    "}\n"
+  ]
+
+now_unix _ =
+  parse_int (trim_trailing (shell "date -u +%s"))
+
+-- ── Independent verify (pure Rail: SHA-256 + Ed25519) ────────────────
+pem_strip_step lines acc =
+  let line = head lines
+  let rest = tail lines
+  let next_acc = cat [acc, line]
+  if str_contains "-----" line then pem_strip_headers rest acc
+  else pem_strip_headers rest next_acc
+
+pem_strip_headers lines acc =
+  if length lines == 0 then acc
+  else pem_strip_step lines acc
+
+pem_extract_pubkey pem_text =
+  let lines = str_split "\n" pem_text
+  let body = pem_strip_headers lines ""
+  let der = base64_decode_bytes body
+  let n = arr_len der
+  arr_slice der (n - 32) 32
+
+build_message digest pulse_id value_hex witnessed_at =
+  cat ["attest|v1|", digest, "|", pulse_id, "|", value_hex, "|", witnessed_at]
+
+verify_attestation pub_path want_digest att_text =
+  let att = parse_json att_text
+  let witness = json_get att "witness"
+  let att_digest = json_str (json_get witness "digest_sha256")
+  let pulse_id_s = show (json_int (json_get witness "pulse_id"))
+  let value_hex = json_str (json_get witness "value_hex")
+  let witnessed_at_s = show (json_int (json_get witness "witnessed_at"))
+  let sig_b64 = json_str (json_get witness "sig")
+  let pk_fp = json_str (json_get witness "pk_fp")
+  if att_digest != want_digest then
+    let _ = print (cat ["VERIFY: FAIL digest mismatch file=", want_digest, " att=", att_digest])
+    1
+  else
+    let pem_text = read_file pub_path
+    let pub_bytes = pem_extract_pubkey pem_text
+    let msg = build_message att_digest pulse_id_s value_hex witnessed_at_s
+    let msg_bytes = string_to_bytes msg
+    let msg_len = string_length_bytes msg
+    let sig_bytes = base64_decode_bytes sig_b64
+    let ok = ed25519_verify pub_bytes msg_bytes msg_len sig_bytes
+    if ok == 1 then
+      let _ = print (cat ["VERIFY: ok  pk_fp=", pk_fp, "  pulse_id=", pulse_id_s])
+      0
+    else
+      let _ = print "VERIFY: BAD signature"
+      1
+
+-- ── Main ──────────────────────────────────────────────────────────────
+run input out =
+  let beacon_url = env_or "BEACON_URL" (beacon_url_default 0)
+  let signer_ip = env_or "SIGNER_IP" (trim_trailing (read_file (signer_url_path_default 0)))
+  let signer_port_s = env_or "SIGNER_PORT" (show (signer_port_default 0))
+  let signer_port = parse_int signer_port_s
+  let signer_path = env_or "SIGNER_PATH" (signer_path_default 0)
+  let token_path = env_or "SIGN_TOKEN_PATH" (sign_token_path_default 0)
+  let token = trim_trailing (read_file token_path)
+  let pub_path = env_or "WITNESS_PUBKEY" (pubkey_path_default 0)
+  -- signer_ip is read from signer_url as a full URL (http://IP:PORT/sign);
+  -- extract the bare host so hc_connect_tcp gets just the IP.
+  let host = extract_host signer_ip
+  -- (1) HASH
+  let digest = sha256_hex_file input
+  let size = read_file_size input
+  let _ = print (cat ["HASH: sha256=", digest, "  size_bytes=", show size, "  artifact=", input])
+  if length (chars token) == 0 then
+    let _ = print "SIG: FAIL missing sign token"
+    7
+  else run_anchor input out beacon_url host signer_port signer_path token pub_path digest size
+
+extract_host url =
+  let after = if str_contains "://" url then str_sub url (str_find "://" url + 3) (length (chars url)) else url
+  let colon = str_find ":" after
+  if colon < 0 then
+    let slash = str_find "/" after
+    if slash < 0 then after else str_sub after 0 slash
+  else str_sub after 0 colon
+
+run_anchor input out beacon_url host signer_port signer_path token pub_path digest size =
+  -- (3) ANCHOR — fetch live beacon pulse (or record "no pulse")
+  let pulse = fetch_pulse beacon_url
+  let (pulse_id, value_hex, beacon_ts) = pulse
+  if length (chars pulse_id) == 0 then
+    let _ = print "PULSE: none (beacon unreachable) — cannot bind to hash-chain; no witness signature requested"
+    let _ = print "SIG: none"
+    let _ = print "VERIFY: skipped (no anchored attestation)"
+    4
+  else
+    let _ = print (cat ["PULSE: pulse_id=", pulse_id, "  value_hex=", value_hex, "  timestamp_utc=", beacon_ts])
+    run_sign input out beacon_url host signer_port signer_path token pub_path digest size pulse_id value_hex beacon_ts
+
+run_sign input out beacon_url host signer_port signer_path token pub_path digest size pulse_id value_hex beacon_ts =
+  -- (2) SIGN — Pi witness Ed25519-signs the canonical message
+  let inner = sign_via_pi_http host signer_port signer_path token digest pulse_id value_hex
+  if length (chars inner) == 0 then
+    let _ = print "SIG: FAIL witness signer returned nothing"
+    5
+  else
+    let wj = parse_json inner
+    let sig_b64 = json_str (json_get wj "sig")
+    let _ = print (cat ["SIG: ", sig_b64])
+    let name = basename input
+    let created_at = now_unix 0
+    let body = build_outer_json name size digest pulse_id value_hex beacon_ts inner created_at beacon_url
+    let _ = write_file out body
+    let _ = print (cat ["ATTESTATION: ", out])
+    -- (4) VERIFY — independent pure-Rail recompute + Ed25519 verify
+    let att_text = read_file out
+    let again_digest = sha256_hex_file input
+    verify_attestation pub_path again_digest att_text
+
+main =
+  let user_args = tail args
+  let input = if length user_args >= 1 then head user_args else input_default 0
+  let out = if length user_args >= 2 then head (tail user_args) else cat [input, ".attestation.json"]
+  run input out

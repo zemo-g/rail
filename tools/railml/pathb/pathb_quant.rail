@@ -1,0 +1,170 @@
+-- pathb_quant.rail -- WEIGHT-BRIDGE: load REAL SmolLM2-135M model.safetensors (pure BF16) and
+-- quantize it to the exact-integer fixed-point regime (S = 2^24, F = 24 fractional bits) with ZERO
+-- float in the decode path, emitting an int32 artifact that pathb_forward can read back deterministically.
+--
+-- THIS MODEL is SmolLM2-135M (Llama arch): hidden 576, intermediate 1536, 30 layers,
+-- 9 heads, 3 kv heads (GQA), head_dim 64, vocab 49152, SiLU MLP, tied embeddings.
+-- The r3_quant P0-spec dims (Gemma E2B) are the STALE placeholder; the quant SCHEME (F=24,
+-- decode-to-fixed-point) is size-agnostic and unchanged.
+--
+-- PIPELINE (the production weight-bridge pattern, honoring the contract):
+--   1. read the safetensors 8-byte LE header length + ASCII JSON header (a tiny dd slice -> read_file_bytes;
+--      the whole 269 MB file is NEVER materialized as a Rail array -- that would be ~2 GB and blow the arena).
+--   2. for each target tensor, byte-scan the header for "NAME": -> "data_offsets":[start,end] (rg_find / rg_int).
+--   3. wbase = 8 + headerlen + start; dd-slice [wbase, wbase+nbytes) of the blob into a temp file.
+--   4. read_file_bytes the slice; for each element decode 2 LE BF16 bytes DIRECTLY to X = round(v * 2^24)
+--      with pure-integer IEEE-754 (rg_bf16_fixed, identical to r5/p3) -- no float ever materialized.
+--   5. emit X as whitespace-separated int32 text, in arena-bounded CHUNKS (no giant string concat).
+--
+-- WHY dd-slice + read_file_bytes (not raw malloc + fread): the runtime FFI tags malloc's pointer return
+-- but byte_at/byte_set use the pointer RAW while untag_args untags it for fread -> the two disagree and
+-- fread-into-malloc reads zeros (verified). read_file_bytes returns a buffer byte_at indexes correctly
+-- (the proven r5b/p3 path). So we slice the bytes we need to a temp file and read_file_bytes that slice.
+--
+-- Build: cd ~/projects/rail-https && ./rail_native tools/railml/pathb/pathb_quant.rail   (-> /tmp/rail_out)
+-- Run:   /tmp/rail_out         (emits tools/railml/pathb/pathb_weights.q24)
+
+import "stdlib/file.rail"
+
+-- ===== model paths / dims =====
+pq_blob _ = "/Users/ledaticempire/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M/blobs/80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1"
+pq_out _  = "tools/railml/pathb/pathb_weights.q24"
+
+-- how many embedding token-rows to quantize (each row = 576 BF16). Bounds artifact size; the
+-- reader can embed any token id < this. 256 rows keeps it small + a real forward exercises it.
+pq_embed_rows _ = 256
+
+-- ===== pure-integer IEEE-754 -> fixed-point (S = 2^24); identical to r5_/rg_ family =====
+-- powers of two without forming a float
+pq_pow2_go acc k = if k == 0 then acc else pq_pow2_go (acc + acc) (k - 1)
+pq_pow2 k = if k < 1 then 1 else pq_pow2_go 1 k
+
+pq_f32_fixed b0 b1 b2 b3 =
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in
+  let sign = bits / 2147483648 in
+  let rest = bits - sign * 2147483648 in
+  let exp  = rest / 8388608 in
+  let mant = rest - exp * 8388608 in
+  if exp == 0 then 0
+  else
+    let mag = 8388608 + mant in
+    let sh = exp - 126 in
+    let xabs = if sh >= 0 then mag * (pq_pow2 sh)
+               else (let d = pq_pow2 (0 - sh) in (mag + d / 2) / d) in
+    if sign == 1 then 0 - xabs else xabs
+-- bf16 = top 16 bits of f32, so as f32 LE bytes it is (0, 0, lo, hi)
+pq_bf16_fixed lo hi = pq_f32_fixed 0 0 lo hi
+
+-- ===== header byte-scan + parse (the rg_/r5b_ pattern) =====
+pq_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then pq_match buf (pos + 1) (tail pcs) else 0
+pq_find buf pos hi pcs = if pos >= hi then 0 - 1 else if pq_match buf pos pcs == 1 then pos else pq_find buf (pos + 1) hi pcs
+pq_find_after buf pos hi pcs = let p = pq_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+pq_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else pq_int buf (pos + 1) (acc * 10 + (c - 48))
+pq_int_after buf pos = let c = byte_at buf pos in if c < 48 then pos else if c > 57 then pos else pq_int_after buf (pos + 1)
+
+-- 8-byte little-endian header length (6 low bytes; safetensors headers are < 2^48)
+pq_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+
+-- data_offsets[k] for a named tensor (k=0 start, k=1 end). hdr buffer is the header bytes; hi = its length.
+pq_offset hdr hi name k =
+  let np = pq_find hdr 0 hi (chars (cat ["\"", name, "\":"])) in
+  let dp = pq_find_after hdr np hi (chars "\"data_offsets\":[") in
+  let start = pq_int hdr dp 0 in
+  if k == 0 then start
+  else (let endp = pq_int_after hdr dp in pq_int hdr (endp + 1) 0)
+
+-- ===== chunked int-text emission (arena-bounded; no giant string) =====
+-- build a string of `cnt` decoded ints starting at element e0 of buf, separated by spaces + trailing nl.
+-- buf element p occupies BF16 bytes [2p, 2p+1]. acc threaded as a string; arena reset by the caller per chunk.
+pq_chunk_str buf e0 cnt i acc =
+  if i >= cnt then acc
+  else
+    let p = e0 + i in
+    let x = pq_bf16_fixed (byte_at buf (2 * p)) (byte_at buf (2 * p + 1)) in
+    pq_chunk_str buf e0 cnt (i + 1) (cat [acc, show x, " "])
+
+-- write `total` decoded ints from buf (elements [0,total)) to outpath, CHUNK ints per append.
+-- arena_mark/arena_reset around each chunk so the bump arena never accumulates the whole tensor's text.
+pq_emit_tensor buf total chunk outpath done =
+  if done >= total then 0
+  else
+    let m = arena_mark 0 in
+    let n = if (done + chunk) > total then (total - done) else chunk in
+    let s = pq_chunk_str buf done n 0 "" in
+    let _ = append_line outpath s in
+    let _ = arena_reset m in
+    pq_emit_tensor buf total chunk outpath (done + n)
+
+-- ===== per-tensor: dd-slice the BF16 bytes, read them, decode+emit =====
+-- slice [wbase, wbase+nbytes) of the blob into /tmp/pq_slice.bin. `dd bs=1` is byte-accurate but
+-- ~minutes for a 1.7 MB tensor; `tail -c +OFF | head -c N` is byte-accurate AND fast (0.05 s / 1.7 MB).
+-- tail -c +K is 1-indexed from the start, so the 0-based byte offset wbase becomes +(wbase+1).
+pq_slice_cmd wbase nbytes =
+  cat ["tail -c +", show (wbase + 1), " '", pq_blob 0, "' | head -c ", show nbytes,
+       " > /tmp/pq_slice.bin"]
+
+-- emit a header line for the tensor, then its values
+pq_do_tensor hdr hi base name rows cols outpath =
+  let start = pq_offset hdr hi name 0 in
+  let endo  = pq_offset hdr hi name 1 in
+  let nbytes = endo - start in          -- BF16: 2 bytes per element
+  let nelems = nbytes / 2 in
+  let wbase = base + start in
+  let _ = shell (pq_slice_cmd wbase nbytes) in
+  let buf = read_file_bytes "/tmp/pq_slice.bin" in
+  let _ = append_line outpath (cat ["tensor ", name, " ", show rows, " ", show cols, " ", show nelems]) in
+  let _ = pq_emit_tensor buf nelems 4096 outpath 0 in
+  let _ = print (cat ["  quantized ", name, "  elems=", show nelems, "  wbase=", show wbase]) in
+  nelems
+
+-- embedding: only the first ROWS token-rows (each cols wide). slice just those bytes.
+pq_do_embed hdr hi base rows cols outpath =
+  let start = pq_offset hdr hi "model.embed_tokens.weight" 0 in
+  let nelems = rows * cols in
+  let nbytes = nelems * 2 in
+  let wbase = base + start in
+  let _ = shell (pq_slice_cmd wbase nbytes) in
+  let buf = read_file_bytes "/tmp/pq_slice.bin" in
+  let _ = append_line outpath (cat ["tensor model.embed_tokens.weight ", show rows, " ", show cols, " ", show nelems, " (first ", show rows, " rows of 49152)"]) in
+  let _ = pq_emit_tensor buf nelems 4096 outpath 0 in
+  let _ = print (cat ["  quantized embed (first ", show rows, " rows)  elems=", show nelems, "  wbase=", show wbase]) in
+  nelems
+
+main =
+  -- 1. read the header (LE length + ASCII JSON). Slice the first 64 KB; header is 30528 bytes.
+  let _ = shell (cat ["head -c 65536 '", pq_blob 0, "' > /tmp/pq_hdr.bin"]) in
+  let hbuf = read_file_bytes "/tmp/pq_hdr.bin" in
+  let hlen = pq_le_len hbuf 0 in
+  let base = 8 + hlen in
+  -- header bytes themselves live at [8, 8+hlen); scan within that window. We pass the same buffer
+  -- but offset the scan start by 8 via a small shim: rebuild a header-only view is unnecessary --
+  -- pq_offset scans from 0, and the names appear only inside the JSON, so scanning [0, 8+hlen) is fine.
+  let hi = base in
+  let _ = print (cat ["pathb_quant: SmolLM2-135M  headerlen=", show hlen, "  base=", show base]) in
+
+  -- 2. fresh artifact + provenance header
+  let outp = pq_out 0 in
+  let _ = write_file outp "" in
+  let _ = append_line outp "PATHB-QUANT v1" in
+  let _ = append_line outp "model SmolLM2-135M" in
+  let _ = append_line outp "F 24" in
+  let _ = append_line outp "scale 16777216" in
+  let _ = append_line outp "dtype-src BF16" in
+  let _ = append_line outp "config d_model=576 n_heads=9 n_kv=3 head_dim=64 intermediate=1536 vocab=49152 n_layers=30 rms_eps=1e-5 rope_theta=100000 act=silu tied_embeddings=1" in
+
+  -- 3. embedding (first N rows) + first transformer block + final norm
+  let er = pq_embed_rows 0 in
+  let _ = pq_do_embed hbuf hi base er 576 outp in
+  let _ = pq_do_tensor hbuf hi base "model.layers.0.input_layernorm.weight" 576 1 outp in
+  let _ = pq_do_tensor hbuf hi base "model.layers.0.self_attn.q_proj.weight" 576 576 outp in
+  let _ = pq_do_tensor hbuf hi base "model.layers.0.self_attn.k_proj.weight" 192 576 outp in
+  let _ = pq_do_tensor hbuf hi base "model.layers.0.self_attn.v_proj.weight" 192 576 outp in
+  let _ = pq_do_tensor hbuf hi base "model.layers.0.self_attn.o_proj.weight" 576 576 outp in
+  let _ = pq_do_tensor hbuf hi base "model.layers.0.post_attention_layernorm.weight" 576 1 outp in
+  let _ = pq_do_tensor hbuf hi base "model.layers.0.mlp.gate_proj.weight" 1536 576 outp in
+  let _ = pq_do_tensor hbuf hi base "model.layers.0.mlp.up_proj.weight" 1536 576 outp in
+  let _ = pq_do_tensor hbuf hi base "model.layers.0.mlp.down_proj.weight" 576 1536 outp in
+  let _ = pq_do_tensor hbuf hi base "model.norm.weight" 576 1 outp in
+  let _ = append_line outp "END" in
+  let _ = print (cat ["pathb_quant DONE -> ", outp]) in
+  0

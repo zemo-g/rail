@@ -1,0 +1,383 @@
+-- pathb_forward.rail -- INTEGER-EXACT forward for SmolLM2-135M on a fixed test prompt.
+--
+-- Reads the quantized fixed-point weights artifact produced by pathb_quant
+-- (tools/railml/pathb/pathb_weights.q24, F=24, S=2^24) and runs a deterministic exact-integer
+-- transformer forward, producing one-token next-token logits. NO float in the forward path:
+-- every matmul is the two-limb superaccumulator (bx2/p2b style), every transcendental is the
+-- fixed-point bx4 family, RoPE is r1_rope rotate-half. Running it twice -> byte-identical logits.
+--
+-- ARTIFACT SCOPE (honest): pathb_weights.q24 carries the embedding (first 256 token-rows),
+-- EXACTLY ONE transformer block (model.layers.0: input_layernorm, q/k/v/o_proj,
+-- post_attention_layernorm, gate/up/down_proj) and model.norm. So this is a faithful ONE-LAYER
+-- exact forward (the artifact's content) followed by the final RMSNorm and the tied LM-head
+-- (embed^T) over the 256 available vocab rows -> 256 logits, argmax reported. Full 30-layer parity
+-- with HF would need all 30 layers + the full 49152-row embed quantized; the quant SCHEME and this
+-- forward are layer-count / vocab agnostic -- add the tensors to the artifact and loop the block.
+-- The MUST-HAVE here is bit-reproducibility of the forward we DO run; that is what is asserted.
+--
+-- SmolLM2-135M (Llama arch): d_model 576, heads 9, kv_heads 3 (GQA group 3), head_dim 64,
+-- intermediate 1536, SiLU MLP (down(silu(gate(x)) * up(x))), rope_theta 100000, tied embeddings.
+--
+-- Build: cd ~/projects/rail-https && ./rail_native tools/railml/pathb/pathb_forward.rail
+-- Run:   /tmp/rail_out
+--   -> tools/railml/pathb/logits.txt  +  a sha256 of it printed to stdout
+
+import "stdlib/file.rail"
+import "tools/bitexact/bx_fixed.rail"
+
+-- ===== dims (SmolLM2-135M) =====
+pf_d _      = 576
+pf_nh _     = 9
+pf_nkv _    = 3
+pf_hd _     = 64
+pf_inter _  = 1536
+pf_vocab _  = 256        -- LM head over the 256 embedding rows present in the artifact
+pf_epsq _   = 17         -- round(1e-5 * S) ~ 167 actually; SmolLM2 rms_eps=1e-5. round(1e-5*2^24)=168.
+-- NB: SmolLM2 uses 1e-5; round(1e-5 * 16777216) = 168. Use 168.
+pf_eps _    = 168
+pf_lnb _    = 193154837  -- ln(100000) * 2^24  (rope_theta = 100000)
+pf_S _      = 16777216
+
+-- ===== artifact text reader (rg_/pr_ pattern; whitespace/newline separated ints) =====
+fwd_skip_ws buf pos =
+  let c = byte_at buf pos in
+  if c == 32 then fwd_skip_ws buf (pos + 1)
+  else if c == 10 then fwd_skip_ws buf (pos + 1)
+  else if c == 9 then fwd_skip_ws buf (pos + 1)
+  else if c == 13 then fwd_skip_ws buf (pos + 1)
+  else pos
+fwd_digits buf pos acc =
+  let c = byte_at buf pos in
+  if c < 48 then acc else if c > 57 then acc else fwd_digits buf (pos + 1) (acc * 10 + (c - 48))
+fwd_digits_end buf pos =
+  let c = byte_at buf pos in
+  if c < 48 then pos else if c > 57 then pos else fwd_digits_end buf (pos + 1)
+-- read one int -> writes value to vc[0], returns end position
+fwd_read_int buf pos vc =
+  let p = fwd_skip_ws buf pos in
+  let c = byte_at buf p in
+  if c == 45 then
+    (let v = 0 - (fwd_digits buf (p + 1) 0) in let e = fwd_digits_end buf (p + 1) in let _ = arr_set vc 0 v in e)
+  else
+    (let v = fwd_digits buf p 0 in let e = fwd_digits_end buf p in let _ = arr_set vc 0 v in e)
+-- read `count` ints from buf into out[0..count) starting at pos; returns end position.
+fwd_read_n buf pos out count i vc =
+  if i >= count then pos
+  else
+    let e = fwd_read_int buf pos vc in
+    let _ = arr_set out i (arr_get vc 0) in
+    fwd_read_n buf e out count (i + 1) vc
+
+-- byte-scan to locate a tensor header line "tensor NAME ..." and return the position of the
+-- FIRST value (just after the newline that ends the header line).
+fwd_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then fwd_match buf (pos + 1) (tail pcs) else 0
+fwd_find buf pos hi pcs = if pos >= hi then 0 - 1 else if fwd_match buf pos pcs == 1 then pos else fwd_find buf (pos + 1) hi pcs
+fwd_to_nl buf pos = if byte_at buf pos == 10 then (pos + 1) else fwd_to_nl buf (pos + 1)
+
+-- load `count` ints for the tensor named `name` into a fresh array; bufhi = artifact length.
+fwd_load buf bufhi name count vc =
+  let hp = fwd_find buf 0 bufhi (chars (cat ["tensor ", name, " "])) in
+  let vp = fwd_to_nl buf hp in
+  let out = arr_new count 0 in
+  let _ = fwd_read_n buf vp out count 0 vc in
+  out
+
+-- ===== two-limb exact superaccumulator dot (the p2b atom, generalized; no hard-coded strides) =====
+pf_rescale h l = (h * 2147483648 + l) / 16777216
+-- acc += sum_p A[abase+p] * B[bbase+p]  (contiguous, depth K). acc[0]=hi, acc[1]=lo.
+pf_adot A abase B bbase K acc p =
+  if p >= K then 0
+  else
+    let a = (arr_get A (abase + p)) * (arr_get B (bbase + p)) in
+    let ahi = a / 2147483648 in
+    let alo = a - ahi * 2147483648 in
+    let h0 = (arr_get acc 0) + ahi in
+    let l0 = (arr_get acc 1) + alo in
+    let h = if l0 >= 2147483648 then h0 + 1 else if l0 < 0 then h0 - 1 else h0 in
+    let l = if l0 >= 2147483648 then l0 - 2147483648 else if l0 < 0 then l0 + 2147483648 else l0 in
+    let _ = arr_set acc 0 h in
+    let _ = arr_set acc 1 l in
+    pf_adot A abase B bbase K acc (p + 1)
+-- strided dot: acc += sum_j P[pbase+j] * V[vbase + j*vstride]
+pf_pvdot P pbase V vbase vstride L acc j =
+  if j >= L then 0
+  else
+    let a = (arr_get P (pbase + j)) * (arr_get V (vbase + j * vstride)) in
+    let ahi = a / 2147483648 in
+    let alo = a - ahi * 2147483648 in
+    let h0 = (arr_get acc 0) + ahi in
+    let l0 = (arr_get acc 1) + alo in
+    let h = if l0 >= 2147483648 then h0 + 1 else if l0 < 0 then h0 - 1 else h0 in
+    let l = if l0 >= 2147483648 then l0 - 2147483648 else if l0 < 0 then l0 + 2147483648 else l0 in
+    let _ = arr_set acc 0 h in
+    let _ = arr_set acc 1 l in
+    pf_pvdot P pbase V vbase vstride L acc (j + 1)
+
+-- ===== generic linear projection: out[obase + o] = sum_p W[o*K + p] * src[sbase + p]
+-- W is row-major (outN x K). Weight rows ARE the safetensors layout: q/k/v/o/gate/up/down all
+-- stored as [out_features, in_features] in HF, exactly W[o*K + p].
+pf_proj W src sbase K out obase outN acc o =
+  if o >= outN then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_adot W (o * K) src sbase K acc 0 in
+    let _ = arr_set out (obase + o) (pf_rescale (arr_get acc 0) (arr_get acc 1)) in
+    pf_proj W src sbase K out obase outN acc (o + 1)
+
+-- ===== RMSNorm (exact): ss = sum X[i]^2/S; meansq=ss/d; rms=fxsqrt(meansq+eps); xn=((X*S/rms)*g)/S
+pf_ssq_a X base d i acc = if i >= d then acc else pf_ssq_b X base d (i + 1) (acc + ((arr_get X (base + i)) * (arr_get X (base + i))) / 16777216)
+pf_ssq_b X base d i acc = if i >= d then acc else pf_ssq_a X base d (i + 1) (acc + ((arr_get X (base + i)) * (arr_get X (base + i))) / 16777216)
+pf_rms X base d eps = let ss = pf_ssq_a X base d 0 0 in let meansq = ss / d in bx4_fxsqrt (meansq + eps)
+pf_normapply X base xn gamma d rms i =
+  if i >= d then xn
+  else let _ = arr_set xn i (((((arr_get X (base + i)) * 16777216) / rms) * (arr_get gamma i)) / 16777216) in
+       pf_normapply X base xn gamma d rms (i + 1)
+
+-- ===== exact-integer RoPE (Llama rotate-half), freq_i = base^(-2i/hd) via fxexp
+pf_freq i hd lnb = bx4_fxexp (0 - ((2 * i * lnb) / hd))
+-- rotate one head slice src[sbase..sbase+hd) at position pos, write to out[obase..)
+pf_rope src sbase out obase hd pos lnb i =
+  if i + i >= hd then out
+  else
+    let fq = pf_freq i hd lnb in
+    let thq = pos * fq in
+    let cq = bx4_cosb thq in
+    let sq = bx4_sinb thq in
+    let qi = arr_get src (sbase + i) in
+    let qj = arr_get src (sbase + i + hd / 2) in
+    let _ = arr_set out (obase + i) ((qi * cq - qj * sq) / 16777216) in
+    let _ = arr_set out (obase + i + hd / 2) ((qj * cq + qi * sq) / 16777216) in
+    pf_rope src sbase out obase hd pos lnb (i + 1)
+-- apply RoPE to every head of T (L tokens, nh heads of width hd, row stride rstride)
+pf_rope_heads src out L nh hd rstride lnb t h =
+  if t >= L then out
+  else if h >= nh then pf_rope_heads src out L nh hd rstride lnb (t + 1) 0
+  else
+    let base = t * rstride + h * hd in
+    let _ = pf_rope src base out base hd t lnb 0 in
+    pf_rope_heads src out L nh hd rstride lnb t (h + 1)
+
+-- ===== exact-integer SiLU: silu(x) = x * sigmoid(x) = x / (1 + e^-x). Fixed-point, built on bx4_fxexp.
+-- e^-x via bx4_fxexp(-x). sig = S*S/(S + e^-x) (fixed-point reciprocal). silu = (x * sig)/S.
+pf_silu xq =
+  let em = bx4_fxexp (0 - xq) in
+  let denom = 16777216 + em in
+  let sig = (16777216 * 16777216) / denom in
+  (xq * sig) / 16777216
+
+-- ===== exact row softmax over a contiguous scores buffer S[base..base+L)
+pf_rowmax S base L j m = if j >= L then m else let v = arr_get S (base + j) in pf_rowmax S base L (j + 1) (if v > m then v else m)
+pf_exprow S E base L m j sum = if j >= L then sum else let e = bx4_fxexp ((arr_get S (base + j)) - m) in let _ = arr_set E (base + j) e in pf_exprow S E base L m (j + 1) (sum + e)
+pf_normrow E P base L sum j = if j >= L then P else let _ = arr_set P (base + j) (((arr_get E (base + j)) * 16777216) / sum) in pf_normrow E P base L sum (j + 1)
+pf_softmax_i S E P base L = let m = pf_rowmax S base L 1 (arr_get S base) in let sum = pf_exprow S E base L m 0 0 in pf_normrow E P base L sum 0
+pf_softmax S E P L i = if i >= L then P else let _ = pf_softmax_i S E P (i * L) L in pf_softmax S E P L (i + 1)
+
+-- ===== attention scores for one (query head qh, kv head kv): S[i][j] = (Qr_qh[i].Kr_kv[j])*scale/S
+-- CAUSAL: j > i masked to a very negative score (so exp -> 0). Qr stride = qdim, Kr stride = kvdim.
+pf_neg_inf _ = 0 - (1000 * 16777216)
+pf_scores_j Qr qb Kr kb qdim kvdim S hd L scaleq i j acc =
+  if j >= L then 0
+  else
+    let masked = if j > i then 1 else 0 in
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_adot Qr (qb + i * qdim) Kr (kb + j * kvdim) hd acc 0 in
+    let raw = pf_rescale (arr_get acc 0) (arr_get acc 1) in
+    let sc = if masked == 1 then (pf_neg_inf 0) else ((raw * scaleq) / 16777216) in
+    let _ = arr_set S (i * L + j) sc in
+    pf_scores_j Qr qb Kr kb qdim kvdim S hd L scaleq i (j + 1) acc
+pf_scores_i Qr qb Kr kb qdim kvdim S hd L scaleq i acc =
+  if i >= L then S
+  else let _ = pf_scores_j Qr qb Kr kb qdim kvdim S hd L scaleq i 0 acc in
+       pf_scores_i Qr qb Kr kb qdim kvdim S hd L scaleq (i + 1) acc
+
+-- context O_h[i][col] = sum_j P[i][j]*V_kv[j][col]; scatter into attn head-h slice (stride qdim)
+pf_ctx_col P V vb kvdim attn ab qdim hd L i col acc =
+  if col >= hd then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_pvdot P (i * L) V (vb + col) kvdim L acc 0 in
+    let _ = arr_set attn (ab + i * qdim + col) (pf_rescale (arr_get acc 0) (arr_get acc 1)) in
+    pf_ctx_col P V vb kvdim attn ab qdim hd L i (col + 1) acc
+pf_ctx_i P V vb kvdim attn ab qdim hd L i acc =
+  if i >= L then attn
+  else let _ = pf_ctx_col P V vb kvdim attn ab qdim hd L i 0 acc in pf_ctx_i P V vb kvdim attn ab qdim hd L (i + 1) acc
+
+-- one query head h (kv = h/group)
+pf_head Qr Kr V attn S E P qdim kvdim hd L scaleq group h acc =
+  let kv = h / group in
+  let qb = h * hd in
+  let kb = kv * hd in
+  let _ = pf_scores_i Qr qb Kr kb qdim kvdim S hd L scaleq 0 acc in
+  let _ = pf_softmax S E P L 0 in
+  pf_ctx_i P V kb kvdim attn (h * hd) qdim hd L 0 acc
+pf_heads Qr Kr V attn S E P qdim kvdim hd L scaleq nh group h acc =
+  if h >= nh then attn
+  else let _ = pf_head Qr Kr V attn S E P qdim kvdim hd L scaleq group h acc in
+       pf_heads Qr Kr V attn S E P qdim kvdim hd L scaleq nh group (h + 1) acc
+
+-- ===== per-token RMSNorm + QKV projection
+pf_proj_tokens X xn Wq Wk Wv Q K V d L qdim kvdim gamma eps acc t =
+  if t >= L then 0
+  else
+    let rms = pf_rms X (t * d) d eps in
+    let _ = pf_normapply X (t * d) xn gamma d rms 0 in
+    let _ = pf_proj Wq xn 0 d Q (t * qdim) qdim acc 0 in
+    let _ = pf_proj Wk xn 0 d K (t * kvdim) kvdim acc 0 in
+    let _ = pf_proj Wv xn 0 d V (t * kvdim) kvdim acc 0 in
+    pf_proj_tokens X xn Wq Wk Wv Q K V d L qdim kvdim gamma eps acc (t + 1)
+
+-- ===== O projection + residual: Y[t] = X[t] + attn[t] Wo^T
+pf_addrow X Y d base c =
+  if c >= d then 0
+  else let _ = arr_set Y (base + c) ((arr_get X (base + c)) + (arr_get Y (base + c))) in pf_addrow X Y d base (c + 1)
+pf_resid X attn Wo Y d qdim L acc t =
+  if t >= L then Y
+  else
+    let _ = pf_proj Wo attn (t * qdim) qdim Y (t * d) d acc 0 in
+    let _ = pf_addrow X Y d (t * d) 0 in
+    pf_resid X attn Wo Y d qdim L acc (t + 1)
+
+-- ===== SiLU MLP block: h = post_norm(Y); g = silu(gate(h)); u = up(h); m = down(g*u); out = Y + m
+pf_silu_mul gate up gg hidden j =
+  if j >= hidden then gg
+  else let _ = arr_set gg j (((pf_silu (arr_get gate j)) * (arr_get up j)) / 16777216) in
+       pf_silu_mul gate up gg hidden (j + 1)
+pf_mlp_tokens Y hn Wg Wu Wd gate up gg M d L hidden gamma eps acc t =
+  if t >= L then 0
+  else
+    let rms = pf_rms Y (t * d) d eps in
+    let _ = pf_normapply Y (t * d) hn gamma d rms 0 in
+    let _ = pf_proj Wg hn 0 d gate 0 hidden acc 0 in
+    let _ = pf_proj Wu hn 0 d up 0 hidden acc 0 in
+    let _ = pf_silu_mul gate up gg hidden 0 in
+    let _ = pf_proj Wd gg 0 hidden M (t * d) d acc 0 in
+    pf_mlp_tokens Y hn Wg Wu Wd gate up gg M d L hidden gamma eps acc (t + 1)
+pf_add_resid Y M d L t = if t >= L then Y else let _ = pf_addrow M Y d (t * d) 0 in pf_add_resid Y M d L (t + 1)
+
+-- ===== embed: build X (L x d) from token-id list ids (each id < 256), embed rows from Emb (256 x d)
+pf_embed_row Emb id X xbase d c = if c >= d then 0 else let _ = arr_set X (xbase + c) (arr_get Emb (id * d + c)) in pf_embed_row Emb id X xbase d (c + 1)
+pf_embed_g Emb ids X d L t =
+  if t >= L then X
+  else let id = arr_get ids t in
+       let _ = pf_embed_row Emb id X (t * d) d 0 in
+       pf_embed_g Emb ids X d L (t + 1)
+
+-- ===== final RMSNorm + tied LM head: logits[v] = (norm(Yf[last]) . Emb[v]) over vocab rows
+-- norm uses model.norm gamma. LM head is the embedding matrix (tied), Emb[v] = row v of the
+-- 256 x d embedding. logits at the LAST position.
+pf_lmhead xn Emb vocab d out acc v =
+  if v >= vocab then out
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_adot Emb (v * d) xn 0 d acc 0 in
+    let _ = arr_set out v (pf_rescale (arr_get acc 0) (arr_get acc 1)) in
+    pf_lmhead xn Emb vocab d out acc (v + 1)
+
+pf_argmax out n i bi bv = if i >= n then bi else let v = arr_get out i in if v > bv then pf_argmax out n (i + 1) i v else pf_argmax out n (i + 1) bi bv
+
+-- dump logits as one int per line
+pf_dump out n i acc = if i >= n then acc else pf_dump out n (i + 1) (cat [acc, show (arr_get out i), "\n"])
+
+-- ===== one full exact-integer forward over the L-token prompt; returns the logits array =====
+pf_run buf bufhi ids L vc =
+  let d = pf_d 0 in
+  let nh = pf_nh 0 in
+  let nkv = pf_nkv 0 in
+  let hd = pf_hd 0 in
+  let inter = pf_inter 0 in
+  let qdim = nh * hd in
+  let kvdim = nkv * hd in
+  let group = nh / nkv in
+  let eps = pf_eps 0 in
+  let lnb = pf_lnb 0 in
+  let scaleq = bx4_fxrsqrt (hd * 16777216) in
+  -- load tensors (ints) from the artifact
+  let Emb = fwd_load buf bufhi "model.embed_tokens.weight" (256 * d) vc in
+  let g_in = fwd_load buf bufhi "model.layers.0.input_layernorm.weight" d vc in
+  let Wq = fwd_load buf bufhi "model.layers.0.self_attn.q_proj.weight" (qdim * d) vc in
+  let Wk = fwd_load buf bufhi "model.layers.0.self_attn.k_proj.weight" (kvdim * d) vc in
+  let Wv = fwd_load buf bufhi "model.layers.0.self_attn.v_proj.weight" (kvdim * d) vc in
+  let Wo = fwd_load buf bufhi "model.layers.0.self_attn.o_proj.weight" (d * qdim) vc in
+  let g_post = fwd_load buf bufhi "model.layers.0.post_attention_layernorm.weight" d vc in
+  let Wg = fwd_load buf bufhi "model.layers.0.mlp.gate_proj.weight" (inter * d) vc in
+  let Wu = fwd_load buf bufhi "model.layers.0.mlp.up_proj.weight" (inter * d) vc in
+  let Wd = fwd_load buf bufhi "model.layers.0.mlp.down_proj.weight" (d * inter) vc in
+  let g_norm = fwd_load buf bufhi "model.norm.weight" d vc in
+  let _ = print "  tensors loaded" in
+  -- embed
+  let X = pf_embed_g Emb ids (arr_new (L * d) 0) d L 0 in
+  -- attention block
+  let acc = arr_new 2 0 in
+  let xn = arr_new d 0 in
+  let Q = arr_new (L * qdim) 0 in
+  let K = arr_new (L * kvdim) 0 in
+  let V = arr_new (L * kvdim) 0 in
+  let _ = pf_proj_tokens X xn Wq Wk Wv Q K V d L qdim kvdim g_in eps acc 0 in
+  let Qr = pf_rope_heads Q (arr_new (L * qdim) 0) L nh hd qdim lnb 0 0 in
+  let Kr = pf_rope_heads K (arr_new (L * kvdim) 0) L nkv hd kvdim lnb 0 0 in
+  let attn = arr_new (L * qdim) 0 in
+  let S = arr_new (L * L) 0 in
+  let E = arr_new (L * L) 0 in
+  let P = arr_new (L * L) 0 in
+  let _ = pf_heads Qr Kr V attn S E P qdim kvdim hd L scaleq nh group 0 acc in
+  let Y = pf_resid X attn Wo (arr_new (L * d) 0) d qdim L acc 0 in
+  -- MLP block
+  let hn = arr_new d 0 in
+  let gate = arr_new inter 0 in
+  let up = arr_new inter 0 in
+  let gg = arr_new inter 0 in
+  let M = arr_new (L * d) 0 in
+  let _ = pf_mlp_tokens Y hn Wg Wu Wd gate up gg M d L inter g_post eps acc 0 in
+  let Yf = pf_add_resid Y M d L 0 in
+  -- final norm at LAST position + tied LM head
+  let last = L - 1 in
+  let rms = pf_rms Yf (last * d) d eps in
+  let xnf = arr_new d 0 in
+  let _ = pf_normapply Yf (last * d) xnf g_norm d rms 0 in
+  let vocab = pf_vocab 0 in
+  let logits = arr_new vocab 0 in
+  let _ = pf_lmhead xnf Emb vocab d logits acc 0 in
+  logits
+
+main =
+  -- fixed test prompt: token ids (all < 256 so they hit the embedding slice present in the artifact).
+  -- "The quick" style placeholder ids -- the point is a DETERMINISTIC exact forward, not a tokenized
+  -- sentence (the BPE merges for SmolLM2 are not in this artifact). 6 positions exercise RoPE + causal.
+  let L = 6 in
+  let ids = arr_new L 0 in
+  let _ = arr_set ids 0 72 in
+  let _ = arr_set ids 1 101 in
+  let _ = arr_set ids 2 108 in
+  let _ = arr_set ids 3 108 in
+  let _ = arr_set ids 4 111 in
+  let _ = arr_set ids 5 32 in
+  let _ = print (cat ["pathb_forward: SmolLM2-135M ONE-LAYER exact-integer forward  L=", show L, "  d=576 heads=9/3 hd=64 inter=1536  vocab(LM)=256"]) in
+  let buf = read_file_bytes "tools/railml/pathb/pathb_weights.q24" in
+  -- read_file_bytes hands back a raw byte buffer indexed by byte_at (NOT a Rail array: arr_len/
+  -- arr_get on it are garbage). Get the byte length from read_file_size.
+  let bufhi = read_file_size "tools/railml/pathb/pathb_weights.q24" in
+  let vc = arr_new 1 0 in
+  -- run twice -> assert byte-identical logits (the WHOLE point: CPU exact, not GPU fp32)
+  let l1 = pf_run buf bufhi ids L vc in
+  let l2 = pf_run buf bufhi ids L vc in
+  let vocab = pf_vocab 0 in
+  let mism = pf_eqcount l1 l2 vocab 0 0 in
+  let det = if mism == 0 then 1 else 0 in
+  let am = pf_argmax l1 vocab 1 0 (arr_get l1 0) in
+  let _ = print (cat ["  argmax token (over 256-row vocab) = ", show am, "   logit(int,S=2^24) = ", show (arr_get l1 am)]) in
+  let _ = print (cat ["  determinism (run-twice byte-identical logits): ", if det == 1 then "PASS" else "FAIL", "  mismatches=", show mism]) in
+  -- emit logits artifact (int per line, S-scaled fixed-point) + a couple of float dequant samples
+  let txt = pf_dump l1 vocab 0 (cat ["PATHB-FORWARD-LOGITS v1 model=SmolLM2-135M layers=1 vocab=", show vocab, " F=24 scale=16777216 L=", show L, " argmax=", show am, "\n"]) in
+  let _ = write_file "tools/railml/pathb/logits.txt" txt in
+  let h = shell "shasum -a 256 tools/railml/pathb/logits.txt" in
+  let _ = print (cat ["  logits.txt sha256: ", h]) in
+  let _ = print (if det == 1
+    then "pathb_forward PASS: integer-exact one-layer SmolLM2-135M forward is bit-reproducible (run-twice byte-identical logits). All matmuls two-limb exact superaccumulator, RMSNorm/SiLU/softmax fixed-point bx4, RoPE r1 rotate-half. No float in the forward path -> CPU exact, schedule-independent."
+    else "pathb_forward FAIL: logits differed run-to-run (should be impossible for the integer path)") in
+  if det == 1 then 0 else 1
+
+pf_eqcount A B n i bad = if i >= n then bad else pf_eqcount A B n (i + 1) (if (arr_get A i) == (arr_get B i) then bad else bad + 1)

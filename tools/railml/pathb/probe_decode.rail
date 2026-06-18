@@ -1,0 +1,70 @@
+-- probe: decode a few embedding elements + layer0 q_proj on the fly, print to find the zero-collapse.
+import "stdlib/file.rail"
+
+pf_blob _ = "/Users/ledaticempire/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M/blobs/80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1"
+
+pq_pow2_go acc k = if k == 0 then acc else pq_pow2_go (acc + acc) (k - 1)
+pq_pow2 k = if k < 1 then 1 else pq_pow2_go 1 k
+pq_f32_fixed b0 b1 b2 b3 =
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in
+  let sign = bits / 2147483648 in
+  let rest = bits - sign * 2147483648 in
+  let exp  = rest / 8388608 in
+  let mant = rest - exp * 8388608 in
+  if exp == 0 then 0
+  else
+    let mag = 8388608 + mant in
+    let sh = exp - 126 in
+    let xabs = if sh >= 0 then mag * (pq_pow2 sh)
+               else (let d = pq_pow2 (0 - sh) in (mag + d / 2) / d) in
+    if sign == 1 then 0 - xabs else xabs
+pq_bf16_fixed lo hi = pq_f32_fixed 0 0 lo hi
+
+pq_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then pq_match buf (pos + 1) (tail pcs) else 0
+pq_find buf pos hi pcs = if pos >= hi then 0 - 1 else if pq_match buf pos pcs == 1 then pos else pq_find buf (pos + 1) hi pcs
+pq_find_after buf pos hi pcs = let p = pq_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+pq_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else pq_int buf (pos + 1) (acc * 10 + (c - 48))
+pq_int_after buf pos = let c = byte_at buf pos in if c < 48 then pos else if c > 57 then pos else pq_int_after buf (pos + 1)
+pq_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+pq_offset hdr hi name k =
+  let np = pq_find hdr 0 hi (chars (cat ["\"", name, "\":"])) in
+  let dp = pq_find_after hdr np hi (chars "\"data_offsets\":[") in
+  let start = pq_int hdr dp 0 in
+  if k == 0 then start
+  else (let endp = pq_int_after hdr dp in pq_int hdr (endp + 1) 0)
+
+main =
+  let buf = read_file_bytes (pf_blob 0) in
+  let hlen = pq_le_len buf 0 in
+  let base = 8 + hlen in
+  let _ = print (cat ["hlen=", show hlen, " base=", show base]) in
+  -- embed start offset
+  let es = pq_offset buf base "model.embed_tokens.weight" 0 in
+  let ee = pq_offset buf base "model.embed_tokens.weight" 1 in
+  let _ = print (cat ["embed data_offsets start=", show es, " end=", show ee, " nelems=", show ((ee - es) / 2)]) in
+  -- decode embed row 504, first 6 cols (d=576). byteaddr = base + es + 2*(504*576 + c)
+  let _ = print "embed row 504 first 6 fixed-point ints:" in
+  let p0 = 504 * 576 in
+  let ba0 = base + es + 2 * p0 in
+  let e0 = pq_bf16_fixed (byte_at buf ba0) (byte_at buf (ba0 + 1)) in
+  let e1 = pq_bf16_fixed (byte_at buf (ba0 + 2)) (byte_at buf (ba0 + 3)) in
+  let e2 = pq_bf16_fixed (byte_at buf (ba0 + 4)) (byte_at buf (ba0 + 5)) in
+  let _ = print (cat ["  ", show e0, " ", show e1, " ", show e2]) in
+  -- layer0 q_proj start
+  let qs = pq_offset buf base "model.layers.0.self_attn.q_proj.weight" 0 in
+  let _ = print (cat ["layer0 q_proj start=", show qs]) in
+  let qb = base + qs in
+  let q0 = pq_bf16_fixed (byte_at buf qb) (byte_at buf (qb + 1)) in
+  let q1 = pq_bf16_fixed (byte_at buf (qb + 2)) (byte_at buf (qb + 3)) in
+  let _ = print (cat ["  q_proj[0]=", show q0, " q_proj[1]=", show q1]) in
+  -- input_layernorm.weight row 0 (gamma) -- should be ~1.0 -> ~16777216
+  let gs = pq_offset buf base "model.layers.0.input_layernorm.weight" 0 in
+  let gb = base + gs in
+  let g0 = pq_bf16_fixed (byte_at buf gb) (byte_at buf (gb + 1)) in
+  let _ = print (cat ["layer0 input_layernorm.weight[0]=", show g0]) in
+  -- model.norm.weight[0]
+  let ns = pq_offset buf base "model.norm.weight" 0 in
+  let nb = base + ns in
+  let n0 = pq_bf16_fixed (byte_at buf nb) (byte_at buf (nb + 1)) in
+  let _ = print (cat ["model.norm.weight[0]=", show n0]) in
+  0
