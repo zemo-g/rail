@@ -171,7 +171,7 @@ Tail-recursive loops match C `-O2` (5 instructions per iteration). The full arch
 The compiler assembles, links, and code-signs **itself** — in pure Rail, in-process — with no Apple `as`, `ld`, or `codesign` in the build. v5.0.0 removed `as`/`ld` from the Linux ELF path; v5.2.0 closes the loop on the macOS host, including the ad-hoc signature arm64 requires, and extends it to FFI binaries.
 
 - **The full Rail toolchain.** A two-pass AArch64 assembler (gate-validated **1248/1248** instruction forms byte-identical to `as`), a Mach-O linker that bakes `@PAGE`/`@PAGEOFF` relocs + `LC_DYLD_INFO` rebase/bind + stubs/`__got`, and an N-page ad-hoc signer — all in Rail.
-- **Bit-reproducible.** Rail owns every byte, including the `LC_UUID` and padding `ld` randomizes, so the self-compile is deterministic: the committed seed reproduces itself byte-for-byte (sha256 `b02dd228…`) in one cycle. Attestation goes from tamper-evident to source-reproducible.
+- **Bit-reproducible.** Rail owns every byte, including the `LC_UUID` and padding `ld` randomizes, so the self-compile is deterministic: the committed seed reproduces itself byte-for-byte (sha256 `b02dd228…`) in one cycle, verified identical across two independent Macs. Attestation goes from tamper-evident to source-reproducible. **Check it yourself:** clone this repo and run `RAIL_ARENA_MB=6000 ./verify_reproducible.sh` — it rebuilds the committed binary from source and confirms the hash.
 - **In-process by default**, with the `as`/`ld` path preserved byte-for-byte as a fallback (`RAIL_ARENA_MB < 5000`). FFI programs stand alone too: multi-dylib linking binds `libsqlite3` with no `ld`. 178/178 tests.
 
 ### v5.1.0 — 2026-05-15 — *Rail emits its own GPU kernels*
