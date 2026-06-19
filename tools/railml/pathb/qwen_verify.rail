@@ -1,0 +1,160 @@
+-- qwen_verify.rail -- memory-light correctness proof for the Qwen3-0.6B port (D2.2).
+-- Full Qwen generation holds ~5GB of weights (0.6B params as Rail 8-byte ints) which macOS
+-- compresses between slow matmuls -> thrash. To verify the PORT (esp. QK-norm) without that
+-- wall, run only the first FEW layers over the 5-token prompt and compare the last-position
+-- hidden-state absum to HF fp32 (the SmolLM2-validated ~0.1% methodology). Loads only the 5
+-- prompt embeddings (not the 1.24GB table) + N layers + no LM head -> ~2GB, no thrash.
+--
+-- HF fp32 (Qwen3-0.6B, prompt [785,6722,315,9625,374]) last-pos hidden absum:
+--   embed 21.0456 | L0 123.4523 | L1 161.8305 | L2 186.8436 | L3 244.0954 | L4 242.3152
+-- Rail prints absum in F=24 units; divide by 16777216 to compare.
+--
+-- Build: cd ~/projects/rail-https && ./rail_native tools/railml/pathb/qwen_verify.rail
+-- Run:   RAIL_ARENA_MB=6000 /tmp/rail_out
+
+import "tools/railml/pathb/pathb_lib.rail"
+import "stdlib/env.rail"
+
+qv_d _ = 1024
+qv_nh _ = 16
+qv_nkv _ = 8
+qv_hd _ = 128
+qv_inter _ = 3072
+qv_eps _ = 17
+qv_lnb _ = 231785805
+qv_nverify _ = 5      -- layers to run + compare
+
+qv_blob _ = let e = getenv "QWEN3_BLOB" in if e == "" then cat [getenv "HOME", "/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca/model.safetensors"] else e
+
+-- ===== QK-norm over a full [L][nheads][hd] tensor (in place) =====
+qn_apply vec base gamma hd rinv i =
+  if i >= hd then 0
+  else let _ = arr_set vec (base + i) (mul_shr (mul_shr (arr_get vec (base + i)) rinv 24) (arr_get gamma i) 24) in
+       qn_apply vec base gamma hd rinv (i + 1)
+qk_norm_tok vec tbase nheads hd gamma eps h =
+  if h >= nheads then 0
+  else let base = tbase + h * hd in
+       let rms = pf_rms vec base hd eps in
+       let _ = qn_apply vec base gamma hd (281474976710656 / rms) 0 in
+       qk_norm_tok vec tbase nheads hd gamma eps (h + 1)
+qk_norm_full vec L stride nheads hd gamma eps t =
+  if t >= L then 0
+  else let _ = qk_norm_tok vec (t * stride) nheads hd gamma eps 0 in
+       qk_norm_full vec L stride nheads hd gamma eps (t + 1)
+
+-- ===== one Qwen3 layer over the full L-token hidden H (full causal attention + QK-norm) =====
+qv_layer LW H li d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc =
+  let g_in   = arr_get LW (li * 11 + 0) in
+  let Wq     = arr_get LW (li * 11 + 1) in
+  let Wk     = arr_get LW (li * 11 + 2) in
+  let Wv     = arr_get LW (li * 11 + 3) in
+  let Wo     = arr_get LW (li * 11 + 4) in
+  let g_post = arr_get LW (li * 11 + 5) in
+  let Wg     = arr_get LW (li * 11 + 6) in
+  let Wu     = arr_get LW (li * 11 + 7) in
+  let Wd     = arr_get LW (li * 11 + 8) in
+  let qnorm  = arr_get LW (li * 11 + 9) in
+  let knorm  = arr_get LW (li * 11 + 10) in
+  let xn = arr_new d 0 in
+  let Q = arr_new (L * qdim) 0 in
+  let K = arr_new (L * kvdim) 0 in
+  let V = arr_new (L * kvdim) 0 in
+  let _ = pf_proj_tokens H xn Wq Wk Wv Q K V d L qdim kvdim g_in eps acc 0 in
+  -- QK-norm BEFORE RoPE (Qwen3)
+  let _ = qk_norm_full Q L qdim nh hd qnorm eps 0 in
+  let _ = qk_norm_full K L kvdim nkv hd knorm eps 0 in
+  let Qr = pf_rope_heads Q (arr_new (L * qdim) 0) L nh hd qdim lnb 0 0 in
+  let Kr = pf_rope_heads K (arr_new (L * kvdim) 0) L nkv hd kvdim lnb 0 0 in
+  let attn = arr_new (L * qdim) 0 in
+  let S = arr_new (L * L) 0 in
+  let E = arr_new (L * L) 0 in
+  let P = arr_new (L * L) 0 in
+  let _ = pf_heads Qr Kr V attn S E P qdim kvdim hd L scaleq nh group 0 acc in
+  let Y = pf_resid H attn Wo (arr_new (L * d) 0) d qdim L acc 0 in
+  let hn = arr_new d 0 in
+  let gate = arr_new inter 0 in
+  let up = arr_new inter 0 in
+  let gg = arr_new inter 0 in
+  let M = arr_new (L * d) 0 in
+  let _ = pf_mlp_tokens Y hn Wg Wu Wd gate up gg M d L inter g_post eps acc 0 in
+  pf_add_resid Y M d L 0
+
+-- run layers 0..nverify-1, copy each block output into the persistent H, print last-pos absum
+qv_layers LW H li nverify d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc =
+  if li >= nverify then 0
+  else
+    let m = arena_mark 0 in
+    let Yf = qv_layer LW H li d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc in
+    let _ = pf_copy Yf H (L * d) 0 in
+    let _ = arena_reset m in
+    let a = pf_absum H ((L - 1) * d) d 0 0 in
+    let _ = print (cat ["  after L", show li, " absum(F24)=", show a, "  /2^24=", show (a / 16777216), ".", show (((a / 1677721) - (a / 16777216) * 10)), " (HF: L0 123.45 L1 161.83 L2 186.84 L3 244.10 L4 242.32)"]) in
+    qv_layers LW H (li + 1) nverify d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc
+
+-- decode one embedding row (token id) into H at position t
+qv_embed_row buf base estart id H t d c =
+  if c >= d then 0
+  else let ba = base + estart + (id * d + c) * 2 in
+       let _ = arr_set H (t * d + c) (pq_bf16_fixed (byte_at buf ba) (byte_at buf (ba + 1))) in
+       qv_embed_row buf base estart id H t d (c + 1)
+
+qv_loadlayers buf hdrhi base LW li nverify d qdim kvdim inter hd =
+  if li >= nverify then 0
+  else
+    let _ = arr_set LW (li * 11 + 0) (ld_tensor buf hdrhi base (ld_lname li "input_layernorm.weight") d) in
+    let _ = arr_set LW (li * 11 + 1) (ld_tensor buf hdrhi base (ld_lname li "self_attn.q_proj.weight") (qdim * d)) in
+    let _ = arr_set LW (li * 11 + 2) (ld_tensor buf hdrhi base (ld_lname li "self_attn.k_proj.weight") (kvdim * d)) in
+    let _ = arr_set LW (li * 11 + 3) (ld_tensor buf hdrhi base (ld_lname li "self_attn.v_proj.weight") (kvdim * d)) in
+    let _ = arr_set LW (li * 11 + 4) (ld_tensor buf hdrhi base (ld_lname li "self_attn.o_proj.weight") (d * qdim)) in
+    let _ = arr_set LW (li * 11 + 5) (ld_tensor buf hdrhi base (ld_lname li "post_attention_layernorm.weight") d) in
+    let _ = arr_set LW (li * 11 + 6) (ld_tensor buf hdrhi base (ld_lname li "mlp.gate_proj.weight") (inter * d)) in
+    let _ = arr_set LW (li * 11 + 7) (ld_tensor buf hdrhi base (ld_lname li "mlp.up_proj.weight") (inter * d)) in
+    let _ = arr_set LW (li * 11 + 8) (ld_tensor buf hdrhi base (ld_lname li "mlp.down_proj.weight") (d * inter)) in
+    let _ = arr_set LW (li * 11 + 9) (ld_tensor buf hdrhi base (ld_lname li "self_attn.q_norm.weight") hd) in
+    let _ = arr_set LW (li * 11 + 10) (ld_tensor buf hdrhi base (ld_lname li "self_attn.k_norm.weight") hd) in
+    qv_loadlayers buf hdrhi base LW (li + 1) nverify d qdim kvdim inter hd
+
+main =
+  let d = qv_d 0 in
+  let nh = qv_nh 0 in
+  let nkv = qv_nkv 0 in
+  let hd = qv_hd 0 in
+  let inter = qv_inter 0 in
+  let eps = qv_eps 0 in
+  let lnb = qv_lnb 0 in
+  let nverify = qv_nverify 0 in
+  let qdim = nh * hd in
+  let kvdim = nkv * hd in
+  let group = nh / nkv in
+  let scaleq = bx4_fxrsqrt (hd * 16777216) in
+  let acc = arr_new 2 0 in
+  let blob = qv_blob 0 in
+  let buf = read_file_bytes blob in
+  let hlen = pq_le_len buf 0 in
+  let base = 8 + hlen in
+  let hdrhi = base in
+  let L = 5 in
+  let ids = arr_new L 0 in
+  let _ = arr_set ids 0 785 in
+  let _ = arr_set ids 1 6722 in
+  let _ = arr_set ids 2 315 in
+  let _ = arr_set ids 3 9625 in
+  let _ = arr_set ids 4 374 in
+  let _ = print (cat ["qwen_verify: ", show nverify, " layers over prompt [785,6722,315,9625,374], compare last-pos absum to HF fp32"]) in
+  -- embed the 5 prompt tokens only
+  let estart = pq_offset buf hdrhi "model.embed_tokens.weight" 0 in
+  let H = arr_new (L * d) 0 in
+  let _ = qv_embed_row buf base estart 785 H 0 d 0 in
+  let _ = qv_embed_row buf base estart 6722 H 1 d 0 in
+  let _ = qv_embed_row buf base estart 315 H 2 d 0 in
+  let _ = qv_embed_row buf base estart 9625 H 3 d 0 in
+  let _ = qv_embed_row buf base estart 374 H 4 d 0 in
+  let ae = pf_absum H ((L - 1) * d) d 0 0 in
+  let _ = print (cat ["  embed   absum(F24)=", show ae, "  /2^24=", show (ae / 16777216), ".", show (((ae / 1677721) - (ae / 16777216) * 10)), " (HF embed 21.05)"]) in
+  let _ = print "  loading first 5 layers (with q/k-norm)..." in
+  let LW = arr_new (nverify * 11) 0 in
+  let _ = qv_loadlayers buf hdrhi base LW 0 nverify d qdim kvdim inter hd in
+  let _ = print "  running layers:" in
+  let _ = qv_layers LW H 0 nverify d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc in
+  let _ = print "  PORT VALID if each Rail /2^24 matches HF within ~1% (QK-norm + non-square head_dim exercised every layer)." in
+  0
