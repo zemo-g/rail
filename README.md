@@ -6,11 +6,11 @@
 </p>
 
 <p align="center">
-  <a href="#releases"><img src="https://img.shields.io/badge/v5.1.0-Emits%20its%20own%20GPU%20kernels-ff5500?style=for-the-badge" alt="v5.1.0"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/v5.2.0-Stands%20alone%20(no%20as%2Fld%2Fcodesign)-ff5500?style=for-the-badge" alt="v5.2.0"></a>
 </p>
 
 <p align="center">
-  <a href="#install"><img src="https://img.shields.io/badge/tests-141%2F141-brightgreen" alt="tests 141/141"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/tests-178%2F178-brightgreen" alt="tests 178/178"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
   <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
@@ -29,12 +29,12 @@
 
 ---
 
-Rail compiles itself. The compiler — ~6,000+ lines of Rail — produces a ~1.0 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. The TLS 1.3 client is also Rail: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat. As of **v5.1.0**, the toolchain is self-hosted to the metal: Rail emits its own aarch64 Linux ELF binaries — no `as`, no `ld` in the path — and emits its own GPU kernels, generating Metal Shading Language from an op-DAG and JIT-compiling it at runtime (35× fused rmsnorm+QKV, 18× fused silu+hadamard). A frontier model + 1 KB Rail spec still compiles 30/30 on a held-out hard-bench — publicly reproducible.
+Rail compiles itself. The compiler — ~6,000+ lines of Rail — produces a ~1.0 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. The TLS 1.3 client is also Rail: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat. As of **v5.2.0**, the toolchain stands entirely alone: Rail assembles, links, and code-signs its own Mach-O binaries in-process — no `as`, no `ld`, no `codesign` — so the self-compile is bit-reproducible (the committed seed reproduces itself byte-for-byte). It also emits its own aarch64 Linux ELF binaries and its own GPU kernels, generating Metal Shading Language from an op-DAG and JIT-compiling it at runtime (35× fused rmsnorm+QKV, 18× fused silu+hadamard). A frontier model + 1 KB Rail spec still compiles 30/30 on a held-out hard-bench — publicly reproducible.
 
 ```
 ./rail_native self && cp /tmp/rail_self ./rail_native  # cycle 1
 ./rail_native self && cmp rail_native /tmp/rail_self   # cycle 2 — byte-identical
-./rail_native test                                     # 141/141
+./rail_native test                                     # 178/178
 ```
 
 ## Quick start
@@ -166,6 +166,14 @@ Tail-recursive loops match C `-O2` (5 instructions per iteration). The full arch
 
 ## Releases
 
+### v5.2.0 — 2026-06-19 — *Rail stands alone (no as/ld/codesign)*
+
+The compiler assembles, links, and code-signs **itself** — in pure Rail, in-process — with no Apple `as`, `ld`, or `codesign` in the build. v5.0.0 removed `as`/`ld` from the Linux ELF path; v5.2.0 closes the loop on the macOS host, including the ad-hoc signature arm64 requires, and extends it to FFI binaries.
+
+- **The full Rail toolchain.** A two-pass AArch64 assembler (gate-validated **1248/1248** instruction forms byte-identical to `as`), a Mach-O linker that bakes `@PAGE`/`@PAGEOFF` relocs + `LC_DYLD_INFO` rebase/bind + stubs/`__got`, and an N-page ad-hoc signer — all in Rail.
+- **Bit-reproducible.** Rail owns every byte, including the `LC_UUID` and padding `ld` randomizes, so the self-compile is deterministic: the committed seed reproduces itself byte-for-byte (sha256 `b02dd228…`) in one cycle. Attestation goes from tamper-evident to source-reproducible.
+- **In-process by default**, with the `as`/`ld` path preserved byte-for-byte as a fallback (`RAIL_ARENA_MB < 5000`). FFI programs stand alone too: multi-dylib linking binds `libsqlite3` with no `ld`. 178/178 tests.
+
 ### v5.1.0 — 2026-05-15 — *Rail emits its own GPU kernels*
 
 Rail's JIT generates Metal Shading Language from its own op-DAG, compiles it at runtime via `newLibraryWithSource:`, and dispatches the kernel — so every GPU kernel the training stack runs is emitted by an attested Rail binary.
@@ -228,6 +236,7 @@ Native floats in ARM64 d-registers, effect handlers via setjmp/longjmp, GC in as
 
 | Version | Date | Headline |
 |---|---|---|
+| **v5.2.0** | 2026-06-19 | Rail stands alone — assembles, links, and code-signs its own Mach-O with no as/ld/codesign; bit-reproducible self-compile; FFI binaries link with no ld |
 | **v5.1.0** | 2026-05-15 | Rail emits its own GPU kernels — MSL from op-DAG, JIT-compiled fused Metal (35× rmsnorm+QKV, 18× silu+hadamard) + bf16 regime |
 | **v5.0.2** | 2026-05-15 | First release attested end-to-end through Rail — shell escape hatches retired |
 | **v5.0.1** | 2026-05-15 | Attestation hygiene + ARM64 codegen tightening |
