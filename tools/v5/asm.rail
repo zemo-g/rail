@@ -35,22 +35,27 @@ import "stdlib/macho.rail"
 -- ============================================================================
 
 -- Trim leading whitespace.
-asm_ltrim s = asm_ltrim_loop (chars s)
-asm_ltrim_loop cs =
-  if cs == [] then ""
-  else if (head cs) == " " || (head cs) == "\t" then asm_ltrim_loop (tail cs)
-  else join "" (asm_chars_to_strs cs)
+-- O(len): count leading whitespace, str_sub once (was join "" <chars> = O(len^2),
+-- the dominant linker-churn source on the long embedded-runtime .asciz lines).
+asm_ltrim s =
+  let cs = chars s
+  let k = asm_count_lead_ws cs 0
+  if k == 0 then s else str_sub s k ((length cs) - k)
+asm_count_lead_ws cs n =
+  if cs == [] then n
+  else if (head cs) == " " || (head cs) == "\t" then asm_count_lead_ws (tail cs) (n + 1)
+  else n
 
 asm_chars_to_strs cs =
   if cs == [] then []
   else cons (char_from_int (char_to_int (head cs))) (asm_chars_to_strs (tail cs))
 
 -- Drop trailing comment (anything from ';' onwards) — common in compile.rail output.
-asm_strip_comment s = asm_strip_loop (chars s) []
-asm_strip_loop cs acc =
-  if cs == [] then join "" (reverse acc)
-  else if (head cs) == ";" then join "" (reverse acc)
-  else asm_strip_loop (tail cs) (cons (char_from_int (char_to_int (head cs))) acc)
+-- O(len): find ';' and str_sub. Returns s unchanged when there is no comment
+-- (the common case) instead of rebuilding the whole string via join.
+asm_strip_comment s =
+  let i = str_find ";" s
+  if i < 0 then s else str_sub s 0 i
 
 -- True if s ends with `:` (= a label definition line).
 asm_is_label s =
@@ -61,16 +66,10 @@ asm_is_label s =
 
 -- Drop the trailing ':' from a label line.
 asm_label_name s =
-  let cs = chars s
-  asm_label_body cs []
-
-asm_label_body cs acc =
-  if cs == [] then join "" (reverse acc)
-  else if (tail cs) == [] then
-    -- last char; if ':' drop, else keep
-    if (head cs) == ":" then join "" (reverse acc)
-    else join "" (reverse (cons (char_from_int (char_to_int (head cs))) acc))
-  else asm_label_body (tail cs) (cons (char_from_int (char_to_int (head cs))) acc)
+  let n = length (chars s)
+  if n == 0 then s
+  else if (str_sub s (n - 1) 1) == ":" then str_sub s 0 (n - 1)
+  else s
 
 -- True if `s` begins with `.` (assembler directive — skip).
 asm_is_directive s =
@@ -83,14 +82,13 @@ asm_is_directive s =
 -- space.  Operand_string = everything after, leading whitespace trimmed.
 asm_split_mn_ops s =
   let cs = chars s
-  asm_split_loop cs []
-
-asm_split_loop cs acc =
-  if cs == [] then [join "" (reverse acc), ""]
-  else if (head cs) == " " || (head cs) == "\t" then
-    [join "" (reverse acc), asm_ltrim (join "" (asm_chars_to_strs (tail cs)))]
-  else
-    asm_split_loop (tail cs) (cons (char_from_int (char_to_int (head cs))) acc)
+  let i = asm_first_ws cs 0
+  if i < 0 then [s, ""]
+  else [str_sub s 0 i, asm_ltrim (str_sub s (i + 1) ((length cs) - i - 1))]
+asm_first_ws cs n =
+  if cs == [] then 0 - 1
+  else if (head cs) == " " || (head cs) == "\t" then n
+  else asm_first_ws (tail cs) (n + 1)
 
 -- ============================================================================
 -- Operand parsing
@@ -98,10 +96,12 @@ asm_split_loop cs acc =
 
 -- Parse `xN` or `wN` → integer N. Returns -1 if not a register.
 asm_reg_num s =
-  let cs = chars s
-  if cs == [] then 0 - 1
-  else if (head cs) == "x" || (head cs) == "w" then asm_parse_int_chars (tail cs) 0
-  else 0 - 1
+  if s == "sp" || s == "xzr" || s == "wzr" then 31   -- SP and zero-reg both encode as 31
+  else
+    let cs = chars s
+    if cs == [] then 0 - 1
+    else if (head cs) == "x" || (head cs) == "w" then asm_parse_int_chars (tail cs) 0
+    else 0 - 1
 
 asm_parse_int_chars cs acc =
   if cs == [] then acc
@@ -119,6 +119,7 @@ asm_imm s =
 
 asm_imm_body cs =
   if cs == [] then 0
+  else if (head cs) == "-" then 0 - (asm_imm_body (tail cs))   -- negative immediates (#-16)
   else if (head cs) == "0" then
     if (tail cs) == [] then 0
     else if (head (tail cs)) == "x" then asm_hex_int (tail (tail cs)) 0
@@ -135,16 +136,21 @@ asm_hex_int cs acc =
     else acc
 
 -- Split operand string on commas, returning a list of trimmed pieces.
-asm_split_commas s = asm_split_c (chars s) [] []
-
-asm_split_c cs cur acc =
+-- O(len): split on commas by INDEX + str_sub (was join "" <rebuilt chars> per
+-- operand = O(len^2) + a fresh char alloc per char, on the per-instruction hot
+-- path). Matches the old emit rules exactly: an operand is emitted at each comma
+-- (even if empty, e.g. ",x0" -> ["","x0"]); a trailing run after the last comma
+-- is emitted only if non-empty (so "x0," -> ["x0"], "" -> []).
+asm_split_commas s =
+  let cs = chars s
+  if cs == [] then [] else asm_split_idx s cs 0 0 []
+asm_split_idx s cs i start acc =
   if cs == [] then
-    if cur == [] then reverse acc
-    else reverse (cons (asm_ltrim (join "" (reverse cur))) acc)
+    (if i > start then reverse (cons (asm_ltrim (str_sub s start (i - start))) acc)
+     else reverse acc)
   else if (head cs) == "," then
-    asm_split_c (tail cs) [] (cons (asm_ltrim (join "" (reverse cur))) acc)
-  else
-    asm_split_c (tail cs) (cons (char_from_int (char_to_int (head cs))) cur) acc
+    asm_split_idx s (tail cs) (i + 1) (i + 1) (cons (asm_ltrim (str_sub s start (i - start))) acc)
+  else asm_split_idx s (tail cs) (i + 1) start acc
 
 -- ============================================================================
 -- Pass 1 — split source into lines, count instructions, build label map.
@@ -161,28 +167,166 @@ asm_classify line =
   else if asm_is_label s == 1 then "label"
   else "insn"
 
--- Walk lines. For each: if label, push (name, current_byte_off). If insn,
--- advance byte_off by 4. Returns the label list at the end.
-asm_pass1 lines off label_map =
-  if lines == [] then label_map
+-- True if string s begins with prefix p (char-by-char, early-out — cheaper than
+-- str_find on the long embedded-runtime-asm string lines).
+asm_starts s p = asm_starts_cs (chars s) (chars p)
+asm_starts_cs sc pc =
+  if pc == [] then 1
+  else if sc == [] then 0
+  else if (head sc) == (head pc) then asm_starts_cs (tail sc) (tail pc)
+  else 0
+
+-- Richer classification for whole-program LAYOUT (compile.rail emits string
+-- literals INLINE in __text: `.Lstr_N: .asciz "..." / .p2align 2`, jumped over by
+-- `b .Lafter` and referenced by `adr`). Tags:
+--   "sec_text"/"sec_other" — section switch into / out of __TEXT,__text
+--   "asciz"/"ascii"        — inline string data (with / without null terminator)
+--   "align"               — .p2align N (zero-fill to 4-boundary, then NOP-fill)
+--   "skip"/"label"/"insn" — as before.
+-- Classify on the comment-stripped prefix; but .asciz DECODING uses the RAW
+-- ltrimmed line — strings legitimately contain ';' (28 in the compiler's own .s).
+-- Classify WITHOUT rebuilding the line. asm_ltrim/asm_strip_comment do
+-- `join "" (...)` which is O(len^2) in Rail — fatal on the long embedded-runtime
+-- `.asciz` lines (a 40x-longer line was measured 4500x slower). We work on the
+-- raw char list (chars = one O(len) pass) and only ever inspect a short prefix /
+-- the last char, so classify is O(len), not O(len^2).
+-- LABELS via trailing ':' — local labels are dotted (`.Lelse_0:`) and would
+-- otherwise be swallowed by the directive check.
+asm_classify2 line =
+  let cs = asm_skip_ws (chars line)
+  if cs == [] then "skip"
+  else if (head cs) == "." then asm_classify_dot cs line
+  else if (asm_chars_end_colon cs) == 1 then "label"
+  else "insn"
+
+asm_skip_ws cs =
+  if cs == [] then []
+  else if (head cs) == " " || (head cs) == "\t" then asm_skip_ws (tail cs)
+  else cs
+
+-- char-list prefix test (reuses asm_starts_cs); cs already ws-stripped.
+asm_cprefix cs p = asm_starts_cs cs (chars p)
+asm_chars_end_colon cs = if (head (reverse cs)) == ":" then 1 else 0
+
+-- a '.'-led line: a known section/data directive, a dotted local label, else skip.
+-- Checking directive prefixes BEFORE the colon test avoids reverse-ing long
+-- `.asciz` lines (only short dotted labels reach the colon check).
+asm_classify_dot cs line =
+  if (asm_cprefix cs ".section") == 1 then (if str_contains "__TEXT,__text" line then "sec_text" else "sec_other")
+  else if (asm_cprefix cs ".text") == 1 then "sec_text"
+  else if (asm_cprefix cs ".data") == 1 then "sec_other"
+  else if (asm_cprefix cs ".zerofill") == 1 then "sec_other"
+  else if (asm_cprefix cs ".asciz") == 1 then "asciz"
+  else if (asm_cprefix cs ".ascii") == 1 then "ascii"
+  else if (asm_cprefix cs ".p2align") == 1 then "align"
+  else if (asm_chars_end_colon cs) == 1 then "label"
+  else "skip"
+
+-- ---- inline-data helpers ----
+-- chars of an .asciz/.ascii line AFTER the opening double-quote.
+asm_str_arg s = asm_skip_to_quote (chars s)
+asm_skip_to_quote cs =
+  if cs == [] then []
+  else if (head cs) == (char_from_int 34) then tail cs
+  else asm_skip_to_quote (tail cs)
+
+-- Decode the quoted body into a list of byte ints, stopping at the closing
+-- (unescaped) quote. Handles \n \t \" \\ — the only escapes the compiler emits.
+asm_decode_str cs acc =
+  if cs == [] then reverse acc
+  else
+    let c = head cs
+    if c == (char_from_int 34) then reverse acc
+    else if c == (char_from_int 92) then
+      (if (tail cs) == [] then reverse acc
+       else asm_decode_str (tail (tail cs)) (cons (asm_escape_byte (head (tail cs))) acc))
+    else asm_decode_str (tail cs) (cons (char_to_int c) acc)
+
+asm_escape_byte e =
+  if e == "n" then 10
+  else if e == "t" then 9
+  else if e == (char_from_int 34) then 34
+  else if e == (char_from_int 92) then 92
+  else char_to_int e
+
+asm_asciz_len raw = length (asm_decode_str (asm_str_arg raw) [])
+
+-- .p2align N → N (the power-of-two exponent).
+asm_p2align_n raw = asm_parse_uint (chars (asm_after_lsl raw)) 0
+asm_parse_uint cs acc =
+  if cs == [] then acc
+  else
+    let d = (char_to_int (head cs)) - 48
+    if (d >= 0) && (d <= 9) then asm_parse_uint (tail cs) (acc * 10 + d) else acc
+
+asm_align_up off n =
+  let a = shl 1 n
+  let r = ((off + a - 1) / a) * a
+  r
+
+-- byte size a line contributes to the __text image (insn=4, asciz=len+1, align=pad).
+-- raw is the UNTRIMMED line: asciz uses asm_str_arg (skips to the quote, so leading
+-- ws is irrelevant — and we avoid an O(len^2) ltrim rebuild on long strings); align
+-- is a short line so its ltrim is cheap (and word-position parsing needs it).
+asm_seg_size off k raw =
+  if k == "insn" then 4
+  else if k == "asciz" then (asm_asciz_len raw) + 1
+  else if k == "ascii" then asm_asciz_len raw
+  else if k == "align" then (asm_align_up off (asm_p2align_n (asm_ltrim raw))) - off
+  else 0
+
+-- ---- keyed label map (hash buckets w/ separate chaining) ----
+-- The old flat cons-list + linear asm_lookup was O(N^2): the full compiler has
+-- ~12K labels and ~120K branch/adr lookups (23 min). A 16384-bucket hash table
+-- makes lookup O(1) amortized. NBUCKETS is a power of 2 so (h & (NBUCKETS-1)) = h
+-- mod NBUCKETS. The polynomial hash is masked to 30 bits each step — Rail's
+-- 63-bit tagged ints overflow multiplicative accumulation (CLAUDE.md PRNG note),
+-- and h*31 + c stays well under 2^63 before the mask.
+asm_nbuckets = 16384
+asm_hash_str s = asm_hash_loop (chars s) 0
+asm_hash_loop cs h =
+  if cs == [] then bit_and h (asm_nbuckets - 1)
+  else asm_hash_loop (tail cs) (bit_and ((h * 31) + (char_to_int (head cs))) 1073741823)
+
+asm_insert buckets name off =
+  let b = asm_hash_str name
+  let _ = arr_set buckets b (cons (cons name (cons off [])) (arr_get buckets b))
+  0
+
+-- Build the label map: walk lines (section + offset aware) inserting __text labels.
+asm_build_labels lines =
+  let buckets = arr_new asm_nbuckets []
+  let _ = asm_pass1 lines 0 1 buckets
+  buckets
+
+-- Pass 1: walk lines tracking the current section + byte offset; record __text
+-- labels with their offset. Inline data + alignment inside __text advance the
+-- offset too, so branch/adr targets resolve to the SAME offsets `as` computes.
+asm_pass1 lines off in_text buckets =
+  if lines == [] then buckets
   else
     let line = head lines
-    let kind = asm_classify line
-    if kind == "skip" then asm_pass1 (tail lines) off label_map
+    let kind = asm_classify2 line
+    if kind == "sec_text" then asm_pass1 (tail lines) off 1 buckets
+    else if kind == "sec_other" then asm_pass1 (tail lines) off 0 buckets
+    else if in_text == 0 then asm_pass1 (tail lines) off 0 buckets
+    else if kind == "skip" then asm_pass1 (tail lines) off 1 buckets
     else if kind == "label" then
-      let name = asm_label_name (asm_ltrim line)
-      asm_pass1 (tail lines) off (cons name (cons off label_map))
+      let _ = asm_insert buckets (asm_label_name (asm_ltrim line)) off
+      asm_pass1 (tail lines) off 1 buckets
     else
-      asm_pass1 (tail lines) (off + 4) label_map
+      asm_pass1 (tail lines) (off + (asm_seg_size off kind line)) 1 buckets
 
--- Look up label name → offset in the flat list. Returns -1 if not found.
-asm_lookup name labels =
-  if labels == [] then 0 - 1
+-- Look up label name → offset via the hash buckets. Returns -1 if not found.
+asm_lookup name buckets =
+  asm_scan_bucket name (arr_get buckets (asm_hash_str name))
+
+asm_scan_bucket name bucket =
+  if bucket == [] then 0 - 1
   else
-    let n = head labels
-    let off = head (tail labels)
-    if n == name then off
-    else asm_lookup name (tail (tail labels))
+    let rec = head bucket
+    if (head rec) == name then (head (tail rec))
+    else asm_scan_bucket name (tail bucket)
 
 -- ============================================================================
 -- Pass 2 — emit bytes for each instruction.
@@ -194,8 +338,9 @@ asm_encode_insn mnemonic ops_str cur_off labels =
   if mnemonic == "mov" then asm_enc_mov ops
   else if mnemonic == "movz" then asm_enc_movz ops
   else if mnemonic == "movk" then asm_enc_movk ops
-  else if mnemonic == "add"  then asm_enc_3reg ops enc_add
-  else if mnemonic == "sub"  then asm_enc_3reg ops enc_sub
+  else if mnemonic == "movn" then asm_enc_movn ops
+  else if mnemonic == "add"  then asm_enc_add ops
+  else if mnemonic == "sub"  then asm_enc_ri ops enc_sub enc_sub_imm
   else if mnemonic == "mul"  then asm_enc_3reg ops enc_mul
   else if mnemonic == "cmp"  then asm_enc_cmp ops
   else if mnemonic == "ret"  then enc_ret
@@ -209,8 +354,8 @@ asm_encode_insn mnemonic ops_str cur_off labels =
   else if mnemonic == "b.gt" then asm_enc_branch ops cur_off labels enc_bgt_byte_off
   else if mnemonic == "b.le" then asm_enc_branch ops cur_off labels enc_ble_byte_off
   else if mnemonic == "b.ge" then asm_enc_branch ops cur_off labels enc_bge_byte_off
-  else if mnemonic == "cbz"  then asm_enc_cb ops cur_off labels enc_cbz_byte_off
-  else if mnemonic == "cbnz" then asm_enc_cb ops cur_off labels enc_cbnz_byte_off
+  else if mnemonic == "cbz"  then asm_enc_cb ops cur_off labels enc_cbz_byte_off enc_cbzw_byte_off
+  else if mnemonic == "cbnz" then asm_enc_cb ops cur_off labels enc_cbnz_byte_off enc_cbnzw_byte_off
   else if mnemonic == "b.cs" then asm_enc_branch ops cur_off labels enc_bcs_byte_off
   else if mnemonic == "b.hs" then asm_enc_branch ops cur_off labels enc_bhs_byte_off
   else if mnemonic == "b.cc" then asm_enc_branch ops cur_off labels enc_bcc_byte_off
@@ -219,12 +364,12 @@ asm_encode_insn mnemonic ops_str cur_off labels =
   else if mnemonic == "b.ls" then asm_enc_branch ops cur_off labels enc_bls_byte_off
   else if mnemonic == "blr"  then enc_blr (asm_reg_num (head ops))
   else if mnemonic == "br"   then enc_br  (asm_reg_num (head ops))
-  else if mnemonic == "and"  then asm_enc_3reg ops enc_and
-  else if mnemonic == "orr"  then asm_enc_3reg ops enc_orr
-  else if mnemonic == "eor"  then asm_enc_3reg ops enc_eor
-  else if mnemonic == "lsl"  then asm_enc_3reg ops enc_lsl
-  else if mnemonic == "lsr"  then asm_enc_3reg ops enc_lsr
-  else if mnemonic == "asr"  then asm_enc_3reg ops enc_asr
+  else if mnemonic == "and"  then asm_enc_logical ops 2449473536 enc_and
+  else if mnemonic == "orr"  then asm_enc_logical ops 2986344448 enc_orr
+  else if mnemonic == "eor"  then asm_enc_logical ops 3523215360 enc_eor
+  else if mnemonic == "lsl"  then asm_enc_ri ops enc_lsl enc_lsl_imm
+  else if mnemonic == "lsr"  then asm_enc_ri ops enc_lsr enc_lsr_imm
+  else if mnemonic == "asr"  then asm_enc_ri ops enc_asr enc_asr_imm
   else if mnemonic == "sdiv" then asm_enc_3reg ops enc_sdiv
   else if mnemonic == "udiv" then asm_enc_3reg ops enc_udiv
   else if mnemonic == "madd" then asm_enc_4reg ops enc_madd
@@ -233,6 +378,8 @@ asm_encode_insn mnemonic ops_str cur_off labels =
   else if mnemonic == "cset" then asm_enc_cset ops
   else if mnemonic == "ldr"  then asm_enc_mem ops 1
   else if mnemonic == "str"  then asm_enc_mem ops 0
+  else if mnemonic == "ldrb" then asm_enc_byte_ldst ops 1
+  else if mnemonic == "strb" then asm_enc_byte_ldst ops 0
   else if mnemonic == "ldp"  then asm_enc_pair ops 1
   else if mnemonic == "stp"  then asm_enc_pair ops 0
   else if mnemonic == "fadd" then asm_enc_3dreg ops enc_fadd
@@ -243,7 +390,71 @@ asm_encode_insn mnemonic ops_str cur_off labels =
   else if mnemonic == "scvtf" then asm_enc_scvtf ops
   else if mnemonic == "fcvtzs" then asm_enc_fcvtzs ops
   else if mnemonic == "fmov" then asm_enc_fmov ops
+  else if mnemonic == "subs" then asm_enc_subs ops
+  else if mnemonic == "tbnz" then asm_enc_tb ops cur_off labels enc_tbnz
+  else if mnemonic == "tbz"  then asm_enc_tb ops cur_off labels enc_tbz
+  else if mnemonic == "adrp" then enc_adrp (asm_reg_num (head ops)) 0   -- @PAGE -> reloc; base
+  else if mnemonic == "adr"  then asm_enc_adr ops cur_off labels
+  else if mnemonic == "neg"  then enc_sub (asm_reg_num (head ops)) 31 (asm_reg_num (head (tail ops)))
+  else if mnemonic == "clz"  then enc_clz (asm_reg_num (head ops)) (asm_reg_num (head (tail ops)))
+  else if mnemonic == "csel" then asm_enc_csel ops
+  else if mnemonic == "fcvt" then asm_enc_fcvt ops
   else 0 - 1                                -- unknown mnemonic
+
+-- add xD, xN, (xM | #imm | sym@PAGEOFF). 3-reg, immediate, or a @PAGEOFF
+-- relocation (emit add-imm with 0; the linker fills the page offset).
+asm_enc_add ops =
+  let dst = asm_reg_num (head ops)
+  let n = asm_reg_num (head (tail ops))
+  let op2 = head (tail (tail ops))
+  let rest = tail (tail (tail ops))
+  let c0 = head (chars op2)
+  let word =
+    if c0 == "#" then
+      let imm = asm_imm op2
+      -- NOTE: Rail && does NOT short-circuit, so `head rest` must be gated by a
+      -- NESTED if (rest != []), never `(rest != []) && (... head rest ...)`.
+      if rest != [] then
+        (if (asm_imm (asm_after_lsl (head rest))) == 12 then enc_add_imm_sh dst n imm 1
+         else enc_add_imm dst n imm)
+      else if (imm > 4095) && ((bit_and imm 4095) == 0) then enc_add_imm_sh dst n (shr imm 12) 1
+      else enc_add_imm dst n imm
+    else if c0 == "x" || c0 == "w" then
+      (if rest != [] then enc_add_sh dst n (asm_reg_num op2) (asm_imm (asm_after_lsl (head rest)))
+       else enc_add dst n (asm_reg_num op2))
+    else enc_add_imm dst n 0
+  if (asm_is_w (head ops)) == 1 then w32 word else word
+
+-- subs xD, xN, #imm   (flag-setting decrement — compile.rail's loop bottom-test)
+asm_enc_subs ops =
+  let word = enc_subs_imm (asm_reg_num (head ops)) (asm_reg_num (head (tail ops))) (asm_imm (head (tail (tail ops))))
+  if (asm_is_w (head ops)) == 1 then w32 word else word
+
+-- tbnz/tbz xR, #bit, LABEL
+asm_enc_tb ops cur_off labels enc_fn =
+  let reg = asm_reg_num (head ops)
+  let bit_n = asm_imm (head (tail ops))
+  let target = asm_lookup (head (tail (tail ops))) labels
+  enc_fn bit_n reg (target - cur_off)
+
+-- adr xD, LABEL : PC-relative to an internal label if known, else 0 (reloc).
+asm_enc_adr ops cur_off labels =
+  let target = asm_lookup (head (tail ops)) labels
+  if target < 0 then enc_adr (asm_reg_num (head ops)) 0
+  else enc_adr (asm_reg_num (head ops)) (target - cur_off)
+
+-- mov xD, #imm  -> single-instruction movz/movn: small +ve = movz; small -ve
+-- (~imm fits 16b) = movn; a value occupying one 16-bit lane = movz with hw shift.
+-- (compile.rail only emits `mov #imm` for single-instruction-encodable values;
+--  multi-lane constants come as explicit movz+movk.)
+asm_mov_imm dst imm =
+  if imm < 0 then
+    (let inv = (0 - imm) - 1
+     if inv < 65536 then enc_movn dst inv 0 else enc_mov_imm16 dst imm)
+  else if imm < 65536 then enc_mov_imm16 dst imm
+  else if (bit_and (shr imm 16) 65535) == (shr imm 16) then enc_movz_hw dst (shr imm 16) 1
+  else if (bit_and (shr imm 32) 65535) == (shr imm 32) then enc_movz_hw dst (shr imm 32) 2
+  else enc_movz_hw dst (shr imm 48) 3
 
 -- mov xD, #imm     → movz   xD, #imm
 -- mov xD, xS       → orr    xD, xzr, xS  (enc_mov_reg)
@@ -253,9 +464,14 @@ asm_enc_mov ops =
   let src_cs = chars src_s
   if src_cs == [] then 0 - 1
   else if (head src_cs) == "#" then
-    enc_mov_imm16 (asm_reg_num dst_s) (asm_imm src_s)
-  else
-    enc_mov_reg (asm_reg_num dst_s) (asm_reg_num src_s)
+    (if (asm_is_w dst_s) == 1 then
+       (let wimm = asm_imm src_s
+        if wimm < 0 then enc_movnw_imm16 (asm_reg_num dst_s) ((0 - wimm) - 1)
+        else enc_movzw_imm16 (asm_reg_num dst_s) wimm)
+     else asm_mov_imm (asm_reg_num dst_s) (asm_imm src_s))
+  else if src_s == "sp" then enc_add_imm (asm_reg_num dst_s) 31 0   -- mov xD, sp = add xD, sp, #0
+  else if dst_s == "sp" then enc_add_imm 31 (asm_reg_num src_s) 0   -- mov sp, xN = add sp, xN, #0
+  else enc_mov_reg (asm_reg_num dst_s) (asm_reg_num src_s)
 
 -- movz xD, #imm[, lsl #N]
 asm_enc_movz ops =
@@ -267,7 +483,16 @@ asm_enc_movz ops =
     let shift_op = head (tail (tail ops))   -- e.g. "lsl #16"
     -- Extract "#N" past the "lsl "
     let shift_n = asm_imm (asm_after_lsl shift_op) / 16
-    enc_movk dst imm shift_n   -- approximation — movz with shift; treat as movk-like
+    enc_movz_hw dst imm shift_n   -- movz with hw shift (NOT movk — movz zeroes other lanes)
+
+-- movn xD, #imm[, lsl #N]  (move-NOT-wide; enc_movn from jit/arm64.rail)
+asm_enc_movn ops =
+  let dst = asm_reg_num (head ops)
+  let imm = asm_imm (head (tail ops))
+  if (tail (tail ops)) == [] then enc_movn dst imm 0
+  else
+    let shift_n = asm_imm (asm_after_lsl (head (tail (tail ops)))) / 16
+    enc_movn dst imm shift_n
 
 asm_after_lsl s = asm_ltrim (asm_drop_word s)
 
@@ -295,26 +520,36 @@ asm_enc_3reg ops enc_fn =
          (asm_reg_num (head (tail (tail ops))))
 
 -- cmp xA, xB   or   cmp xA, #imm
+-- 32-bit (W) variant of any data-processing word = clear the sf bit (bit 31).
+w32 word = bit_and word 2147483647
+
 asm_enc_cmp ops =
   let a = asm_reg_num (head ops)
   let b_s = head (tail ops)
   let b_cs = chars b_s
   if b_cs == [] then 0 - 1
-  else if (head b_cs) == "#" then enc_cmp_imm a (asm_imm b_s)
-  else enc_cmp a (asm_reg_num b_s)
+  else if (head b_cs) == "#" then
+    (let imm = asm_imm b_s
+     let rest = tail (tail ops)
+     if (asm_is_w (head ops)) == 1 then enc_cmpw_imm a imm
+     else if rest != [] then
+       (if (asm_imm (asm_after_lsl (head rest))) == 12 then enc_cmp_imm_sh a imm 1 else enc_cmp_imm a imm)
+     else if (imm > 4095) && ((bit_and imm 4095) == 0) then enc_cmp_imm_sh a (shr imm 12) 1
+     else enc_cmp_imm a imm)
+  else (if (asm_is_w (head ops)) == 1 then w32 (enc_cmp a (asm_reg_num b_s)) else enc_cmp a (asm_reg_num b_s))
 
--- bl / b / b.cond LABEL
+-- bl / b / b.cond LABEL. An UNRESOLVED (external) symbol -> emit 0 offset
+-- (matches `as`; the linker fills it via a BRANCH26 reloc). Local labels resolve.
 asm_enc_branch ops cur_off labels enc_fn =
   let target = asm_lookup (head ops) labels
-  let delta = target - cur_off
-  enc_fn delta
+  if target < 0 then enc_fn 0
+  else enc_fn (target - cur_off)
 
--- cbz / cbnz xR, LABEL
-asm_enc_cb ops cur_off labels enc_fn =
+-- cbz / cbnz xR|wR, LABEL — picks the 32-bit variant for a w-register.
+asm_enc_cb ops cur_off labels enc_x enc_w =
   let reg = asm_reg_num (head ops)
-  let target = asm_lookup (head (tail ops)) labels
-  let delta = target - cur_off
-  enc_fn reg delta
+  let delta = (asm_lookup (head (tail ops)) labels) - cur_off
+  if (asm_is_w (head ops)) == 1 then enc_w reg delta else enc_x reg delta
 
 -- 4-register form: <mn> xD, xN, xM, xA  (madd / msub)
 asm_enc_4reg ops enc_fn =
@@ -323,9 +558,81 @@ asm_enc_4reg ops enc_fn =
          (asm_reg_num (head (tail (tail ops))))
          (asm_reg_num (head (tail (tail (tail ops)))))
 
--- tst xA, xB
+-- tst xA, (xB | #bitmask)
 asm_enc_tst ops =
-  enc_tst (asm_reg_num (head ops)) (asm_reg_num (head (tail ops)))
+  let a = asm_reg_num (head ops)
+  let b_s = head (tail ops)
+  let word = if (head (chars b_s)) == "#" then enc_tst_imm a (asm_imm b_s) else enc_tst a (asm_reg_num b_s)
+  if (asm_is_w (head ops)) == 1 then w32 word else word
+
+-- and/orr/eor/lsl/lsr/asr xD, xN, (xM -> reg_fn | #imm -> imm_fn). W-dest clears sf.
+asm_enc_ri ops reg_fn imm_fn =
+  let dst = asm_reg_num (head ops)
+  let n = asm_reg_num (head (tail ops))
+  let op2 = head (tail (tail ops))
+  let word = if (head (chars op2)) == "#" then imm_fn dst n (asm_imm op2) else reg_fn dst n (asm_reg_num op2)
+  if (asm_is_w (head ops)) == 1 then w32 word else word
+
+-- and/orr/eor with a logical-immediate or register source. Two bit-63 tag masks
+-- exceed Rail's 63-bit tagged-int range so they CANNOT go through asm_imm; match
+-- them by literal string and emit the pre-computed N:immr:imms directly. For a
+-- w-register #imm, the 32-bit bitmask must encode with N=0 — replicate the value
+-- into both 32-bit halves so enc_logical_imm finds element-size 32 (N=0), then
+-- w32 clears the sf bit. (w32 only clears bit 31, never the N bit at 22, so an
+-- un-replicated 64-bit encoding would leave N=1 — illegal for the 32-bit form.)
+asm_enc_logical ops base reg_fn =
+  let dst = asm_reg_num (head ops)
+  let n = asm_reg_num (head (tail ops))
+  let op2 = head (tail (tail ops))
+  let isw = asm_is_w (head ops)
+  if (head (chars op2)) == "#" then
+    (if op2 == "#0x7fffffffffffffff" then bit_or base (bit_or 4194304 (bit_or 63488 (bit_or (shl n 5) dst)))
+     else if op2 == "#0x8000000000000000" then bit_or base (bit_or 4194304 (bit_or 65536 (bit_or (shl n 5) dst)))
+     else
+       (let raw = asm_imm op2
+        let v = if isw == 1 then bit_or raw (shl raw 32) else raw
+        let word = enc_logical_imm base dst n v
+        if isw == 1 then w32 word else word))
+  else
+    (let word = reg_fn dst n (asm_reg_num op2)
+     if isw == 1 then w32 word else word)
+
+-- width detector: 1 if operand names a w-register (32-bit), else 0.
+asm_is_w s =
+  let cs = chars s
+  if cs == [] then 0
+  else if (head cs) == "w" then 1
+  else 0
+
+-- sN -> N (32-bit float reg, for fcvt)
+asm_sreg_num s =
+  let cs = chars s
+  if cs == [] then 0 - 1
+  else if (head cs) == "s" then asm_parse_int_chars (tail cs) 0
+  else 0 - 1
+
+-- ARM condition name -> 4-bit code.
+asm_cond_code c =
+  if c == "eq" then 0 else if c == "ne" then 1
+  else if c == "cs" then 2 else if c == "hs" then 2
+  else if c == "cc" then 3 else if c == "lo" then 3
+  else if c == "mi" then 4 else if c == "pl" then 5
+  else if c == "vs" then 6 else if c == "vc" then 7
+  else if c == "hi" then 8 else if c == "ls" then 9
+  else if c == "ge" then 10 else if c == "lt" then 11
+  else if c == "gt" then 12 else if c == "le" then 13
+  else 14
+
+-- csel xD, xN, xM, cond
+asm_enc_csel ops =
+  enc_csel (asm_reg_num (head ops)) (asm_reg_num (head (tail ops))) (asm_reg_num (head (tail (tail ops)))) (asm_cond_code (head (tail (tail (tail ops)))))
+
+-- fcvt dD, sN (single->double) or fcvt sD, dN (double->single)
+asm_enc_fcvt ops =
+  let dst = head ops
+  let src = head (tail ops)
+  if (head (chars dst)) == "d" then enc_fcvt_d_s (asm_dreg_num dst) (asm_sreg_num src)
+  else enc_fcvt_s_d (asm_sreg_num dst) (asm_dreg_num src)
 
 -- cset xD, <cond>
 -- ops[0] is "xN", ops[1] is the bare cond name.
@@ -349,23 +656,87 @@ asm_enc_cset ops =
 -- The operand string is split by our comma-splitter as:
 --   ["xD",  "[xN",  "#imm]"]      (3 elements after split-on-comma)
 -- We extract the digits inside [xN and #imm].
+-- Unified single-reg load/store. Handles: float (dD dest), post-index ([xN],#i),
+-- register-offset ([xN, xM, lsl #s]), pre-index ([xN, #i]!), and plain #imm
+-- offset (x or w width). Mirrors asm_enc_pair's mode detection.
+-- FP (d/s) load/store: [xN,#imm] offset (d scaled 8), [xN,xM,lsl#N] reg-offset,
+-- [xN,#imm]! pre-index, [xN] no-offset. (s [xN,#imm] offset not emitted by the
+-- compiler; not handled here.)
+asm_enc_fp_mem dst_s base_s rest base is_ldr =
+  let is_d = (head (chars dst_s)) == "d"
+  let reg = if is_d then asm_dreg_num dst_s else asm_sreg_num dst_s
+  if asm_last_is base_s "]" then
+    (if is_ldr == 1 then enc_ldr_d reg base 0 else enc_str_d reg base 0)
+  else
+    let off_s = if rest == [] then "0" else head rest
+    let oc0 = head (chars off_s)
+    if oc0 == "x" || oc0 == "w" then
+      let m = asm_reg_after_bracket off_s
+      let sh = if (tail rest) == [] then 0 else asm_imm (asm_after_lsl (head (tail rest)))
+      let s = if sh == 0 then 0 else 1
+      (if is_d then (if is_ldr == 1 then enc_regoff_b 4234176512 reg base m s else enc_regoff_b 4229982208 reg base m s)
+       else (if is_ldr == 1 then enc_regoff_b 3160434688 reg base m s else enc_regoff_b 3156240384 reg base m s))
+    else if asm_last_is off_s "!" then
+      let imm = asm_imm_from_brk off_s
+      (if is_ldr == 1 then enc_idx9_b 4232055808 reg base imm else enc_idx9_b 4227861504 reg base imm)
+    else
+      let imm = asm_imm_from_brk off_s
+      (if is_ldr == 1 then enc_ldr_d reg base imm else enc_str_d reg base imm)
+
 asm_enc_mem ops is_ldr =
-  let dst = asm_reg_num (head ops)
+  let dst_s = head ops
   let base_s = head (tail ops)
-  let off_s = if (tail (tail ops)) == [] then "0" else head (tail (tail ops))
+  let rest = tail (tail ops)
   let base = asm_reg_after_bracket base_s
-  let imm = asm_imm_from_brk off_s
-  if is_ldr == 1 then enc_ldr_imm dst base imm
-  else enc_str_imm dst base imm
+  if ((head (chars dst_s)) == "d") || ((head (chars dst_s)) == "s") then asm_enc_fp_mem dst_s base_s rest base is_ldr
+  else if asm_last_is base_s "]" then
+    if rest == [] then
+      -- `[xN]` with NO displacement = zero-offset SCALED load, NOT post-index.
+      (if (asm_is_w dst_s) == 1 then (if is_ldr == 1 then enc_ldrw_imm (asm_reg_num dst_s) base 0 else enc_strw_imm (asm_reg_num dst_s) base 0)
+       else (if is_ldr == 1 then enc_ldr_imm (asm_reg_num dst_s) base 0 else enc_str_imm (asm_reg_num dst_s) base 0))
+    else
+      let immp = asm_imm (head rest)
+      (if is_ldr == 1 then enc_ldr_x_postidx (asm_reg_num dst_s) base immp else enc_str_x_postidx (asm_reg_num dst_s) base immp)
+  else
+    let off_s = if rest == [] then "0" else head rest
+    let oc0 = head (chars off_s)
+    if oc0 == "x" || oc0 == "w" then
+      let m = asm_reg_after_bracket off_s
+      let sh = if (tail rest) == [] then 0 else asm_imm (asm_after_lsl (head (tail rest)))
+      let s = if sh == 3 then 1 else 0
+      (if is_ldr == 1 then enc_ldr_regoff (asm_reg_num dst_s) base m s else enc_str_regoff (asm_reg_num dst_s) base m s)
+    else if asm_last_is off_s "!" then
+      let immw = asm_imm_from_brk off_s
+      (if is_ldr == 1 then enc_ldr_x_preidx (asm_reg_num dst_s) base immw else enc_str_x_preidx (asm_reg_num dst_s) base immw)
+    else
+      let immo = asm_imm_from_brk off_s
+      if (asm_is_w dst_s) == 1 then
+        (if is_ldr == 1 then enc_ldrw_imm (asm_reg_num dst_s) base immo else enc_strw_imm (asm_reg_num dst_s) base immo)
+      else if (immo < 0) || ((bit_and immo 7) != 0) then
+        -- negative or non-8-multiple offset: unscaled LDUR/STUR (imm9)
+        (if is_ldr == 1 then enc_ldur (asm_reg_num dst_s) base immo else enc_stur (asm_reg_num dst_s) base immo)
+      else
+        (if is_ldr == 1 then enc_ldr_imm (asm_reg_num dst_s) base immo else enc_str_imm (asm_reg_num dst_s) base immo)
 
 -- "[xN" → register number N
+-- Register name between an optional "[" and the first "]"/","/" "/"!" — so
+-- "[sp", "[sp]", "[x9", "[x9]" all yield the bare register token.
+asm_reg_token cs acc =
+  if cs == [] then join "" (reverse acc)
+  else if (head cs) == "]" || (head cs) == "," || (head cs) == " " || (head cs) == "!" then join "" (reverse acc)
+  else asm_reg_token (tail cs) (cons (char_from_int (char_to_int (head cs))) acc)
+
 asm_reg_after_bracket s =
   let cs = chars s
-  -- Skip "["
   if cs == [] then 0 - 1
-  else if (head cs) == "[" then
-    asm_reg_num (join "" (asm_chars_to_strs (tail cs)))
-  else asm_reg_num s
+  else if (head cs) == "[" then asm_reg_num (asm_reg_token (tail cs) [])
+  else asm_reg_num (asm_reg_token cs [])
+
+-- True if string s ends with the single char c.
+asm_last_is s c =
+  let cs = chars s
+  if cs == [] then false
+  else (head (reverse cs)) == c
 
 -- "#N]" or "#N" → integer
 asm_imm_from_brk s =
@@ -379,15 +750,72 @@ asm_imm_brk_loop cs acc =
 
 -- ── Load/store pair: ldp xD1, xD2, [xN, #imm]
 -- Comma-split → ["xD1", "xD2", "[xN", "#imm]"]
+-- ldp/stp in all three addressing modes:
+--   offset      stp x1,x2,[xN, #imm]    base token "[xN", imm token "...]"
+--   pre-index   stp x1,x2,[xN, #imm]!   imm token ends with "!"
+--   post-index  stp x1,x2,[xN], #imm    base token "[xN]" (ends with "]")
 asm_enc_pair ops is_ldp =
+  if (head (chars (head ops))) == "d" then asm_enc_pair_fp ops is_ldp
+  else asm_enc_pair_x ops is_ldp
+
+-- FP register pair (dA, dB) — offset form (the only FP-pair form the compiler emits).
+-- Bases: stp_d 0x6D000000 (1828716544), ldp_d 0x6D400000 (1832910848). imm scaled by 8.
+asm_enc_pair_fp ops is_ldp =
+  let d1 = asm_dreg_num (head ops)
+  let d2 = asm_dreg_num (head (tail ops))
+  let base_s = head (tail (tail ops))
+  let rest = tail (tail (tail ops))
+  let base = asm_reg_after_bracket base_s
+  let imm = if rest == [] then 0 else asm_imm_from_brk (head rest)
+  enc_pair_base (if is_ldp == 1 then 1832910848 else 1828716544) d1 d2 base imm
+
+asm_enc_pair_x ops is_ldp =
   let d1 = asm_reg_num (head ops)
   let d2 = asm_reg_num (head (tail ops))
   let base_s = head (tail (tail ops))
-  let off_s = if (tail (tail (tail ops))) == [] then "0" else head (tail (tail (tail ops)))
+  let rest = tail (tail (tail ops))
   let base = asm_reg_after_bracket base_s
-  let imm = asm_imm_from_brk off_s
-  if is_ldp == 1 then enc_ldp_imm d1 d2 base imm
-  else enc_stp_imm d1 d2 base imm
+  if asm_last_is base_s "]" then
+    if rest == [] then
+      enc_pair_base (if is_ldp == 1 then 2839543808 else 2835349504) d1 d2 base 0    -- [base] no-offset = offset form, imm 0
+    else
+      enc_pair_base (if is_ldp == 1 then 2831155200 else 2826960896) d1 d2 base (asm_imm (head rest))   -- post
+  else
+    let off_s = if rest == [] then "0" else head rest
+    let imm = asm_imm_from_brk off_s
+    if asm_last_is off_s "!" then
+      enc_pair_base (if is_ldp == 1 then 2847932416 else 2843738112) d1 d2 base imm -- pre
+    else
+      enc_pair_base (if is_ldp == 1 then 2839543808 else 2835349504) d1 d2 base imm -- offset
+
+-- ── Byte load/store: ldrb/strb wD, [xN, #imm12] | [xN, xM] | [xN] | [xN], #imm9
+-- Comma-split shapes (same splitter as ldp/stp):
+--   imm-offset  ldrb w0,[x1,#4]   ["w0", "[x1", "#4]"]   3rd starts with '#'
+--   reg-offset  ldrb w0,[x1,x2]   ["w0", "[x1", "x2]"]   3rd starts with 'x'/'w'
+--   plain       ldrb w0,[x1]      ["w0", "[x1]"]          base token ends with ']'
+--   post-index  ldrb w0,[x1],#1   ["w0", "[x1]", "#1"]    base ']' + a 3rd token
+asm_enc_byte_ldst ops is_ldr =
+  let dst = asm_reg_num (head ops)
+  let base_s = head (tail ops)
+  let rest = tail (tail ops)
+  let base = asm_reg_after_bracket base_s
+  if asm_last_is base_s "]" then
+    -- base token closed the bracket: either plain [xN] or post-index [xN],#imm
+    if rest == [] then
+      (if is_ldr == 1 then enc_ldrb_imm dst base 0 else enc_strb_imm dst base 0)
+    else
+      let imm = asm_imm (head rest)
+      (if is_ldr == 1 then enc_ldrb_postidx dst base imm else enc_strb_postidx dst base imm)
+  else
+    -- bracket still open: 3rd token is "#imm]" (offset) or "xM]" (register)
+    let op3 = head rest
+    let c0 = head (chars op3)
+    if c0 == "#" then
+      let imm = asm_imm_from_brk op3
+      (if is_ldr == 1 then enc_ldrb_imm dst base imm else enc_strb_imm dst base imm)
+    else
+      let m = asm_reg_after_bracket op3
+      (if is_ldr == 1 then enc_ldrb_regoff dst base m else enc_strb_regoff dst base m)
 
 -- ── Float ops: fadd / fsub / fmul / fdiv  dD, dA, dB
 asm_dreg_num s =
@@ -416,22 +844,30 @@ asm_enc_fmov ops =
   let src = head (tail ops)
   let src_cs = chars src
   if src_cs == [] then 0 - 1
-  else if (head src_cs) == "d" then
-    enc_fmov_d_d (asm_dreg_num dst) (asm_dreg_num src)
-  else
-    enc_fmov_d_x (asm_dreg_num dst) (asm_reg_num src)
+  else if (head (chars dst)) == "x" then enc_fmov_x_d (asm_reg_num dst) (asm_dreg_num src)   -- fmov xD, dN
+  else if (head src_cs) == "d" then enc_fmov_d_d (asm_dreg_num dst) (asm_dreg_num src)
+  else enc_fmov_d_x (asm_dreg_num dst) (asm_reg_num src)
 
 -- ============================================================================
 -- Pass 2 driver — walk lines, emit into buf at off++.
 -- Returns the count of bytes emitted.
 -- ============================================================================
 
-asm_pass2 lines buf off labels =
+asm_pass2 lines buf off in_text labels =
   if lines == [] then off
   else
     let line = head lines
-    let kind = asm_classify line
-    if kind == "skip" || kind == "label" then asm_pass2 (tail lines) buf off labels
+    let kind = asm_classify2 line
+    if kind == "sec_text" then asm_pass2 (tail lines) buf off 1 labels
+    else if kind == "sec_other" then asm_pass2 (tail lines) buf off 0 labels
+    else if in_text == 0 then asm_pass2 (tail lines) buf off 0 labels
+    else if kind == "skip" || kind == "label" then asm_pass2 (tail lines) buf off 1 labels
+    else if kind == "asciz" then
+      asm_pass2 (tail lines) buf (asm_emit_str buf off (asm_decode_str (asm_str_arg line) []) 1) 1 labels
+    else if kind == "ascii" then
+      asm_pass2 (tail lines) buf (asm_emit_str buf off (asm_decode_str (asm_str_arg line) []) 0) 1 labels
+    else if kind == "align" then
+      asm_pass2 (tail lines) buf (asm_pad buf off (asm_align_up off (asm_p2align_n (asm_ltrim line)))) 1 labels
     else
       let stripped = asm_ltrim (asm_strip_comment line)
       let parts = asm_split_mn_ops stripped
@@ -439,7 +875,41 @@ asm_pass2 lines buf off labels =
       let ops_str = head (tail parts)
       let word = asm_encode_insn mn ops_str off labels
       let _ = cb_emit buf off word
-      asm_pass2 (tail lines) buf (off + 4) labels
+      asm_pass2 (tail lines) buf (off + 4) 1 labels
+
+-- emit decoded byte list at off; add_null=1 appends a 0 terminator. Returns new off.
+-- (helper split out: a paren-wrapped `(let _ = f..\n bareident..)` mis-parses —
+-- the parser glues the body onto f's args across the newline; function-body-level
+-- newline-lets are fine.)
+asm_emit_str buf off bytes add_null =
+  let o2 = asm_emit_bytes buf off bytes
+  if add_null == 1 then asm_emit_null buf o2
+  else o2
+
+asm_emit_null buf o2 =
+  let _ = arr_set buf o2 0
+  o2 + 1
+
+asm_emit_bytes buf off bs =
+  if bs == [] then off
+  else
+    let _ = arr_set buf off (head bs)
+    asm_emit_bytes buf (off + 1) (tail bs)
+
+-- .p2align fill (matches `as` in a pure-instructions __text): zero-pad up to the
+-- next 4-byte boundary, then NOP-fill (0xd503201f) each remaining instruction slot.
+asm_pad buf off target =
+  if off >= target then off
+  else if (off - ((off / 4) * 4)) == 0 then asm_pad_nop buf off target
+  else asm_pad_zero buf off target
+
+asm_pad_nop buf off target =
+  let _ = cb_emit buf off inst_nop
+  asm_pad buf (off + 4) target
+
+asm_pad_zero buf off target =
+  let _ = arr_set buf off 0
+  asm_pad buf (off + 1) target
 
 -- ============================================================================
 -- Top-level: assemble a Rail-string of .s into a byte buffer.
@@ -449,17 +919,183 @@ asm_pass2 lines buf off labels =
 asm_assemble src capacity =
   let buf = arr_new capacity 0
   let lines = asm_lines src
-  let labels = asm_pass1 lines 0 []
-  let nbytes = asm_pass2 lines buf 0 labels
+  let labels = asm_build_labels lines
+  let nbytes = asm_pass2 lines buf 0 1 labels
   buf
 
-asm_bytes_len src =
-  let lines = asm_lines src
-  asm_pass1_count lines 0
+-- A symbol is a LOCAL label iff it starts with '.' (e.g. .Lxxx). An external
+-- (dylib import like _free/_malloc) is a bl/b target that misses asm_lookup AND
+-- is not a local label — it needs a BIND/BR26 relocation the linker resolves.
+asm_is_local_label sym =
+  let cs = chars sym
+  if cs == [] then 0 else if (head cs) == "." then 1 else 0
 
-asm_pass1_count lines n =
-  if lines == [] then n
+-- Collect external-symbol relocations for bl/b: a flat list of records,
+-- each [text_byte_offset, symbol_name], in INPUT (ascending-offset) order.
+-- (Offsets here count the pure instruction stream; the full-.s layout pass will
+-- re-base them once data/align padding is modeled — P2.)
+asm_collect_relocs lines off in_text labels acc =
+  if lines == [] then reverse acc
   else
-    let kind = asm_classify (head lines)
-    if kind == "insn" then asm_pass1_count (tail lines) (n + 4)
-    else asm_pass1_count (tail lines) n
+    let line = head lines
+    let kind = asm_classify2 line
+    if kind == "sec_text" then asm_collect_relocs (tail lines) off 1 labels acc
+    else if kind == "sec_other" then asm_collect_relocs (tail lines) off 0 labels acc
+    else if in_text == 0 then asm_collect_relocs (tail lines) off 0 labels acc
+    else if kind == "skip" then asm_collect_relocs (tail lines) off 1 labels acc
+    else if kind == "label" then asm_collect_relocs (tail lines) off 1 labels acc
+    else if kind == "insn" then
+      (let parts = asm_split_mn_ops (asm_ltrim (asm_strip_comment line))
+       let mn = head parts
+       let sym = head (tail parts)
+       if (mn == "bl" || mn == "b") then
+         (if (asm_lookup sym labels) < 0 then
+            (if (asm_is_local_label sym) == 0 then asm_collect_relocs (tail lines) (off + 4) 1 labels (cons (cons off (cons sym [])) acc)
+             else asm_collect_relocs (tail lines) (off + 4) 1 labels acc)
+          else asm_collect_relocs (tail lines) (off + 4) 1 labels acc)
+       else asm_collect_relocs (tail lines) (off + 4) 1 labels acc)
+    else asm_collect_relocs (tail lines) (off + (asm_seg_size off kind line)) 1 labels acc
+
+asm_relocs src =
+  let lines = asm_lines src
+  asm_collect_relocs lines 0 1 (asm_build_labels lines) []
+
+asm_bytes_len src = asm_textlen (asm_lines src) 0 1
+
+-- lines/labels-taking variants: a caller (the linker) that already split the
+-- source into `lines` and built the label map once threads both through every
+-- pass instead of re-splitting src + rebuilding the 16384-bucket map per call
+-- (the map was built 4x and relocs computed 2x — each a full O(N) line-walk).
+asm_assemble_l lines labels capacity =
+  let buf = arr_new capacity 0
+  let _ = asm_pass2 lines buf 0 1 labels
+  buf
+asm_relocs_l lines labels = asm_collect_relocs lines 0 1 labels []
+asm_bytes_len_l lines = asm_textlen lines 0 1
+
+-- __text image size (section + inline-data + alignment aware; mirrors asm_pass1).
+asm_textlen lines off in_text =
+  if lines == [] then off
+  else
+    let line = head lines
+    let kind = asm_classify2 line
+    if kind == "sec_text" then asm_textlen (tail lines) off 1
+    else if kind == "sec_other" then asm_textlen (tail lines) off 0
+    else if in_text == 0 then asm_textlen (tail lines) off 0
+    else if kind == "label" then asm_textlen (tail lines) off 1
+    else if kind == "skip" then asm_textlen (tail lines) off 1
+    else asm_textlen (tail lines) (off + (asm_seg_size off kind line)) 1
+
+-- ============================================================================
+-- Parse-once line records. Every linker pass otherwise re-classifies (chars +
+-- reverse per line) and re-splits the mnemonic/ops of every instruction — 8
+-- full walks over ~158K lines. Measured (6GB arena, peak RSS == bytes alloc'd):
+-- 8x classify = 4.24GB, 1x assemble = 3.07GB; together == the ~6GB floor. We
+-- classify + split ONCE into a record and have all passes read the record.
+-- Record = [kind, mn, ops_str, raw]. For non-insn lines mn/ops are "".
+-- mn/ops are split EXACTLY as pass2/collect_relocs do (ltrim . strip_comment),
+-- so the cached values are byte-for-byte what those passes would recompute.
+-- ============================================================================
+asm_rec_kind r = head r
+asm_rec_mn   r = head (tail r)
+asm_rec_ops  r = head (tail (tail r))
+asm_rec_raw  r = head (tail (tail (tail r)))
+
+asm_make_record line =
+  let kind = asm_classify2 line
+  if kind == "insn" then asm_make_insn_record kind line
+  else cons kind (cons "" (cons "" (cons line [])))
+-- split out: a paren `(let x = f a\n bareexpr)` glues bareexpr onto f's args
+-- across the newline (see asm_emit_str note); a function-body newline-let is fine.
+asm_make_insn_record kind line =
+  let parts = asm_split_mn_ops (asm_ltrim (asm_strip_comment line))
+  cons kind (cons (head parts) (cons (head (tail parts)) (cons line [])))
+
+asm_build_records lines = asm_build_records_go lines []
+asm_build_records_go lines acc =
+  if lines == [] then reverse acc
+  else asm_build_records_go (tail lines) (cons (asm_make_record (head lines)) acc)
+
+-- pass1 over records: build the label map (no per-line classify/chars/reverse).
+asm_build_labels_r records =
+  let buckets = arr_new asm_nbuckets []
+  let _ = asm_pass1_r records 0 1 buckets
+  buckets
+asm_pass1_r records off in_text buckets =
+  if records == [] then buckets
+  else
+    let r = head records
+    let kind = asm_rec_kind r
+    if kind == "sec_text" then asm_pass1_r (tail records) off 1 buckets
+    else if kind == "sec_other" then asm_pass1_r (tail records) off 0 buckets
+    else if in_text == 0 then asm_pass1_r (tail records) off 0 buckets
+    else if kind == "skip" then asm_pass1_r (tail records) off 1 buckets
+    else if kind == "label" then
+      let _ = asm_insert buckets (asm_label_name (asm_ltrim (asm_rec_raw r))) off
+      asm_pass1_r (tail records) off 1 buckets
+    else
+      asm_pass1_r (tail records) (off + (asm_seg_size off kind (asm_rec_raw r))) 1 buckets
+
+-- __text image size over records.
+asm_textlen_r records off in_text =
+  if records == [] then off
+  else
+    let r = head records
+    let kind = asm_rec_kind r
+    if kind == "sec_text" then asm_textlen_r (tail records) off 1
+    else if kind == "sec_other" then asm_textlen_r (tail records) off 0
+    else if in_text == 0 then asm_textlen_r (tail records) off 0
+    else if kind == "label" then asm_textlen_r (tail records) off 1
+    else if kind == "skip" then asm_textlen_r (tail records) off 1
+    else asm_textlen_r (tail records) (off + (asm_seg_size off kind (asm_rec_raw r))) 1
+
+-- pass2 over records: emit bytes. Insn uses cached mn/ops (no re-split).
+asm_pass2_r records buf off in_text labels =
+  if records == [] then off
+  else
+    let r = head records
+    let kind = asm_rec_kind r
+    if kind == "sec_text" then asm_pass2_r (tail records) buf off 1 labels
+    else if kind == "sec_other" then asm_pass2_r (tail records) buf off 0 labels
+    else if in_text == 0 then asm_pass2_r (tail records) buf off 0 labels
+    else if kind == "skip" || kind == "label" then asm_pass2_r (tail records) buf off 1 labels
+    else if kind == "asciz" then
+      asm_pass2_r (tail records) buf (asm_emit_str buf off (asm_decode_str (asm_str_arg (asm_rec_raw r)) []) 1) 1 labels
+    else if kind == "ascii" then
+      asm_pass2_r (tail records) buf (asm_emit_str buf off (asm_decode_str (asm_str_arg (asm_rec_raw r)) []) 0) 1 labels
+    else if kind == "align" then
+      asm_pass2_r (tail records) buf (asm_pad buf off (asm_align_up off (asm_p2align_n (asm_ltrim (asm_rec_raw r))))) 1 labels
+    else
+      let word = asm_encode_insn (asm_rec_mn r) (asm_rec_ops r) off labels
+      let _ = cb_emit buf off word
+      asm_pass2_r (tail records) buf (off + 4) 1 labels
+
+-- external-bl reloc collection over records.
+asm_collect_relocs_r records off in_text labels acc =
+  if records == [] then reverse acc
+  else
+    let r = head records
+    let kind = asm_rec_kind r
+    if kind == "sec_text" then asm_collect_relocs_r (tail records) off 1 labels acc
+    else if kind == "sec_other" then asm_collect_relocs_r (tail records) off 0 labels acc
+    else if in_text == 0 then asm_collect_relocs_r (tail records) off 0 labels acc
+    else if kind == "skip" then asm_collect_relocs_r (tail records) off 1 labels acc
+    else if kind == "label" then asm_collect_relocs_r (tail records) off 1 labels acc
+    else if kind == "insn" then
+      (let mn = asm_rec_mn r
+       let sym = asm_rec_ops r
+       if (mn == "bl" || mn == "b") then
+         (if (asm_lookup sym labels) < 0 then
+            (if (asm_is_local_label sym) == 0 then asm_collect_relocs_r (tail records) (off + 4) 1 labels (cons (cons off (cons sym [])) acc)
+             else asm_collect_relocs_r (tail records) (off + 4) 1 labels acc)
+          else asm_collect_relocs_r (tail records) (off + 4) 1 labels acc)
+       else asm_collect_relocs_r (tail records) (off + 4) 1 labels acc)
+    else asm_collect_relocs_r (tail records) (off + (asm_seg_size off kind (asm_rec_raw r))) 1 labels acc
+
+-- record-taking public entries (parallel to the _l lines-taking ones).
+asm_assemble_r records labels capacity =
+  let buf = arr_new capacity 0
+  let _ = asm_pass2_r records buf 0 1 labels
+  buf
+asm_relocs_r records labels = asm_collect_relocs_r records 0 1 labels []
+asm_bytes_len_r records = asm_textlen_r records 0 1
