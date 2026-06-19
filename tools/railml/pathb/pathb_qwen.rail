@@ -1,0 +1,251 @@
+-- pathb_qwen.rail -- KV-cached integer-exact generation for Qwen3-0.6B (SECOND architecture, D2.2).
+--
+-- Proves the Path-B substrate (pathb_lib.rail) is not SmolLM2-specific. Qwen3 deltas vs SmolLM2:
+--   - dims: d=1024, 28 layers, 16 heads / 8 kv (group 2), head_dim 128 (NON-SQUARE: qdim=2048 != d),
+--     intermediate 3072, vocab 151936, rms_eps 1e-6, rope_theta 1e6.
+--   - QK-NORM (the one genuinely new op): per-head RMSNorm on Q and K over head_dim, with q_norm/k_norm
+--     [128] weights, applied AFTER q/k projection and BEFORE RoPE. This file adds it.
+--   - tied embeddings (lm_head.weight is a stored duplicate of embed_tokens; tie=True) -> head uses Emb.
+-- The non-square head_dim needs NO new code -- the block math is already dim-parameterized.
+--
+-- Build: cd ~/projects/rail-https && ./rail_native tools/railml/pathb/pathb_qwen.rail
+-- Run:   RAIL_ARENA_MB=12000 /tmp/rail_out
+--
+-- VERIFY (HF transformers 5.5.0 greedy, fp32): prompt "The capital of France is" = ids
+--   [785,6722,315,9625,374] -> generates [12095,13,576,6722,315,15344,374,21718]
+--   = " Paris. The capital of Italy is Rome". g[0] must = 12095 (' Paris').
+--
+-- MEMORY WALL (honest): Qwen3-0.6B's ~0.6B params as Rail 8-byte tagged ints = ~4.8 GB weights
+-- (+ 1.5 GB blob). During the slow per-step integer matmuls those pages go cold and macOS compresses
+-- then re-faults them every step -> self-thrash; full g[0] can take 15+ min on a 24 GB machine. This
+-- is a SCALABILITY limit of the 8-byte-int rep, NOT a port bug. CORRECTNESS is proven memory-light by
+-- qwen_verify.rail: first-layers' last-pos hidden absum matches HF fp32 to ~0.1% (embed 21.0/HF 21.05,
+-- L0 123.4/123.45, L1 161.8/161.83, L2 186.8/186.84) -- QK-norm + non-square head_dim + RoPE 1e6 all
+-- exercised. Future: compact fixed-point packing or tensor streaming removes the wall.
+
+import "tools/railml/pathb/pathb_lib.rail"
+import "stdlib/env.rail"
+
+-- ===== Qwen3-0.6B config =====
+qg_d _      = 1024
+qg_nh _     = 16
+qg_nkv _    = 8
+qg_hd _     = 128
+qg_inter _  = 3072
+qg_vocab _  = 151936
+qg_nlayers _ = 28
+qg_eps _    = 17           -- round(1e-6 * 2^24)
+qg_lnb _    = 231785805    -- round(ln(1e6) * 2^24), rope_theta = 1e6
+qg_maxgen _ = 8
+
+qg_blob _ = let e = getenv "QWEN3_BLOB" in if e == "" then cat [getenv "HOME", "/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca/model.safetensors"] else e
+
+-- ===== single-token decode helpers (same logic as pathb_generate; kept local to not touch that file) =====
+pg_qkv xrow xn Wq Wk Wv Q K V d qdim kvdim gamma eps acc =
+  let rms = pf_rms xrow 0 d eps in
+  let _ = pf_normapply xrow 0 xn gamma d rms 0 in
+  let _ = pf_proj Wq xn 0 d Q 0 qdim acc 0 in
+  let _ = pf_proj Wk xn 0 d K 0 kvdim acc 0 in
+  let _ = pf_proj Wv xn 0 d V 0 kvdim acc 0 in
+  0
+pg_rope_one src out nheads hd pos lnb h =
+  if h >= nheads then out
+  else let b = h * hd in
+       let _ = pf_rope src b out b hd pos lnb 0 in
+       pg_rope_one src out nheads hd pos lnb (h + 1)
+pg_store src cache cbase kvdim i =
+  if i >= kvdim then 0
+  else let _ = arr_set cache (cbase + i) (arr_get src i) in pg_store src cache cbase kvdim (i + 1)
+pg_scores Qr qhb Kcache kbaseL kvdim hd scaleq npos S acc j =
+  if j >= npos then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_adot Qr qhb Kcache (kbaseL + j * kvdim) hd acc 0 in
+    let raw = pf_rescale (arr_get acc 0) (arr_get acc 1) in
+    let _ = arr_set S j ((raw * scaleq) / 16777216) in
+    pg_scores Qr qhb Kcache kbaseL kvdim hd scaleq npos S acc (j + 1)
+pg_ctx P Vcache vbaseL kvdim attn ab hd npos col acc =
+  if col >= hd then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_pvdot P 0 Vcache (vbaseL + col) kvdim npos acc 0 in
+    let _ = arr_set attn (ab + col) (pf_rescale (arr_get acc 0) (arr_get acc 1)) in
+    pg_ctx P Vcache vbaseL kvdim attn ab hd npos (col + 1)
+pg_head Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq group npos h acc =
+  let kv = h / group in
+  let qhb = h * hd in
+  let hb = layerbase + kv * hd in
+  let _ = pg_scores Qr qhb Kcache hb kvdim hd scaleq npos S acc 0 in
+  let _ = pf_softmax_i S E P 0 npos in
+  pg_ctx P Vcache hb kvdim attn (h * hd) hd npos 0 acc
+pg_heads Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq nh group npos h acc =
+  if h >= nh then attn
+  else let _ = pg_head Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq group npos h acc in
+       pg_heads Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq nh group npos (h + 1) acc
+
+-- ===== QK-NORM (NEW): in-place per-head RMSNorm over head_dim, scaled by gamma[hd] =====
+qn_apply vec base gamma hd rinv i =
+  if i >= hd then 0
+  else let _ = arr_set vec (base + i) (mul_shr (mul_shr (arr_get vec (base + i)) rinv 24) (arr_get gamma i) 24) in
+       qn_apply vec base gamma hd rinv (i + 1)
+qk_norm vec nheads hd gamma eps h =
+  if h >= nheads then 0
+  else
+    let base = h * hd in
+    let rms = pf_rms vec base hd eps in
+    let _ = qn_apply vec base gamma hd (281474976710656 / rms) 0 in
+    qk_norm vec nheads hd gamma eps (h + 1)
+
+-- ===== one Qwen3 layer: QKV -> QK-norm -> RoPE -> cached attention -> o+resid -> MLP =====
+-- LW directory: 11 standalone arrays per layer at li*11+k (adds q_norm[9], k_norm[10] vs SmolLM2's 9).
+qg_layer LW xrow li d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc =
+  let g_in   = arr_get LW (li * 11 + 0) in
+  let Wq     = arr_get LW (li * 11 + 1) in
+  let Wk     = arr_get LW (li * 11 + 2) in
+  let Wv     = arr_get LW (li * 11 + 3) in
+  let Wo     = arr_get LW (li * 11 + 4) in
+  let g_post = arr_get LW (li * 11 + 5) in
+  let Wg     = arr_get LW (li * 11 + 6) in
+  let Wu     = arr_get LW (li * 11 + 7) in
+  let Wd     = arr_get LW (li * 11 + 8) in
+  let qnorm  = arr_get LW (li * 11 + 9) in
+  let knorm  = arr_get LW (li * 11 + 10) in
+  let xn = arr_new d 0 in
+  let Q = arr_new qdim 0 in
+  let K = arr_new kvdim 0 in
+  let V = arr_new kvdim 0 in
+  let _ = pg_qkv xrow xn Wq Wk Wv Q K V d qdim kvdim g_in eps acc in
+  -- QK-norm (Qwen3): per-head RMSNorm on Q (nh heads) and K (nkv heads) BEFORE RoPE
+  let _ = qk_norm Q nh hd qnorm eps 0 in
+  let _ = qk_norm K nkv hd knorm eps 0 in
+  let Qr = pg_rope_one Q (arr_new qdim 0) nh hd pos lnb 0 in
+  let Kr = pg_rope_one K (arr_new kvdim 0) nkv hd pos lnb 0 in
+  let layerbase = li * maxseq * kvdim in
+  let _ = pg_store Kr Kcache (layerbase + pos * kvdim) kvdim 0 in
+  let _ = pg_store V  Vcache (layerbase + pos * kvdim) kvdim 0 in
+  let npos = pos + 1 in
+  let attn = arr_new qdim 0 in
+  let S = arr_new maxseq 0 in
+  let E = arr_new maxseq 0 in
+  let P = arr_new maxseq 0 in
+  let _ = pg_heads Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq nh group npos 0 acc in
+  let Y = arr_new d 0 in
+  let _ = pf_proj Wo attn 0 qdim Y 0 d acc 0 in
+  let _ = pf_addrow xrow Y d 0 0 in
+  let hn = arr_new d 0 in
+  let rms2 = pf_rms Y 0 d eps in
+  let _ = pf_normapply Y 0 hn g_post d rms2 0 in
+  let gate = arr_new inter 0 in
+  let up = arr_new inter 0 in
+  let gg = arr_new inter 0 in
+  let _ = pf_proj Wg hn 0 d gate 0 inter acc 0 in
+  let _ = pf_proj Wu hn 0 d up 0 inter acc 0 in
+  let _ = pf_silu_mul gate up gg inter 0 in
+  let M = arr_new d 0 in
+  let _ = pf_proj Wd gg 0 inter M 0 d acc 0 in
+  let _ = pf_addrow M Y d 0 0 in
+  Y
+
+qg_layers LW xrow li nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc =
+  if li >= nlayers then xrow
+  else
+    let m = arena_mark 0 in
+    let Y = qg_layer LW xrow li d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc in
+    let _ = pf_copy Y xrow d 0 in
+    let _ = arena_reset m in
+    qg_layers LW xrow (li + 1) nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc
+
+qg_step LW Emb gnorm tokid Kcache Vcache pos maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc =
+  let xrow = arr_new d 0 in
+  let _ = pf_embed_row Emb tokid xrow 0 d 0 in
+  let _ = qg_layers LW xrow 0 nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc in
+  let rms = pf_rms xrow 0 d eps in
+  let xnf = arr_new d 0 in
+  let _ = pf_normapply xrow 0 xnf gnorm d rms 0 in
+  let logits = arr_new vocab 0 in
+  let _ = pf_lmhead xnf Emb vocab d logits acc 0 in
+  logits
+
+-- pre-decode ALL 28 layers' 11 tensors ONCE into LW (li*11+k).
+qg_loadall buf hdrhi base LW li nlayers d qdim kvdim inter hd =
+  if li >= nlayers then 0
+  else
+    let _ = arr_set LW (li * 11 + 0) (ld_tensor buf hdrhi base (ld_lname li "input_layernorm.weight") d) in
+    let _ = arr_set LW (li * 11 + 1) (ld_tensor buf hdrhi base (ld_lname li "self_attn.q_proj.weight") (qdim * d)) in
+    let _ = arr_set LW (li * 11 + 2) (ld_tensor buf hdrhi base (ld_lname li "self_attn.k_proj.weight") (kvdim * d)) in
+    let _ = arr_set LW (li * 11 + 3) (ld_tensor buf hdrhi base (ld_lname li "self_attn.v_proj.weight") (kvdim * d)) in
+    let _ = arr_set LW (li * 11 + 4) (ld_tensor buf hdrhi base (ld_lname li "self_attn.o_proj.weight") (d * qdim)) in
+    let _ = arr_set LW (li * 11 + 5) (ld_tensor buf hdrhi base (ld_lname li "post_attention_layernorm.weight") d) in
+    let _ = arr_set LW (li * 11 + 6) (ld_tensor buf hdrhi base (ld_lname li "mlp.gate_proj.weight") (inter * d)) in
+    let _ = arr_set LW (li * 11 + 7) (ld_tensor buf hdrhi base (ld_lname li "mlp.up_proj.weight") (inter * d)) in
+    let _ = arr_set LW (li * 11 + 8) (ld_tensor buf hdrhi base (ld_lname li "mlp.down_proj.weight") (d * inter)) in
+    let _ = arr_set LW (li * 11 + 9) (ld_tensor buf hdrhi base (ld_lname li "self_attn.q_norm.weight") hd) in
+    let _ = arr_set LW (li * 11 + 10) (ld_tensor buf hdrhi base (ld_lname li "self_attn.k_norm.weight") hd) in
+    qg_loadall buf hdrhi base LW (li + 1) nlayers d qdim kvdim inter hd
+
+qg_loop LW Emb gnorm ids L gbuf maxgen pos Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc =
+  if pos >= (L + maxgen - 1) then 0
+  else
+    let tok = if pos < L then (arr_get ids pos) else (arr_get gbuf (pos - L)) in
+    let m = arena_mark 0 in
+    let logits = qg_step LW Emb gnorm tok Kcache Vcache pos maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc in
+    let pred = pf_argmax logits vocab 1 0 (arr_get logits 0) in
+    let _ = if pos >= (L - 1) then arr_set gbuf (pos - (L - 1)) pred else 0 in
+    let _ = if pos >= (L - 1) then print (cat ["  gen[", show (pos - (L - 1)), "]  pos ", show (pos + 1), " = ", show pred]) else (print (cat ["  prefill pos=", show pos, " tok=", show tok])) in
+    let _ = arena_reset m in
+    qg_loop LW Emb gnorm ids L gbuf maxgen (pos + 1) Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc
+
+main =
+  let blob = qg_blob 0 in
+  let bsz = read_file_size blob in
+  if bsz < 100000000 then
+    let _ = print (cat ["pathb_qwen: FATAL -- blob missing or too small (", show bsz, " bytes): ", blob]) in
+    let _ = print "  Set $QWEN3_BLOB, or: hf download Qwen/Qwen3-0.6B model.safetensors" in
+    1
+  else
+  let d = qg_d 0 in
+  let nh = qg_nh 0 in
+  let nkv = qg_nkv 0 in
+  let hd = qg_hd 0 in
+  let inter = qg_inter 0 in
+  let nlayers = qg_nlayers 0 in
+  let vocab = qg_vocab 0 in
+  let eps = qg_eps 0 in
+  let lnb = qg_lnb 0 in
+  let maxgen = qg_maxgen 0 in
+  let qdim = nh * hd in
+  let kvdim = nkv * hd in
+  let group = nh / nkv in
+  let scaleq = bx4_fxrsqrt (hd * 16777216) in
+  let acc = arr_new 2 0 in
+  let buf = read_file_bytes blob in
+  let hlen = pq_le_len buf 0 in
+  let base = 8 + hlen in
+  let hdrhi = base in
+  -- prompt: "The capital of France is" -> HF ids
+  let L = 5 in
+  let ids = arr_new L 0 in
+  let _ = arr_set ids 0 785 in
+  let _ = arr_set ids 1 6722 in
+  let _ = arr_set ids 2 315 in
+  let _ = arr_set ids 3 9625 in
+  let _ = arr_set ids 4 374 in
+  let _ = print (cat ["pathb_qwen: Qwen3-0.6B KV-cached generation  L=", show L, " maxgen=", show maxgen, " (d=", show d, " heads=", show nh, "/", show nkv, " hd=", show hd, " qdim=", show qdim, " vocab=", show vocab, ")"]) in
+  let _ = print "  decoding embedding (151936 x 1024) + pre-loading 28 layers (with q/k-norm)..." in
+  let Emb = ld_tensor buf hdrhi base "model.embed_tokens.weight" (vocab * d) in
+  let gnorm = ld_tensor buf hdrhi base "model.norm.weight" d in
+  let LW = arr_new (nlayers * 11) 0 in
+  let _ = qg_loadall buf hdrhi base LW 0 nlayers d qdim kvdim inter hd in
+  let _ = print "  weights cached; generating..." in
+  let maxseq = L + maxgen in
+  let Kcache = arr_new (nlayers * maxseq * kvdim) 0 in
+  let Vcache = arr_new (nlayers * maxseq * kvdim) 0 in
+  let gbuf = arr_new (maxgen + 1) 0 in
+  let _ = qg_loop LW Emb gnorm ids L gbuf maxgen 0 Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc in
+  let _ = print "  generated vs HF greedy reference [12095,13,576,6722,315,15344,374,21718]:" in
+  let _ = print (cat ["    g[0]=", show (arr_get gbuf 0), " (HF 12095 ' Paris')  g[1]=", show (arr_get gbuf 1), " (HF 13)  g[2]=", show (arr_get gbuf 2), " (HF 576)  g[3]=", show (arr_get gbuf 3), " (HF 6722)"]) in
+  let ok = if (arr_get gbuf 0) == 12095 then 1 else 0 in
+  let _ = print (cat ["  D2.2 g[0] parity (== 12095 ' Paris'): ", if ok == 1 then "PASS" else "FAIL"]) in
+  0
