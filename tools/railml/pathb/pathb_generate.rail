@@ -87,16 +87,19 @@ pg_heads Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq nh group npos h a
        pg_heads Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq nh group npos (h + 1) acc
 
 -- ===== one transformer layer over a single token at position pos, using/updating the cache =====
-pg_layer buf hdrhi base xrow li d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc =
-  let g_in   = ld_tensor buf hdrhi base (ld_lname li "input_layernorm.weight") d in
-  let Wq     = ld_tensor buf hdrhi base (ld_lname li "self_attn.q_proj.weight") (qdim * d) in
-  let Wk     = ld_tensor buf hdrhi base (ld_lname li "self_attn.k_proj.weight") (kvdim * d) in
-  let Wv     = ld_tensor buf hdrhi base (ld_lname li "self_attn.v_proj.weight") (kvdim * d) in
-  let Wo     = ld_tensor buf hdrhi base (ld_lname li "self_attn.o_proj.weight") (d * qdim) in
-  let g_post = ld_tensor buf hdrhi base (ld_lname li "post_attention_layernorm.weight") d in
-  let Wg     = ld_tensor buf hdrhi base (ld_lname li "mlp.gate_proj.weight") (inter * d) in
-  let Wu     = ld_tensor buf hdrhi base (ld_lname li "mlp.up_proj.weight") (inter * d) in
-  let Wd     = ld_tensor buf hdrhi base (ld_lname li "mlp.down_proj.weight") (d * inter) in
+-- Weights come from the pre-decoded directory LW (9 standalone arrays per layer at li*9+k) so they
+-- are decoded ONCE (pg_loadall) instead of reloaded from the blob every step. Each LW entry is a full
+-- array starting at 0 -- identical shape to ld_tensor's return -- so the block math is unchanged.
+pg_layer LW xrow li d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc =
+  let g_in   = arr_get LW (li * 9 + 0) in
+  let Wq     = arr_get LW (li * 9 + 1) in
+  let Wk     = arr_get LW (li * 9 + 2) in
+  let Wv     = arr_get LW (li * 9 + 3) in
+  let Wo     = arr_get LW (li * 9 + 4) in
+  let g_post = arr_get LW (li * 9 + 5) in
+  let Wg     = arr_get LW (li * 9 + 6) in
+  let Wu     = arr_get LW (li * 9 + 7) in
+  let Wd     = arr_get LW (li * 9 + 8) in
   -- QKV for the single token
   let xn = arr_new d 0 in
   let Q = arr_new qdim 0 in
@@ -136,20 +139,20 @@ pg_layer buf hdrhi base xrow li d nh nkv hd inter qdim kvdim group eps lnb scale
   Y
 
 -- loop all layers for ONE token; xrow is the persistent per-token hidden (survives per-layer resets).
-pg_layers buf hdrhi base xrow li nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc =
+pg_layers LW xrow li nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc =
   if li >= nlayers then xrow
   else
     let m = arena_mark 0 in
-    let Y = pg_layer buf hdrhi base xrow li d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc in
+    let Y = pg_layer LW xrow li d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc in
     let _ = pf_copy Y xrow d 0 in
     let _ = arena_reset m in
-    pg_layers buf hdrhi base xrow (li + 1) nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc
+    pg_layers LW xrow (li + 1) nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc
 
 -- one full step: embed token -> all layers (cache updated at slot pos) -> final norm + tied LM head.
-pg_step buf hdrhi base Emb gnorm tokid Kcache Vcache pos maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc =
+pg_step LW Emb gnorm tokid Kcache Vcache pos maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc =
   let xrow = arr_new d 0 in
   let _ = pf_embed_row Emb tokid xrow 0 d 0 in
-  let _ = pg_layers buf hdrhi base xrow 0 nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc in
+  let _ = pg_layers LW xrow 0 nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc in
   let rms = pf_rms xrow 0 d eps in
   let xnf = arr_new d 0 in
   let _ = pf_normapply xrow 0 xnf gnorm d rms 0 in
@@ -164,20 +167,37 @@ pg_dump_verify logits vocab nlayers L am =
   pf_dump_file path logits vocab 4096 0
 
 -- generation loop. ids = prompt (length L); gbuf collects generated tokens.
-pg_loop buf hdrhi base Emb gnorm ids L gbuf maxgen pos Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc =
+pg_loop LW Emb gnorm ids L gbuf maxgen pos Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc =
   if pos >= (L + maxgen - 1) then 0
   else
     let tok = if pos < L then (arr_get ids pos) else (arr_get gbuf (pos - L)) in
     let m = arena_mark 0 in
-    let logits = pg_step buf hdrhi base Emb gnorm tok Kcache Vcache pos maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc in
+    let logits = pg_step LW Emb gnorm tok Kcache Vcache pos maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc in
     let pred = pf_argmax logits vocab 1 0 (arr_get logits 0) in
     let _ = if pos == (L - 1) then (let _ = pg_dump_verify logits vocab nlayers L pred in print (cat ["  [verify] dumped pos=", show (L - 1), " logits (expect sha fe76eb50...)"])) else 0 in
     let _ = if pos >= (L - 1) then arr_set gbuf (pos - (L - 1)) pred else 0 in
     let _ = if pos >= (L - 1) then print (cat ["  gen[", show (pos - (L - 1)), "]  predicts token at pos ", show (pos + 1), " = ", show pred]) else (print (cat ["  prefill pos=", show pos, " tok=", show tok])) in
     let _ = arena_reset m in
-    pg_loop buf hdrhi base Emb gnorm ids L gbuf maxgen (pos + 1) Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc
+    pg_loop LW Emb gnorm ids L gbuf maxgen (pos + 1) Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc
 
 pg_print_gen gbuf n i = if i >= n then 0 else let _ = print (cat ["    g[", show i, "] = ", show (arr_get gbuf i)]) in pg_print_gen gbuf n (i + 1)
+
+-- pre-decode ALL layer weights ONCE into the directory LW (9 standalone arrays per layer at li*9+k).
+-- This is the weight-cache: ~135M BF16 elements decoded one time, then reused for every decode step
+-- (vs reloading the 269 MB blob per step). Persistent (allocated before the generation loop's marks).
+pg_loadall buf hdrhi base LW li nlayers d qdim kvdim inter =
+  if li >= nlayers then 0
+  else
+    let _ = arr_set LW (li * 9 + 0) (ld_tensor buf hdrhi base (ld_lname li "input_layernorm.weight") d) in
+    let _ = arr_set LW (li * 9 + 1) (ld_tensor buf hdrhi base (ld_lname li "self_attn.q_proj.weight") (qdim * d)) in
+    let _ = arr_set LW (li * 9 + 2) (ld_tensor buf hdrhi base (ld_lname li "self_attn.k_proj.weight") (kvdim * d)) in
+    let _ = arr_set LW (li * 9 + 3) (ld_tensor buf hdrhi base (ld_lname li "self_attn.v_proj.weight") (kvdim * d)) in
+    let _ = arr_set LW (li * 9 + 4) (ld_tensor buf hdrhi base (ld_lname li "self_attn.o_proj.weight") (d * qdim)) in
+    let _ = arr_set LW (li * 9 + 5) (ld_tensor buf hdrhi base (ld_lname li "post_attention_layernorm.weight") d) in
+    let _ = arr_set LW (li * 9 + 6) (ld_tensor buf hdrhi base (ld_lname li "mlp.gate_proj.weight") (inter * d)) in
+    let _ = arr_set LW (li * 9 + 7) (ld_tensor buf hdrhi base (ld_lname li "mlp.up_proj.weight") (inter * d)) in
+    let _ = arr_set LW (li * 9 + 8) (ld_tensor buf hdrhi base (ld_lname li "mlp.down_proj.weight") (d * inter)) in
+    pg_loadall buf hdrhi base LW (li + 1) nlayers d qdim kvdim inter
 
 main =
   let blob = pg_blob 0 in
@@ -219,13 +239,16 @@ main =
   let _ = print "  decoding full embedding (49152 x 576)..." in
   let Emb = ld_tensor buf hdrhi base "model.embed_tokens.weight" (vocab * d) in
   let gnorm = ld_tensor buf hdrhi base "model.norm.weight" d in
-  let _ = print "  embedding decoded; generating..." in
+  let _ = print "  embedding decoded; pre-loading all layers' weights (once)..." in
+  let LW = arr_new (nlayers * 9) 0 in
+  let _ = pg_loadall buf hdrhi base LW 0 nlayers d qdim kvdim inter in
+  let _ = print "  weights cached; generating..." in
   -- KV cache: per-layer, maxseq positions, kvdim each
   let maxseq = L + maxgen in
   let Kcache = arr_new (nlayers * maxseq * kvdim) 0 in
   let Vcache = arr_new (nlayers * maxseq * kvdim) 0 in
   let gbuf = arr_new (maxgen + 1) 0 in
-  let _ = pg_loop buf hdrhi base Emb gnorm ids L gbuf maxgen 0 Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc in
+  let _ = pg_loop LW Emb gnorm ids L gbuf maxgen 0 Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc in
   let _ = print (cat ["  generated ", show maxgen, " tokens:"]) in
   let _ = pg_print_gen gbuf maxgen 0 in
   let h = shell "shasum -a 256 tools/railml/pathb/logits_gen_verify.txt" in
