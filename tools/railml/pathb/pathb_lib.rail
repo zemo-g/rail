@@ -1,0 +1,328 @@
+-- pathb_lib.rail -- shared pure-Rail model substrate for the Path-B family.
+-- Extracted VERBATIM from pathb_forward_full.rail (lines 49-331 block math + 347-380 IO),
+-- so the attested forward and the KV-cached generator share ONE source of the block
+-- functions. All functions are dim-parameterized (no model config baked in) -> reusable
+-- across SmolLM2 / Qwen3 (D2.2) and the attested-training track (D4).
+-- Imports: stdlib/file.rail (byte_at/read_file_bytes/append_line), bx_fixed (bx4_* fixed-pt).
+
+import "stdlib/file.rail"
+import "tools/bitexact/bx_fixed.rail"
+
+-- ===== pure-integer BF16 -> fixed-point (S=2^24) decoder (REUSED VERBATIM from pathb_quant) =====
+pq_pow2_go acc k = if k == 0 then acc else pq_pow2_go (acc + acc) (k - 1)
+pq_pow2 k = if k < 1 then 1 else pq_pow2_go 1 k
+pq_f32_fixed b0 b1 b2 b3 =
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in
+  let sign = bits / 2147483648 in
+  let rest = bits - sign * 2147483648 in
+  let exp  = rest / 8388608 in
+  let mant = rest - exp * 8388608 in
+  if exp == 0 then 0
+  else
+    let mag = 8388608 + mant in
+    let sh = exp - 126 in
+    let xabs = if sh >= 0 then mag * (pq_pow2 sh)
+               else (let d = pq_pow2 (0 - sh) in (mag + d / 2) / d) in
+    if sign == 1 then 0 - xabs else xabs
+pq_bf16_fixed lo hi = pq_f32_fixed 0 0 lo hi
+
+-- ===== header byte-scan + parse (REUSED VERBATIM from pathb_quant) =====
+pq_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then pq_match buf (pos + 1) (tail pcs) else 0
+pq_find buf pos hi pcs = if pos >= hi then 0 - 1 else if pq_match buf pos pcs == 1 then pos else pq_find buf (pos + 1) hi pcs
+pq_find_after buf pos hi pcs = let p = pq_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+pq_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else pq_int buf (pos + 1) (acc * 10 + (c - 48))
+pq_int_after buf pos = let c = byte_at buf pos in if c < 48 then pos else if c > 57 then pos else pq_int_after buf (pos + 1)
+-- 8-byte little-endian header length
+pq_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+-- data_offsets[k] for a named tensor (k=0 start, k=1 end). hdr scanned within [0, hi).
+pq_offset hdr hi name k =
+  let np = pq_find hdr 0 hi (chars (cat ["\"", name, "\":"])) in
+  let dp = pq_find_after hdr np hi (chars "\"data_offsets\":[") in
+  let start = pq_int hdr dp 0 in
+  if k == 0 then start
+  else (let endp = pq_int_after hdr dp in pq_int hdr (endp + 1) 0)
+
+-- ===== ON-THE-FLY BF16 tensor loader =====
+-- Decode `count` elements of the named tensor into a FRESH int array. byteaddr = base + start + 2*p.
+-- The header window [0, hi) is the small JSON; data lives at [base, EOF). No re-scan of the 269 MB blob.
+ld_decode buf base start out count i =
+  if i >= count then out
+  else
+    let ba = base + start + 2 * i in
+    let _ = arr_set out i (pq_bf16_fixed (byte_at buf ba) (byte_at buf (ba + 1))) in
+    ld_decode buf base start out count (i + 1)
+ld_tensor buf hdrhi base name count =
+  let start = pq_offset buf hdrhi name 0 in
+  let out = arr_new count 0 in
+  ld_decode buf base start out count 0
+
+-- build a layer-prefixed tensor name: "model.layers.<i>.<suffix>"
+ld_lname i suffix = cat ["model.layers.", show i, ".", suffix]
+
+-- ===== two-limb exact superaccumulator dot (REUSED VERBATIM) =====
+pf_rescale h l = (h * 2147483648 + l) / 16777216
+pf_adot A abase B bbase K acc p =
+  if p >= K then 0
+  else
+    let a = (arr_get A (abase + p)) * (arr_get B (bbase + p)) in
+    let ahi = a / 2147483648 in
+    let alo = a - ahi * 2147483648 in
+    let h0 = (arr_get acc 0) + ahi in
+    let l0 = (arr_get acc 1) + alo in
+    let h = if l0 >= 2147483648 then h0 + 1 else if l0 < 0 then h0 - 1 else h0 in
+    let l = if l0 >= 2147483648 then l0 - 2147483648 else if l0 < 0 then l0 + 2147483648 else l0 in
+    let _ = arr_set acc 0 h in
+    let _ = arr_set acc 1 l in
+    pf_adot A abase B bbase K acc (p + 1)
+pf_pvdot P pbase V vbase vstride L acc j =
+  if j >= L then 0
+  else
+    let a = (arr_get P (pbase + j)) * (arr_get V (vbase + j * vstride)) in
+    let ahi = a / 2147483648 in
+    let alo = a - ahi * 2147483648 in
+    let h0 = (arr_get acc 0) + ahi in
+    let l0 = (arr_get acc 1) + alo in
+    let h = if l0 >= 2147483648 then h0 + 1 else if l0 < 0 then h0 - 1 else h0 in
+    let l = if l0 >= 2147483648 then l0 - 2147483648 else if l0 < 0 then l0 + 2147483648 else l0 in
+    let _ = arr_set acc 0 h in
+    let _ = arr_set acc 1 l in
+    pf_pvdot P pbase V vbase vstride L acc (j + 1)
+
+-- ===== generic linear projection (REUSED VERBATIM) =====
+pf_proj W src sbase K out obase outN acc o =
+  if o >= outN then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_adot W (o * K) src sbase K acc 0 in
+    let _ = arr_set out (obase + o) (pf_rescale (arr_get acc 0) (arr_get acc 1)) in
+    pf_proj W src sbase K out obase outN acc (o + 1)
+
+-- ===== RMSNorm (REUSED VERBATIM) =====
+-- mul_shr X X 24 = X^2 >> 24 in a FULL 128-bit intermediate -> exact even when X^2 exceeds 2^64
+-- (SmolLM2 massive activations reach ~2^38; the square is ~2^76, which a single-limb X*X overflows).
+pf_ssq_a X base d i acc = if i >= d then acc else pf_ssq_b X base d (i + 1) (acc + mul_shr (arr_get X (base + i)) (arr_get X (base + i)) 24)
+pf_ssq_b X base d i acc = if i >= d then acc else pf_ssq_a X base d (i + 1) (acc + mul_shr (arr_get X (base + i)) (arr_get X (base + i)) 24)
+pf_rms X base d eps = let ss = pf_ssq_a X base d 0 0 in let meansq = ss / d in bx4_fxsqrt (meansq + eps)
+-- normalize via a reciprocal so X*S (which overflows for X~2^38) is never formed: rinv = 2^48/rms,
+-- then xn = mul_shr(mul_shr(X, rinv, 24), gamma, 24) -- both products in 128-bit, exact + overflow-safe.
+pf_normapply X base xn gamma d rms i = pf_normapply2 X base xn gamma d (281474976710656 / rms) i
+pf_normapply2 X base xn gamma d rinv i =
+  if i >= d then xn
+  else let _ = arr_set xn i (mul_shr (mul_shr (arr_get X (base + i)) rinv 24) (arr_get gamma i) 24) in
+       pf_normapply2 X base xn gamma d rinv (i + 1)
+
+-- ===== RoPE (REUSED VERBATIM) =====
+pf_freq i hd lnb = bx4_fxexp (0 - ((2 * i * lnb) / hd))
+pf_rope src sbase out obase hd pos lnb i =
+  if i + i >= hd then out
+  else
+    let fq = pf_freq i hd lnb in
+    let thq = pos * fq in
+    let cq = bx4_cosb thq in
+    let sq = bx4_sinb thq in
+    let qi = arr_get src (sbase + i) in
+    let qj = arr_get src (sbase + i + hd / 2) in
+    let _ = arr_set out (obase + i) ((qi * cq - qj * sq) / 16777216) in
+    let _ = arr_set out (obase + i + hd / 2) ((qj * cq + qi * sq) / 16777216) in
+    pf_rope src sbase out obase hd pos lnb (i + 1)
+pf_rope_heads src out L nh hd rstride lnb t h =
+  if t >= L then out
+  else if h >= nh then pf_rope_heads src out L nh hd rstride lnb (t + 1) 0
+  else
+    let base = t * rstride + h * hd in
+    let _ = pf_rope src base out base hd t lnb 0 in
+    pf_rope_heads src out L nh hd rstride lnb t (h + 1)
+
+-- ===== SiLU (REUSED VERBATIM) =====
+pf_silu xq =
+  let em = bx4_fxexp (0 - xq) in
+  let denom = 16777216 + em in
+  let sig = (16777216 * 16777216) / denom in
+  mul_shr xq sig 24
+
+-- ===== softmax (REUSED VERBATIM) =====
+pf_rowmax S base L j m = if j >= L then m else let v = arr_get S (base + j) in pf_rowmax S base L (j + 1) (if v > m then v else m)
+pf_exprow S E base L m j sum = if j >= L then sum else let e = bx4_fxexp ((arr_get S (base + j)) - m) in let _ = arr_set E (base + j) e in pf_exprow S E base L m (j + 1) (sum + e)
+pf_normrow E P base L sum j = if j >= L then P else let _ = arr_set P (base + j) (((arr_get E (base + j)) * 16777216) / sum) in pf_normrow E P base L sum (j + 1)
+pf_softmax_i S E P base L = let m = pf_rowmax S base L 1 (arr_get S base) in let sum = pf_exprow S E base L m 0 0 in pf_normrow E P base L sum 0
+pf_softmax S E P L i = if i >= L then P else let _ = pf_softmax_i S E P (i * L) L in pf_softmax S E P L (i + 1)
+
+-- ===== attention scores (REUSED VERBATIM) =====
+pf_neg_inf _ = 0 - (1000 * 16777216)
+pf_scores_j Qr qb Kr kb qdim kvdim S hd L scaleq i j acc =
+  if j >= L then 0
+  else
+    let masked = if j > i then 1 else 0 in
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_adot Qr (qb + i * qdim) Kr (kb + j * kvdim) hd acc 0 in
+    let raw = pf_rescale (arr_get acc 0) (arr_get acc 1) in
+    let sc = if masked == 1 then (pf_neg_inf 0) else ((raw * scaleq) / 16777216) in
+    let _ = arr_set S (i * L + j) sc in
+    pf_scores_j Qr qb Kr kb qdim kvdim S hd L scaleq i (j + 1) acc
+pf_scores_i Qr qb Kr kb qdim kvdim S hd L scaleq i acc =
+  if i >= L then S
+  else let _ = pf_scores_j Qr qb Kr kb qdim kvdim S hd L scaleq i 0 acc in
+       pf_scores_i Qr qb Kr kb qdim kvdim S hd L scaleq (i + 1) acc
+
+-- ===== context (REUSED VERBATIM) =====
+pf_ctx_col P V vb kvdim attn ab qdim hd L i col acc =
+  if col >= hd then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_pvdot P (i * L) V (vb + col) kvdim L acc 0 in
+    let _ = arr_set attn (ab + i * qdim + col) (pf_rescale (arr_get acc 0) (arr_get acc 1)) in
+    pf_ctx_col P V vb kvdim attn ab qdim hd L i (col + 1) acc
+pf_ctx_i P V vb kvdim attn ab qdim hd L i acc =
+  if i >= L then attn
+  else let _ = pf_ctx_col P V vb kvdim attn ab qdim hd L i 0 acc in pf_ctx_i P V vb kvdim attn ab qdim hd L (i + 1) acc
+
+-- ===== heads (REUSED VERBATIM) =====
+pf_head Qr Kr V attn S E P qdim kvdim hd L scaleq group h acc =
+  let kv = h / group in
+  let qb = h * hd in
+  let kb = kv * hd in
+  let _ = pf_scores_i Qr qb Kr kb qdim kvdim S hd L scaleq 0 acc in
+  let _ = pf_softmax S E P L 0 in
+  pf_ctx_i P V kb kvdim attn (h * hd) qdim hd L 0 acc
+pf_heads Qr Kr V attn S E P qdim kvdim hd L scaleq nh group h acc =
+  if h >= nh then attn
+  else let _ = pf_head Qr Kr V attn S E P qdim kvdim hd L scaleq group h acc in
+       pf_heads Qr Kr V attn S E P qdim kvdim hd L scaleq nh group (h + 1) acc
+
+-- ===== per-token RMSNorm + QKV projection (REUSED VERBATIM) =====
+pf_proj_tokens X xn Wq Wk Wv Q K V d L qdim kvdim gamma eps acc t =
+  if t >= L then 0
+  else
+    let rms = pf_rms X (t * d) d eps in
+    let _ = pf_normapply X (t * d) xn gamma d rms 0 in
+    let _ = pf_proj Wq xn 0 d Q (t * qdim) qdim acc 0 in
+    let _ = pf_proj Wk xn 0 d K (t * kvdim) kvdim acc 0 in
+    let _ = pf_proj Wv xn 0 d V (t * kvdim) kvdim acc 0 in
+    pf_proj_tokens X xn Wq Wk Wv Q K V d L qdim kvdim gamma eps acc (t + 1)
+
+-- ===== O projection + residual (REUSED VERBATIM) =====
+pf_addrow X Y d base c =
+  if c >= d then 0
+  else let _ = arr_set Y (base + c) ((arr_get X (base + c)) + (arr_get Y (base + c))) in pf_addrow X Y d base (c + 1)
+pf_resid X attn Wo Y d qdim L acc t =
+  if t >= L then Y
+  else
+    let _ = pf_proj Wo attn (t * qdim) qdim Y (t * d) d acc 0 in
+    let _ = pf_addrow X Y d (t * d) 0 in
+    pf_resid X attn Wo Y d qdim L acc (t + 1)
+
+-- ===== SiLU MLP block (REUSED VERBATIM) =====
+pf_silu_mul gate up gg hidden j =
+  if j >= hidden then gg
+  else let _ = arr_set gg j (((pf_silu (arr_get gate j)) * (arr_get up j)) / 16777216) in
+       pf_silu_mul gate up gg hidden (j + 1)
+pf_mlp_tokens Y hn Wg Wu Wd gate up gg M d L hidden gamma eps acc t =
+  if t >= L then 0
+  else
+    let rms = pf_rms Y (t * d) d eps in
+    let _ = pf_normapply Y (t * d) hn gamma d rms 0 in
+    let _ = pf_proj Wg hn 0 d gate 0 hidden acc 0 in
+    let _ = pf_proj Wu hn 0 d up 0 hidden acc 0 in
+    let _ = pf_silu_mul gate up gg hidden 0 in
+    let _ = pf_proj Wd gg 0 hidden M (t * d) d acc 0 in
+    pf_mlp_tokens Y hn Wg Wu Wd gate up gg M d L hidden gamma eps acc (t + 1)
+pf_add_resid Y M d L t = if t >= L then Y else let _ = pf_addrow M Y d (t * d) 0 in pf_add_resid Y M d L (t + 1)
+
+-- ===== embed (REUSED VERBATIM, full vocab) =====
+pf_embed_row Emb id X xbase d c = if c >= d then 0 else let _ = arr_set X (xbase + c) (arr_get Emb (id * d + c)) in pf_embed_row Emb id X xbase d (c + 1)
+pf_embed_g Emb ids X d L t =
+  if t >= L then X
+  else let id = arr_get ids t in
+       let _ = pf_embed_row Emb id X (t * d) d 0 in
+       pf_embed_g Emb ids X d L (t + 1)
+
+-- ===== final RMSNorm + tied LM head (REUSED VERBATIM, full vocab) =====
+pf_lmhead xn Emb vocab d out acc v =
+  if v >= vocab then out
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_adot Emb (v * d) xn 0 d acc 0 in
+    let _ = arr_set out v (pf_rescale (arr_get acc 0) (arr_get acc 1)) in
+    pf_lmhead xn Emb vocab d out acc (v + 1)
+
+pf_argmax out n i bi bv = if i >= n then bi else let v = arr_get out i in if v > bv then pf_argmax out n (i + 1) i v else pf_argmax out n (i + 1) bi bv
+pf_eqcount A B n i bad = if i >= n then bad else pf_eqcount A B n (i + 1) (if (arr_get A i) == (arr_get B i) then bad else bad + 1)
+
+-- ===== copy hidden buffer src[0..L*d) -> dst[0..L*d) (so it survives arena_reset of the layer scratch) =====
+pf_copy src dst n i = if i >= n then dst else let _ = arr_set dst i (arr_get src i) in pf_copy src dst n (i + 1)
+
+-- ===== ONE transformer layer over hidden H (L x d). Reads weights on-the-fly. Returns NEW hidden array. =====
+-- Layer scratch (weights + Q/K/V/attn/...) lives between arena_mark/arena_reset in pf_layers, so we
+-- must copy the block output into a persistent buffer BEFORE the caller resets. We return Yf here
+-- (allocated inside the scratch); the caller copies it out and resets.
+pf_layer buf hdrhi base H li d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc =
+  let g_in   = ld_tensor buf hdrhi base (ld_lname li "input_layernorm.weight") d in
+  let Wq     = ld_tensor buf hdrhi base (ld_lname li "self_attn.q_proj.weight") (qdim * d) in
+  let Wk     = ld_tensor buf hdrhi base (ld_lname li "self_attn.k_proj.weight") (kvdim * d) in
+  let Wv     = ld_tensor buf hdrhi base (ld_lname li "self_attn.v_proj.weight") (kvdim * d) in
+  let Wo     = ld_tensor buf hdrhi base (ld_lname li "self_attn.o_proj.weight") (d * qdim) in
+  let g_post = ld_tensor buf hdrhi base (ld_lname li "post_attention_layernorm.weight") d in
+  let Wg     = ld_tensor buf hdrhi base (ld_lname li "mlp.gate_proj.weight") (inter * d) in
+  let Wu     = ld_tensor buf hdrhi base (ld_lname li "mlp.up_proj.weight") (inter * d) in
+  let Wd     = ld_tensor buf hdrhi base (ld_lname li "mlp.down_proj.weight") (d * inter) in
+  -- attention
+  let xn = arr_new d 0 in
+  let Q = arr_new (L * qdim) 0 in
+  let K = arr_new (L * kvdim) 0 in
+  let V = arr_new (L * kvdim) 0 in
+  let _ = pf_proj_tokens H xn Wq Wk Wv Q K V d L qdim kvdim g_in eps acc 0 in
+  let Qr = pf_rope_heads Q (arr_new (L * qdim) 0) L nh hd qdim lnb 0 0 in
+  let Kr = pf_rope_heads K (arr_new (L * kvdim) 0) L nkv hd kvdim lnb 0 0 in
+  let attn = arr_new (L * qdim) 0 in
+  let S = arr_new (L * L) 0 in
+  let E = arr_new (L * L) 0 in
+  let P = arr_new (L * L) 0 in
+  let _ = pf_heads Qr Kr V attn S E P qdim kvdim hd L scaleq nh group 0 acc in
+  let Y = pf_resid H attn Wo (arr_new (L * d) 0) d qdim L acc 0 in
+  -- MLP
+  let hn = arr_new d 0 in
+  let gate = arr_new inter 0 in
+  let up = arr_new inter 0 in
+  let gg = arr_new inter 0 in
+  let M = arr_new (L * d) 0 in
+  let _ = pf_mlp_tokens Y hn Wg Wu Wd gate up gg M d L inter g_post eps acc 0 in
+  pf_add_resid Y M d L 0
+
+-- ===== read prompt ids (whitespace-separated ints) from prompt_ids.txt =====
+ids_skip_ws buf pos hi = if pos >= hi then pos else let c = byte_at buf pos in if c == 32 then ids_skip_ws buf (pos + 1) hi else if c == 10 then ids_skip_ws buf (pos + 1) hi else if c == 9 then ids_skip_ws buf (pos + 1) hi else if c == 13 then ids_skip_ws buf (pos + 1) hi else pos
+ids_is_digit c = if c < 48 then 0 else if c > 57 then 0 else 1
+ids_digits buf pos hi acc = if pos >= hi then acc else let c = byte_at buf pos in if ids_is_digit c == 1 then ids_digits buf (pos + 1) hi (acc * 10 + (c - 48)) else acc
+ids_digits_end buf pos hi = if pos >= hi then pos else let c = byte_at buf pos in if ids_is_digit c == 1 then ids_digits_end buf (pos + 1) hi else pos
+-- count how many ints are in the buffer
+ids_count buf pos hi acc =
+  let p = ids_skip_ws buf pos hi in
+  if p >= hi then acc
+  else let c = byte_at buf p in
+       if ids_is_digit c == 1 then (let e = ids_digits_end buf p hi in ids_count buf e hi (acc + 1))
+       else acc
+ids_fill buf pos hi out i =
+  let p = ids_skip_ws buf pos hi in
+  if p >= hi then out
+  else let c = byte_at buf p in
+       if ids_is_digit c == 1 then
+         (let v = ids_digits buf p hi 0 in let e = ids_digits_end buf p hi in let _ = arr_set out i v in ids_fill buf e hi out (i + 1))
+       else out
+
+-- ===== dump logits (chunked to avoid a giant string build) =====
+pf_dump_chunk out base n i acc = if i >= n then acc else pf_dump_chunk out base n (i + 1) (cat [acc, show (arr_get out (base + i)), "\n"])
+pf_dump_file path out n chunk done =
+  if done >= n then 0
+  else
+    let m = arena_mark 0 in
+    let k = if (done + chunk) > n then (n - done) else chunk in
+    let s = pf_dump_chunk out done k 0 "" in
+    let _ = append_line path s in
+    let _ = arena_reset m in
+    pf_dump_file path out n chunk (done + k)
+
+-- diagnostic: sum of abs of an array slice
+pf_absum A base n i acc = if i >= n then acc else let v = arr_get A (base + i) in pf_absum A base n (i + 1) (acc + (if v < 0 then 0 - v else v))
