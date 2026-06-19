@@ -2,6 +2,56 @@
 
 All notable changes to Rail are documented here.
 
+## v5.2.0 — 2026-06-19 — Rail stands alone (no as/ld/codesign)
+
+Major milestone.  The compiler now assembles, links, and code-signs
+**itself** — in-process, in pure Rail — with no Apple `as`, `ld`, or
+`codesign` anywhere in the build.  v5.0.0 removed `as`/`ld` from the
+*Linux ELF* path; v5.2.0 closes the loop on the macOS host platform,
+including the ad-hoc signature arm64 requires, and extends it to FFI
+programs.  The last external tool in Rail's build is gone.
+
+Because Rail now owns every byte of the output — including the
+`LC_UUID` and section padding that `ld` randomizes — the self-compile
+is **deterministic and bit-reproducible**: the committed seed
+reproduces itself byte-for-byte (sha256 `b02dd228…`) in a single
+cycle.  That upgrades attestation from tamper-evident to
+source-reproducible.
+
+### The Rail toolchain
+
+- **Pure-Rail AArch64 assembler** (`tools/v5/asm.rail`).  Two-pass,
+  ~45 mnemonics, whole-program `__text` layout with `.L` local labels,
+  inline string literals, and `.p2align` NOP-fill.  Differentially
+  gate-validated **1248/1248 instruction forms byte-identical to
+  `as`**, with the full compiler `__text` (651,184 bytes) byte-exact.
+- **Pure-Rail Mach-O linker** (`tools/v5/link_lib.rail`,
+  `link_macho.rail`).  Bakes `@PAGE`/`@PAGEOFF` relocations, builds the
+  `__data`/`__bss`/`__mod_init` image, emits the classic
+  `LC_DYLD_INFO` rebase + bind streams, stubs + `__got`, and the full
+  symtab/dysymtab/indirect-symtab — then ad-hoc signs it
+  (`stdlib/codesign.rail`, N-page signer).
+- **In-process by default.**  `self_compile` rail-links itself when
+  `RAIL_ARENA_MB ≥ 5000`; below that (or with `/tmp/.rail_force_as_ld`)
+  it falls back to the original `as`/`ld` path, byte-for-byte
+  unchanged.  The committed seed *is* the rail-linked binary.
+- **FFI stands alone too.**  Multi-dylib linking (a second
+  `LC_LOAD_DYLIB` + per-import dylib ordinal) links `libsqlite3` FFI
+  binaries with no `ld`.  `stdlib/sqlite.rail` gains prepared
+  statements (prepare/bind/step/column/finalize) and weak
+  auto-linking, zero-cost for binaries that don't use it.
+
+### Notes
+
+- **178/178 tests.**  CI verifies the byte-identical fixed point on
+  the `as`/`ld` fallback (the in-process rail-link peaks ~8.5 GB, over
+  the 7 GB CI runner); the rail-link reproduction is verified locally.
+- **Self-compile now needs an arena.**  The inlined linker enlarges
+  the compiler source, so prefix `./rail_native self` with
+  `RAIL_ARENA_MB=6000` (bare 1 GB thrashes).  See `CLAUDE.md`.
+- Compiler *behavior* is unchanged — same codegen, same external API.
+  This release is the build pipeline, not the language.
+
 ## v5.1.0 — 2026-05-15 — Rail emits its own GPU kernels
 
 Major release.  Rail now generates Metal Shading Language source from
