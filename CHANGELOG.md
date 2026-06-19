@@ -45,7 +45,14 @@ source-reproducible.
 
 - **178/178 tests.**  CI verifies the byte-identical fixed point on
   the `as`/`ld` fallback (the in-process rail-link peaks ~8.5 GB, over
-  the 7 GB CI runner); the rail-link reproduction is verified locally.
+  the 7 GB CI runner); the rail-link reproduction is verified on two
+  independent hosts (below).
+- **Reproducible across hosts (verified).**  The rail-link path emits
+  every byte itself — no host `as`, `ld`, or SDK — so the build is
+  host-independent: the seed compiled on an Apple M4 Pro (macOS 26.3)
+  and an M1 Ultra (macOS 26.4.1) is byte-identical (`b02dd228…`).
+  Reproducible attestation in the literal sense — rebuild it yourself
+  and check the hash.
 - **Self-compile now needs an arena.**  The inlined linker enlarges
   the compiler source, so prefix `./rail_native self` with
   `RAIL_ARENA_MB=6000` (bare 1 GB thrashes).  See `CLAUDE.md`.
