@@ -3,6 +3,12 @@
 -- Usage: ./rail_native test | ./rail_native self | ./rail_native <file.rail>
 -- Produces: /tmp/rail_out (native ARM64 binary on Apple Silicon)
 
+-- The pure-Rail Mach-O linker (lk_link_file), so self_compile can link the
+-- compiler IN-PROCESS with no as/ld/codesign when the arena is large enough
+-- (RAIL_ARENA_MB >= rail_link_min_mb). See self_compile / rail_use_link.
+import "tools/v5/link_lib.rail"
+foreign getenv name -> str
+
 digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
 alpha_lower = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"]
 alpha_upper = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
@@ -5779,7 +5785,12 @@ build prefix asm_text =
     let quartz_lib = if has_quartz_lib == "1" then " -L tools/desk -weak-lquartz_bridge -framework CoreGraphics -framework Foundation -framework AppKit -framework ApplicationServices" else ""
     let has_concurrent_lib = ensure_fresh_dylib "tools/runtime/concurrent.c" "tools/runtime/libconcurrent.dylib" "tools/runtime/build_concurrent.sh"
     let concurrent_lib = if has_concurrent_lib == "1" then " -L tools/runtime -weak-lconcurrent" else ""
-    let ld_cmd = cat ["ld -o ", prefix, " ", tmp, ".o", rt_objs, gpu_lib, jit_lib, quartz_lib, concurrent_lib, " -lSystem -syslibroot ", sdk, " -arch arm64 -stack_size 0x10000000 2>&1"]
+    -- libsqlite3 is a macOS system dylib (always present); weak-link it so
+    -- stdlib/sqlite.rail's foreign decls (sqlite3_open/prepare/step/column/...)
+    -- resolve at link time, with zero cost for binaries that don't use it (same
+    -- -weak-l pattern as the optional dylibs above). 2026-06-17: enables the
+    -- Rail-native grounding oracle (PAOS Stage 3).
+    let ld_cmd = cat ["ld -o ", prefix, " ", tmp, ".o", rt_objs, gpu_lib, jit_lib, quartz_lib, concurrent_lib, " -weak-lsqlite3 -lSystem -syslibroot ", sdk, " -arch arm64 -stack_size 0x10000000 2>&1"]
     let ld_result = strip_trailing_ws (shell ld_cmd)
     let _ = if ld_result != "" then print (cat ["  ld: ", ld_result]) else print "  ld: OK"
     let _ = shell (cat ["codesign -s - ", prefix, " 2>&1"])
@@ -6291,6 +6302,37 @@ run_tests _ =
   let _ = print (cat [show total, "/178 tests passed"])
   if total == 178 then 0 else 1
 
+-- ===========================================================================
+-- M6 — self-hosted emit path. Replaces as/ld/codesign with the pure-Rail
+-- linker tools/v5/link_macho.rail (pre-built once to /tmp/v5_linker). Opt-in
+-- via the /tmp/.rail_use_rail_linker sentinel so the default as/ld path stays
+-- byte-for-byte untouched until the rail-linked compiler is proven to bootstrap
+-- to a fixed point. The compiler's own .s imports exactly the 8 libSystem
+-- functions link_macho.rail binds, so this path is scoped to self-compilation;
+-- arbitrary-FFI programs (sqlite oracle, GPU, ...) still use build_native+as/ld.
+-- ===========================================================================
+-- rail-link is the DEFAULT self-compile path (in-process lk_link_file, no
+-- as/ld/codesign) whenever the arena is large enough to hold the in-process
+-- link (RAIL_ARENA_MB >= rail_link_min_mb). A bare self-compile (1GB default
+-- arena) falls back to as/ld so the committed seed stays reproducible and CI
+-- stays light; /tmp/.rail_force_as_ld forces as/ld regardless. NOT a global
+-- arena bump (would balloon long-running services); the build sets the env.
+rail_link_min_mb = 5000
+rail_link_arena_mb _ = str_to_int (getenv "RAIL_ARENA_MB")
+rail_force_as_ld _ =
+  (trim (shell "test -f /tmp/.rail_force_as_ld && echo 1 || echo 0")) == "1"
+rail_use_link _ =
+  if rail_force_as_ld 0 then false
+  else (rail_link_arena_mb 0) >= rail_link_min_mb
+
+-- Link `src_s` (a .s path) into a signed Mach-O at `prefix` IN-PROCESS, Rail
+-- only. lk_link_file writes /tmp/v5_rail (ad-hoc sig embedded in the bytes);
+-- cp to prefix. Returns the file size.
+link_rail_inproc prefix src_s =
+  let sz = lk_link_file src_s "/tmp/v5_rail"
+  let _ = shell (cat ["cp /tmp/v5_rail ", prefix, " && chmod +x ", prefix, " 2>&1"])
+  sz
+
 self_compile _ =
   let _ = print "\n=== Self-compilation ==="
   let self_src = read_file "tools/compile.rail"
@@ -6298,15 +6340,21 @@ self_compile _ =
   let self_asm = compile_program self_src
   let _ = write_file "/tmp/rail_self.s" self_asm
   let _ = print "  Compiled to assembly"
-  let sdk = trim (shell "xcrun --show-sdk-path")
-  let as_res = strip_trailing_ws (shell "as -o /tmp/rail_self.o /tmp/rail_self.s 2>&1")
-  let _ = if as_res != "" then print (cat ["  as: ", as_res]) else print "  as: OK"
-  let rtdir2 = get_runtime_dir 0
-  let ld_res = strip_trailing_ws (shell (cat ["ld -o /tmp/rail_self /tmp/rail_self.o -lSystem -syslibroot ", sdk, " -arch arm64 -stack_size 0x10000000 2>&1"]))
-  let _ = if ld_res != "" then print (cat ["  ld: ", ld_res]) else print "  ld: OK"
-  let _ = shell "codesign -s - /tmp/rail_self 2>&1"
-  let _ = print "  Binary: /tmp/rail_self"
-  0
+  if rail_use_link 0 then
+    let _ = print (cat ["  [rail-link] in-process self-hosted linker (no as/ld/codesign), arena=", show (rail_link_arena_mb 0), "MB"])
+    let _ = link_rail_inproc "/tmp/rail_self" "/tmp/rail_self.s"
+    let _ = print "  Binary: /tmp/rail_self"
+    0
+  else
+    let sdk = trim (shell "xcrun --show-sdk-path")
+    let as_res = strip_trailing_ws (shell "as -o /tmp/rail_self.o /tmp/rail_self.s 2>&1")
+    let _ = if as_res != "" then print (cat ["  as: ", as_res]) else print "  as: OK"
+    let rtdir2 = get_runtime_dir 0
+    let ld_res = strip_trailing_ws (shell (cat ["ld -o /tmp/rail_self /tmp/rail_self.o -lSystem -syslibroot ", sdk, " -arch arm64 -stack_size 0x10000000 2>&1"]))
+    let _ = if ld_res != "" then print (cat ["  ld: ", ld_res]) else print "  ld: OK"
+    let _ = shell "codesign -s - /tmp/rail_self 2>&1"
+    let _ = print "  Binary: /tmp/rail_self"
+    0
 
 join_args lst n =
   if n > 0 then

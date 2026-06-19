@@ -1,11 +1,22 @@
 -- stdlib/sqlite.rail — SQLite3 via FFI
 -- Import: import "stdlib/sqlite.rail"
--- NOTE: Requires manual ld flag: --link "-lsqlite3" (not yet implemented)
--- For now, add -lsqlite3 to the ld command manually
+-- LINKING: libsqlite3 is weak-linked automatically by compile.rail's ld step
+-- (a macOS system dylib, always present) — no manual flag needed since
+-- 2026-06-17. Just `import "stdlib/sqlite.rail"` and the foreign symbols
+-- resolve. Verified: sqlite3_open on a real DB returns rc=0.
 
 foreign sqlite3_open path db_ptr -> int
 foreign sqlite3_exec db sql callback ctx errmsg -> int
 foreign sqlite3_close db -> int
+
+-- malloc/free for handle out-params and bind buffers. Declared here (with
+-- `-> ptr`) so sqlite.rail is self-contained: without a typed decl, Rail treats
+-- malloc's return as a tagged int and mis-shifts the pointer, corrupting every
+-- db/stmt handle (a NULL-ish handle silently fails all queries). byte_set/byte_at
+-- are builtins. NOTE: do NOT import this module alongside stdlib/socket.rail,
+-- which also declares malloc/free (duplicate foreign decl).
+foreign malloc size -> ptr
+foreign free p -> int
 
 -- Return codes
 sqlite_ok = 0
@@ -21,3 +32,75 @@ exec db sql = sqlite3_exec db sql 0 0 0
 
 -- Close database
 close_db db = sqlite3_close db
+
+-- ── Prepared statements (added 2026-06-17, validated against a live SQLite DB) ─
+-- Handles (db, stmt) come back through 8-byte out-param buffers; Rail has no
+-- peek_ptr, so sq_handle reassembles the pointer via byte_at. macOS heap ptrs
+-- are < 2^47, so bytes 6-7 are 0 and there is no 63-bit tagged-int overflow.
+-- Foreign int args are passed by value (untagged), so the reassembled handle
+-- round-trips correctly into prepare/bind/step/column.
+--
+-- CAVEAT: `foreign sqlite3_column_double ... -> float` SEGFAULTS — Rail's
+-- float-RETURN FFI mishandles a foreign whose args are non-float. Read numeric
+-- results as INT instead: for an average, SELECT SUM + COUNT (two column_int
+-- reads) and do exact rational arithmetic in Rail, or CAST(ROUND(x*scale) AS
+-- INTEGER). Bonus: integer/rational math is MORE byte-equal than float64 (no
+-- rounding divergence) — the right call for an attested oracle anyway.
+foreign sqlite3_prepare_v2 db sql nbyte stmt_ptr tail -> int
+foreign sqlite3_bind_text stmt idx txt nbyte destructor -> int
+foreign sqlite3_step stmt -> int
+foreign sqlite3_column_int stmt col -> int
+foreign sqlite3_column_type stmt col -> int
+foreign sqlite3_finalize stmt -> int
+
+sqlite_row = 100
+sqlite_null_type = 5
+
+-- Reassemble an 8-byte little-endian handle from a malloc'd out-param buffer.
+sq_handle buf = (byte_at buf 0) + (byte_at buf 1) * 256 + (byte_at buf 2) * 65536 + (byte_at buf 3) * 16777216 + (byte_at buf 4) * 4294967296 + (byte_at buf 5) * 1099511627776 + (byte_at buf 6) * 281474976710656
+
+-- Open a DB; returns the db handle, or 0 on failure. path is copied to a C
+-- buffer (sq_strdup) because a runtime-built path string (e.g. from argv or cat)
+-- passed straight to the foreign sqlite3_open is the heap-object pointer, not the
+-- char data — sqlite would open a garbage filename (silently creating an EMPTY db
+-- whose every query returns 0 rows). Literals happen to pass cleanly, masking it.
+sq_open path =
+  let cpath = sq_strdup path
+  let p = malloc 8
+  let rc = sqlite3_open cpath p
+  let h = if rc == 0 then sq_handle p else 0
+  let _ = free cpath
+  let _ = free p
+  h
+
+-- Prepare a statement on db; returns the stmt handle, or 0 on failure. sql is
+-- copied to a C buffer for the same reason as sq_open (robust for runtime SQL).
+sq_prepare db sql =
+  let csql = sq_strdup sql
+  let p = malloc 8
+  let rc = sqlite3_prepare_v2 db csql (0 - 1) p 0
+  let h = if rc == 0 then sq_handle p else 0
+  let _ = free csql
+  let _ = free p
+  h
+
+-- Copy a Rail string into a fresh malloc'd, NUL-terminated C buffer and return
+-- the raw pointer. Needed because Rail passes a runtime-built string (from
+-- str_sub/str_replace/cat) to a foreign char* arg as its HEAP-OBJECT pointer, not
+-- the raw byte data — so sqlite reads the object header as text and the bind
+-- matches nothing. A malloc'd buffer (raw `-> ptr`) marshals correctly. String
+-- LITERALS happen to pass as a clean .asciz pointer, which masked this for an
+-- hour on 2026-06-17 (recon worked with literal db-times, returned 0 with
+-- reconstructed ones).
+sq_strdup s = sq_strdup_into s (malloc ((length (chars s)) + 1)) 0 (length (chars s))
+sq_strdup_into buf_s buf i n =
+  if i >= n then (let _ = byte_set buf i 0 in buf)
+  else let _ = byte_set buf i (char_to_int (str_sub buf_s i 1)) in sq_strdup_into buf_s buf (i + 1) n
+
+-- Bind a 1-indexed text param. nbyte = explicit byte length; destructor -1 =
+-- SQLITE_TRANSIENT so sqlite copies the bytes immediately (safe to free after).
+sq_bind st idx s =
+  let buf = sq_strdup s
+  let rc = sqlite3_bind_text st idx buf (length (chars s)) (0 - 1)
+  let _ = free buf
+  rc
