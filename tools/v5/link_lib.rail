@@ -176,8 +176,20 @@ lk_align4 n = ((n + 3) / 4) * 4
 --    got_vmaddr got_foff modinit_vmaddr modinit_foff datac_seg_fsz
 --    data_vmaddr data_foff bss_vmaddr data_seg_fsz data_seg_vmsz
 --    linkedit_vmaddr linkedit_foff]
-lk_layout text_size n_imp data_size bss_size modinit_size =
-  let text_foff = lk_lc_end
+-- Multi-dylib support: imports from libsqlite3 (sqlite3_*) bind to dylib ordinal
+-- 2 and need a 2nd LC_LOAD_DYLIB; everything else is libSystem (ordinal 1). nx =
+-- number of EXTRA dylibs beyond libSystem (0 for the compiler -> byte-identical).
+lk_sym_is_sqlite sym = (asm_starts sym "_sqlite3_") == 1
+lk_dylib_ord sym = if lk_sym_is_sqlite sym then 2 else 1
+lk_needs_sqlite imports =
+  if imports == [] then 0
+  else if lk_sym_is_sqlite (head imports) then 1
+  else lk_needs_sqlite (tail imports)
+-- LC end (= text_foff) given nx extra dylib load commands (each 56 bytes).
+lk_lc_end_n nx = lk_lc_end + (56 * nx)
+
+lk_layout text_size n_imp data_size bss_size modinit_size nx =
+  let text_foff = lk_lc_end_n nx
   let text_vmaddr = lk_text_vm_base + text_foff
   let stubs_foff = lk_align4 (text_foff + text_size)
   let stubs_vmaddr = lk_text_vm_base + stubs_foff
@@ -520,18 +532,27 @@ lk_str_bytes s = lk_strb_go (chars s)
 lk_strb_go cs = if cs == [] then [] else cons (char_to_int (head cs)) (lk_strb_go (tail cs))
 lk_put_cstr buf off s = lk_put_u8 buf (lk_put_bytes buf off (lk_str_bytes s)) 0
 lk_emit_bind buf off imports =
-  let o1 = lk_put_u8 buf off 17
+  let ord0 = lk_dylib_ord (head imports)
+  let o1 = lk_put_u8 buf off (16 + ord0)   -- 0x10 SET_DYLIB_ORDINAL_IMM | ord
   let o2 = lk_put_u8 buf o1 64
   let o3 = lk_put_cstr buf o2 (head imports)
   let o4 = lk_put_u8 buf o3 81
   let o5 = lk_put_u8 buf o4 114
   let o6 = lk_uleb buf o5 0
   let o7 = lk_put_u8 buf o6 144
-  let o8 = lk_bind_rest buf o7 (tail imports)
+  let o8 = lk_bind_rest buf o7 ord0 (tail imports)
   lk_put_u8 buf o8 0
-lk_bind_rest buf off imports =
+-- Re-emit SET_DYLIB_ORDINAL only when the dylib changes (dyld carries it forward),
+-- so an all-libSystem import set is byte-identical to the old single-ordinal stream.
+lk_bind_rest buf off prev_ord imports =
   if imports == [] then off
-  else lk_bind_rest buf (lk_put_u8 buf (lk_put_cstr buf (lk_put_u8 buf off 64) (head imports)) 144) (tail imports)
+  else
+    let ord = lk_dylib_ord (head imports)
+    let oa = if ord == prev_ord then off else lk_put_u8 buf off (16 + ord)
+    let ob = lk_put_u8 buf oa 64
+    let oc = lk_put_cstr buf ob (head imports)
+    let od = lk_put_u8 buf oc 144
+    lk_bind_rest buf od ord (tail imports)
 -- count DO_BIND (0x90) opcodes in [off,end) — validation.
 lk_count_byte buf off endoff target =
   if off >= endoff then 0
@@ -723,6 +744,18 @@ emit_load_dylib_ls buf off =
   let o7 = mw_cstr buf o6 "/usr/lib/libSystem.B.dylib"
   mw_zeros buf o7 (off + 56 - o7)
 
+-- LC_LOAD_DYLIB for libsqlite3 (ordinal 2), same 56-byte shape. compat 1.0.0
+-- (always satisfiable); current 380.0.0 to match the system dylib.
+emit_load_dylib_sqlite buf off =
+  let o1 = mw_u32 buf off 12
+  let o2 = mw_u32 buf o1 56
+  let o3 = mw_u32 buf o2 24
+  let o4 = mw_u32 buf o3 2
+  let o5 = mw_u32 buf o4 24903680
+  let o6 = mw_u32 buf o5 65536
+  let o7 = mw_cstr buf o6 "/usr/lib/libsqlite3.dylib"
+  mw_zeros buf o7 (off + 56 - o7)
+
 lk_copyn dst dst_off src src_off n =
   if n <= 0 then 0
   else
@@ -730,11 +763,11 @@ lk_copyn dst dst_off src src_off n =
     lk_copyn dst (dst_off + 1) src (src_off + 1) (n - 1)
 
 -- all 14 load commands, offsets/addresses from the M1 layout (lay) + LINKEDIT layout (le).
-lk_emit_all_lc buf lay le imports n_imp text_size modinit_size data_size bss_size main_vaddr =
+lk_emit_all_lc buf lay le imports n_imp text_size modinit_size data_size bss_size main_vaddr nx =
   let le_foff = lk_nth lay 16
   let le_fsz = (lk_nth le 12) - le_foff
   let entryoff = main_vaddr - lk_text_vm_base
-  let p0 = emit_mach_header buf 0 14 1176 mh_flags_pie_exec
+  let p0 = emit_mach_header buf 0 (14 + nx) (1176 + (56 * nx)) mh_flags_pie_exec
   let p1 = emit_segment_64_nosects buf p0 "__PAGEZERO" 0 4294967296 0 0 0 0
   let p2 = lk_emit_seg_text buf p1 lay text_size n_imp
   let p3 = lk_emit_seg_datac buf p2 lay n_imp modinit_size
@@ -748,7 +781,8 @@ lk_emit_all_lc buf lay le imports n_imp text_size modinit_size data_size bss_siz
   let p11 = emit_build_version buf p10 1703936 1703936
   let p12 = emit_main buf p11 entryoff 0
   let p13 = emit_load_dylib_ls buf p12
-  emit_code_signature_lc buf p13 (lk_nth le 10) (lk_nth le 11)
+  let p14 = if nx > 0 then emit_load_dylib_sqlite buf p13 else p13
+  emit_code_signature_lc buf p14 (lk_nth le 10) (lk_nth le 11)
 
 -- Link a compiler .s (already on disk at src_path) into a complete signed,
 -- runnable Mach-O at out_path with NO as/ld/codesign. Returns the file size.
@@ -780,7 +814,8 @@ lk_link_file src_path out_path =
   let relocs = asm_relocs_r records textlabels
   let imports = lk_dedup_syms relocs []
   let n_imp = length imports
-  let lay = lk_layout text_size n_imp dataoff bssoff modoff
+  let nx = lk_needs_sqlite imports
+  let lay = lk_layout text_size n_imp dataoff bssoff modoff nx
   -- text: assemble, bake @PAGE, patch import bl -> stubs
   let textbuf = asm_assemble_r records textlabels (text_size + 16)
   let _ = lk_bake_pass_r records textbuf 0 1 syms textlabels lay 0
@@ -801,7 +836,7 @@ lk_link_file src_path out_path =
   let main_vaddr = lk_resolve "_main" syms textlabels lay
   -- assemble the file
   let buf = arr_new file_size 0
-  let _ = lk_emit_all_lc buf lay le imports n_imp text_size modoff dataoff bssoff main_vaddr
+  let _ = lk_emit_all_lc buf lay le imports n_imp text_size modoff dataoff bssoff main_vaddr nx
   let _ = lk_copyn buf (lk_nth lay 1) textbuf 0 text_size
   let _ = lk_emit_stubs buf (lk_nth lay 3) (lk_nth lay 2) (lk_nth lay 5) n_imp
   let _ = lk_put_u64 buf (lk_nth lay 8) (lk_resolve "_rail_arena_init" syms textlabels lay)
