@@ -1,0 +1,203 @@
+-- pathb_stream.rail -- STREAMING SmolLM2-135M generation: the scalable "form base".
+--
+-- The weight-cached generator (pathb_generate) holds ALL layers' weights in anonymous memory -> for
+-- a big model macOS compresses the idle pages between slow matmuls and thrashes. This version streams:
+--   1. the blob is MMAP'd (stdlib/mmap.rail) -> file-backed, clean pages, evictable, scales past RAM;
+--   2. each layer's weights are decoded TRANSIENTLY (arena_mark/reset per layer) -> only ONE layer is
+--      resident at a time, so anonymous working set is bounded (~1 layer) REGARDLESS of model depth.
+-- Trade: re-decode per step (slower) for BOUNDED memory + no thrash + arbitrary model size. The
+-- embedding is cached (needed every step by the tied LM head); everything else streams.
+--
+-- This is the bit-exactness GATE for the streaming path: it must reproduce the attested artifact.
+-- Build: ./rail_native tools/railml/pathb/pathb_stream.rail
+-- Run:   RAIL_ARENA_MB=4096 /tmp/rail_out
+-- VERIFY: prefill logits@posL-1 sha == fe76eb50... (== attested forward) AND g[0]=260 (' the').
+
+import "tools/railml/pathb/pathb_lib.rail"
+import "stdlib/mmap.rail"
+import "stdlib/env.rail"
+
+ps_d _      = 576
+ps_nh _     = 9
+ps_nkv _    = 3
+ps_hd _     = 64
+ps_inter _  = 1536
+ps_vocab _  = 49152
+ps_nlayers _ = 30
+ps_eps _    = 168
+ps_lnb _    = 193154837
+ps_maxgen _ = 1
+
+ps_blob _ = let e = getenv "SMOLLM2_BLOB" in if e == "" then cat [getenv "HOME", "/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M/blobs/80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1"] else e
+
+-- ===== single-token KV-cache decode helpers (same logic as pathb_generate) =====
+ps_qkv xrow xn Wq Wk Wv Q K V d qdim kvdim gamma eps acc =
+  let rms = pf_rms xrow 0 d eps in
+  let _ = pf_normapply xrow 0 xn gamma d rms 0 in
+  let _ = pf_proj Wq xn 0 d Q 0 qdim acc 0 in
+  let _ = pf_proj Wk xn 0 d K 0 kvdim acc 0 in
+  let _ = pf_proj Wv xn 0 d V 0 kvdim acc 0 in
+  0
+ps_rope_one src out nheads hd pos lnb h =
+  if h >= nheads then out
+  else let b = h * hd in let _ = pf_rope src b out b hd pos lnb 0 in ps_rope_one src out nheads hd pos lnb (h + 1)
+ps_store src cache cbase kvdim i =
+  if i >= kvdim then 0 else let _ = arr_set cache (cbase + i) (arr_get src i) in ps_store src cache cbase kvdim (i + 1)
+ps_scores Qr qhb Kcache kbaseL kvdim hd scaleq npos S acc j =
+  if j >= npos then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_adot Qr qhb Kcache (kbaseL + j * kvdim) hd acc 0 in
+    let raw = pf_rescale (arr_get acc 0) (arr_get acc 1) in
+    let _ = arr_set S j ((raw * scaleq) / 16777216) in
+    ps_scores Qr qhb Kcache kbaseL kvdim hd scaleq npos S acc (j + 1)
+ps_ctx P Vcache vbaseL kvdim attn ab hd npos col acc =
+  if col >= hd then 0
+  else
+    let _ = arr_set acc 0 0 in
+    let _ = arr_set acc 1 0 in
+    let _ = pf_pvdot P 0 Vcache (vbaseL + col) kvdim npos acc 0 in
+    let _ = arr_set attn (ab + col) (pf_rescale (arr_get acc 0) (arr_get acc 1)) in
+    ps_ctx P Vcache vbaseL kvdim attn ab hd npos (col + 1)
+ps_head Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq group npos h acc =
+  let kv = h / group in
+  let qhb = h * hd in
+  let hb = layerbase + kv * hd in
+  let _ = ps_scores Qr qhb Kcache hb kvdim hd scaleq npos S acc 0 in
+  let _ = pf_softmax_i S E P 0 npos in
+  ps_ctx P Vcache hb kvdim attn (h * hd) hd npos 0 acc
+ps_heads Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq nh group npos h acc =
+  if h >= nh then attn
+  else let _ = ps_head Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq group npos h acc in
+       ps_heads Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq nh group npos (h + 1) acc
+
+-- ===== STREAMING layer: decode the 9 weights from the (mmap'd) blob on the fly, transient =====
+ps_layer buf hdrhi base xrow li d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc =
+  let g_in   = ld_tensor buf hdrhi base (ld_lname li "input_layernorm.weight") d in
+  let Wq     = ld_tensor buf hdrhi base (ld_lname li "self_attn.q_proj.weight") (qdim * d) in
+  let Wk     = ld_tensor buf hdrhi base (ld_lname li "self_attn.k_proj.weight") (kvdim * d) in
+  let Wv     = ld_tensor buf hdrhi base (ld_lname li "self_attn.v_proj.weight") (kvdim * d) in
+  let Wo     = ld_tensor buf hdrhi base (ld_lname li "self_attn.o_proj.weight") (d * qdim) in
+  let g_post = ld_tensor buf hdrhi base (ld_lname li "post_attention_layernorm.weight") d in
+  let Wg     = ld_tensor buf hdrhi base (ld_lname li "mlp.gate_proj.weight") (inter * d) in
+  let Wu     = ld_tensor buf hdrhi base (ld_lname li "mlp.up_proj.weight") (inter * d) in
+  let Wd     = ld_tensor buf hdrhi base (ld_lname li "mlp.down_proj.weight") (d * inter) in
+  let xn = arr_new d 0 in
+  let Q = arr_new qdim 0 in
+  let K = arr_new kvdim 0 in
+  let V = arr_new kvdim 0 in
+  let _ = ps_qkv xrow xn Wq Wk Wv Q K V d qdim kvdim g_in eps acc in
+  let Qr = ps_rope_one Q (arr_new qdim 0) nh hd pos lnb 0 in
+  let Kr = ps_rope_one K (arr_new kvdim 0) nkv hd pos lnb 0 in
+  let layerbase = li * maxseq * kvdim in
+  let _ = ps_store Kr Kcache (layerbase + pos * kvdim) kvdim 0 in
+  let _ = ps_store V  Vcache (layerbase + pos * kvdim) kvdim 0 in
+  let npos = pos + 1 in
+  let attn = arr_new qdim 0 in
+  let S = arr_new maxseq 0 in
+  let E = arr_new maxseq 0 in
+  let P = arr_new maxseq 0 in
+  let _ = ps_heads Qr Kcache Vcache layerbase attn S E P kvdim hd scaleq nh group npos 0 acc in
+  let Y = arr_new d 0 in
+  let _ = pf_proj Wo attn 0 qdim Y 0 d acc 0 in
+  let _ = pf_addrow xrow Y d 0 0 in
+  let hn = arr_new d 0 in
+  let rms2 = pf_rms Y 0 d eps in
+  let _ = pf_normapply Y 0 hn g_post d rms2 0 in
+  let gate = arr_new inter 0 in
+  let up = arr_new inter 0 in
+  let gg = arr_new inter 0 in
+  let _ = pf_proj Wg hn 0 d gate 0 inter acc 0 in
+  let _ = pf_proj Wu hn 0 d up 0 inter acc 0 in
+  let _ = pf_silu_mul gate up gg inter 0 in
+  let M = arr_new d 0 in
+  let _ = pf_proj Wd gg 0 inter M 0 d acc 0 in
+  let _ = pf_addrow M Y d 0 0 in
+  Y
+
+-- per-layer arena_mark/reset => only ONE layer's weights resident at a time (bounded anon memory)
+ps_layers buf hdrhi base xrow li nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc =
+  if li >= nlayers then xrow
+  else
+    let m = arena_mark 0 in
+    let Y = ps_layer buf hdrhi base xrow li d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc in
+    let _ = pf_copy Y xrow d 0 in
+    let _ = arena_reset m in
+    ps_layers buf hdrhi base xrow (li + 1) nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc
+
+ps_step buf hdrhi base Emb gnorm tokid Kcache Vcache pos maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc =
+  let xrow = arr_new d 0 in
+  let _ = pf_embed_row Emb tokid xrow 0 d 0 in
+  let _ = ps_layers buf hdrhi base xrow 0 nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq Kcache Vcache pos maxseq acc in
+  let rms = pf_rms xrow 0 d eps in
+  let xnf = arr_new d 0 in
+  let _ = pf_normapply xrow 0 xnf gnorm d rms 0 in
+  let logits = arr_new vocab 0 in
+  let _ = pf_lmhead xnf Emb vocab d logits acc 0 in
+  logits
+
+ps_dump_verify logits vocab nlayers L am =
+  let path = "tools/railml/pathb/logits_stream_verify.txt" in
+  let _ = write_file path (cat ["PATHB-FORWARD-FULL-LOGITS v1 model=SmolLM2-135M layers=", show nlayers, " vocab=", show vocab, " F=24 scale=16777216 L=", show L, " argmax=", show am, "\n"]) in
+  pf_dump_file path logits vocab 4096 0
+
+ps_loop buf hdrhi base Emb gnorm ids L gbuf maxgen pos Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc =
+  if pos >= (L + maxgen - 1) then 0
+  else
+    let tok = if pos < L then (arr_get ids pos) else (arr_get gbuf (pos - L)) in
+    let m = arena_mark 0 in
+    let logits = ps_step buf hdrhi base Emb gnorm tok Kcache Vcache pos maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc in
+    let pred = pf_argmax logits vocab 1 0 (arr_get logits 0) in
+    let _ = if pos == (L - 1) then (let _ = ps_dump_verify logits vocab nlayers L pred in print "  [verify] dumped pos L-1 logits") else 0 in
+    let _ = if pos >= (L - 1) then arr_set gbuf (pos - (L - 1)) pred else 0 in
+    let _ = print (cat ["  ", (if pos < L then "prefill" else "gen"), " pos=", show pos, " -> next=", show pred]) in
+    let _ = arena_reset m in
+    ps_loop buf hdrhi base Emb gnorm ids L gbuf maxgen (pos + 1) Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc
+
+main =
+  let blob = ps_blob 0 in
+  let bsz = mmap_size blob in
+  if bsz < 10000000 then
+    let _ = print (cat ["pathb_stream: FATAL -- blob missing/too small (", show bsz, "): ", blob]) in 1
+  else
+  let d = ps_d 0 in
+  let nh = ps_nh 0 in
+  let nkv = ps_nkv 0 in
+  let hd = ps_hd 0 in
+  let inter = ps_inter 0 in
+  let nlayers = ps_nlayers 0 in
+  let vocab = ps_vocab 0 in
+  let eps = ps_eps 0 in
+  let lnb = ps_lnb 0 in
+  let maxgen = ps_maxgen 0 in
+  let qdim = nh * hd in
+  let kvdim = nkv * hd in
+  let group = nh / nkv in
+  let scaleq = bx4_fxrsqrt (hd * 16777216) in
+  let acc = arr_new 2 0 in
+  -- MMAP the blob: file-backed, clean, evictable, scales past RAM
+  let buf = mmap_open blob in
+  let hlen = pq_le_len buf 0 in
+  let base = 8 + hlen in
+  let hdrhi = base in
+  let L = 5 in
+  let ids = arr_new L 0 in
+  let _ = arr_set ids 0 504 in
+  let _ = arr_set ids 1 3575 in
+  let _ = arr_set ids 2 282 in
+  let _ = arr_set ids 3 4649 in
+  let _ = arr_set ids 4 314 in
+  let _ = print (cat ["pathb_stream: SmolLM2-135M MMAP+per-layer streaming  L=", show L, " maxgen=", show maxgen, " (bounded anon = 1 layer)"]) in
+  -- embedding cached (needed by tied LM head each step); layers stream
+  let Emb = ld_tensor buf hdrhi base "model.embed_tokens.weight" (vocab * d) in
+  let gnorm = ld_tensor buf hdrhi base "model.norm.weight" d in
+  let maxseq = L + maxgen in
+  let Kcache = arr_new (nlayers * maxseq * kvdim) 0 in
+  let Vcache = arr_new (nlayers * maxseq * kvdim) 0 in
+  let gbuf = arr_new (maxgen + 1) 0 in
+  let _ = ps_loop buf hdrhi base Emb gnorm ids L gbuf maxgen 0 Kcache Vcache maxseq d nh nkv hd inter qdim kvdim group eps lnb scaleq vocab nlayers acc in
+  let h = shell "shasum -a 256 tools/railml/pathb/logits_stream_verify.txt" in
+  let _ = print (cat ["  g[0]=", show (arr_get gbuf 0), " (expect 260 ' the')   prefill sha: ", h]) in
+  let _ = print "  EXPECT sha fe76eb50aa0440eeedac67fa1bd64df670a0a7141db89690db5dd3779186b08c  AND g[0]=260" in
+  0
