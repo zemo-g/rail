@@ -57,7 +57,14 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 
 ```bash
 ./rail_native test                    # run 141-test suite
-./rail_native self                    # self-compile → /tmp/rail_self (must be byte-identical)
+RAIL_ARENA_MB=6000 ./rail_native self # self-compile. The compiler now INLINES the pure-Rail
+                                      #   Mach-O linker (tools/v5/link_lib.rail), so self_compile
+                                      #   DEFAULTS to in-process rail-link (NO as/ld/codesign) when
+                                      #   RAIL_ARENA_MB>=5000, else falls back to as/ld. The inlined
+                                      #   source is bigger -> needs an arena (bare 1GB will thrash).
+                                      #   The committed rail_native seed IS this rail-linked binary;
+                                      #   it self-reproduces byte-identically (R1==R2 fixed point).
+                                      #   /tmp/.rail_force_as_ld forces the as/ld path.
 ./rail_native run file.rail           # compile + execute
 ./rail_native file.rail               # compile only → /tmp/rail_out
 ./rail_native x86 file.rail           # compile to x86_64 Linux → /tmp/rail_x86.s
@@ -139,11 +146,12 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 
 ### Modifying the Compiler
 
-After editing `tools/compile.rail`:
-1. `./rail_native self` — self-compile
+After editing `tools/compile.rail` (prefix every `self` with `RAIL_ARENA_MB=6000` — the
+inlined linker makes the compiler bigger; default rail-link path needs the arena):
+1. `RAIL_ARENA_MB=6000 ./rail_native self` — self-compile (in-process rail-link)
 2. `cp /tmp/rail_self rail_native` — install new binary
 3. `./rail_native test` — verify 141/141
-4. `./rail_native self && cmp rail_native /tmp/rail_self` — verify fixed point. **Needs ≥2 cycles**: gen0's shipped runtime asm doesn't necessarily match what gen0's source emits, so cycle 1 typically differs. Cycle 2 always lands the byte-identical fixed point (gen2 == gen3 == gen4). See `notes/bootstrap_convergence_audit_2026-05-13.md` for the empirical proof. Verify by running self twice after installing and `cmp`-ing the two outputs.
+4. `RAIL_ARENA_MB=6000 ./rail_native self && cmp rail_native /tmp/rail_self` — verify fixed point. **Needs ≥2 cycles**: gen0's shipped runtime asm doesn't necessarily match what gen0's source emits, so cycle 1 typically differs. Cycle 2 always lands the byte-identical fixed point (gen2 == gen3 == gen4). See `notes/bootstrap_convergence_audit_2026-05-13.md` for the empirical proof. Verify by running self twice after installing and `cmp`-ing the two outputs.
 
 **NOTE**: Self-compile works cleanly since the 256MB stack fix. No gen2_head bootstrap needed.
 
