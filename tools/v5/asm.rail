@@ -985,3 +985,117 @@ asm_textlen lines off in_text =
     else if kind == "label" then asm_textlen (tail lines) off 1
     else if kind == "skip" then asm_textlen (tail lines) off 1
     else asm_textlen (tail lines) (off + (asm_seg_size off kind line)) 1
+
+-- ============================================================================
+-- Parse-once line records. Every linker pass otherwise re-classifies (chars +
+-- reverse per line) and re-splits the mnemonic/ops of every instruction — 8
+-- full walks over ~158K lines. Measured (6GB arena, peak RSS == bytes alloc'd):
+-- 8x classify = 4.24GB, 1x assemble = 3.07GB; together == the ~6GB floor. We
+-- classify + split ONCE into a record and have all passes read the record.
+-- Record = [kind, mn, ops_str, raw]. For non-insn lines mn/ops are "".
+-- mn/ops are split EXACTLY as pass2/collect_relocs do (ltrim . strip_comment),
+-- so the cached values are byte-for-byte what those passes would recompute.
+-- ============================================================================
+asm_rec_kind r = head r
+asm_rec_mn   r = head (tail r)
+asm_rec_ops  r = head (tail (tail r))
+asm_rec_raw  r = head (tail (tail (tail r)))
+
+asm_make_record line =
+  let kind = asm_classify2 line
+  if kind == "insn" then asm_make_insn_record kind line
+  else cons kind (cons "" (cons "" (cons line [])))
+-- split out: a paren `(let x = f a\n bareexpr)` glues bareexpr onto f's args
+-- across the newline (see asm_emit_str note); a function-body newline-let is fine.
+asm_make_insn_record kind line =
+  let parts = asm_split_mn_ops (asm_ltrim (asm_strip_comment line))
+  cons kind (cons (head parts) (cons (head (tail parts)) (cons line [])))
+
+asm_build_records lines = asm_build_records_go lines []
+asm_build_records_go lines acc =
+  if lines == [] then reverse acc
+  else asm_build_records_go (tail lines) (cons (asm_make_record (head lines)) acc)
+
+-- pass1 over records: build the label map (no per-line classify/chars/reverse).
+asm_build_labels_r records =
+  let buckets = arr_new asm_nbuckets []
+  let _ = asm_pass1_r records 0 1 buckets
+  buckets
+asm_pass1_r records off in_text buckets =
+  if records == [] then buckets
+  else
+    let r = head records
+    let kind = asm_rec_kind r
+    if kind == "sec_text" then asm_pass1_r (tail records) off 1 buckets
+    else if kind == "sec_other" then asm_pass1_r (tail records) off 0 buckets
+    else if in_text == 0 then asm_pass1_r (tail records) off 0 buckets
+    else if kind == "skip" then asm_pass1_r (tail records) off 1 buckets
+    else if kind == "label" then
+      let _ = asm_insert buckets (asm_label_name (asm_ltrim (asm_rec_raw r))) off
+      asm_pass1_r (tail records) off 1 buckets
+    else
+      asm_pass1_r (tail records) (off + (asm_seg_size off kind (asm_rec_raw r))) 1 buckets
+
+-- __text image size over records.
+asm_textlen_r records off in_text =
+  if records == [] then off
+  else
+    let r = head records
+    let kind = asm_rec_kind r
+    if kind == "sec_text" then asm_textlen_r (tail records) off 1
+    else if kind == "sec_other" then asm_textlen_r (tail records) off 0
+    else if in_text == 0 then asm_textlen_r (tail records) off 0
+    else if kind == "label" then asm_textlen_r (tail records) off 1
+    else if kind == "skip" then asm_textlen_r (tail records) off 1
+    else asm_textlen_r (tail records) (off + (asm_seg_size off kind (asm_rec_raw r))) 1
+
+-- pass2 over records: emit bytes. Insn uses cached mn/ops (no re-split).
+asm_pass2_r records buf off in_text labels =
+  if records == [] then off
+  else
+    let r = head records
+    let kind = asm_rec_kind r
+    if kind == "sec_text" then asm_pass2_r (tail records) buf off 1 labels
+    else if kind == "sec_other" then asm_pass2_r (tail records) buf off 0 labels
+    else if in_text == 0 then asm_pass2_r (tail records) buf off 0 labels
+    else if kind == "skip" || kind == "label" then asm_pass2_r (tail records) buf off 1 labels
+    else if kind == "asciz" then
+      asm_pass2_r (tail records) buf (asm_emit_str buf off (asm_decode_str (asm_str_arg (asm_rec_raw r)) []) 1) 1 labels
+    else if kind == "ascii" then
+      asm_pass2_r (tail records) buf (asm_emit_str buf off (asm_decode_str (asm_str_arg (asm_rec_raw r)) []) 0) 1 labels
+    else if kind == "align" then
+      asm_pass2_r (tail records) buf (asm_pad buf off (asm_align_up off (asm_p2align_n (asm_ltrim (asm_rec_raw r))))) 1 labels
+    else
+      let word = asm_encode_insn (asm_rec_mn r) (asm_rec_ops r) off labels
+      let _ = cb_emit buf off word
+      asm_pass2_r (tail records) buf (off + 4) 1 labels
+
+-- external-bl reloc collection over records.
+asm_collect_relocs_r records off in_text labels acc =
+  if records == [] then reverse acc
+  else
+    let r = head records
+    let kind = asm_rec_kind r
+    if kind == "sec_text" then asm_collect_relocs_r (tail records) off 1 labels acc
+    else if kind == "sec_other" then asm_collect_relocs_r (tail records) off 0 labels acc
+    else if in_text == 0 then asm_collect_relocs_r (tail records) off 0 labels acc
+    else if kind == "skip" then asm_collect_relocs_r (tail records) off 1 labels acc
+    else if kind == "label" then asm_collect_relocs_r (tail records) off 1 labels acc
+    else if kind == "insn" then
+      (let mn = asm_rec_mn r
+       let sym = asm_rec_ops r
+       if (mn == "bl" || mn == "b") then
+         (if (asm_lookup sym labels) < 0 then
+            (if (asm_is_local_label sym) == 0 then asm_collect_relocs_r (tail records) (off + 4) 1 labels (cons (cons off (cons sym [])) acc)
+             else asm_collect_relocs_r (tail records) (off + 4) 1 labels acc)
+          else asm_collect_relocs_r (tail records) (off + 4) 1 labels acc)
+       else asm_collect_relocs_r (tail records) (off + 4) 1 labels acc)
+    else asm_collect_relocs_r (tail records) (off + (asm_seg_size off kind (asm_rec_raw r))) 1 labels acc
+
+-- record-taking public entries (parallel to the _l lines-taking ones).
+asm_assemble_r records labels capacity =
+  let buf = arr_new capacity 0
+  let _ = asm_pass2_r records buf 0 1 labels
+  buf
+asm_relocs_r records labels = asm_collect_relocs_r records 0 1 labels []
+asm_bytes_len_r records = asm_textlen_r records 0 1

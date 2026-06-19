@@ -93,6 +93,38 @@ lk_walk_zf line lines sec dataoff bssoff modoff syms =
   let base = asm_align_up bssoff algn
   lk_walk (tail lines) sec dataoff (base + size) modoff (cons (cons name (cons 2 (cons base []))) syms)
 
+-- Record-consuming lk_walk: fast-skip insn records (an instruction is always in
+-- __text, never switches section or adds data/bss/mod bytes, so skipping it is
+-- exactly equivalent); only the ~5K non-insn lines re-run lk_sec_of on raw.
+lk_walk_r records sec dataoff bssoff modoff syms =
+  if records == [] then cons dataoff (cons bssoff (cons modoff (cons syms [])))
+  else
+    let r = head records
+    if (asm_rec_kind r) == "insn" then lk_walk_r (tail records) sec dataoff bssoff modoff syms
+    else lk_walk_r_step r records sec dataoff bssoff modoff syms
+lk_walk_r_step r records sec dataoff bssoff modoff syms =
+  let line = asm_rec_raw r
+  let sw = lk_sec_of line
+  if sw >= 0 then lk_walk_r (tail records) sw dataoff bssoff modoff syms
+  else
+    let cs = asm_skip_ws (chars line)
+    if cs == [] then lk_walk_r (tail records) sec dataoff bssoff modoff syms
+    else if (asm_cprefix cs ".zerofill") == 1 then lk_walk_zf_r line records sec dataoff bssoff modoff syms
+    else if (asm_chars_end_colon cs) == 1 then
+      (if sec == 1 then lk_walk_r (tail records) sec dataoff bssoff modoff (cons (cons (asm_label_name (asm_ltrim line)) (cons 1 (cons dataoff []))) syms)
+       else lk_walk_r (tail records) sec dataoff bssoff modoff syms)
+    else
+      (if sec == 1 then lk_walk_r (tail records) sec (dataoff + (lk_data_dir_size dataoff line)) bssoff modoff syms
+       else if sec == 3 then lk_walk_r (tail records) sec dataoff bssoff (modoff + (lk_data_dir_size modoff line)) syms
+       else lk_walk_r (tail records) sec dataoff bssoff modoff syms)
+lk_walk_zf_r line records sec dataoff bssoff modoff syms =
+  let parts = lk_zerofill_parts line
+  let name = head (tail (tail parts))
+  let size = asm_imm (head (tail (tail (tail parts))))
+  let algn = asm_imm (head (tail (tail (tail (tail parts)))))
+  let base = asm_align_up bssoff algn
+  lk_walk_r (tail records) sec dataoff (base + size) modoff (cons (cons name (cons 2 (cons base []))) syms)
+
 -- ===========================================================================
 -- M1 validation main — print computed sizes + key data/bss symbol offsets,
 -- to diff against `nm -n` ground truth (data base = __text size).
@@ -271,6 +303,22 @@ lk_bake_pass lines buf off in_text datasyms textlabels lay nbad =
     else if kind == "align" then lk_bake_pass (tail lines) buf (off + (asm_seg_size off kind line)) 1 datasyms textlabels lay nbad
     else lk_bake_pass (tail lines) buf (off + 4) 1 datasyms textlabels lay (nbad + (lk_maybe_bake buf off line datasyms textlabels lay))
 
+-- record-consuming bake pass (raw line from the record; lk_maybe_bake early-outs
+-- on non-@PAGE lines so its internal split runs only on the few adrp/add/ldst).
+lk_bake_pass_r records buf off in_text datasyms textlabels lay nbad =
+  if records == [] then nbad
+  else
+    let r = head records
+    let kind = asm_rec_kind r
+    if kind == "sec_text" then lk_bake_pass_r (tail records) buf off 1 datasyms textlabels lay nbad
+    else if kind == "sec_other" then lk_bake_pass_r (tail records) buf off 0 datasyms textlabels lay nbad
+    else if in_text == 0 then lk_bake_pass_r (tail records) buf off 0 datasyms textlabels lay nbad
+    else if kind == "skip" then lk_bake_pass_r (tail records) buf off 1 datasyms textlabels lay nbad
+    else if kind == "label" then lk_bake_pass_r (tail records) buf off 1 datasyms textlabels lay nbad
+    else if (kind == "asciz") || (kind == "ascii") then lk_bake_pass_r (tail records) buf (off + (asm_seg_size off kind (asm_rec_raw r))) 1 datasyms textlabels lay nbad
+    else if kind == "align" then lk_bake_pass_r (tail records) buf (off + (asm_seg_size off kind (asm_rec_raw r))) 1 datasyms textlabels lay nbad
+    else lk_bake_pass_r (tail records) buf (off + 4) 1 datasyms textlabels lay (nbad + (lk_maybe_bake buf off (asm_rec_raw r) datasyms textlabels lay))
+
 -- ===========================================================================
 -- M3 — data image emission. Emit the __data bytes (resolving .quad/.long symbol
 -- pointers to absolute VM addresses + recording a rebase for each), the
@@ -334,6 +382,26 @@ lk_demit lines sec off databuf datasyms textlabels lay rebs =
       else
         let r = lk_demit_dir line off databuf datasyms textlabels lay rebs
         lk_demit (tail lines) sec (head r) databuf datasyms textlabels lay (head (tail r))
+
+-- record-consuming data emitter: fast-skip insn records (always __text, sec!=1).
+lk_demit_r records sec off databuf datasyms textlabels lay rebs =
+  if records == [] then reverse rebs
+  else
+    let rec = head records
+    if (asm_rec_kind rec) == "insn" then lk_demit_r (tail records) sec off databuf datasyms textlabels lay rebs
+    else lk_demit_r_step rec records sec off databuf datasyms textlabels lay rebs
+lk_demit_r_step rec records sec off databuf datasyms textlabels lay rebs =
+  let line = asm_rec_raw rec
+  let sw = lk_sec_of line
+  if sw >= 0 then lk_demit_r (tail records) sw off databuf datasyms textlabels lay rebs
+  else if sec != 1 then lk_demit_r (tail records) sec off databuf datasyms textlabels lay rebs
+  else
+    let cs = asm_skip_ws (chars line)
+    if cs == [] then lk_demit_r (tail records) sec off databuf datasyms textlabels lay rebs
+    else if (asm_chars_end_colon cs) == 1 then lk_demit_r (tail records) sec off databuf datasyms textlabels lay rebs
+    else
+      let r2 = lk_demit_dir line off databuf datasyms textlabels lay rebs
+      lk_demit_r (tail records) sec (head r2) databuf datasyms textlabels lay (head (tail r2))
 
 lk_demit_dir line off databuf datasyms textlabels lay rebs =
   let cs = asm_skip_ws (chars line)
@@ -688,24 +756,29 @@ main =
   -- `textlabels` and `relocs` through every pass (was: 5 re-splits of src, 4
   -- rebuilds of the label map, asm_relocs computed twice).
   let lines = asm_lines src
-  let textlabels = asm_build_labels lines
-  let st = lk_walk lines 0 0 0 0 []
+  -- Parse + classify + split each line ONCE into records [kind,mn,ops,raw]; every
+  -- pass below reads the records instead of re-classifying (was 7 full walks each
+  -- doing chars+reverse per line + re-splitting every instruction). Drops the
+  -- linker's arena floor (8x classify ~4.2GB of the ~6GB was redundant).
+  let records = asm_build_records lines
+  let textlabels = asm_build_labels_r records
+  let st = lk_walk_r records 0 0 0 0 []
   let dataoff = head st
   let bssoff = head (tail st)
   let modoff = head (tail (tail st))
   let syms = head (tail (tail (tail st)))
-  let text_size = asm_bytes_len_l lines
+  let text_size = asm_bytes_len_r records
   let lay = lk_layout text_size 8 dataoff bssoff modoff
-  let relocs = asm_relocs_l lines textlabels
+  let relocs = asm_relocs_r records textlabels
   let imports = lk_dedup_syms relocs []
   let n_imp = length imports
   -- text: assemble, bake @PAGE, patch import bl -> stubs
-  let textbuf = asm_assemble_l lines textlabels (text_size + 16)
-  let _ = lk_bake_pass lines textbuf 0 1 syms textlabels lay 0
+  let textbuf = asm_assemble_r records textlabels (text_size + 16)
+  let _ = lk_bake_pass_r records textbuf 0 1 syms textlabels lay 0
   let _ = lk_patch_imports textbuf relocs imports (lk_nth lay 0) (lk_nth lay 2)
   -- data image + rebases
   let databuf = arr_new (dataoff + 16) 0
-  let rebs = lk_demit lines 0 0 databuf syms textlabels lay []
+  let rebs = lk_demit_r records 0 0 databuf syms textlabels lay []
   -- rebase + bind streams (temp buffers give their sizes)
   let rbuf = arr_new 16384 0
   let rend = lk_emit_rebase rbuf 0 64 rebs
