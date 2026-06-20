@@ -34,13 +34,35 @@ bx4_isqrt_b n c d =
     else bx4_isqrt_a n (c / 2) (d / 4)
 bx4_isqrt n = if n < 1 then 0 else bx4_isqrt_a n 0 (bx4_topbit n 1)
 
--- NOTE: for xq >= ~2^38 `xq * 16777216` OVERFLOWS a 63-bit int (massive-activation RMS: meansq reaches
--- ~2^43 in both SmolLM2 and Qwen3). The overflow is benign for SmolLM2 greedy (it hits only late layers
--- and token 260 is robust -> the attested sha fe76eb50 absorbs it) but corrupts Qwen3 (hits L3 and
--- propagates -> argmax breaks). The bx4_topbit fix above stops the resulting INFINITE LOOP so the
--- forward at least TERMINATES; a correct overflow-safe sqrt (128-bit, like mul_shr gave the matmul)
--- is the real fix but changes SmolLM2's logits -> requires re-attesting the artifact. Tracked separately.
-bx4_fxsqrt xq = bx4_isqrt (xq * 16777216)
+-- Overflow-safe fixed-point sqrt: floor(sqrt(xq << 24)) with NO 63-bit overflow.
+-- The naive `bx4_isqrt (xq * 16777216)` overflows for xq >= ~2^38 (massive-activation RMS: meansq
+-- reaches ~2^43 in both SmolLM2 and Qwen3). Garbage was benign for SmolLM2 greedy (token 260 robust)
+-- but corrupts Qwen3 (overflow at L3 propagates -> argmax breaks). We never form xq*2^24; instead we
+-- binary-search the largest r with r*r <= xq*2^24, comparing 128-bit-EXACT via mul_shr:
+--   hr = (r*r) >> 24   [mul_shr = full 128-bit (smulh:mul)]; then r*r <= xq*2^24  iff
+--     hr < xq,  OR  (hr == xq AND (r*r) mod 2^24 == 0).
+-- (r*r) mod 2^24 = (c*c) mod 2^24 where c = r mod 2^24 (c*c < 2^48, no overflow). For every
+-- NON-overflowing xq this returns the SAME value as the old bx4_isqrt(xq*2^24), so all pre-existing
+-- attested artifacts stay byte-identical; only the previously-garbage overflow cases change.
+-- HI = 2^40: mul_shr(HI,HI,24)=2^56 (< 2^63 so the mul_shr result never overflows, and > any real
+-- meansq ~2^43 so P(HI)=false). Big consts are COMPUTED (a*a*4096), never bare literals >=32768.
+bx4_sqrt_le r xq =
+  let hr = mul_shr r r 24 in
+  if hr < xq then true
+  else if hr > xq then false
+  else
+    let c  = r - (r / 16777216) * 16777216 in
+    let cc = c * c in
+    (cc - (cc / 16777216) * 16777216) == 0
+bx4_bsqrt lo hi xq =
+  if (lo + 1) >= hi then lo
+  else
+    let mid = (lo + hi) / 2 in
+    if bx4_sqrt_le mid xq then bx4_bsqrt mid hi xq
+    else bx4_bsqrt lo mid xq
+bx4_fxsqrt xq =
+  if xq < 1 then 0
+  else let a = 16384 in bx4_bsqrt 0 ((a * a) * 4096) xq
 bx4_fxrsqrt xq = let q = bx4_fxsqrt xq in if q == 0 then 0 else 281474976710656 / q
 
 -- ================= fixed-point exp (arg-reduced, unrolled poly) =================
