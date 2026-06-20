@@ -16,7 +16,7 @@ Prompt `"The capital of France is"` (tokenized pure-Rail by `tok2`, ids
 | Property | Result |
 |---|---|
 | Scope | all 30 layers, full 49152 vocab, real BPE prompt |
-| Determinism | bit-reproducible across runs/processes/recompiles — `logits_full.txt` sha256 `fe76eb50…` |
+| Determinism | bit-reproducible across runs/processes/recompiles — `logits_full.txt` sha256 `d8a9f0c7…` |
 | **HF parity** | **argmax = token 260 `' the'` = HF fp32 greedy token** |
 | Attestation | Pi-witness (fleet0) Ed25519 signed, beacon-anchored, verified |
 | Foreign check | `pathb_foreign_check_full.py` on stock python3 (pure RFC-8032): exit 0 |
