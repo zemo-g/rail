@@ -40,18 +40,31 @@ qf_load fd hdrbuf hdrhi base name count sb =
   let _ = ld_decode sb 0 0 out count 0 in
   out
 
--- decode `count` BF16 elements from sb[0..] into out[obase..] (for chunked embedding load)
-qf_dec_off sb out obase count i =
-  if i >= count then 0
-  else let _ = arr_set out (obase + i) (pq_bf16_fixed (byte_at sb (2 * i)) (byte_at sb (2 * i + 1))) in qf_dec_off sb out obase count (i + 1)
--- cache the whole embedding (vocab x d) into Emb via chunked pread (sb holds `rowsper` rows at a time)
-qf_load_embed fd base estart Emb vocab d sb rowsper v =
-  if v >= vocab then 0
+-- decode one BF16 embedding row (token id) from the file into H[tb..] via a tiny pread (input embed)
+qf_dec_into rb H tb d i = if i >= d then 0 else let _ = arr_set H (tb + i) (pq_bf16_fixed (byte_at rb (2 * i)) (byte_at rb (2 * i + 1))) in qf_dec_into rb H tb d (i + 1)
+qf_embed_row fd base estart id H tb d rb =
+  let _ = file_pread fd rb (d * 2) (base + estart + id * d * 2) in
+  qf_dec_into rb H tb d 0
+-- STREAMED tied LM head: pread the embedding in vocab CHUNKS, decode each chunk to 8-byte (transient,
+-- arena-reset per chunk), idot each row with xnf, track argmax in best[]. NEVER holds the 1.24 GB
+-- table -> working set stays ~one chunk so the macOS compressor never engages; idot keeps it fast.
+qf_lm_argmax chunkEmb xnf d rows vbase best r =
+  if r >= rows then 0
   else
-    let rows = if (v + rowsper) > vocab then (vocab - v) else rowsper in
+    let lg = idot chunkEmb (r * d) xnf 0 d in
+    let _ = if lg > (arr_get best 1) then (let _ = arr_set best 0 (vbase + r) in arr_set best 1 lg) else 0 in
+    qf_lm_argmax chunkEmb xnf d rows vbase best (r + 1)
+qf_lmhead_stream fd base estart xnf d vocab chunk sb best v =
+  if v >= vocab then (arr_get best 0)
+  else
+    let rows = if (v + chunk) > vocab then (vocab - v) else chunk in
+    let m = arena_mark 0 in
     let _ = file_pread fd sb (rows * d * 2) (base + estart + v * d * 2) in
-    let _ = qf_dec_off sb Emb (v * d) (rows * d) 0 in
-    qf_load_embed fd base estart Emb vocab d sb rowsper (v + rowsper)
+    let chunkEmb = arr_new (rows * d) 0 in
+    let _ = ld_decode sb 0 0 chunkEmb (rows * d) 0 in
+    let _ = qf_lm_argmax chunkEmb xnf d rows v best 0 in
+    let _ = arena_reset m in
+    qf_lmhead_stream fd base estart xnf d vocab chunk sb best (v + chunk)
 
 -- QK-norm over full [L][nheads][hd] (in place), before RoPE
 qf_qn_apply vec b gamma hd rinv i =
@@ -64,7 +77,7 @@ qf_qk_full vec L stride nheads hd gamma eps t =
   if t >= L then 0 else let _ = qf_qk_tok vec (t * stride) nheads hd gamma eps 0 in qf_qk_full vec L stride nheads hd gamma eps (t + 1)
 
 -- one full-attention Qwen layer (weights pread-streamed once into transient 8-byte arrays)
-qf_layer fd hdrbuf hdrhi base sb H li d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc =
+qf_layer fd hdrbuf hdrhi base sb H li d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc cosT sinT =
   let g_in   = qf_load fd hdrbuf hdrhi base (ld_lname li "input_layernorm.weight") d sb in
   let Wq     = qf_load fd hdrbuf hdrhi base (ld_lname li "self_attn.q_proj.weight") (qdim * d) sb in
   let Wk     = qf_load fd hdrbuf hdrhi base (ld_lname li "self_attn.k_proj.weight") (kvdim * d) sb in
@@ -83,8 +96,8 @@ qf_layer fd hdrbuf hdrhi base sb H li d nh nkv hd inter qdim kvdim group eps lnb
   let _ = pf_proj_tokens H xn Wq Wk Wv Q K V d L qdim kvdim g_in eps acc 0 in
   let _ = qf_qk_full Q L qdim nh hd qnorm eps 0 in
   let _ = qf_qk_full K L kvdim nkv hd knorm eps 0 in
-  let Qr = pf_rope_heads Q (arr_new (L * qdim) 0) L nh hd qdim lnb 0 0 in
-  let Kr = pf_rope_heads K (arr_new (L * kvdim) 0) L nkv hd kvdim lnb 0 0 in
+  let Qr = pf_rope_heads_t Q (arr_new (L * qdim) 0) L nh hd qdim cosT sinT 0 0 in
+  let Kr = pf_rope_heads_t K (arr_new (L * kvdim) 0) L nkv hd kvdim cosT sinT 0 0 in
   let attn = arr_new (L * qdim) 0 in
   let S = arr_new (L * L) 0 in
   let E = arr_new (L * L) 0 in
@@ -99,14 +112,14 @@ qf_layer fd hdrbuf hdrhi base sb H li d nh nkv hd inter qdim kvdim group eps lnb
   let _ = pf_mlp_tokens Y hn Wg Wu Wd gate up gg M d L inter g_post eps acc 0 in
   pf_add_resid Y M d L 0
 
-qf_layers fd hdrbuf hdrhi base sb H li nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc =
+qf_layers fd hdrbuf hdrhi base sb H li nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc cosT sinT =
   if li >= nlayers then H
   else
     let m = arena_mark 0 in
-    let Yf = qf_layer fd hdrbuf hdrhi base sb H li d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc in
+    let Yf = qf_layer fd hdrbuf hdrhi base sb H li d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc cosT sinT in
     let _ = pf_copy Yf H (L * d) 0 in
     let _ = arena_reset m in
-    qf_layers fd hdrbuf hdrhi base sb H (li + 1) nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc
+    qf_layers fd hdrbuf hdrhi base sb H (li + 1) nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc cosT sinT
 
 main =
   let blob = qf_blob 0 in
@@ -142,23 +155,29 @@ main =
   let _ = arr_set ids 3 9625 in
   let _ = arr_set ids 4 374 in
   let _ = print (cat ["pathb_qwen_fast: Qwen3-0.6B pread-streamed forward  L=", show L]) in
-  -- cache the embedding once (chunked pread); tied LM head reads it pre-decoded (fast)
-  let _ = print "  caching embedding (151936 x 1024) via chunked pread..." in
-  let Emb = arr_new (vocab * d) 0 in
-  let _ = qf_load_embed fd base estart Emb vocab d sb 2048 0 in
+  -- input: pread the 5 prompt embedding rows (tiny); the 1.24 GB embedding table is NEVER cached
   let H = arr_new (L * d) 0 in
-  let _ = pf_embed_g Emb ids H d L 0 in
-  let _ = print "  embedded; pread-streaming 28 layers..." in
-  let _ = qf_layers fd hdrbuf hdrhi base sb H 0 nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc in
+  let rb = pack_alloc 512 in              -- one row = 1024*2 = 2048 bytes
+  let _ = qf_embed_row fd base estart 785 H 0 d rb in
+  let _ = qf_embed_row fd base estart 6722 H (1 * d) d rb in
+  let _ = qf_embed_row fd base estart 315 H (2 * d) d rb in
+  let _ = qf_embed_row fd base estart 9625 H (3 * d) d rb in
+  let _ = qf_embed_row fd base estart 374 H (4 * d) d rb in
+  -- precompute RoPE cos/sin tables ONCE (shared across all heads + all 28 layers)
+  let cosT = arr_new (L * (hd / 2)) 0 in
+  let sinT = arr_new (L * (hd / 2)) 0 in
+  let _ = pf_rope_build cosT sinT L hd lnb 0 0 in
+  let _ = print "  embedded; pread-streaming 28 layers (idot matmul + precomputed RoPE)..." in
+  let _ = qf_layers fd hdrbuf hdrhi base sb H 0 nlayers d nh nkv hd inter qdim kvdim group eps lnb scaleq L acc cosT sinT in
   let gnorm = qf_load fd hdrbuf hdrhi base "model.norm.weight" d sb in
   let last = L - 1 in
   let rms = pf_rms H (last * d) d eps in
   let xnf = arr_new d 0 in
   let _ = pf_normapply H (last * d) xnf gnorm d rms 0 in
-  let _ = print "  layers done; tied LM head (cached embed)..." in
-  let logits = arr_new vocab 0 in
-  let _ = pf_lmhead xnf Emb vocab d logits acc 0 in
-  let am = pf_argmax logits vocab 1 0 (arr_get logits 0) in
+  let _ = print "  layers done; streamed-idot LM head over 151936 vocab..." in
+  let best = arr_new 2 0 in
+  let _ = arr_set best 1 (0 - 1000000000000000) in
+  let am = qf_lmhead_stream fd base estart xnf d vocab 2048 sb best 0 in
   let _ = print (cat ["  argmax = ", show am, "   (HF greedy parity = 12095 ' Paris')"]) in
   let _ = print (cat ["  D2.2-fast parity (argmax==12095): ", if am == 12095 then "PASS" else "FAIL"]) in
   let _ = file_close fd in
