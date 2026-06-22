@@ -230,13 +230,13 @@ split " " "hello world"    -- returns ["hello", "world"]
 split "\n" "line1\nline2"  -- returns ["line1", "line2"]
 ```
 
-**Important**: `split` treats its first argument as a set of single-character delimiters, not a substring. Each character in the delimiter string is a separate split point:
+**Important**: `split` takes a *single-character* delimiter. If you pass a multi-character string, only the **first** character is used — it is not a set of delimiters, and not a substring:
 
 ```rail
-split "ab" "xaybz"    -- splits on "a" AND "b" -> ["x", "y", "z"]
+split "ab" "xaybz"    -- uses only "a" -> ["x", "ybz"]   ("b" is NOT a delimiter)
 ```
 
-This is the most common gotcha in Rail. For substring-based splitting, use `shell` with `sed` or `perl`.
+This is the most common gotcha in Rail. For multi-character (substring) delimiters, use `str_split`.
 
 ### `append` (strings)
 

@@ -95,7 +95,7 @@ range N                               -- [0..N-1]
 \a -> \b -> a + b                    -- nested lambdas work (flattened to multi-param)
 write_file path content, read_file path
 let _ = shell "command"
-join sep list, split "c" str          -- split is per-character, NOT substring
+join sep list, split "c" str          -- split: 1-char delimiter (first char if multiple), NOT substring
 str_split ", " str                    -- multi-char split
 str_find "needle" "haystack"          -- returns index or -1
 str_contains "needle" "haystack"      -- returns bool
