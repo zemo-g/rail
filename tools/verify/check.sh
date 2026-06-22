@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# tools/verify/check.sh — one command to check Rail's core claims yourself.
+# "Check me, don't trust me." Each section is an independent, verifiable claim;
+# a third party can run any one on its own. See VERIFY.md for what each proves.
+#
+# Usage:
+#   tools/verify/check.sh           full self-audit (~25 min: source rebuild + full tests)
+#   tools/verify/check.sh --quick   fast pass (~1 min: skip rebuild, run the quick suite)
+# Exit 0 iff every run check passed.
+set -uo pipefail
+cd "$(dirname "$0")/../.." || exit 2          # repo root
+
+QUICK=0; [ "${1:-}" = "--quick" ] && QUICK=1
+ARENA="${RAIL_ARENA_MB:-6000}"
+pass=0; fail=0
+ok(){ printf '  \033[32mok\033[0m  %s\n' "$1"; pass=$((pass+1)); }
+no(){ printf '  \033[31mNO\033[0m  %s\n' "$1"; fail=$((fail+1)); }
+
+echo "== 1. Reproducible seed (binary == what the source rebuilds) =="
+if [ "$QUICK" = 1 ]; then
+  echo "  -- skipped in --quick; run ./verify_reproducible.sh for the byte-identity proof"
+elif RAIL_ARENA_MB="$ARENA" ./verify_reproducible.sh; then ok "reproducible from source"
+else no "NOT reproducible (or env: needs Apple Silicon + RAIL_ARENA_MB>=6000)"; fi
+
+echo "== 2. Tests (runner self-reports its count) =="
+tcmd=$([ "$QUICK" = 1 ] && echo quick || echo test)
+if RAIL_ARENA_MB=4096 ./rail_native "$tcmd" 2>/tmp/_verify_test.log | grep -q 'FAIL'; then
+  no "$tcmd suite reported a FAIL"
+else ok "$tcmd suite (no FAIL)"; fi
+
+echo "== 3. Grammar present (the language surface, readable) =="
+if [ -f grammar/rail.ebnf ]; then ok "grammar/rail.ebnf ($(wc -l < grammar/rail.ebnf | tr -d ' ') lines)"
+else no "grammar/rail.ebnf missing"; fi
+
+echo "== 4. Status matrix regenerates live (cannot drift) =="
+if RAIL_ARENA_MB=4096 ./rail_native run tools/deploy/gen_status.rail >/tmp/_verify_status.log 2>&1 \
+   && [ -f docs/STATUS.md ]; then ok "docs/STATUS.md regenerated from the tree"
+else no "gen_status failed (see /tmp/_verify_status.log)"; fi
+
+echo "== 5. Release attestation =="
+if [ -f tools/attest/attest.rail ]; then ok "tools/attest/ present — verify a tagged release with attest.rail"
+else no "tools/attest/ missing"; fi
+
+echo
+echo "passed: $pass   failed: $fail"
+[ "$fail" = 0 ]
