@@ -84,7 +84,7 @@ head [10, 20, 30]    -- returns 10
 head ["a", "b"]      -- returns "a"
 ```
 
-Calling `head` on an empty list is undefined behavior.
+Calling `head` on an empty list returns `0`. (Rail runtime safety: both `head []` and `head` on a non-list return `0` rather than segfaulting.)
 
 ### `tail`
 
@@ -93,6 +93,7 @@ Return all elements except the first.
 ```rail
 tail [10, 20, 30]    -- returns [20, 30]
 tail [1]             -- returns []
+tail []              -- returns [] (tail on a non-list also returns [])
 ```
 
 ### `cons`

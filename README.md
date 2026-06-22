@@ -29,7 +29,7 @@
 
 ---
 
-Rail compiles itself. The compiler — ~6,000+ lines of Rail — produces a ~1.0 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. The TLS 1.3 client is also Rail: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat. As of **v5.2.0**, the toolchain stands entirely alone: Rail assembles, links, and code-signs its own Mach-O binaries in-process — no `as`, no `ld`, no `codesign` — so the self-compile is bit-reproducible (the committed seed reproduces itself byte-for-byte). It also emits its own aarch64 Linux ELF binaries and its own GPU kernels, generating Metal Shading Language from an op-DAG and JIT-compiling it at runtime (35× fused rmsnorm+QKV, 18× fused silu+hadamard). A frontier model + 1 KB Rail spec still compiles 30/30 on a held-out hard-bench — publicly reproducible.
+Rail compiles itself. The compiler — ~9,200 lines of Rail — produces a ~0.9 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. The TLS 1.3 client is also Rail: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat. As of **v5.2.0**, the toolchain stands entirely alone: Rail assembles, links, and code-signs its own Mach-O binaries in-process — no `as`, no `ld`, no `codesign` — so the self-compile is bit-reproducible (the committed seed reproduces itself byte-for-byte). It also emits its own aarch64 Linux ELF binaries and its own GPU kernels, generating Metal Shading Language from an op-DAG and JIT-compiling it at runtime (35× fused rmsnorm+QKV, 18× fused silu+hadamard). A frontier model + 1 KB Rail spec still compiles 30/30 on a held-out hard-bench — publicly reproducible.
 
 ```
 ./rail_native self && cp /tmp/rail_self ./rail_native  # cycle 1
@@ -50,7 +50,7 @@ Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, We
 ```bash
 ./rail_native <file.rail>        # compile to /tmp/rail_out
 ./rail_native run <file.rail>    # compile + execute
-./rail_native test               # run the 140-test suite
+./rail_native test               # run the 178-test suite
 ./rail_native self               # self-compile, fixed point at gen2
 ./rail_native x86 <file.rail>    # cross-compile to Linux x86_64
 ./rail_native linux <file.rail>  # cross-compile to Linux ARM64
@@ -64,7 +64,7 @@ Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, We
 ### 1. Compiles itself, byte-identical
 
 ```
-./rail_native self                    -- ~7,050 lines of Rail →
+./rail_native self                    -- ~9,200 lines of Rail →
                                       --   a ~1.0 MB ARM64 binary
 cp /tmp/rail_self ./rail_native       -- cycle 1: install gen1
 ./rail_native self                    -- cycle 2: that binary compiles
