@@ -1,6 +1,10 @@
 # Independent verification (the one non-Rail corner)
 
-This directory is, by deliberate design, the **only non-Rail code in the repo**.
+This directory is, by deliberate design, the only non-Rail code added **for
+verification** — distinct from the small, irreducible asm/ObjC/C platform boundary
+(kernel syscalls, GPU hosts) tracked in [`SHIMS.md`](../../SHIMS.md). Those shims
+exist out of platform necessity; this exists out of *choice*, because independence
+requires a different language by a different code path.
 
 [`docs/INDEPENDENCE.md`](../../docs/INDEPENDENCE.md) explains why: Rail's
 byte-identical self-hosting proves a fixed point exists, but it does **not**
