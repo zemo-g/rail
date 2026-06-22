@@ -117,6 +117,36 @@ done
 fi
 real_peers=$(printf '%s' "$real_peers" | awk '{$1=$1};1')
 
+# ── Hardware-truth self-heal (2026-06-22) ───────────────────────────────────
+# A pin file can rot — a USB-C stub (Air's en4) or a moved cable's stale leg
+# (Studio's en19) — and TB silently goes dark for weeks. Independently derive
+# the REAL TB-IP port of every PHYSICALLY CONNECTED peer from IORegistry
+# (AppleThunderboltIPPort -> IOLocation = receptacle) crossed with the
+# connected receptacles (system_profiler). A non-empty result WINS over the
+# pin (hardware is ground truth, so a rotted pin self-corrects); empty (no
+# peers, or a parse failure) falls back to the pin/heuristic computed above.
+# Read-only here — the add/remove logic below acts on the resulting real_peers.
+hw_real_ports() {
+  local connected
+  connected=$(system_profiler SPThunderboltDataType 2>/dev/null | LC_ALL=C awk '
+    $1=="Status:" {st=$0}
+    $1=="Receptacle:" {if (st ~ /Device connected/ && st !~ /No device/) print $2}')
+  [ -z "$connected" ] && return 0
+  ioreg -rc AppleThunderboltIPPort -l 2>/dev/null | LC_ALL=C awk '
+    /AppleThunderboltIPPort / {inport=1; loc=""; next}
+    inport && /"IOLocation"/ {s=$0; gsub(/[^0-9]/,"",s); loc=s; next}
+    inport && /"BSD Name"/ {match($0,/en[0-9]+/); print loc, substr($0,RSTART,RLENGTH); inport=0}
+  ' | while read -r loc bsd; do printf '%s\n' "$connected" | grep -qx "$loc" && printf '%s\n' "$bsd"; done | sort -u | tr '\n' ' '
+}
+hw_peers=$(hw_real_ports | awk '{$1=$1};1')
+if [ -n "$hw_peers" ]; then
+  [ "$hw_peers" != "$real_peers" ] && log "hw-truth OVERRIDE pin=[$real_peers] -> hardware=[$hw_peers]"
+  real_peers="$hw_peers"
+  log "hw-truth peers=[$hw_peers]"
+else
+  log "hw-truth empty (no peers / parse) — keeping pin=[$real_peers]"
+fi
+
 # ── Snapshot current bridge0 members ────────────────────────────────────────
 if ifconfig bridge0 >/dev/null 2>&1; then
   members=$(ifconfig bridge0 | awk '/^[[:space:]]*member:/ {print $2}' | tr '\n' ' ')
