@@ -87,7 +87,7 @@ getOrDefault opt = match opt           -- pattern match (NO 'with' keyword)
   | Some x -> x
   | None -> 0
 
-fold add 0 [1,2,3,4,5]               -- fold (use named 2-arg functions, NOT nested lambdas)
+fold add 0 [1,2,3,4,5]               -- fold (named 2-arg fns OR \a b -> ... multi-arg lambdas both work)
 map f list, filter f list             -- list ops
 head xs, tail xs, length xs, reverse xs, cons x xs
 range N                               -- [0..N-1]
@@ -95,7 +95,7 @@ range N                               -- [0..N-1]
 \a -> \b -> a + b                    -- nested lambdas work (flattened to multi-param)
 write_file path content, read_file path
 let _ = shell "command"
-join sep list, split "c" str          -- split is per-character, NOT substring
+join sep list, split "c" str          -- split: 1-char delimiter (first char if multiple), NOT substring
 str_split ", " str                    -- multi-char split
 str_find "needle" "haystack"          -- returns index or -1
 str_contains "needle" "haystack"      -- returns bool

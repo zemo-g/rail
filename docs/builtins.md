@@ -151,16 +151,16 @@ gt2 x = if x > 2 then true else false
 filter gt2 [1, 2, 3, 4, 5]    -- returns [3, 4, 5]
 ```
 
-**Known limitation**: Inline lambdas in `filter` can segfault. Always use named predicate functions:
+Inline lambdas work in `filter`, including ones that capture outer values:
 
 ```rail
--- BAD: may segfault at runtime
-filter (\x -> x > 2) [1, 2, 3, 4, 5]
+filter (\x -> x > 2) [1, 2, 3, 4, 5]    -- returns [3, 4, 5]
 
--- GOOD: use a named function
-gt2 x = if x > 2 then true else false
-filter gt2 [1, 2, 3, 4, 5]
+let lo = 2
+filter (\x -> x > lo) [1, 2, 3, 4, 5]   -- captures `lo`; returns [3, 4, 5]
 ```
+
+Named predicate functions read more clearly for anything non-trivial.
 
 ### `fold`
 
@@ -173,7 +173,13 @@ fold add 0 [1, 2, 3, 4, 5]    -- returns 15
 
 `fold f init [a, b, c]` computes `f (f (f init a) b) c`.
 
-**Important**: Use named 2-argument functions, not nested lambdas.
+Multi-argument lambdas work directly:
+
+```rail
+fold (\a b -> a + b) 0 [1, 2, 3, 4, 5]    -- returns 15
+```
+
+Named 2-argument functions are equally fine.
 
 ### `reverse`
 
@@ -224,13 +230,13 @@ split " " "hello world"    -- returns ["hello", "world"]
 split "\n" "line1\nline2"  -- returns ["line1", "line2"]
 ```
 
-**Important**: `split` treats its first argument as a set of single-character delimiters, not a substring. Each character in the delimiter string is a separate split point:
+**Important**: `split` takes a *single-character* delimiter. If you pass a multi-character string, only the **first** character is used — it is not a set of delimiters, and not a substring:
 
 ```rail
-split "ab" "xaybz"    -- splits on "a" AND "b" -> ["x", "y", "z"]
+split "ab" "xaybz"    -- uses only "a" -> ["x", "ybz"]   ("b" is NOT a delimiter)
 ```
 
-This is the most common gotcha in Rail. For substring-based splitting, use `shell` with `sed` or `perl`.
+This is the most common gotcha in Rail. For multi-character (substring) delimiters, use `str_split`.
 
 ### `append` (strings)
 
