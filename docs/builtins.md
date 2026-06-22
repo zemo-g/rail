@@ -151,16 +151,16 @@ gt2 x = if x > 2 then true else false
 filter gt2 [1, 2, 3, 4, 5]    -- returns [3, 4, 5]
 ```
 
-**Known limitation**: Inline lambdas in `filter` can segfault. Always use named predicate functions:
+Inline lambdas work in `filter`, including ones that capture outer values:
 
 ```rail
--- BAD: may segfault at runtime
-filter (\x -> x > 2) [1, 2, 3, 4, 5]
+filter (\x -> x > 2) [1, 2, 3, 4, 5]    -- returns [3, 4, 5]
 
--- GOOD: use a named function
-gt2 x = if x > 2 then true else false
-filter gt2 [1, 2, 3, 4, 5]
+let lo = 2
+filter (\x -> x > lo) [1, 2, 3, 4, 5]   -- captures `lo`; returns [3, 4, 5]
 ```
+
+Named predicate functions read more clearly for anything non-trivial.
 
 ### `fold`
 
@@ -173,7 +173,13 @@ fold add 0 [1, 2, 3, 4, 5]    -- returns 15
 
 `fold f init [a, b, c]` computes `f (f (f init a) b) c`.
 
-**Important**: Use named 2-argument functions, not nested lambdas.
+Multi-argument lambdas work directly:
+
+```rail
+fold (\a b -> a + b) 0 [1, 2, 3, 4, 5]    -- returns 15
+```
+
+Named 2-argument functions are equally fine.
 
 ### `reverse`
 
