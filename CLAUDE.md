@@ -87,7 +87,7 @@ getOrDefault opt = match opt           -- pattern match (NO 'with' keyword)
   | Some x -> x
   | None -> 0
 
-fold add 0 [1,2,3,4,5]               -- fold (use named 2-arg functions, NOT nested lambdas)
+fold add 0 [1,2,3,4,5]               -- fold (named 2-arg fns OR \a b -> ... multi-arg lambdas both work)
 map f list, filter f list             -- list ops
 head xs, tail xs, length xs, reverse xs, cons x xs
 range N                               -- [0..N-1]
