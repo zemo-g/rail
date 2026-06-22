@@ -73,31 +73,57 @@ type TrackedTensor = | Tracked value tape_idx
 
 type TapeEntry = | TapeEntry tag captures parents
 
--- The tape is built as a plain list. We append to the end (cons + reverse at
--- the end would work, but for clarity we use an accumulator pattern).
--- In practice, the caller threads the tape through each operation.
+-- The tape is an array-backed log: slot 0 holds the entry count, slots
+-- 1..count hold TapeEntry objects. The caller threads the tape through each
+-- operation; ag_tape_push returns the (possibly grown) array plus the new
+-- entry's index.
 
 -- ============================================================================
--- TAPE MANAGEMENT
+-- TAPE MANAGEMENT  (array-backed: O(1) push and O(1) random-access get)
 -- ============================================================================
+-- The previous representation was a plain list: ag_tape_push did `length` +
+-- `append` (both O(n)) and ag_tape_get walked the list with a per-step
+-- `length tape == 0` check, so building an n-op tape was O(n^2) and the
+-- backward pass was worse than its advertised O(tape_length). The array log
+-- below makes push O(1) amortized (doubling) and get O(1), so backprop is
+-- genuinely O(tape_length).
 
--- ag_tape_new: create an empty tape
-ag_tape_new _ = []
+-- ag_tape_new: create an empty tape. Slot 0 = count (0); entries start at slot 1.
+ag_tape_new _ =
+  let a = arr_new 64 0
+  let _ = arr_set a 0 0
+  a
 
--- ag_tape_push: append an entry, return (new_tape, index_of_new_entry)
--- Index = length of tape before push (0-based).
+-- ag_tape_len: number of entries on the tape (O(1)).
+ag_tape_len tape = arr_get tape 0
+
+-- ag_tape_push: store entry at slot count+1, growing (doubling) if full.
+-- Returns (tape, index); index = entry count before push (0-based), matching
+-- the old list semantics so every tracked_* caller is unchanged.
 ag_tape_push tape entry =
-  let idx = length tape
-  let new_tape = append tape [entry]
-  (new_tape, idx)
+  let n = arr_get tape 0
+  let cap = arr_len tape
+  let t = if n + 1 < cap then tape else ag_tape_grow tape
+  let _ = arr_set t (n + 1) entry
+  let _ = arr_set t 0 (n + 1)
+  (t, n)
 
--- ag_tape_get: retrieve entry at index i
-ag_tape_get tape i = ag_tape_get_acc tape i 0
+-- ag_tape_grow: allocate a 2x array and copy slots 0..count across.
+ag_tape_grow tape =
+  let big = arr_new (arr_len tape * 2) 0
+  let _ = ag_tape_copy tape big (arr_get tape 0)
+  big
 
-ag_tape_get_acc tape i cur =
-  if length tape == 0 then TapeEntry "noop" [] []
-  else if cur == i then head tape
-  else ag_tape_get_acc (tail tape) i (cur + 1)
+-- ag_tape_copy: copy slots k..0 from src to dst (tail-recursive -> loop).
+ag_tape_copy src dst k =
+  if k < 0 then 0
+  else
+    let _ = arr_set dst k (arr_get src k)
+    ag_tape_copy src dst (k - 1)
+
+-- ag_tape_get: retrieve entry at 0-based index i (O(1)). Slot 0 is the count,
+-- so entry i lives at slot i+1.
+ag_tape_get tape i = arr_get tape (i + 1)
 
 -- ============================================================================
 -- LEAF CREATION (parameters and inputs)
@@ -537,7 +563,7 @@ ag_scatter_add dw ids upstream pos =
 -- Time complexity: O(tape_length), one backward call per forward op.
 
 ag_backward tape loss_idx =
-  let n = length tape
+  let n = ag_tape_len tape
   -- grad_table: mutable array of (Tensor | 0), one per tape entry
   -- 0 means "no gradient accumulated yet"
   let grad_table = arr_new n 0
