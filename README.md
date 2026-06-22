@@ -2,7 +2,7 @@
 
 <p align="center">
   <em>A self-hosting systems language that speaks TLS alone.</em><br>
-  <sub>Zero C dependencies. GC in ARM64 assembly. HTTPS in pure Rail.</sub>
+  <sub>No C in the runtime. GC in ARM64 assembly. HTTPS in pure Rail.</sub>
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
   <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
   <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
-  <a href="#why-rail"><img src="https://img.shields.io/badge/C%20dependencies-0-brightgreen" alt="0 C dependencies"></a>
+  <a href="#why-rail"><img src="https://img.shields.io/badge/C%20in%20seed-0-brightgreen" alt="zero C in the seed binary"></a>
   <a href="#releases"><img src="https://img.shields.io/badge/backends-6-orange" alt="6 backends"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL%201.1-green" alt="BSL 1.1"></a>
 </p>
@@ -73,7 +73,7 @@ cmp rail_native /tmp/rail_self        -- and the output is identical
                                       --   (byte-identical fixed point)
 ```
 
-The GC, allocator, and runtime support are ARM64 assembly embedded in the compiler itself. No `gcc`, no `libc`, no linker scripts — just `as` and `ld`.
+The GC, allocator, and runtime support are ARM64 assembly embedded in the compiler itself. No `gcc`, no `libc`, no linker scripts — and since v5.2.0 no `as` or `ld` either: Rail assembles, links, and code-signs itself.
 
 ### 2. Speaks HTTPS, natively ✨ *new in v3.0.0*
 
@@ -109,9 +109,9 @@ The compiler is the fitness function. Programs that compile become training data
 
 ## Why Rail
 
-- **Zero C transitive dependency.** The seed binary needs only `as` + `ld` + the kernel. No glibc. No OpenSSL. No runtime C at all — the GC is 300 lines of ARM64 assembly inside the compiler.
+- **No C in the core.** The seed binary needs only the kernel — since v5.2.0 it assembles, links, and signs itself (no `as`/`ld`/`codesign`). No glibc, no OpenSSL, no runtime C; the GC is ~300 lines of ARM64 assembly inside the compiler. Optional concurrency, GPU (Metal), and JIT features use a small asm/ObjC/C boundary, tracked honestly in [`SHIMS.md`](SHIMS.md).
 - **Byte-identical self-compile.** `./rail_native self` produces output identical to the binary that produced it. The compiler's own source is the regression suite.
-- **The compiler is the source of truth.** Training loops, tests, site generation, HTTPS clients — they all get compiled by the same binary you cloned. If it compiles, it runs.
+- **One binary checks everything.** Training loops, tests, site generation, HTTPS clients — all compiled by the same binary you cloned. That makes the compiler a single, reproducible *checker* you can re-run yourself — not a proof of correctness: a program can compile and still be wrong. Compilation proves a program is *accepted by the binary you run*, nothing more.
 - **Production surface is narrow and honest.** Rail v3.0.0 ships the crypto it uses (ChaCha20-Poly1305, x25519, SHA-256/384/512, ECDSA-P256/P384, RSA-PSS/PKCS1) and nothing more. Every primitive is NIST- or RFC-vector-validated.
 - **Six backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), Linux x86_64, WebAssembly, Cortex-M4 (Thumb-2), and RISC-V rv32imc — the same compiler cross-compiles to all of them.
 
