@@ -36,7 +36,10 @@ claimed=$(awk '
   /^\*\*Currently running/ { in_block=1; next }
   in_block && /^\*\*/ { in_block=0 }
   in_block { print }
-' "$CLAUDE_MD" | grep -oE 'com\.ledatic\.[a-z_-]*[a-z0-9]' | sort -u)
+' "$CLAUDE_MD" | grep -v '_\*' | grep -oE 'com\.ledatic\.[a-z_-]*[a-z0-9]' | sort -u)
+# NB: grep -v '_\*' drops the family/summary rows ("8x com.ledatic.audit_*",
+# "~16x com.ledatic.lakes_*") so the glob suffix isn't mis-extracted as the
+# bare phantom services com.ledatic.audit / com.ledatic.lakes (NO_PLIST noise).
 
 if [[ -z "$claimed" ]]; then
   echo "FATAL: no claimed-running services found in $CLAUDE_MD"
