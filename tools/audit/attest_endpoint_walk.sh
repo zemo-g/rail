@@ -241,7 +241,7 @@ class_pages() {
   # a static marketing page — confirmed 2026-05-27, no widget ever built.
   for page in system ot; do
     html=$(curl -sf "$BASE/$page")
-    if ! grep -qE '/?_shared/[a-z-]+-(live|attest|cite)\.js' <<<"$html"; then
+    if ! grep -qE '/?_shared/([a-z-]+-(live|attest|cite)|pulse-clock|proof-tray)\.js' <<<"$html"; then
       missing+=" $page"
     fi
   done
