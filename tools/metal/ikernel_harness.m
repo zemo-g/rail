@@ -45,14 +45,23 @@ static int read_longs(const char *path, int64_t *dst, long n) {
 }
 
 int main(int argc, const char **argv) {
-    if (argc != 8 && argc != 9) {
-        fprintf(stderr, "usage: ikernel_harness <kernel.metal> <fn> <A.txt> <B.txt> <rows> <d> <out.txt> [i64]\n");
+    if (argc < 8) {
+        fprintf(stderr, "usage: ikernel_harness <kernel.metal> <fn> <A.txt> <B.txt> <rows> <d> <out.txt> [i64] [reps=N] [on=N]\n");
         return 2;
     }
     @autoreleasepool {
         long rows = atol(argv[5]);
         long d    = atol(argv[6]);
-        int  i64  = (argc == 9 && strcmp(argv[8], "i64") == 0);
+        int  i64  = 0;
+        long reps = 1;      // dispatches per timing run (all encoded in one command buffer)
+        long on   = 0;      // output element count; default rows
+        for (int i = 8; i < argc; i++) {
+            if (strcmp(argv[i], "i64") == 0) i64 = 1;
+            else if (strncmp(argv[i], "reps=", 5) == 0) reps = atol(argv[i] + 5);
+            else if (strncmp(argv[i], "on=", 3) == 0)   on = atol(argv[i] + 3);
+        }
+        if (on <= 0) on = rows;
+        if (reps <= 0) reps = 1;
         if (rows <= 0 || d <= 0) { fprintf(stderr, "bad rows/d\n"); return 2; }
 
         size_t esz = i64 ? sizeof(int64_t) : sizeof(int32_t);
@@ -86,7 +95,7 @@ int main(int argc, const char **argv) {
                                              options:MTLResourceStorageModeShared];
         id<MTLBuffer> bufB = [dev newBufferWithBytes:B length:d * esz
                                              options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufO = [dev newBufferWithLength:rows * sizeof(int64_t)
+        id<MTLBuffer> bufO = [dev newBufferWithLength:on * sizeof(int64_t)
                                               options:MTLResourceStorageModeShared];
 
         id<MTLCommandQueue> q = [dev newCommandQueue];
@@ -97,14 +106,19 @@ int main(int argc, const char **argv) {
         [enc setBuffer:bufB offset:0 atIndex:1];
         [enc setBuffer:bufO offset:0 atIndex:2];
         NSUInteger tg = MIN((NSUInteger)256, pso.maxTotalThreadsPerThreadgroup);
-        [enc dispatchThreads:MTLSizeMake(rows, 1, 1)
-       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        // reps identical dispatches in one command buffer amortize launch
+        // overhead for timing; the kernel is idempotent so the result is
+        // unchanged.  gpu_dispatch_ms reports total/reps.
+        for (long r = 0; r < reps; r++) {
+            [enc dispatchThreads:MTLSizeMake(rows, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        }
         [enc endEncoding];
 
         double t0 = CFAbsoluteTimeGetCurrent();
         [cb commit];
         [cb waitUntilCompleted];
-        double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+        double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0 / (double)reps;
 
         if (cb.status != MTLCommandBufferStatusCompleted) {
             fprintf(stderr, "GPU execution failed (status %ld)\n", (long)cb.status);
@@ -114,7 +128,7 @@ int main(int argc, const char **argv) {
         FILE *out = fopen(argv[7], "w");
         if (!out) { fprintf(stderr, "cannot open out file\n"); return 2; }
         int64_t *O = (int64_t *)bufO.contents;
-        for (long i = 0; i < rows; i++) fprintf(out, "%lld\n", (long long)O[i]);
+        for (long i = 0; i < on; i++) fprintf(out, "%lld\n", (long long)O[i]);
         fclose(out);
 
         fprintf(stderr, "gpu_dispatch_ms=%.3f\n", ms);
