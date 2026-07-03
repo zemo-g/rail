@@ -4053,6 +4053,21 @@ import "stdlib/<name>.rail"
 > 63-bit tagged ints, with headroom.
 > ───────────────────────────────────────────────────────────────────────
 
+### `emit_msl_fx_matvec_shaped rows d shift`
+
+> Fixed-point matvec with mul_shr rescale (attested-GPU track, act 2).
+> 
+> Mirrors Rail's mul_shr primitive EXACTLY: full 128-bit product
+> (mul = low 64, smulh/mulhi = high 64), logical-shift the low half,
+> arithmetic-shift-combine the high half.  Same formula as the ARM64
+> emit in tools/compile.rail (search "mul_shr"), so CPU twin and GPU
+> twin agree bit-for-bit even when a*b overflows int64 -- the
+> massive-activation regime that motivated mul_shr in the first
+> place (t173: 3.2e11 * 3.2e11 >> 24).
+> 
+> Caller contract: 1 <= shift < 64, and |mul_shr result| * d must fit
+> int64 (and Rail's 63-bit ints) for the row accumulator.
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────
