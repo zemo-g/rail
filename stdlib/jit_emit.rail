@@ -266,6 +266,94 @@ emit_msl_fx_matvec_shaped rows d shift =
        "    O[gid] = acc;\n",
        "}\n"]
 
+-- Fixed-point RMSNorm (attested-GPU track, act 3).
+--
+-- The last transformer-layer op that needed a discovery step: rsqrt.
+-- Computed as a pure-integer binary search -- find the largest r with
+-- mul_shr(mul_shr(r,r,S), v, S) <= ONE -- the same move as Path-B's
+-- bx4_fxsqrt.  Every operation is mul_shr / add / compare / shift, so
+-- a CPU twin using the mul_shr primitive lands on identical bits.
+--
+-- Q32.32 fixed point (S=32).  Caller contract: |x| < 2^34, |g| < 2^33,
+-- d <= 2^12; the search bound hi=2^45 keeps every intermediate inside
+-- int64.  One thread per row; the search is ~45 exact iterations.
+emit_msl_fx_rmsnorm_shaped rows d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint D = ",    show d,    ";\n",
+       "constant long FX_ONE = 4294967296;\n",
+       "constant long FX_EPS = 4295;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "// largest r in [0, 2^45] with mul_shr(mul_shr(r,r,32), v, 32) <= FX_ONE\n",
+       "static inline long fx_rsqrt(long v) {\n",
+       "    long lo = 0;\n",
+       "    long hi = 35184372088832 + 1;\n",
+       "    while (hi - lo > 1) {\n",
+       "        long mid = lo + (hi - lo) / 2;\n",
+       "        long t = mul_shr_gpu(mid, mid, 32);\n",
+       "        if (mul_shr_gpu(t, v, 32) <= FX_ONE) lo = mid; else hi = mid;\n",
+       "    }\n",
+       "    return lo;\n",
+       "}\n\n",
+       "kernel void fx_rmsnorm(\n",
+       "    device const long *X [[buffer(0)]],\n",
+       "    device const long *G [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    uint base = gid * D;\n",
+       "    long ss = 0;\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        long x = X[base + j];\n",
+       "        ss += mul_shr_gpu(x, x, 32);\n",
+       "    }\n",
+       "    long r = fx_rsqrt(ss / (long)D + FX_EPS);\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        O[base + j] = mul_shr_gpu(mul_shr_gpu(X[base + j], r, 32), G[j], 32);\n",
+       "    }\n",
+       "}\n"]
+
+-- Unroll-parameterized fx matvec (attested-GPU track, act 5: kernel
+-- tournament).  Integer addition is associative, so EVERY unroll
+-- factor produces byte-identical output -- the twin oracle stays
+-- exact while an optimization search explores variants.  (A float
+-- kernel can never promise that.)  Caller: d divisible by unroll.
+emit_fx_body u j =
+  if j >= u then []
+  else cons (cat ["        acc += mul_shr_gpu(A[base + j + ", show j, "], B[j + ", show j, "], SHIFT);\n"]) (emit_fx_body u (j + 1))
+
+emit_msl_fx_matvec_unrolled rows d shift unroll =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ",  show rows,  ";\n",
+       "constant uint D = ",     show d,     ";\n",
+       "constant uint SHIFT = ", show shift, ";\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "kernel void fx_matvec(\n",
+       "    device const long *A [[buffer(0)]],\n",
+       "    device const long *B [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    long acc = 0;\n",
+       "    uint base = gid * D;\n",
+       "    for (uint j = 0; j < D; j += ", show unroll, ") {\n",
+       cat (emit_fx_body unroll 0),
+       "    }\n",
+       "    O[gid] = acc;\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];

@@ -4068,6 +4068,31 @@ import "stdlib/<name>.rail"
 > Caller contract: 1 <= shift < 64, and |mul_shr result| * d must fit
 > int64 (and Rail's 63-bit ints) for the row accumulator.
 
+### `emit_msl_fx_rmsnorm_shaped rows d`
+
+> Fixed-point RMSNorm (attested-GPU track, act 3).
+> 
+> The last transformer-layer op that needed a discovery step: rsqrt.
+> Computed as a pure-integer binary search -- find the largest r with
+> mul_shr(mul_shr(r,r,S), v, S) <= ONE -- the same move as Path-B's
+> bx4_fxsqrt.  Every operation is mul_shr / add / compare / shift, so
+> a CPU twin using the mul_shr primitive lands on identical bits.
+> 
+> Q32.32 fixed point (S=32).  Caller contract: |x| < 2^34, |g| < 2^33,
+> d <= 2^12; the search bound hi=2^45 keeps every intermediate inside
+> int64.  One thread per row; the search is ~45 exact iterations.
+
+### `emit_fx_body u j`
+
+> Unroll-parameterized fx matvec (attested-GPU track, act 5: kernel
+> tournament).  Integer addition is associative, so EVERY unroll
+> factor produces byte-identical output -- the twin oracle stays
+> exact while an optimization search explores variants.  (A float
+> kernel can never promise that.)  Caller: d divisible by unroll.
+
+### `emit_msl_fx_matvec_unrolled rows d shift unroll`
+
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────

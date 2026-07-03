@@ -1,0 +1,150 @@
+-- fx_kernel_tournament.rail — twin-kernel attestation, act 5 (2026-07-03).
+--
+-- The apprentice loop pointed at our own kernels: GENERATE variants,
+-- ORACLE-verify each one, keep the winner.  The oracle is mechanical
+-- and perfect: byte-equality against the CPU twin (Rail's mul_shr
+-- primitive).  Integer addition is associative, so every unroll
+-- factor must produce IDENTICAL bits -- the oracle stays exact while
+-- the optimization search explores.  A float kernel could never
+-- promise that: reordering float adds changes the answer, so float
+-- autotuning always trades correctness guarantees for speed.  Fixed
+-- point gets both.
+--
+-- Today the generator is a parameterized emitter (unroll 1/2/4/8);
+-- the same tournament record works unchanged when an LLM proposes
+-- the variants -- that is PAOS/apprentice territory.
+--
+-- run from repo root: ./rail_native run tools/metal/fx_kernel_tournament.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+lcg_next s = ((s * 1103515245) + 12345) % 2147483648
+
+fill_fx a n s i =
+  if i >= n then s
+  else
+    let s2 = lcg_next s in
+    let s3 = lcg_next s2 in
+    let v = (((s2 % 2097152) * 1048576) + (s3 % 1048576)) - 1099511627776 in
+    let _ = arr_set a i v in
+    fill_fx a n s3 (i + 1)
+
+fx_dot_row a b d base j acc =
+  if j >= d then acc
+  else fx_dot_row a b d base (j + 1) (acc + (mul_shr (arr_get a (base + j)) (arr_get b j) 40))
+
+fx_rows a b out rows d i =
+  if i >= rows then 0
+  else
+    let _ = arr_set out i (fx_dot_row a b d (i * d) 0 0) in
+    fx_rows a b out rows d (i + 1)
+
+row_str a base d j accl =
+  if j >= d then join " " (reverse accl)
+  else row_str a base d (j + 1) (cons (show (arr_get a (base + j))) accl)
+
+rows_text a rows d i accl =
+  if i >= rows then join "\n" (reverse accl)
+  else rows_text a rows d (i + 1) (cons (row_str a (i * d) d 0 []) accl)
+
+out_text o n i accl =
+  if i >= n then join "\n" (reverse accl)
+  else out_text o n (i + 1) (cons (show (arr_get o i)) accl)
+
+-- parse "gpu_dispatch_ms=1.234" -> integer microseconds (1234)
+pu_walk cs acc dot fr =
+  if (length cs) == 0 then acc
+  else
+    let c = head cs in
+    if c == "." then pu_walk (tail cs) acc 1 fr
+    else
+      let dig = (char_to_int c) - 48 in
+      if dig < 0 then acc
+      else if dig > 9 then acc
+      else if dot == 0 then pu_walk (tail cs) ((acc * 10) + dig) 0 fr
+      else if fr < 3 then pu_walk (tail cs) ((acc * 10) + dig) 1 (fr + 1)
+      else acc
+
+parse_us s =
+  let i = str_find "=" s in
+  pu_walk (chars (str_sub s (i + 1) 24)) 0 0 0
+
+-- run one variant: emit -> dispatch (reps=50) -> oracle-verify -> time
+-- returns [unroll, agree, us, msl_hash]
+run_variant u rows d shift cpu_h =
+  let msl = emit_msl_fx_matvec_unrolled rows d shift u in
+  let mf = cat ["/tmp/agk/fx_u", show u, ".metal"] in
+  let _ = write_file mf msl in
+  let outf = cat ["/tmp/agk/fx_u", show u, "_out.txt"] in
+  let errf = cat ["/tmp/agk/fx_u", show u, "_ms.txt"] in
+  let cmd = cat ["/tmp/agk/ikernel_harness ", mf, " fx_matvec /tmp/agk/fxA.txt /tmp/agk/fxB.txt ",
+                 show rows, " ", show d, " ", outf, " i64 reps=50 2>", errf] in
+  let _ = shell cmd in
+  let oh = sha256_hex (read_file outf) in
+  let agree = if oh == cpu_h then 1 else 0 in
+  let us = parse_us (read_file errf) in
+  [u, agree, us]
+
+run_all us_list rows d shift cpu_h accl =
+  if (length us_list) == 0 then reverse accl
+  else run_all (tail us_list) rows d shift cpu_h (cons (run_variant (head us_list) rows d shift cpu_h) accl)
+
+variant_json v =
+  cat ["    {\"unroll\": ", show (head v),
+       ", \"oracle_agree\": ", show (head (tail v)),
+       ", \"us_per_dispatch\": ", show (head (tail (tail v))), "}"]
+
+pick_best best v =
+  if (head (tail v)) == 0 then best
+  else
+    let us = head (tail (tail v)) in
+    let bus = head (tail (tail best)) in
+    if us < bus then v else best
+
+count_agree acc v = acc + (head (tail v))
+
+main =
+  let rows = 512 in
+  let d = 512 in
+  let shift = 40 in
+  let seed = 5678 in
+  let _ = shell "mkdir -p /tmp/agk" in
+  -- inputs + CPU oracle (same spec + seed as act 2)
+  let a = arr_new (rows * d) 0 in
+  let b = arr_new d 0 in
+  let s1 = fill_fx a (rows * d) seed 0 in
+  let _ = fill_fx b d s1 0 in
+  let _ = write_file "/tmp/agk/fxA.txt" (cat [rows_text a rows d 0 [], "\n"]) in
+  let _ = write_file "/tmp/agk/fxB.txt" (cat [row_str b 0 d 0 [], "\n"]) in
+  let cpu = arr_new rows 0 in
+  let _ = fx_rows a b cpu rows d 0 in
+  let ctext = cat [out_text cpu rows 0 [], "\n"] in
+  let cpu_h = sha256_hex ctext in
+  let _ = shell "test -x /tmp/agk/ikernel_harness || clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  -- the tournament: generate -> oracle-verify -> time, per variant
+  let results = run_all [1, 2, 4, 8] rows d shift cpu_h [] in
+  let n_agree = fold count_agree 0 results in
+  let best = fold pick_best [0, 1, 999999999] results in
+  let verdict = if n_agree == (length results) then "ALL-VARIANTS-EXACT" else "SOME-VARIANTS-DIVERGE" in
+  let record = cat ["{\n",
+    "  \"schema\": \"kernel-tournament-v0\",\n",
+    "  \"kernel\": \"fx_matvec\",\n",
+    "  \"oracle\": \"byte-equality vs Rail mul_shr CPU twin\",\n",
+    "  \"rows\": ", show rows, ", \"d\": ", show d, ", \"shift\": ", show shift, ", \"seed\": ", show seed, ",\n",
+    "  \"cpu_out_sha256\": \"", cpu_h, "\",\n",
+    "  \"variants\": [\n",
+    join ",\n" (map variant_json results),
+    "\n  ],\n",
+    "  \"winner_unroll\": ", show (head best), ",\n",
+    "  \"winner_us\": ", show (head (tail (tail best))), ",\n",
+    "  \"verdict\": \"", verdict, "\"\n",
+    "}\n"] in
+  let _ = write_file "/tmp/agk/tournament_record.json" record in
+  let _ = print "kernel tournament (oracle = byte-exact CPU twin):" in
+  let _ = print (cat ["  variants agree:  ", show n_agree, " of ", show (length results)]) in
+  let _ = print (cat ["  winner:          unroll=", show (head best), " at ", show (head (tail (tail best))), " us/dispatch"]) in
+  let _ = print (cat ["  verdict:         ", verdict]) in
+  let _ = print "  record:          /tmp/agk/tournament_record.json" in
+  let _ = print (record) in
+  if n_agree == (length results) then 0 else 1
