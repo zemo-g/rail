@@ -38,7 +38,7 @@ import "stdlib/<name>.rail"
 ### `aead_tags_match a b`
 
 
-### `aead_tag_cmp_at a b i`
+### `aead_tag_cmp_at a b i acc`
 
 
 ### `aead_decrypt key nonce aad aad_len ct ct_len tag`
@@ -67,6 +67,11 @@ import "stdlib/<name>.rail"
 
 ### `anthropic_chat model prompt max_tokens key_path`
 
+
+### `anthropic_chat_unsafe_noverify model prompt max_tokens key_path`
+
+> Explicit opt-in for debug: bypasses TLS chain validation. DO NOT USE for
+> production API-key-bearing calls. Same signature as anthropic_chat.
 
 
 ## `stdlib/args.rail`
@@ -555,17 +560,44 @@ import "stdlib/<name>.rail"
 
 ### `char_code c`
 
-> char_code and from_char_code — needs FFI or builtin
-> For now, use ordinal values for ASCII
-> These are placeholders that work via shell
+> char_code / from_char_code: use the runtime primitives directly.
+> The previous version shelled out via `printf '%d'` per character,
+> which made any base64 op O(N) forks (a 64-byte sig = 64 forks).
 
 ### `from_char_code n`
 
 
-### `hex_byte n`
+### `b64_idx_of_byte c`
 
 
-### `hex_digit n`
+### `b64_idx_of_byte_lo n`
+
+
+### `b64_idx_of_byte_dig n`
+
+
+### `b64_idx_of_byte_sym n`
+
+
+### `b64_filter_bytes cs acc`
+
+
+### `b64_decoded_byte_len n`
+
+
+### `b64_dec_full_bytes cs out off`
+
+
+### `b64_dec_tail3_bytes cs out off`
+
+
+### `b64_dec_tail2_bytes cs out off`
+
+
+### `b64_dec_loop_bytes cs out off`
+
+
+### `base64_decode_bytes s`
 
 
 
@@ -985,6 +1017,10 @@ import "stdlib/<name>.rail"
 
 ### `string_to_bytes_at cs arr i`
 
+> WARNING: do not check `length cs == 0` as the loop guard here.
+> `length` on a Rail cons-list is O(N), so the recursive walk would
+> be O(N^2) and a 360 KB string took *hours* before this was fixed.
+> Pattern-match on the empty list shape instead, which is O(1).
 
 ### `string_to_bytes s`
 
@@ -1322,6 +1358,177 @@ import "stdlib/<name>.rail"
 
 
 
+## `stdlib/codesign.rail`
+
+### `cs_magic_embedded_signature`
+
+
+### `cs_magic_codedirectory`
+
+
+### `cs_magic_requirements`
+
+
+### `cs_slot_codedirectory`
+
+
+### `cs_slot_requirements`
+
+
+### `cs_adhoc_flag`
+
+
+### `cs_hashtype_sha256`
+
+
+### `cs_hashsize_sha256`
+
+
+### `cs_execseg_main_binary`
+
+
+### `cd_version_20400`
+
+> CodeDirectory version that supports execSeg fields (Apple Silicon).
+
+### `cd_pagesize_log2_16k`
+
+> Page size as log2.  Canonical codesign uses 14 (= 16 KB page).
+
+### `cs_u32_be buf off v`
+
+
+### `cs_u64_be buf off v`
+
+
+### `cs_ident_string`
+
+
+### `cs_ident_len`
+
+
+### `cs_cd_fixed_size`
+
+
+### `cs_cd_special_slots`
+
+
+### `cs_cd_code_slots`
+
+
+### `cs_cd_hashes_size`
+
+
+### `cs_cd_size`
+
+
+### `cs_req_size`
+
+
+### `cs_sb_header_size`
+
+
+### `cs_sb_index_size`
+
+
+### `cs_sig_total_size`
+
+
+### `cs_off_cd`
+
+> Offsets within the signature blob.
+
+### `cs_off_req`
+
+
+### `cs_cd_ident_off`
+
+> Offsets within the CodeDirectory.
+
+### `cs_cd_hashes_start`
+
+
+### `cs_cd_hash_off_in_cd`
+
+
+### `emit_requirements buf off`
+
+> ============================================================================
+> Emit the empty Requirements wrapper into buf at off.  Returns off+12.
+> ============================================================================
+
+### `emit_cd_header buf off code_limit text_seg_base text_seg_limit`
+
+> ============================================================================
+> Emit the CodeDirectory fixed-size header into buf at off.
+> ============================================================================
+
+### `emit_cd_identifier buf cd_start`
+
+> Write the identifier string at the right offset within the CD.  Returns
+> offset of byte after the trailing NUL.
+
+### `emit_cd_ident_chars buf off cs`
+
+
+### `cs_sha256_range src off n`
+
+> Compute SHA-256 of bytes [off, off+n) in src buffer.  Returns a 32-byte
+> array (the hash digest).
+
+### `cs_copy_hash dst dst_off src`
+
+> Copy 32 bytes from src arr into dst buf at dst_off.
+
+### `cs_copy_hash_loop dst dst_off src i`
+
+
+### `emit_signature binary_buf sig_off code_limit text_base text_limit`
+
+> ============================================================================
+> Top-level: write the full signature blob into `buf` starting at `sig_off`.
+> binary_buf  - the Mach-O buffer being signed
+> sig_off     - file offset where the signature starts (= start of __LINKEDIT)
+> code_limit  - bytes hashed (= sig_off, conventionally)
+> text_base   - __TEXT segment base in the file (0)
+> text_limit  - __TEXT segment file size
+> 
+> Caller must have written LC_CODE_SIGNATURE referencing
+> (dataoff = sig_off, datasize = cs_sig_total_size) BEFORE calling this,
+> so the page hash captures the LC entry itself.
+> ============================================================================
+
+### `cs_n_code_pages code_limit`
+
+> ============================================================================
+> GENERALIZED ad-hoc signer — N code pages (16K each). The fixed emit_signature
+> above only handles a 1-page binary; emit_signature_n handles any size by
+> sizing the CodeDirectory + SuperBlob dynamically and hashing each 16K page
+> into its own code slot. Returns sig_off + total_size.
+> n_code   = ceil(code_limit / 16384)
+> cd_size  = 96 + (2 + n_code) * 32        (96 = 88 header + 8 ident; 2 special slots)
+> total    = 12 + 16 + cd_size + 12 = cd_size + 40
+> off_req  = 28 + cd_size
+> Call emit_signature_total_n first to size LC_CODE_SIGNATURE.datasize + file.
+> ============================================================================
+
+### `cs_cd_size_n n_code`
+
+
+### `cs_total_size_n code_limit`
+
+
+### `emit_cd_header_n buf off cd_size n_code code_limit text_base text_limit`
+
+
+### `emit_code_slots_n buf cd_start code_limit n_code i`
+
+> hash each 16K page [i*16384, min(code_limit,(i+1)*16384)) into code slot i
+
+### `emit_signature_n binary_buf sig_off code_limit text_base text_limit`
+
+
+
 ## `stdlib/concurrent.rail`
 
 ### `rc_chan_make capacity`
@@ -1358,6 +1565,53 @@ import "stdlib/<name>.rail"
 
 > Join a task handle; blocks until the thread exits. Returns the int64
 > result the worker stored on exit.
+
+### `chan_send_v ch v`
+
+
+### `chan_recv_v ch`
+
+
+### `chan_send_float ch f`
+
+> Float convenience aliases (ARM64: floats are register-raw doubles, so
+> the v1 box path bit-preserves them; on x86 floats are heap-boxed
+> pointers and ride the same path — the box ends up holding the boxed-
+> float pointer rather than raw d-bits, which is identical from the
+> recv-side semantics).
+
+### `chan_recv_float ch`
+
+
+### `select handles`
+
+> `select` is the typed-value variant: assumes channels carry boxed
+> values (sent via chan_send_v / chan_send_float). Returns the logical
+> Rail value, not the wire box pointer.
+
+### `select_with_default handles default_val`
+
+> `select_with_default` is the non-blocking typed-value variant.
+> Returns (-1, default_val) immediately if no channel has a value.
+
+### `select_int handles`
+
+> `select_int` is the raw int64 variant for channels used via the v0
+> rc_chan_send / rc_chan_recv API. Returns the wire value as a tagged
+> int. The C side pre-retags the wire bits before writing the out-slot
+> so Rail can use arr_get directly without further bit manipulation.
+
+### `select_int_with_default handles default_val`
+
+
+### `arr_from_list xs n`
+
+> Small helper: copy a list into a freshly-allocated mutable array of the
+> given length. Used to flatten the handle list into a layout the C bridge
+> can index by offset.
+
+### `arr_fill_from_list a xs i`
+
 
 
 ## `stdlib/cortexm_runtime.rail`
@@ -1401,6 +1655,174 @@ import "stdlib/<name>.rail"
 
 ### `cm_finalize s`
 
+
+
+## `stdlib/csv.rail`
+
+### `csv_dq`
+
+> Single-character constants synthesized at runtime (no \r literal in Rail).
+
+### `csv_cr`
+
+
+### `csv_lf`
+
+
+### `csv_rev xs`
+
+> Reverse a list (local; avoids importing list.rail).
+
+### `csv_rev_acc xs acc`
+
+
+### `csv_finish_field rev_chars`
+
+> Turn an accumulated (reversed) list of single-char strings into a field.
+
+### `csv_parse_line line`
+
+
+### `csv_unq cs cur fields`
+
+> Outside quotes.
+
+### `csv_inq cs cur fields`
+
+> Inside quotes. A "" is an escaped quote; a lone " closes the field.
+
+### `csv_parse text`
+
+
+### `csv_push_row cur fields rows`
+
+> Close the current record and push it onto rows (reversing its fields).
+
+### `csv_doc_unq cs cur fields rows`
+
+> Outside quotes (document level).
+
+### `csv_doc_inq cs cur fields rows`
+
+> Inside quotes (document level): newlines/commas are literal data.
+
+### `csv_doc_end cur fields rows`
+
+> End of input: only emit a final record if there's pending content. A file
+> ending in a newline leaves cur=[] and fields=[], which we drop.
+
+### `csv_needs_quote f`
+
+> Does a field need quoting? True if it contains comma, quote, CR, or LF.
+
+### `csv_scan_special cs`
+
+
+### `csv_escape_chars cs`
+
+> Double every embedded quote.
+
+### `csv_quote_field f`
+
+
+### `csv_field_out f`
+
+
+### `csv_fields_out fields`
+
+> Map each field through csv_field_out and join with commas.
+
+### `csv_row_to_string fields`
+
+
+
+## `stdlib/date.rail`
+
+### `is_leap_year y`
+
+> ── Leap year ───────────────────────────────────────────────────────────
+> Gregorian rule: divisible by 4, except centuries, except multiples of 400.
+> No short-circuit in Rail, so the nested-if form keeps the modulos honest.
+
+### `days_from_civil y m d`
+
+> ── days_from_civil (Hinnant) ───────────────────────────────────────────
+> (y, m, d) -> days since 1970-01-01. Inverse of civil_from_days.
+> y is the proleptic Gregorian year; the algorithm shifts so that the year
+> "starts" in March, which makes the leap day fall at the end of the cycle.
+
+### `civil_from_days z`
+
+> ── civil_from_days (Hinnant) ───────────────────────────────────────────
+> days since 1970-01-01 -> [y, m, d]. Inverse of days_from_civil.
+
+### `day_of_week y m d`
+
+> ── Day of week ─────────────────────────────────────────────────────────
+> 1970-01-01 (day 0) was a Thursday. Sunday-based index: shift by +4 then
+> take mod 7. Rail's `%` can yield a negative result for negative operands,
+> so we add 7 and re-mod to land in 0..6 for pre-epoch dates too.
+
+### `date_pad2 n`
+
+> ── Formatting ──────────────────────────────────────────────────────────
+
+### `date_format y m d`
+
+
+### `unix_to_civil secs`
+
+> ── Unix seconds → civil date-time ──────────────────────────────────────
+> Returns [y, m, d, h, mi, s]. Floor-divides so negative (pre-epoch) seconds
+> still produce a valid date with 0 <= h,mi,s in range. UTC, ignores leap secs.
+
+### `datetime_format secs`
+
+
+
+## `stdlib/deque.rail`
+
+### `deque_new _`
+
+> Construct an empty deque
+
+### `deque_is_empty dq`
+
+> True when the deque holds no elements
+
+### `deque_size dq`
+
+> Number of elements (O(n))
+
+### `push_front x dq`
+
+> Push x onto the FRONT
+
+### `push_back x dq`
+
+> Push x onto the BACK
+
+### `pop_front dq`
+
+> Pop from the FRONT -> (value, newDeque)
+> If front is empty, reverse back into front first (rebalance).
+
+### `deque_pop_front_rebalanced f`
+
+> After rebalance, front = reverse(back) and back = [].
+
+### `pop_back dq`
+
+> Pop from the BACK -> (value, newDeque)
+> If back is empty, reverse front into back first (rebalance).
+
+### `deque_pop_back_rebalanced b`
+
+> After rebalance, back = reverse(front) and front = [].
+
+### `deque_to_list dq`
+
+> Convert to an ordinary list in front-to-back order
 
 
 ## `stdlib/dirent.rail`
@@ -1502,7 +1924,23 @@ import "stdlib/<name>.rail"
 > Skip the name field of an answer record. Could be a label sequence
 > ending in 0, or a pointer (first byte's top 2 bits set).
 
+### `dns_set_recv_timeout fd secs`
+
+> Set SO_RCVTIMEO on the UDP socket so a missing reply doesn't hang
+> the process forever (Tailscale's MagicDNS occasionally drops UDP
+> packets; without this, dns_resolve_a blocks indefinitely on retry
+> queries).  macOS BSD: SOL_SOCKET = 0xFFFF, SO_RCVTIMEO = 0x1006.
+> Argument is `struct timeval { time_t tv_sec; suseconds_t tv_usec; }`
+> which is 16 bytes on 64-bit darwin (8 + 8).
+
 ### `dns_resolve_a host`
+
+
+### `dns_resolve_a_try host attempt`
+
+> Up to 3 attempts at 2-second timeout each.  Total worst-case 6 s.
+
+### `dns_resolve_a_once host`
 
 
 ### `dns_send_udp fd buf len ip port`
@@ -1875,6 +2313,12 @@ import "stdlib/<name>.rail"
 
 ### `ed_bytes_eq a b i n`
 
+> Constant-time byte-array equality. XOR-OR-folds across all n bytes
+> regardless of where the first mismatch is. Used for ed25519 signature
+> final-equality (R_lhs == R_rhs) and provenance /verify/<id> compares.
+
+### `ed_bytes_eq_acc a b i n acc`
+
 
 ### `ed_gf_parity a`
 
@@ -1980,8 +2424,24 @@ import "stdlib/<name>.rail"
 ### `ed25519_verify pub_bytes msg_bytes msg_len sig_bytes`
 
 
+### `ed_r_canonical R R_enc`
+
+> Re-encode R and compare to R_enc (which carries the original sign bit
+> in bit 7 of byte 31). Returns 1 if canonical, 0 if non-canonical.
+
 ### `ed25519_verify_step2 pub_bytes msg_bytes msg_len sig_bytes R_enc R`
 
+
+### `ed_a_in_small_subgroup A`
+
+> Returns 1 if 8*A equals the identity point. Identity-encoded bytes:
+> byte 0 = 0x01, bytes 1..31 = 0x00.
+
+### `ed_is_identity_enc enc i acc`
+
+> Identity check: byte 0 must be 1, all other bytes must be 0.
+> Uses XOR-OR-fold so we look at all 32 bytes regardless of where the
+> first deviation is.
 
 ### `ed25519_verify_step3 pub_bytes msg_bytes msg_len sig_bytes R_enc R A`
 
@@ -1990,6 +2450,221 @@ import "stdlib/<name>.rail"
 
 
 ### `ed25519_verify_final R A S k B`
+
+
+
+## `stdlib/ed25519_scalar.rail`
+
+### `sc_l_bytes _`
+
+> ── L as 32-byte LE constant ──────────────────────────────────────────
+
+### `sc_bn_add_inplace a b n`
+
+> a += b, both n-byte LE buffers. Returns carry-out (0 or 1).
+
+### `sc_bn_add_loop a b n i carry`
+
+
+### `sc_bn_sub_inplace a b n`
+
+> a -= b, both n-byte LE buffers. Returns borrow (0 or 1). Caller is
+> responsible for ensuring a >= b before calling (use sc_bn_ge).
+
+### `sc_bn_sub_loop a b n i borrow`
+
+
+### `sc_bn_ge a b n`
+
+> Returns 1 if a >= b (n-byte LE), else 0.
+
+### `sc_bn_ge_loop a b i`
+
+
+### `sc_bn_shl1_inplace a n`
+
+> Shift n-byte LE buffer left by 1 bit, in-place. Returns the bit shifted
+> out of the top.
+
+### `sc_bn_shl1_loop a n i carry`
+
+
+### `sc_bn_shr1_inplace a n`
+
+> Shift n-byte LE buffer right by 1 bit, in-place. Bit shifted in from
+> the top is 0.
+
+### `sc_bn_shr1_from_top a i carry`
+
+
+### `sc_bn_mul a alen b blen out`
+
+> Schoolbook multiply: out[0..(alen+blen)] = a * b. out must be pre-zeroed.
+
+### `sc_bn_mul_outer a alen b blen out i`
+
+
+### `sc_bn_mul_inner a b blen out i j carry`
+
+
+### `sc_bn_mul_carry_propagate out idx carry`
+
+
+### `sc_bn_copy src dst n`
+
+> Copy n bytes from src[0..n] to dst[0..n].
+
+### `sc_bn_copy_loop src dst n i`
+
+
+### `sc_bn_zero buf n`
+
+> Zero n bytes of buf.
+
+### `sc_bn_zero_loop buf n i`
+
+
+### `sc_reduce_bytes_n input n`
+
+> ── sc_reduce_bytes_n: input mod L, where input is n-byte LE ──────────
+> 
+> Method: classical shift-and-subtract long division.
+> Build shifted_L = L << max_shift in an n-byte buffer (with L's top
+> bit landing in input's top bit position).  Then for k = max_shift
+> down to 0, conditionally subtract shifted_L if working >= shifted_L,
+> then shift shifted_L right by 1 bit.  After the loop, working is in
+> [0, L), i.e. the bottom 32 bytes are the result and bytes 32.. are
+> guaranteed zero.
+> 
+> L's top bit is at position 252 (bit 4 of byte 31). For an n-byte input
+> (top bit at most at position 8n-1), max_shift = (8n - 1) - 252 = 8n - 253.
+
+### `sc_bn_shl_n_times a n k`
+
+
+### `sc_reduce_loop working shifted n k`
+
+
+### `sc_reduce input`
+
+> sc_reduce: 64-byte LE input -> 32-byte LE (input mod L).
+
+### `sc_muladd a b c`
+
+> sc_muladd: (a*b + c) mod L. All inputs are 32-byte LE; output is 32-byte LE.
+
+
+## `stdlib/ed25519_sign.rail`
+
+### `ed25519_sk_expand seed`
+
+
+### `ed25519_scalar_mult_base a`
+
+> Encode [a]B for a 32-byte LE scalar a. Returns a fresh 32-byte array.
+
+### `ed25519_pk_from_sk seed`
+
+
+### `ed25519_sign seed msg msg_len`
+
+
+
+## `stdlib/elf.rail`
+
+### `elf_magic_0`
+
+
+### `elf_magic_1`
+
+
+### `elf_magic_2`
+
+
+### `elf_magic_3`
+
+
+### `elf_class_64`
+
+
+### `elf_data_2lsb`
+
+
+### `elf_version`
+
+
+### `elf_osabi_sysv`
+
+
+### `et_exec`
+
+
+### `em_aarch64`
+
+
+### `pt_load`
+
+> Program-header types
+
+### `pt_phdr`
+
+
+### `pf_x`
+
+> Program-header flags
+
+### `pf_w`
+
+
+### `pf_r`
+
+
+### `pf_rx`
+
+
+### `pf_rw`
+
+
+### `ehdr_size`
+
+> Sizes
+
+### `phdr_size`
+
+
+### `elf_text_vaddr`
+
+> Conventional base virtual address for static aarch64 ELFs.
+> (The linker default; the kernel doesn't care as long as PIE isn't set
+> and the address is page-aligned.)
+
+### `elf_page_size`
+
+
+### `elf_emit_ehdr buf off entry phnum`
+
+> entry        = virtual address of the first instruction
+> phoff        = file offset of the first program header (always 64 for us)
+> phnum        = number of program headers
+
+### `elf_emit_phdr buf off p_type p_flags p_offset p_vaddr p_filesz p_memsz p_align`
+
+
+### `elf_emit_tiny buf code_buf code_size`
+
+
+### `elf_copy_bytes dst dst_off src src_off n`
+
+
+### `elf_align_up x a`
+
+
+### `elf_emit_full buf text_buf text_size data_buf data_size bss_size`
+
+> Emit a binary with up to two PT_LOADs (text RX, data RW).  The data
+> segment's memsz extends into bss territory if bss_size > 0.
+
+### `elf_write_file path buf n`
 
 
 
@@ -2018,10 +2693,6 @@ import "stdlib/<name>.rail"
 
 > Open file for appending
 
-### `close fp`
-
-> Close file
-
 ### `slurp path`
 
 > Read entire file as string (uses read_file builtin)
@@ -2037,6 +2708,23 @@ import "stdlib/<name>.rail"
 > because Rail's builtins don't expose append-mode write directly.
 > Promoted from inline copies in self_train.rail / s0_pcfg/tick.rail /
 > s0_pcfg/harvest.rail (originally Empire transplant Session 1).
+
+### `read_file_size path`
+
+> Returns the size in bytes; -1 if the file can't be opened.
+
+### `read_file_bytes path`
+
+> Returns an int array of length file_size with the file's raw bytes,
+> one byte per element.  Empty array on missing file.  Walks the
+> malloc'd C buffer with byte_at -> arr_set so the binary contents
+> survive intact (no NUL truncation, no chars-of-string detour).
+
+### `read_file_bytes_open fp path`
+
+
+### `file_copy_bytes_to_arr buf arr i n`
+
 
 
 ## `stdlib/fit.rail`
@@ -2263,6 +2951,83 @@ import "stdlib/<name>.rail"
 > in write_file).
 
 
+## `stdlib/float_arr.rail`
+
+### `fam_go fn a out i n`
+
+
+### `float_arr_map fn a`
+
+> float_arr_map fn a : apply fn elementwise, returning a fresh same-length array.
+
+### `fam2_go fn a b out i n`
+
+
+### `float_arr_map2 fn a b`
+
+> float_arr_map2 fn a b : apply binary fn elementwise over two same-length arrays.
+
+### `fas_go a n i acc`
+
+> fas_go: reduce-add over the array. acc is a float (threads via ordinary
+> recursion -- float accumulators are not loop-optimized, which is correct here;
+> depth = array length). Mirrors fmv_dot's accumulator convention.
+
+### `float_arr_sum a`
+
+> float_arr_sum a : sum of all elements. The scalar readout the P3 V-series AD
+> detection keys on (f ... = float_arr_sum (float_arr_map g ...)); d(sum)/dx_i = 1.
+
+### `fmv_dot w xv n j i acc`
+
+> fmv_dot: row j dotted with the input vector. acc is a float (threads via
+> ordinary recursion -- float accumulators are not loop-optimized, which is
+> correct here; depth = n, the input width).
+
+### `fmv_go w xv out n j z`
+
+
+### `float_mat_vec w xv`
+
+> float_mat_vec w xv : (out x n) flat matrix times length-n vector -> length-out
+> vector.  z_j = sum_i w[j*n + i] * xv_i.  n = len xv ; out = len w / n.
+
+### `fmvt_acc w ctz n out i j acc`
+
+> fmvt_acc: column i of w^T dotted with ctz (sum over the out rows).
+
+### `fmvt_go w ctz n out i r`
+
+
+### `float_mat_vec_t w ctz`
+
+> float_mat_vec_t w ctz : transpose-matvec.  r_i = sum_j ctz_j * w[j*n + i].
+> out = len ctz ; n = len w / out.  Returns the length-n input-space gradient.
+
+### `fo_inner a b nb j i r`
+
+> fo_inner: fill row j of the outer product (a_j scaled across all of b).
+
+### `fo_go a b na nb j r`
+
+
+### `float_outer a b`
+
+> float_outer a b : flat row-major outer product.  r[j*nb + i] = a_j * b_i.
+> Length na*nb -- the natural shape of the matvec weight gradient outer(ct,x).
+
+### `fd_go a b n i acc`
+
+> fd_go: dot accumulator (float threads via ordinary recursion).
+
+### `float_dot a b`
+
+> float_dot a b : scalar inner product  sum_i a_i * b_i.  The generalized readout
+> L = float_dot y g treats g as a fixed upstream cotangent on the net output y;
+> its VJP wrt y is g, so net__rgrad seeds __cty_i = g_i * __gy. With g = ones this
+> reduces to float_arr_sum (the proven slice-5b readout), so it strictly generalizes.
+
+
 ## `stdlib/fmt.rail`
 
 ### `format template values`
@@ -2472,6 +3237,56 @@ import "stdlib/<name>.rail"
 
 
 ### `ht_remove_pair pairs key`
+
+
+
+## `stdlib/heap.rail`
+
+### `heap_swap a i j`
+
+> swap slots i and j of the backing array.
+
+### `heap_sift_up a i`
+
+> sift-up: bubble the value at slot i toward the root while it is smaller than
+> its parent. Single-arg loop on i; parent index is a let-binding.
+
+### `heap_smaller_child a n i`
+
+> pick the smaller of node i and its two children (returns the index to swap
+> with, or i itself when i is already <= both children / has no children).
+
+### `heap_sift_down a n i`
+
+> sift-down: push the value at slot i toward the leaves while a child is
+> smaller. Single-arg loop on i; child indices live inside heap_smaller_child.
+
+### `heap_new cap`
+
+> heap_new cap : empty min-heap with capacity for `cap` ints. Slot 0 = size.
+
+### `heap_size h`
+
+> heap_size h : number of elements currently in the heap.
+
+### `heap_peek h`
+
+> heap_peek h : the minimum element, or 0 when the heap is empty.
+
+### `heap_push h v`
+
+> heap_push h v : insert v and restore the heap property. Returns h.
+
+### `heap_pop h`
+
+> heap_pop h : remove and return the minimum. Returns 0 if empty. The last
+> element is moved to the root and sifted down to restore the invariant.
+
+### `heapify_go h xs`
+
+> heapify_from_list xs : build a heap holding every int in xs (insert each).
+
+### `heapify_from_list xs`
 
 
 
@@ -2848,6 +3663,12 @@ import "stdlib/<name>.rail"
 ### `https_post_app_phase fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs`
 
 
+### `hc_build_put host path ctype body hdrs`
+
+
+### `https_put_app_phase fd host path ctype body hdrs priv ch_msg ch_msg_len sh_msg sh_msg_len fb fl c_hs`
+
+
 ### `https_post_url_unsafe_noverify url ctype body hdrs`
 
 > URL-form POST: https_post_url_unsafe_noverify url content_type body extra_hdrs.
@@ -3115,6 +3936,9 @@ import "stdlib/<name>.rail"
 ### `hs_drive_post fd host path ctype body hdrs store`
 
 
+### `hs_drive_put fd host path ctype body hdrs store`
+
+
 ### `https_get_with_store store host ip port path`
 
 
@@ -3133,6 +3957,15 @@ import "stdlib/<name>.rail"
 ### `https_post_url url ctype body hdrs`
 
 
+### `https_put_with_store store host ip port path ctype body hdrs`
+
+
+### `https_put host ip port path ctype body hdrs`
+
+
+### `https_put_url url ctype body hdrs`
+
+
 ### `https_get_strict host ip port path`
 
 
@@ -3146,6 +3979,221 @@ import "stdlib/<name>.rail"
 
 
 
+## `stdlib/jit.rail`
+
+### `jit_compile_rmsnorm_qkv _`
+
+> Compile the fused rmsnorm+QKV kernel.  Source is emitted by jit_emit.
+
+### `jit_run_rmsnorm_qkv kid x_arr g_arr wq_arr wk_arr wv_arr qkv_packed seq d`
+
+> Dispatch.  Packs SEQ+D into one int (Rail FFI's 8-arg cap).
+
+### `jit_compile_silu_hadamard _`
+
+> Compile the fused silu+hadamard kernel.  Source is emitted by jit_emit.
+
+### `jit_run_silu_hadamard kid g_arr u_arr out_sig n`
+
+> Dispatch.  `out_sig` is a packed buffer of 2*N doubles: h_act in
+> [0, N), sigmoid(gate) in [N, 2N).
+
+### `jit_compile_rmsnorm_qkv_shaped seq d`
+
+> ───────────────────────────────────────────────────────────────────────
+> Phase 2.9 v1.5 — shape-specialized compile entry points.  Take concrete
+> dimensions, emit shape-baked MSL via jit_emit.rail's *_shaped emitters,
+> JIT-compile.  Returns a kid specialized to those dims; Metal can fully
+> unroll the D-loops.  Dispatch wrappers (jit_run_*) stay shape-agnostic.
+> ───────────────────────────────────────────────────────────────────────
+
+### `jit_compile_silu_hadamard_shaped n`
+
+
+
+## `stdlib/jit_emit.rail`
+
+### `emit_msl_rmsnorm_qkv _`
+
+> ───────────────────────────────────────────────────────────────────────
+> Generic-shape emitters (Phase 2.5).  Kept for v5.1.0 callers and for
+> the byte-verification fixtures.
+> ───────────────────────────────────────────────────────────────────────
+
+### `emit_msl_silu_hadamard _`
+
+
+### `emit_msl_rmsnorm_qkv_shaped seq d`
+
+> ───────────────────────────────────────────────────────────────────────
+> Phase 2.9 v1.5 — shape-specialized emitters.  Each call returns MSL
+> where the dimensions are top-level `constant uint` declarations
+> instead of buffer arguments.  Metal can fully unroll the D-loops.
+> Different (SEQ, D) produces different bytes, validated in the
+> jit_emit_shaped_smoke fuzz check.
+> ───────────────────────────────────────────────────────────────────────
+
+### `emit_msl_silu_hadamard_shaped n`
+
+
+### `emit_msl_idot_shaped rows d`
+
+> ───────────────────────────────────────────────────────────────────────
+> Integer-exact kernels (attested-GPU track, 2026-07-03).
+> 
+> int32 inputs, int64 accumulate -- no floats anywhere, so the result
+> is the SAME BITS on every device that runs it.  That is what lets a
+> GPU dispatch join the attestation chain: the CPU reference (plain
+> Rail 63-bit integers) and the emitted GPU kernel are twin
+> implementations of one exact computation, and agreement is
+> byte-equality, not "close enough".
+> 
+> Caller contract: |A[i]|, |B[j]| < 2^15 and d <= 2^16 keeps every
+> accumulator below 2^46 -- exact in Metal's int64 AND in Rail's
+> 63-bit tagged ints, with headroom.
+> ───────────────────────────────────────────────────────────────────────
+
+### `node_seq node`
+
+> ───────────────────────────────────────────────────────────────────────
+> Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
+> The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
+> its N = seq * d_ff.
+> ───────────────────────────────────────────────────────────────────────
+
+### `node_d   node`
+
+
+### `node_n   node`
+
+
+### `emit_msl_for_match _ m`
+
+> ───────────────────────────────────────────────────────────────────────
+> Pattern dispatch — Phase 2.5 generic stubs.
+> ───────────────────────────────────────────────────────────────────────
+
+### `emit_msl_for_match_shaped tape m`
+
+> ───────────────────────────────────────────────────────────────────────
+> Phase 2.9 v1.5 — shape-aware dispatch.  Looks up the matched node's
+> shape and emits specialized MSL.
+> ───────────────────────────────────────────────────────────────────────
+
+
+## `stdlib/jit_match.rail`
+
+### `match_kind m`
+
+
+### `find_matmul_children tape p i n acc`
+
+> ───────────────────────────────────────────────────────────────────────
+> Children search.
+> find_matmul_children tape p i n acc:
+> walk tape from index i to n, accumulating tape indices of "matmul"
+> nodes whose parents[0] == p.  Returns the list in tape order.
+> ───────────────────────────────────────────────────────────────────────
+
+### `find_hadamard_child tape p i n`
+
+> Returns -1 if no matching hadamard child found.
+
+### `try_qkv_match tape rms_idx n acc`
+
+> ───────────────────────────────────────────────────────────────────────
+> Per-pattern emitters.  Each appends 0 or 1 FuseMatch to acc.
+> ───────────────────────────────────────────────────────────────────────
+
+### `try_silu_match tape silu_idx n acc`
+
+
+### `walk_tape_loop tape i n acc`
+
+> ───────────────────────────────────────────────────────────────────────
+> Main walker.
+> ───────────────────────────────────────────────────────────────────────
+
+### `walk_tape tape`
+
+
+### `dump_match m`
+
+> ───────────────────────────────────────────────────────────────────────
+> Debug helper: print all matches one per line.
+> ───────────────────────────────────────────────────────────────────────
+
+### `dump_matches_loop ms`
+
+
+### `dump_matches ms`
+
+
+
+## `stdlib/jit_node.rail`
+
+### `jit_tape_new _`
+
+
+### `jit_tape_push tape node`
+
+
+### `jit_tape_get tape i`
+
+
+### `jit_tape_get_acc tape i cur`
+
+
+### `jit_nth n xs`
+
+> Same as stdlib/tensor.rail's list_nth.  Named jit_nth so consumers of
+> jit_node can avoid importing tensor.rail (which would re-introduce a
+> duplicate-symbol path through transformer for callers like
+> lm_v3_chunked_jit_long that import transformer directly).
+
+### `traced_value t`
+
+
+### `traced_idx   t`
+
+
+### `node_tag     n`
+
+
+### `node_shape   n`
+
+
+### `node_dtype   n`
+
+
+### `node_parents n`
+
+
+### `jit_tape_dump_loop tape n i`
+
+
+### `jit_tape_dump tape`
+
+
+
+## `stdlib/jit_tape.rail`
+
+### `jit_leaf tape t dtype`
+
+> Wrap an existing Tensor as a leaf TracedTensor.  Pushes a "leaf" node
+> onto the tape that codegen treats as a kernel input buffer.
+
+### `traced_rmsnorm tape x g dtype`
+
+> traced_rmsnorm: trace + execute rmsnorm.  Returns updated tape + a
+> TracedTensor for the y output (rstd is dropped for now; Phase 3 may
+> need it as a separate tape entry for backward).
+
+### `traced_matmul tape a b dtype`
+
+> traced_matmul: trace + execute (default f64) matmul.
+
+
 ## `stdlib/json.rail`
 
 ### `json_skip_ws cs`
@@ -3156,13 +4204,29 @@ import "stdlib/<name>.rail"
 
 > Parse a JSON string value (after opening quote)
 
+### `json_num_char c`
+
+> Recognize a character that can appear inside a JSON number token.
+> Accumulating the WHOLE token (digits, sign, decimal point, exponent)
+> is what lets json_float recover the real value -- the old version only
+> kept digits and '-', so "0.0003" / "1.5" / "1e5" silently truncated.
+
 ### `json_parse_num cs acc`
 
-> Parse a JSON number (integer only for now)
+> Parse a JSON number token.  Captures the full numeric lexeme so the
+> accessors can interpret it as either int (json_int) or float (json_float).
 
 ### `json_parse cs`
 
 > Parse a JSON value, returns (value, remaining_chars)
+
+### `json_str_to_int s`
+
+> Pure-Rail string->int.  `to_int` is float-only and silently returns 0
+> for plain integer strings.
+
+### `json_str_to_int_acc cs acc sign`
+
 
 ### `json_parse_array cs acc`
 
@@ -3189,7 +4253,14 @@ import "stdlib/<name>.rail"
 
 ### `json_int val`
 
-> Get int value
+> Get int value (truncated integer part of the number)
+
+### `json_float val`
+
+> Get float value.  Re-parses the raw numeric token captured at parse
+> time, so fractional/exponent fields ("0.0003", "1.5", "1e5") survive.
+> Falls back to the integer slot promoted to float for older two-element
+> ["num", n] values.
 
 ### `json_items val`
 
@@ -3197,7 +4268,28 @@ import "stdlib/<name>.rail"
 
 ### `json_encode val`
 
-> Serialize JSON value to string
+> Serialize JSON value to string.  Split into per-tag helpers because
+> a single `if/then/else` chain with let-bindings under several arms,
+> plus a multi-line lambda inside `map`, defeated the parser; flat
+> helpers parse cleanly and read better anyway.
+
+### `json_encode_str val`
+
+
+### `json_encode_num val`
+
+
+### `json_encode_bool val`
+
+
+### `json_encode_arr val`
+
+
+### `json_encode_pair p`
+
+
+### `json_encode_obj val`
+
 
 ### `drop n xs`
 
@@ -3258,10 +4350,44 @@ import "stdlib/<name>.rail"
 
 ### `sort xs`
 
-> Sort (insertion sort — good enough for small lists)
+> Sort (insertion sort — ascending, good enough for small lists)
 
 ### `insert x sorted`
 
+
+### `cmp tag a b`
+
+> sort_by: insertion sort driven by a NAMED comparator passed as a
+> function-tag string. The tag is dispatched internally via match, so no
+> lambda or function value crosses an argument boundary (lambda-comparator
+> args can segfault). Built-in tags: "asc" (a<=b) and "desc" (a>=b).
+> `cmp tag a b` returns true iff `a` should come before `b`.
+
+### `sort_by tag xs`
+
+
+### `insert_by tag x sorted`
+
+
+### `msort xs`
+
+> msort: true merge sort, ascending, O(n log n) — for large lists.
+> The list is split into two halves by alternating elements
+> (msplit_a / msplit_b mutual recursion — a self-loop divide that
+> changes two accumulators would miscompile). Each half is sorted
+> recursively and the two sorted halves are merged.
+
+### `msplit_a xs ls rs`
+
+> Alternating split: even-index elements to ls, odd-index to rs.
+> Mutual recursion avoids the two-accumulator self-loop trap.
+
+### `msplit_b xs ls rs`
+
+
+### `merge_sorted a b`
+
+> Merge two ascending-sorted lists into one ascending-sorted list.
 
 
 ## `stdlib/llm.rail`
@@ -3327,6 +4453,238 @@ import "stdlib/<name>.rail"
 
 
 
+## `stdlib/macho.rail`
+
+### `mh_magic_64`
+
+> 64-bit Mach-O magic, little-endian on disk.
+
+### `cpu_type_arm64`
+
+> CPU types
+
+### `cpu_subtype_arm64_all`
+
+
+### `mh_execute`
+
+> File types
+
+### `mh_noundefs`
+
+> Header flags
+
+### `mh_dyldlink`
+
+
+### `mh_twolevel`
+
+
+### `mh_pie`
+
+
+### `mh_flags_pie_exec`
+
+> Composite flag used by our exit-42 reference: 0x00200085
+
+### `lc_segment_64`
+
+> Load command codes
+
+### `lc_symtab`
+
+
+### `lc_dysymtab`
+
+
+### `lc_load_dylinker`
+
+
+### `lc_uuid`
+
+
+### `lc_main`
+
+
+### `lc_build_version`
+
+
+### `lc_code_signature`
+
+
+### `vm_prot_none`
+
+> VM protection flags
+
+### `vm_prot_read`
+
+
+### `vm_prot_write`
+
+
+### `vm_prot_execute`
+
+
+### `vm_prot_rx`
+
+
+### `vm_prot_r`
+
+
+### `s_attr_pure_instructions`
+
+> Section attribute flags for __text
+
+### `s_attr_some_instructions`
+
+
+### `section_text_flags`
+
+
+### `platform_macos`
+
+> Platform IDs for LC_BUILD_VERSION
+
+### `pagezero_vmsize`
+
+> Standard macOS layout
+
+### `text_vmaddr`
+
+
+### `page_size`
+
+
+### `mw_u8 buf off v`
+
+> Write one byte at off. Returns next offset.
+
+### `mw_u16 buf off v`
+
+> little-endian u16 (used by nlist_64 n_desc)
+
+### `mw_u32 buf off v`
+
+> Write 4 bytes little-endian.
+
+### `mw_u64 buf off v`
+
+> Write 8 bytes little-endian. Rail's int is tagged 63-bit, so values up to
+> ~9.2e18 fit; for our purposes (offsets, sizes, vmaddrs up to 0x1_0000_4000)
+> this is fine.
+
+### `mw_str_padded buf off str len`
+
+> Write a fixed-length zero-padded string. Used for segname (16 bytes)
+> and sectname (16 bytes). String content is copied; remainder zero-fills.
+
+### `mw_str_copy buf off cs i n`
+
+
+### `mw_zeros buf off n`
+
+
+### `mw_copy_bytes dst dst_off src src_off n`
+
+> Copy n bytes from src buffer @ src_off into dst buffer @ dst_off.
+
+### `mw_cstr buf off str`
+
+> Write a NUL-terminated C string at off. Returns offset after the NUL.
+
+### `mw_cstr_copy buf off cs`
+
+
+### `emit_mach_header buf off ncmds sizeofcmds flags`
+
+
+### `emit_segment_64_nosects buf off segname vmaddr vmsize fileoff filesize maxprot initprot`
+
+> Emit a no-section segment (used by __PAGEZERO and __LINKEDIT).
+> cmdsize = 72.
+
+### `emit_segment_64_text buf off vmaddr vmsize fileoff filesize sect_addr sect_size sect_offset sect_align`
+
+> Emit an LC_SEGMENT_64 with a single __text section. cmdsize = 72 + 80 = 152.
+> Used for __TEXT.
+
+### `emit_symtab buf off symoff nsyms stroff strsize`
+
+> ============================================================================
+> LC_SYMTAB (24 bytes)
+> ============================================================================
+
+### `emit_dysymtab_empty buf off`
+
+> ============================================================================
+> LC_DYSYMTAB (80 bytes — all zeros except cmd+size for a no-dylib binary)
+> ============================================================================
+
+### `emit_dysymtab_zeros buf off n`
+
+
+### `emit_load_dylinker buf off`
+
+> ============================================================================
+> LC_LOAD_DYLINKER (32 bytes for "/usr/lib/dyld\0" + padding)
+> Header is 12 bytes; name starts at offset 12; total 32 bytes; remainder zero.
+> ============================================================================
+
+### `emit_uuid buf off`
+
+> ============================================================================
+> LC_UUID (24 bytes) — 16-byte UUID
+> Phase 1: emit a deterministic placeholder (all zeros except version nibble).
+> Phase 2 will hash the binary content into the UUID for traceability.
+> ============================================================================
+
+### `pack_version major minor patch`
+
+> ============================================================================
+> LC_BUILD_VERSION (32 bytes; one tool entry)
+> Version encoding: X.Y.Z → (X << 16) | (Y << 8) | Z
+> ============================================================================
+
+### `emit_build_version buf off minos_packed sdk_packed`
+
+
+### `emit_main buf off entryoff stacksize`
+
+> ============================================================================
+> LC_MAIN (24 bytes)
+> ============================================================================
+
+### `emit_code_signature_lc buf off dataoff datasize`
+
+> ============================================================================
+> LC_CODE_SIGNATURE (16 bytes) — points at the embedded SuperBlob in __LINKEDIT
+> ============================================================================
+
+### `hex_digits`
+
+
+### `hex_char_at i`
+
+
+### `drop_chars n cs`
+
+
+### `macho_byte_to_hex b`
+
+
+### `macho_buf_to_hex_chars buf i acc`
+
+
+### `macho_buf_to_hex buf n`
+
+
+### `macho_write_file path buf n`
+
+> Write the byte buffer to disk via hex+xxd pipeline. The resulting
+> file is also chmod +x so it's ready to codesign + run.
+> Returns 0 on success, non-zero on shell failure.
+
+
 ## `stdlib/map.rail`
 
 ### `map_new _`
@@ -3381,6 +4739,33 @@ import "stdlib/<name>.rail"
 
 > Clamp int to range
 
+### `clamp_i lo hi x`
+
+> Clamp int to range (explicit name; same as clamp, kept for clarity)
+
+### `is_nan x`
+
+> Float classification --------------------------------------------------------
+> NaN is the only IEEE 754 value not equal to itself. The float == path lowers
+> to fcmp ONLY when the operand is statically known to be a float. A bare
+> function parameter `x` is untyped, so `x == x` would lower to an integer/tag
+> compare (boxed pointer == itself -> always true) and miss NaN. We force the
+> float domain with `let xf = x +. 0.0`; that marks xf as float so xf == xf
+> correctly lowers to fcmp. Verified: is_nan (0.0 /. 0.0) -> 1, is_nan 1.0 -> 0.
+
+### `is_inf x`
+
+> Largest finite double sentinels. 1.0e308 is safe to write as a literal; we
+> keep the comparison threshold as 1.0e308 itself. We do NOT write a +inf
+> literal (no such literal form, and big-literal codegen is a trap) -- real
+> infinities arise at runtime via overflowing arithmetic and compare strictly
+> greater than 1.0e308. The `+. 0.0` promotion is applied so the dotted float
+> comparisons lower to fcmp across the function boundary.
+
+### `is_finite x`
+
+> Finite = not NaN and not infinite. Avoids && (no short-circuit) by nesting.
+
 
 ## `stdlib/metal_kernel.rail`
 
@@ -3401,6 +4786,454 @@ import "stdlib/<name>.rail"
 ### `metal_apply_unary src name x_arr`
 
 > Apply a Metal kernel to a float_arr.  Returns a fresh float_arr.
+
+
+## `stdlib/mhd_axisym.rail`
+
+### `ma_nr`
+
+
+### `ma_nz`
+
+
+### `ma_nrnz`
+
+
+### `ma_nfields`
+
+
+### `ma_state_size`
+
+
+### `ma_nrm1`
+
+> Hoisted boundary-arithmetic constants.
+> Working around a Rail compiler bug where `(ma_nz - 2)` and similar
+> inline `(named_int - small_int)` expressions, when passed as a
+> positional function argument alongside another integer parameter
+> whose value is 0, produce wrong index computation in the callee.
+> Pattern verified 2026-04-28: `ma_get s f j (ma_nz - 2)` fails for
+> j=0 (returns 0 instead of the cell value), but `ma_get s f j 62`
+> and `ma_get s f j ma_nzm2` both work.  Investigation deferred to
+> a separate compiler-level session; meanwhile, hoist all such
+> expressions to named module-level constants.
+
+### `ma_nrm2`
+
+
+### `ma_nzm1`
+
+
+### `ma_nzm2`
+
+
+### `ma_f_rho`
+
+
+### `ma_f_mr`
+
+
+### `ma_f_mz`
+
+
+### `ma_f_en`
+
+
+### `ma_f_bt`
+
+
+### `ma_idx f j i`
+
+
+### `ma_get s f j i`
+
+
+### `ma_put s f j i v`
+
+
+### `ma_pressure s j i`
+
+
+### `ma_flux_r s j i fa`
+
+
+### `ma_flux_z s j i fa`
+
+
+### `ma_cell_speed s j i`
+
+
+### `ma_speed_check s i acc`
+
+
+### `ma_speed_loop s i acc`
+
+
+### `ma_max_speed s`
+
+
+### `ma_is_boundary j i`
+
+
+### `ma_inlet_b_theta j ctx`
+
+
+### `ma_apply_bc s ns ctx j i`
+
+
+### `ma_lxf_apply s ns ctx frp frm fzp fzm j i f`
+
+
+### `ma_lxf_cell s ns ctx frp frm fzp fzm j i`
+
+
+### `ma_step_one s ns ctx frp frm fzp fzm i`
+
+> Per-cell dispatch.  ctx carries inlet + coeffs; this keeps the outer
+> loop's recursive call at exactly 8 args (Rail's TCO sweet spot).
+
+### `ma_step_loop s ns ctx frp frm fzp fzm i`
+
+
+### `ma_lxf_step s ctx dt`
+
+> ma_lxf_step now takes the ctx array directly (caller builds it once,
+> reuses across many steps).  See ma_make_ctx below for the helper.
+
+### `ma_make_ctx rho_in vz_in p_in i_arc r_min r_max dr dz`
+
+> Construct ctx from operating-point parameters.  dt-derived coeffs
+> are filled later by ma_lxf_step.
+
+### `ma_init_cell s ctx i`
+
+
+### `ma_init_loop s ctx i`
+
+
+### `ma_init_state ctx`
+
+
+### `ma_sum_field s f i acc`
+
+
+### `ma_total_mass s`
+
+
+### `ma_total_energy s`
+
+
+### `ma_max_bt_check s i acc`
+
+
+### `ma_max_bt_loop s i acc`
+
+
+### `ma_max_b_theta s`
+
+
+
+## `stdlib/mhd_kernel.rail`
+
+### `mk_nn`
+
+
+### `mk_nn2`
+
+
+### `mk_state_size`
+
+
+### `mk_f_rho`
+
+
+### `mk_f_mx`
+
+
+### `mk_f_my`
+
+
+### `mk_f_bx`
+
+
+### `mk_f_by`
+
+
+### `mk_f_en`
+
+
+### `mk_wrap i`
+
+
+### `mk_idx f x y`
+
+
+### `mk_get state f x y`
+
+
+### `mk_put state f x y v`
+
+
+### `mk_init_cell state i`
+
+
+### `mk_init_loop state i`
+
+
+### `mk_init_state`
+
+
+### `mk_pressure state x y`
+
+
+### `mk_x_flux state x y fa`
+
+
+### `mk_y_flux state x y fa`
+
+
+### `mk_cell_speed state x y`
+
+
+### `mk_speed_check state i acc`
+
+
+### `mk_speed_loop state i acc`
+
+
+### `mk_max_speed state`
+
+
+### `mk_lxf_update_fields state ns coeffs fxr fxl fyu fyd x y f`
+
+
+### `mk_lxf_update_cell state ns coeffs fxr fxl fyu fyd x y`
+
+
+### `mk_lxf_step_cell state ns coeffs fxr fxl fyu fyd i`
+
+
+### `mk_lxf_loop state ns coeffs fxr fxl fyu fyd i`
+
+
+### `mk_lxf_step state dt`
+
+
+### `mk_lxf_step_into state ns dt coeffs fxr fxl fyu fyd`
+
+> In-place variant: writes the next state into caller-owned `ns`, plus
+> caller-owned scratch buffers. Returns 0. Use this in long-running
+> drivers (e.g. the entropy beacon) so per-frame allocation is bounded
+> and the conservative GC doesn't have to chase 768 KB state buffers
+> every step. coeffs must be float_arr_new 2; fxr/fxl/fyu/fyd must be
+> float_arr_new 6 each. ns must be float_arr_new mk_state_size.
+
+### `mk_compute_dt state`
+
+> CFL: dt = 0.2 * dx / max_speed = 0.00981747704246810 / smax
+
+### `mk_minmod a b`
+
+> minmod: zero at extrema, smaller-magnitude argument otherwise.
+
+### `mk_slope_x_at state f x y`
+
+
+### `mk_slope_y_at state f x y`
+
+
+### `mk_slope_cell_fields state slx sly x y f`
+
+
+### `mk_slope_loop state slx sly i`
+
+
+### `mk_recon_xL state slx f x y`
+
+> Reconstruct conserved field f at the right side of cell x (interface x+1/2):
+> Left state of interface = cell x + half slope.
+> Right state of interface = cell x+1 - half slope.
+
+### `mk_recon_xR state slx f x y`
+
+
+### `mk_recon_yL state sly f x y`
+
+
+### `mk_recon_yR state sly f x y`
+
+
+### `mk_pack_xL state slx x y u f`
+
+> Pack reconstructed conserved vectors into 6-element arrays at an x-interface.
+
+### `mk_pack_xR state slx x y u f`
+
+
+### `mk_pack_yL state sly x y u f`
+
+
+### `mk_pack_yR state sly x y u f`
+
+
+### `mk_x_flux_from_u u fa`
+
+> Ideal MHD flux from a 6-element conserved vector.
+> Includes positivity floors on density and pressure — drives the
+> positivity-preserving property of the whole MUSCL scheme.
+
+### `mk_y_flux_from_u u fa`
+
+
+### `mk_wave_speed_u u`
+
+
+### `mk_rusanov_assemble uL uR fL fR fi alpha f`
+
+> Rusanov / local-Lax-Friedrichs interface flux assembler.
+> F_iface = ½(F(uL) + F(uR)) - ½α(uR - uL),  α = max(c_L, c_R).
+
+### `mk_rusanov_x uL uR fL fR fi`
+
+
+### `mk_rusanov_y uL uR fL fR fi`
+
+
+### `mk_muscl_apply state ns dt_dx dt_dy fxR fxL fyU fyD x y f`
+
+> Apply the interface-flux divergence to one cell, all 6 fields.
+> Density floor enforced post-update; pressure floor lives in fluxes.
+
+### `mk_muscl_cell state slx sly ns dt_dx dt_dy uL uR fL fR fxR fxL fyU fyD x y`
+
+
+### `mk_muscl_loop state slx sly ns dt_dx dt_dy uL uR fL fR fxR fxL fyU fyD i`
+
+
+### `mk_muscl_step state dt`
+
+
+### `mk_compute_dt_muscl state`
+
+> MUSCL + Rusanov + forward-Euler is stable up to CFL ≈ 0.5 in 2D;
+> 0.3 leaves comfortable headroom and matches the LF dt scale.
+
+### `mk_sum_field state f i acc`
+
+
+### `mk_total_mass state`
+
+
+### `mk_total_energy state`
+
+
+### `mk_divb_cell state i`
+
+
+### `mk_divb_check state i acc`
+
+
+### `mk_divb_loop state i acc`
+
+
+### `mk_max_div_b state`
+
+
+### `mk_minrho_check state i acc`
+
+
+### `mk_minrho_loop state i acc`
+
+
+### `mk_min_density state`
+
+
+### `mk_dump_row state field y i acc`
+
+
+### `mk_dump_field_rows state field y acc`
+
+
+### `mk_dump_field state field path`
+
+
+### `mk_prim_buffer_size`
+
+
+### `mk_fill_primitives state out i`
+
+
+### `mk_dump_primitives_bin state out path`
+
+> Caller provides `out` (a float_arr_new mk_prim_buffer_size 0.0) once at
+> daemon start and reuses it across frames.
+
+### `mk_print_diag step state m0 e0 dt t`
+
+
+
+## `stdlib/mhd_mpd.rail`
+
+### `mpd_gaussian z z0 sigma`
+
+> Smooth (1 - x^2)^2 polynomial bump on |x| <= 1, zero outside.
+> Avoids the exp foreign call (which has had segfault interaction with
+> the GC under arena pressure) while staying C2-continuous and matching
+> a Gaussian envelope to within ~10% on the |x| <= 1.5 sigma region.
+
+### `mpd_radial_falloff r r_anode`
+
+
+### `mpd_bz_at_z coils n_coils idx z acc`
+
+> Sum contributions of all coils at axial position z.
+
+### `mpd_build_bz_field bz coils n_coils r_min r_max dr dz i`
+
+
+### `mpd_build_br_field br bz dr dz i`
+
+> B_r from solenoid continuity: B_r ≈ -(r/2) * dB_z/dz (paraxial).
+
+### `mpd_build_applied bz br coils n_coils r_min r_max dr dz`
+
+> Top-level builder: takes coil pack + geometry, fills bz and br.
+
+### `mpd_jz_self s r_min dr j i`
+
+
+### `mpd_jr_self s dz j i`
+
+
+### `mpd_jt_app bz br dr dz j i`
+
+
+### `mpd_apply_geometry s ns r_min dr dt j i`
+
+
+### `mpd_apply_lorentz s ns bz br r_min dr dz dt j i`
+
+
+### `mpd_apply_ohmic s ns bz br r_min dr dz dt m_ion j i`
+
+
+### `mpd_apply_cell s ns bz br params dt j i`
+
+
+### `mpd_apply_loop s ns bz br params dt i`
+
+
+### `mpd_apply_sources s ns bz br params dt`
+
+
+### `mpd_thrust_cell s bz br r_min dr dz j i acc`
+
+
+### `mpd_thrust_loop s bz br r_min dr dz acc i`
+
+
+### `mpd_thrust_integral s bz br params`
+
 
 
 ## `stdlib/mlx_client.rail`
@@ -3895,6 +5728,47 @@ import "stdlib/<name>.rail"
 
 
 
+## `stdlib/prng.rail`
+
+### `prng_mask48`
+
+> 48-bit mask: (1 << 48) - 1. Computed (not a literal) to avoid baking a
+> >=2^47 constant; shl on a small literal is safe.
+
+### `prng_mask24`
+
+> 24-bit mask, used to extract a clean mantissa for rng_float.
+
+### `prng_unit24`
+
+> Magnitude of a 24-bit unit, as a float, for the [0,1) scaling.
+
+### `rng_new seed`
+
+> Seed -> state. Never let the state be 0 (xorshift with 0 state is a fixed
+> point that only ever yields 0). A nonzero seed-mix guarantees liveness.
+
+### `prng_step state`
+
+> One xorshift step on the 48-bit state. Shifts 21/35/4 give a full-period
+> orbit over the masked width; mask after each xor keeps it in 48 bits.
+
+### `rng_next state`
+
+> Advance the generator. Returns (raw_output, new_state). The raw output is
+> the post-step state itself (a 48-bit nonnegative int).
+
+### `rng_int state n`
+
+> Uniform-ish integer in [0, n). For n <= 0 we return 0 (no valid range).
+> Modulo of a 48-bit value by a small n has negligible bias for typical n.
+
+### `rng_float state`
+
+> Float in [0.0, 1.0). Uses the top 24 bits of the raw output as a mantissa
+> and divides by 2^24, so the result never reaches 1.0.
+
+
 ## `stdlib/quartz.rail`
 
 ### `qz_ev_none`
@@ -4164,6 +6038,75 @@ import "stdlib/<name>.rail"
 > Output parses as one float per line; empty trailing line tolerated.
 
 ### `parse_uniforms_loop parts arr n i`
+
+
+
+## `stdlib/set.rail`
+
+### `set_buckets_n`
+
+
+### `set_hash_mask`
+
+
+### `set_djb2 s`
+
+
+### `set_djb2_acc cs h`
+
+
+### `set_idx key`
+
+
+### `set_new _`
+
+
+### `set_elems s`
+
+
+### `set_add s key`
+
+> Idempotent insert. Membership-checked so elems stays deduped.
+
+### `set_contains s key`
+
+
+### `set_member_in bucket key`
+
+
+### `set_remove s key`
+
+> Rebuild from the surviving members so buckets and elems stay consistent.
+
+### `set_list_without xs key`
+
+
+### `set_size s`
+
+
+### `set_to_list s`
+
+
+### `set_from_list xs`
+
+> Fold a list of strings into a fresh set (dedups along the way).
+
+### `set_add_all s xs`
+
+
+### `set_union a b`
+
+
+### `set_intersect a b`
+
+
+### `set_keep_if_in xs other`
+
+
+### `set_difference a b`
+
+
+### `set_drop_if_in xs other`
 
 
 
@@ -4543,7 +6486,11 @@ import "stdlib/<name>.rail"
 ### `tcp_bytes_to_str buf off n acc`
 
 > Copy `n` bytes from buf[off..off+n) into a Rail string.
-> Uses char_from_int + join; O(N²) alloc, fine for small reads.
+> Builds a list of single-char strings then joins once: O(N) allocation
+> instead of O(N²) from repeated prefix-copying concat.
+
+### `tcp_bytes_to_list buf off n`
+
 
 ### `recv_http_request fd`
 
@@ -4602,6 +6549,48 @@ import "stdlib/<name>.rail"
 
 > Close database
 
+### `sqlite_row`
+
+
+### `sqlite_null_type`
+
+
+### `sq_handle buf`
+
+> Reassemble an 8-byte little-endian handle from a malloc'd out-param buffer.
+
+### `sq_open path`
+
+> Open a DB; returns the db handle, or 0 on failure. path is copied to a C
+> buffer (sq_strdup) because a runtime-built path string (e.g. from argv or cat)
+> passed straight to the foreign sqlite3_open is the heap-object pointer, not the
+> char data — sqlite would open a garbage filename (silently creating an EMPTY db
+> whose every query returns 0 rows). Literals happen to pass cleanly, masking it.
+
+### `sq_prepare db sql`
+
+> Prepare a statement on db; returns the stmt handle, or 0 on failure. sql is
+> copied to a C buffer for the same reason as sq_open (robust for runtime SQL).
+
+### `sq_strdup s`
+
+> Copy a Rail string into a fresh malloc'd, NUL-terminated C buffer and return
+> the raw pointer. Needed because Rail passes a runtime-built string (from
+> str_sub/str_replace/cat) to a foreign char* arg as its HEAP-OBJECT pointer, not
+> the raw byte data — so sqlite reads the object header as text and the bind
+> matches nothing. A malloc'd buffer (raw `-> ptr`) marshals correctly. String
+> LITERALS happen to pass as a clean .asciz pointer, which masked this for an
+> hour on 2026-06-17 (recon worked with literal db-times, returned 0 with
+> reconstructed ones).
+
+### `sq_strdup_into buf_s buf i n`
+
+
+### `sq_bind st idx s`
+
+> Bind a 1-indexed text param. nbyte = explicit byte length; destructor -1 =
+> SQLITE_TRANSIENT so sqlite copies the bytes immediately (safe to free after).
+
 
 ## `stdlib/stat.rail`
 
@@ -4617,13 +6606,22 @@ import "stdlib/<name>.rail"
 
 > Check if file is writable (access with W_OK = 2)
 
+### `stat_parse_int s`
+
+> Pure-Rail string→int (the `to_int` builtin is float-only — `to_int "910"`
+> returns 0, which silently broke file_size for years).  Local copy of the
+> pattern from stdlib/socket.rail.
+
+### `stat_parse_int_acc cs acc`
+
+
 ### `file_size path`
 
-> Get file size in bytes (via shell)
+> Get file size in bytes (via shell).
 
 ### `file_mtime path`
 
-> Get file modification time as Unix timestamp (via shell)
+> Get file modification time as Unix timestamp (via shell).
 
 
 ## `stdlib/strbuf.rail`
@@ -4887,6 +6885,13 @@ import "stdlib/<name>.rail"
 > gpu_available if they need graceful degradation). ~1.7-1.8× speedup vs
 > tgl_matmul_f64 on M1 Ultra per fp16_drafts/RESULTS.md; Phase 4b training
 > uses this in lm_v3_chunked_fp16.rail.
+
+### `matmul_bf16 a b`
+
+> bf16 matmul (added 2026-05-14): same Rail signature as matmul_f16.
+> Dylib stages f64→bf16 on input and bf16→f64 on output; accumulator
+> stays fp32 inside the kernel. bf16's exponent range matches f32
+> (~3.4e38) — fp16's step-2759 overflow simply cannot happen here.
 
 ### `matmul_bias_relu_f16 a b bias`
 
@@ -5700,7 +7705,18 @@ import "stdlib/<name>.rail"
 
 ### `wait n`
 
-> Sleep for n seconds
+> Sleep for n seconds (libc sleep(3), int seconds only).
+> For sub-second precision use wait_us.
+
+### `wait_us n`
+
+> Sleep for n microseconds (libc usleep, max ~1e6 per call).
+> Deprecated on macOS but still functional; nanosleep wrapper deferred.
+
+### `cpu_us _`
+
+> Process CPU time in microseconds (CLOCKS_PER_SEC = 1e6 on macOS + Linux).
+> Does NOT advance during sleep — measure compute durations only.
 
 
 ## `stdlib/tls13.rail`
@@ -5791,6 +7807,17 @@ import "stdlib/<name>.rail"
 ### `cv_dns_match cert v_off v_len host host_len`
 
 > Match a single SAN dNSName entry (cert[v_off..v_off+v_len)) against host.
+> 
+> Note: the wildcard branch is evaluated FIRST when the cert SAN starts
+> with `*.`, otherwise we fall through to exact-equality. The older
+> ordering short-circuited to cv_bytes_ieq whenever v_len == host_len,
+> which made wildcard certs whose total byte length happened to equal
+> the hostname's (e.g. SAN "*.co.uk" vs host "x.co.uk", both 7 bytes)
+> unmatchable. Flagged by security-audit-2026-05-12 (Fixer-A lane).
+
+### `cv_count_dots cert off end_off acc`
+
+> Count the number of '.' (0x2e) bytes inside cert[off..end_off).
 
 ### `cv_bytes_ieq a a_off b b_off n`
 
@@ -5904,6 +7931,9 @@ import "stdlib/<name>.rail"
 
 
 ### `tcl_tag_cmp a b i`
+
+
+### `tcl_tag_cmp_acc a b i acc`
 
 
 
@@ -6366,6 +8396,12 @@ import "stdlib/<name>.rail"
 ### `parse_port cs`
 
 
+### `url_parse_int_chars cs acc`
+
+> Pure-Rail digit-list -> int.  The builtin `to_int` is float-only and
+> silently returns 0 for plain integer strings; that broke port parsing
+> for any explicit ":<port>" URL.
+
 ### `parse_path cs`
 
 
@@ -6392,6 +8428,51 @@ import "stdlib/<name>.rail"
 ### `from_chars cs`
 
 > Convert list of chars to string
+
+### `url_hex_digit n`
+
+> Map a nibble (0..15) to its uppercase hex character.
+
+### `url_hex_val c`
+
+> Map a hex character ('0'-'9','a'-'f','A'-'F') to its value, or -1.
+
+### `url_is_unreserved b`
+
+> An unreserved byte may appear literally; everything else is %-encoded.
+> Unreserved set = ALPHA / DIGIT / "-" / "_" / "." / "~"
+
+### `url_enc_byte b`
+
+> Encode a single byte: literal if unreserved, else "%HH".
+
+### `pct_encode s`
+
+> pct_encode: percent-encode every reserved/unsafe byte of a string.
+
+### `pct_encode_acc cs acc`
+
+
+### `pct_decode s`
+
+> pct_decode: reverse of pct_encode.  "%HH" -> byte, "+" -> space.
+> A malformed trailing "%" (no two hex digits) is passed through literally.
+
+### `pct_decode_acc cs acc`
+
+
+### `parse_query_str q`
+
+> parse_query_str: "x=1&y=hello%20world" -> [(x,1),(y,hello world)]
+> Each key and value is percent-decoded.  Empty pairs are skipped.
+> (parse_url's helper `parse_query` strips the leading "?"; this works on the
+> raw query body, so callers can compose: parse_query_str (parse_url ...)._5)
+
+### `parse_pairs parts`
+
+
+### `parse_pair p`
+
 
 
 ## `stdlib/x25519.rail`
@@ -6510,6 +8591,11 @@ import "stdlib/<name>.rail"
 ### `x25519_scalarmult q n p`
 
 
+### `x25519_q_nonzero q i acc`
+
+> XOR-OR-fold across q[0..32]; returns 1 if any byte is non-zero, 0 if
+> every byte is zero. Constant-time scan over the full 32 bytes.
+
 ### `x25519_ladder a b c d e f x1 z i`
 
 
@@ -6519,4 +8605,10 @@ import "stdlib/<name>.rail"
 
 ### `x25519 scalar u`
 
+
+### `x25519_safe scalar u`
+
+> Explicit-status variant. Returns [q, ok] where ok=1 on success and
+> ok=0 if the input was a low-order point (RFC 7748 §6.1). Strict TLS
+> callers should prefer this and abort the handshake on ok==0.
 
