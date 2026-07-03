@@ -1,0 +1,146 @@
+-- attested_idot_demo.rail — twin-kernel attestation PoC (2026-07-03).
+--
+-- One workload, two implementations born from the same repo:
+--   CPU twin: plain Rail 63-bit integer arithmetic (this file)
+--   GPU twin: integer MSL emitted by stdlib/jit_emit.rail
+--             (emit_msl_idot_shaped), JIT-compiled by the OS Metal
+--             runtime via tools/metal/ikernel_harness.m
+--
+-- Integer math is exact on both sides, so agreement is BYTE-equality,
+-- not "close enough".  The attestation record binds kernel source,
+-- inputs and both outputs by sha256 (pure-Rail stdlib/sha256.rail).
+-- Inputs are bound by (seed, this file): the LCG below regenerates
+-- them deterministically, so a verifier reruns the whole demo and
+-- must land on identical hashes.
+--
+-- run from repo root: ./rail_native run tools/metal/attested_idot_demo.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+-- deterministic LCG.  s stays in [0, 2^31); s * 1103515245 < 2^62 so
+-- the product is exact in Rail's 63-bit tagged ints.
+lcg_next s = ((s * 1103515245) + 12345) % 2147483648
+
+-- fill n slots with values in [-32768, 32767]; returns the final seed
+-- so A and B draw from one continuous stream.
+fill_arr a n s i =
+  if i >= n then s
+  else
+    let s2 = lcg_next s in
+    let _ = arr_set a i ((s2 % 65536) - 32768) in
+    fill_arr a n s2 (i + 1)
+
+-- CPU twin: integer dot product per row.  |acc| < 2^15*2^15*2^9 = 2^39.
+dot_row a b d base j acc =
+  if j >= d then acc
+  else dot_row a b d base (j + 1) (acc + ((arr_get a (base + j)) * (arr_get b j)))
+
+cpu_rows a b out rows d i =
+  if i >= rows then 0
+  else
+    let _ = arr_set out i (dot_row a b d (i * d) 0 0) in
+    cpu_rows a b out rows d (i + 1)
+
+-- text serialization (whitespace-separated ints; harness fscanf reads both)
+row_str a base d j accl =
+  if j >= d then join " " (reverse accl)
+  else row_str a base (d) (j + 1) (cons (show (arr_get a (base + j))) accl)
+
+rows_text a rows d i accl =
+  if i >= rows then join "\n" (reverse accl)
+  else rows_text a rows d (i + 1) (cons (row_str a (i * d) d 0 []) accl)
+
+out_text o rows i accl =
+  if i >= rows then join "\n" (reverse accl)
+  else out_text o rows (i + 1) (cons (show (arr_get o i)) accl)
+
+-- string -> int (to_int is float-only; walk digits per the socket.rail pattern)
+pi_digits cs acc =
+  if (length cs) == 0 then acc
+  else pi_digits (tail cs) ((acc * 10) + ((char_to_int (head cs)) - 48))
+
+parse_i s =
+  let cs = chars s in
+  if (head cs) == "-" then 0 - (pi_digits (tail cs) 0)
+  else pi_digits cs 0
+
+-- compare GPU output lines against the CPU twin, count mismatches
+cmp_walk lines cpu i rows mism =
+  if i >= rows then mism
+  else
+    let g = parse_i (head lines) in
+    let c = arr_get cpu i in
+    let m2 = if g == c then mism else mism + 1 in
+    cmp_walk (tail lines) cpu (i + 1) rows m2
+
+main =
+  let rows = 512 in
+  let d = 512 in
+  let seed = 1234 in
+  let _ = shell "mkdir -p /tmp/agk" in
+  -- 1. emit the GPU twin from the Rail emitter
+  let msl = emit_msl_idot_shaped rows d in
+  let _ = write_file "/tmp/agk/idot.metal" msl in
+  -- 2. deterministic inputs
+  let a = arr_new (rows * d) 0 in
+  let b = arr_new d 0 in
+  let s1 = fill_arr a (rows * d) seed 0 in
+  let _ = fill_arr b d s1 0 in
+  let atext = cat [rows_text a rows d 0 [], "\n"] in
+  let btext = cat [row_str b 0 d 0 [], "\n"] in
+  let _ = write_file "/tmp/agk/A.txt" atext in
+  let _ = write_file "/tmp/agk/B.txt" btext in
+  -- 3. CPU twin
+  let cpu = arr_new rows 0 in
+  let _ = cpu_rows a b cpu rows d 0 in
+  let ctext = cat [out_text cpu rows 0 [], "\n"] in
+  let _ = write_file "/tmp/agk/cpu_out.txt" ctext in
+  -- 4. build + run the GPU twin twice (second run = run-to-run determinism)
+  let _ = shell "clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  let cmd1 = cat ["/tmp/agk/ikernel_harness /tmp/agk/idot.metal idot_matvec /tmp/agk/A.txt /tmp/agk/B.txt ", show rows, " ", show d, " /tmp/agk/gpu_out1.txt 2>/tmp/agk/gpu_ms1.txt"] in
+  let cmd2 = cat ["/tmp/agk/ikernel_harness /tmp/agk/idot.metal idot_matvec /tmp/agk/A.txt /tmp/agk/B.txt ", show rows, " ", show d, " /tmp/agk/gpu_out2.txt 2>/tmp/agk/gpu_ms2.txt"] in
+  let _ = shell cmd1 in
+  let _ = shell cmd2 in
+  -- 5. verify: GPU twin vs CPU twin, then GPU run 1 vs run 2
+  let gtext = read_file "/tmp/agk/gpu_out1.txt" in
+  let gtext2 = read_file "/tmp/agk/gpu_out2.txt" in
+  let lines = split "\n" gtext in
+  let mism = cmp_walk lines cpu 0 rows 0 in
+  let msl_h = sha256_hex msl in
+  let a_h = sha256_hex atext in
+  let b_h = sha256_hex btext in
+  let c_h = sha256_hex ctext in
+  let g_h = sha256_hex gtext in
+  let g2_h = sha256_hex gtext2 in
+  let det = if g_h == g2_h then "true" else "false" in
+  let verdict = if mism == 0 then "TWINS-AGREE" else "TWINS-DIVERGE" in
+  -- 6. attestation record: binds kernel source, inputs and both outputs
+  let record = cat ["{\n",
+    "  \"schema\": \"twin-kernel-attest-v0\",\n",
+    "  \"kernel\": \"idot_matvec\",\n",
+    "  \"emitter\": \"stdlib/jit_emit.rail:emit_msl_idot_shaped\",\n",
+    "  \"rows\": ", show rows, ",\n",
+    "  \"d\": ", show d, ",\n",
+    "  \"seed\": ", show seed, ",\n",
+    "  \"msl_sha256\": \"", msl_h, "\",\n",
+    "  \"a_sha256\": \"", a_h, "\",\n",
+    "  \"b_sha256\": \"", b_h, "\",\n",
+    "  \"cpu_out_sha256\": \"", c_h, "\",\n",
+    "  \"gpu_out_sha256\": \"", g_h, "\",\n",
+    "  \"gpu_run2_sha256\": \"", g2_h, "\",\n",
+    "  \"gpu_deterministic\": ", det, ",\n",
+    "  \"mismatches\": ", show mism, ",\n",
+    "  \"verdict\": \"", verdict, "\"\n",
+    "}\n"] in
+  let _ = write_file "/tmp/agk/attest_record.json" record in
+  -- 7. report
+  let _ = print "twin-kernel attestation (integer-exact GPU):" in
+  let _ = print (cat ["  rows x d:        ", show rows, " x ", show d]) in
+  let _ = print (cat ["  mismatches:      ", show mism, " of ", show rows]) in
+  let _ = print (cat ["  cpu_out sha256:  ", c_h]) in
+  let _ = print (cat ["  gpu_out sha256:  ", g_h]) in
+  let _ = print (cat ["  gpu run1==run2:  ", det]) in
+  let _ = print (cat ["  verdict:         ", verdict]) in
+  let _ = print "  record:          /tmp/agk/attest_record.json" in
+  if mism == 0 then 0 else 1
