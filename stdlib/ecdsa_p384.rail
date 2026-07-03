@@ -36,6 +36,212 @@ p384_load_n _ = bn_from_be (hex_to_bytes "ffffffffffffffffffffffffffffffffffffff
 p384_load_gx _ = bn_from_be (hex_to_bytes "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7") 24
 p384_load_gy _ = bn_from_be (hex_to_bytes "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f") 24
 
+-- ── P-384-specific modular multiplication (perf-critical) ────────────
+-- Generic bn_mul_mod allocates 1-2 fresh 24-limb arrays per BIT of its
+-- 767-iteration reduction loop — ~1,500 heap allocs per field mult,
+-- ~10^7 per ECDSA verify. That allocation churn is what turned one
+-- P-384 chain-signature verify into a >447 s CPU pin during TLS
+-- handshakes (the 2026-07-02 cortex incident). These variants hoist
+-- every reduction scratch buffer out of the loop. Additive only: the
+-- shared bignum_n.rail entry points (used by rsa_pss.rail) are
+-- untouched.
+--
+-- p384_mul_mod requires c to be distinct from m. c may alias a or b
+-- (the wide product is fully formed before c is written).
+
+-- Within this module m is always one of exactly two moduli: the field
+-- prime p (low limb 0xffff -> Solinas fast reduction, ~700x fewer limb
+-- ops than the bit-serial loop) or the group order n (low limb 0x2973
+-- -> generic reduction with hoisted scratch). Do NOT call with any
+-- other modulus whose low limb is 0xffff.
+p384_mul_mod c a b m =
+  let wide = arr_new 48 0
+  let _ = bn_mul_raw wide a b 24
+  if arr_get m 0 == 65535 then p384_redp c wide m
+  else
+    let tmp = arr_new 24 0
+    let _ = bn_zero c 24
+    let _ = p384_wm_loop_h c wide m tmp 767
+    c
+
+p384_sqr_mod c a m = p384_mul_mod c a a m
+
+-- ── Solinas fast reduction mod p384 (FIPS 186-4 D.2 / Guide-to-ECC
+-- Alg 2.30) ──────────────────────────────────────────────────────────
+-- p = 2^384 - 2^128 - 2^96 + 2^32 - 1. With t = 2^32 and the wide input
+-- split into 32-bit words c0..c23 (c_k = a[2k] + a[2k+1]*2^16), the
+-- ten-term identity
+--   c ≡ s1 + 2*s2 + s3 + s4 + s5 + s6 + s7 - s8 - s9 - s10 (mod p)
+-- holds for ANY c < 2^768 (each 2^(384+32j) is rewritten via
+-- t^12 ≡ t^4 + t^3 - t + 1). Positive terms + 4p accumulate in pos,
+-- negative terms in neg; both are normalized, subtracted, and the
+-- result (< 12p) is brought into [0, p) by conditional subtraction.
+-- Differential-tested against bn_wide_mod on 1000 pseudorandom 768-bit
+-- inputs: ~/rail-bugqueue/repro_d_diffreduce.rail (===DIFF-OK 1000===).
+--
+-- a: 48-limb wide input. p: the 24-limb field prime. c: 24-limb output.
+
+-- Add mult * (32-bit word k of wide a) into acc at word position j.
+-- Word w <-> limb pair (2w, 2w+1). Raw accumulation, normalized later.
+p384_rw acc j a k mult =
+  let _ = arr_set acc (j + j) (arr_get acc (j + j) + mult * arr_get a (k + k))
+  let _ = arr_set acc (j + j + 1) (arr_get acc (j + j + 1) + mult * arr_get a (k + k + 1))
+  0
+
+-- Single carry-normalization pass (all limbs non-negative).
+p384_acc_norm acc i carry n =
+  if i >= n then 0
+  else
+    let v = arr_get acc i + carry
+    let _ = arr_set acc i (bit_and v 65535)
+    p384_acc_norm acc (i + 1) (shr v 16) n
+
+p384_redp c a p =
+  let pos = arr_new 26 0
+  let neg = arr_new 26 0
+  -- s1: low words c0..c11 at j = k
+  let _ = p384_rw pos 0 a 0 1
+  let _ = p384_rw pos 1 a 1 1
+  let _ = p384_rw pos 2 a 2 1
+  let _ = p384_rw pos 3 a 3 1
+  let _ = p384_rw pos 4 a 4 1
+  let _ = p384_rw pos 5 a 5 1
+  let _ = p384_rw pos 6 a 6 1
+  let _ = p384_rw pos 7 a 7 1
+  let _ = p384_rw pos 8 a 8 1
+  let _ = p384_rw pos 9 a 9 1
+  let _ = p384_rw pos 10 a 10 1
+  let _ = p384_rw pos 11 a 11 1
+  -- c12: +j0 +j3 +j4, -j1
+  let _ = p384_rw pos 0 a 12 1
+  let _ = p384_rw pos 3 a 12 1
+  let _ = p384_rw pos 4 a 12 1
+  let _ = p384_rw neg 1 a 12 1
+  -- c13: +j1 +j4 +j5, -j2
+  let _ = p384_rw pos 1 a 13 1
+  let _ = p384_rw pos 4 a 13 1
+  let _ = p384_rw pos 5 a 13 1
+  let _ = p384_rw neg 2 a 13 1
+  -- c14: +j2 +j5 +j6, -j3
+  let _ = p384_rw pos 2 a 14 1
+  let _ = p384_rw pos 5 a 14 1
+  let _ = p384_rw pos 6 a 14 1
+  let _ = p384_rw neg 3 a 14 1
+  -- c15: +j3 +j6 +j7, -j4
+  let _ = p384_rw pos 3 a 15 1
+  let _ = p384_rw pos 6 a 15 1
+  let _ = p384_rw pos 7 a 15 1
+  let _ = p384_rw neg 4 a 15 1
+  -- c16: +j4 +j7 +j8, -j5
+  let _ = p384_rw pos 4 a 16 1
+  let _ = p384_rw pos 7 a 16 1
+  let _ = p384_rw pos 8 a 16 1
+  let _ = p384_rw neg 5 a 16 1
+  -- c17: +j5 +j8 +j9, -j6
+  let _ = p384_rw pos 5 a 17 1
+  let _ = p384_rw pos 8 a 17 1
+  let _ = p384_rw pos 9 a 17 1
+  let _ = p384_rw neg 6 a 17 1
+  -- c18: +j6 +j9 +j10, -j7
+  let _ = p384_rw pos 6 a 18 1
+  let _ = p384_rw pos 9 a 18 1
+  let _ = p384_rw pos 10 a 18 1
+  let _ = p384_rw neg 7 a 18 1
+  -- c19: +j7 +j10 +j11, -j8
+  let _ = p384_rw pos 7 a 19 1
+  let _ = p384_rw pos 10 a 19 1
+  let _ = p384_rw pos 11 a 19 1
+  let _ = p384_rw neg 8 a 19 1
+  -- c20: +j0 +j3 +j4 +j8 +j11, -j1 -j9
+  let _ = p384_rw pos 0 a 20 1
+  let _ = p384_rw pos 3 a 20 1
+  let _ = p384_rw pos 4 a 20 1
+  let _ = p384_rw pos 8 a 20 1
+  let _ = p384_rw pos 11 a 20 1
+  let _ = p384_rw neg 1 a 20 1
+  let _ = p384_rw neg 9 a 20 1
+  -- c21: +j0 +j3 +2*j4 +j5 +j9, -j2 -j10
+  let _ = p384_rw pos 0 a 21 1
+  let _ = p384_rw pos 3 a 21 1
+  let _ = p384_rw pos 4 a 21 2
+  let _ = p384_rw pos 5 a 21 1
+  let _ = p384_rw pos 9 a 21 1
+  let _ = p384_rw neg 2 a 21 1
+  let _ = p384_rw neg 10 a 21 1
+  -- c22: +j1 +j4 +2*j5 +j6 +j10, -j3 -j11
+  let _ = p384_rw pos 1 a 22 1
+  let _ = p384_rw pos 4 a 22 1
+  let _ = p384_rw pos 5 a 22 2
+  let _ = p384_rw pos 6 a 22 1
+  let _ = p384_rw pos 10 a 22 1
+  let _ = p384_rw neg 3 a 22 1
+  let _ = p384_rw neg 11 a 22 1
+  -- c23: +j1 +j2 +j5 +2*j6 +j7 +j11, -j0 -j3 -2*j4
+  let _ = p384_rw pos 1 a 23 1
+  let _ = p384_rw pos 2 a 23 1
+  let _ = p384_rw pos 5 a 23 1
+  let _ = p384_rw pos 6 a 23 2
+  let _ = p384_rw pos 7 a 23 1
+  let _ = p384_rw pos 11 a 23 1
+  let _ = p384_rw neg 0 a 23 1
+  let _ = p384_rw neg 3 a 23 1
+  let _ = p384_rw neg 4 a 23 2
+  -- pos += 4p (guarantees pos >= neg since neg < 3*2^384 < 4p).
+  -- bn_uadd doubles as the normalization pass for pos.
+  let p4 = arr_new 26 0
+  let _ = bn_copy p4 p 24
+  let _ = bn_shl1_out p4 26
+  let _ = bn_shl1_out p4 26
+  let _ = bn_uadd pos pos p4 26
+  let _ = p384_acc_norm neg 0 0 26
+  let r = arr_new 26 0
+  let bor = bn_usub r pos neg 26
+  if bor == 1 then
+    -- Unreachable by construction (pos >= neg); fall back to the
+    -- generic hoisted loop rather than return garbage.
+    let tmp = arr_new 24 0
+    let _ = bn_zero c 24
+    let _ = p384_wm_loop_h c a p tmp 767
+    c
+  else
+    -- r < 12p: bring into [0, p) by conditional subtraction.
+    let p26 = arr_new 26 0
+    let _ = bn_copy p26 p 24
+    let tmp26 = arr_new 26 0
+    let _ = p384_redp_final r p26 tmp26
+    let _ = bn_copy c r 24
+    c
+
+p384_redp_final r p26 tmp26 =
+  let bor = bn_usub tmp26 r p26 26
+  if bor == 0 then
+    let _ = bn_copy r tmp26 26
+    p384_redp_final r p26 tmp26
+  else 0
+
+-- Bit-serial wide reduction with hoisted scratch: r is the accumulator
+-- (must start zeroed), tmp is a 24-limb scratch reused across all 767
+-- iterations. Same algorithm as bn_wm_loop, zero allocations per bit.
+p384_wm_loop_h r a m tmp bit_idx =
+  if bit_idx < 0 then 0
+  else
+    let carry = bn_shl1_out r 24
+    let limb_idx = shr bit_idx 4
+    let bit_in_limb = bit_and bit_idx 15
+    let bit_val = bit_and (shr (arr_get a limb_idx) bit_in_limb) 1
+    let _ = arr_set r 0 (arr_get r 0 + bit_val)
+    let _ = bn_carry_fix r 0 24
+    if carry == 1 then
+      let _ = bn_usub tmp r m 24
+      let _ = bn_copy r tmp 24
+      p384_wm_loop_h r a m tmp (bit_idx - 1)
+    else
+      let bor = bn_usub tmp r m 24
+      if bor == 0 then
+        let _ = bn_copy r tmp 24
+        p384_wm_loop_h r a m tmp (bit_idx - 1)
+      else p384_wm_loop_h r a m tmp (bit_idx - 1)
+
 -- ── Modular inverse via Fermat's little theorem ──────────────────────
 -- a^-1 mod m = a^(m-2) mod m.
 
@@ -57,14 +263,14 @@ p384_pow_loop c base exp m nl bit_idx =
   if bit_idx < 0 then 0
   else
     let tmp = bn_new nl
-    let _ = bn_sqr_mod tmp c m nl
+    let _ = p384_sqr_mod tmp c m
     let _ = bn_copy c tmp nl
     let limb_idx = shr bit_idx 4
     let bit_in_limb = bit_and bit_idx 15
     let b = bit_and (shr (arr_get exp limb_idx) bit_in_limb) 1
     if b == 1 then
       let tmp2 = bn_new nl
-      let _ = bn_mul_mod tmp2 c base m nl
+      let _ = p384_mul_mod tmp2 c base m
       let _ = bn_copy c tmp2 nl
       p384_pow_loop c base exp m nl (bit_idx - 1)
     else p384_pow_loop c base exp m nl (bit_idx - 1)
@@ -100,24 +306,24 @@ p384_point_dbl out pin =
 
 p384_dbl_core out X Y Z p =
   let Z2 = bn_new 24
-  let _ = bn_sqr_mod Z2 Z p 24
+  let _ = p384_sqr_mod Z2 Z p
   let gamma = bn_new 24
-  let _ = bn_sqr_mod gamma Y p 24
+  let _ = p384_sqr_mod gamma Y p
   let beta = bn_new 24
-  let _ = bn_mul_mod beta X gamma p 24
+  let _ = p384_mul_mod beta X gamma p
   let t1 = bn_new 24
   let _ = bn_mod_sub t1 X Z2 p 24
   let t2 = bn_new 24
   let _ = bn_mod_add t2 X Z2 p 24
   let t3 = bn_new 24
-  let _ = bn_mul_mod t3 t1 t2 p 24
+  let _ = p384_mul_mod t3 t1 t2 p
   let alpha = bn_new 24
   let _ = bn_mod_add alpha t3 t3 p 24
   let tmp_alpha = bn_new 24
   let _ = bn_mod_add tmp_alpha alpha t3 p 24
   let _ = bn_copy alpha tmp_alpha 24
   let alpha2 = bn_new 24
-  let _ = bn_sqr_mod alpha2 alpha p 24
+  let _ = p384_sqr_mod alpha2 alpha p
   let beta4 = bn_new 24
   let _ = bn_mod_add beta4 beta beta p 24
   let tmp = bn_new 24
@@ -130,7 +336,7 @@ p384_dbl_core out X Y Z p =
   let YpZ = bn_new 24
   let _ = bn_mod_add YpZ Y Z p 24
   let YpZ2 = bn_new 24
-  let _ = bn_sqr_mod YpZ2 YpZ p 24
+  let _ = p384_sqr_mod YpZ2 YpZ p
   let t4 = bn_new 24
   let _ = bn_mod_sub t4 YpZ2 gamma p 24
   let Z3 = arr_get out 2
@@ -138,9 +344,9 @@ p384_dbl_core out X Y Z p =
   let fourbeta_mX3 = bn_new 24
   let _ = bn_mod_sub fourbeta_mX3 beta4 X3 p 24
   let t5 = bn_new 24
-  let _ = bn_mul_mod t5 alpha fourbeta_mX3 p 24
+  let _ = p384_mul_mod t5 alpha fourbeta_mX3 p
   let g2 = bn_new 24
-  let _ = bn_sqr_mod g2 gamma p 24
+  let _ = p384_sqr_mod g2 gamma p
   let g4 = bn_new 24
   let _ = bn_mod_add g4 g2 g2 p 24
   let tmp2 = bn_new 24
@@ -171,21 +377,21 @@ p384_add_core out pin qin p =
   let Y2 = arr_get qin 1
   let Z2 = arr_get qin 2
   let Z2sq = bn_new 24
-  let _ = bn_sqr_mod Z2sq Z2 p 24
+  let _ = p384_sqr_mod Z2sq Z2 p
   let U1 = bn_new 24
-  let _ = bn_mul_mod U1 X1 Z2sq p 24
+  let _ = p384_mul_mod U1 X1 Z2sq p
   let Z1sq = bn_new 24
-  let _ = bn_sqr_mod Z1sq Z1 p 24
+  let _ = p384_sqr_mod Z1sq Z1 p
   let U2 = bn_new 24
-  let _ = bn_mul_mod U2 X2 Z1sq p 24
+  let _ = p384_mul_mod U2 X2 Z1sq p
   let Z2cb = bn_new 24
-  let _ = bn_mul_mod Z2cb Z2sq Z2 p 24
+  let _ = p384_mul_mod Z2cb Z2sq Z2 p
   let S1 = bn_new 24
-  let _ = bn_mul_mod S1 Y1 Z2cb p 24
+  let _ = p384_mul_mod S1 Y1 Z2cb p
   let Z1cb = bn_new 24
-  let _ = bn_mul_mod Z1cb Z1sq Z1 p 24
+  let _ = p384_mul_mod Z1cb Z1sq Z1 p
   let S2 = bn_new 24
-  let _ = bn_mul_mod S2 Y2 Z1cb p 24
+  let _ = p384_mul_mod S2 Y2 Z1cb p
   let H = bn_new 24
   let _ = bn_mod_sub H U2 U1 p 24
   let r = bn_new 24
@@ -201,13 +407,13 @@ p384_add_core out pin qin p =
 
 p384_add_normal out X1 X2 Y1 Y2 Z1 Z2 U1 S1 H r p =
   let Hsq = bn_new 24
-  let _ = bn_sqr_mod Hsq H p 24
+  let _ = p384_sqr_mod Hsq H p
   let Hcb = bn_new 24
-  let _ = bn_mul_mod Hcb Hsq H p 24
+  let _ = p384_mul_mod Hcb Hsq H p
   let U1Hsq = bn_new 24
-  let _ = bn_mul_mod U1Hsq U1 Hsq p 24
+  let _ = p384_mul_mod U1Hsq U1 Hsq p
   let rsq = bn_new 24
-  let _ = bn_sqr_mod rsq r p 24
+  let _ = p384_sqr_mod rsq r p
   let t1 = bn_new 24
   let _ = bn_mod_sub t1 rsq Hcb p 24
   let U1Hsq2 = bn_new 24
@@ -217,15 +423,15 @@ p384_add_normal out X1 X2 Y1 Y2 Z1 Z2 U1 S1 H r p =
   let diff = bn_new 24
   let _ = bn_mod_sub diff U1Hsq X3 p 24
   let t2 = bn_new 24
-  let _ = bn_mul_mod t2 r diff p 24
+  let _ = p384_mul_mod t2 r diff p
   let t3 = bn_new 24
-  let _ = bn_mul_mod t3 S1 Hcb p 24
+  let _ = p384_mul_mod t3 S1 Hcb p
   let Y3 = arr_get out 1
   let _ = bn_mod_sub Y3 t2 t3 p 24
   let Z1Z2 = bn_new 24
-  let _ = bn_mul_mod Z1Z2 Z1 Z2 p 24
+  let _ = p384_mul_mod Z1Z2 Z1 Z2 p
   let Z3 = arr_get out 2
-  let _ = bn_mul_mod Z3 Z1Z2 H p 24
+  let _ = p384_mul_mod Z3 Z1Z2 H p
   out
 
 -- Convert Jacobian to affine; returns 1 on success, 0 if at infinity.
@@ -237,11 +443,11 @@ p384_to_affine ax ay pt =
     let Zinv = bn_new 24
     let _ = p384_mod_inv Zinv Z p
     let Zinv2 = bn_new 24
-    let _ = bn_sqr_mod Zinv2 Zinv p 24
+    let _ = p384_sqr_mod Zinv2 Zinv p
     let Zinv3 = bn_new 24
-    let _ = bn_mul_mod Zinv3 Zinv2 Zinv p 24
-    let _ = bn_mul_mod ax (arr_get pt 0) Zinv2 p 24
-    let _ = bn_mul_mod ay (arr_get pt 1) Zinv3 p 24
+    let _ = p384_mul_mod Zinv3 Zinv2 Zinv p
+    let _ = p384_mul_mod ax (arr_get pt 0) Zinv2 p
+    let _ = p384_mul_mod ay (arr_get pt 1) Zinv3 p
     1
 
 -- Scalar multiplication: out = k * P. k is a 24-limb bignum.
@@ -294,9 +500,9 @@ ecdsa_p384_verify_core e r s pub_x_bytes pub_y_bytes =
   let w = bn_new 24
   let _ = p384_mod_inv w s n
   let u1 = bn_new 24
-  let _ = bn_mul_mod u1 e w n 24
+  let _ = p384_mul_mod u1 e w n
   let u2 = bn_new 24
-  let _ = bn_mul_mod u2 r w n 24
+  let _ = p384_mul_mod u2 r w n
   let Gpt = p384_point_new 0
   let _ = bn_copy (arr_get Gpt 0) (p384_load_gx 0) 24
   let _ = bn_copy (arr_get Gpt 1) (p384_load_gy 0) 24
