@@ -4133,6 +4133,22 @@ import "stdlib/<name>.rail"
 > accumulator under 2^56 -- inside int64 AND Rail's 63-bit ints, so
 > twin agreement is guaranteed worst-case, not statistically.
 
+### `emit_msl_fx_ffn_shaped seq d`
+
+> Fused fixed-point SwiGLU FFN (attested-GPU track, act 9).  No new
+> discovery: silu is x * sigmoid(x), sigmoid reduces to fx_exp (act
+> 7), the rest is matvec (act 2) + rmsnorm (act 3).  Fused:
+> xn = rmsnorm(x)  ->  gate = WG.xn,  up = WU.xn
+> act = silu(gate) * up  ->  down = WD.act  ->  out = x + down
+> Hidden dim = D (square FFN keeps the packed layout simple; the
+> twin-exactness point is identical at h != D).
+> Params packed: X | G | WG(DxD) | WU(DxD) | WD(DxD).
+> 
+> sigmoid is the ONLY division; done overflow-safe as
+> (num << 16) / (denom >> 16) -- the act-8 lesson: any path that can
+> overflow int64 is where Rail's 63-bit and Metal's 64-bit wrap
+> diverge.  This form keeps every intermediate < 2^48.
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────
