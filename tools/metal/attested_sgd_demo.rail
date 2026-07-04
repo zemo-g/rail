@@ -1,0 +1,164 @@
+-- attested_sgd_demo.rail — twin-kernel attestation, act 10 (2026-07-04).
+--
+-- THE BACKWARD PASS: an attested fixed-point SGD step for a linear
+-- layer, twin-verified.  y=W.x, MSE loss, weight grad (outer product),
+-- SGD update -- all mul_shr/add/mul-by-2 (no division -> no rounding
+-- trap).  Built to the reviewed spec (SPEC_attested_backward.md):
+--   * bounds EXERCISE the 128-bit path (products > 2^63) while results
+--     stay < 2^62 -- so the naive-int64 negative control genuinely
+--     diverges (a real wrap-width proof, not just plumbing)
+--   * t is PINNED to y-scale (review S1)
+--   * tamper control uses a LARGE delta (review S3)
+--   * record binds W,x,t,LR,W' AND the msl hash (pins the computation,
+--     review S4) + d + fixed-point format (N3)
+-- This is the last conceptual unknown between attested forward and
+-- attested training; every transformer weight update is this shape.
+--
+-- run from repo root: ./rail_native run tools/metal/attested_sgd_demo.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+lcg_next s = ((s * 1103515245) + 12345) % 2147483648
+
+fill_q a n s i m1 m2 off =
+  if i >= n then s
+  else
+    let s2 = lcg_next s in
+    let s3 = lcg_next s2 in
+    let v = (((s2 % m1) * m2) + (s3 % m2)) - off in
+    let _ = arr_set a i v in
+    fill_q a n s3 (i + 1) m1 m2 off
+
+-- CPU twin of fx_sgd_step, identical formula AND identical packed-buffer
+-- indexing as the GPU kernel: W at [wrow+j], x at [off_x+j], t at [off_t+i].
+sgd_dot p off_x d wrow j acc =
+  if j >= d then acc
+  else sgd_dot p off_x d wrow (j + 1) (acc + (mul_shr (arr_get p (wrow + j)) (arr_get p (off_x + j)) 32))
+
+sgd_upd p off_x out d wrow g lr j =
+  if j >= d then 0
+  else
+    let dW = mul_shr g (arr_get p (off_x + j)) 32 in
+    let _ = arr_set out (wrow + j) ((arr_get p (wrow + j)) - (mul_shr lr dW 32)) in
+    sgd_upd p off_x out d wrow g lr (j + 1)
+
+sgd_rows p out d lr i =
+  if i >= d then 0
+  else
+    let off_x = d * d in
+    let off_t = (d * d) + d in
+    let wrow = i * d in
+    let y = sgd_dot p off_x d wrow 0 0 in
+    let g = (y - (arr_get p (off_t + i))) * 2 in
+    let _ = sgd_upd p off_x out d wrow g lr 0 in
+    sgd_rows p out d lr (i + 1)
+
+-- pack W(d*d) | x(d) | t(d) into one flat array text
+out_text o n i accl =
+  if i >= n then join "\n" (reverse accl)
+  else out_text o n (i + 1) (cons (show (arr_get o i)) accl)
+
+pi_digits cs acc =
+  if (length cs) == 0 then acc
+  else pi_digits (tail cs) ((acc * 10) + ((char_to_int (head cs)) - 48))
+
+parse_i s =
+  let cs = chars s in
+  if (head cs) == "-" then 0 - (pi_digits (tail cs) 0)
+  else pi_digits cs 0
+
+cmp_walk lines cpu i n mism =
+  if i >= n then mism
+  else
+    let g = parse_i (head lines) in
+    let c = arr_get cpu i in
+    let m2 = if g == c then mism else mism + 1 in
+    cmp_walk (tail lines) cpu (i + 1) n m2
+
+copy_arr src dst n i =
+  if i >= n then 0
+  else
+    let _ = arr_set dst i (arr_get src i) in
+    copy_arr src dst n (i + 1)
+
+main =
+  let d = 64 in
+  let lr = 1048576 in
+  let seed = 1357 in
+  let total = (d * d) + d + d in
+  let _ = shell "mkdir -p /tmp/agk" in
+  let _ = shell "test -x /tmp/agk/ikernel_harness || clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  -- 1. emit the GPU twin (LR baked as constant)
+  let msl = emit_msl_fx_sgd_step d lr in
+  let _ = write_file "/tmp/agk/fx_sgd.metal" msl in
+  -- 2. packed params: W,x in [-2^38,2^38) ; t in [-2^50,2^50) (pinned to y-scale)
+  let p = arr_new total 0 in
+  let s1 = fill_q p (d * d) seed 0 1048576 524288 274877906944 in
+  let s2 = fill_q p ((d * d) + d) s1 (d * d) 1048576 524288 274877906944 in
+  let _ = fill_q p total s2 ((d * d) + d) 67108864 33554432 1125899906842624 in
+  let ptext = cat [out_text p total 0 [], "\n"] in
+  let _ = write_file "/tmp/agk/sgP.txt" ptext in
+  -- 3. CPU twin
+  let out = arr_new (d * d) 0 in
+  let _ = sgd_rows p out d lr 0 in
+  let ctext = cat [out_text out (d * d) 0 [], "\n"] in
+  -- 4. GPU twin, twice (harness reads A rows=d, cols=total/d)
+  let hd = total / d in
+  let onarg = cat ["on=", show (d * d)] in
+  let cmd1 = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_sgd.metal fx_sgd_step /tmp/agk/sgP.txt /tmp/agk/sgP.txt ", show d, " ", show hd, " /tmp/agk/sg_gpu_out1.txt i64 ", onarg, " 2>/dev/null"] in
+  let cmd2 = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_sgd.metal fx_sgd_step /tmp/agk/sgP.txt /tmp/agk/sgP.txt ", show d, " ", show hd, " /tmp/agk/sg_gpu_out2.txt i64 ", onarg, " 2>/dev/null"] in
+  let _ = shell cmd1 in
+  let _ = shell cmd2 in
+  -- 5. verify twins + determinism
+  let gtext = read_file "/tmp/agk/sg_gpu_out1.txt" in
+  let mism = cmp_walk (split "\n" gtext) out 0 (d * d) 0 in
+  let c_h = sha256_hex ctext in
+  let g_h = sha256_hex gtext in
+  let det = if g_h == (sha256_hex (read_file "/tmp/agk/sg_gpu_out2.txt")) then "true" else "false" in
+  let verdict = if mism == 0 then "SGD-TWINS-AGREE" else "SGD-TWINS-DIVERGE" in
+  -- 6a. NEGATIVE CONTROL: naive int64 mul_shr (no mulhi) must diverge
+  let _ = shell "sed 's/long hi  = mulhi(a, b);/long hi = 0;/' /tmp/agk/fx_sgd.metal > /tmp/agk/fx_sgd_naive.metal" in
+  let ncmd = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_sgd_naive.metal fx_sgd_step /tmp/agk/sgP.txt /tmp/agk/sgP.txt ", show d, " ", show hd, " /tmp/agk/sg_naive_out.txt i64 ", onarg, " 2>/dev/null"] in
+  let _ = shell ncmd in
+  let naive_mism = cmp_walk (split "\n" (read_file "/tmp/agk/sg_naive_out.txt")) out 0 (d * d) 0 in
+  let neg_ctrl = if naive_mism > 0 then "DIVERGES-as-required" else "MATCHES-test-too-weak" in
+  -- 6b. TAMPER CONTROL: perturb one x_j by a large delta, W' must diverge
+  let p2 = arr_new total 0 in
+  let _ = fill_q p2 total seed 0 1 1 0 in
+  let _ = copy_arr p p2 total 0 in
+  let _ = arr_set p2 (d * d) ((arr_get p2 (d * d)) + 137438953472) in
+  let out_t = arr_new (d * d) 0 in
+  let _ = sgd_rows p2 out_t d lr 0 in
+  let tamper_mism = cmp_walk (split "\n" (cat [out_text out_t (d * d) 0 [], "\n"])) out 0 (d * d) 0 in
+  let tamper_ctrl = if tamper_mism > 0 then "DIVERGES-as-required" else "UNCHANGED-test-too-weak" in
+  -- 7. attestation record (binds data AND computation)
+  let record = cat ["{\n",
+    "  \"schema\": \"attested-train-step-v0\",\n",
+    "  \"kernel\": \"fx_sgd_step (linear layer, MSE, one SGD update)\",\n",
+    "  \"emitter\": \"stdlib/jit_emit.rail:emit_msl_fx_sgd_step\",\n",
+    "  \"d\": ", show d, ", \"shift\": 32, \"fx_one\": 4294967296,\n",
+    "  \"lr_num\": ", show lr, ", \"seed\": ", show seed, ",\n",
+    "  \"msl_sha256\": \"", sha256_hex msl, "\",\n",
+    "  \"params_sha256\": \"", sha256_hex ptext, "\",\n",
+    "  \"weights_out_cpu_sha256\": \"", c_h, "\",\n",
+    "  \"weights_out_gpu_sha256\": \"", g_h, "\",\n",
+    "  \"gpu_deterministic\": ", det, ",\n",
+    "  \"mismatches\": ", show mism, ",\n",
+    "  \"neg_control_naive_int64\": \"", neg_ctrl, "\",\n",
+    "  \"tamper_control_large_dx\": \"", tamper_ctrl, "\",\n",
+    "  \"verdict\": \"", verdict, "\"\n",
+    "}\n"] in
+  let _ = write_file "/tmp/agk/sgd_attest_record.json" record in
+  let _ = print "twin-kernel attestation act 10 (attested SGD TRAINING step on GPU):" in
+  let _ = print (cat ["  layer:           linear ", show d, "x", show d, ", MSE, 1 SGD step (", show (d * d), " weights)"]) in
+  let _ = print (cat ["  sample W'[0]:    ", show (arr_get out 0)]) in
+  let _ = print (cat ["  mismatches:      ", show mism, " of ", show (d * d)]) in
+  let _ = print (cat ["  cpu W' sha256:   ", c_h]) in
+  let _ = print (cat ["  gpu W' sha256:   ", g_h]) in
+  let _ = print (cat ["  gpu run1==run2:  ", det]) in
+  let _ = print (cat ["  neg control:     naive int64 -> ", neg_ctrl]) in
+  let _ = print (cat ["  tamper control:  large dx -> ", tamper_ctrl]) in
+  let _ = print (cat ["  verdict:         ", verdict]) in
+  let _ = print "  record:          /tmp/agk/sgd_attest_record.json" in
+  if mism == 0 then 0 else 1
