@@ -4201,6 +4201,22 @@ import "stdlib/<name>.rail"
 > < 2^63; for d<=1024 with normalized activations it stays ~2^55.
 > Packed W(rows*K) | x(K).  One thread per output row.
 
+### `emit_msl_fx_matmul24_batched rows k seqL`
+
+> BATCHED matvec (act 20 -- the perf item).  Same idot math as fx_matmul but
+> Y[t,o] = (sum_i W[o,i]*X[t,i])>>24 for ALL L tokens in ONE dispatch: the
+> weight W is uploaded ONCE (packed P = W(ROWS*K) | X(L*K)) instead of
+> re-uploaded per token.  Bit-for-bit identical to L separate fx_matmul
+> dispatches; kills the per-token weight-reupload bottleneck.  One thread per
+> (t,o) output; O laid out [t][o] = t*ROWS + o (same as the per-token path).
+
+### `emit_msl_fx_matmul_bwd_batched out k seqL`
+
+> BATCHED linear-backward (act 20).  dx[t,i] = (sum_o W[o,i]*dy[t,o])>>24 for
+> all L tokens in one dispatch.  Packed P = W(OUT*K) | dy(L*OUT), OFF_DY=OUT*K.
+> One thread per (t,i); O laid out [t][i] = t*K + i.  Bit-for-bit identical to
+> L separate fx_matmul_bwd dispatches.
+
 ### `emit_msl_fx_gelu24_shaped n`
 
 > GPT GELU (tanh-approx) device function + elementwise kernel (act 12).
