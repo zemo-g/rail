@@ -4093,6 +4093,25 @@ import "stdlib/<name>.rail"
 ### `emit_msl_fx_matvec_unrolled rows d shift unroll`
 
 
+### `emit_msl_fx_softmax_shaped rows d`
+
+> Fixed-point softmax (attested-GPU track, act 7 -- the LAST
+> discovery item).
+> 
+> exp is the one transcendental a transformer needs (softmax AND
+> silu).  Fixed-point spec, exact on both twins:
+> range-reduce:  n = (-x)/LN2  (trunc),  r = x + n*LN2 in (-ln2, 0]
+> exp(x) = taylor(r) >> n     -- the 2^-n scaling is a pure shift
+> taylor: 1 + r + r^2/2 + ... + r^7/5040, every power via mul_shr,
+> every divisor a truncating int64 division -- semantics identical
+> on ARM64 sdiv and Metal long division.
+> Softmax rows: m = max, e_j = fx_exp(s_j - m)  (arg <= 0 always),
+> p_j = (e_j << 16) / (sum >> 16)  ~ e_j * 2^32 / sum.  sum >= ONE
+> (the max element contributes exp(0) = exactly ONE), so no div-by-0.
+> 
+> Q32.32.  Approximation error ~1e-6 vs real exp; twin agreement is
+> exact by construction regardless -- the spec IS the computation.
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────

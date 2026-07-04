@@ -354,6 +354,70 @@ emit_msl_fx_matvec_unrolled rows d shift unroll =
        "    O[gid] = acc;\n",
        "}\n"]
 
+-- Fixed-point softmax (attested-GPU track, act 7 -- the LAST
+-- discovery item).
+--
+-- exp is the one transcendental a transformer needs (softmax AND
+-- silu).  Fixed-point spec, exact on both twins:
+--   range-reduce:  n = (-x)/LN2  (trunc),  r = x + n*LN2 in (-ln2, 0]
+--   exp(x) = taylor(r) >> n     -- the 2^-n scaling is a pure shift
+--   taylor: 1 + r + r^2/2 + ... + r^7/5040, every power via mul_shr,
+--   every divisor a truncating int64 division -- semantics identical
+--   on ARM64 sdiv and Metal long division.
+-- Softmax rows: m = max, e_j = fx_exp(s_j - m)  (arg <= 0 always),
+-- p_j = (e_j << 16) / (sum >> 16)  ~ e_j * 2^32 / sum.  sum >= ONE
+-- (the max element contributes exp(0) = exactly ONE), so no div-by-0.
+--
+-- Q32.32.  Approximation error ~1e-6 vs real exp; twin agreement is
+-- exact by construction regardless -- the spec IS the computation.
+emit_msl_fx_softmax_shaped rows d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint D = ",    show d,    ";\n",
+       "constant long FX_ONE = 4294967296;\n",
+       "constant long FX_LN2 = 2977044472;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "// exp(x) for x <= 0, Q32.32\n",
+       "static inline long fx_exp(long x) {\n",
+       "    if (x < -137438953472) return 0;\n",
+       "    long n = (0 - x) / FX_LN2;\n",
+       "    long r = x + n * FX_LN2;\n",
+       "    long p2 = mul_shr_gpu(r, r, 32);\n",
+       "    long p3 = mul_shr_gpu(p2, r, 32);\n",
+       "    long p4 = mul_shr_gpu(p3, r, 32);\n",
+       "    long p5 = mul_shr_gpu(p4, r, 32);\n",
+       "    long p6 = mul_shr_gpu(p5, r, 32);\n",
+       "    long p7 = mul_shr_gpu(p6, r, 32);\n",
+       "    long acc = FX_ONE + r + p2/2 + p3/6 + p4/24 + p5/120 + p6/720 + p7/5040;\n",
+       "    return acc >> n;\n",
+       "}\n\n",
+       "kernel void fx_softmax(\n",
+       "    device const long *S [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    uint base = gid * D;\n",
+       "    long m = S[base];\n",
+       "    for (uint j = 1; j < D; j++) { if (S[base + j] > m) m = S[base + j]; }\n",
+       "    long sum = 0;\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        long e = fx_exp(S[base + j] - m);\n",
+       "        O[base + j] = e;\n",
+       "        sum += e;\n",
+       "    }\n",
+       "    long den = sum >> 16;\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        O[base + j] = (O[base + j] << 16) / den;\n",
+       "    }\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
