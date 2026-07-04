@@ -418,6 +418,116 @@ emit_msl_fx_softmax_shaped rows d =
        "    }\n",
        "}\n"]
 
+-- integer sqrt for emit-time constants (d <= 2^12, trivial walk)
+jit_isqrt_walk n i = if (i * i) > n then i - 1 else jit_isqrt_walk n (i + 1)
+jit_isqrt n = jit_isqrt_walk n 1
+
+-- Fused fixed-point single-head attention (attested-GPU track, act 8:
+-- THE COMPOSITION).  No new math -- rmsnorm, matvec, softmax are the
+-- proven acts 2/3/7 device functions, fused into one kernel:
+--   xn = rmsnorm(x)  ->  q,k = Wq,Wk projections  ->  scores/sqrt(D)
+--   ->  softmax  ->  out = x + sum_j p_j * (Wv . xn_j)   (residual)
+-- Params ride in ONE packed buffer (X | G | WQ | WK | WV), the same
+-- shape as a real weights blob.  One thread per query position.
+--
+-- Bounds (|x|<2^29, |g|,|W|<2^27, d<=64, seq<=16) keep every
+-- accumulator under 2^56 -- inside int64 AND Rail's 63-bit ints, so
+-- twin agreement is guaranteed worst-case, not statistically.
+emit_msl_fx_attention_shaped seq d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint SEQ = ", show seq, ";\n",
+       "constant uint D = ",   show d,   ";\n",
+       "constant long FX_ONE = 4294967296;\n",
+       "constant long FX_EPS = 4295;\n",
+       "constant long FX_LN2 = 2977044472;\n",
+       -- 1/sqrt(d) is baked at EMIT time: fx_rsqrt's overflow-free
+       -- contract is v <= 2^36, and d*ONE exceeds it -- on overflow
+       -- Rail wraps at 63 bits vs Metal's 64, the ONE place twins can
+       -- silently diverge.  (Found by the twin harness itself.)
+       "constant long FX_ISD = ", show (4294967296 / (jit_isqrt d)), ";\n",
+       "constant uint OFF_G  = SEQ * D;\n",
+       "constant uint OFF_WQ = SEQ * D + D;\n",
+       "constant uint OFF_WK = SEQ * D + D + D * D;\n",
+       "constant uint OFF_WV = SEQ * D + D + 2 * D * D;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "static inline long fx_rsqrt(long v) {\n",
+       "    long lo = 0;\n",
+       "    long hi = 35184372088832 + 1;\n",
+       "    while (hi - lo > 1) {\n",
+       "        long mid = lo + (hi - lo) / 2;\n",
+       "        long t = mul_shr_gpu(mid, mid, 32);\n",
+       "        if (mul_shr_gpu(t, v, 32) <= FX_ONE) lo = mid; else hi = mid;\n",
+       "    }\n",
+       "    return lo;\n",
+       "}\n\n",
+       "static inline long fx_exp(long x) {\n",
+       "    if (x < -137438953472) return 0;\n",
+       "    long n = (0 - x) / FX_LN2;\n",
+       "    long r = x + n * FX_LN2;\n",
+       "    long p2 = mul_shr_gpu(r, r, 32);\n",
+       "    long p3 = mul_shr_gpu(p2, r, 32);\n",
+       "    long p4 = mul_shr_gpu(p3, r, 32);\n",
+       "    long p5 = mul_shr_gpu(p4, r, 32);\n",
+       "    long p6 = mul_shr_gpu(p5, r, 32);\n",
+       "    long p7 = mul_shr_gpu(p6, r, 32);\n",
+       "    long acc = FX_ONE + r + p2/2 + p3/6 + p4/24 + p5/120 + p6/720 + p7/5040;\n",
+       "    return acc >> n;\n",
+       "}\n\n",
+       "static void rms_row(device const long *P, uint j, thread long *dst) {\n",
+       "    long ss = 0;\n",
+       "    for (uint c = 0; c < D; c++) { long x = P[j * D + c]; ss += mul_shr_gpu(x, x, 32); }\n",
+       "    long r = fx_rsqrt(ss / (long)D + FX_EPS);\n",
+       "    for (uint c = 0; c < D; c++) {\n",
+       "        dst[c] = mul_shr_gpu(mul_shr_gpu(P[j * D + c], r, 32), P[OFF_G + c], 32);\n",
+       "    }\n",
+       "}\n\n",
+       "static void matvec(device const long *P, uint off, thread long *v, thread long *dst) {\n",
+       "    for (uint rr = 0; rr < D; rr++) {\n",
+       "        long acc = 0;\n",
+       "        for (uint c = 0; c < D; c++) acc += mul_shr_gpu(P[off + rr * D + c], v[c], 32);\n",
+       "        dst[rr] = acc;\n",
+       "    }\n",
+       "}\n\n",
+       "kernel void fx_attention(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= SEQ) return;\n",
+       "    long xn[",  show d,   "];\n",
+       "    long xnj[", show d,   "];\n",
+       "    long q[",   show d,   "];\n",
+       "    long w[",   show d,   "];\n",
+       "    long probs[", show seq, "];\n",
+       "    rms_row(P, gid, xn);\n",
+       "    matvec(P, OFF_WQ, xn, q);\n",
+       "    for (uint j = 0; j < SEQ; j++) {\n",
+       "        rms_row(P, j, xnj);\n",
+       "        matvec(P, OFF_WK, xnj, w);\n",
+       "        long s = 0;\n",
+       "        for (uint c = 0; c < D; c++) s += mul_shr_gpu(q[c], w[c], 32);\n",
+       "        probs[j] = mul_shr_gpu(s, FX_ISD, 32);\n",
+       "    }\n",
+       "    long m = probs[0];\n",
+       "    for (uint j = 1; j < SEQ; j++) { if (probs[j] > m) m = probs[j]; }\n",
+       "    long sum = 0;\n",
+       "    for (uint j = 0; j < SEQ; j++) { probs[j] = fx_exp(probs[j] - m); sum += probs[j]; }\n",
+       "    long den = sum >> 16;\n",
+       "    for (uint j = 0; j < SEQ; j++) probs[j] = (probs[j] << 16) / den;\n",
+       "    for (uint c = 0; c < D; c++) O[gid * D + c] = P[gid * D + c];\n",
+       "    for (uint j = 0; j < SEQ; j++) {\n",
+       "        rms_row(P, j, xnj);\n",
+       "        matvec(P, OFF_WV, xnj, w);\n",
+       "        for (uint c = 0; c < D; c++) O[gid * D + c] += mul_shr_gpu(probs[j], w[c], 32);\n",
+       "    }\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
