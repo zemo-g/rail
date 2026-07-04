@@ -4243,6 +4243,40 @@ import "stdlib/<name>.rail"
 > Packed P = W(OUT*K) | x(K) | dy(OUT).  One thread per output row; each
 > writes its whole K-length weight row.  FX_LR is the learning rate in F=24.
 
+### `emit_msl_fx_layernorm_bwd_shaped rows d`
+
+> LayerNorm-backward, F=24 (attested-GPU track, act 17 -- the first of the
+> two backward ops the full 16-layer backprop needs).  Input gradient dx for
+> GPT-style LayerNorm y = gamma*xhat + beta, xhat = (x-mean)/sqrt(var+eps)
+> (mean-subtract + POPULATION variance, matching gp_layernorm exactly).
+> The standard row-local result:
+> dxhat_i = dy_i*gamma_i
+> dx_i = inv * (dxhat_i - mean(dxhat) - xhat_i*mean(dxhat*xhat))
+> Recomputes mean/var/inv/xhat/dxhat on the fly (NO d-length thread-local
+> arrays -- d=768 would blow the per-thread stack), so it is a pure one-
+> thread-per-row kernel like the forward.  fxrsqrt24 = the exact 128-bit
+> binary-search rsqrt (same helper the forward uses).  beta does not affect
+> dx.  Packed P = X(rows*d) | gamma(d) | dy(rows*d).  eps=168.
+
+### `emit_msl_fx_attn_bwd_shaped seqL qdim nh hd`
+
+> Attention-backward, F=24 (attested-GPU track, act 18 -- the last backward
+> op the full 16-layer backprop needs).  dQ, dK, dV through the causal MHA
+> forward (emit_msl_fx_attn24_shaped / pf_heads):
+> O[i,c] = (sum_{j<=i} p[i,j]*V[j,c]) >> 24,  p = softmax(scaled causal QK^T)
+> Backward (dm cancels in the softmax Jacobian, so no max-grad):
+> dp[i,j]   = sum_c dO[i,c]*V[j,c] (>>24 per term)
+> dsc[i,j]  = p[i,j]*(dp[i,j] - sum_k p[i,k]*dp[i,k])       (softmax Jacobian)
+> draw[i,j] = dsc[i,j]*SCALEQ/S                              (scale chain)
+> dQ[i,c]  = sum_{j<=i} draw[i,j]*K[j,c] (>>24 per term)
+> dK[j,c]  = sum_{i>=j} draw[i,j]*Q[i,c]
+> dV[j,c]  = sum_{i>=j} dO[i,c]*p[i,j]
+> SCHEDULE-INDEPENDENT / bit-exact: one thread per position, each doing its
+> OWN sequential accumulation (dQ per query, dK/dV per key recompute every
+> query i>=j's softmax) -- no atomics, no cross-thread reduction.  3*L threads:
+> region gid/L in {0=dQ,1=dK,2=dV}, pos gid%L.  P = Q|K|V, U = dO,
+> O = dQ|dK|dV (each L*QDIM).  Thread-local arrays sized L,HD -> keep L modest.
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────

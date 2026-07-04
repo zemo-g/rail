@@ -1,0 +1,108 @@
+-- attested_attn_bwd_demo.rail -- twin-kernel attestation, act 18.
+-- Attention-backward (dQ/dK/dV) on GPU, F=24, twin-verified vs the model's
+-- own fixed-point CPU math.  The last backward op the full 16-layer backprop
+-- needs.  Backward of the causal MHA forward (pf_heads / act 13):
+--   dp[i,j]=sum_c dO[i,c]V[j,c]; dsc=p*(dp-sum p*dp); draw=dsc*SCALEQ/S;
+--   dQ[i,c]=sum_{j<=i} draw*K[j,c]; dK[j,c]=sum_{i>=j} draw*Q[i,c];
+--   dV[j,c]=sum_{i>=j} dO[i,c]*p[i,j].
+--
+-- run: ./rail_native run tools/metal/attested_attn_bwd_demo.rail
+
+import "stdlib/ijit.rail"
+import "stdlib/sha256.rail"
+
+-- ==== F=24 exp chain (bx_fixed.rail) ====
+bx4_pow2_go acc k = if k == 0 then acc else bx4_pow2_go (acc + acc) (k - 1)
+bx4_pow2 k = if k < 1 then 1 else bx4_pow2_go 1 k
+bx4_exp_poly fq =
+  let p8 = 416 in let p7 = 3329 + (p8 * fq) / 16777216 in let p6 = 23302 + (p7 * fq) / 16777216 in
+  let p5 = 139810 + (p6 * fq) / 16777216 in let p4 = 699051 + (p5 * fq) / 16777216 in
+  let p3 = 2796203 + (p4 * fq) / 16777216 in let p2 = 8388608 + (p3 * fq) / 16777216 in
+  let p1 = 16777216 + (p2 * fq) / 16777216 in 16777216 + (p1 * fq) / 16777216
+bx4_exp_neg ax =
+  let k = ax / 11629080 in let fq = ax - k * 11629080 in let ef = bx4_exp_poly fq in
+  let emf = 281474976710656 / ef in if k >= 50 then 0 else let p2 = bx4_pow2 k in (emf + p2 / 2) / p2
+
+-- ==== forward softmax (verbatim from attested_attn24_demo) ====
+c_raw q k qi kj hd c acc = if c >= hd then acc else c_raw q k qi kj hd (c + 1) (acc + ((arr_get q (qi + c)) * (arr_get k (kj + c))))
+c_scores q k sc i h qdim hd seqL j =
+  if j >= seqL then 0
+  else let scv = if j > i then (0 - 16777216000)
+                 else let raw = mul_shr (c_raw q k (i * qdim + h * hd) (j * qdim + h * hd) hd 0 0) 1 24 in (raw * 2097152) / 16777216 in
+       let _ = arr_set sc j scv in c_scores q k sc i h qdim hd seqL (j + 1)
+c_rowmax sc seqL j m = if j >= seqL then m else c_rowmax sc seqL (j + 1) (let v = arr_get sc j in if v > m then v else m)
+c_exprow sc ex seqL m j sum = if j >= seqL then sum else let e = bx4_exp_neg (m - (arr_get sc j)) in let _ = arr_set ex j e in c_exprow sc ex seqL m (j + 1) (sum + e)
+
+-- ==== CPU twin: backward dQ/dK/dV ====
+b_fillp ex p sum i j = if j > i then 0 else let _ = arr_set p j (((arr_get ex j) * 16777216) / sum) in b_fillp ex p sum i (j + 1)
+b_dpc dO v i j qb hd qdim c acc = if c >= hd then acc else b_dpc dO v i j qb hd qdim (c + 1) (acc + (mul_shr (arr_get dO (i * qdim + qb + c)) (arr_get v (j * qdim + qb + c)) 24))
+b_filldp dO v dp i qb hd qdim j = if j > i then 0 else let _ = arr_set dp j (b_dpc dO v i j qb hd qdim 0 0) in b_filldp dO v dp i qb hd qdim (j + 1)
+b_dot p dp i j acc = if j > i then acc else b_dot p dp i (j + 1) (acc + (mul_shr (arr_get p j) (arr_get dp j) 24))
+b_filldraw p dp draw dot i j = if j > i then 0 else let ds = mul_shr (arr_get p j) ((arr_get dp j) - dot) 24 in let _ = arr_set draw j ((ds * 2097152) / 16777216) in b_filldraw p dp draw dot i (j + 1)
+b_dqc draw k i qb hd qdim c j acc = if j > i then acc else b_dqc draw k i qb hd qdim c (j + 1) (acc + (mul_shr (arr_get draw j) (arr_get k (j * qdim + qb + c)) 24))
+b_dq draw k dQ i qb hd qdim c = if c >= hd then 0 else let _ = arr_set dQ (i * qdim + qb + c) (b_dqc draw k i qb hd qdim c 0 0) in b_dq draw k dQ i qb hd qdim (c + 1)
+b_dk_c draw q dK i j qb hd qdim c = if c >= hd then 0 else let idx = (j * qdim + qb + c) in let _ = arr_set dK idx ((arr_get dK idx) + (mul_shr (arr_get draw j) (arr_get q (i * qdim + qb + c)) 24)) in b_dk_c draw q dK i j qb hd qdim (c + 1)
+b_dk draw q dK i qb hd qdim j = if j > i then 0 else let _ = b_dk_c draw q dK i j qb hd qdim 0 in b_dk draw q dK i qb hd qdim (j + 1)
+b_dv_c dO p dV i j qb hd qdim c = if c >= hd then 0 else let idx = (j * qdim + qb + c) in let _ = arr_set dV idx ((arr_get dV idx) + (mul_shr (arr_get dO (i * qdim + qb + c)) (arr_get p j) 24)) in b_dv_c dO p dV i j qb hd qdim (c + 1)
+b_dv dO p dV i qb hd qdim j = if j > i then 0 else let _ = b_dv_c dO p dV i j qb hd qdim 0 in b_dv dO p dV i qb hd qdim (j + 1)
+b_head q k v dO sc ex p dp draw dQ dK dV i h qdim hd seqL =
+  let _ = c_scores q k sc i h qdim hd seqL 0 in
+  let m = c_rowmax sc seqL 1 (arr_get sc 0) in
+  let sum = c_exprow sc ex seqL m 0 0 in
+  let qb = h * hd in
+  let _ = b_fillp ex p sum i 0 in
+  let _ = b_filldp dO v dp i qb hd qdim 0 in
+  let dot = b_dot p dp i 0 0 in
+  let _ = b_filldraw p dp draw dot i 0 in
+  let _ = b_dq draw k dQ i qb hd qdim 0 in
+  let _ = b_dk draw q dK i qb hd qdim 0 in
+  let _ = b_dv dO p dV i qb hd qdim 0 in
+  0
+b_heads q k v dO sc ex p dp draw dQ dK dV i nh qdim hd seqL h = if h >= nh then 0 else let _ = b_head q k v dO sc ex p dp draw dQ dK dV i h qdim hd seqL in b_heads q k v dO sc ex p dp draw dQ dK dV i nh qdim hd seqL (h + 1)
+b_tokens q k v dO sc ex p dp draw dQ dK dV nh qdim hd seqL i = if i >= seqL then 0 else let _ = b_heads q k v dO sc ex p dp draw dQ dK dV i nh qdim hd seqL 0 in b_tokens q k v dO sc ex p dp draw dQ dK dV nh qdim hd seqL (i + 1)
+
+-- ==== io ====
+lcg s = ((s * 1103515245) + 12345) % 2147483648
+fillr a n s i lo rng = if i >= n then s else let s2 = lcg s in let _ = arr_set a i ((s2 % rng) - lo) in fillr a n s2 (i + 1) lo rng
+cpseg src soff dst doff n i = if i >= n then 0 else let _ = arr_set dst (doff + i) (arr_get src (soff + i)) in cpseg src soff dst doff n (i + 1)
+cmp_arr a b off n i mism = if i >= n then mism else cmp_arr a b off n (i + 1) (if (arr_get a (off + i)) == (arr_get b i) then mism else mism + 1)
+
+run_attn seqL nh hd =
+  let qdim = nh * hd in
+  let lq = seqL * qdim in
+  -- deterministic real-scale Q/K/V (+/-2^22) and dO (+/-2^19)
+  let q = arr_new lq 0 in let _ = fillr q lq 4242 0 4194304 8388608 in
+  let k = arr_new lq 0 in let _ = fillr k lq 7331 0 4194304 8388608 in
+  let v = arr_new lq 0 in let _ = fillr v lq 913 0 4194304 8388608 in
+  let dO = arr_new lq 0 in let _ = fillr dO lq 555 0 524288 1048576 in
+  -- CPU twin
+  let sc = arr_new seqL 0 in let ex = arr_new seqL 0 in
+  let p = arr_new seqL 0 in let dp = arr_new seqL 0 in let draw = arr_new seqL 0 in
+  let dQc = arr_new lq 0 in let dKc = arr_new lq 0 in let dVc = arr_new lq 0 in
+  let _ = b_tokens q k v dO sc ex p dp draw dQc dKc dVc nh qdim hd seqL 0 in
+  -- GPU: P=Q|K|V, U=dO, O=dQ|dK|dV (3*lq); nthreads=3*L
+  let P = arr_new (3 * lq) 0 in
+  let _ = cpseg q 0 P 0 lq 0 in let _ = cpseg k 0 P lq lq 0 in let _ = cpseg v 0 P (2 * lq) lq 0 in
+  let kid = ijit_compile (emit_msl_fx_attn_bwd_shaped seqL qdim nh hd) in
+  let _ = if kid < 0 then print (cat ["  COMPILE FAIL kid=", show kid]) else 0 in
+  let G = arr_new (3 * lq) 0 in
+  let _ = ijit_run kid P dO G (3 * lq) lq (3 * lq) (3 * seqL) in
+  let mq = cmp_arr G dQc 0 lq 0 0 in
+  let mk = cmp_arr G dKc lq lq 0 0 in
+  let mv = cmp_arr G dVc (2 * lq) lq 0 0 in
+  let tot = mq + mk + mv in
+  -- dQ[query 0] is exactly 0 (single-element softmax has zero score-grad); show a later row.
+  let ql = (seqL - 1) * qdim in
+  let _ = print (cat ["  L=", show seqL, " nh=", show nh, " hd=", show hd,
+    "  dQ ", show mq, " dK ", show mk, " dV ", show mv, " mism",
+    "   dQ[last row 0..2]=", show (arr_get G ql), " ", show (arr_get G (ql + 1)), " ", show (arr_get G (ql + 2)),
+    "   dV[0..2]=", show (arr_get G (2 * lq)), " ", show (arr_get G (2 * lq + 1)), " ", show (arr_get G (2 * lq + 2))]) in
+  tot
+
+main =
+  let _ = print "twin-kernel attestation act 18 (attention-backward on GPU, F=24):" in
+  let m1 = run_attn 6 2 8 in
+  let m2 = run_attn 8 12 64 in
+  let total = m1 + m2 in
+  let _ = print (cat ["  verdict: ", if total == 0 then "ATTN-BWD-TWINS-AGREE" else "DIVERGE"]) in
+  if total == 0 then 0 else 1
