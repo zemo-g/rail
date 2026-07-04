@@ -4177,6 +4177,23 @@ import "stdlib/<name>.rail"
 > S=2^24, eps=168 (round(1e-5 * 2^24)).  One thread per row.
 > Params packed X(rows*D) | gamma(D) | beta(D).
 
+### `emit_msl_fx_matmul24_shaped rows k`
+
+> GPT matvec with idot semantics (attested-GPU track, act 12).  The
+> 138M model's projections use `idot` = (sum_i W_i*x_i) >> 24 -- a
+> FULL-precision accumulate then ONE arithmetic shift (NOT per-element
+> mul_shr).  GPU: int64 accumulate, then >>24 (arithmetic floor,
+> matches Rail's smulh-based shift).  Bound: the raw sum must stay
+> < 2^63; for d<=1024 with normalized activations it stays ~2^55.
+> Packed W(rows*K) | x(K).  One thread per output row.
+
+### `emit_msl_fx_gelu24_shaped n`
+
+> GPT GELU (tanh-approx) device function + elementwise kernel (act 12).
+> Faithful MSL port of bx4_gelu -> bx4_tanh -> bx4_fxexp -> bx4_exp_poly
+> (bx_fixed.rail, F=24).  Uses truncating `/` (NOT >>) everywhere to
+> match Rail's division rounding exactly on negatives.
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────
