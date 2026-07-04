@@ -4112,6 +4112,27 @@ import "stdlib/<name>.rail"
 > Q32.32.  Approximation error ~1e-6 vs real exp; twin agreement is
 > exact by construction regardless -- the spec IS the computation.
 
+### `jit_isqrt_walk n i`
+
+> integer sqrt for emit-time constants (d <= 2^12, trivial walk)
+
+### `jit_isqrt n`
+
+
+### `emit_msl_fx_attention_shaped seq d`
+
+> Fused fixed-point single-head attention (attested-GPU track, act 8:
+> THE COMPOSITION).  No new math -- rmsnorm, matvec, softmax are the
+> proven acts 2/3/7 device functions, fused into one kernel:
+> xn = rmsnorm(x)  ->  q,k = Wq,Wk projections  ->  scores/sqrt(D)
+> ->  softmax  ->  out = x + sum_j p_j * (Wv . xn_j)   (residual)
+> Params ride in ONE packed buffer (X | G | WQ | WK | WV), the same
+> shape as a real weights blob.  One thread per query position.
+> 
+> Bounds (|x|<2^29, |g|,|W|<2^27, d<=64, seq<=16) keep every
+> accumulator under 2^56 -- inside int64 AND Rail's 63-bit ints, so
+> twin agreement is guaranteed worst-case, not statistically.
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────
