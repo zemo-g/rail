@@ -668,6 +668,73 @@ emit_msl_fx_sgd_step d lr_num =
        "    }\n",
        "}\n"]
 
+-- Fixed-point GPT-style LayerNorm (attested-GPU track, act 11 -- the
+-- REAL-MODEL wiring).  The 138M attested base model is GPT-2 family
+-- (LayerNorm+bias, GELU, learned pos-emb) at F=24, NOT the Llama
+-- family (RMSNorm/SwiGLU, F=32) of acts 3/8/9.  This emitter ports
+-- the model's ACTUAL gp_layernorm (pathb_gpt_forward.rail) exactly:
+-- mean-subtract, population variance, fxrsqrt (128-bit binary-search
+-- sqrt at F=24 with the exact fractional tie-break), affine WITH bias.
+-- S=2^24, eps=168 (round(1e-5 * 2^24)).  One thread per row.
+-- Params packed X(rows*D) | gamma(D) | beta(D).
+emit_msl_fx_layernorm24_shaped rows d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint D = ",    show d,    ";\n",
+       "constant long EPS = 168;\n",
+       "constant uint OFF_G = ROWS * D;\n",
+       "constant uint OFF_B = ROWS * D + D;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "// exact port of bx4_sqrt_le (bx_fixed.rail): r*r>>24 vs xq, with\n",
+       "// the fractional tie-break when the high parts are equal.\n",
+       "static inline bool sqrt_le(long r, long xq) {\n",
+       "    long hr = mul_shr_gpu(r, r, 24);\n",
+       "    if (hr < xq) return true;\n",
+       "    if (hr > xq) return false;\n",
+       "    long c  = r - (r / 16777216) * 16777216;\n",
+       "    long cc = c * c;\n",
+       "    return (cc - (cc / 16777216) * 16777216) == 0;\n",
+       "}\n",
+       "static inline long fxsqrt24(long xq) {\n",
+       "    if (xq < 1) return 0;\n",
+       "    long lo = 0;\n",
+       "    long hi = (16384L * 16384L) * 4096L;\n",
+       "    while ((lo + 1) < hi) {\n",
+       "        long mid = (lo + hi) / 2;\n",
+       "        if (sqrt_le(mid, xq)) lo = mid; else hi = mid;\n",
+       "    }\n",
+       "    return lo;\n",
+       "}\n",
+       "static inline long fxrsqrt24(long xq) {\n",
+       "    long q = fxsqrt24(xq);\n",
+       "    return q == 0 ? 0 : 281474976710656L / q;\n",
+       "}\n\n",
+       "kernel void fx_layernorm(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    uint base = gid * D;\n",
+       "    long s = 0;\n",
+       "    for (uint i = 0; i < D; i++) s += P[base + i];\n",
+       "    long mean = s / (long)D;\n",
+       "    long vs = 0;\n",
+       "    for (uint i = 0; i < D; i++) { long dx = P[base + i] - mean; vs += mul_shr_gpu(dx, dx, 24); }\n",
+       "    long var = vs / (long)D;\n",
+       "    long inv = fxrsqrt24(var + EPS);\n",
+       "    for (uint i = 0; i < D; i++) {\n",
+       "        long dx = P[base + i] - mean;\n",
+       "        O[base + i] = mul_shr_gpu(mul_shr_gpu(dx, inv, 24), P[OFF_G + i], 24) + P[OFF_B + i];\n",
+       "    }\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];

@@ -4165,6 +4165,18 @@ import "stdlib/<name>.rail"
 > replaces the MSE term); this proves the training step stays exact
 > and attestable.  lr_num is the Q32.32 learning-rate constant.
 
+### `emit_msl_fx_layernorm24_shaped rows d`
+
+> Fixed-point GPT-style LayerNorm (attested-GPU track, act 11 -- the
+> REAL-MODEL wiring).  The 138M attested base model is GPT-2 family
+> (LayerNorm+bias, GELU, learned pos-emb) at F=24, NOT the Llama
+> family (RMSNorm/SwiGLU, F=32) of acts 3/8/9.  This emitter ports
+> the model's ACTUAL gp_layernorm (pathb_gpt_forward.rail) exactly:
+> mean-subtract, population variance, fxrsqrt (128-bit binary-search
+> sqrt at F=24 with the exact fractional tie-break), affine WITH bias.
+> S=2^24, eps=168 (round(1e-5 * 2^24)).  One thread per row.
+> Params packed X(rows*D) | gamma(D) | beta(D).
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────
