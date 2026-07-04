@@ -886,6 +886,83 @@ emit_msl_fx_attn24_shaped seqL qdim nh hd =
        "    }\n",
        "}\n"]
 
+-- BACKWARD pass primitives, F=24 (attested-GPU track, act 15).
+-- Two classes cover transformer backprop:
+--   linear-backward: dx = W^T . dy = (sum_o W[o*K+i]*dy[o]) >> 24
+--                    (dW = dy (x) x is the act-10 outer product/update)
+--   nonlinear-backward: gelu'(x) = bx4_gelu_grad (the transcendental
+--                    DERIVATIVE, a fixed-point algorithm -> bit-exact).
+-- Both twin-verify vs the model's own fixed-point CPU math.
+
+-- dx = W^T . dy ; W is [OUT x K] row-major, packed W(OUT*K) | dy(OUT).
+-- One thread per input index i.  Same idot semantics as the forward.
+emit_msl_fx_matmul_bwd_shaped out k =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint OUT = ", show out, ";\n",
+       "constant uint K = ",   show k,   ";\n",
+       "constant uint OFF_DY = OUT * K;\n\n",
+       "kernel void fx_matmul_bwd(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= K) return;\n",
+       "    long acc = 0;\n",
+       "    for (uint o = 0; o < OUT; o++) acc += P[o * K + gid] * P[OFF_DY + o];\n",
+       "    O[gid] = acc >> 24;\n",
+       "}\n"]
+
+-- gelu'(x), F=24 -- faithful port of bx4_gelu_grad -> bx4_tanh ->
+-- bx4_fxexp.  All truncating `/`.  Elementwise, one thread per element.
+emit_msl_fx_gelu_grad24_shaped n =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint N = ", show n, ";\n",
+       "constant long S = 16777216;\n",
+       "constant long S48 = 281474976710656;\n",
+       "constant long LN2 = 11629080;\n\n",
+       "static inline long fx_pow2(long k) { long a = 1; for (long i = 0; i < k; i++) a += a; return k < 1 ? 1 : a; }\n",
+       "static inline long exp_poly(long fq) {\n",
+       "    long p = 416;\n",
+       "    p = 3329 + (p*fq)/S; p = 23302 + (p*fq)/S; p = 139810 + (p*fq)/S;\n",
+       "    p = 699051 + (p*fq)/S; p = 2796203 + (p*fq)/S; p = 8388608 + (p*fq)/S;\n",
+       "    p = 16777216 + (p*fq)/S; p = 16777216 + (p*fq)/S; return p;\n",
+       "}\n",
+       "static inline long fxexp_neg(long ax) {\n",
+       "    long k = ax / LN2; long fq = ax - k*LN2; long ef = exp_poly(fq);\n",
+       "    long emf = S48 / ef; if (k >= 50) return 0;\n",
+       "    long p2 = fx_pow2(k); return (emf + p2/2) / p2;\n",
+       "}\n",
+       "static inline long tanh_pos(long axq) { long em = fxexp_neg(axq + axq); return ((S - em) * S) / (S + em); }\n",
+       "static inline long fx_tanh(long xq) { return xq < 0 ? -tanh_pos(-xq) : tanh_pos(xq); }\n",
+       "static inline long gelu_grad(long xq) {\n",
+       "    long x2 = (xq * xq) / S;\n",
+       "    long x3 = (x2 * xq) / S;\n",
+       "    long ax3 = (750194 * x3) / S;\n",
+       "    long inner0 = xq + ax3;\n",
+       "    long u = (13386610 * inner0) / S;\n",
+       "    long t = fx_tanh(u);\n",
+       "    long term1 = (S + t) / 2;\n",
+       "    long sech2 = S - (t * t) / S;\n",
+       "    long a3x2 = (3 * (750194 * x2)) / S;\n",
+       "    long inner1 = S + a3x2;\n",
+       "    long dudx = (13386610 * inner1) / S;\n",
+       "    long p1 = (xq * sech2) / S;\n",
+       "    long p2 = (p1 * dudx) / S;\n",
+       "    return term1 + p2 / 2;\n",
+       "}\n\n",
+       "kernel void fx_gelu_grad(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= N) return;\n",
+       "    O[gid] = gelu_grad(P[gid]);\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];

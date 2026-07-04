@@ -4204,6 +4204,16 @@ import "stdlib/<name>.rail"
 > F=24.  Q|K|V packed (each L*QDIM, group=1 so kvdim=qdim).  One thread
 > per query token.  L small (<=64) -> thread-local score/exp arrays fit.
 
+### `emit_msl_fx_matmul_bwd_shaped out k`
+
+> dx = W^T . dy ; W is [OUT x K] row-major, packed W(OUT*K) | dy(OUT).
+> One thread per input index i.  Same idot semantics as the forward.
+
+### `emit_msl_fx_gelu_grad24_shaped n`
+
+> gelu'(x), F=24 -- faithful port of bx4_gelu_grad -> bx4_tanh ->
+> bx4_fxexp.  All truncating `/`.  Elementwise, one thread per element.
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────
