@@ -4194,6 +4194,16 @@ import "stdlib/<name>.rail"
 > (bx_fixed.rail, F=24).  Uses truncating `/` (NOT >>) everywhere to
 > match Rail's division rounding exactly on negatives.
 
+### `emit_msl_fx_attn24_shaped seqL qdim nh hd`
+
+> GPT causal multi-head attention, F=24 (attested-GPU track, act 13).
+> Faithful port of the model's pf_heads: per query token i, per head h,
+> causal scores (idot(Q_h,K_h)>>24, then *scaleq trunc-div, mask j>i to
+> -1000*S), softmax over positions (rowmax, fxexp, normalize), then
+> weighted-V (sum_j P[j]*V_h >>24).  scaleq = 2097152 = 1/sqrt(64) in
+> F=24.  Q|K|V packed (each L*QDIM, group=1 so kvdim=qdim).  One thread
+> per query token.  L small (<=64) -> thread-local score/exp arrays fit.
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────

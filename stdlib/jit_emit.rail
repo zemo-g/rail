@@ -820,6 +820,72 @@ emit_msl_fx_gelu24_shaped n =
        "    O[gid] = fx_gelu(P[gid]);\n",
        "}\n"]
 
+-- GPT causal multi-head attention, F=24 (attested-GPU track, act 13).
+-- Faithful port of the model's pf_heads: per query token i, per head h,
+-- causal scores (idot(Q_h,K_h)>>24, then *scaleq trunc-div, mask j>i to
+-- -1000*S), softmax over positions (rowmax, fxexp, normalize), then
+-- weighted-V (sum_j P[j]*V_h >>24).  scaleq = 2097152 = 1/sqrt(64) in
+-- F=24.  Q|K|V packed (each L*QDIM, group=1 so kvdim=qdim).  One thread
+-- per query token.  L small (<=64) -> thread-local score/exp arrays fit.
+emit_msl_fx_attn24_shaped seqL qdim nh hd =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint L = ",    show seqL, ";\n",
+       "constant uint QDIM = ", show qdim, ";\n",
+       "constant uint NH = ",   show nh,   ";\n",
+       "constant uint HD = ",   show hd,   ";\n",
+       "constant long SCALEQ = 2097152;\n",
+       "constant long S = 16777216;\n",
+       "constant long S48 = 281474976710656;\n",
+       "constant long LN2 = 11629080;\n",
+       "constant long NEG_INF = -16777216000;\n",
+       "constant uint OFF_K = L * QDIM;\n",
+       "constant uint OFF_V = 2 * L * QDIM;\n\n",
+       "static inline long fx_pow2(long k) { long a = 1; for (long i = 0; i < k; i++) a += a; return k < 1 ? 1 : a; }\n",
+       "static inline long exp_poly(long fq) {\n",
+       "    long p = 416;\n",
+       "    p = 3329 + (p*fq)/S; p = 23302 + (p*fq)/S; p = 139810 + (p*fq)/S;\n",
+       "    p = 699051 + (p*fq)/S; p = 2796203 + (p*fq)/S; p = 8388608 + (p*fq)/S;\n",
+       "    p = 16777216 + (p*fq)/S; p = 16777216 + (p*fq)/S; return p;\n",
+       "}\n",
+       "static inline long fxexp_neg(long ax) {\n",  -- ax = |x|, returns e^{-ax} * S
+       "    long k = ax / LN2; long fq = ax - k*LN2; long ef = exp_poly(fq);\n",
+       "    long emf = S48 / ef; if (k >= 50) return 0;\n",
+       "    long p2 = fx_pow2(k); return (emf + p2/2) / p2;\n",
+       "}\n\n",
+       "kernel void fx_attn(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= L) return;\n",
+       "    long sc[", show seqL, "];\n",
+       "    long ex[", show seqL, "];\n",
+       "    for (uint h = 0; h < NH; h++) {\n",
+       "        uint qb = h * HD;\n",
+       "        for (uint j = 0; j < L; j++) {\n",
+       "            if (j > gid) { sc[j] = NEG_INF; continue; }\n",
+       "            long raw = 0;\n",
+       "            for (uint c = 0; c < HD; c++) raw += P[gid*QDIM + qb + c] * P[OFF_K + j*QDIM + qb + c];\n",
+       "            raw = raw >> 24;\n",
+       "            sc[j] = (raw * SCALEQ) / S;\n",
+       "        }\n",
+       "        long m = sc[0];\n",
+       "        for (uint j = 1; j < L; j++) if (sc[j] > m) m = sc[j];\n",
+       "        long sum = 0;\n",
+       "        for (uint j = 0; j < L; j++) { long e = fxexp_neg(m - sc[j]); ex[j] = e; sum += e; }\n",
+       "        for (uint c = 0; c < HD; c++) {\n",
+       "            long acc = 0;\n",
+       "            for (uint j = 0; j < L; j++) {\n",
+       "                long p = (ex[j] * S) / sum;\n",
+       "                acc += p * P[OFF_V + j*QDIM + qb + c];\n",
+       "            }\n",
+       "            O[gid*QDIM + qb + c] = acc >> 24;\n",
+       "        }\n",
+       "    }\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
