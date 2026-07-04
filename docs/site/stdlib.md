@@ -3979,6 +3979,20 @@ import "stdlib/<name>.rail"
 
 
 
+## `stdlib/ijit.rail`
+
+### `ijit_compile msl`
+
+> Compile MSL source -> pipeline id.  Writes the int JIT tmp file the
+> dylib reads, then JIT-compiles.
+
+### `ijit_run kid a b o sizeA sizeB sizeO nthreads`
+
+> Dispatch a shaped kernel.  Thin pass-through; kept so callers read as
+> ijit_run (mirrors jit_run_*), and so a future arg-packing change stays
+> local to this module.
+
+
 ## `stdlib/jit.rail`
 
 ### `jit_compile_rmsnorm_qkv _`
@@ -4213,6 +4227,21 @@ import "stdlib/<name>.rail"
 
 > gelu'(x), F=24 -- faithful port of bx4_gelu_grad -> bx4_tanh ->
 > bx4_fxexp.  All truncating `/`.  Elementwise, one thread per element.
+
+### `emit_msl_fx_wupdate24_shaped out k lr_num`
+
+> Fused weight-gradient + SGD update for a linear layer, F=24 (attested-
+> GPU track, act 16 -- completes the training step).  For y = W.x with
+> upstream dy (out), the weight gradient is the outer product
+> dW[o,i] = dy[o]*x[i] and the SGD step is W'[o,i] = W[o,i] - lr*dW[o,i].
+> Both products go through mul_shr_gpu (the exact 128-bit-reconstruct port
+> of Rail's mul_shr, already twin-verified in acts 10/11), so the result
+> is bit-identical to the CPU twin's mul_shr on every sign.  This is the
+> F=24 adaptation of the Q32 act-10 sgd_step, split out as update-only so
+> it composes with the separately-attested matmul24 forward and
+> matmul_bwd (dx) rather than re-deriving y internally.
+> Packed P = W(OUT*K) | x(K) | dy(OUT).  One thread per output row; each
+> writes its whole K-length weight row.  FX_LR is the learning rate in F=24.
 
 ### `node_seq node`
 

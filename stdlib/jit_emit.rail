@@ -963,6 +963,46 @@ emit_msl_fx_gelu_grad24_shaped n =
        "    O[gid] = gelu_grad(P[gid]);\n",
        "}\n"]
 
+-- Fused weight-gradient + SGD update for a linear layer, F=24 (attested-
+-- GPU track, act 16 -- completes the training step).  For y = W.x with
+-- upstream dy (out), the weight gradient is the outer product
+-- dW[o,i] = dy[o]*x[i] and the SGD step is W'[o,i] = W[o,i] - lr*dW[o,i].
+-- Both products go through mul_shr_gpu (the exact 128-bit-reconstruct port
+-- of Rail's mul_shr, already twin-verified in acts 10/11), so the result
+-- is bit-identical to the CPU twin's mul_shr on every sign.  This is the
+-- F=24 adaptation of the Q32 act-10 sgd_step, split out as update-only so
+-- it composes with the separately-attested matmul24 forward and
+-- matmul_bwd (dx) rather than re-deriving y internally.
+-- Packed P = W(OUT*K) | x(K) | dy(OUT).  One thread per output row; each
+-- writes its whole K-length weight row.  FX_LR is the learning rate in F=24.
+emit_msl_fx_wupdate24_shaped out k lr_num =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint OUT = ",   show out,    ";\n",
+       "constant uint K = ",     show k,      ";\n",
+       "constant long FX_LR = ", show lr_num, ";\n",
+       "constant uint OFF_X = OUT * K;\n",
+       "constant uint OFF_DY = OUT * K + K;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "kernel void fx_wupdate(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= OUT) return;\n",
+       "    uint wrow = gid * K;\n",
+       "    long dy = P[OFF_DY + gid];\n",
+       "    for (uint i = 0; i < K; i++) {\n",
+       "        long dW = mul_shr_gpu(dy, P[OFF_X + i], 24);\n",
+       "        O[wrow + i] = P[wrow + i] - mul_shr_gpu(FX_LR, dW, 24);\n",
+       "    }\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
