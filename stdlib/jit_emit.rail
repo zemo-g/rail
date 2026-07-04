@@ -528,6 +528,104 @@ emit_msl_fx_attention_shaped seq d =
        "    }\n",
        "}\n"]
 
+-- Fused fixed-point SwiGLU FFN (attested-GPU track, act 9).  No new
+-- discovery: silu is x * sigmoid(x), sigmoid reduces to fx_exp (act
+-- 7), the rest is matvec (act 2) + rmsnorm (act 3).  Fused:
+--   xn = rmsnorm(x)  ->  gate = WG.xn,  up = WU.xn
+--   act = silu(gate) * up  ->  down = WD.act  ->  out = x + down
+-- Hidden dim = D (square FFN keeps the packed layout simple; the
+-- twin-exactness point is identical at h != D).
+-- Params packed: X | G | WG(DxD) | WU(DxD) | WD(DxD).
+--
+-- sigmoid is the ONLY division; done overflow-safe as
+-- (num << 16) / (denom >> 16) -- the act-8 lesson: any path that can
+-- overflow int64 is where Rail's 63-bit and Metal's 64-bit wrap
+-- diverge.  This form keeps every intermediate < 2^48.
+emit_msl_fx_ffn_shaped seq d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint SEQ = ", show seq, ";\n",
+       "constant uint D = ",   show d,   ";\n",
+       "constant long FX_ONE = 4294967296;\n",
+       "constant long FX_EPS = 4295;\n",
+       "constant long FX_LN2 = 2977044472;\n",
+       "constant uint OFF_G  = SEQ * D;\n",
+       "constant uint OFF_WG = SEQ * D + D;\n",
+       "constant uint OFF_WU = SEQ * D + D + D * D;\n",
+       "constant uint OFF_WD = SEQ * D + D + 2 * D * D;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "static inline long fx_rsqrt(long v) {\n",
+       "    long lo = 0;\n",
+       "    long hi = 35184372088832 + 1;\n",
+       "    while (hi - lo > 1) {\n",
+       "        long mid = lo + (hi - lo) / 2;\n",
+       "        long t = mul_shr_gpu(mid, mid, 32);\n",
+       "        if (mul_shr_gpu(t, v, 32) <= FX_ONE) lo = mid; else hi = mid;\n",
+       "    }\n",
+       "    return lo;\n",
+       "}\n\n",
+       "static inline long fx_exp(long x) {\n",
+       "    if (x < -137438953472) return 0;\n",
+       "    long n = (0 - x) / FX_LN2;\n",
+       "    long r = x + n * FX_LN2;\n",
+       "    long p2 = mul_shr_gpu(r, r, 32);\n",
+       "    long p3 = mul_shr_gpu(p2, r, 32);\n",
+       "    long p4 = mul_shr_gpu(p3, r, 32);\n",
+       "    long p5 = mul_shr_gpu(p4, r, 32);\n",
+       "    long p6 = mul_shr_gpu(p5, r, 32);\n",
+       "    long p7 = mul_shr_gpu(p6, r, 32);\n",
+       "    long acc = FX_ONE + r + p2/2 + p3/6 + p4/24 + p5/120 + p6/720 + p7/5040;\n",
+       "    return acc >> n;\n",
+       "}\n\n",
+       "// silu(g) = g * sigmoid(g); sigmoid via e = exp(-|g|) so exp's\n",
+       "// arg is always <= 0.  g>=0: sig = ONE/(ONE+e).  g<0: sig = e/(ONE+e).\n",
+       "static inline long fx_silu(long g) {\n",
+       "    long ag = g < 0 ? -g : g;\n",
+       "    long e = fx_exp(-ag);\n",
+       "    long denom = FX_ONE + e;\n",
+       "    long num = g < 0 ? e : FX_ONE;\n",
+       "    long sig = (num << 16) / (denom >> 16);\n",
+       "    return mul_shr_gpu(g, sig, 32);\n",
+       "}\n\n",
+       "static void rms_row(device const long *P, uint j, thread long *dst) {\n",
+       "    long ss = 0;\n",
+       "    for (uint c = 0; c < D; c++) { long x = P[j * D + c]; ss += mul_shr_gpu(x, x, 32); }\n",
+       "    long r = fx_rsqrt(ss / (long)D + FX_EPS);\n",
+       "    for (uint c = 0; c < D; c++) {\n",
+       "        dst[c] = mul_shr_gpu(mul_shr_gpu(P[j * D + c], r, 32), P[OFF_G + c], 32);\n",
+       "    }\n",
+       "}\n\n",
+       "static void matvec(device const long *P, uint off, thread long *v, thread long *dst) {\n",
+       "    for (uint rr = 0; rr < D; rr++) {\n",
+       "        long acc = 0;\n",
+       "        for (uint c = 0; c < D; c++) acc += mul_shr_gpu(P[off + rr * D + c], v[c], 32);\n",
+       "        dst[rr] = acc;\n",
+       "    }\n",
+       "}\n\n",
+       "kernel void fx_ffn(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= SEQ) return;\n",
+       "    long xn[",   show d, "];\n",
+       "    long gate[", show d, "];\n",
+       "    long up[",   show d, "];\n",
+       "    long act[",  show d, "];\n",
+       "    long down[", show d, "];\n",
+       "    rms_row(P, gid, xn);\n",
+       "    matvec(P, OFF_WG, xn, gate);\n",
+       "    matvec(P, OFF_WU, xn, up);\n",
+       "    for (uint c = 0; c < D; c++) act[c] = mul_shr_gpu(fx_silu(gate[c]), up[c], 32);\n",
+       "    matvec(P, OFF_WD, act, down);\n",
+       "    for (uint c = 0; c < D; c++) O[gid * D + c] = P[gid * D + c] + down[c];\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
