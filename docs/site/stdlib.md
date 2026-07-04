@@ -4149,6 +4149,22 @@ import "stdlib/<name>.rail"
 > overflow int64 is where Rail's 63-bit and Metal's 64-bit wrap
 > diverge.  This form keeps every intermediate < 2^48.
 
+### `emit_msl_fx_sgd_step d lr_num`
+
+> Fused fixed-point SGD step (attested-GPU track, act 10: the BACKWARD
+> pass -- attested TRAINING).  One linear layer y=W.x, MSE loss, one
+> SGD update, all mul_shr/add/shift (no division -> no rounding
+> trap).  Per review: bounds EXERCISE the 128-bit path (products
+> >2^63) while results stay <2^62; LR baked at emit time is bound via
+> the msl hash in the record.  One thread per row i:
+> y_i  = sum_j mul_shr(W_ij, x_j, 32)     (forward, inline)
+> g_i  = (y_i - t_i) << 1                  (MSE grad, x2 = shift)
+> W'_ij = W_ij - mul_shr(LR, mul_shr(g_i, x_j, 32), 32)
+> Params packed W(d*d) | x(d) | t(d); output = updated W (d*d).
+> Every transformer weight update is this shape (upstream grad
+> replaces the MSE term); this proves the training step stays exact
+> and attestable.  lr_num is the Q32.32 learning-rate constant.
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────

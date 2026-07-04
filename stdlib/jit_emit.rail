@@ -626,6 +626,48 @@ emit_msl_fx_ffn_shaped seq d =
        "    for (uint c = 0; c < D; c++) O[gid * D + c] = P[gid * D + c] + down[c];\n",
        "}\n"]
 
+-- Fused fixed-point SGD step (attested-GPU track, act 10: the BACKWARD
+-- pass -- attested TRAINING).  One linear layer y=W.x, MSE loss, one
+-- SGD update, all mul_shr/add/shift (no division -> no rounding
+-- trap).  Per review: bounds EXERCISE the 128-bit path (products
+-- >2^63) while results stay <2^62; LR baked at emit time is bound via
+-- the msl hash in the record.  One thread per row i:
+--   y_i  = sum_j mul_shr(W_ij, x_j, 32)     (forward, inline)
+--   g_i  = (y_i - t_i) << 1                  (MSE grad, x2 = shift)
+--   W'_ij = W_ij - mul_shr(LR, mul_shr(g_i, x_j, 32), 32)
+-- Params packed W(d*d) | x(d) | t(d); output = updated W (d*d).
+-- Every transformer weight update is this shape (upstream grad
+-- replaces the MSE term); this proves the training step stays exact
+-- and attestable.  lr_num is the Q32.32 learning-rate constant.
+emit_msl_fx_sgd_step d lr_num =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint D = ",   show d,      ";\n",
+       "constant long FX_LR = ", show lr_num, ";\n",
+       "constant uint OFF_X = D * D;\n",
+       "constant uint OFF_T = D * D + D;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "kernel void fx_sgd_step(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= D) return;\n",
+       "    uint wrow = gid * D;\n",
+       "    long y = 0;\n",
+       "    for (uint j = 0; j < D; j++) y += mul_shr_gpu(P[wrow + j], P[OFF_X + j], 32);\n",
+       "    long g = (y - P[OFF_T + gid]) * 2;\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        long dW = mul_shr_gpu(g, P[OFF_X + j], 32);\n",
+       "        O[wrow + j] = P[wrow + j] - mul_shr_gpu(FX_LR, dW, 32);\n",
+       "    }\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
