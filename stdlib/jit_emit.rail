@@ -801,6 +801,37 @@ emit_msl_fx_matmul_bwd_batched out k seqL =
        "    O[gid] = acc >> 24;\n",
        "}\n"]
 
+-- PERSISTENT-WEIGHT variants (act 23): W in buffer(0) (resident, uploaded once
+-- via tgl_ibuf_upload), X/dy in buffer(1) (small, uploaded per dispatch).
+-- Same math as the _batched kernels; bit-for-bit identical.  Eliminates the
+-- per-dispatch re-pack + re-upload of the (unchanging) weight.
+emit_msl_fx_matmul24_wx rows k seqL =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint K = ",    show k,    ";\n",
+       "constant uint L = ",    show seqL, ";\n\n",
+       "kernel void fx_matmul_wx(device const long *W [[buffer(0)]], device const long *X [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= L * ROWS) return;\n",
+       "    uint t = gid / ROWS; uint o = gid % ROWS;\n",
+       "    long acc = 0;\n",
+       "    uint wrow = o * K; uint xrow = t * K;\n",
+       "    for (uint i = 0; i < K; i++) acc += W[wrow + i] * X[xrow + i];\n",
+       "    O[gid] = acc >> 24;\n",
+       "}\n"]
+emit_msl_fx_matmul_bwd_wx out k seqL =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint OUT = ", show out,  ";\n",
+       "constant uint K = ",   show k,    ";\n",
+       "constant uint L = ",   show seqL, ";\n\n",
+       "kernel void fx_matmul_bwd_wx(device const long *W [[buffer(0)]], device const long *DY [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= L * K) return;\n",
+       "    uint t = gid / K; uint i = gid % K;\n",
+       "    long acc = 0;\n",
+       "    uint dyrow = t * OUT;\n",
+       "    for (uint o = 0; o < OUT; o++) acc += W[o * K + i] * DY[dyrow + o];\n",
+       "    O[gid] = acc >> 24;\n",
+       "}\n"]
+
 -- GPT GELU (tanh-approx) device function + elementwise kernel (act 12).
 -- Faithful MSL port of bx4_gelu -> bx4_tanh -> bx4_fxexp -> bx4_exp_poly
 -- (bx_fixed.rail, F=24).  Uses truncating `/` (NOT >>) everywhere to
@@ -923,6 +954,59 @@ emit_msl_fx_attn24_shaped seqL qdim nh hd =
        "            }\n",
        "            O[gid*QDIM + qb + c] = acc >> 24;\n",
        "        }\n",
+       "    }\n",
+       "}\n"]
+
+-- Attention forward, PARALLELIZED per (query, head) (act 22 -- the perf item).
+-- Identical math to fx_attn but ONE thread per (query i, head h) = L*NH threads
+-- instead of L threads each looping all NH heads.  On the model shape (L=9,
+-- NH=12) that is 108 threads vs 9 -- 12x more GPU occupancy for the single most
+-- expensive op.  Bit-for-bit identical (each thread does the SAME per-(i,h)
+-- sequential work).  gid -> i = gid/NH, h = gid%NH.
+emit_msl_fx_attn24_par seqL qdim nh hd =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint L = ",    show seqL, ";\n",
+       "constant uint QDIM = ", show qdim, ";\n",
+       "constant uint NH = ",   show nh,   ";\n",
+       "constant uint HD = ",   show hd,   ";\n",
+       "constant long SCALEQ = 2097152;\n",
+       "constant long S = 16777216;\n",
+       "constant long S48 = 281474976710656;\n",
+       "constant long LN2 = 11629080;\n",
+       "constant long NEG_INF = -16777216000;\n",
+       "constant uint OFF_K = L * QDIM;\n",
+       "constant uint OFF_V = 2 * L * QDIM;\n\n",
+       "static inline long fx_pow2(long k) { long a = 1; for (long i = 0; i < k; i++) a += a; return k < 1 ? 1 : a; }\n",
+       "static inline long exp_poly(long fq) {\n",
+       "    long p = 416;\n",
+       "    p = 3329 + (p*fq)/S; p = 23302 + (p*fq)/S; p = 139810 + (p*fq)/S;\n",
+       "    p = 699051 + (p*fq)/S; p = 2796203 + (p*fq)/S; p = 8388608 + (p*fq)/S;\n",
+       "    p = 16777216 + (p*fq)/S; p = 16777216 + (p*fq)/S; return p;\n",
+       "}\n",
+       "static inline long fxexp_neg(long ax) {\n",
+       "    long k = ax / LN2; long fq = ax - k*LN2; long ef = exp_poly(fq);\n",
+       "    long emf = S48 / ef; if (k >= 50) return 0;\n",
+       "    long p2 = fx_pow2(k); return (emf + p2/2) / p2;\n",
+       "}\n\n",
+       "kernel void fx_attn_p(device const long *P [[buffer(0)]], device const long *U [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= L * NH) return;\n",
+       "    uint i = gid / NH; uint h = gid % NH; uint qb = h * HD;\n",
+       "    long sc[", show seqL, "]; long ex[", show seqL, "];\n",
+       "    for (uint j = 0; j < L; j++) {\n",
+       "        if (j > i) { sc[j] = NEG_INF; continue; }\n",
+       "        long raw = 0;\n",
+       "        for (uint c = 0; c < HD; c++) raw += P[i*QDIM + qb + c] * P[OFF_K + j*QDIM + qb + c];\n",
+       "        raw = raw >> 24;\n",
+       "        sc[j] = (raw * SCALEQ) / S;\n",
+       "    }\n",
+       "    long m = sc[0];\n",
+       "    for (uint j = 1; j < L; j++) if (sc[j] > m) m = sc[j];\n",
+       "    long sum = 0;\n",
+       "    for (uint j = 0; j < L; j++) { long e = fxexp_neg(m - sc[j]); ex[j] = e; sum += e; }\n",
+       "    for (uint c = 0; c < HD; c++) {\n",
+       "        long acc = 0;\n",
+       "        for (uint j = 0; j < L; j++) { long p = (ex[j] * S) / sum; acc += p * P[OFF_V + j*QDIM + qb + c]; }\n",
+       "        O[i*QDIM + qb + c] = acc >> 24;\n",
        "    }\n",
        "}\n"]
 

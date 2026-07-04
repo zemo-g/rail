@@ -81,6 +81,9 @@ gpu_wgrad kid dy x dW out k L = let P = arr_new (L * out + L * k) 0 in let _ = c
 -- BATCHED (act 20): weight uploaded ONCE, all L tokens in one dispatch.
 gpu_proj_b kid W src out rows k L = let P = arr_new (rows * k + L * k) 0 in let _ = cpseg W 0 P 0 (rows * k) 0 in let _ = cpseg src 0 P (rows * k) (L * k) 0 in ijit_run kid P P out (rows * k + L * k) 1 (L * rows) (L * rows)
 gpu_mbwd_b kid W dyv dxo out k L = let P = arr_new (out * k + L * out) 0 in let _ = cpseg W 0 P 0 (out * k) 0 in let _ = cpseg dyv 0 P (out * k) (L * out) 0 in ijit_run kid P P dxo (out * k + L * out) 1 (L * k) (L * k)
+-- PERSISTENT-weight variants (act 23): weight resident on GPU (wid), only X uploaded.
+gpu_proj_wx kid wid src out rows k L = ijit_run_wx kid wid src out (L * k) (L * rows) (L * rows)
+gpu_mbwd_wx kid wid dyv dxo out k L = ijit_run_wx kid wid dyv dxo (L * out) (L * k) (L * k)
 
 -- ===== weight cache: decode ALL layer weights ONCE (act 21 -- perf).
 -- wc[li*12 + j] holds the decoded array for tensor j of layer li:
@@ -102,74 +105,86 @@ wc_load fd hdr base wc li nlayers d qdim inter =
     let _ = arr_set wc (li * 12 + 11) (ld_f32 fd hdr base (bname li "mlp.layers.2.bias") d) in
     wc_load fd hdr base wc (li + 1) nlayers d qdim inter
 
+-- upload the 6 big matmul weights of each layer to RESIDENT GPU buffers once.
+-- wcb[li*6 + j]: 0 Wq  1 Wk  2 Wv  3 Wo  4 Wm0  5 Wm2  (handles into g_ibufs)
+wcb_load wc wcb li nlayers d qdim inter =
+  if li >= nlayers then 0
+  else
+    let _ = arr_set wcb (li * 6 + 0) (ibuf_upload (arr_get wc (li * 12 + 2)) (qdim * d)) in
+    let _ = arr_set wcb (li * 6 + 1) (ibuf_upload (arr_get wc (li * 12 + 3)) (qdim * d)) in
+    let _ = arr_set wcb (li * 6 + 2) (ibuf_upload (arr_get wc (li * 12 + 4)) (qdim * d)) in
+    let _ = arr_set wcb (li * 6 + 3) (ibuf_upload (arr_get wc (li * 12 + 5)) (d * qdim)) in
+    let _ = arr_set wcb (li * 6 + 4) (ibuf_upload (arr_get wc (li * 12 + 8)) (inter * d)) in
+    let _ = arr_set wcb (li * 6 + 5) (ibuf_upload (arr_get wc (li * 12 + 10)) (d * inter)) in
+    wcb_load wc wcb (li + 1) nlayers d qdim inter
+
 -- ===== GPU forward block (cached weights; SAVES QKV/h1/r1 for the backward) =====
-gpu_block H li L d nh hd qdim inter ks wc Aqkv Ah1 Ar1 =
+gpu_block H li L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 =
   let kLN = arr_get ks 0 in let kP1 = arr_get ks 1 in let kUp = arr_get ks 2 in let kDn = arr_get ks 3 in let kAt = arr_get ks 4 in let kGe = arr_get ks 5 in
   let g1 = arr_get wc (li * 12 + 0) in let b1 = arr_get wc (li * 12 + 1) in
-  let Wq = arr_get wc (li * 12 + 2) in let Wk = arr_get wc (li * 12 + 3) in let Wv = arr_get wc (li * 12 + 4) in let Wo = arr_get wc (li * 12 + 5) in
   let g2 = arr_get wc (li * 12 + 6) in let b2 = arr_get wc (li * 12 + 7) in
-  let Wm0 = arr_get wc (li * 12 + 8) in let bm0 = arr_get wc (li * 12 + 9) in let Wm2 = arr_get wc (li * 12 + 10) in let bm2 = arr_get wc (li * 12 + 11) in
+  let bm0 = arr_get wc (li * 12 + 9) in let bm2 = arr_get wc (li * 12 + 11) in
+  let wWq = arr_get wcb (li * 6 + 0) in let wWk = arr_get wcb (li * 6 + 1) in let wWv = arr_get wcb (li * 6 + 2) in let wWo = arr_get wcb (li * 6 + 3) in let wWm0 = arr_get wcb (li * 6 + 4) in let wWm2 = arr_get wcb (li * 6 + 5) in
   let ln1 = arr_new (L * d) 0 in let _ = gpu_ln kLN H g1 b1 ln1 L d in
-  let Q = arr_new (L * qdim) 0 in let _ = gpu_proj_b kP1 Wq ln1 Q qdim d L in
-  let K = arr_new (L * qdim) 0 in let _ = gpu_proj_b kP1 Wk ln1 K qdim d L in
-  let V = arr_new (L * qdim) 0 in let _ = gpu_proj_b kP1 Wv ln1 V qdim d L in
+  let Q = arr_new (L * qdim) 0 in let _ = gpu_proj_wx kP1 wWq ln1 Q qdim d L in
+  let K = arr_new (L * qdim) 0 in let _ = gpu_proj_wx kP1 wWk ln1 K qdim d L in
+  let V = arr_new (L * qdim) 0 in let _ = gpu_proj_wx kP1 wWv ln1 V qdim d L in
   let QKV = arr_new (3 * L * qdim) 0 in let _ = cpseg Q 0 QKV 0 (L * qdim) 0 in let _ = cpseg K 0 QKV (L * qdim) (L * qdim) 0 in let _ = cpseg V 0 QKV (2 * L * qdim) (L * qdim) 0 in
   let _ = cpseg QKV 0 Aqkv (li * 3 * L * qdim) (3 * L * qdim) 0 in
-  let attn = arr_new (L * qdim) 0 in let _ = ijit_run kAt QKV QKV attn (3 * L * qdim) 1 (L * qdim) L in
-  let ao = arr_new (L * d) 0 in let _ = gpu_proj_b kP1 Wo attn ao d qdim L in
+  let attn = arr_new (L * qdim) 0 in let _ = ijit_run kAt QKV QKV attn (3 * L * qdim) 1 (L * qdim) (L * nh) in
+  let ao = arr_new (L * d) 0 in let _ = gpu_proj_wx kP1 wWo attn ao d qdim L in
   let r1 = arr_new (L * d) 0 in let _ = resid_add H ao r1 (L * d) 0 in
   let _ = cpseg r1 0 Ar1 (li * L * d) (L * d) 0 in
   let ln2 = arr_new (L * d) 0 in let _ = gpu_ln kLN r1 g2 b2 ln2 L d in
-  let h1 = arr_new (L * inter) 0 in let _ = gpu_proj_b kUp Wm0 ln2 h1 inter d L in let _ = bias_add h1 bm0 L inter 0 0 in
+  let h1 = arr_new (L * inter) 0 in let _ = gpu_proj_wx kUp wWm0 ln2 h1 inter d L in let _ = bias_add h1 bm0 L inter 0 0 in
   let _ = cpseg h1 0 Ah1 (li * L * inter) (L * inter) 0 in
   let h2 = arr_new (L * inter) 0 in let _ = ijit_run kGe h1 h1 h2 (L * inter) 1 (L * inter) (L * inter) in
-  let mo = arr_new (L * d) 0 in let _ = gpu_proj_b kDn Wm2 h2 mo d inter L in let _ = bias_add mo bm2 L d 0 0 in
+  let mo = arr_new (L * d) 0 in let _ = gpu_proj_wx kDn wWm2 h2 mo d inter L in let _ = bias_add mo bm2 L d 0 0 in
   let y = arr_new (L * d) 0 in let _ = resid_add r1 mo y (L * d) 0 in
   y
-gpu_layers Hcur Hin li nlayers L d nh hd qdim inter ks wc Aqkv Ah1 Ar1 =
+gpu_layers Hcur Hin li nlayers L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 =
   if li >= nlayers then 0
   else let _ = cpseg Hcur 0 Hin (li * L * d) (L * d) 0 in
        let m = arena_mark 0 in
-       let y = gpu_block Hcur li L d nh hd qdim inter ks wc Aqkv Ah1 Ar1 in
+       let y = gpu_block Hcur li L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 in
        let _ = cpseg y 0 Hcur 0 (L * d) 0 in let _ = arena_reset m in
-       gpu_layers Hcur Hin (li + 1) nlayers L d nh hd qdim inter ks wc Aqkv Ah1 Ar1
+       gpu_layers Hcur Hin (li + 1) nlayers L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1
 
 -- ===== GPU backward for one block: cached weights + SAVED activations, NO recompute =====
-gpu_block_bwd Hin li dHout dHin L d nh hd qdim inter ks wc Aqkv Ah1 Ar1 =
+gpu_block_bwd Hin li dHout dHin L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 =
   let kGe = arr_get ks 5 in let kGg = arr_get ks 6 in let kEm = arr_get ks 7 in let kBd1 = arr_get ks 8 in let kBdDn = arr_get ks 9 in let kBdUp = arr_get ks 10 in let kAtB = arr_get ks 11 in let kLNb = arr_get ks 12 in
-  let g1 = arr_get wc (li * 12 + 0) in
-  let Wq = arr_get wc (li * 12 + 2) in let Wk = arr_get wc (li * 12 + 3) in let Wv = arr_get wc (li * 12 + 4) in let Wo = arr_get wc (li * 12 + 5) in
-  let g2 = arr_get wc (li * 12 + 6) in let Wm0 = arr_get wc (li * 12 + 8) in let Wm2 = arr_get wc (li * 12 + 10) in
+  let g1 = arr_get wc (li * 12 + 0) in let g2 = arr_get wc (li * 12 + 6) in
+  let wWq = arr_get wcb (li * 6 + 0) in let wWk = arr_get wcb (li * 6 + 1) in let wWv = arr_get wcb (li * 6 + 2) in let wWo = arr_get wcb (li * 6 + 3) in let wWm0 = arr_get wcb (li * 6 + 4) in let wWm2 = arr_get wcb (li * 6 + 5) in
   let Hb = arr_new (L * d) 0 in let _ = cpseg Hin (li * L * d) Hb 0 (L * d) 0 in
   let QKV = arr_new (3 * L * qdim) 0 in let _ = cpseg Aqkv (li * 3 * L * qdim) QKV 0 (3 * L * qdim) 0 in
   let h1 = arr_new (L * inter) 0 in let _ = cpseg Ah1 (li * L * inter) h1 0 (L * inter) 0 in
   let r1 = arr_new (L * d) 0 in let _ = cpseg Ar1 (li * L * d) r1 0 (L * d) 0 in
   -- backward: dHout is grad w.r.t. block output y = r1 + mo
-  let dh2 = arr_new (L * inter) 0 in let _ = gpu_mbwd_b kBdDn Wm2 dHout dh2 d inter L in
+  let dh2 = arr_new (L * inter) 0 in let _ = gpu_mbwd_wx kBdDn wWm2 dHout dh2 d inter L in
   let gp = arr_new (L * inter) 0 in let _ = ijit_run kGg h1 h1 gp (L * inter) 1 (L * inter) (L * inter) in
   let dh1 = arr_new (L * inter) 0 in let _ = ijit_run kEm dh2 gp dh1 (L * inter) (L * inter) (L * inter) (L * inter) in
-  let dln2 = arr_new (L * d) 0 in let _ = gpu_mbwd_b kBdUp Wm0 dh1 dln2 inter d L in
+  let dln2 = arr_new (L * d) 0 in let _ = gpu_mbwd_wx kBdUp wWm0 dh1 dln2 inter d L in
   let dr1 = arr_new (L * d) 0 in let _ = cpseg dHout 0 dr1 0 (L * d) 0 in
   let dr1ln = arr_new (L * d) 0 in let _ = gpu_lnbwd kLNb r1 g2 dln2 dr1ln L d in let _ = addinto dr1 dr1ln (L * d) 0 in
-  let dattn = arr_new (L * qdim) 0 in let _ = gpu_mbwd_b kBd1 Wo dr1 dattn d qdim L in
+  let dattn = arr_new (L * qdim) 0 in let _ = gpu_mbwd_wx kBd1 wWo dr1 dattn d qdim L in
   let dG = arr_new (3 * L * qdim) 0 in let _ = ijit_run kAtB QKV dattn dG (3 * L * qdim) (L * qdim) (3 * L * qdim) (3 * L) in
   let dQ = arr_new (L * qdim) 0 in let _ = cpseg dG 0 dQ 0 (L * qdim) 0 in
   let dK = arr_new (L * qdim) 0 in let _ = cpseg dG (L * qdim) dK 0 (L * qdim) 0 in
   let dV = arr_new (L * qdim) 0 in let _ = cpseg dG (2 * L * qdim) dV 0 (L * qdim) 0 in
   let dln1 = arr_new (L * d) 0 in
-  let t1 = arr_new (L * d) 0 in let _ = gpu_mbwd_b kBd1 Wq dQ t1 qdim d L in let _ = addinto dln1 t1 (L * d) 0 in
-  let t2 = arr_new (L * d) 0 in let _ = gpu_mbwd_b kBd1 Wk dK t2 qdim d L in let _ = addinto dln1 t2 (L * d) 0 in
-  let t3 = arr_new (L * d) 0 in let _ = gpu_mbwd_b kBd1 Wv dV t3 qdim d L in let _ = addinto dln1 t3 (L * d) 0 in
+  let t1 = arr_new (L * d) 0 in let _ = gpu_mbwd_wx kBd1 wWq dQ t1 qdim d L in let _ = addinto dln1 t1 (L * d) 0 in
+  let t2 = arr_new (L * d) 0 in let _ = gpu_mbwd_wx kBd1 wWk dK t2 qdim d L in let _ = addinto dln1 t2 (L * d) 0 in
+  let t3 = arr_new (L * d) 0 in let _ = gpu_mbwd_wx kBd1 wWv dV t3 qdim d L in let _ = addinto dln1 t3 (L * d) 0 in
   let _ = cpseg dr1 0 dHin 0 (L * d) 0 in
   let dxln = arr_new (L * d) 0 in let _ = gpu_lnbwd kLNb Hb g1 dln1 dxln L d in let _ = addinto dHin dxln (L * d) 0 in
   0
-gpu_layers_bwd Hin dH li L d nh hd qdim inter ks wc Aqkv Ah1 Ar1 =
+gpu_layers_bwd Hin dH li L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 =
   if li < 0 then 0
   else let m = arena_mark 0 in
        let dHin = arr_new (L * d) 0 in
-       let _ = gpu_block_bwd Hin li dH dHin L d nh hd qdim inter ks wc Aqkv Ah1 Ar1 in
+       let _ = gpu_block_bwd Hin li dH dHin L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 in
        let _ = cpseg dHin 0 dH 0 (L * d) 0 in let _ = arena_reset m in
-       gpu_layers_bwd Hin dH (li - 1) L d nh hd qdim inter ks wc Aqkv Ah1 Ar1
+       gpu_layers_bwd Hin dH (li - 1) L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1
 
 main =
   let blob = cat [getenv "HOME", "/.ledatic/railml-trial/canonical_bestpass.safetensors"] in
@@ -190,27 +205,28 @@ main =
   -- decode ALL layer weights ONCE (act 21) + activation buffers for the backward
   let _ = print "decoding all 16 layers' weights once (cache) ..." in
   let wc = arr_new (nlayers * 12) 0 in let _ = wc_load fd hdrbuf base wc 0 nlayers d qdim inter in
+  let wcb = arr_new (nlayers * 6) 0 in let _ = wcb_load wc wcb 0 nlayers d qdim inter in
   let Aqkv = arr_new (nlayers * 3 * L * qdim) 0 in
   let Ah1 = arr_new (nlayers * L * inter) 0 in
   let Ar1 = arr_new (nlayers * L * d) 0 in
   -- all 13 block kernels compiled once, bundled into ks (avoids 30-arg fns)
   let ks = arr_new 13 0 in
   let _ = arr_set ks 0 (ijit_compile (emit_msl_fx_layernorm24_shaped L d)) in
-  let _ = arr_set ks 1 (ijit_compile (emit_msl_fx_matmul24_batched qdim d L)) in
-  let _ = arr_set ks 2 (ijit_compile (emit_msl_fx_matmul24_batched inter d L)) in
-  let _ = arr_set ks 3 (ijit_compile (emit_msl_fx_matmul24_batched d inter L)) in
-  let _ = arr_set ks 4 (ijit_compile (emit_msl_fx_attn24_shaped L qdim nh hd)) in
+  let _ = arr_set ks 1 (ijit_compile (emit_msl_fx_matmul24_wx qdim d L)) in
+  let _ = arr_set ks 2 (ijit_compile (emit_msl_fx_matmul24_wx inter d L)) in
+  let _ = arr_set ks 3 (ijit_compile (emit_msl_fx_matmul24_wx d inter L)) in
+  let _ = arr_set ks 4 (ijit_compile (emit_msl_fx_attn24_par L qdim nh hd)) in
   let _ = arr_set ks 5 (ijit_compile (emit_msl_fx_gelu24_shaped (L * inter))) in
   let _ = arr_set ks 6 (ijit_compile (emit_msl_fx_gelu_grad24_shaped (L * inter))) in
   let _ = arr_set ks 7 (ijit_compile (emit_msl_fx_elemul24 (L * inter))) in
-  let _ = arr_set ks 8 (ijit_compile (emit_msl_fx_matmul_bwd_batched qdim d L)) in
-  let _ = arr_set ks 9 (ijit_compile (emit_msl_fx_matmul_bwd_batched d inter L)) in
-  let _ = arr_set ks 10 (ijit_compile (emit_msl_fx_matmul_bwd_batched inter d L)) in
+  let _ = arr_set ks 8 (ijit_compile (emit_msl_fx_matmul_bwd_wx qdim d L)) in
+  let _ = arr_set ks 9 (ijit_compile (emit_msl_fx_matmul_bwd_wx d inter L)) in
+  let _ = arr_set ks 10 (ijit_compile (emit_msl_fx_matmul_bwd_wx inter d L)) in
   let _ = arr_set ks 11 (ijit_compile (emit_msl_fx_attn_bwd_shaped L qdim nh hd)) in
   let _ = arr_set ks 12 (ijit_compile (emit_msl_fx_layernorm_bwd_shaped L d)) in
   let kLN1 = ijit_compile (emit_msl_fx_layernorm24_shaped 1 d) in
   let _ = print "forward: 16 GPU layers ..." in
-  let _ = gpu_layers H Hin 0 nlayers L d nh hd qdim inter ks wc Aqkv Ah1 Ar1 in
+  let _ = gpu_layers H Hin 0 nlayers L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 in
   -- final LN (last pos) + LM head
   let gnf = ld_f32 fd hdrbuf base "lnf.weight" d in let bnf = ld_f32 fd hdrbuf base "lnf.bias" d in
   let xnf = arr_new d 0 in let _ = gpu_ln1 kLN1 H ((L - 1) * d) xnf gnf bnf d in
@@ -241,7 +257,7 @@ main =
   let dH = arr_new (L * d) 0 in let _ = cpseg dHlast 0 dH ((L - 1) * d) d 0 in
   -- ===== 16-layer backward loop (kernels already in ks) =====
   let _ = print "backward: 16 GPU layers ..." in
-  let _ = gpu_layers_bwd Hin dH (nlayers - 1) L d nh hd qdim inter ks wc Aqkv Ah1 Ar1 in
+  let _ = gpu_layers_bwd Hin dH (nlayers - 1) L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 in
   let _ = fclose fd in
   -- dH now = dx (grad w.r.t. the embedded input H = Tok[ids]+Pos). Embedding grads scatter to those rows.
   let dxabs = sumabs dH (L * d) 0 0 in

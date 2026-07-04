@@ -4234,6 +4234,15 @@ import "stdlib/<name>.rail"
 > F=24.  Q|K|V packed (each L*QDIM, group=1 so kvdim=qdim).  One thread
 > per query token.  L small (<=64) -> thread-local score/exp arrays fit.
 
+### `emit_msl_fx_attn24_par seqL qdim nh hd`
+
+> Attention forward, PARALLELIZED per (query, head) (act 22 -- the perf item).
+> Identical math to fx_attn but ONE thread per (query i, head h) = L*NH threads
+> instead of L threads each looping all NH heads.  On the model shape (L=9,
+> NH=12) that is 108 threads vs 9 -- 12x more GPU occupancy for the single most
+> expensive op.  Bit-for-bit identical (each thread does the SAME per-(i,h)
+> sequential work).  gid -> i = gid/NH, h = gid%NH.
+
 ### `emit_msl_fx_matmul_bwd_shaped out k`
 
 > dx = W^T . dy ; W is [OUT x K] row-major, packed W(OUT*K) | dy(OUT).

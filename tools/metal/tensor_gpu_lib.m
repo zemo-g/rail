@@ -1968,6 +1968,72 @@ int tgl_ijit_dispatch(int kid, const long *A, const long *B, long *O,
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Persistent int64 GPU buffers (attested-GPU track, act 23 -- the perf item).
+//
+// The weight-cache + saved-activations work moved the bottleneck off the GPU
+// dispatch and onto the CPU-side re-packing + re-upload of every weight to a
+// fresh GPU staging buffer on EVERY dispatch (a 768x3072 weight = 19 MB copied
+// + uploaded 16x/step for nothing -- it never changes within a step).
+//
+// tgl_ibuf_upload uploads a Rail integer array ONCE into a resident MTLBuffer
+// and returns a handle.  tgl_ijit_dispatch_wx then dispatches a kernel with
+// that resident weight bound at buffer(0) and only the small activation X
+// uploaded per call at buffer(1) -- eliminating the per-dispatch weight copy.
+// Bit-for-bit identical to the packed path (same untag -> int64 -> kernel).
+static NSMutableArray *g_ibufs = nil;
+
+int tgl_ibuf_upload(const long *arr, int n) {
+    if (ensure_init() != 1) return -1;
+    if (n < 1) return -1;
+    if (!g_ibufs) g_ibufs = [NSMutableArray array];
+    const long *ap = arr + 2;   // skip [tag, len]
+    id<MTLBuffer> b = [g_device newBufferWithLength:(NSUInteger)n * 8
+                                            options:MTLResourceStorageModeShared];
+    if (!b) return -1;
+    long *dst = (long *)b.contents;
+    for (int i = 0; i < n; i++) dst[i] = ap[i] >> 1;   // untag once
+    [g_ibufs addObject:b];
+    return (int)(g_ibufs.count - 1);
+}
+
+// Dispatch kernel `kid` with resident weight buffer `wid` at buffer(0), Rail
+// array X uploaded to buffer(1), output downloaded from buffer(2).  Kernel must
+// be a *_wx variant that reads W from buffer(0) and X from buffer(1).
+int tgl_ijit_dispatch_wx(int kid, int wid, const long *X, long *O,
+                         int sizeX, int sizeO, int nthreads) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (wid < 0 || !g_ibufs || wid >= (int)g_ibufs.count) return -1;
+    if (ensure_init() != 1) return -1;
+    if (sizeX < 1 || sizeO < 1 || nthreads < 1) return -3;
+    const long *Xp = X + 2;
+    long       *Op = O + 2;
+    @autoreleasepool {
+        id<MTLBuffer> bW = g_ibufs[wid];
+        id<MTLBuffer> bX = pool_acquire((NSUInteger)sizeX * 8);
+        id<MTLBuffer> bO = pool_acquire((NSUInteger)sizeO * 8);
+        long *Xi = (long *)bX.contents;
+        for (int t = 0; t < sizeX; t++) Xi[t] = Xp[t] >> 1;
+        id<MTLComputePipelineState> p = g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bX offset:0 atIndex:1];
+        [enc setBuffer:bO offset:0 atIndex:2];
+        dispatch_1d(enc, (uint32_t)nthreads);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) {
+            pool_release(bX); pool_release(bO); return -2;
+        }
+        long *Ol = (long *)bO.contents;
+        for (int t = 0; t < sizeO; t++) Op[t] = (Ol[t] << 1) | 1;
+        pool_release(bX); pool_release(bO);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
 // bf16 host-side staging helpers (added 2026-05-14).
 // bf16 layout = upper 16 bits of f32 representation; conversion is
 // just a bit-shift with round-to-nearest-even.
