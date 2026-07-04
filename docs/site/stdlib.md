@@ -4277,6 +4277,21 @@ import "stdlib/<name>.rail"
 > region gid/L in {0=dQ,1=dK,2=dV}, pos gid%L.  P = Q|K|V, U = dO,
 > O = dQ|dK|dV (each L*QDIM).  Thread-local arrays sized L,HD -> keep L modest.
 
+### `emit_msl_fx_elemul24 n`
+
+> Elementwise fixed-point multiply O[i]=A[i]*B[i]>>24 (A=buf0, B=buf1).
+> Used for dh1 = dh2 (x) gelu'(h1) in the MLP backward.
+
+### `emit_msl_fx_wgrad24_shaped out k seqL`
+
+> Weight-gradient accumulate over tokens: dW[o,i] = sum_t dy[t,o]*x[t,i] >>24.
+> Packed P = dy(L*OUT) | x(L*K); one thread per output row o.  This is the
+> multi-token weight gradient (the act-16 wupdate was single-token fused).
+
+### `emit_msl_fx_sgd_apply n lr_num`
+
+> Elementwise SGD apply: O[i] = W[i] - lr*dW[i]>>24  (W=buf0, dW=buf1).
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────

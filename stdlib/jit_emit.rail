@@ -1200,6 +1200,50 @@ emit_msl_fx_attn_bwd_shaped seqL qdim nh hd =
        "    }\n",
        "}\n"]
 
+-- Backward-glue kernels (attested-GPU track, act 19) -- the small ops that
+-- chain the block backward + one SGD step.  All at F=24, mul_shr_gpu.
+
+-- Elementwise fixed-point multiply O[i]=A[i]*B[i]>>24 (A=buf0, B=buf1).
+-- Used for dh1 = dh2 (x) gelu'(h1) in the MLP backward.
+emit_msl_fx_elemul24 n =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint N = ", show n, ";\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) { long hi=mulhi(a,b); ulong lo=(ulong)a*(ulong)b; return (hi<<(64-s))|(long)(lo>>s); }\n\n",
+       "kernel void fx_elemul(device const long *A [[buffer(0)]], device const long *B [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= N) return;\n",
+       "    O[gid] = mul_shr_gpu(A[gid], B[gid], 24);\n",
+       "}\n"]
+
+-- Weight-gradient accumulate over tokens: dW[o,i] = sum_t dy[t,o]*x[t,i] >>24.
+-- Packed P = dy(L*OUT) | x(L*K); one thread per output row o.  This is the
+-- multi-token weight gradient (the act-16 wupdate was single-token fused).
+emit_msl_fx_wgrad24_shaped out k seqL =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint OUT = ", show out, ";\n",
+       "constant uint K = ",   show k,   ";\n",
+       "constant uint L = ",   show seqL, ";\n",
+       "constant uint OFF_X = L * OUT;\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) { long hi=mulhi(a,b); ulong lo=(ulong)a*(ulong)b; return (hi<<(64-s))|(long)(lo>>s); }\n\n",
+       "kernel void fx_wgrad(device const long *P [[buffer(0)]], device const long *U [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= OUT) return;\n",
+       "    for (uint i = 0; i < K; i++) {\n",
+       "        long acc = 0;\n",
+       "        for (uint t = 0; t < L; t++) acc += mul_shr_gpu(P[t*OUT+gid], P[OFF_X + t*K + i], 24);\n",
+       "        O[gid*K + i] = acc;\n",
+       "    }\n",
+       "}\n"]
+
+-- Elementwise SGD apply: O[i] = W[i] - lr*dW[i]>>24  (W=buf0, dW=buf1).
+emit_msl_fx_sgd_apply n lr_num =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint N = ", show n, ";\n",
+       "constant long FX_LR = ", show lr_num, ";\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) { long hi=mulhi(a,b); ulong lo=(ulong)a*(ulong)b; return (hi<<(64-s))|(long)(lo>>s); }\n\n",
+       "kernel void fx_sgd_apply(device const long *W [[buffer(0)]], device const long *G [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= N) return;\n",
+       "    O[gid] = W[gid] - mul_shr_gpu(FX_LR, G[gid], 24);\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
