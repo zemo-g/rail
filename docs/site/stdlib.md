@@ -3992,6 +3992,12 @@ import "stdlib/<name>.rail"
 > ijit_run (mirrors jit_run_*), and so a future arg-packing change stays
 > local to this module.
 
+### `ibuf_upload arr n`
+
+
+### `ijit_run_wx kid wid x o sizeX sizeO nthreads`
+
+
 
 ## `stdlib/jit.rail`
 
@@ -4217,6 +4223,16 @@ import "stdlib/<name>.rail"
 > One thread per (t,i); O laid out [t][i] = t*K + i.  Bit-for-bit identical to
 > L separate fx_matmul_bwd dispatches.
 
+### `emit_msl_fx_matmul24_wx rows k seqL`
+
+> PERSISTENT-WEIGHT variants (act 23): W in buffer(0) (resident, uploaded once
+> via tgl_ibuf_upload), X/dy in buffer(1) (small, uploaded per dispatch).
+> Same math as the _batched kernels; bit-for-bit identical.  Eliminates the
+> per-dispatch re-pack + re-upload of the (unchanging) weight.
+
+### `emit_msl_fx_matmul_bwd_wx out k seqL`
+
+
 ### `emit_msl_fx_gelu24_shaped n`
 
 > GPT GELU (tanh-approx) device function + elementwise kernel (act 12).
@@ -4301,6 +4317,15 @@ import "stdlib/<name>.rail"
 > query i>=j's softmax) -- no atomics, no cross-thread reduction.  3*L threads:
 > region gid/L in {0=dQ,1=dK,2=dV}, pos gid%L.  P = Q|K|V, U = dO,
 > O = dQ|dK|dV (each L*QDIM).  Thread-local arrays sized L,HD -> keep L modest.
+
+### `emit_msl_fx_attn_bwd_par seqL qdim nh hd`
+
+> Attention-backward, PARALLELIZED per (region, pos, head) (act 24 -- perf).
+> Identical math to fx_attn_bwd but ONE thread per (region, position, head) =
+> 3*L*NH threads instead of 3*L threads each looping all NH heads.  On the
+> model shape that is 3*9*12=324 threads vs 27 -- 12x occupancy for the most
+> expensive backward op (it recomputes a softmax per output).  Bit-for-bit
+> identical.  gid -> region = gid/(L*NH), rem = gid%(L*NH), pos = rem/NH, h = rem%NH.
 
 ### `emit_msl_fx_elemul24 n`
 

@@ -1324,6 +1324,67 @@ emit_msl_fx_attn_bwd_shaped seqL qdim nh hd =
        "    }\n",
        "}\n"]
 
+-- Attention-backward, PARALLELIZED per (region, pos, head) (act 24 -- perf).
+-- Identical math to fx_attn_bwd but ONE thread per (region, position, head) =
+-- 3*L*NH threads instead of 3*L threads each looping all NH heads.  On the
+-- model shape that is 3*9*12=324 threads vs 27 -- 12x occupancy for the most
+-- expensive backward op (it recomputes a softmax per output).  Bit-for-bit
+-- identical.  gid -> region = gid/(L*NH), rem = gid%(L*NH), pos = rem/NH, h = rem%NH.
+emit_msl_fx_attn_bwd_par seqL qdim nh hd =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint L = ",    show seqL, ";\n",
+       "constant uint QDIM = ", show qdim, ";\n",
+       "constant uint NH = ",   show nh,   ";\n",
+       "constant uint HD = ",   show hd,   ";\n",
+       "constant long SCALEQ = 2097152;\n",
+       "constant long S = 16777216;\n",
+       "constant long S48 = 281474976710656;\n",
+       "constant long LN2 = 11629080;\n",
+       "constant uint OFF_K = L * QDIM;\n",
+       "constant uint OFF_V = 2 * L * QDIM;\n",
+       "constant uint OFF_DK = L * QDIM;\n",
+       "constant uint OFF_DV = 2 * L * QDIM;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) { long hi = mulhi(a, b); ulong lo = (ulong)a * (ulong)b; return (hi << (64 - s)) | (long)(lo >> s); }\n",
+       "static inline long fx_pow2(long k) { long a = 1; for (long i = 0; i < k; i++) a += a; return k < 1 ? 1 : a; }\n",
+       "static inline long exp_poly(long fq) {\n",
+       "    long p = 416;\n",
+       "    p = 3329 + (p*fq)/S; p = 23302 + (p*fq)/S; p = 139810 + (p*fq)/S;\n",
+       "    p = 699051 + (p*fq)/S; p = 2796203 + (p*fq)/S; p = 8388608 + (p*fq)/S;\n",
+       "    p = 16777216 + (p*fq)/S; p = 16777216 + (p*fq)/S; return p;\n",
+       "}\n",
+       "static inline long fxexp_neg(long ax) { long k = ax / LN2; long fq = ax - k*LN2; long ef = exp_poly(fq); long emf = S48 / ef; if (k >= 50) return 0; long p2 = fx_pow2(k); return (emf + p2/2) / p2; }\n",
+       "static inline void softmax_row(device const long* P, uint i, uint qb, thread long* p) {\n",
+       "    long sc[", show seqL, "];\n",
+       "    for (uint j = 0; j <= i; j++) { long raw = 0; for (uint c = 0; c < HD; c++) raw += P[i*QDIM+qb+c] * P[OFF_K+j*QDIM+qb+c]; raw = raw >> 24; sc[j] = (raw * SCALEQ) / S; }\n",
+       "    long m = sc[0]; for (uint j = 1; j <= i; j++) if (sc[j] > m) m = sc[j];\n",
+       "    long sm = 0; long e[", show seqL, "]; for (uint j = 0; j <= i; j++) { long ee = fxexp_neg(m - sc[j]); e[j] = ee; sm += ee; }\n",
+       "    for (uint j = 0; j <= i; j++) p[j] = (e[j] * S) / sm;\n",
+       "}\n",
+       "static inline void dp_row(device const long* P, device const long* U, uint i, uint qb, thread long* dp) {\n",
+       "    for (uint j = 0; j <= i; j++) { long acc = 0; for (uint c = 0; c < HD; c++) acc += mul_shr_gpu(U[i*QDIM+qb+c], P[OFF_V+j*QDIM+qb+c], 24); dp[j] = acc; }\n",
+       "}\n",
+       "static inline void draw_row(device const long* P, device const long* U, uint i, uint qb, thread long* draw) {\n",
+       "    long p[", show seqL, "]; long dp[", show seqL, "]; softmax_row(P, i, qb, p); dp_row(P, U, i, qb, dp);\n",
+       "    long dot = 0; for (uint j = 0; j <= i; j++) dot += mul_shr_gpu(p[j], dp[j], 24);\n",
+       "    for (uint j = 0; j <= i; j++) { long ds = mul_shr_gpu(p[j], dp[j] - dot, 24); draw[j] = (ds * SCALEQ) / S; }\n",
+       "}\n\n",
+       "kernel void fx_attn_bwd_p(device const long *P [[buffer(0)]], device const long *U [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= 3 * L * NH) return;\n",
+       "    uint region = gid / (L * NH); uint rem = gid % (L * NH); uint pos = rem / NH; uint h = rem % NH; uint qb = h * HD;\n",
+       "    if (region == 0) {\n",
+       "        uint i = pos; long draw[", show seqL, "]; draw_row(P, U, i, qb, draw);\n",
+       "        for (uint c = 0; c < HD; c++) { long acc = 0; for (uint j = 0; j <= i; j++) acc += mul_shr_gpu(draw[j], P[OFF_K+j*QDIM+qb+c], 24); O[i*QDIM+qb+c] = acc; }\n",
+       "    } else if (region == 1) {\n",
+       "        uint j = pos; long dkacc[", show hd, "]; for (uint c = 0; c < HD; c++) dkacc[c] = 0;\n",
+       "        for (uint i = j; i < L; i++) { long draw[", show seqL, "]; draw_row(P, U, i, qb, draw); for (uint c = 0; c < HD; c++) dkacc[c] += mul_shr_gpu(draw[j], P[i*QDIM+qb+c], 24); }\n",
+       "        for (uint c = 0; c < HD; c++) O[OFF_DK + j*QDIM+qb+c] = dkacc[c];\n",
+       "    } else {\n",
+       "        uint j = pos; long dvacc[", show hd, "]; for (uint c = 0; c < HD; c++) dvacc[c] = 0;\n",
+       "        for (uint i = j; i < L; i++) { long p[", show seqL, "]; softmax_row(P, i, qb, p); for (uint c = 0; c < HD; c++) dvacc[c] += mul_shr_gpu(U[i*QDIM+qb+c], p[j], 24); }\n",
+       "        for (uint c = 0; c < HD; c++) O[OFF_DV + j*QDIM+qb+c] = dvacc[c];\n",
+       "    }\n",
+       "}\n"]
+
 -- Backward-glue kernels (attested-GPU track, act 19) -- the small ops that
 -- chain the block backward + one SGD step.  All at F=24, mul_shr_gpu.
 
