@@ -1996,6 +1996,21 @@ int tgl_ibuf_upload(const long *arr, int n) {
     return (int)(g_ibufs.count - 1);
 }
 
+// tgl_ibuf_update overwrites the resident buffer `wid` IN PLACE with a Rail
+// integer array (same untag as upload). No new allocation -> no leak across a
+// training loop that re-writes weights every step. StorageModeShared means the
+// GPU sees the new contents on the next dispatch. Returns 0 on success.
+int tgl_ibuf_update(int wid, const long *arr, int n) {
+    if (!g_ibufs || wid < 0 || wid >= (int)g_ibufs.count) return -1;
+    if (n < 1) return -1;
+    id<MTLBuffer> b = g_ibufs[wid];
+    if ((NSUInteger)n * 8 > b.length) return -2;
+    const long *ap = arr + 2;   // skip [tag, len]
+    long *dst = (long *)b.contents;
+    for (int i = 0; i < n; i++) dst[i] = ap[i] >> 1;   // untag once
+    return 0;
+}
+
 // Dispatch kernel `kid` with resident weight buffer `wid` at buffer(0), Rail
 // array X uploaded to buffer(1), output downloaded from buffer(2).  Kernel must
 // be a *_wx variant that reads W from buffer(0) and X from buffer(1).
