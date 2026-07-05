@@ -4342,6 +4342,19 @@ import "stdlib/<name>.rail"
 
 > Elementwise SGD apply: O[i] = W[i] - lr*dW[i]>>24  (W=buf0, dW=buf1).
 
+### `emit_msl_fx_adam_step n b1 b2 eps lr`
+
+> F=24 AdamW update, twin of the CPU fx_adam (fx_adam_gate.rail). One thread per
+> weight element. Bias-correction c1,c2 (=1-beta^t) change per step, so they ride
+> in the packed buffer rather than being baked; lr/beta1/beta2/eps are constants.
+> fx_sqrt24 = pure-integer binary search matching Path-B bx4_fxsqrt bit-for-bit
+> (same move as fx_rsqrt above), so a CPU twin using mul_shr lands identical bits.
+> P (buffer0), size 3N+2: W[0..N) | m[N..2N) | v[2N..3N) | c1@[3N] | c2@[3N+1]
+> G (buffer1), size N: gradient (already summed; caller means it by scaling lr)
+> O (buffer2), size 3N: W'[0..N) | m'[N..2N) | v'[2N..3N)
+> CRITICAL (measured in fx_adam_gate): EPS must be ~1e-3 (16777) in F=24, not the
+> fp32-default 1e-8 -- else v=g^2 underflows to 0 and the update mhat/eps explodes.
+
 ### `node_seq node`
 
 > ───────────────────────────────────────────────────────────────────────
