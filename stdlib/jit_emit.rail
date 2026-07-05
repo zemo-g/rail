@@ -1429,6 +1429,58 @@ emit_msl_fx_sgd_apply n lr_num =
        "    O[gid] = W[gid] - mul_shr_gpu(FX_LR, G[gid], 24);\n",
        "}\n"]
 
+-- F=24 AdamW update, twin of the CPU fx_adam (fx_adam_gate.rail). One thread per
+-- weight element. Bias-correction c1,c2 (=1-beta^t) change per step, so they ride
+-- in the packed buffer rather than being baked; lr/beta1/beta2/eps are constants.
+-- fx_sqrt24 = pure-integer binary search matching Path-B bx4_fxsqrt bit-for-bit
+-- (same move as fx_rsqrt above), so a CPU twin using mul_shr lands identical bits.
+--   P (buffer0), size 3N+2: W[0..N) | m[N..2N) | v[2N..3N) | c1@[3N] | c2@[3N+1]
+--   G (buffer1), size N: gradient (already summed; caller means it by scaling lr)
+--   O (buffer2), size 3N: W'[0..N) | m'[N..2N) | v'[2N..3N)
+-- CRITICAL (measured in fx_adam_gate): EPS must be ~1e-3 (16777) in F=24, not the
+-- fp32-default 1e-8 -- else v=g^2 underflows to 0 and the update mhat/eps explodes.
+emit_msl_fx_adam_step n b1 b2 eps lr =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint N = ", show n, ";\n",
+       "constant long B1 = ", show b1, ";\n",
+       "constant long B2 = ", show b2, ";\n",
+       "constant long EPS = ", show eps, ";\n",
+       "constant long LR = ", show lr, ";\n",
+       "constant long ONE = 16777216;\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) { long hi=mulhi(a,b); ulong lo=(ulong)a*(ulong)b; return (hi<<(64-s))|(long)(lo>>s); }\n",
+       "static inline long fx_sqrt24(long xq) {\n",
+       "    if (xq < 1) return 0;\n",
+       "    long lo = 0; long hi = 1099511627776;\n",
+       "    while (lo + 1 < hi) {\n",
+       "        long mid = (lo + hi) / 2;\n",
+       "        long hr = mul_shr_gpu(mid, mid, 24);\n",
+       "        bool le;\n",
+       "        if (hr < xq) le = true; else if (hr > xq) le = false;\n",
+       "        else { long c = mid - (mid/ONE)*ONE; long cc = c*c; le = ((cc - (cc/ONE)*ONE) == 0); }\n",
+       "        if (le) lo = mid; else hi = mid;\n",
+       "    }\n",
+       "    return lo;\n",
+       "}\n\n",
+       "kernel void fx_adam(device const long *P [[buffer(0)]], device const long *G [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= N) return;\n",
+       "    long g = G[gid];\n",
+       "    long w = P[gid];\n",
+       "    long mprev = P[N + gid];\n",
+       "    long vprev = P[2*N + gid];\n",
+       "    long c1 = P[3*N];\n",
+       "    long c2 = P[3*N + 1];\n",
+       "    long mo = mul_shr_gpu(B1, mprev, 24) + mul_shr_gpu(ONE - B1, g, 24);\n",
+       "    long g2 = mul_shr_gpu(g, g, 24);\n",
+       "    long vo = mul_shr_gpu(B2, vprev, 24) + mul_shr_gpu(ONE - B2, g2, 24);\n",
+       "    long mhat = (mo * ONE) / c1;\n",
+       "    long vhat = (vo * ONE) / c2;\n",
+       "    long denom = fx_sqrt24(vhat) + EPS;\n",
+       "    long upd = (denom == 0) ? 0 : (mhat * ONE) / denom;\n",
+       "    O[gid] = w - mul_shr_gpu(LR, upd, 24);\n",
+       "    O[N + gid] = mo;\n",
+       "    O[2*N + gid] = vo;\n",
+       "}\n"]
+
 -- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
