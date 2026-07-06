@@ -1,0 +1,91 @@
+-- Rail GPT — CPU forward pass (Phase 2 capstone, importable, no main).
+--
+-- Composes the verified twins over the frozen 261-tensor GptWeights:
+--   embed(tok+pos) -> L pre-norm blocks -> final LN -> head -> logits.
+-- Block = ln1 -> Q/K/V proj -> causal MHA core -> O proj -> +residual
+--         -> ln2 -> MLP -> +residual.  All ops are already twin-verified;
+-- this is pure assembly, so its only new risk is wiring, gated by D0.
+--
+-- W  : list of 261 float_arr (canonical order, INTERFACES.md §3), pre-transposed
+--      Linears stored [in,out]. gw_nth W t addresses tensor t.
+-- cfg: GptConfig (gc_* accessors).  rt : [seqL, scaleq, eps] runtime bundle.
+-- ws : scratch list [lnbuf(d), q,k,v,attn (seqL*d), sc,ex (seqL), tmp(dff),
+--      obuf(d), mbuf(d), zbias(vocab)].  X : activation [seqL*d].
+
+import "stdlib/gpt/gpt_attn.rail"
+
+gw_nth xs i = if i <= 0 then head xs else gw_nth (tail xs) (i - 1)
+gp_rt_seq rt = gw_nth rt 0
+gp_rt_scale rt = gw_nth rt 1
+gp_rt_eps rt = gw_nth rt 2
+
+gp_addinto X base src d c =
+  if c >= d then 0
+  else let _ = arr_set X (base + c) ((arr_get X (base + c)) + (arr_get src c)) in gp_addinto X base src d (c + 1)
+
+-- ===== embeddings: X[i] = tok[id_i] + pos[i] =====
+gp_embed_row tokw posw X xb tb pb d c =
+  if c >= d then 0
+  else let _ = arr_set X (xb + c) ((arr_get tokw (tb + c)) + (arr_get posw (pb + c))) in gp_embed_row tokw posw X xb tb pb d (c + 1)
+gp_embed W cfg X ids seqL i =
+  if i >= seqL then X
+  else let d = gc_dmodel cfg in
+       let _ = gp_embed_row (gw_nth W 0) (gw_nth W 1) X (i * d) ((arr_get ids i) * d) (i * d) d 0 in
+       gp_embed W cfg X ids seqL (i + 1)
+
+-- ===== block phase 1: ln1 + Q/K/V projections for every token =====
+gp_qkv W bb cfg rt ws X i =
+  if i >= (gp_rt_seq rt) then 0
+  else
+    let d = gc_dmodel cfg in
+    let lnbuf = gw_nth ws 0 in
+    let _ = gp_layernorm X (i * d) lnbuf (gw_nth W (bb + 0)) (gw_nth W (bb + 1)) d (gp_rt_eps rt) in
+    let _ = gfx_matvec_off (gw_nth W (bb + 2)) lnbuf 0 (gw_nth W (bb + 3)) (gw_nth ws 1) (i * d) d d 0 in
+    let _ = gfx_matvec_off (gw_nth W (bb + 4)) lnbuf 0 (gw_nth W (bb + 5)) (gw_nth ws 2) (i * d) d d 0 in
+    let _ = gfx_matvec_off (gw_nth W (bb + 6)) lnbuf 0 (gw_nth W (bb + 7)) (gw_nth ws 3) (i * d) d d 0 in
+    gp_qkv W bb cfg rt ws X (i + 1)
+
+-- ===== block phase 3: output projection of attn context + residual into X =====
+gp_oproj W bb cfg rt ws X i =
+  if i >= (gp_rt_seq rt) then 0
+  else let d = gc_dmodel cfg in
+       let _ = gfx_matvec_off (gw_nth W (bb + 8)) (gw_nth ws 4) (i * d) (gw_nth W (bb + 9)) (gw_nth ws 8) 0 d d 0 in
+       let _ = gp_addinto X (i * d) (gw_nth ws 8) d 0 in
+       gp_oproj W bb cfg rt ws X (i + 1)
+
+-- ===== block phase 4: ln2 + MLP + residual =====
+gp_ffn W bb cfg rt ws X i =
+  if i >= (gp_rt_seq rt) then 0
+  else let d = gc_dmodel cfg in let dff = gc_dff cfg in
+       let lnbuf = gw_nth ws 0 in
+       let _ = gp_layernorm X (i * d) lnbuf (gw_nth W (bb + 10)) (gw_nth W (bb + 11)) d (gp_rt_eps rt) in
+       let _ = gp_mlp lnbuf (gw_nth W (bb + 12)) (gw_nth W (bb + 13)) (gw_nth W (bb + 14)) (gw_nth W (bb + 15)) d dff (gw_nth ws 7) (gw_nth ws 9) in
+       let _ = gp_addinto X (i * d) (gw_nth ws 9) d 0 in
+       gp_ffn W bb cfg rt ws X (i + 1)
+
+gp_block W bb cfg rt ws X =
+  let _ = gp_qkv W bb cfg rt ws X 0 in
+  let d = gc_dmodel cfg in
+  let _ = gp_attn_core (gw_nth ws 1) (gw_nth ws 2) (gw_nth ws 3) (gw_nth ws 5) (gw_nth ws 6) (gw_nth ws 4) (gc_nhead cfg) d (gc_headdim cfg) (gp_rt_seq rt) (gp_rt_scale rt) 0 in
+  let _ = gp_oproj W bb cfg rt ws X 0 in
+  gp_ffn W bb cfg rt ws X 0
+
+gp_layers W cfg rt ws X l =
+  if l >= (gc_nlayer cfg) then X
+  else let _ = gp_block W (2 + l * 16) cfg rt ws X in gp_layers W cfg rt ws X (l + 1)
+
+-- ===== final LN + head -> logits[i*vocab + o] =====
+gp_final W cfg rt ws X logits i =
+  if i >= (gp_rt_seq rt) then logits
+  else let d = gc_dmodel cfg in let vocab = gc_vocab cfg in
+       let hbase = 2 + (gc_nlayer cfg) * 16 in
+       let lnbuf = gw_nth ws 0 in
+       let _ = gp_layernorm X (i * d) lnbuf (gw_nth W (hbase + 0)) (gw_nth W (hbase + 1)) d (gp_rt_eps rt) in
+       let _ = gfx_matvec_off (gw_nth W (hbase + 2)) lnbuf 0 (gw_nth ws 10) logits (i * vocab) d vocab 0 in
+       gp_final W cfg rt ws X logits (i + 1)
+
+-- full forward: fills X and logits in place, returns logits.
+gp_forward W cfg rt ws X ids logits =
+  let _ = gp_embed W cfg X ids (gp_rt_seq rt) 0 in
+  let _ = gp_layers W cfg rt ws X 0 in
+  gp_final W cfg rt ws X logits 0
