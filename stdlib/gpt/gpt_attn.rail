@@ -1,0 +1,62 @@
+-- Rail GPT — causal multi-head attention CORE twin (Phase 2, importable, no main).
+--
+-- VERBATIM port of the certified pf_heads (attested_attn24_demo.rail act-13,
+-- verified GPU==CPU byte-exact). Operates on ALREADY-PROJECTED, per-token-packed
+-- Q/K/V: element (token i, head h, chan c) at index i*qdim + h*hd + c. Produces
+-- the attention context `attn` in the same layout. The Q/K/V/O projections are
+-- ordinary gfx_matvec (composed in gpt_forward), NOT here.
+--
+-- Arithmetic is copied EXACTLY: mul_shr (floor) for the q.k dot and the context
+-- write, truncating `/` for the softmax-scale and prob steps -- the demo mixes
+-- them and that exact mix is what reproduces on GPU. scaleq = round(2^24/sqrt(hd))
+-- passed in (= 2097152 for hd=64), matching the kernel's emit-time-baked 1/sqrt(d).
+-- Causal mask sentinel = -1000.0 (F=24); bx4_exp_neg underflows it to exactly 0.
+-- bx4_exp_neg comes from bx_fixed via the import chain (do NOT redefine it).
+
+import "stdlib/gpt/gpt_mlp.rail"
+
+ga_raw q k qi kj hd c acc =
+  if c >= hd then acc
+  else ga_raw q k qi kj hd (c + 1) (acc + ((arr_get q (qi + c)) * (arr_get k (kj + c))))
+
+ga_scores q k sc i h qdim hd seqL scaleq j =
+  if j >= seqL then 0
+  else
+    let scv = if j > i then (0 - 16777216000)
+              else let raw = mul_shr (ga_raw q k (i * qdim + h * hd) (j * qdim + h * hd) hd 0 0) 1 24 in (raw * scaleq) / 16777216 in
+    let _ = arr_set sc j scv in
+    ga_scores q k sc i h qdim hd seqL scaleq (j + 1)
+
+ga_rowmax sc seqL j m =
+  if j >= seqL then m else ga_rowmax sc seqL (j + 1) (let v = arr_get sc j in if v > m then v else m)
+
+ga_exprow sc ex seqL m j sum =
+  if j >= seqL then sum
+  else let e = bx4_exp_neg (m - (arr_get sc j)) in let _ = arr_set ex j e in ga_exprow sc ex seqL m (j + 1) (sum + e)
+
+ga_pvdot ex v vb qdim seqL sum j acc =
+  if j >= seqL then acc
+  else let p = ((arr_get ex j) * 16777216) / sum in
+       ga_pvdot ex v vb qdim seqL sum (j + 1) (acc + (p * (arr_get v (vb + j * qdim))))
+
+ga_ctx ex v attn i h qdim hd seqL sum c =
+  if c >= hd then 0
+  else
+    let acc = ga_pvdot ex v (h * hd + c) qdim seqL sum 0 0 in
+    let _ = arr_set attn (i * qdim + h * hd + c) (mul_shr acc 1 24) in
+    ga_ctx ex v attn i h qdim hd seqL sum (c + 1)
+
+ga_head q k v sc ex attn i h qdim hd seqL scaleq =
+  let _ = ga_scores q k sc i h qdim hd seqL scaleq 0 in
+  let m = ga_rowmax sc seqL 1 (arr_get sc 0) in
+  let sum = ga_exprow sc ex seqL m 0 0 in
+  ga_ctx ex v attn i h qdim hd seqL sum 0
+
+ga_heads q k v sc ex attn i nh qdim hd seqL scaleq h =
+  if h >= nh then 0
+  else let _ = ga_head q k v sc ex attn i h qdim hd seqL scaleq in ga_heads q k v sc ex attn i nh qdim hd seqL scaleq (h + 1)
+
+-- full causal MHA context over the sequence. q,k,v,attn : [seqL*qdim]. sc,ex : [seqL].
+gp_attn_core q k v sc ex attn nh qdim hd seqL scaleq i =
+  if i >= seqL then attn
+  else let _ = ga_heads q k v sc ex attn i nh qdim hd seqL scaleq 0 in gp_attn_core q k v sc ex attn nh qdim hd seqL scaleq (i + 1)
