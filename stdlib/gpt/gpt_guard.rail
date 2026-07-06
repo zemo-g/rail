@@ -1,0 +1,64 @@
+-- Rail GPT — fixed-point overflow guard substrate (Phase 1, L0 "robust" keystone).
+--
+-- The 63-bit Rail vs 64-bit Metal wrap is the ONE place the CPU/GPU twins can
+-- silently diverge (caught once at 1/sqrt(d), twin-memory Act 8). Today every fx
+-- emitter states its precondition as a COMMENT; here they become runtime checks.
+--
+-- FAIL-CLOSED, not crash: a violated bound returns 0, threaded through an all_ok
+-- accumulator, so any overflow makes the training step REFUSE TO SIGN its ledger
+-- record (mirrors finalize_sign.py refusing to write an unverified signature).
+-- This is the correct attestation semantics — a poisoned step must not enter the
+-- chain, and it must not crash the witness that is re-checking it either.
+
+gk_abs x = if x < 0 then 0 - x else x
+
+-- Q39.24 substrate constant.
+gk_ONE = 16777216            -- 2^24
+
+-- Bounds are computed as runtime OPERANDS via gk_pow2, never written as big
+-- literals: a literal >= 2^62 is UNREPRESENTABLE in Rail's 63-bit tagged int and
+-- silently reads as 0 (the self-check below caught exactly this). The "fits int64"
+-- ceiling is therefore capped at 2^61 -- the largest Rail-representable bound, and
+-- itself the 63-bit wall this guard exists to defend against.
+gk_pow2 n = if n <= 0 then 1 else 2 * (gk_pow2 (n - 1))
+
+-- Canonical bounds from the emitter contracts (jit_emit.rail):
+--   fx_matvec/matmul24 : |mul_shr result| * d must fit int64      -> 2^61 (Rail ceiling)
+--   fx_layernorm24     : |x| < 2^34, d <= 2^12, isqrt hi = 2^45
+--   fx_attn24          : |x| < 2^29, d <= 64, seq <= 16, accum < 2^56
+--   fx_rsqrt           : v <= 2^36
+--   fx_adam            : products use 128-bit path, results < 2^61 (Rail ceiling)
+gk_b_matmul = gk_pow2 61
+gk_b_ln_x   = gk_pow2 34
+gk_b_ln_hi  = gk_pow2 45
+gk_b_attn_x = gk_pow2 29
+gk_b_attn_a = gk_pow2 56
+gk_b_rsqrt  = gk_pow2 36
+gk_b_adam   = gk_pow2 61
+
+-- Pure predicate: 1 if |val| < bound, else 0. Used inside hot loops (no print).
+gk_inbound val bound = if (gk_abs val) < bound then 1 else 0
+
+-- Loud guard: on violation prints a FATAL line and returns 0. Thread the result
+-- through all_ok (multiply), so the whole step/record is poisoned by any breach.
+gk_guard name val bound =
+  if (gk_abs val) < bound then 1
+  else let _ = print (join "" ["FATAL fx-overflow: ", name, " = ", show val, " exceeds ", show bound, " (Rail 63b vs Metal 64b divergence risk) -- step refuses to sign"]) in 0
+
+-- Fold a guard into a running all_ok (any breach -> 0 forever).
+gk_and_guard acc name val bound = acc * (gk_guard name val bound)
+
+-- ===== instrument self-check (bx11 pattern): the guard MUST catch a breach =====
+-- One in-bound value (passes), one deliberately over-bound value (must be caught).
+main =
+  let ok_safe   = gk_guard "safe.matmul"  1000000000            gk_b_matmul in   -- 1e9  < 2^62 -> 1
+  let ok_breach = gk_guard "BREACH.attn.x" 600000000            gk_b_attn_x in   -- 6e8  > 2^29 -> 0 (loud)
+  let ok_neg    = gk_guard "safe.neg"      (0 - 5000000000)     gk_b_matmul in   -- -5e9 < 2^62 -> 1
+  let ok_negbrk = gk_guard "BREACH.neg"    (0 - 70000000000)    gk_b_rsqrt in    -- -7e10> 2^36 -> 0 (loud)
+  let pass_guard   = if ok_safe == 1 then (if ok_neg == 1 then 1 else 0) else 0 in
+  let catch_guard  = if ok_breach == 0 then (if ok_negbrk == 0 then 1 else 0) else 0 in
+  let all_ok_demo  = gk_and_guard (gk_and_guard 1 "a" 5 gk_b_matmul) "b" 600000000 gk_b_attn_x in
+  let _ = print (join "" ["gk guard passes in-bound (incl negative): ", if pass_guard == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["gk guard catches breach   (incl negative): ", if catch_guard == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["gk all_ok poisoned by any breach:          ", if all_ok_demo == 0 then "PASS" else "FAIL"]) in
+  print (if (pass_guard == 1) then (if (catch_guard == 1) then (if (all_ok_demo == 0) then "gpt_guard.rail: Phase 1 L0 self-check OK" else "gpt_guard.rail: SELF-CHECK FAILED") else "gpt_guard.rail: SELF-CHECK FAILED") else "gpt_guard.rail: SELF-CHECK FAILED")
