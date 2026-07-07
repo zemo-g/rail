@@ -1,0 +1,83 @@
+-- Cross-device byte-equality: ALL fx GPU kernels (fwd + bwd + adam), F=24
+-- integer-exact. Fixed inputs -> one sha256 over every kernel output. Same sha on
+-- Mini (M4 Pro) and Studio (M1 Ultra) == full cross-device determinism == shardable.
+
+import "stdlib/ijit.rail"
+import "stdlib/sha256.rail"
+
+fillp a n seed i = if i >= n then a else let _ = arr_set a i (((((i * 37) + seed) % 23) - 11) * 4194304) in fillp a n seed (i + 1)
+mk n seed = fillp (arr_new n 0) n seed 0
+ser a n i acc = if i >= n then acc else ser a n (i + 1) (cat [acc, show (arr_get a i), ","])
+cpy src soff dst doff n i = if i >= n then 0 else let _ = arr_set dst (doff + i) (arr_get src (soff + i)) in cpy src soff dst doff n (i + 1)
+
+main =
+  let d = 16 in let rows = 4 in let nh = 2 in let hd = 8 in let qdim = 16 in let seqL = 4 in let inter = 32 in
+  let lq = seqL * qdim in
+
+  -- FWD 1: layernorm24 (rsqrt).  P = X|g|b
+  let xln = mk (rows * d) 23 in let gm = mk d 5 in let bt = mk d 7 in
+  let Pln = arr_new (rows * d + d + d) 0 in
+  let _ = cpy xln 0 Pln 0 (rows * d) 0 in let _ = cpy gm 0 Pln (rows * d) d 0 in let _ = cpy bt 0 Pln (rows * d + d) d 0 in
+  let kLN = ijit_compile (emit_msl_fx_layernorm24_shaped rows d) in
+  let lnout = arr_new (rows * d) 0 in let _ = ijit_run kLN Pln Pln lnout (rows * d + d + d) 1 (rows * d) rows in
+
+  -- FWD 2: matmul24_wx (resident weight)
+  let Wm = mk (qdim * d) 3 in let Xm = mk (seqL * d) 9 in
+  let kMM = ijit_compile (emit_msl_fx_matmul24_wx qdim d seqL) in
+  let widMM = ibuf_upload Wm (qdim * d) in
+  let mmout = arr_new (seqL * qdim) 0 in let _ = ijit_run_wx kMM widMM Xm mmout (seqL * d) (seqL * qdim) (seqL * qdim) in
+
+  -- FWD 3: gelu24
+  let gin = mk 64 11 in let kGe = ijit_compile (emit_msl_fx_gelu24_shaped 64) in
+  let gout = arr_new 64 0 in let _ = ijit_run kGe gin gin gout 64 1 64 64 in
+
+  -- FWD 4: attn24_par (exp/softmax)
+  let qkv = mk (3 * lq) 42 in let kAt = ijit_compile (emit_msl_fx_attn24_par seqL qdim nh hd) in
+  let attn = arr_new lq 0 in let _ = ijit_run kAt qkv qkv attn (3 * lq) 1 lq (seqL * nh) in
+
+  -- BWD 5: matmul_bwd_wx (dx = W^T dy)
+  let Wb = mk (qdim * d) 3 in let dy = mk (seqL * qdim) 13 in
+  let kMB = ijit_compile (emit_msl_fx_matmul_bwd_wx qdim d seqL) in
+  let widMB = ibuf_upload Wb (qdim * d) in
+  let dxout = arr_new (seqL * d) 0 in let _ = ijit_run_wx kMB widMB dy dxout (seqL * qdim) (seqL * d) (seqL * d) in
+
+  -- BWD 6: gelu_grad24
+  let ggin = mk 64 17 in let kGg = ijit_compile (emit_msl_fx_gelu_grad24_shaped 64) in
+  let ggout = arr_new 64 0 in let _ = ijit_run kGg ggin ggin ggout 64 1 64 64 in
+
+  -- BWD 7: elemul24 (dh1 = dh2 (*) gelu')
+  let ea = mk 64 21 in let eb = mk 64 27 in let kEm = ijit_compile (emit_msl_fx_elemul24 64) in
+  let emout = arr_new 64 0 in let _ = ijit_run kEm ea eb emout 64 64 64 64 in
+
+  -- BWD 8: layernorm_bwd (dx).  P = X|g|dy
+  let Plb = arr_new (rows * d + d + rows * d) 0 in
+  let dyl = mk (rows * d) 31 in
+  let _ = cpy xln 0 Plb 0 (rows * d) 0 in let _ = cpy gm 0 Plb (rows * d) d 0 in let _ = cpy dyl 0 Plb (rows * d + d) (rows * d) 0 in
+  let kLB = ijit_compile (emit_msl_fx_layernorm_bwd_shaped rows d) in
+  let lbout = arr_new (rows * d) 0 in let _ = ijit_run kLB Plb Plb lbout (rows * d + d + rows * d) 1 (rows * d) rows in
+
+  -- BWD 9: attn_bwd_par (dQ/dK/dV)
+  let dattn = mk lq 37 in let kAB = ijit_compile (emit_msl_fx_attn_bwd_par seqL qdim nh hd) in
+  let dG = arr_new (3 * lq) 0 in let _ = ijit_run kAB qkv dattn dG (3 * lq) lq (3 * lq) (3 * seqL * nh) in
+
+  -- BWD 10: wgrad24 (dW = dy (x) x).  P = dy|x
+  let dyw = mk (seqL * qdim) 43 in let xw = mk (seqL * d) 47 in
+  let Pw = arr_new (seqL * qdim + seqL * d) 0 in
+  let _ = cpy dyw 0 Pw 0 (seqL * qdim) 0 in let _ = cpy xw 0 Pw (seqL * qdim) (seqL * d) 0 in
+  let kWg = ijit_compile (emit_msl_fx_wgrad24_shaped qdim d seqL) in
+  let dWout = arr_new (qdim * d) 0 in let _ = ijit_run kWg Pw Pw dWout (seqL * qdim + seqL * d) 1 (qdim * d) qdim in
+
+  -- OPT 11: adam_step.  P = W|m|v|c1|c2 ; grad in dW ; O = W'|m'|v'
+  let na = 64 in
+  let Wa = mk na 51 in let ma = mk na 53 in let va = mk na 55 in let ga = mk na 57 in
+  let Pa = arr_new (3 * na + 2) 0 in
+  let _ = cpy Wa 0 Pa 0 na 0 in let _ = cpy ma 0 Pa na na 0 in let _ = cpy va 0 Pa (2 * na) na 0 in
+  let _ = arr_set Pa (3 * na) (16777216 - 15099494) in let _ = arr_set Pa (3 * na + 1) (16777216 - 16760439) in
+  let kAd = ijit_compile (emit_msl_fx_adam_step na 15099494 16760439 16777 1677) in
+  let Oa = arr_new (3 * na) 0 in let _ = ijit_run kAd Pa ga Oa (3 * na + 2) na (3 * na) na in
+
+  -- hash EVERY kernel output
+  let blob = cat [ser lnout (rows*d) 0 "", ser mmout (seqL*qdim) 0 "", ser gout 64 0 "", ser attn lq 0 "", ser dxout (seqL*d) 0 "", ser ggout 64 0 "", ser emout 64 0 "", ser lbout (rows*d) 0 "", ser dG (3*lq) 0 "", ser dWout (qdim*d) 0 "", ser Oa (3*na) 0 ""] in
+  let sha = sha256_hex blob in
+  let _ = print (cat ["outs: ln=", show (arr_get lnout 0), " mm=", show (arr_get mmout 0), " gelu=", show (arr_get gout 1), " attn=", show (arr_get attn 0), " mbwd=", show (arr_get dxout 0), " adam=", show (arr_get Oa 0)]) in
+  print (cat ["XDEV-ALL-SHA ", sha])
