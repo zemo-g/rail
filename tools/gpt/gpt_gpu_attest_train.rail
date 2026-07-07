@@ -1,0 +1,85 @@
+-- Rail GPT — gp_gpu wired into an ATTESTED trainer: GPU-computed training whose
+-- ledger is bit-identical to CPU. A linear head W[vocab,d] trained (CE overfit) with
+-- the forward matmul on the GPU (gp_gpu, integer-exact) and the step hash-chained +
+-- Ed25519-signed. Runs the SAME training twice -- GPU forward and CPU forward -- and
+-- proves the chain heads MATCH: GPU training is attestation-equivalent to CPU.
+-- (Correctness demo at d=256; the GPU SPEED win is at 138M scale, see gp_forward_gpu.)
+
+import "stdlib/gpt/gpt_backward.rail"
+import "stdlib/gpt/gp_gpu.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+mkp_go a n seed i = if i >= n then a else let _ = arr_set a i (((((i * 37) + seed) % 13) - 6) * 65536) in mkp_go a n seed (i + 1)
+mkp n seed = mkp_go (arr_new n 0) n seed 0
+gp_ser_v a n i acc = if i >= n then acc else gp_ser_v a n (i + 1) (cat [acc, show (arr_get a i), ","])
+gp_wsha W n = sha256_hex (gp_ser_v W n 0 "")
+gp_canon batchsha loss prev step wsha = cat ["{\"b\":\"", batchsha, "\",\"l\":", show loss, ",\"p\":\"", prev, "\",\"s\":", show step, ",\"w\":\"", wsha, "\"}"]
+gp_rec prev batchsha loss step wsha = sha256_hex (cat [prev, gp_canon batchsha loss prev step wsha])
+
+-- st=[W,m,v,x,logits,ex,p,dl,zbias,gW]; gk=[use_gpu,kid,wid]; hp=[d,vocab,target,lr,b1,b2,eps,maxstep]
+gp_atrain st gk hp batchsha wshas prev p1 p2 step =
+  let maxstep = arr_get hp 7 in
+  if step > maxstep then prev
+  else
+    let W = arr_get st 0 in let m = arr_get st 1 in let v = arr_get st 2 in let x = arr_get st 3 in
+    let logits = arr_get st 4 in let ex = arr_get st 5 in let p = arr_get st 6 in let dl = arr_get st 7 in
+    let zbias = arr_get st 8 in let gW = arr_get st 9 in
+    let d = arr_get hp 0 in let vocab = arr_get hp 1 in let target = arr_get hp 2 in
+    let lr = arr_get hp 3 in let b1 = arr_get hp 4 in let b2 = arr_get hp 5 in let eps = arr_get hp 6 in
+    let _ = if (arr_get gk 0) == 1 then (let _ = gp_gpu_mm (arr_get gk 1) (arr_get gk 2) x logits vocab d 1 in 0)
+            else (let _ = gfx_matvec W x zbias logits d vocab 0 in 0) in
+    let _ = gp_softmax logits ex p vocab in
+    let _ = gp_ce_grad p dl vocab target 0 in
+    let _ = gp_zero gW (vocab * d) 0 in
+    let _ = gp_wgrad dl x gW vocab d 0 0 in
+    let np1 = gp_bc_next p1 b1 in let np2 = gp_bc_next p2 b2 in
+    let _ = gp_adam_vec W m v gW (vocab * d) b1 b2 lr eps (16777216 - np1) (16777216 - np2) 0 0 in
+    let _ = if (arr_get gk 0) == 1 then gp_gpu_weight_update (arr_get gk 2) W vocab d else 0 in
+    let wsha = gp_wsha W (vocab * d) in
+    let rec = gp_rec prev batchsha (arr_get p target) step wsha in
+    let _ = arr_set wshas step wsha in
+    gp_atrain st gk hp batchsha wshas rec np1 np2 (step + 1)
+
+mk_st d vocab seed =
+  let st = arr_new 10 0 in
+  let _ = arr_set st 0 (mkp (vocab * d) seed) in let _ = arr_set st 1 (arr_new (vocab * d) 0) in let _ = arr_set st 2 (arr_new (vocab * d) 0) in
+  let _ = arr_set st 3 (mkp d 555) in let _ = arr_set st 4 (arr_new vocab 0) in let _ = arr_set st 5 (arr_new vocab 0) in
+  let _ = arr_set st 6 (arr_new vocab 0) in let _ = arr_set st 7 (arr_new vocab 0) in let _ = arr_set st 8 (arr_new vocab 0) in
+  let _ = arr_set st 9 (arr_new (vocab * d) 0) in st
+
+run_train use_gpu wshas =
+  let d = 256 in let vocab = 16 in
+  let hp = arr_new 8 0 in
+  let _ = arr_set hp 0 d in let _ = arr_set hp 1 vocab in let _ = arr_set hp 2 5 in let _ = arr_set hp 3 1677721 in
+  let _ = arr_set hp 4 gp_adam_beta_default1 in let _ = arr_set hp 5 gp_adam_beta_default2 in let _ = arr_set hp 6 gp_adam_eps_default in let _ = arr_set hp 7 20 in
+  let st = mk_st d vocab 42 in
+  let gk = arr_new 3 0 in
+  let _ = arr_set gk 0 use_gpu in
+  let _ = if use_gpu == 1 then (let _ = arr_set gk 1 (gp_gpu_mm_kernel vocab d 1) in let _ = arr_set gk 2 (gp_gpu_weight (arr_get st 0) vocab d) in 0) else 0 in
+  let batchsha = sha256_hex "batch-0" in let genesis = sha256_hex "railgpt.gpu.attest.genesis.v1" in
+  let head = gp_atrain st gk hp batchsha wshas genesis 16777216 16777216 1 in
+  let pf = arr_get (arr_get st 6) 5 in
+  let _ = print (cat ["  ", if use_gpu == 1 then "GPU" else "CPU", " run: final p[target]=", show pf, ", chain head=", head]) in
+  head
+
+main =
+  let _ = print "gp_gpu wired into attested trainer: GPU-forward training, signed hash-chain" in
+  let wG = arr_new 21 0 in let headG = run_train 1 wG in
+  let wC = arr_new 21 0 in let headC = run_train 0 wC in
+  let cA = if headG == headC then 1 else 0 in
+  let _ = print (cat ["(A) GPU-trained chain head == CPU-trained (attestation-equivalent): ", if cA == 1 then "PASS" else "FAIL"]) in
+  let cB = if (arr_get wG 1) == (arr_get wG 20) then 0 else 1 in
+  let _ = print (cat ["(B) weights_sha evolves over training: ", if cB == 1 then "PASS" else "FAIL"]) in
+  let seed = sha256 "railgpt.attest.dev.key.v1" in
+  let pk = ed25519_pk_from_sk seed in
+  let hm = sha256 headG in let sig = ed25519_sign seed hm 32 in
+  let vok = ed25519_verify pk hm 32 sig in
+  let cC = if vok == 1 then 1 else 0 in
+  let _ = print (cat ["(C) Ed25519-sign GPU-trained head, verify=", show vok, ": ", if cC == 1 then "PASS" else "FAIL"]) in
+  let allok = cA * cB * cC in
+  print (if allok == 1 then "gpt_gpu_attest_train: GPU-SPEED ATTESTED TRAINING OK (GPU-forward, chain == CPU, signed)" else "gpt_gpu_attest_train: FAILED")
