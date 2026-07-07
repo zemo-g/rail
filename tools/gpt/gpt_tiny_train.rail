@@ -1,0 +1,143 @@
+-- Rail GPT — END-TO-END proof: the tiny 1-block model TRAINS and LEARNS.
+-- Full forward through the real architecture (embed -> ln1 -> causal MHA -> resid
+-- -> ln2 -> MLP -> resid -> lnf -> head), then backprop the last-position CE through
+-- head -> lnf(LN-bwd) -> down(matmul-bwd) -> gelu(bwd) -> up(wgrad) and fx-AdamW-update
+-- head+Wup+Wdown. CE must fall (p[target] -> 1). Exercises the whole trained pipeline.
+--
+-- Wt[15]: 0 tok 1 pos 2 g1 3 b1 4 Wq 5 Wk 6 Wv 7 Wo 8 g2 9 b2 10 Wup 11 Wdown 12 gf 13 bf 14 head
+-- S: 0 H 1 lnbuf 2 q 3 k 4 v 5 attn 6 sc 7 ex 8 obuf 9 r1 10 ln2 11 h1 12 gh1 13 y 14 lnf
+--    15 logits 16 pex 17 p 18 dl 19 dlnf 20 dy 21 dgh1 22 dh1 23 zd 24 zint 25 zvoc
+--    26 gHead 27 gUp 28 gDown 29 mHead 30 vHead 31 mUp 32 vUp 33 mDown 34 vDown
+-- hp: 0 d 1 nh 2 hd 3 inter 4 vocab 5 seqL 6 target 7 eps 8 scaleq 9 lr 10 b1 11 b2 12 maxstep
+
+import "stdlib/gpt/gpt_backward.rail"
+
+mkc_go a n v i = if i >= n then a else let _ = arr_set a i v in mkc_go a n v (i + 1)
+mkc n v = mkc_go (arr_new n 0) n v 0
+mkp_go a n seed i = if i >= n then a else let _ = arr_set a i (((((i * 37) + seed) % 11) - 5) * 131072) in mkp_go a n seed (i + 1)
+mkp n seed = mkp_go (arr_new n 0) n seed 0
+
+t_zero a n i = if i >= n then 0 else let _ = arr_set a i 0 in t_zero a n (i + 1)
+t_add A ab B out d i = if i >= d then 0 else let _ = arr_set out i ((arr_get A (ab + i)) + (arr_get B i)) in t_add A ab B out d (i + 1)
+t_gelu x y n i = if i >= n then 0 else let _ = arr_set y i (bx4_gelu (arr_get x i)) in t_gelu x y n (i + 1)
+
+t_embed Wt S hp ids t =
+  let d = arr_get hp 0 in let seqL = arr_get hp 5 in
+  if t >= seqL then 0
+  else let _ = gp_embed_row (arr_get Wt 0) (arr_get Wt 1) (arr_get S 0) (t * d) ((arr_get ids t) * d) (t * d) d 0 in t_embed Wt S hp ids (t + 1)
+
+t_qkv Wt S hp t =
+  let d = arr_get hp 0 in let seqL = arr_get hp 5 in let eps = arr_get hp 7 in
+  if t >= seqL then 0
+  else let _ = gp_layernorm (arr_get S 0) (t * d) (arr_get S 1) (arr_get Wt 2) (arr_get Wt 3) d eps in
+       let _ = gfx_matvec_off (arr_get Wt 4) (arr_get S 1) 0 (arr_get S 23) (arr_get S 2) (t * d) d d 0 in
+       let _ = gfx_matvec_off (arr_get Wt 5) (arr_get S 1) 0 (arr_get S 23) (arr_get S 3) (t * d) d d 0 in
+       let _ = gfx_matvec_off (arr_get Wt 6) (arr_get S 1) 0 (arr_get S 23) (arr_get S 4) (t * d) d d 0 in
+       t_qkv Wt S hp (t + 1)
+
+-- forward, saving last-token activations for backward.
+gp_tf Wt S hp ids =
+  let d = arr_get hp 0 in let nh = arr_get hp 1 in let hd = arr_get hp 2 in let inter = arr_get hp 3 in
+  let vocab = arr_get hp 4 in let seqL = arr_get hp 5 in let eps = arr_get hp 7 in let scaleq = arr_get hp 8 in
+  let tt = seqL - 1 in
+  let _ = t_embed Wt S hp ids 0 in
+  let _ = t_qkv Wt S hp 0 in
+  let _ = gp_attn_core (arr_get S 2) (arr_get S 3) (arr_get S 4) (arr_get S 6) (arr_get S 7) (arr_get S 5) nh d hd seqL scaleq 0 in
+  let _ = gfx_matvec_off (arr_get Wt 7) (arr_get S 5) (tt * d) (arr_get S 23) (arr_get S 8) 0 d d 0 in
+  let _ = t_add (arr_get S 0) (tt * d) (arr_get S 8) (arr_get S 9) d 0 in
+  let _ = gp_layernorm (arr_get S 9) 0 (arr_get S 10) (arr_get Wt 8) (arr_get Wt 9) d eps in
+  let _ = gfx_matvec (arr_get Wt 10) (arr_get S 10) (arr_get S 24) (arr_get S 11) d inter 0 in
+  let _ = t_gelu (arr_get S 11) (arr_get S 12) inter 0 in
+  let _ = gfx_matvec (arr_get Wt 11) (arr_get S 12) (arr_get S 23) (arr_get S 8) inter d 0 in
+  let _ = t_add (arr_get S 9) 0 (arr_get S 8) (arr_get S 13) d 0 in
+  let _ = gp_layernorm (arr_get S 13) 0 (arr_get S 14) (arr_get Wt 12) (arr_get Wt 13) d eps in
+  gfx_matvec (arr_get Wt 14) (arr_get S 14) (arr_get S 25) (arr_get S 15) d vocab 0
+
+-- backward (last token): accumulate gHead/gUp/gDown.
+gp_tb Wt S hp =
+  let d = arr_get hp 0 in let inter = arr_get hp 3 in let vocab = arr_get hp 4 in
+  let target = arr_get hp 6 in let eps = arr_get hp 7 in
+  let _ = gp_ce_grad (arr_get S 17) (arr_get S 18) vocab target 0 in
+  let _ = gp_wgrad_acc (arr_get S 18) (arr_get S 14) (arr_get S 26) vocab d 0 0 in
+  let _ = gp_mbwd_dx (arr_get Wt 14) (arr_get S 18) (arr_get S 19) vocab d 0 in
+  let _ = gp_ln_bwd_dx (arr_get S 13) (arr_get Wt 12) (arr_get S 19) (arr_get S 20) 0 d eps in
+  let _ = gp_wgrad_acc (arr_get S 20) (arr_get S 12) (arr_get S 28) d inter 0 0 in
+  let _ = gp_mbwd_dx (arr_get Wt 11) (arr_get S 20) (arr_get S 21) d inter 0 in
+  let _ = gp_gelu_bwd (arr_get S 21) (arr_get S 11) (arr_get S 22) inter 0 in
+  gp_wgrad_acc (arr_get S 22) (arr_get S 10) (arr_get S 27) inter d 0 0
+
+gp_train_loop Wt S hp ids p1 p2 step =
+  let maxstep = arr_get hp 12 in
+  if step > maxstep then 0
+  else
+    let d = arr_get hp 0 in let inter = arr_get hp 3 in let vocab = arr_get hp 4 in
+    let b1 = arr_get hp 10 in let b2 = arr_get hp 11 in let lr = arr_get hp 9 in let target = arr_get hp 6 in
+    let _ = t_zero (arr_get S 26) (vocab * d) 0 in
+    let _ = t_zero (arr_get S 27) (inter * d) 0 in
+    let _ = t_zero (arr_get S 28) (d * inter) 0 in
+    let _ = gp_tf Wt S hp ids in
+    let _ = gp_softmax (arr_get S 15) (arr_get S 16) (arr_get S 17) vocab in
+    let _ = gp_tb Wt S hp in
+    let np1 = gp_bc_next p1 b1 in let np2 = gp_bc_next p2 b2 in
+    let c1 = 16777216 - np1 in let c2 = 16777216 - np2 in
+    let e = gp_adam_eps_default in
+    let _ = gp_adam_vec (arr_get Wt 14) (arr_get S 29) (arr_get S 30) (arr_get S 26) (vocab * d) b1 b2 lr e c1 c2 0 0 in
+    let _ = gp_adam_vec (arr_get Wt 10) (arr_get S 31) (arr_get S 32) (arr_get S 27) (inter * d) b1 b2 lr e c1 c2 0 0 in
+    let _ = gp_adam_vec (arr_get Wt 11) (arr_get S 33) (arr_get S 34) (arr_get S 28) (d * inter) b1 b2 lr e c1 c2 0 0 in
+    let _ = if (step - (step / 6) * 6) == 0 then print (join "" ["  step ", show step, ": p[target]=", show (arr_get (arr_get S 17) target)]) else 0 in
+    gp_train_loop Wt S hp ids np1 np2 (step + 1)
+
+mk_wt d inter vocab seqL =
+  let Wt = arr_new 15 0 in
+  let _ = arr_set Wt 0 (mkp (vocab * d) 10) in let _ = arr_set Wt 1 (mkp (seqL * d) 20) in
+  let _ = arr_set Wt 2 (mkc d 16777216) in let _ = arr_set Wt 3 (mkc d 0) in
+  let _ = arr_set Wt 4 (mkp (d * d) 30) in let _ = arr_set Wt 5 (mkp (d * d) 40) in
+  let _ = arr_set Wt 6 (mkp (d * d) 50) in let _ = arr_set Wt 7 (mkp (d * d) 60) in
+  let _ = arr_set Wt 8 (mkc d 16777216) in let _ = arr_set Wt 9 (mkc d 0) in
+  let _ = arr_set Wt 10 (mkp (inter * d) 70) in let _ = arr_set Wt 11 (mkp (d * inter) 80) in
+  let _ = arr_set Wt 12 (mkc d 16777216) in let _ = arr_set Wt 13 (mkc d 0) in
+  let _ = arr_set Wt 14 (mkp (vocab * d) 90) in Wt
+
+mk_s d inter vocab seqL =
+  let S = arr_new 35 0 in
+  let _ = arr_set S 0 (arr_new (seqL * d) 0) in let _ = arr_set S 1 (arr_new d 0) in
+  let _ = arr_set S 2 (arr_new (seqL * d) 0) in let _ = arr_set S 3 (arr_new (seqL * d) 0) in
+  let _ = arr_set S 4 (arr_new (seqL * d) 0) in let _ = arr_set S 5 (arr_new (seqL * d) 0) in
+  let _ = arr_set S 6 (arr_new seqL 0) in let _ = arr_set S 7 (arr_new seqL 0) in
+  let _ = arr_set S 8 (arr_new d 0) in let _ = arr_set S 9 (arr_new d 0) in
+  let _ = arr_set S 10 (arr_new d 0) in let _ = arr_set S 11 (arr_new inter 0) in
+  let _ = arr_set S 12 (arr_new inter 0) in let _ = arr_set S 13 (arr_new d 0) in let _ = arr_set S 14 (arr_new d 0) in
+  let _ = arr_set S 15 (arr_new vocab 0) in let _ = arr_set S 16 (arr_new vocab 0) in let _ = arr_set S 17 (arr_new vocab 0) in
+  let _ = arr_set S 18 (arr_new vocab 0) in let _ = arr_set S 19 (arr_new d 0) in let _ = arr_set S 20 (arr_new d 0) in
+  let _ = arr_set S 21 (arr_new inter 0) in let _ = arr_set S 22 (arr_new inter 0) in
+  let _ = arr_set S 23 (arr_new d 0) in let _ = arr_set S 24 (arr_new inter 0) in let _ = arr_set S 25 (arr_new vocab 0) in
+  let _ = arr_set S 26 (arr_new (vocab * d) 0) in let _ = arr_set S 27 (arr_new (inter * d) 0) in let _ = arr_set S 28 (arr_new (d * inter) 0) in
+  let _ = arr_set S 29 (arr_new (vocab * d) 0) in let _ = arr_set S 30 (arr_new (vocab * d) 0) in
+  let _ = arr_set S 31 (arr_new (inter * d) 0) in let _ = arr_set S 32 (arr_new (inter * d) 0) in
+  let _ = arr_set S 33 (arr_new (d * inter) 0) in let _ = arr_set S 34 (arr_new (d * inter) 0) in S
+
+main =
+  let d = 8 in let nh = 2 in let hd = 4 in let inter = 16 in let vocab = 5 in let seqL = 3 in let target = 2 in
+  let hp = arr_new 13 0 in
+  let _ = arr_set hp 0 d in let _ = arr_set hp 1 nh in let _ = arr_set hp 2 hd in let _ = arr_set hp 3 inter in
+  let _ = arr_set hp 4 vocab in let _ = arr_set hp 5 seqL in let _ = arr_set hp 6 target in let _ = arr_set hp 7 168 in
+  let _ = arr_set hp 8 8388608 in let _ = arr_set hp 9 1677721 in let _ = arr_set hp 10 gp_adam_beta_default1 in
+  let _ = arr_set hp 11 gp_adam_beta_default2 in let _ = arr_set hp 12 60 in
+  let Wt = mk_wt d inter vocab seqL in
+  let S = mk_s d inter vocab seqL in
+  let ids = arr_new seqL 0 in let _ = arr_set ids 0 1 in let _ = arr_set ids 1 3 in let _ = arr_set ids 2 4 in
+  let _ = gp_tf Wt S hp ids in
+  let _ = gp_softmax (arr_get S 15) (arr_get S 16) (arr_get S 17) vocab in
+  let p0 = arr_get (arr_get S 17) target in
+  let _ = print (join "" ["Phase 3 END-TO-END: tiny 1-block GPT, train head+MLP on last-pos target=", show target]) in
+  let _ = print (join "" ["  initial p[target]=", show p0]) in
+  let _ = gp_train_loop Wt S hp ids 16777216 16777216 1 in
+  let _ = gp_tf Wt S hp ids in
+  let _ = gp_softmax (arr_get S 15) (arr_get S 16) (arr_get S 17) vocab in
+  let pf = arr_get (arr_get S 17) target in
+  let _ = print (join "" ["  final p[target]=", show pf, "  (/", show 16777216, ")"]) in
+  let learned = if pf > (p0 + p0) then 1 else 0 in
+  let strong = if pf > 12000000 then 1 else 0 in
+  let _ = print (join "" ["(A) CE descends (p[target] grew): ", show p0, " -> ", show pf, " -> ", if learned == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["(B) strong overfit (p[target] > 0.72): ", if strong == 1 then "PASS" else "FAIL"]) in
+  print (if (learned * strong) == 1 then "gpt_tiny_train: END-TO-END TINY MODEL LEARNS (full fwd + backprop head/lnf/MLP + fx-AdamW)" else "gpt_tiny_train: FAILED")
