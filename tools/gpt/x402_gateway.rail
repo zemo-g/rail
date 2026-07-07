@@ -29,8 +29,20 @@ build_resp status stext ct extra body =
 
 -- first token after the method on the request line (the path)
 req_path req = let lines = str_split (cat [char_from_int 10]) req in if length lines == 0 then "/" else let parts = str_split " " (head lines) in if length parts < 2 then "/" else head (tail parts)
--- x402 clients retry with an "X-PAYMENT:" header carrying the payment payload
-has_payment req = str_contains "X-PAYMENT" req
+
+-- the exact payment terms the gateway REQUIRES; the payer must have signed these
+pay_msg nonce = cat ["x402|exact|base|10000|0x0129b9e66C449b4c7027F07A7b8811BBf6fb3301|/data|", nonce]
+-- extract a header value (to end of line)
+hval req key = let i = str_find key req in if i < 0 then "" else let rest = str_sub req (i + (length (chars key))) 400 in let nl = str_find (char_from_int 13) rest in if nl < 0 then rest else str_sub rest 0 nl
+-- REAL verification: X-PAYMENT = <payer_pk_hex>.<nonce>.<sig_hex>; reconstruct the
+-- required terms + the payer's nonce, Ed25519-verify the authorization signature.
+verify_payment req =
+  let xp = hval req "X-PAYMENT: " in
+  if (length (chars xp)) < 20 then 0
+  else let parts = str_split "." xp in
+       if (length parts) < 3 then 0
+       else let pkhex = head parts in let nonce = head (tail parts) in let sighex = head (tail (tail parts)) in
+            if ed25519_verify (hex_to_bytes pkhex) (sha256 (pay_msg nonce)) 32 (hex_to_bytes sighex) then 1 else 0
 
 -- attestation headers: hash of the body + Ed25519 signature over that hash
 attest_headers =
@@ -43,11 +55,18 @@ attest_headers =
        "X-Attestation-Sig: ", sig, crlf,
        "X-Payment-Response: settled", crlf]
 
+-- persist body/hash/sig so the buyer's x402_verify can independently check them
+persist_receipt =
+  let h = sha256 resource in
+  let sig = ed25519_sign (sha256 "ledatic.x402.gateway.dev.key.v1") h 32 in
+  let _ = write_file "/tmp/x402_body.txt" resource in
+  let _ = write_file "/tmp/x402_hash.txt" (bytes_to_hex h 32) in
+  write_file "/tmp/x402_sig.txt" (bytes_to_hex sig 64)
+
 main =
   let req = read_file "/tmp/rail_http_req.txt" in
   let path = req_path req in
-  let out = if (str_contains "/data" path) then
-              (if has_payment req then build_resp 200 "OK" "application/json" attest_headers resource
-               else build_resp 402 "Payment Required" "application/json" "" offer)
-            else build_resp 404 "Not Found" "text/plain" "" "no such resource -- try GET /data" in
-  print out
+  if (str_contains "/data" path) then
+    (if (verify_payment req) == 1 then (let _ = persist_receipt in print (build_resp 200 "OK" "application/json" attest_headers resource))
+     else print (build_resp 402 "Payment Required" "application/json" "" offer))
+  else print (build_resp 404 "Not Found" "text/plain" "" "no such resource -- try GET /data")
