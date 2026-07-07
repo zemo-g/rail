@@ -20,7 +20,7 @@ Authoritative source: `attested-base/pilot/gpt.py` GPT class + `mid` preset.
 | vocab_size | load-time | byte-level BPE; set from checkpoint meta, never hardcoded |
 | norm | LayerNorm **with bias** | pre-norm: `x=x+attn(ln1(x))`, `x=x+mlp(ln2(x))` |
 | activation | GELU | |
-| attention | standard MHA (not GQA) | self-attn q=k=v=ln1(x); additive causal mask; proj bias=True |
+| attention | standard MHA (not GQA) | self-attn q=k=v=ln1(x); additive causal mask; **proj bias=False** (verified from real weights — MHA defaults bias=False) |
 | head | `Linear(d_model, vocab, bias=False)` | **UNTIED**, no bias — separate from token embedding |
 | tie_head | 0 (untied) — DECIDED | Owned 138M is trained untied; tying would make our weights un-loadable/un-witnessable and forces dense Adam over 12.6M embed rows (fights sparse-SGD embed + dense-Adam head). Flag reserved for future from-scratch small runs where the ~9% saving + regularization may help. |
 | loss | mean CE over ALL T positions | matches `loss_fn`; last-position is the weaker witness metric |
@@ -47,23 +47,27 @@ Index → field (integers only):
 
 Every trainable tensor, in canonical serialization order. This is the COMPLETE set the checkpoint must persist — no more head-only.
 
+All Linear weights stored **RAW [out, in]** row-major (nn.Linear), indexed `W[o*in+i]` — NO transpose (matches raw safetensors + the certified fx_matmul_wx kernel). Verified: this layout reproduces the owned 138M's argmax 5836.
+
 ```
-tok.weight            [vocab, d_model]
+tok.weight            [vocab, d_model]   (row lookup by token id)
 pos.weight            [block_size, d_model]
 -- per layer i in 0..n_layer-1 (×16):
   blk.i.ln1.weight    [d_model]        blk.i.ln1.bias    [d_model]
-  blk.i.attn.q.weight [d_model,d_model] blk.i.attn.q.bias [d_model]
-  blk.i.attn.k.weight [d_model,d_model] blk.i.attn.k.bias [d_model]
-  blk.i.attn.v.weight [d_model,d_model] blk.i.attn.v.bias [d_model]
-  blk.i.attn.o.weight [d_model,d_model] blk.i.attn.o.bias [d_model]
+  blk.i.attn.q.weight [d_model,d_model]   (query_proj.weight, BIAS-FREE)
+  blk.i.attn.k.weight [d_model,d_model]   (key_proj.weight,   BIAS-FREE)
+  blk.i.attn.v.weight [d_model,d_model]   (value_proj.weight, BIAS-FREE)
+  blk.i.attn.o.weight [d_model,d_model]   (out_proj.weight,   BIAS-FREE)
   blk.i.ln2.weight    [d_model]        blk.i.ln2.bias    [d_model]
-  blk.i.mlp.up.weight [d_ff,d_model]   blk.i.mlp.up.bias  [d_ff]
-  blk.i.mlp.dn.weight [d_model,d_ff]   blk.i.mlp.dn.bias  [d_model]
+  blk.i.mlp.up.weight [d_ff,d_model]   blk.i.mlp.up.bias  [d_ff]   (mlp.layers.0)
+  blk.i.mlp.dn.weight [d_model,d_ff]   blk.i.mlp.dn.bias  [d_model] (mlp.layers.2)
 lnf.weight            [d_model]        lnf.bias           [d_model]
 head.weight           [vocab, d_model]   (bias-free)
 ```
 
-Tensor count = 2 + 16·16 + 2 + 1 = **261 tensors**. Names map 1:1 to HF/MLX names for `export`.
+**Real model = 197 tensors** (5 + 16·12): attention projections are bias-free.
+The in-memory forward array keeps a uniform 16-slot/layer stride (261 slots) with
+**zero arrays in the 4 absent attn-bias slots**, so `gp_forward` needs no special-casing (a zero-bias add is a no-op). Names map 1:1 to HF/MLX safetensors keys (`blocks.{i}.attn.query_proj.weight`, `mlp.layers.0/2.weight`, …) for load + `export`.
 
 ---
 
