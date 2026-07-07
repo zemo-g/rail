@@ -57,3 +57,40 @@ gp_ln_bwd_dx x g dy dxo base d eps =
   let m1 = (gp_lnb_sum1 g dy base d 0 0) / d in
   let m2 = (gp_lnb_sum2 x g dy base d mean inv 0 0) / d in
   gp_lnb_dxrow x g dy dxo base d mean inv m1 m2 0
+
+gp_zero a n i = if i >= n then 0 else let _ = arr_set a i 0 in gp_zero a n (i + 1)
+
+-- ===== causal MHA backward (dQ/dK/dV) -- verbatim from attested_attn_bwd_demo act-18 =====
+-- dp[i,j]=sum_c dO[i,c]V[j,c]; dsc=p*(dp-sum p*dp); draw=dsc*SCALEQ/S;
+-- dQ[i,c]=sum_{j<=i} draw*K[j,c]; dK[j,c]+=sum_{i>=j} draw*Q[i,c]; dV[j,c]+=sum_{i>=j} dO[i,c]*p[i,j].
+-- scaleq passed in (= round(2^24/sqrt(hd))). Reuses forward ga_scores/ga_rowmax/ga_exprow.
+gab_fillp ex p sum i j = if j > i then 0 else let _ = arr_set p j (((arr_get ex j) * 16777216) / sum) in gab_fillp ex p sum i (j + 1)
+gab_dpc dO v i j qb hd qdim c acc = if c >= hd then acc else gab_dpc dO v i j qb hd qdim (c + 1) (acc + (mul_shr (arr_get dO (i * qdim + qb + c)) (arr_get v (j * qdim + qb + c)) 24))
+gab_filldp dO v dp i qb hd qdim j = if j > i then 0 else let _ = arr_set dp j (gab_dpc dO v i j qb hd qdim 0 0) in gab_filldp dO v dp i qb hd qdim (j + 1)
+gab_dot p dp i j acc = if j > i then acc else gab_dot p dp i (j + 1) (acc + (mul_shr (arr_get p j) (arr_get dp j) 24))
+gab_filldraw p dp draw dot i scaleq j = if j > i then 0 else let ds = mul_shr (arr_get p j) ((arr_get dp j) - dot) 24 in let _ = arr_set draw j ((ds * scaleq) / 16777216) in gab_filldraw p dp draw dot i scaleq (j + 1)
+gab_dqc draw k i qb hd qdim c j acc = if j > i then acc else gab_dqc draw k i qb hd qdim c (j + 1) (acc + (mul_shr (arr_get draw j) (arr_get k (j * qdim + qb + c)) 24))
+gab_dq draw k dQ i qb hd qdim c = if c >= hd then 0 else let _ = arr_set dQ (i * qdim + qb + c) (gab_dqc draw k i qb hd qdim c 0 0) in gab_dq draw k dQ i qb hd qdim (c + 1)
+gab_dk_c draw q dK i j qb hd qdim c = if c >= hd then 0 else let idx = (j * qdim + qb + c) in let _ = arr_set dK idx ((arr_get dK idx) + (mul_shr (arr_get draw j) (arr_get q (i * qdim + qb + c)) 24)) in gab_dk_c draw q dK i j qb hd qdim (c + 1)
+gab_dk draw q dK i qb hd qdim j = if j > i then 0 else let _ = gab_dk_c draw q dK i j qb hd qdim 0 in gab_dk draw q dK i qb hd qdim (j + 1)
+gab_dv_c dO p dV i j qb hd qdim c = if c >= hd then 0 else let idx = (j * qdim + qb + c) in let _ = arr_set dV idx ((arr_get dV idx) + (mul_shr (arr_get dO (i * qdim + qb + c)) (arr_get p j) 24)) in gab_dv_c dO p dV i j qb hd qdim (c + 1)
+gab_dv dO p dV i qb hd qdim j = if j > i then 0 else let _ = gab_dv_c dO p dV i j qb hd qdim 0 in gab_dv dO p dV i qb hd qdim (j + 1)
+gab_head q k v dO sc ex p dp draw dQ dK dV i h qdim hd seqL scaleq =
+  let _ = ga_scores q k sc i h qdim hd seqL scaleq 0 in
+  let m = ga_rowmax sc seqL 1 (arr_get sc 0) in
+  let sum = ga_exprow sc ex seqL m 0 0 in
+  let qb = h * hd in
+  let _ = gab_fillp ex p sum i 0 in
+  let _ = gab_filldp dO v dp i qb hd qdim 0 in
+  let dot = gab_dot p dp i 0 0 in
+  let _ = gab_filldraw p dp draw dot i scaleq 0 in
+  let _ = gab_dq draw k dQ i qb hd qdim 0 in
+  let _ = gab_dk draw q dK i qb hd qdim 0 in
+  let _ = gab_dv dO p dV i qb hd qdim 0 in 0
+gab_heads q k v dO sc ex p dp draw dQ dK dV i nh qdim hd seqL scaleq h = if h >= nh then 0 else let _ = gab_head q k v dO sc ex p dp draw dQ dK dV i h qdim hd seqL scaleq in gab_heads q k v dO sc ex p dp draw dQ dK dV i nh qdim hd seqL scaleq (h + 1)
+gab_tokens q k v dO sc ex p dp draw dQ dK dV nh qdim hd seqL scaleq i = if i >= seqL then 0 else let _ = gab_heads q k v dO sc ex p dp draw dQ dK dV i nh qdim hd seqL scaleq 0 in gab_tokens q k v dO sc ex p dp draw dQ dK dV nh qdim hd seqL scaleq (i + 1)
+
+-- wrapper: zero dQ/dK/dV, then run. q,k,v,dO,dQ,dK,dV : [seqL*qdim]; sc,ex,p,dp,draw : [seqL].
+gp_attn_bwd q k v dO sc ex p dp draw dQ dK dV nh qdim hd seqL scaleq =
+  let _ = gp_zero dQ (seqL * qdim) 0 in let _ = gp_zero dK (seqL * qdim) 0 in let _ = gp_zero dV (seqL * qdim) 0 in
+  gab_tokens q k v dO sc ex p dp draw dQ dK dV nh qdim hd seqL scaleq 0
