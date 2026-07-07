@@ -1,0 +1,43 @@
+-- Cross-device byte-equality probe for the FUSED NONLINEAR GPU kernels
+-- (gelu / rsqrt-layernorm / exp-softmax-attention), F=24 integer-exact. Runs the
+-- kernels on FIXED deterministic inputs, hashes ALL integer outputs -> one sha256.
+-- Same sha on Mini (M4 Pro) and Studio (M1 Ultra) == byte-equal == shardable.
+
+import "stdlib/ijit.rail"
+import "stdlib/sha256.rail"
+
+fillp a n seed i = if i >= n then a else let _ = arr_set a i (((((i * 37) + seed) % 23) - 11) * 4194304) in fillp a n seed (i + 1)
+ser a n i acc = if i >= n then acc else ser a n (i + 1) (cat [acc, show (arr_get a i), ","])
+cpy src soff dst doff n i = if i >= n then 0 else let _ = arr_set dst (doff + i) (arr_get src (soff + i)) in cpy src soff dst doff n (i + 1)
+
+main =
+  -- (1) GELU24 (tanh/exp fused), 64 elements
+  let ng = 64 in
+  let gin = fillp (arr_new ng 0) ng 11 0 in
+  let kGe = ijit_compile (emit_msl_fx_gelu24_shaped ng) in
+  let gout = arr_new ng 0 in let _ = ijit_run kGe gin gin gout ng 1 ng ng in
+
+  -- (2) LayerNorm24 (rsqrt fused): rows=4, d=16. Pack X | gamma | beta.
+  let rows = 4 in let d = 16 in
+  let xln = fillp (arr_new (rows * d) 0) (rows * d) 23 0 in
+  let gm = fillp (arr_new d 0) d 5 0 in let bt = fillp (arr_new d 0) d 7 0 in
+  let P = arr_new (rows * d + d + d) 0 in
+  let _ = cpy xln 0 P 0 (rows * d) 0 in
+  let _ = cpy gm 0 P (rows * d) d 0 in
+  let _ = cpy bt 0 P (rows * d + d) d 0 in
+  let kLN = ijit_compile (emit_msl_fx_layernorm24_shaped rows d) in
+  let lnout = arr_new (rows * d) 0 in
+  let _ = ijit_run kLN P P lnout (rows * d + d + d) 1 (rows * d) rows in
+
+  -- (3) Attention24 (exp/softmax fused): seqL=3, qdim=8, nh=2, hd=4. Packed Q|K|V.
+  let seqL = 3 in let qdim = 8 in let nh = 2 in let hd = 4 in
+  let lq = seqL * qdim in
+  let qkv = fillp (arr_new (3 * lq) 0) (3 * lq) 42 0 in
+  let kAt = ijit_compile (emit_msl_fx_attn24_par seqL qdim nh hd) in
+  let attn = arr_new lq 0 in let _ = ijit_run kAt qkv qkv attn (3 * lq) 1 lq (seqL * nh) in
+
+  -- hash all three outputs into one digest
+  let blob = cat [ser gout ng 0 "", "|", ser lnout (rows * d) 0 "", "|", ser attn lq 0 ""] in
+  let sha = sha256_hex blob in
+  let _ = print (cat ["gelu[0,1]=", show (arr_get gout 0), ",", show (arr_get gout 1), " ln[0]=", show (arr_get lnout 0), " attn[0]=", show (arr_get attn 0)]) in
+  print (cat ["XDEV-FUSED-SHA ", sha])
