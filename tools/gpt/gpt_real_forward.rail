@@ -1,0 +1,92 @@
+-- Rail GPT — REAL 138M forward: load the owned canonical_bestpass.safetensors and
+-- reproduce the MLX greedy argmax (gold = 5836) via the unified gp_forward.
+-- Compile to a binary and run with RAIL_ARENA_MB>=8000 (./rail_native run SIGBUSes
+-- on the 30MB+ load). Weights loaded RAW [out,in] (no transpose); attn projections
+-- are bias-free (real model), so those slots get zero arrays.
+
+import "stdlib/gpt/gpt_forward.rail"
+import "stdlib/file.rail"
+import "stdlib/env.rail"
+foreign pread fd buf count offset -> int
+
+-- ===== safetensors F32 loader (verbatim from the certified FAST engine) =====
+pq_pow2_go acc k = if k == 0 then acc else pq_pow2_go (acc + acc) (k - 1)
+pq_pow2 k = if k < 1 then 1 else pq_pow2_go 1 k
+pq_f32_fixed b0 b1 b2 b3 = let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in let sign = bits / 2147483648 in let rest = bits - sign * 2147483648 in let exp = rest / 8388608 in let mant = rest - exp * 8388608 in if exp == 0 then 0 else let mag = 8388608 + mant in let sh = exp - 126 in let xabs = if sh >= 0 then mag * (pq_pow2 sh) else (let dd = pq_pow2 (0 - sh) in (mag + dd / 2) / dd) in if sign == 1 then 0 - xabs else xabs
+pq_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then pq_match buf (pos + 1) (tail pcs) else 0
+pq_find buf pos hi pcs = if pos >= hi then 0 - 1 else if pq_match buf pos pcs == 1 then pos else pq_find buf (pos + 1) hi pcs
+pq_find_after buf pos hi pcs = let p = pq_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+pq_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else pq_int buf (pos + 1) (acc * 10 + (c - 48))
+pq_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+pq_offset hdr hi name = let np = pq_find hdr 0 hi (chars (cat ["\"", name, "\":"])) in let dp = pq_find_after hdr np hi (chars "\"data_offsets\":[") in pq_int hdr dp 0
+gp_dec_f32 cbuf out obase count i = if i >= count then 0 else let ba = 4 * i in let _ = arr_set out (obase + i) (pq_f32_fixed (byte_at cbuf ba) (byte_at cbuf (ba + 1)) (byte_at cbuf (ba + 2)) (byte_at cbuf (ba + 3))) in gp_dec_f32 cbuf out obase count (i + 1)
+ld_f32 fd hdrbuf base name count = let start = pq_offset hdrbuf base name in let cbuf = malloc (count * 4) in let nr = pread fd cbuf (count * 4) (base + start) in let out = arr_new count 0 in let _ = gp_dec_f32 cbuf out 0 count 0 in let _ = free cbuf in out
+bname li suffix = cat ["blocks.", show li, ".", suffix]
+gp_zeros n = arr_new n 0
+
+-- ===== load all layers into the unified 261-array W (attn biases = zero) =====
+gp_load_layers W fd hdr base li nlayers d qdim inter =
+  if li >= nlayers then 0
+  else
+    let bb = 2 + li * 16 in
+    let _ = arr_set W (bb + 0) (ld_f32 fd hdr base (bname li "ln1.weight") d) in
+    let _ = arr_set W (bb + 1) (ld_f32 fd hdr base (bname li "ln1.bias") d) in
+    let _ = arr_set W (bb + 2) (ld_f32 fd hdr base (bname li "attn.query_proj.weight") (qdim * d)) in
+    let _ = arr_set W (bb + 3) (gp_zeros d) in
+    let _ = arr_set W (bb + 4) (ld_f32 fd hdr base (bname li "attn.key_proj.weight") (qdim * d)) in
+    let _ = arr_set W (bb + 5) (gp_zeros d) in
+    let _ = arr_set W (bb + 6) (ld_f32 fd hdr base (bname li "attn.value_proj.weight") (qdim * d)) in
+    let _ = arr_set W (bb + 7) (gp_zeros d) in
+    let _ = arr_set W (bb + 8) (ld_f32 fd hdr base (bname li "attn.out_proj.weight") (d * qdim)) in
+    let _ = arr_set W (bb + 9) (gp_zeros d) in
+    let _ = arr_set W (bb + 10) (ld_f32 fd hdr base (bname li "ln2.weight") d) in
+    let _ = arr_set W (bb + 11) (ld_f32 fd hdr base (bname li "ln2.bias") d) in
+    let _ = arr_set W (bb + 12) (ld_f32 fd hdr base (bname li "mlp.layers.0.weight") (inter * d)) in
+    let _ = arr_set W (bb + 13) (ld_f32 fd hdr base (bname li "mlp.layers.0.bias") inter) in
+    let _ = arr_set W (bb + 14) (ld_f32 fd hdr base (bname li "mlp.layers.2.weight") (d * inter)) in
+    let _ = arr_set W (bb + 15) (ld_f32 fd hdr base (bname li "mlp.layers.2.bias") d) in
+    let _ = print (cat ["  loaded layer ", show li]) in
+    gp_load_layers W fd hdr base (li + 1) nlayers d qdim inter
+
+mk_ws d inter vocab seqL =
+  let ws = arr_new 11 0 in
+  let _ = arr_set ws 0 (arr_new d 0) in let _ = arr_set ws 1 (arr_new (seqL * d) 0) in
+  let _ = arr_set ws 2 (arr_new (seqL * d) 0) in let _ = arr_set ws 3 (arr_new (seqL * d) 0) in
+  let _ = arr_set ws 4 (arr_new (seqL * d) 0) in let _ = arr_set ws 5 (arr_new seqL 0) in
+  let _ = arr_set ws 6 (arr_new seqL 0) in let _ = arr_set ws 7 (arr_new inter 0) in
+  let _ = arr_set ws 8 (arr_new d 0) in let _ = arr_set ws 9 (arr_new d 0) in let _ = arr_set ws 10 (arr_new vocab 0) in
+  ws
+
+argmax_go lg base n i best bi = if i >= n then bi else let v = arr_get lg (base + i) in if v > best then argmax_go lg base n (i + 1) v i else argmax_go lg base n (i + 1) best bi
+
+main =
+  let d = 768 in let nh = 12 in let hd = 64 in let qdim = 768 in let inter = 3072 in let L = 9 in let vocab = 16384 in let nlayers = 16 in
+  let cfg = [16, 768, 12, 64, 3072, 512, 16384, 24, 1, 0, 0] in
+  let blob = cat [getenv "HOME", "/.ledatic/railml-trial/canonical_bestpass.safetensors"] in
+  if (read_file_size blob) < 10000000 then let _ = print "FATAL: blob missing" in 1
+  else
+  let fd = fopen blob "rb" in
+  let hb8 = malloc 8 in let _ = pread fd hb8 8 0 in let hlen = pq_le_len hb8 0 in let _ = free hb8 in
+  let base = 8 + hlen in let hdr = malloc base in let _ = pread fd hdr base 0 in
+  let _ = print "loading weights (261-tensor unified layout, raw [out,in]) ..." in
+  let hbase = 2 + nlayers * 16 in
+  let W = arr_new (hbase + 3) 0 in
+  let _ = arr_set W 0 (ld_f32 fd hdr base "tok.weight" (vocab * d)) in
+  let _ = arr_set W 1 (ld_f32 fd hdr base "pos.weight" (L * d)) in
+  let _ = gp_load_layers W fd hdr base 0 nlayers d qdim inter in
+  let _ = arr_set W hbase (ld_f32 fd hdr base "lnf.weight" d) in
+  let _ = arr_set W (hbase + 1) (ld_f32 fd hdr base "lnf.bias" d) in
+  let _ = arr_set W (hbase + 2) (ld_f32 fd hdr base "head.weight" (vocab * d)) in
+  let _ = print "weights loaded. running forward ..." in
+  let ids = arr_new L 0 in
+  let _ = arr_set ids 0 328 in let _ = arr_set ids 1 2432 in let _ = arr_set ids 2 554 in let _ = arr_set ids 3 183 in
+  let _ = arr_set ids 4 12154 in let _ = arr_set ids 5 533 in let _ = arr_set ids 6 197 in let _ = arr_set ids 7 27 in let _ = arr_set ids 8 661 in
+  let rt = arr_new 3 0 in let _ = arr_set rt 0 L in let _ = arr_set rt 1 2097152 in let _ = arr_set rt 2 168 in
+  let ws = mk_ws d inter vocab L in
+  let X = arr_new (L * d) 0 in
+  let logits = arr_new (L * vocab) 0 in
+  let _ = gp_forward W cfg rt ws X ids logits in
+  let base_last = (L - 1) * vocab in
+  let am = argmax_go logits base_last vocab 1 (arr_get logits base_last) 0 in
+  let _ = print (cat ["forward argmax (last pos) = ", show am, "  (MLX gold = 5836)"]) in
+  print (if am == 5836 then "gpt_real_forward: UNIFIED FORWARD REPRODUCES OWNED 138M -- argmax 5836 MATCH" else cat ["gpt_real_forward: MISMATCH (got ", show am, ")"])
