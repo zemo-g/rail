@@ -1,0 +1,42 @@
+-- Rail GPT — fixed-point AdamW optimizer twin (Phase 3, importable, no main).
+--
+-- Element step matches the certified GPU fx_adam (emit_msl_fx_adam_step): mul_shr
+-- (floor) for the moment updates and lr*upd; truncating `/` for mhat=mo*ONE/c1 and
+-- upd=mhat*ONE/denom; gfx_fxsqrt (binary-search) for sqrt(vhat). eps must be ~1e-3
+-- (16777) in Q39.24 -- 1e-8 underflows to 0 and vhat=g^2 collapses.
+--
+-- HONEST naming: this is AdamW with DECOUPLED weight decay `wd`. wd=0 -> exactly the
+-- certified plain-Adam fx_adam (the GPU kernel has no decay term; every prior "AdamW"
+-- label was a misnomer). Set wd>0 for true AdamW.
+--
+-- c1,c2 = bias corrections (ONE - beta1^t, ONE - beta2^t), advanced by the caller.
+
+import "stdlib/gpt/gpt_forward.rail"
+
+gp_adam_beta_default1 = 15099494   -- 0.9
+gp_adam_beta_default2 = 16760439   -- 0.999
+gp_adam_eps_default   = 16777      -- ~1e-3 (Q39.24 representability floor)
+
+-- one element: updates m[i], v[i], w[i] in place given gradient g.
+gp_adam_elem w m v i g beta1 beta2 lr eps c1 c2 wd =
+  let mo = (mul_shr beta1 (arr_get m i) 24) + (mul_shr (16777216 - beta1) g 24) in
+  let g2 = mul_shr g g 24 in
+  let vo = (mul_shr beta2 (arr_get v i) 24) + (mul_shr (16777216 - beta2) g2 24) in
+  let mhat = (mo * 16777216) / c1 in
+  let vhat = (vo * 16777216) / c2 in
+  let denom = (gfx_fxsqrt vhat) + eps in
+  let upd = if denom == 0 then 0 else (mhat * 16777216) / denom in
+  let wold = arr_get w i in
+  let wdec = if wd == 0 then wold else wold - (mul_shr (mul_shr lr wd 24) wold 24) in
+  let _ = arr_set m i mo in
+  let _ = arr_set v i vo in
+  arr_set w i (wdec - (mul_shr lr upd 24))
+
+-- apply Adam over a whole weight array `w` (len n) using gradient array `g`.
+gp_adam_vec w m v g n beta1 beta2 lr eps c1 c2 wd i =
+  if i >= n then 0
+  else let _ = gp_adam_elem w m v i (arr_get g i) beta1 beta2 lr eps c1 c2 wd in
+       gp_adam_vec w m v g n beta1 beta2 lr eps c1 c2 wd (i + 1)
+
+-- bias-correction advance: p_t = beta^t (start ONE at t=0); c_t = ONE - p_t. Returns p_t.
+gp_bc_next p_prev beta = mul_shr p_prev beta 24
