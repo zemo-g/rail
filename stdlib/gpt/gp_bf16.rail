@@ -1,0 +1,49 @@
+-- Rail GPT — deterministic bf16 codec for compressed optimizer state (importable).
+--
+-- Adam m/v stored as bf16 (2 bytes) instead of F=24 int64 (8 bytes) -> 4x smaller
+-- opt state. Kept ATTESTABLE: conversion is pure INTEGER bit-surgery (no
+-- nondeterministic float arithmetic), so encode/decode are fixed algorithms that
+-- reproduce bit-for-bit on any device. Each Adam step: decode bf16 -> exact F=24
+-- int -> exact F=24 update -> encode -> bf16.
+--
+-- bf16 = top 16 bits of fp32 = [sign:1 | exp:8 | mant:7]. Value = V/2^24 (F=24).
+--
+-- NOTE: guards are written with the NON-simple branch as `then` on purpose -- a
+-- function body `if <cmp> then <int-const-or-param> else ...` triggers the
+-- compiler's early-return opt whose .Learly label counter COLLIDES across several
+-- such functions (assembler "symbol .Learly_N already defined"). Keeping the const
+-- branch in `else` (or inlining const-only guards inside a let) dodges it.
+
+gp_pow2_go acc k = if k != 0 then gp_pow2_go (acc + acc) (k - 1) else acc
+gp_pow2 k = if k >= 1 then gp_pow2_go 1 k else 1
+
+-- fp32 bit pattern (bytes b0..b3, little-endian) -> F=24 int. (== pq_f32_fixed.)
+gp_fp32_to_f24 b0 b1 b2 b3 =
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in
+  let sign = bits / 2147483648 in let rest = bits - sign * 2147483648 in
+  let exp = rest / 8388608 in let mant = rest - exp * 8388608 in
+  if exp == 0 then 0
+  else let mag = 8388608 + mant in let sh = exp - 126 in
+       let xabs = if sh >= 0 then mag * (gp_pow2 sh) else (let dd = gp_pow2 (0 - sh) in (mag + dd / 2) / dd) in
+       if sign == 1 then 0 - xabs else xabs
+
+gp_bf16_to_f24 b = gp_fp32_to_f24 0 0 (b - (b / 256) * 256) (b / 256)
+
+gp_msb_go A i = if A >= 2 then gp_msb_go (A / 2) (i + 1) else i
+gp_msb A = if A > 0 then gp_msb_go A 0 else 0
+gp_mant frac msb = if msb >= 23 then frac / (gp_pow2 (msb - 23)) else frac * (gp_pow2 (23 - msb))
+
+-- V != 0 assumed. sign/absi inlined inside lets (const-only guards avoid .Learly).
+gp_enc V =
+  let sign = if V < 0 then 1 else 0 in
+  let A = if V < 0 then 0 - V else V in
+  let msb = gp_msb A in
+  let exp = msb + 103 in
+  let frac = A - (gp_pow2 msb) in
+  let mant = gp_mant frac msb in
+  let fp32 = (sign * 2147483648) + (exp * 8388608) + mant in
+  let lsb = (fp32 / 65536) - ((fp32 / 65536) / 2) * 2 in
+  (fp32 + 32767 + lsb) / 65536
+
+gp_f24_to_bf16 V = if V != 0 then gp_enc V else 0
+gp_f24_bf16_roundtrip V = gp_bf16_to_f24 (gp_f24_to_bf16 V)

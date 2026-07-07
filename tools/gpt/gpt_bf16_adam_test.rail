@@ -1,0 +1,71 @@
+-- Rail GPT — bf16 optimizer state: prove Adam converges with m/v stored in bf16
+-- (2 bytes) instead of F=24 int64 (8 bytes) -> 4x smaller opt state, still
+-- deterministic/attestable (integer bit-surgery codec). Trains the 5-logit CE
+-- optimizer with bf16 m/v and compares convergence to full-precision F=24 m/v.
+
+import "stdlib/gpt/gpt_loss.rail"
+import "stdlib/gpt/gp_bf16.rail"
+
+-- Adam element with bf16-stored m/v: decode -> exact F=24 update -> encode.
+gp_adam_elem_bf16 w mbf vbf i g beta1 beta2 lr eps c1 c2 =
+  let m = gp_bf16_to_f24 (arr_get mbf i) in
+  let v = gp_bf16_to_f24 (arr_get vbf i) in
+  let mo = (mul_shr beta1 m 24) + (mul_shr (16777216 - beta1) g 24) in
+  let g2 = mul_shr g g 24 in
+  let vo = (mul_shr beta2 v 24) + (mul_shr (16777216 - beta2) g2 24) in
+  let mhat = (mo * 16777216) / c1 in
+  let vhat = (vo * 16777216) / c2 in
+  let denom = (gfx_fxsqrt vhat) + eps in
+  let upd = if denom == 0 then 0 else (mhat * 16777216) / denom in
+  let _ = arr_set mbf i (gp_f24_to_bf16 mo) in
+  let _ = arr_set vbf i (gp_f24_to_bf16 vo) in
+  arr_set w i ((arr_get w i) - (mul_shr lr upd 24))
+
+gp_adam_vec_bf16 w mbf vbf g n beta1 beta2 lr eps c1 c2 i =
+  if i >= n then 0
+  else let _ = gp_adam_elem_bf16 w mbf vbf i (arr_get g i) beta1 beta2 lr eps c1 c2 in gp_adam_vec_bf16 w mbf vbf g n beta1 beta2 lr eps c1 c2 (i + 1)
+
+setup_logits lg = let _ = arr_set lg 0 16777216 in let _ = arr_set lg 1 33554432 in let _ = arr_set lg 2 0 in let _ = arr_set lg 3 16777216 in let _ = arr_set lg 4 8388608 in lg
+
+-- hp=[n,target,lr,b1,b2,eps,maxstep,use_bf16]
+gp_train lg m v ex p dl hp p1 p2 step =
+  let maxstep = arr_get hp 6 in
+  if step > maxstep then 0
+  else
+    let n = arr_get hp 0 in let target = arr_get hp 1 in let lr = arr_get hp 2 in
+    let b1 = arr_get hp 3 in let b2 = arr_get hp 4 in let eps = arr_get hp 5 in
+    let _ = gp_softmax lg ex p n in
+    let _ = gp_ce_grad p dl n target 0 in
+    let np1 = gp_bc_next p1 b1 in let np2 = gp_bc_next p2 b2 in
+    let c1 = 16777216 - np1 in let c2 = 16777216 - np2 in
+    let _ = if (arr_get hp 7) == 1 then gp_adam_vec_bf16 lg m v dl n b1 b2 lr eps c1 c2 0
+            else gp_adam_vec lg m v dl n b1 b2 lr eps c1 c2 0 0 in
+    gp_train lg m v ex p dl hp np1 np2 (step + 1)
+
+run use_bf16 =
+  let n = 5 in
+  let hp = arr_new 8 0 in
+  let _ = arr_set hp 0 n in let _ = arr_set hp 1 2 in let _ = arr_set hp 2 1677721 in
+  let _ = arr_set hp 3 gp_adam_beta_default1 in let _ = arr_set hp 4 gp_adam_beta_default2 in
+  let _ = arr_set hp 5 gp_adam_eps_default in let _ = arr_set hp 6 40 in let _ = arr_set hp 7 use_bf16 in
+  let lg = setup_logits (arr_new n 0) in
+  let m = arr_new n 0 in let v = arr_new n 0 in let ex = arr_new n 0 in let p = arr_new n 0 in let dl = arr_new n 0 in
+  let _ = gp_train lg m v ex p dl hp 16777216 16777216 1 in
+  let _ = gp_softmax lg ex p n in
+  arr_get p 2
+
+main =
+  let _ = print "bf16 optimizer state: Adam with m/v in bf16 (2B) vs F=24 (8B)" in
+  let pf24a = run 0 in let pf24b = run 0 in
+  let pbf16a = run 1 in let pbf16b = run 1 in
+  let _ = print (join "" ["  F=24  opt state: final p[target]=", show pf24a]) in
+  let _ = print (join "" ["  bf16  opt state: final p[target]=", show pbf16a]) in
+  let convF = if pf24a > 12000000 then 1 else 0 in
+  let convB = if pbf16a > 12000000 then 1 else 0 in
+  let detF = if pf24a == pf24b then 1 else 0 in
+  let detB = if pbf16a == pbf16b then 1 else 0 in
+  let _ = print (join "" ["(A) F=24 converges (p>0.72): ", if convF == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["(B) bf16 converges (p>0.72): ", if convB == 1 then "PASS" else "FAIL"]) in
+  let _ = print (join "" ["(C) both deterministic (run-twice identical): ", if (detF * detB) == 1 then "PASS" else "FAIL"]) in
+  let allok = convF * convB * detF * detB in
+  print (if allok == 1 then "gpt_bf16_adam_test: bf16 OPT STATE CONVERGES + deterministic (4x smaller, attestable)" else "gpt_bf16_adam_test: FAILED")
