@@ -25,7 +25,16 @@ while (( $# )); do
 done
 
 BASE="${LEDATIC_BASE:-https://ledatic.org}"
-RAIL_DIR="${HOME}/projects/rail"
+# The /system page advertises PUBLIC rail (origin/master), so verify against a
+# master-TRACKING reference, NOT a working clone -- those sit on feature branches
+# with divergent test counts, which caused the 2026-07-07 171-vs-178 false FAIL
+# (the working clone was on security/gitleaks-config@171; origin/master actually
+# tests 178, matching the page). Self-refresh to latest origin/master each run.
+RAIL_DIR="${RAIL_MASTER_REF:-${HOME}/.fleet/rail-master-ref}"
+if [[ -e "$RAIL_DIR/.git" ]]; then
+  git -C "$RAIL_DIR" fetch --quiet origin master 2>/dev/null \
+    && git -C "$RAIL_DIR" reset --hard --quiet origin/master 2>/dev/null || true
+fi
 PAGE=/tmp/system_audit.html
 
 total_pass=0
@@ -53,8 +62,10 @@ curl -sf "$BASE/system" -o "$PAGE" || { echo "FATAL: could not fetch /system"; e
 # ============================================================================
 class_rail_version() {
   local page_ver tag_ver
-  # Header reads e.g. "RAIL v5.1.0 · 141/141"
-  page_ver=$(grep -oE 'RAIL v[0-9]+\.[0-9]+\.[0-9]+' "$PAGE" | head -1 | awk '{print $2}')
+  # Page carries the version as an attested <data> element, e.g.
+  # <data pulse="...">v5.2.0</data> (format moved off the old "RAIL v5.1.0"
+  # header string 2026-07 — match the bare vX.Y.Z anywhere).
+  page_ver=$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' "$PAGE" | head -1)
   tag_ver=$(cd "$RAIL_DIR" && git tag --list 'v*' | sort -V | tail -1)
   log "page: $page_ver  substrate: $tag_ver"
   if [[ "$page_ver" == "$tag_ver" ]]; then
