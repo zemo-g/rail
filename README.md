@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="#releases"><img src="https://img.shields.io/badge/v5.2.0-Stands%20alone%20(no%20as%2Fld%2Fcodesign)-ff5500?style=for-the-badge" alt="v5.2.0"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/v5.3.0-Independence%20%2B%203%C3%97%20faster%20self--compile-ff5500?style=for-the-badge" alt="v5.3.0"></a>
 </p>
 
 <p align="center">
@@ -165,6 +165,15 @@ main =
 Tail-recursive loops match C `-O2` (5 instructions per iteration). The full architecture is documented in [`CHANGELOG.md`](CHANGELOG.md) — see v2.0.0 for the compiler/runtime; v3.0.0 for the TLS stack.
 
 ## Releases
+
+### v5.3.0 — 2026-07-08 — *Independence + 3× faster self-compile*
+
+19 PRs of consolidation: the trusting-trust answer plus a big perf cut.
+
+- **Independence checker.** A reference checker written *outside* Rail re-derives the integer core — the committed seed no longer asks you to trust Rail to check Rail. Alongside it: a one-command check-me kit (`VERIFY.md` + `tools/verify/check.sh`) and a self-generated truth matrix (`docs/STATUS.md`).
+- **Self-compile 61 s → 19.2 s (3.2×).** Parser cursor O(N²)→O(N) and exact-size GC free-list buckets; autograd + JIT tapes go O(n²)→O(n) as well.
+- **Multi-argument lambdas** (`\a b -> e`), integer div/mod differential fuzzing, grounding contracts (numerics / attested subset / threat model), and truth-reconciled docs. 178/178 tests; the seed stays bit-reproducible (nightly witness green throughout).
+
 
 ### v5.2.0 — 2026-06-19 — *Rail stands alone (no as/ld/codesign)*
 
