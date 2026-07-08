@@ -106,6 +106,7 @@ module.exports = grammar({
     match_arm: $ => seq(
       '|',
       $.pattern,
+      optional(seq('if', $._expr)),
       '->',
       $._expr,
     ),
@@ -188,10 +189,10 @@ module.exports = grammar({
       ']',
     ),
 
-    // \x -> x + 1
+    // \x -> x + 1   |   \a b -> a + b (multi-arg since v5.3.0)
     lambda: $ => seq(
       '\\',
-      $.identifier,
+      repeat1($.identifier),
       '->',
       $._expr,
     ),
