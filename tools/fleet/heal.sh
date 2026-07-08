@@ -1,7 +1,7 @@
 #!/bin/bash
 # Fleet self-healer — Mini node
 # Detects & repairs the class of failures we hit on 2026-04-18:
-#   - bridge0 alias 10.42.0.1 vanishes when Internet Sharing toggles
+#   - bridge0 alias 10.42.0.1 vanishes when Internet Sharing toggles  # leak-guard-allow (fabric convention, private range)
 #   - new TB peer interfaces appear but don't auto-join bridge0
 #   - token file ends up world-readable or empty
 #   - fleet agent crashes silently

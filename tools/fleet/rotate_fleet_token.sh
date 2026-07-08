@@ -17,12 +17,14 @@
 
 set -euo pipefail
 
-NODES=(
-  "mini:localhost:10.42.0.1"
-  "studio:studio:10.42.0.2"
-  "air:<peer-user>@<peer-host>:10.42.0.3"
-  "pi:<witness-user>@<witness-host>:10.87.231.45"   # Pi uses Tailscale IP
-)
+# Node list comes from ~/.fleet/nodes_ssh — one "name:ssh_target:agent_ip"
+# per line — so no fleet addressing lives in the public tree.
+NODES=()
+while IFS= read -r line; do
+  case "$line" in ""|\#*) continue;; esac
+  NODES+=("$line")
+done < "$HOME/.fleet/nodes_ssh"
+[ ${#NODES[@]} -gt 0 ] || { echo "no nodes in ~/.fleet/nodes_ssh" >&2; exit 1; }
 
 NEW_TOKEN=$(openssl rand -hex 32)
 NEW_MD5=$(printf '%s' "$NEW_TOKEN" | md5 -q 2>/dev/null || printf '%s' "$NEW_TOKEN" | md5sum | awk '{print $1}')

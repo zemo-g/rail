@@ -7,7 +7,7 @@ Two arms:
   naked: just the bench prompt, no Rail-specific priming
   spec:  Rail self-spec prefix + the bench prompt
 
-Calls Studio's local Qwen-122B-A10B at 10.42.0.2:8088 (OpenAI-compatible
+Calls Studio's local Qwen-122B-A10B at localhost:8088 (OpenAI-compatible
 mlx_lm.server). N=3 reranks per (prompt, arm). Grades each completion
 with `./rail_native parse-check` AND `./rail_native FILE` (full compile).
 
@@ -16,13 +16,14 @@ Usage:
 """
 from __future__ import annotations
 import json
+import os
 import subprocess
 import sys
 import urllib.request
 import urllib.error
 from pathlib import Path
 
-ENDPOINT = "http://10.42.0.2:8088/v1/chat/completions"
+ENDPOINT = os.environ.get("MLX_ENDPOINT", "http://localhost:8088/v1/chat/completions")
 MODEL = "mlx-community/Qwen3.5-122B-A10B-heretic-v2-2.34bit-msq"
 N_RERANK = 3
 MAX_TOKENS = 256

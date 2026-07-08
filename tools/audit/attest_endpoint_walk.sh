@@ -4,8 +4,8 @@
 # Endpoint audit walker — Phase 1 of docs/plans/ATTEST_ENDPOINT_AUDIT.md.
 # Probes each public attestation surface, reports per-class verdict + counters.
 #
-# READ-ONLY. No healing. No chain write yet (Phase 2 — gated on Studio :9101
-# /lab/entry route from the Lakes lab integration plan).
+# READ-ONLY. No healing. No chain write yet (Phase 2 — gated on a planned
+# internal lab-entry route).
 #
 # Exit code: 0 if every class PASS, 1 if any class FAIL, 2 on probe error.
 #
