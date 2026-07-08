@@ -2135,6 +2135,39 @@ int tgl_ijit_dispatch_rr(int kid, int ih, int oh, int nthreads) {
     return 1;
 }
 
+// Resident-optimizer Adam: W@0 G@1 M@2 V@3 C@4 all resident; updates W/M/V in place.
+// Zero CPU touch (all buffers already untagged int64). Kills the adam_w round-trip.
+int tgl_ijit_dispatch_adam_r(int kid, int wh, int gh, int mh, int vh, int ch, int nthreads) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (!g_ibufs) return -1;
+    if (wh < 0 || wh >= (int)g_ibufs.count || gh < 0 || gh >= (int)g_ibufs.count) return -1;
+    if (mh < 0 || mh >= (int)g_ibufs.count || vh < 0 || vh >= (int)g_ibufs.count) return -1;
+    if (ch < 0 || ch >= (int)g_ibufs.count) return -1;
+    if (ensure_init() != 1) return -1;
+    if (nthreads < 1) return -3;
+    @autoreleasepool {
+        id<MTLBuffer> bW = g_ibufs[wh];
+        id<MTLBuffer> bG = g_ibufs[gh];
+        id<MTLBuffer> bM = g_ibufs[mh];
+        id<MTLBuffer> bV = g_ibufs[vh];
+        id<MTLBuffer> bC = g_ibufs[ch];
+        id<MTLComputePipelineState> p = g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bG offset:0 atIndex:1];
+        [enc setBuffer:bM offset:0 atIndex:2];
+        [enc setBuffer:bV offset:0 atIndex:3];
+        [enc setBuffer:bC offset:0 atIndex:4];
+        dispatch_1d(enc, (uint32_t)nthreads);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) return -2;
+    }
+    return 1;
+}
+
 // ────────────────────────────────────────────────────────────────────
 // bf16 host-side staging helpers (added 2026-05-14).
 // bf16 layout = upper 16 bits of f32 representation; conversion is

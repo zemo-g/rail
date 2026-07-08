@@ -37,9 +37,32 @@ UNTAGGED int64 (same rep the kernels already consume), so a chain runs GPU-side 
 CPU untag/retag/readback between ops. **`resident_proof.rail`: BYTE-IDENTICAL to the staged
 `ijit_run_wx` path** (attestation preserved) — the critical property.
 
-## Next (the actual speedup): RESIDENT OPTIMIZER STATE
+## DONE (2026-07-08): RESIDENT OPTIMIZER STATE -- ~5x less CPU, byte-identical
 
-Keep W (already resident via ibuf), m, v, and dW RESIDENT across steps; a resident-adam
-kernel reads W/dW/m/v resident and updates W/m/v IN PLACE, GPU-side. Kills the ~10n
-CPU round-trip in all 96 adam_w calls -> attacks the 88%. Est. step ~10.7s -> a few s (~3-7x).
-Must re-validate byte-exactness (twin discipline) after each kernel change.
+Shipped. W (already resident via ibuf), m, v, dW, and c1/c2 now all RESIDENT; a resident-Adam
+kernel (`emit_msl_fx_adam_step_r`, dispatch `tgl_ijit_dispatch_adam_r`) reads W/dW/m/v resident
+and updates W/m/v IN PLACE, GPU-side. The only CPU work left per adam call is the single dW
+upload. `arith_finetune_res.rail` = the rewired trainer (wmv_load -> abuf_alloc; 96 adam_w ->
+adam_w_r; resident C buffer updated per step; wcb_download restores W to Rail before save).
+
+Validation (twin discipline):
+- `resident_adam_test.rail`: resident Adam == staged adam_w BYTE-EXACT on W,M,V (inter*d=2.4M).
+- CE trajectory: resident trainer == staged trainer BYTE-IDENTICAL over 5 steps (same corpus,
+  same init) -> training dynamics unchanged, attestation preserved.
+- Save path: wcb_download + head download + write_all_st -> valid 555MB safetensors.
+
+Measured (5 steps, L=64, Mini M4 Pro):
+| | wall | user CPU | CPU% |
+|---|---|---|---|
+| staged   | 82.2s | 60.6s | 74% |
+| resident | 33.0s | 12.0s | 38% |
+**~5x less CPU** (the 88% layer-backward adam bottleneck, gone), ~3.3x per-step wall
+(amortizing startup: ~14s -> ~4s/step). Step moved from CPU-bound (74%) to GPU-bound (38%).
+
+## Next levers (now that adam is off the CPU)
+Step is now GPU-bound. Remaining CPU: forward/backward activation packing (cpseg in the LN/attn
+paths) + wgrad dW readback + per-call dW upload. Options: (a) resident dW end-to-end (wgrad
+writes resident -> adam reads resident, drop the dW upload too); (b) resident activations across
+the layer (the original `ijit_run_wxrr`/`_rr` primitives, now free to use). Diminishing returns
+vs the adam win; re-measure before building. For step A (300M), this ~3-5x already makes a
+self-hosted run materially more tractable.
