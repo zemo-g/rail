@@ -9,7 +9,7 @@ cleanup candidate.
 | Entry | Purpose |
 |---|---|
 | `tools/` | Everything Rail-source-but-not-compiler-or-stdlib: the compiler driver (`compile.rail`), deploy generators, fleet control plane, attestation kernel, training-arm orchestrator, plasma + Metal kernels, JIT, package manager, fuzz / lint / trace foundations, test harness, third-party device shims. The kitchen. |
-| `stdlib/` | Rail's standard library — 101 modules. Everything `import`-able. |
+| `stdlib/` | Rail's standard library — 102 modules. Everything `import`-able. |
 | `examples/` | Hand-curated `.rail` programs that demonstrate language features. 32 files. |
 | `tests/` | Placeholder dir; the actual test corpus is inside `tools/compile.rail` as `run_test` calls. See `tests/README.md`. |
 | `docs/` | Current-truth documentation — language ref, stdlib, ABI, release runbook, active design docs. Dated retros / closed investigations live in `docs/archive/`. |
