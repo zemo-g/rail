@@ -2,7 +2,7 @@
 # repro_30of30.sh — one-line reproduction of the canonical 30/30 substrate result.
 #
 # Auto-detects an environment that can run the bench:
-#   1. If the local MLX teacher (Studio-internal http://10.42.0.2:8082) is
+#   1. If the local MLX teacher (the MLX teacher (default http://localhost:8082, e.g. over an SSH tunnel)) is
 #      reachable, runs the canonical probe at
 #      tools/train/spec_in_context_probe_full.py.
 #   2. Else, if ANTHROPIC_API_KEY is set, runs tools/bench/repro_anthropic.py
@@ -21,7 +21,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RAIL_NATIVE="$REPO_ROOT/rail_native"
 MLX_PROBE="$REPO_ROOT/tools/train/spec_in_context_probe_full.py"
 ANTHROPIC_PROBE="$REPO_ROOT/tools/bench/repro_anthropic.py"
-MLX_ENDPOINT="${MLX_ENDPOINT:-http://10.42.0.2:8082}"
+MLX_ENDPOINT="${MLX_ENDPOINT:-http://localhost:8082}"
 
 usage() {
     cat <<'USAGE'
@@ -37,7 +37,7 @@ rerank). Auto-detects which backend to use:
       ANTHROPIC_API_KEY=... tools/bench/repro_30of30.sh
 
   Path B (local MLX — Studio-internal):
-    Requires the MLX teacher reachable at http://10.42.0.2:8082 (override
+    Requires the MLX teacher reachable at http://localhost:8082 (override
     via MLX_ENDPOINT env var). No external cost, ~15 min wall-clock.
 
       tools/bench/repro_30of30.sh
@@ -90,7 +90,7 @@ else
     echo
     echo "  Path B (local MLX teacher):"
     echo "    Run a 100B+ open-weight model (e.g. Qwen-122B) on an MLX or vLLM"
-    echo "    endpoint. By default this script probes http://10.42.0.2:8082."
+    echo "    endpoint. By default this script probes http://localhost:8082."
     echo "    Override: MLX_ENDPOINT=http://your-host:port bash $0"
     echo
     echo "  See tools/bench/README.md for full setup."

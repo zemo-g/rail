@@ -23,7 +23,7 @@ within 30 s. Walk-away.
 ### Install (per node)
 
 ```bash
-echo "10.42.0.X" > ~/.fleet/tb-ip           # Mini=.1, Studio=.2, Air=.3
+echo "10.42.0.X" > ~/.fleet/tb-ip           # Mini=.1, Studio=.2, Air=.3 (leak-guard-allow: convention example)
 sudo cp tools/fleet/com.ledatic.tb_autojoin.plist /Library/LaunchDaemons/
 sudo chown root:wheel /Library/LaunchDaemons/com.ledatic.tb_autojoin.plist
 sudo chmod 644        /Library/LaunchDaemons/com.ledatic.tb_autojoin.plist
