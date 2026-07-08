@@ -1,0 +1,533 @@
+-- attested_train_segment.rail -- MODE A of the A+B strategy (2026-07-05): an
+-- ATTESTED TRAINING loop STREAMING the REAL corpus. Extends the AdamW full-model
+-- loop with a per-step real corpus window (train.bin) + real next-token target + a
+-- hash-chained attestation ledger: each attested F=24 AdamW step binds {step,
+-- batch_sha256, ptgt_f24 (real loss), target, weights_sha256} into the same chain the
+-- witness (mode B) and the MLX path use. Endpoints bind the checkpoint file sha (w0
+-- at init, wN at the final checkpoint) -> a self-hosted, attested lineage segment.
+--
+-- winstride>0 STREAMS the corpus (a new window every step); winstride=0 overfits ONE
+-- window (with a higher alr that mode gives a clean CE->0 descent gate -- see feec1f7).
+--
+-- FINDING (honestly attested): naive 1-example-per-step online AdamW is UNSTABLE.
+-- Adam is ~scale-invariant, so each step moves each param ~alr regardless of grad; at
+-- alr=0.005 the head is slammed toward each window's target and the model predicts the
+-- PREVIOUS window's target next (catastrophic overfit, mean CE 13.85, many at the ~0-prob
+-- floor). alr=1e-4 keeps it stable. REAL training needs MINIBATCHES (grad averaged over
+-- many sequences) -- the engine is single-sequence today; minibatch grad-accum is next.
+-- The attestation correctly SURFACED this recipe bug -- the engine is right, the recipe
+-- was wrong. On a converged checkpoint you can't lower loss on seen data anyway; the
+-- clean loss-descent proof is the overfit-one mode. This file proves the attested online
+-- LOOP over the real corpus runs + hash-chains + checkpoints + Python-verifies.
+--
+-- run: ./rail_native tools/metal/attested_train_segment.rail && RAIL_ARENA_MB=9000 /tmp/rail_out
+--
+-- ---- (original AdamW-loop header follows) ----
+-- the FULL-MODEL loop on the 138M GPT trained
+-- with AdamW instead of SGD (2026-07-05). Sibling of attested_model_train_loop.rail
+-- (the SGD proof); mirrors the gate pair (fx_convergence_gate=SGD, fx_adam_gate=Adam).
+--   forward (16-layer resident GPU engine) -> softmax CE -> full backward that,
+--   per block, ALSO computes the 6 matmul weight gradients (gpu_wgrad, from
+--   recomputed ln1/ln2/attn/h2) -> ADAMW-update the resident weight cache IN PLACE
+--   via ibuf_update -> update LM head (Adam) + token/pos embeddings (SGD scatter).
+--
+-- The AdamW step is the twin-verified GPU kernel (emit_msl_fx_adam_step): per
+-- weight, pack P=[W|m|v|c1|c2], dispatch, unpack [W'|m'|v'], ibuf_update. m/v
+-- optimizer state is resident (parallel to wc); c1/c2 = 1-beta^t ride in the
+-- buffer and advance per step. **EPS = 1e-3 (16777 in F=24)** -- the fx_adam_gate
+-- finding: with 1e-8 the second moment v=g^2 underflows to 0 and mhat/eps blows up.
+-- Adam is ~scale-invariant to grad magnitude, so the raw summed wgrad feeds in
+-- directly (no batch division). v1 FREEZES LayerNorm gains/biases + mlp biases.
+--
+-- Optimizer state is bundled into one `opt` array (wm/wv arrays, the 3 adam
+-- kernels, c1/c2) that replaces the scalar `lr` in the backward path -- Rail
+-- high-arity fns SIGSEGV, so the update args ride in one pointer.
+--
+-- GATE: overfit the pinned prompt to a NON-argmax target (6000). All-layer AdamW
+-- must drive CE(target) down and move the argmax 5836 -> 6000.
+--
+-- Build+run (big load + 2.2GB m/v state -> run the BINARY with a large arena):
+--   ./rail_native tools/metal/attested_model_train_adam.rail && RAIL_ARENA_MB=9000 /tmp/rail_out
+
+import "stdlib/file.rail"
+import "stdlib/env.rail"
+import "stdlib/ijit.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+foreign pread fd buf count offset -> int
+foreign malloc size -> ptr
+foreign free p
+foreign log x -> float   -- for the CE readout (declared directly; math.rail's global `e` collides with softmax's local)
+
+-- ===== F32 loader =====
+pq_pow2_go acc k = if k == 0 then acc else pq_pow2_go (acc + acc) (k - 1)
+pq_pow2 k = if k < 1 then 1 else pq_pow2_go 1 k
+pq_f32_fixed b0 b1 b2 b3 = let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in let sign = bits / 2147483648 in let rest = bits - sign * 2147483648 in let exp = rest / 8388608 in let mant = rest - exp * 8388608 in if exp == 0 then 0 else let mag = 8388608 + mant in let sh = exp - 126 in let xabs = if sh >= 0 then mag * (pq_pow2 sh) else (let dd = pq_pow2 (0 - sh) in (mag + dd / 2) / dd) in if sign == 1 then 0 - xabs else xabs
+pq_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then pq_match buf (pos + 1) (tail pcs) else 0
+pq_find buf pos hi pcs = if pos >= hi then 0 - 1 else if pq_match buf pos pcs == 1 then pos else pq_find buf (pos + 1) hi pcs
+pq_find_after buf pos hi pcs = let p = pq_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+pq_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else pq_int buf (pos + 1) (acc * 10 + (c - 48))
+pq_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+pq_offset hdr hi name k = let np = pq_find hdr 0 hi (chars (cat ["\"", name, "\":"])) in let dp = pq_find_after hdr np hi (chars "\"data_offsets\":[") in pq_int hdr dp 0
+gp_dec_f32 cbuf out obase count i = if i >= count then 0 else let ba = 4 * i in let _ = arr_set out (obase + i) (pq_f32_fixed (byte_at cbuf ba) (byte_at cbuf (ba + 1)) (byte_at cbuf (ba + 2)) (byte_at cbuf (ba + 3))) in gp_dec_f32 cbuf out obase count (i + 1)
+ld_f32 fd hdrbuf base name count = let start = pq_offset hdrbuf base name 0 in let cbuf = malloc (count * 4) in let nr = pread fd cbuf (count * 4) (base + start) in let out = arr_new count 0 in let _ = gp_dec_f32 cbuf out 0 count 0 in let _ = free cbuf in out
+bname li suffix = cat ["blocks.", show li, ".", suffix]
+
+-- ===== F=24 math =====
+bx4_sqrt_le r xq = let hr = mul_shr r r 24 in if hr < xq then true else if hr > xq then false else let c = r - (r / 16777216) * 16777216 in let cc = c * c in (cc - (cc / 16777216) * 16777216) == 0
+bx4_bsqrt lo hi xq = if (lo + 1) >= hi then lo else let mid = (lo + hi) / 2 in if bx4_sqrt_le mid xq then bx4_bsqrt mid hi xq else bx4_bsqrt lo mid xq
+bx4_fxsqrt xq = if xq < 1 then 0 else let a = 16384 in bx4_bsqrt 0 ((a * a) * 4096) xq
+bx4_fxrsqrt xq = let q = bx4_fxsqrt xq in if q == 0 then 0 else 281474976710656 / q
+bx4_pow2b_go acc k = if k == 0 then acc else bx4_pow2b_go (acc + acc) (k - 1)
+bx4_pow2b k = if k < 1 then 1 else bx4_pow2b_go 1 k
+bx4_exp_poly fq = let p8 = 416 in let p7 = 3329 + (p8 * fq) / 16777216 in let p6 = 23302 + (p7 * fq) / 16777216 in let p5 = 139810 + (p6 * fq) / 16777216 in let p4 = 699051 + (p5 * fq) / 16777216 in let p3 = 2796203 + (p4 * fq) / 16777216 in let p2 = 8388608 + (p3 * fq) / 16777216 in let p1 = 16777216 + (p2 * fq) / 16777216 in 16777216 + (p1 * fq) / 16777216
+bx4_exp_neg ax = let k = ax / 11629080 in let fq = ax - k * 11629080 in let ef = bx4_exp_poly fq in let emf = 281474976710656 / ef in if k >= 50 then 0 else let p2 = bx4_pow2b k in (emf + p2 / 2) / p2
+bx4_gelu_grad xq = let x2 = (xq * xq) / 16777216 in let x3 = (x2 * xq) / 16777216 in let ax3 = (750194 * x3) / 16777216 in let inner0 = xq + ax3 in let u = (13386610 * inner0) / 16777216 in let t = (let axq = if u < 0 then 0 - u else u in let em = bx4_exp_neg (axq + axq) in let tp = ((16777216 - em) * 16777216) / (16777216 + em) in if u < 0 then 0 - tp else tp) in let term1 = (16777216 + t) / 2 in let sech2 = 16777216 - (t * t) / 16777216 in let a3x2 = (3 * (750194 * x2)) / 16777216 in let inner1 = 16777216 + a3x2 in let dudx = (13386610 * inner1) / 16777216 in let p1 = (xq * sech2) / 16777216 in let p2 = (p1 * dudx) / 16777216 in term1 + p2 / 2
+
+-- ===== helpers =====
+cpseg src soff dst doff n i = if i >= n then 0 else let _ = arr_set dst (doff + i) (arr_get src (soff + i)) in cpseg src soff dst doff n (i + 1)
+resid_add A B out n i = if i >= n then 0 else let _ = arr_set out i ((arr_get A i) + (arr_get B i)) in resid_add A B out n (i + 1)
+bias_add Y bias L d t i = if t >= L then 0 else if i >= d then bias_add Y bias L d (t + 1) 0 else let _ = arr_set Y (t * d + i) ((arr_get Y (t * d + i)) + (arr_get bias i)) in bias_add Y bias L d t (i + 1)
+mk_x_row Tok Pos x tb ob d i = if i >= d then 0 else let _ = arr_set x (ob + i) ((arr_get Tok (tb + i)) + (arr_get Pos (ob + i))) in mk_x_row Tok Pos x tb ob d (i + 1)
+mk_x_loop Tok Pos ids H d L t = if t >= L then 0 else let id = arr_get ids t in let _ = mk_x_row Tok Pos H (id * d) (t * d) d 0 in mk_x_loop Tok Pos ids H d L (t + 1)
+argmax_go lg n i best bi = if i >= n then bi else let v = arr_get lg i in if v > best then argmax_go lg n (i + 1) v i else argmax_go lg n (i + 1) best bi
+addinto A B n i = if i >= n then 0 else let _ = arr_set A i ((arr_get A i) + (arr_get B i)) in addinto A B n (i + 1)
+zero A n i = if i >= n then 0 else let _ = arr_set A i 0 in zero A n (i + 1)
+scale2 A out n i = if i >= n then 0 else let _ = arr_set out i (2 * (arr_get A i)) in scale2 A out n (i + 1)
+sumabs A n i acc = if i >= n then acc else sumabs A n (i + 1) (acc + (let v = arr_get A i in if v < 0 then 0 - v else v))
+-- softmax (F=24): rowmax, exp(x-m), normalize; returns sum, writes probs
+sm_max lg n i m = if i >= n then m else sm_max lg n (i + 1) (let v = arr_get lg i in if v > m then v else m)
+sm_exp lg ex n m i sum = if i >= n then sum else let e = bx4_exp_neg (m - (arr_get lg i)) in let _ = arr_set ex i e in sm_exp lg ex n m (i + 1) (sum + e)
+sm_norm ex p n sum i = if i >= n then 0 else let _ = arr_set p i (((arr_get ex i) * 16777216) / sum) in sm_norm ex p n sum (i + 1)
+
+-- ===== GPU op wrappers =====
+gpu_ln kid X g b out rows d = let P = arr_new (rows * d + d + d) 0 in let _ = cpseg X 0 P 0 (rows * d) 0 in let _ = cpseg g 0 P (rows * d) d 0 in let _ = cpseg b 0 P (rows * d + d) d 0 in ijit_run kid P P out (rows * d + d + d) 1 (rows * d) rows
+gpu_ln1 kid X base xn g b d = let P = arr_new (d + d + d) 0 in let _ = cpseg X base P 0 d 0 in let _ = cpseg g 0 P d d 0 in let _ = cpseg b 0 P (2 * d) d 0 in ijit_run kid P P xn (d + d + d) 1 d 1
+gpu_proj_tok kid P rowbuf src out rows k L t = if t >= L then 0 else let _ = cpseg src (t * k) P (rows * k) k 0 in let _ = ijit_run kid P P rowbuf (rows * k + k) 1 rows rows in let _ = cpseg rowbuf 0 out (t * rows) rows 0 in gpu_proj_tok kid P rowbuf src out rows k L (t + 1)
+gpu_proj kid W src out rows k L = let P = arr_new (rows * k + k) 0 in let _ = cpseg W 0 P 0 (rows * k) 0 in let rowbuf = arr_new rows 0 in gpu_proj_tok kid P rowbuf src out rows k L 0
+gpu_mbwd_tok kid P rowbuf dyv out out_off k L t = if t >= L then 0 else let _ = cpseg dyv (t * out) P (out * k) out 0 in let _ = ijit_run kid P P rowbuf (out * k + out) 1 k k in let _ = cpseg rowbuf 0 out_off (t * k) k 0 in gpu_mbwd_tok kid P rowbuf dyv out out_off k L (t + 1)
+gpu_mbwd kid W dyv dxout out k L = let P = arr_new (out * k + out) 0 in let _ = cpseg W 0 P 0 (out * k) 0 in let rowbuf = arr_new k 0 in gpu_mbwd_tok kid P rowbuf dyv out dxout k L 0
+gpu_lnbwd kid X g dy out rows d = let P = arr_new (rows * d + d + rows * d) 0 in let _ = cpseg X 0 P 0 (rows * d) 0 in let _ = cpseg g 0 P (rows * d) d 0 in let _ = cpseg dy 0 P (rows * d + d) (rows * d) 0 in ijit_run kid P P out (rows * d + d + rows * d) 1 (rows * d) rows
+gpu_wgrad kid dy x dW out k L = let P = arr_new (L * out + L * k) 0 in let _ = cpseg dy 0 P 0 (L * out) 0 in let _ = cpseg x 0 P (L * out) (L * k) 0 in ijit_run kid P P dW (L * out + L * k) 1 (out * k) out
+-- BATCHED (act 20): weight uploaded ONCE, all L tokens in one dispatch.
+gpu_proj_b kid W src out rows k L = let P = arr_new (rows * k + L * k) 0 in let _ = cpseg W 0 P 0 (rows * k) 0 in let _ = cpseg src 0 P (rows * k) (L * k) 0 in ijit_run kid P P out (rows * k + L * k) 1 (L * rows) (L * rows)
+gpu_mbwd_b kid W dyv dxo out k L = let P = arr_new (out * k + L * out) 0 in let _ = cpseg W 0 P 0 (out * k) 0 in let _ = cpseg dyv 0 P (out * k) (L * out) 0 in ijit_run kid P P dxo (out * k + L * out) 1 (L * k) (L * k)
+-- PERSISTENT-weight variants (act 23): weight resident on GPU (wid), only X uploaded.
+gpu_proj_wx kid wid src out rows k L = ijit_run_wx kid wid src out (L * k) (L * rows) (L * rows)
+gpu_mbwd_wx kid wid dyv dxo out k L = ijit_run_wx kid wid dyv dxo (L * out) (L * k) (L * k)
+
+-- ===== weight cache: decode ALL layer weights ONCE (act 21 -- perf).
+-- wc[li*12 + j] holds the decoded array for tensor j of layer li:
+--   0 g1  1 b1  2 Wq  3 Wk  4 Wv  5 Wo  6 g2  7 b2  8 Wm0  9 bm0  10 Wm2  11 bm2
+wc_load fd hdr base wc li nlayers d qdim inter =
+  if li >= nlayers then 0
+  else
+    let _ = arr_set wc (li * 12 + 0) (ld_f32 fd hdr base (bname li "ln1.weight") d) in
+    let _ = arr_set wc (li * 12 + 1) (ld_f32 fd hdr base (bname li "ln1.bias") d) in
+    let _ = arr_set wc (li * 12 + 2) (ld_f32 fd hdr base (bname li "attn.query_proj.weight") (qdim * d)) in
+    let _ = arr_set wc (li * 12 + 3) (ld_f32 fd hdr base (bname li "attn.key_proj.weight") (qdim * d)) in
+    let _ = arr_set wc (li * 12 + 4) (ld_f32 fd hdr base (bname li "attn.value_proj.weight") (qdim * d)) in
+    let _ = arr_set wc (li * 12 + 5) (ld_f32 fd hdr base (bname li "attn.out_proj.weight") (d * qdim)) in
+    let _ = arr_set wc (li * 12 + 6) (ld_f32 fd hdr base (bname li "ln2.weight") d) in
+    let _ = arr_set wc (li * 12 + 7) (ld_f32 fd hdr base (bname li "ln2.bias") d) in
+    let _ = arr_set wc (li * 12 + 8) (ld_f32 fd hdr base (bname li "mlp.layers.0.weight") (inter * d)) in
+    let _ = arr_set wc (li * 12 + 9) (ld_f32 fd hdr base (bname li "mlp.layers.0.bias") inter) in
+    let _ = arr_set wc (li * 12 + 10) (ld_f32 fd hdr base (bname li "mlp.layers.2.weight") (d * inter)) in
+    let _ = arr_set wc (li * 12 + 11) (ld_f32 fd hdr base (bname li "mlp.layers.2.bias") d) in
+    wc_load fd hdr base wc (li + 1) nlayers d qdim inter
+
+-- upload the 6 big matmul weights of each layer to RESIDENT GPU buffers once.
+-- wcb[li*6 + j]: 0 Wq  1 Wk  2 Wv  3 Wo  4 Wm0  5 Wm2  (handles into g_ibufs)
+wcb_load wc wcb li nlayers d qdim inter =
+  if li >= nlayers then 0
+  else
+    let _ = arr_set wcb (li * 6 + 0) (ibuf_upload (arr_get wc (li * 12 + 2)) (qdim * d)) in
+    let _ = arr_set wcb (li * 6 + 1) (ibuf_upload (arr_get wc (li * 12 + 3)) (qdim * d)) in
+    let _ = arr_set wcb (li * 6 + 2) (ibuf_upload (arr_get wc (li * 12 + 4)) (qdim * d)) in
+    let _ = arr_set wcb (li * 6 + 3) (ibuf_upload (arr_get wc (li * 12 + 5)) (d * qdim)) in
+    let _ = arr_set wcb (li * 6 + 4) (ibuf_upload (arr_get wc (li * 12 + 8)) (inter * d)) in
+    let _ = arr_set wcb (li * 6 + 5) (ibuf_upload (arr_get wc (li * 12 + 10)) (d * inter)) in
+    wcb_load wc wcb (li + 1) nlayers d qdim inter
+
+-- Adam m/v optimizer state, zero-init, mirroring wcb's 6 matmul slots per layer.
+-- wm[li*6+j] / wv[li*6+j]: 0-3 qdim*d (Wq/Wk/Wv/Wo)  4 inter*d (Wm0)  5 d*inter (Wm2)
+wmv_load wm wv li nlayers d qdim inter =
+  if li >= nlayers then 0
+  else
+    let _ = arr_set wm (li * 6 + 0) (arr_new (qdim * d) 0) in let _ = arr_set wv (li * 6 + 0) (arr_new (qdim * d) 0) in
+    let _ = arr_set wm (li * 6 + 1) (arr_new (qdim * d) 0) in let _ = arr_set wv (li * 6 + 1) (arr_new (qdim * d) 0) in
+    let _ = arr_set wm (li * 6 + 2) (arr_new (qdim * d) 0) in let _ = arr_set wv (li * 6 + 2) (arr_new (qdim * d) 0) in
+    let _ = arr_set wm (li * 6 + 3) (arr_new (d * qdim) 0) in let _ = arr_set wv (li * 6 + 3) (arr_new (d * qdim) 0) in
+    let _ = arr_set wm (li * 6 + 4) (arr_new (inter * d) 0) in let _ = arr_set wv (li * 6 + 4) (arr_new (inter * d) 0) in
+    let _ = arr_set wm (li * 6 + 5) (arr_new (d * inter) 0) in let _ = arr_set wv (li * 6 + 5) (arr_new (d * inter) 0) in
+    wmv_load wm wv (li + 1) nlayers d qdim inter
+
+-- ===== GPU forward block (cached weights; SAVES QKV/h1/r1 for the backward) =====
+gpu_block H li L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 =
+  let kLN = arr_get ks 0 in let kP1 = arr_get ks 1 in let kUp = arr_get ks 2 in let kDn = arr_get ks 3 in let kAt = arr_get ks 4 in let kGe = arr_get ks 5 in
+  let g1 = arr_get wc (li * 12 + 0) in let b1 = arr_get wc (li * 12 + 1) in
+  let g2 = arr_get wc (li * 12 + 6) in let b2 = arr_get wc (li * 12 + 7) in
+  let bm0 = arr_get wc (li * 12 + 9) in let bm2 = arr_get wc (li * 12 + 11) in
+  let wWq = arr_get wcb (li * 6 + 0) in let wWk = arr_get wcb (li * 6 + 1) in let wWv = arr_get wcb (li * 6 + 2) in let wWo = arr_get wcb (li * 6 + 3) in let wWm0 = arr_get wcb (li * 6 + 4) in let wWm2 = arr_get wcb (li * 6 + 5) in
+  let ln1 = arr_new (L * d) 0 in let _ = gpu_ln kLN H g1 b1 ln1 L d in
+  let Q = arr_new (L * qdim) 0 in let _ = gpu_proj_wx kP1 wWq ln1 Q qdim d L in
+  let K = arr_new (L * qdim) 0 in let _ = gpu_proj_wx kP1 wWk ln1 K qdim d L in
+  let V = arr_new (L * qdim) 0 in let _ = gpu_proj_wx kP1 wWv ln1 V qdim d L in
+  let QKV = arr_new (3 * L * qdim) 0 in let _ = cpseg Q 0 QKV 0 (L * qdim) 0 in let _ = cpseg K 0 QKV (L * qdim) (L * qdim) 0 in let _ = cpseg V 0 QKV (2 * L * qdim) (L * qdim) 0 in
+  let _ = cpseg QKV 0 Aqkv (li * 3 * L * qdim) (3 * L * qdim) 0 in
+  let attn = arr_new (L * qdim) 0 in let _ = ijit_run kAt QKV QKV attn (3 * L * qdim) 1 (L * qdim) (L * nh) in
+  let ao = arr_new (L * d) 0 in let _ = gpu_proj_wx kP1 wWo attn ao d qdim L in
+  let r1 = arr_new (L * d) 0 in let _ = resid_add H ao r1 (L * d) 0 in
+  let _ = cpseg r1 0 Ar1 (li * L * d) (L * d) 0 in
+  let ln2 = arr_new (L * d) 0 in let _ = gpu_ln kLN r1 g2 b2 ln2 L d in
+  let h1 = arr_new (L * inter) 0 in let _ = gpu_proj_wx kUp wWm0 ln2 h1 inter d L in let _ = bias_add h1 bm0 L inter 0 0 in
+  let _ = cpseg h1 0 Ah1 (li * L * inter) (L * inter) 0 in
+  let h2 = arr_new (L * inter) 0 in let _ = ijit_run kGe h1 h1 h2 (L * inter) 1 (L * inter) (L * inter) in
+  let mo = arr_new (L * d) 0 in let _ = gpu_proj_wx kDn wWm2 h2 mo d inter L in let _ = bias_add mo bm2 L d 0 0 in
+  let y = arr_new (L * d) 0 in let _ = resid_add r1 mo y (L * d) 0 in
+  y
+gpu_layers Hcur Hin li nlayers L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 =
+  if li >= nlayers then 0
+  else let _ = cpseg Hcur 0 Hin (li * L * d) (L * d) 0 in
+       let m = arena_mark 0 in
+       let y = gpu_block Hcur li L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 in
+       let _ = cpseg y 0 Hcur 0 (L * d) 0 in let _ = arena_reset m in
+       gpu_layers Hcur Hin (li + 1) nlayers L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1
+
+-- ===== GPU backward for one block: cached weights + SAVED activations, NO recompute =====
+-- SGD-update a weight array in the resident cache IN PLACE, then push it into the
+-- resident GPU buffer (ibuf_update -- no realloc, no leak). W:Rail arr, wid:handle.
+sgd_walk W dW n lr i = if i >= n then 0 else let _ = arr_set W i ((arr_get W i) - (mul_shr lr (arr_get dW i) 24)) in sgd_walk W dW n lr (i + 1)
+apply_w W dW wid n lr = let _ = sgd_walk W dW n lr 0 in let _ = ibuf_update wid W n in 0
+-- ADAMW update of one resident weight via the twin-verified GPU kernel.
+-- Pack P=[W|m|v|c1|c2], dispatch kAdam (N baked to match n), unpack [W'|m'|v'] back
+-- into W/m/v, then push W into the resident GPU buffer (ibuf_update). c1/c2 = 1-beta^t.
+adam_w W dW m v wid n kAdam c1 c2 =
+  let P = arr_new (3 * n + 2) 0 in
+  let _ = cpseg W 0 P 0 n 0 in
+  let _ = cpseg m 0 P n n 0 in
+  let _ = cpseg v 0 P (2 * n) n 0 in
+  let _ = arr_set P (3 * n) c1 in let _ = arr_set P (3 * n + 1) c2 in
+  let O = arr_new (3 * n) 0 in
+  let _ = ijit_run kAdam P dW O (3 * n + 2) n (3 * n) n in
+  let _ = cpseg O 0 W 0 n 0 in
+  let _ = cpseg O n m 0 n 0 in
+  let _ = cpseg O (2 * n) v 0 n 0 in
+  let _ = ibuf_update wid W n in 0
+
+-- gpu_block_bwd (+weight update): computes input grads AND the 6 matmul weight
+-- grads, SGD-updates them in wc + ibuf_update in place. LN gains/biases + mlp
+-- biases are FROZEN in v1. Recomputes ln1/ln2/attn/h2 (the wgrad inputs) from the
+-- saved activations -- cheap, no extra forward save buffers.
+gpu_block_bwd Hin li dHout dHin L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 opt =
+  let kLN = arr_get ks 0 in let kAt = arr_get ks 4 in let kGe = arr_get ks 5 in
+  let kGg = arr_get ks 6 in let kEm = arr_get ks 7 in let kBd1 = arr_get ks 8 in let kBdDn = arr_get ks 9 in let kBdUp = arr_get ks 10 in let kAtB = arr_get ks 11 in let kLNb = arr_get ks 12 in
+  let kWgQ = arr_get ks 13 in let kWgO = arr_get ks 14 in let kWgM0 = arr_get ks 15 in let kWgM2 = arr_get ks 16 in
+  let g1 = arr_get wc (li * 12 + 0) in let b1 = arr_get wc (li * 12 + 1) in let g2 = arr_get wc (li * 12 + 6) in let b2 = arr_get wc (li * 12 + 7) in
+  let wWq = arr_get wcb (li * 6 + 0) in let wWk = arr_get wcb (li * 6 + 1) in let wWv = arr_get wcb (li * 6 + 2) in let wWo = arr_get wcb (li * 6 + 3) in let wWm0 = arr_get wcb (li * 6 + 4) in let wWm2 = arr_get wcb (li * 6 + 5) in
+  let Hb = arr_new (L * d) 0 in let _ = cpseg Hin (li * L * d) Hb 0 (L * d) 0 in
+  let QKV = arr_new (3 * L * qdim) 0 in let _ = cpseg Aqkv (li * 3 * L * qdim) QKV 0 (3 * L * qdim) 0 in
+  let h1 = arr_new (L * inter) 0 in let _ = cpseg Ah1 (li * L * inter) h1 0 (L * inter) 0 in
+  let r1 = arr_new (L * d) 0 in let _ = cpseg Ar1 (li * L * d) r1 0 (L * d) 0 in
+  -- backward: dHout is grad w.r.t. block output y = r1 + mo
+  let dh2 = arr_new (L * inter) 0 in let _ = gpu_mbwd_wx kBdDn wWm2 dHout dh2 d inter L in
+  let gp = arr_new (L * inter) 0 in let _ = ijit_run kGg h1 h1 gp (L * inter) 1 (L * inter) (L * inter) in
+  let dh1 = arr_new (L * inter) 0 in let _ = ijit_run kEm dh2 gp dh1 (L * inter) (L * inter) (L * inter) (L * inter) in
+  let dln2 = arr_new (L * d) 0 in let _ = gpu_mbwd_wx kBdUp wWm0 dh1 dln2 inter d L in
+  let dr1 = arr_new (L * d) 0 in let _ = cpseg dHout 0 dr1 0 (L * d) 0 in
+  let dr1ln = arr_new (L * d) 0 in let _ = gpu_lnbwd kLNb r1 g2 dln2 dr1ln L d in let _ = addinto dr1 dr1ln (L * d) 0 in
+  let dattn = arr_new (L * qdim) 0 in let _ = gpu_mbwd_wx kBd1 wWo dr1 dattn d qdim L in
+  let dG = arr_new (3 * L * qdim) 0 in let _ = ijit_run kAtB QKV dattn dG (3 * L * qdim) (L * qdim) (3 * L * qdim) (3 * L * nh) in
+  let dQ = arr_new (L * qdim) 0 in let _ = cpseg dG 0 dQ 0 (L * qdim) 0 in
+  let dK = arr_new (L * qdim) 0 in let _ = cpseg dG (L * qdim) dK 0 (L * qdim) 0 in
+  let dV = arr_new (L * qdim) 0 in let _ = cpseg dG (2 * L * qdim) dV 0 (L * qdim) 0 in
+  let dln1 = arr_new (L * d) 0 in
+  let t1 = arr_new (L * d) 0 in let _ = gpu_mbwd_wx kBd1 wWq dQ t1 qdim d L in let _ = addinto dln1 t1 (L * d) 0 in
+  let t2 = arr_new (L * d) 0 in let _ = gpu_mbwd_wx kBd1 wWk dK t2 qdim d L in let _ = addinto dln1 t2 (L * d) 0 in
+  let t3 = arr_new (L * d) 0 in let _ = gpu_mbwd_wx kBd1 wWv dV t3 qdim d L in let _ = addinto dln1 t3 (L * d) 0 in
+  let _ = cpseg dr1 0 dHin 0 (L * d) 0 in
+  let dxln = arr_new (L * d) 0 in let _ = gpu_lnbwd kLNb Hb g1 dln1 dxln L d in let _ = addinto dHin dxln (L * d) 0 in
+  -- ===== WEIGHT GRADS: recompute forward acts (ln1/attn/ln2/h2), wgrad, SGD update =====
+  let ln1 = arr_new (L * d) 0 in let _ = gpu_ln kLN Hb g1 b1 ln1 L d in
+  let attn = arr_new (L * qdim) 0 in let _ = ijit_run kAt QKV QKV attn (3 * L * qdim) 1 (L * qdim) (L * nh) in
+  let ln2 = arr_new (L * d) 0 in let _ = gpu_ln kLN r1 g2 b2 ln2 L d in
+  let h2 = arr_new (L * inter) 0 in let _ = ijit_run kGe h1 h1 h2 (L * inter) 1 (L * inter) (L * inter) in
+  let dWq = arr_new (qdim * d) 0 in let _ = gpu_wgrad kWgQ dQ ln1 dWq qdim d L in
+  let dWk = arr_new (qdim * d) 0 in let _ = gpu_wgrad kWgQ dK ln1 dWk qdim d L in
+  let dWv = arr_new (qdim * d) 0 in let _ = gpu_wgrad kWgQ dV ln1 dWv qdim d L in
+  let dWo = arr_new (d * qdim) 0 in let _ = gpu_wgrad kWgO dr1 attn dWo d qdim L in
+  let dWm0 = arr_new (inter * d) 0 in let _ = gpu_wgrad kWgM0 dh1 ln2 dWm0 inter d L in
+  let dWm2 = arr_new (d * inter) 0 in let _ = gpu_wgrad kWgM2 dHout h2 dWm2 d inter L in
+  -- ADAMW: optimizer state + kernels + bias-correction ride in `opt`
+  let wm = arr_get opt 1 in let wv = arr_get opt 2 in let kAdQ = arr_get opt 3 in let kAdM = arr_get opt 4 in let c1 = arr_get opt 5 in let c2 = arr_get opt 6 in
+  let _ = adam_w (arr_get wc (li * 12 + 2)) dWq (arr_get wm (li * 6 + 0)) (arr_get wv (li * 6 + 0)) wWq (qdim * d) kAdQ c1 c2 in
+  let _ = adam_w (arr_get wc (li * 12 + 3)) dWk (arr_get wm (li * 6 + 1)) (arr_get wv (li * 6 + 1)) wWk (qdim * d) kAdQ c1 c2 in
+  let _ = adam_w (arr_get wc (li * 12 + 4)) dWv (arr_get wm (li * 6 + 2)) (arr_get wv (li * 6 + 2)) wWv (qdim * d) kAdQ c1 c2 in
+  let _ = adam_w (arr_get wc (li * 12 + 5)) dWo (arr_get wm (li * 6 + 3)) (arr_get wv (li * 6 + 3)) wWo (d * qdim) kAdQ c1 c2 in
+  let _ = adam_w (arr_get wc (li * 12 + 8)) dWm0 (arr_get wm (li * 6 + 4)) (arr_get wv (li * 6 + 4)) wWm0 (inter * d) kAdM c1 c2 in
+  let _ = adam_w (arr_get wc (li * 12 + 10)) dWm2 (arr_get wm (li * 6 + 5)) (arr_get wv (li * 6 + 5)) wWm2 (d * inter) kAdM c1 c2 in
+  0
+gpu_layers_bwd Hin dH li L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 opt =
+  if li < 0 then 0
+  else let m = arena_mark 0 in
+       let dHin = arr_new (L * d) 0 in
+       let _ = gpu_block_bwd Hin li dH dHin L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 opt in
+       let _ = cpseg dHin 0 dH 0 (L * d) 0 in let _ = arena_reset m in
+       gpu_layers_bwd Hin dH (li - 1) L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 opt
+
+-- embedding grad scatter (Tok/Pos are CPU arrays read by mk_x_loop -> update in place)
+emb_row Tok Pos toff poff dH d lr j = if j >= d then 0 else let g = arr_get dH (poff + j) in let _ = arr_set Tok (toff + j) ((arr_get Tok (toff + j)) - (mul_shr lr g 24)) in let _ = arr_set Pos (poff + j) ((arr_get Pos (poff + j)) - (mul_shr lr g 24)) in emb_row Tok Pos toff poff dH d lr (j + 1)
+emb_update Tok Pos ids dH d L lr t = if t >= L then 0 else let _ = emb_row Tok Pos ((arr_get ids t) * d) (t * d) dH d lr 0 in emb_update Tok Pos ids dH d L lr (t + 1)
+
+-- safetensors writer (single tensor; see safetensors_write_demo.rail)
+oct3 v = let a0 = v / 64 in let r0 = v - a0 * 64 in let a1 = r0 / 8 in let a2 = r0 - a1 * 8 in cat ["\\", show a0, show a1, show a2]
+le8_esc h = cat [oct3 (h - (h / 256) * 256), oct3 ((h / 256) - (h / 65536) * 256), oct3 ((h / 65536) - (h / 16777216) * 256), oct3 ((h / 16777216) - (h / 4294967296) * 256), "\\000\\000\\000\\000"]
+i2f_into src n dst i = if i >= n then 0 else let _ = float_arr_set dst i ((to_float (arr_get src i)) /. 16777216.0) in i2f_into src n dst (i + 1)
+write_one_st path name shape arr n =
+  let payload = float_arr_new n 0.0 in let _ = i2f_into arr n payload 0 in
+  let hdr = cat ["{\"", name, "\":{\"dtype\":\"F32\",\"shape\":[", shape, "],\"data_offsets\":[0,", show (n * 4), "]}}"] in
+  let _ = float_arr_to_f32_file (cat [path, ".p"]) payload n in
+  let _ = write_file (cat [path, ".h"]) hdr in
+  let _ = shell (cat ["printf '", le8_esc (length hdr), "' > ", path, ".l"]) in
+  let _ = shell (cat ["cat ", path, ".l ", path, ".h ", path, ".p > ", path, " && rm -f ", path, ".l ", path, ".h ", path, ".p"]) in 0
+
+-- ===== corpus reader (shared with attested_corpus_probe / attested_witness) =====
+read_tok buf ids n i = if i >= n then 0 else let _ = arr_set ids i ((byte_at buf (2 * i)) + 256 * (byte_at buf (2 * i + 1))) in read_tok buf ids n (i + 1)
+load_window path start n =
+  let fd = fopen path "rb" in let nb = 2 * n in let buf = malloc nb in
+  let _ = pread fd buf nb (2 * start) in
+  let ids = arr_new n 0 in let _ = read_tok buf ids n 0 in
+  let _ = free buf in let _ = fclose fd in ids
+ids_csv ids n i acc = if i >= n then acc else ids_csv ids n (i + 1) (if i == 0 then show (arr_get ids i) else cat [acc, ",", show (arr_get ids i)])
+
+-- ===== attested ledger (shared construction with attested_ledger_probe, Python-verified) =====
+kv_i k v = cat ["\"", k, "\": ", show v]
+kv_s k v = cat ["\"", k, "\": \"", v, "\""]
+-- fields sorted: batch_sha256, mode, prev_hash, ptgt_f24, step, target, weights_sha256
+canon_open batch prev ptgt step target weights =
+  cat ["{", kv_s "batch_sha256" batch, ", ", kv_s "mode" "train", ", ", kv_s "prev_hash" prev, ", ", kv_i "ptgt_f24" ptgt, ", ", kv_i "step" step, ", ", kv_i "target" target, ", ", kv_s "weights_sha256" weights]
+rec_hash batch prev ptgt step target weights = bytes_to_hex (sha256 (cat [prev, canon_open batch prev ptgt step target weights, "}"])) 32
+rec_line batch prev ptgt step target weights rh = cat [canon_open batch prev ptgt step target weights, ", ", kv_s "record_hash" rh, "}"]
+file_sha path = let _ = shell (cat ["shasum -a 256 ", path, " | cut -c1-64 > /tmp/rail_seg_sha"]) in str_sub (read_file "/tmp/rail_seg_sha") 0 64
+concat_lines pfx k K acc = if k >= K then acc else concat_lines pfx (k + 1) K (cat [acc, read_file (cat [pfx, show k, ".line"]), "\n"])
+
+-- CE(target) readout only (forward -> softmax -> -ln p[target])
+fwd_ce bag cfg =
+  let d = arr_get cfg 0 in let nh = arr_get cfg 1 in let hd = arr_get cfg 2 in let qdim = arr_get cfg 3 in let inter = arr_get cfg 4 in let L = arr_get cfg 5 in let vocab = arr_get cfg 6 in let nlayers = arr_get cfg 7 in let target = arr_get cfg 8 in
+  let headWid = arr_get cfg 11 in let kHead = arr_get cfg 12 in let kLN1 = arr_get cfg 13 in
+  let Tok = arr_get bag 0 in let Pos = arr_get bag 1 in let ids = arr_get bag 2 in let H = arr_get bag 3 in let Hin = arr_get bag 4 in let wc = arr_get bag 5 in let wcb = arr_get bag 6 in let ks = arr_get bag 7 in let Aqkv = arr_get bag 8 in let Ah1 = arr_get bag 9 in let Ar1 = arr_get bag 10 in let gnf = arr_get bag 12 in let bnf = arr_get bag 13 in let xnf = arr_get bag 14 in let logits = arr_get bag 15 in let ex = arr_get bag 16 in let p = arr_get bag 17 in
+  let _ = mk_x_loop Tok Pos ids H d L 0 in
+  let _ = gpu_layers H Hin 0 nlayers L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 in
+  let _ = gpu_ln1 kLN1 H ((L - 1) * d) xnf gnf bnf d in
+  let _ = gpu_proj_wx kHead headWid xnf logits vocab d 1 in
+  let mx = sm_max logits vocab 1 (arr_get logits 0) in
+  let ssum = sm_exp logits ex vocab mx 0 0 in
+  let _ = sm_norm ex p vocab ssum 0 in
+  let pt = (let v = arr_get p target in if v < 1 then 1 else v) in
+  0.0 -. (log ((to_float pt) /. 16777216.0))
+
+-- ===== ALL-POSITIONS training: logits+CE+grad at EVERY position (L x more learning/step) =====
+gpu_ln_all kid X xn g b L d = let P = arr_new (L * d + d + d) 0 in let _ = cpseg X 0 P 0 (L * d) 0 in let _ = cpseg g 0 P (L * d) d 0 in let _ = cpseg b 0 P (L * d + d) d 0 in ijit_run kid P P xn (L * d + d + d) 1 (L * d) L
+smx_off lg base n i m = if i >= n then m else smx_off lg base n (i + 1) (let v = arr_get lg (base + i) in if v > m then v else m)
+smexp_off lg ex base n m i sum = if i >= n then sum else let e = bx4_exp_neg (m - (arr_get lg (base + i))) in let _ = arr_set ex i e in smexp_off lg ex base n m (i + 1) (sum + e)
+norm_into dst ex base n sum i = if i >= n then 0 else let _ = arr_set dst (base + i) (((arr_get ex i) * 16777216) / sum) in norm_into dst ex base n sum (i + 1)
+-- for each position t: softmax logits_all[t] -> dlogits_all[t]=p ; dlogits_all[t,tgt]-=1 ; accumulate CE
+pos_ce_dlogits logits_all dlogits_all ids exbuf L vocab t ceacc =
+  if t >= L then ceacc
+  else let base = t * vocab in let tgt = arr_get ids (t + 1) in
+       let mx = smx_off logits_all base vocab 0 (arr_get logits_all base) in
+       let ssum = smexp_off logits_all exbuf base vocab mx 0 0 in
+       let _ = norm_into dlogits_all exbuf base vocab ssum 0 in
+       let pt = (let v = arr_get dlogits_all (base + tgt) in if v < 1 then 1 else v) in
+       let _ = arr_set dlogits_all (base + tgt) ((arr_get dlogits_all (base + tgt)) - 16777216) in
+       pos_ce_dlogits logits_all dlogits_all ids exbuf L vocab (t + 1) (ceacc +. (0.0 -. (log ((to_float pt) /. 16777216.0))))
+
+-- one ALL-POSITIONS training step (no attestation in this verify build)
+step_all bag cfg stp =
+  let corpus = arr_get bag 22 in
+  let ids = load_window corpus ((arr_get cfg 23) + stp * (arr_get cfg 24)) ((arr_get cfg 5) + 1) in
+  let mrk = arena_mark 0 in
+  let d = arr_get cfg 0 in let nh = arr_get cfg 1 in let hd = arr_get cfg 2 in let qdim = arr_get cfg 3 in let inter = arr_get cfg 4 in let L = arr_get cfg 5 in let vocab = arr_get cfg 6 in let nlayers = arr_get cfg 7 in let lr = arr_get cfg 9 in
+  let headWid = arr_get cfg 11 in
+  let kLNf = arr_get cfg 25 in let kHd = arr_get cfg 26 in let kBd = arr_get cfg 27 in let kWg = arr_get cfg 28 in let kLb = arr_get cfg 29 in
+  let beta1 = arr_get cfg 17 in let beta2 = arr_get cfg 18 in let kAdamH = arr_get cfg 21 in let opt = arr_get cfg 22 in
+  let b1t = mul_shr (arr_get cfg 19) beta1 24 in let _ = arr_set cfg 19 b1t in let c1 = 16777216 - b1t in
+  let b2t = mul_shr (arr_get cfg 20) beta2 24 in let _ = arr_set cfg 20 b2t in let c2 = 16777216 - b2t in
+  let _ = arr_set opt 5 c1 in let _ = arr_set opt 6 c2 in
+  let Tok = arr_get bag 0 in let Pos = arr_get bag 1 in let H = arr_get bag 3 in let Hin = arr_get bag 4 in let wc = arr_get bag 5 in let wcb = arr_get bag 6 in let ks = arr_get bag 7 in let Aqkv = arr_get bag 8 in let Ah1 = arr_get bag 9 in let Ar1 = arr_get bag 10 in let Head = arr_get bag 11 in let gnf = arr_get bag 12 in let bnf = arr_get bag 13 in let mHead = arr_get bag 19 in let vHead = arr_get bag 20 in
+  let _ = mk_x_loop Tok Pos ids H d L 0 in
+  let _ = gpu_layers H Hin 0 nlayers L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 in
+  let xnf = arr_new (L * d) 0 in let _ = gpu_ln_all kLNf H xnf gnf bnf L d in
+  let logits = arr_new (L * vocab) 0 in let _ = gpu_proj_wx kHd headWid xnf logits vocab d L in
+  let exbuf = arr_new vocab 0 in let dl = arr_new (L * vocab) 0 in
+  let ceacc = pos_ce_dlogits logits dl ids exbuf L vocab 0 0.0 in
+  let meance = ceacc /. (to_float L) in
+  let _ = print (cat ["  step ", show stp, "  mean-CE(all-pos) = ", show_float meance]) in
+  let dxnf = arr_new (L * d) 0 in let _ = gpu_mbwd_wx kBd headWid dl dxnf vocab d L in
+  let dHead = arr_new (vocab * d) 0 in let _ = gpu_wgrad kWg dl xnf dHead vocab d L in
+  let _ = adam_w Head dHead mHead vHead headWid (vocab * d) kAdamH c1 c2 in
+  let dH = arr_new (L * d) 0 in let _ = gpu_lnbwd kLb H gnf dxnf dH L d in
+  let _ = gpu_layers_bwd Hin dH (nlayers - 1) L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 opt in
+  let _ = emb_update Tok Pos ids dH d L lr 0 in
+  let _ = arena_reset mrk in
+  0
+verify_loop bag cfg step maxsteps = if step > maxsteps then 0 else let _ = step_all bag cfg step in verify_loop bag cfg (step + 1) maxsteps
+
+-- ===== generation eval (reuses trained in-memory weights + L-forward, read one position) =====
+argmax_off lg base n i best bi = if i >= n then bi else let v = arr_get lg (base + i) in if v > best then argmax_off lg base n (i + 1) v i else argmax_off lg base n (i + 1) best bi
+padf seq i n = if i >= n then 0 else let _ = arr_set seq i 0 in padf seq (i + 1) n
+gen_next bag cfg seq rdpos =
+  let d = arr_get cfg 0 in let nh = arr_get cfg 1 in let hd = arr_get cfg 2 in let qdim = arr_get cfg 3 in let inter = arr_get cfg 4 in let L = arr_get cfg 5 in let vocab = arr_get cfg 6 in let nlayers = arr_get cfg 7 in
+  let headWid = arr_get cfg 11 in let kLNf = arr_get cfg 25 in let kHd = arr_get cfg 26 in
+  let Tok = arr_get bag 0 in let Pos = arr_get bag 1 in let H = arr_get bag 3 in let Hin = arr_get bag 4 in let wc = arr_get bag 5 in let wcb = arr_get bag 6 in let ks = arr_get bag 7 in let Aqkv = arr_get bag 8 in let Ah1 = arr_get bag 9 in let Ar1 = arr_get bag 10 in let gnf = arr_get bag 12 in let bnf = arr_get bag 13 in
+  let _ = mk_x_loop Tok Pos seq H d L 0 in
+  let _ = gpu_layers H Hin 0 nlayers L d nh hd qdim inter ks wc wcb Aqkv Ah1 Ar1 in
+  let xnf = arr_new (L * d) 0 in let _ = gpu_ln_all kLNf H xnf gnf bnf L d in
+  let logits = arr_new (L * vocab) 0 in let _ = gpu_proj_wx kHd headWid xnf logits vocab d L in
+  argmax_off logits (rdpos * vocab) vocab 1 (arr_get logits (rdpos * vocab)) 0
+gen_prompt bag cfg seq P K gen =
+  let L = arr_get cfg 5 in
+  gen_go bag cfg seq P K gen L 0
+gen_go bag cfg seq P K gen L i =
+  if i >= K then 0
+  else let len = P + i in let _ = padf seq len L in
+       let pred = gen_next bag cfg seq (len - 1) in
+       let _ = arr_set seq len pred in let _ = arr_set gen i pred in
+       gen_go bag cfg seq P K gen L (i + 1)
+gstr arr n i acc = if i >= n then acc else gstr arr n (i + 1) (cat [acc, show (arr_get arr i), " "])
+setp seq ids P i = if i >= P then 0 else let _ = arr_set seq i (arr_get ids i) in setp seq ids P (i + 1)
+-- run gen on the 3 eval prompts, write ids to a file
+-- TOKENIZER PROBE (inference-only): 8 rare-atomic single-token numbers (A, predict FAIL)
+-- + 8 multi-token common numbers (B, predict PASS). Echo copy test on the TRAINED bind model.
+eval_write bag cfg tag =
+  let L = arr_get cfg 5 in let K = 6 in
+  let p1 = arr_new L 0 in let i1 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 3077 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))) 11 in let _ = setp p1 i1 11 0 in let g1 = arr_new K 0 in let _ = gen_prompt bag cfg p1 11 K g1 in
+  let p2 = arr_new L 0 in let i2 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 8857 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))) 11 in let _ = setp p2 i2 11 0 in let g2 = arr_new K 0 in let _ = gen_prompt bag cfg p2 11 K g2 in
+  let p3 = arr_new L 0 in let i3 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 5491 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))) 11 in let _ = setp p3 i3 11 0 in let g3 = arr_new K 0 in let _ = gen_prompt bag cfg p3 11 K g3 in
+  let p4 = arr_new L 0 in let i4 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 10894 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))) 11 in let _ = setp p4 i4 11 0 in let g4 = arr_new K 0 in let _ = gen_prompt bag cfg p4 11 K g4 in
+  let p5 = arr_new L 0 in let i5 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 16375 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))) 11 in let _ = setp p5 i5 11 0 in let g5 = arr_new K 0 in let _ = gen_prompt bag cfg p5 11 K g5 in
+  let p6 = arr_new L 0 in let i6 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 12273 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))) 11 in let _ = setp p6 i6 11 0 in let g6 = arr_new K 0 in let _ = gen_prompt bag cfg p6 11 K g6 in
+  let p7 = arr_new L 0 in let i7 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 10138 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))) 11 in let _ = setp p7 i7 11 0 in let g7 = arr_new K 0 in let _ = gen_prompt bag cfg p7 11 K g7 in
+  let p8 = arr_new L 0 in let i8 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 7528 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))) 11 in let _ = setp p8 i8 11 0 in let g8 = arr_new K 0 in let _ = gen_prompt bag cfg p8 11 K g8 in
+  let p9 = arr_new L 0 in let i9 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 27 (cons 1138 (cons 53 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))))) 13 in let _ = setp p9 i9 13 0 in let g9 = arr_new K 0 in let _ = gen_prompt bag cfg p9 13 K g9 in
+  let p10 = arr_new L 0 in let i10 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 35 (cons 3331 (cons 23 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))))) 13 in let _ = setp p10 i10 13 0 in let g10 = arr_new K 0 in let _ = gen_prompt bag cfg p10 13 K g10 in
+  let p11 = arr_new L 0 in let i11 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 51 (cons 6919 (cons 48 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))))) 13 in let _ = setp p11 i11 13 0 in let g11 = arr_new K 0 in let _ = gen_prompt bag cfg p11 13 K g11 in
+  let p12 = arr_new L 0 in let i12 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 54 (cons 7068 (cons 53 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))))) 13 in let _ = setp p12 i12 13 0 in let g12 = arr_new K 0 in let _ = gen_prompt bag cfg p12 13 K g12 in
+  let p13 = arr_new L 0 in let i13 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 48 (cons 6497 (cons 35 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))))) 13 in let _ = setp p13 i13 13 0 in let g13 = arr_new K 0 in let _ = gen_prompt bag cfg p13 13 K g13 in
+  let p14 = arr_new L 0 in let i14 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 78 (cons 4217 (cons 35 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))))) 13 in let _ = setp p14 i14 13 0 in let g14 = arr_new K 0 in let _ = gen_prompt bag cfg p14 13 K g14 in
+  let p15 = arr_new L 0 in let i15 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 78 (cons 1257 (cons 53 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))))) 13 in let _ = setp p15 i15 13 0 in let g15 = arr_new K 0 in let _ = gen_prompt bag cfg p15 13 K g15 in
+  let p16 = arr_new L 0 in let i16 = mk_list_arr (cons 328 (cons 42 (cons 210 (cons 191 (cons 183 (cons 2247 (cons 78 (cons 2171 (cons 27 (cons 661 (cons 5836 (cons 1192 (cons 4542 []))))))))))))) 13 in let _ = setp p16 i16 13 0 in let g16 = arr_new K 0 in let _ = gen_prompt bag cfg p16 13 K g16 in
+  write_file "/tmp/probe3.ids" (cat [gstr g1 K 0 "", "\n", gstr g2 K 0 "", "\n", gstr g3 K 0 "", "\n", gstr g4 K 0 "", "\n", gstr g5 K 0 "", "\n", gstr g6 K 0 "", "\n", gstr g7 K 0 "", "\n", gstr g8 K 0 "", "\n", gstr g9 K 0 "", "\n", gstr g10 K 0 "", "\n", gstr g11 K 0 "", "\n", gstr g12 K 0 "", "\n", gstr g13 K 0 "", "\n", gstr g14 K 0 "", "\n", gstr g15 K 0 "", "\n", gstr g16 K 0 "", "\n"])
+mk_list_arr xs n = let a = arr_new n 0 in let _ = mla xs a 0 in a
+mla xs a i = if xs == [] then 0 else let _ = arr_set a i (head xs) in mla (tail xs) a (i + 1)
+train_loop bag cfg step maxsteps = if step > maxsteps then 0 else
+  let _ = step_all bag cfg step in
+  let _ = if (step > 0) then (if (step - (step / 100) * 100) == 0 then (let _ = print (cat ["  [gate] eval @ step ", show step]) in eval_write bag cfg (cat ["ck", show step])) else 0) else 0 in
+  train_loop bag cfg (step + 1) maxsteps
+ito_go n acc = if n == 0 then acc else ito_go (n / 10) (cat [char_from_int (48 + (n - (n / 10) * 10)), acc])
+itoa n = if n == 0 then "0" else ito_go n ""
+payload_write idx arr count = let payload = float_arr_new count 0.0 in let _ = i2f_into arr count payload 0 in float_arr_to_f32_file (cat ["/tmp/rst_", itoa idx, ".p"]) payload count
+emit_t st name arr count shape =
+  let idx = arr_get st 0 in let off = arr_get st 1 in
+  let _ = payload_write idx arr count in
+  let _ = arr_set st 0 (idx + 1) in let _ = arr_set st 1 (off + count * 4) in
+  cat ["\"", name, "\":{\"dtype\":\"F32\",\"shape\":[", shape, "],\"data_offsets\":[", itoa off, ",", itoa (off + count * 4), "]}"]
+emit_layer wc li header st d qdim inter =
+  let h = cat [header, ",", emit_t st (bname li "ln1.weight") (arr_get wc (li * 12 + 0)) d (show d)] in
+  let h = cat [h, ",", emit_t st (bname li "ln1.bias") (arr_get wc (li * 12 + 1)) d (show d)] in
+  let h = cat [h, ",", emit_t st (bname li "attn.query_proj.weight") (arr_get wc (li * 12 + 2)) (qdim * d) (cat [show qdim, ",", show d])] in
+  let h = cat [h, ",", emit_t st (bname li "attn.key_proj.weight") (arr_get wc (li * 12 + 3)) (qdim * d) (cat [show qdim, ",", show d])] in
+  let h = cat [h, ",", emit_t st (bname li "attn.value_proj.weight") (arr_get wc (li * 12 + 4)) (qdim * d) (cat [show qdim, ",", show d])] in
+  let h = cat [h, ",", emit_t st (bname li "attn.out_proj.weight") (arr_get wc (li * 12 + 5)) (d * qdim) (cat [show d, ",", show qdim])] in
+  let h = cat [h, ",", emit_t st (bname li "ln2.weight") (arr_get wc (li * 12 + 6)) d (show d)] in
+  let h = cat [h, ",", emit_t st (bname li "ln2.bias") (arr_get wc (li * 12 + 7)) d (show d)] in
+  let h = cat [h, ",", emit_t st (bname li "mlp.layers.0.weight") (arr_get wc (li * 12 + 8)) (inter * d) (cat [show inter, ",", show d])] in
+  let h = cat [h, ",", emit_t st (bname li "mlp.layers.0.bias") (arr_get wc (li * 12 + 9)) inter (show inter)] in
+  let h = cat [h, ",", emit_t st (bname li "mlp.layers.2.weight") (arr_get wc (li * 12 + 10)) (d * inter) (cat [show d, ",", show inter])] in
+  cat [h, ",", emit_t st (bname li "mlp.layers.2.bias") (arr_get wc (li * 12 + 11)) d (show d)]
+emit_layers wc li nlayers header st d qdim inter = if li >= nlayers then header else emit_layers wc (li + 1) nlayers (emit_layer wc li header st d qdim inter) st d qdim inter
+cat_files i np acc = if i >= np then acc else cat_files (i + 1) np (cat [acc, "/tmp/rst_", show i, ".p "])
+write_all_st path Tok Pos wc gnf bnf Head vocab d qdim inter nlayers npos =
+  let st = arr_new 2 0 in
+  let h = emit_t st "tok.weight" Tok (vocab * d) (cat [show vocab, ",", show d]) in
+  let h = cat [h, ",", emit_t st "pos.weight" Pos (npos * d) (cat [show npos, ",", show d])] in
+  let h = emit_layers wc 0 nlayers h st d qdim inter in
+  let h = cat [h, ",", emit_t st "lnf.weight" gnf d (show d)] in
+  let h = cat [h, ",", emit_t st "lnf.bias" bnf d (show d)] in
+  let h = cat [h, ",", emit_t st "head.weight" Head (vocab * d) (cat [show vocab, ",", show d])] in
+  let header = cat ["{", h, "}"] in
+  let _ = write_file (cat [path, ".h"]) header in
+  let _ = shell (cat ["printf '", le8_esc (length header), "' > ", path, ".l"]) in
+  let np = arr_get st 0 in
+  let _ = shell (cat ["cat ", path, ".l ", path, ".h ", cat_files 0 np "", " > ", path, " && rm -f ", path, ".l ", path, ".h /tmp/rst_*.p"]) in 0
+
+main =
+  let blob = cat [getenv "HOME", "/.ledatic/railml-trial/arith_bind_probe.safetensors"] in
+  if (read_file_size blob) < 10000000 then let _ = print "FATAL blob missing" in 1
+  else
+  let corpus = cat [getenv "HOME", "/.ledatic/railml-trial/arith/binding_curriculum.bin"] in
+  if (read_file_size corpus) < 1000 then let _ = print "FATAL binding_curriculum.bin missing" in 1
+  else
+  let d = 768 in let nh = 12 in let hd = 64 in let qdim = 768 in let inter = 3072 in let L = 64 in let vocab = 16384 in let nlayers = 16 in
+  let fd = fopen blob "rb" in
+  let hbuf8 = malloc 8 in let _ = pread fd hbuf8 8 0 in let hlen = pq_le_len hbuf8 0 in let _ = free hbuf8 in
+  let base = 8 + hlen in let hdrbuf = malloc base in let _ = pread fd hdrbuf base 0 in
+  let _ = print "TOKENIZER PROBE (Rail-native GPU, inference-only): does single-atomic-token predict copy FAILURE?" in
+  let Tok = ld_f32 fd hdrbuf base "tok.weight" (vocab * d) in
+  let npos = 512 in let Pos = ld_f32 fd hdrbuf base "pos.weight" (npos * d) in
+  let H = arr_new (L * d) 0 in let Hin = arr_new (nlayers * L * d) 0 in
+  let wc = arr_new (nlayers * 12) 0 in let _ = wc_load fd hdrbuf base wc 0 nlayers d qdim inter in
+  let wcb = arr_new (nlayers * 6) 0 in let _ = wcb_load wc wcb 0 nlayers d qdim inter in
+  let Aqkv = arr_new (nlayers * 3 * L * qdim) 0 in let Ah1 = arr_new (nlayers * L * inter) 0 in let Ar1 = arr_new (nlayers * L * d) 0 in
+  let ks = arr_new 17 0 in
+  let _ = arr_set ks 0 (ijit_compile (emit_msl_fx_layernorm24_shaped L d)) in
+  let _ = arr_set ks 1 (ijit_compile (emit_msl_fx_matmul24_wx qdim d L)) in
+  let _ = arr_set ks 2 (ijit_compile (emit_msl_fx_matmul24_wx inter d L)) in
+  let _ = arr_set ks 3 (ijit_compile (emit_msl_fx_matmul24_wx d inter L)) in
+  let _ = arr_set ks 4 (ijit_compile (emit_msl_fx_attn24_par L qdim nh hd)) in
+  let _ = arr_set ks 5 (ijit_compile (emit_msl_fx_gelu24_shaped (L * inter))) in
+  let _ = arr_set ks 6 (ijit_compile (emit_msl_fx_gelu_grad24_shaped (L * inter))) in
+  let _ = arr_set ks 7 (ijit_compile (emit_msl_fx_elemul24 (L * inter))) in
+  let _ = arr_set ks 8 (ijit_compile (emit_msl_fx_matmul_bwd_wx qdim d L)) in
+  let _ = arr_set ks 9 (ijit_compile (emit_msl_fx_matmul_bwd_wx d inter L)) in
+  let _ = arr_set ks 10 (ijit_compile (emit_msl_fx_matmul_bwd_wx inter d L)) in
+  let _ = arr_set ks 11 (ijit_compile (emit_msl_fx_attn_bwd_par L qdim nh hd)) in
+  let _ = arr_set ks 12 (ijit_compile (emit_msl_fx_layernorm_bwd_shaped L d)) in
+  let _ = arr_set ks 13 (ijit_compile (emit_msl_fx_wgrad24_shaped qdim d L)) in
+  let _ = arr_set ks 14 (ijit_compile (emit_msl_fx_wgrad24_shaped d qdim L)) in
+  let _ = arr_set ks 15 (ijit_compile (emit_msl_fx_wgrad24_shaped inter d L)) in
+  let _ = arr_set ks 16 (ijit_compile (emit_msl_fx_wgrad24_shaped d inter L)) in
+  let kLNf = ijit_compile (emit_msl_fx_layernorm24_shaped L d) in
+  let kHd = ijit_compile (emit_msl_fx_matmul24_wx vocab d L) in
+  let kBd = ijit_compile (emit_msl_fx_matmul_bwd_wx vocab d L) in
+  let kWg = ijit_compile (emit_msl_fx_wgrad24_shaped vocab d L) in
+  let kLb = ijit_compile (emit_msl_fx_layernorm_bwd_shaped L d) in
+  let gnf = ld_f32 fd hdrbuf base "lnf.weight" d in let bnf = ld_f32 fd hdrbuf base "lnf.bias" d in
+  let Head = ld_f32 fd hdrbuf base "head.weight" (vocab * d) in
+  let headWid = ibuf_upload Head (vocab * d) in
+  let beta1 = 15099494 in let beta2 = 16760439 in let eps = 16777 in let alr = 1677 in
+  let kAdamQ = ijit_compile (emit_msl_fx_adam_step (qdim * d) beta1 beta2 eps alr) in
+  let kAdamM = ijit_compile (emit_msl_fx_adam_step (inter * d) beta1 beta2 eps alr) in
+  let kAdamH = ijit_compile (emit_msl_fx_adam_step (vocab * d) beta1 beta2 eps alr) in
+  let wm = arr_new (nlayers * 6) 0 in let wv = arr_new (nlayers * 6) 0 in let _ = wmv_load wm wv 0 nlayers d qdim inter in
+  let mHead = arr_new (vocab * d) 0 in let vHead = arr_new (vocab * d) 0 in
+  let opt = arr_new 7 0 in
+  let _ = arr_set opt 0 alr in let _ = arr_set opt 1 wm in let _ = arr_set opt 2 wv in let _ = arr_set opt 3 kAdamQ in let _ = arr_set opt 4 kAdamM in
+  let _ = fclose fd in
+  let lr = 4194 in let maxsteps = 299 in let winstride = 91 in let winstart = 0 in
+  let cfg = arr_new 30 0 in
+  let _ = arr_set cfg 0 d in let _ = arr_set cfg 1 nh in let _ = arr_set cfg 2 hd in let _ = arr_set cfg 3 qdim in let _ = arr_set cfg 4 inter in let _ = arr_set cfg 5 L in let _ = arr_set cfg 6 vocab in let _ = arr_set cfg 7 nlayers in let _ = arr_set cfg 9 lr in let _ = arr_set cfg 10 maxsteps in
+  let _ = arr_set cfg 11 headWid in
+  let _ = arr_set cfg 17 beta1 in let _ = arr_set cfg 18 beta2 in let _ = arr_set cfg 19 16777216 in let _ = arr_set cfg 20 16777216 in let _ = arr_set cfg 21 kAdamH in let _ = arr_set cfg 22 opt in
+  let _ = arr_set cfg 23 winstart in let _ = arr_set cfg 24 winstride in
+  let _ = arr_set cfg 25 kLNf in let _ = arr_set cfg 26 kHd in let _ = arr_set cfg 27 kBd in let _ = arr_set cfg 28 kWg in let _ = arr_set cfg 29 kLb in
+  let bag = arr_new 24 0 in
+  let _ = arr_set bag 0 Tok in let _ = arr_set bag 1 Pos in let _ = arr_set bag 3 H in let _ = arr_set bag 4 Hin in let _ = arr_set bag 5 wc in let _ = arr_set bag 6 wcb in let _ = arr_set bag 7 ks in let _ = arr_set bag 8 Aqkv in let _ = arr_set bag 9 Ah1 in let _ = arr_set bag 10 Ar1 in let _ = arr_set bag 11 Head in let _ = arr_set bag 12 gnf in let _ = arr_set bag 13 bnf in let _ = arr_set bag 19 mHead in let _ = arr_set bag 20 vHead in let _ = arr_set bag 22 corpus in
+  let _ = print "=== TOKENIZER PROBE: rare-atomic vs multi-common number copy (trained bind model) ===" in
+  let _ = eval_write bag cfg "test" in
+  print "probe3 done -- decode /tmp/probe3.ids"
