@@ -1,6 +1,6 @@
-import json, struct, sys
+import json, struct, sys, os
 
-ST = "/Users/ledaticempire/.ledatic/railml-trial/canonical_bestpass.safetensors"
+ST = os.environ.get("RAILML_ST", os.path.expanduser("~/.ledatic/railml-trial/canonical_bestpass.safetensors"))
 OUT = "/tmp/agk/ln_P.txt"
 
 def pq_pow2(k): return 1 if k < 1 else (1 << k)
