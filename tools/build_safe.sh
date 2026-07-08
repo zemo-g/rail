@@ -4,31 +4,32 @@
 cd "$(dirname "$0")/.."
 echo "=== Building rail_safe ==="
 
-# Step 1: Patch arena to 32MB and compile
-cp tools/compile.rail /tmp/compile_safe_build.rail
-sed -i '' 's/536870912/33554432/g' /tmp/compile_safe_build.rail
-echo "  Arena patched to 32MB"
-
-# Step 2: Two-stage bootstrap
-echo "  Stage 1: rail_native → stage1 (512MB BSS, 32MB strings)"
-./rail_native /tmp/compile_safe_build.rail 2>&1 | grep -q "ld: OK"
+# Step 1+2: Two-stage in-process self-compile (v5 toolchain — no as/ld,
+# no sed arena patch). Since v5 the arena is NOT baked into the binary:
+# _rail_arena_init mmaps it at startup, sized by the RAIL_ARENA_MB env var
+# (default 1GB). The sandbox therefore enforces 32MB at LAUNCH
+# (RAIL_ARENA_MB=32 in Dockerfile.safe / safe_server), not at build time.
+# rail_safe is the two-stage fixed-point of the current compiler source.
+echo "  Stage 1: rail_native -> stage1 (in-process rail-link)"
+RAIL_ARENA_MB=6000 ./rail_native self 2>&1 | grep -q "Binary: /tmp/rail_self"
 if [ $? -ne 0 ]; then echo "FAIL: stage1 compile"; exit 1; fi
-cp /tmp/rail_out /tmp/rail_safe_s1
+cp /tmp/rail_self /tmp/rail_safe_s1
 chmod +x /tmp/rail_safe_s1
 
-echo "  Stage 2: stage1 → rail_safe (32MB BSS, 32MB strings)"
-/tmp/rail_safe_s1 /tmp/compile_safe_build.rail 2>&1 | grep -q "ld: OK"
+echo "  Stage 2: stage1 -> rail_safe candidate (fixed point)"
+RAIL_ARENA_MB=6000 /tmp/rail_safe_s1 self 2>&1 | grep -q "Binary: /tmp/rail_self"
 if [ $? -ne 0 ]; then echo "FAIL: stage2 compile"; exit 1; fi
-cp /tmp/rail_out /tmp/rail_safe_candidate
+cp /tmp/rail_self /tmp/rail_safe_candidate
 chmod +x /tmp/rail_safe_candidate
 
-# Verify BSS is 32MB
-BSS=$(otool -l /tmp/rail_safe_candidate | grep -A5 "__bss" | grep size | awk '{print $2}')
-if [ "$BSS" != "0x0000000002000000" ]; then
-  echo "FAIL: BSS is $BSS, expected 0x0000000002000000 (32MB)"
+# Fixed point: stage2 output must equal a stage-3 recompile by the candidate
+RAIL_ARENA_MB=6000 /tmp/rail_safe_candidate self 2>&1 | grep -q "Binary: /tmp/rail_self"
+if [ $? -ne 0 ]; then echo "FAIL: stage3 compile"; exit 1; fi
+if ! cmp -s /tmp/rail_self /tmp/rail_safe_candidate; then
+  echo "FAIL: candidate is not a byte-identical fixed point"
   exit 1
 fi
-echo "  BSS verified: 32MB"
+echo "  Fixed point verified (stage2 == stage3, byte-identical)"
 
 # Step 3: Adversarial test suite — ALL must pass
 echo "=== Adversarial Test Suite ==="
