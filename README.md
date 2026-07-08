@@ -75,7 +75,7 @@ cmp rail_native /tmp/rail_self        -- and the output is identical
 
 The GC, allocator, and runtime support are ARM64 assembly embedded in the compiler itself. No `gcc`, no `libc`, no linker scripts — and since v5.2.0 no `as` or `ld` either: Rail assembles, links, and code-signs itself.
 
-### 2. Speaks HTTPS, natively ✨ *new in v3.0.0*
+### 2. Speaks HTTPS, natively ✨ *since v3.0.0*
 
 ```rail
 import "stdlib/anthropic_client.rail"
@@ -112,7 +112,7 @@ The compiler is the fitness function. Programs that compile become training data
 - **No C in the core.** The seed binary needs only the kernel — since v5.2.0 it assembles, links, and signs itself (no `as`/`ld`/`codesign`). No glibc, no OpenSSL, no runtime C; the GC is ~300 lines of ARM64 assembly inside the compiler. Optional concurrency, GPU (Metal), and JIT features use a small asm/ObjC/C boundary, tracked honestly in [`SHIMS.md`](SHIMS.md).
 - **Byte-identical self-compile.** `./rail_native self` produces output identical to the binary that produced it. The compiler's own source is the regression suite.
 - **One binary checks everything.** Training loops, tests, site generation, HTTPS clients — all compiled by the same binary you cloned. That makes the compiler a single, reproducible *checker* you can re-run yourself — not a proof of correctness: a program can compile and still be wrong. Compilation proves a program is *accepted by the binary you run*, nothing more.
-- **Production surface is narrow and honest.** Rail v3.0.0 ships the crypto it uses (ChaCha20-Poly1305, x25519, SHA-256/384/512, ECDSA-P256/P384, RSA-PSS/PKCS1) and nothing more. Every primitive is NIST- or RFC-vector-validated.
+- **Production surface is narrow and honest.** Rail ships the crypto it uses (ChaCha20-Poly1305, x25519, SHA-256/384/512, ECDSA-P256/P384/P521, RSA-PSS/PKCS1) and nothing more. Every primitive is NIST- or RFC-vector-validated.
 - **Six backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), Linux x86_64, WebAssembly (experimental), Cortex-M4 (Thumb-2), and RISC-V rv32imc — the same compiler cross-compiles to all of them.
 
 ## The language
@@ -269,18 +269,18 @@ Native floats in ARM64 d-registers, effect handlers via setjmp/longjmp, GC in as
 
 ## Honest limits
 
-Things Rail v3.0.0 **doesn't** do, so you don't hit them as surprises:
+Things Rail v5.3.0 **doesn't** do, so you don't hit them as surprises:
 
-- TLS ships one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one ECDHE group (`x25519`), and three sig-algs (`rsa_pss_rsae_sha256 | ecdsa_secp256r1_sha256 | rsa_pkcs1_sha256`). Modern CDN fronts work; legacy servers may not.
+- TLS ships one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one ECDHE group (`x25519`), and three CertificateVerify sig-algs (`rsa_pss_rsae_sha256 | ecdsa_secp256r1_sha256 | ecdsa_secp521r1_sha512`). Modern CDN fronts work; legacy servers may not.
 - No TLS session resumption, no 0-RTT, no client certificates.
 - No constant-time or side-channel resistance guarantees. This is not OpenSSL; don't ship it to a Defense customer.
-- Each HTTPS connection is 5–8 seconds wall time (public-key verify dominates). Great for one-shot API calls, not for an HTTP proxy.
-- Response body is assembled via `join ""` — O(N²), caps cleanly around 64 KB. Streaming is a v3.1 item.
+- Each HTTPS connection costs seconds of wall time (public-key verify dominates). Great for one-shot API calls, not for an HTTP proxy.
+- Response body is assembled via `join ""` — O(N²), caps cleanly around 64 KB. Streaming is an open item.
 - Rail is not ANSI-standardised. There is no formal type system or soundness proof. Use it because it's fast, small, and honest — not because it's Haskell.
 
 ## License
 
-[Business Source License 1.1](LICENSE). Free for non-production use; the Additional Use Grant covers research, education, and personal projects. Converts to Apache 2.0 on 2030-04-06.
+[Business Source License 1.1](LICENSE). Free for non-production use; the Additional Use Grant covers research, education, and personal projects. Converts to MIT on 2030-03-14.
 
 ## Notes
 

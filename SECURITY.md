@@ -1,6 +1,6 @@
 # Security
 
-Rail v3.0.0 ships a pure-Rail TLS 1.3 + X.509 stack. This file documents what that means for security-minded users, and how to report issues.
+Rail ships a pure-Rail TLS 1.3 + X.509 stack (since v3.0.0; current release v5.3.0). This file documents what that means for security-minded users, and how to report issues.
 
 ## Security posture (read this before deploying)
 
@@ -10,7 +10,7 @@ Rail v3.0.0 ships a pure-Rail TLS 1.3 + X.509 stack. This file documents what th
 - **Side-channel hardened.** No effort has been made to equalise memory access patterns, guard against cache-timing attacks, or resist power analysis.
 - **Formally verified.** No soundness proof, no model-checked state machine. The TLS 1.3 handshake is validated against RFC 8448 §3 traces; that's a vector match, not a proof.
 - **Audited.** There has been no third-party security review.
-- **Feature-complete.** One cipher suite, one ECDHE group, three sig-algs (see `README.md` honest-limits section). Server cert chain walking is an opt-in primitive, not the default in `https_get`.
+- **Feature-complete.** One cipher suite, one ECDHE group, three CertificateVerify sig-algs (see `README.md` honest-limits section). Server cert chain walking is an opt-in primitive, not the default in `https_get`.
 
 **What this means in practice:**
 
@@ -18,7 +18,7 @@ Rail v3.0.0 ships a pure-Rail TLS 1.3 + X.509 stack. This file documents what th
 - Fine for fleet-to-fleet traffic you control.
 - **Not** fine for handling third-party user traffic, client-certificate authentication, or anything where a sophisticated adversary can observe your process.
 
-If you're evaluating this for any kind of production deployment, use OpenSSL / rustls / boringssl instead. Rail v3.0.0's HTTPS is for *Rail* — for the language itself to talk to the world. It is not a general-purpose TLS library.
+If you're evaluating this for any kind of production deployment, use OpenSSL / rustls / boringssl instead. Rail's HTTPS is for *Rail* — for the language itself to talk to the world. It is not a general-purpose TLS library.
 
 ## Cryptographic primitives shipped
 
