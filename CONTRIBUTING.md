@@ -8,7 +8,7 @@ Rail is a real project with a narrow but honest feature set. Contributions are w
 git clone https://github.com/zemo-g/rail
 cd rail
 
-./rail_native test       # 140/140 core tests
+./rail_native test       # 178/178 core tests
 ./rail_native self       # self-compile → /tmp/rail_self
 ./rail_native self && cmp rail_native /tmp/rail_self
 # ↑ may print a one-byte-or-more difference on a clean tree; that is
@@ -23,14 +23,15 @@ If any of those three fails on `master`, that's a bug — please open an issue.
 ## Prerequisites
 
 - Apple Silicon Mac (ARM64 macOS) is the primary development target.
-- Xcode command-line tools for `as` + `ld` (`xcode-select --install`).
-- No other dependencies. Rail builds with just `as`, `ld`, and the kernel.
+- No other dependencies. Since v5.2.0 the compiler assembles, links, and
+  code-signs itself — no Xcode `as`/`ld` in the build. (The legacy `as`/`ld`
+  fallback engages automatically when `RAIL_ARENA_MB < 5000`.)
 
 Linux ARM64 and Linux x86_64 work as cross-compile targets; WASM too. See `./rail_native linux`, `./rail_native x86`, `./rail_native wasm`.
 
 ## The bar for a compiler patch
 
-The compiler is `tools/compile.rail` (~6,719 lines of Rail). It compiles itself. Every change goes through this loop:
+The compiler is `tools/compile.rail` (~9,200 lines of Rail). It compiles itself. Every change goes through this loop:
 
 ```bash
 # 1. Edit tools/compile.rail.
@@ -42,7 +43,7 @@ The compiler is `tools/compile.rail` (~6,719 lines of Rail). It compiles itself.
 cp /tmp/rail_self ./rail_native
 
 # 4. Verify the test suite still passes.
-./rail_native test                        # must be 140/140
+./rail_native test                        # must be 178/178
 
 # 5. Verify the fixed-point property (≥2 cycles).
 ./rail_native self && cp /tmp/rail_self ./rail_native

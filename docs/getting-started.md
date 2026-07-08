@@ -155,5 +155,5 @@ rail/
 
 - [Language Reference](language-reference.md) -- complete syntax guide
 - [Builtins](builtins.md) -- every built-in function
-- [Standard Library](stdlib.md) -- all 101 stdlib modules
+- [Standard Library](stdlib.md) -- the core stdlib modules (101 total in `stdlib/`)
 - [Examples](examples.md) -- annotated example programs
