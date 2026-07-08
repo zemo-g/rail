@@ -1,0 +1,151 @@
+-- attested_ln_real_demo.rail — twin-kernel attestation, act 11 (2026-07-04).
+--
+-- WIRING TO THE REAL 138M MODEL.  The attested base model is GPT-2
+-- family (LayerNorm+bias, F=24) -- not the Llama family of acts 3/8/9.
+-- This runs block-0 LayerNorm of the REAL model on GPU and twin-
+-- verifies it against the model's ACTUAL fixed-point CPU op.
+--
+-- Input (/tmp/agk/ln_P.txt) is the real last-token hidden (tok[661]+
+-- pos[8]) and real blocks.0.ln1.{weight,bias}, decoded F32->Q24 from
+-- canonical_bestpass.safetensors by extract_ln.py (pq_f32_fixed exact).
+-- The CPU twin below is the model's own gp_layernorm math (F=24,
+-- 128-bit binary-search fxrsqrt with the exact fractional tie-break).
+--
+-- Attestation-relevant check: GPU fixed-point == Rail CPU fixed-point,
+-- BYTE-exact.  Both differ from the MLX float ref (-3450268 6448591
+-- 1702770) by ~1e-5 -- the expected, deterministic fixed-point gap,
+-- NOT a twin divergence.
+--
+-- prep: python3 $CLAUDE_JOB_DIR/tmp/extract_ln.py   (writes ln_P.txt)
+-- run:  ./rail_native run tools/metal/attested_ln_real_demo.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+-- ==== the model's own fixed-point LayerNorm (F=24), copied verbatim ====
+bx4_sqrt_le r xq =
+  let hr = mul_shr r r 24 in
+  if hr < xq then true
+  else if hr > xq then false
+  else
+    let c  = r - (r / 16777216) * 16777216 in
+    let cc = c * c in
+    (cc - (cc / 16777216) * 16777216) == 0
+
+bx4_bsqrt lo hi xq =
+  if (lo + 1) >= hi then lo
+  else
+    let mid = (lo + hi) / 2 in
+    if bx4_sqrt_le mid xq then bx4_bsqrt mid hi xq
+    else bx4_bsqrt lo mid xq
+
+bx4_fxsqrt xq = if xq < 1 then 0 else bx4_bsqrt 0 ((16384 * 16384) * 4096) xq
+bx4_fxrsqrt xq = let q = bx4_fxsqrt xq in if q == 0 then 0 else 281474976710656 / q
+
+gp_ln_sum X base d i acc = if i >= d then acc else gp_ln_sum X base d (i + 1) (acc + arr_get X (base + i))
+gp_ln_var X base d mean i acc = if i >= d then acc else let dx = (arr_get X (base + i)) - mean in gp_ln_var X base d mean (i + 1) (acc + mul_shr dx dx 24)
+gp_ln_apply X base xn gamma beta d mean inv i =
+  if i >= d then xn
+  else let dx = (arr_get X (base + i)) - mean in
+       let _ = arr_set xn i ((mul_shr (mul_shr dx inv 24) (arr_get gamma i) 24) + (arr_get beta i)) in
+       gp_ln_apply X base xn gamma beta d mean inv (i + 1)
+gp_layernorm X base xn gamma beta d eps =
+  let s = gp_ln_sum X base d 0 0 in
+  let mean = s / d in
+  let vs = gp_ln_var X base d mean 0 0 in
+  let var = vs / d in
+  let inv = bx4_fxrsqrt (var + eps) in
+  gp_ln_apply X base xn gamma beta d mean inv 0
+
+-- ==== load helpers ====
+pi_digits cs acc =
+  if (length cs) == 0 then acc
+  else pi_digits (tail cs) ((acc * 10) + ((char_to_int (head cs)) - 48))
+parse_i s =
+  if (length (chars s)) == 0 then 0
+  else let cs = chars s in
+    if (head cs) == "-" then 0 - (pi_digits (tail cs) 0) else pi_digits cs 0
+
+load_lines lines a i n =
+  if i >= n then 0
+  else
+    let _ = arr_set a i (parse_i (head lines)) in
+    load_lines (tail lines) a (i + 1) n
+
+out_text o n i accl =
+  if i >= n then join "\n" (reverse accl)
+  else out_text o n (i + 1) (cons (show (arr_get o i)) accl)
+
+cmp_walk lines cpu i n mism =
+  if i >= n then mism
+  else
+    let g = parse_i (head lines) in
+    let c = arr_get cpu i in
+    let m2 = if g == c then mism else mism + 1 in
+    cmp_walk (tail lines) cpu (i + 1) n m2
+
+copy_off src soff dst n i =
+  if i >= n then 0
+  else
+    let _ = arr_set dst i (arr_get src (soff + i)) in
+    copy_off src soff dst n (i + 1)
+
+main =
+  let d = 768 in
+  let total = d + d + d in
+  let _ = shell "mkdir -p /tmp/agk" in
+  let _ = shell "test -x /tmp/agk/ikernel_harness || clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  -- load real packed params: hidden(768) | gamma(768) | beta(768)
+  let p = arr_new total 0 in
+  let _ = load_lines (split "\n" (read_file "/tmp/agk/ln_P.txt")) p 0 total in
+  -- CPU twin: the model's own gp_layernorm on the real hidden + weights.
+  -- gamma/beta live at offsets d and 2d in the packed buffer, so copy them
+  -- out and run the LN pieces directly (matches the GPU packed indexing).
+  let xn = arr_new d 0 in
+  let gamma = arr_new d 0 in
+  let beta = arr_new d 0 in
+  let _ = copy_off p d gamma d 0 in
+  let _ = copy_off p (2 * d) beta d 0 in
+  let s = gp_ln_sum p 0 d 0 0 in
+  let mean = s / d in
+  let vs = gp_ln_var p 0 d mean 0 0 in
+  let var = vs / d in
+  let inv = bx4_fxrsqrt (var + 168) in
+  let _ = gp_ln_apply p 0 xn gamma beta d mean inv 0 in
+  let ctext = cat [out_text xn d 0 [], "\n"] in
+  let c_h = sha256_hex ctext in
+  -- emit + run GPU twin
+  let msl = emit_msl_fx_layernorm24_shaped 1 d in
+  let _ = write_file "/tmp/agk/fx_ln.metal" msl in
+  let hd = total in
+  let cmd = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_ln.metal fx_layernorm /tmp/agk/ln_P.txt /tmp/agk/ln_P.txt 1 ", show hd, " /tmp/agk/ln_gpu_out.txt i64 on=", show d, " 2>/dev/null"] in
+  let _ = shell cmd in
+  let gtext = read_file "/tmp/agk/ln_gpu_out.txt" in
+  let g_h = sha256_hex gtext in
+  let mism = cmp_walk (split "\n" gtext) xn 0 d 0 in
+  let verdict = if mism == 0 then "LN-TWINS-AGREE" else "LN-TWINS-DIVERGE" in
+  let record = cat ["{\n",
+    "  \"schema\": \"twin-kernel-attest-v0\",\n",
+    "  \"kernel\": \"fx_layernorm (GPT-2 LayerNorm+bias, F=24) on REAL 138M block-0 weights\",\n",
+    "  \"model\": \"canonical_bestpass.safetensors (138M, d=768)\",\n",
+    "  \"emitter\": \"stdlib/jit_emit.rail:emit_msl_fx_layernorm24_shaped\",\n",
+    "  \"d\": ", show d, ", \"shift\": 24, \"eps\": 168,\n",
+    "  \"msl_sha256\": \"", sha256_hex msl, "\",\n",
+    "  \"cpu_out_sha256\": \"", c_h, "\",\n",
+    "  \"gpu_out_sha256\": \"", g_h, "\",\n",
+    "  \"mismatches\": ", show mism, ",\n",
+    "  \"gpu_out_0_2\": [", show (arr_get xn 0), ", ", show (arr_get xn 1), ", ", show (arr_get xn 2), "],\n",
+    "  \"mlx_float_ref_0_2\": [-3450268, 6448591, 1702770],\n",
+    "  \"note\": \"fixed-point vs MLX float differs ~1e-5 by design; twin check is GPU==CPU\",\n",
+    "  \"verdict\": \"", verdict, "\"\n",
+    "}\n"] in
+  let _ = write_file "/tmp/agk/ln_attest_record.json" record in
+  let _ = print "twin-kernel attestation act 11 (REAL 138M block-0 LayerNorm on GPU):" in
+  let _ = print (cat ["  d:               ", show d, " (GPT-2 LayerNorm+bias, F=24)"]) in
+  let _ = print (cat ["  cpu out[0..2]:   ", show (arr_get xn 0), " ", show (arr_get xn 1), " ", show (arr_get xn 2)]) in
+  let _ = print (cat ["  mismatches:      ", show mism, " of ", show d]) in
+  let _ = print (cat ["  cpu sha256:      ", c_h]) in
+  let _ = print (cat ["  gpu sha256:      ", g_h]) in
+  let _ = print (cat ["  MLX float ref:   -3450268 6448591 1702770  (~1e-5 gap = fixed-pt vs float, expected)"]) in
+  let _ = print (cat ["  verdict:         ", verdict]) in
+  if mism == 0 then 0 else 1

@@ -1,0 +1,224 @@
+-- attested_train_step_demo.rail -- ONE attested training step of the real
+-- 138M model, end-to-end, at GPU speed, in-process (Phase 0 milestone,
+-- 2026-07-04).
+--
+-- Loads a REAL weight matrix (blocks.0.attn.out_proj.weight, [768x768]) and
+-- a REAL activation (tok.weight row 328) from canonical_bestpass.safetensors
+-- via a single pread byte-slice each (NOT the whole 530MB blob), then runs a
+-- complete SGD step on it:
+--
+--   forward   y  = W . x                 (fx_matmul     kernel, act 12)
+--   loss/grad dy = 2*(y - 0)  [MSE->0]    (CPU, exact fixed-point)
+--   backward  dx = W^T . dy              (fx_matmul_bwd kernel, act 15)
+--   update    W' = W - lr*(dy (x) x)      (fx_wupdate    kernel, act 16)
+--
+-- Every op is dispatched IN-PROCESS via stdlib/ijit.rail (no subprocess,
+-- no text I/O -- ~1ms/op vs ~54ms/op for the old ikernel_harness), and
+-- every op is a twin: the GPU int64 result is compared bit-for-bit against
+-- the model's own fixed-point CPU math (mul_shr, F=24).  A receipt binds
+-- kernel sources + every tensor (W, x, y, dy, dx, W') by sha256 into a
+-- single step digest, which is Ed25519-signed.  Re-running reproduces the
+-- digest and signature bit-for-bit (fixed-point + deterministic sign).
+--
+-- run: ./rail_native run tools/metal/attested_train_step_demo.rail
+
+import "stdlib/file.rail"
+import "stdlib/env.rail"
+import "stdlib/ijit.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+foreign pread fd buf count offset -> int
+foreign malloc size -> ptr
+foreign free p
+foreign tgl_now_ms dummy -> float
+
+-- ===== F32 -> F=24 fixed-point decode (verbatim from pathb) =====
+pq_pow2_go acc k = if k == 0 then acc else pq_pow2_go (acc + acc) (k - 1)
+pq_pow2 k = if k < 1 then 1 else pq_pow2_go 1 k
+pq_f32_fixed b0 b1 b2 b3 =
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in
+  let sign = bits / 2147483648 in
+  let rest = bits - sign * 2147483648 in
+  let exp  = rest / 8388608 in
+  let mant = rest - exp * 8388608 in
+  if exp == 0 then 0
+  else
+    let mag = 8388608 + mant in
+    let sh = exp - 126 in
+    let xabs = if sh >= 0 then mag * (pq_pow2 sh)
+               else (let dd = pq_pow2 (0 - sh) in (mag + dd / 2) / dd) in
+    if sign == 1 then 0 - xabs else xabs
+
+-- ===== safetensors header scan (verbatim from pathb) =====
+pq_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then pq_match buf (pos + 1) (tail pcs) else 0
+pq_find buf pos hi pcs = if pos >= hi then 0 - 1 else if pq_match buf pos pcs == 1 then pos else pq_find buf (pos + 1) hi pcs
+pq_find_after buf pos hi pcs = let p = pq_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+pq_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else pq_int buf (pos + 1) (acc * 10 + (c - 48))
+pq_int_after buf pos = let c = byte_at buf pos in if c < 48 then pos else if c > 57 then pos else pq_int_after buf (pos + 1)
+pq_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+pq_offset hdr hi name k =
+  let np = pq_find hdr 0 hi (chars (cat ["\"", name, "\":"])) in
+  let dp = pq_find_after hdr np hi (chars "\"data_offsets\":[") in
+  let start = pq_int hdr dp 0 in
+  if k == 0 then start
+  else (let endp = pq_int_after hdr dp in pq_int hdr (endp + 1) 0)
+
+-- ===== single-tensor F32 slice loader (pread only the named tensor) =====
+gp_dec_f32 cbuf out obase count i =
+  if i >= count then 0
+  else
+    let ba = 4 * i in
+    let _ = arr_set out (obase + i) (pq_f32_fixed (byte_at cbuf ba) (byte_at cbuf (ba + 1)) (byte_at cbuf (ba + 2)) (byte_at cbuf (ba + 3))) in
+    gp_dec_f32 cbuf out obase count (i + 1)
+ld_f32 fd hdrbuf base name count =
+  let start = pq_offset hdrbuf base name 0 in
+  let dataoff = base + start in
+  let nb = count * 4 in
+  let cbuf = malloc nb in
+  let nr = pread fd cbuf nb dataoff in
+  let out = arr_new count 0 in
+  let _ = gp_dec_f32 cbuf out 0 count 0 in
+  let _ = free cbuf in
+  out
+
+-- ===== CPU twins (the model's own fixed-point math, F=24) =====
+-- forward: y[o] = (sum_i W[o*k+i]*x[i]) >> 24   (idot / fx_matmul semantics)
+fwd_dot W wbase x k i acc = if i >= k then acc else fwd_dot W wbase x k (i + 1) (acc + ((arr_get W (wbase + i)) * (arr_get x i)))
+fwd_rows W x y out k o = if o >= out then 0 else let _ = arr_set y o (mul_shr (fwd_dot W (o * k) x k 0 0) 1 24) in fwd_rows W x y out k (o + 1)
+-- grad of MSE-to-zero loss: dy = 2*y
+dy_from_y y dy n i = if i >= n then 0 else let _ = arr_set dy i (2 * (arr_get y i)) in dy_from_y y dy n (i + 1)
+-- backward: dx[i] = (sum_o W[o*k+i]*dy[o]) >> 24   (fx_matmul_bwd semantics)
+bwd_col W dy out k i o acc = if o >= out then acc else bwd_col W dy out k i (o + 1) (acc + ((arr_get W (o * k + i)) * (arr_get dy o)))
+bwd_rows W dy dx out k i = if i >= k then 0 else let _ = arr_set dx i (mul_shr (bwd_col W dy out k i 0 0) 1 24) in bwd_rows W dy dx out k (i + 1)
+-- update: W'[o*k+i] = W[o*k+i] - mul_shr(lr, mul_shr(dy[o], x[i], 24), 24)
+wupd_row W x dy Wn lr k o i = if i >= k then 0 else let dW = mul_shr (arr_get dy o) (arr_get x i) 24 in let _ = arr_set Wn (o * k + i) ((arr_get W (o * k + i)) - (mul_shr lr dW 24)) in wupd_row W x dy Wn lr k o (i + 1)
+wupd_rows W x dy Wn lr out k o = if o >= out then 0 else let _ = wupd_row W x dy Wn lr k o 0 in wupd_rows W x dy Wn lr out k (o + 1)
+
+-- ===== helpers =====
+cpseg src soff dst doff n i = if i >= n then 0 else let _ = arr_set dst (doff + i) (arr_get src (soff + i)) in cpseg src soff dst doff n (i + 1)
+cmp_arr a b n i mism = if i >= n then mism else cmp_arr a b n (i + 1) (if (arr_get a i) == (arr_get b i) then mism else mism + 1)
+-- content-hash a tensor by streaming small decimal-text chunks into an
+-- incremental sha256 -- O(n), never builds one huge string (the bump
+-- allocator is O(n^2) on giant concat; a 590K-element join hangs for minutes).
+seg_text a base m i acc = if i >= m then join " " (reverse acc) else seg_text a base m (i + 1) (cons (show (arr_get a (base + i))) acc)
+hash_go st a n off chunk = if off >= n then st else let m = if (off + chunk) > n then n - off else chunk in let st2 = sha256_update_str st (cat [seg_text a off m 0 [], " "]) in hash_go st2 a n (off + chunk) chunk
+sha_tensor a n = bytes_to_hex (sha256_finalize (hash_go (sha256_init 0) a n 0 1024)) 32
+-- Fast overflow-safe content fold (fx_fold64) for the bulk weight matrices:
+-- pure-Rail sha256 runs ~150 KB/s, so hashing a 590K-element matrix as text
+-- costs ~1 min.  mul_shr does the mix in a 128-bit intermediate (never
+-- overflows a 63-bit int), giving an O(n) reproducible fingerprint.  The
+-- SIGNED outer digest is still sha256+ed25519; the full 590K-element GPU==CPU
+-- bit-exact check (cmp_arr) is the real twin verification.
+fold_go a arr n i = if i >= n then a else fold_go (mul_shr (a + (arr_get arr i) + 1) 6364136223846793005 3) arr n (i + 1)
+fold64 arr n = show (fold_go 1 arr n 0)
+
+main =
+  let blob = cat [getenv "HOME", "/.ledatic/railml-trial/canonical_bestpass.safetensors"] in
+  let bsz = read_file_size blob in
+  if bsz < 10000000 then let _ = print (cat ["FATAL blob missing: ", blob]) in 1
+  else
+  let out = 768 in let k = 768 in
+  let lr = 167772 in                 -- 0.01 in F=24 (round(0.01 * 2^24))
+  let fd = fopen blob "rb" in
+  let hbuf8 = malloc 8 in
+  let _ = pread fd hbuf8 8 0 in
+  let hlen = pq_le_len hbuf8 0 in
+  let _ = free hbuf8 in
+  let base = 8 + hlen in
+  let hdrbuf = malloc base in
+  let _ = pread fd hdrbuf base 0 in
+  -- REAL weight + REAL activation
+  let W = ld_f32 fd hdrbuf base "blocks.0.attn.out_proj.weight" (out * k) in
+  let Tokrow = ld_f32 fd hdrbuf base "tok.weight" (329 * k) in
+  let x = arr_new k 0 in
+  let _ = cpseg Tokrow (328 * k) x 0 k 0 in
+  let _ = fclose fd in
+  let _ = print "attested training step on REAL 138M weights (out_proj[768x768], F=24):" in
+  let _ = print (cat ["  W[0..2]=", show (arr_get W 0), " ", show (arr_get W 1), " ", show (arr_get W 2),
+    "   x[0..2]=", show (arr_get x 0), " ", show (arr_get x 1), " ", show (arr_get x 2)]) in
+  -- ===== compile the three kernels once =====
+  let kF = ijit_compile (emit_msl_fx_matmul24_shaped out k) in
+  let kB = ijit_compile (emit_msl_fx_matmul_bwd_shaped out k) in
+  let kU = ijit_compile (emit_msl_fx_wupdate24_shaped out k lr) in
+  let _ = if (kF < 0) || (kB < 0) || (kU < 0) then print (cat ["  COMPILE FAIL kF=", show kF, " kB=", show kB, " kU=", show kU]) else 0 in
+  -- ===== 1. FORWARD  y = W.x  (GPU vs CPU) =====
+  let sizeF = out * k + k in
+  let PF = arr_new sizeF 0 in
+  let _ = cpseg W 0 PF 0 (out * k) 0 in
+  let _ = cpseg x 0 PF (out * k) k 0 in
+  let yc = arr_new out 0 in let _ = fwd_rows W x yc out k 0 in
+  let yg = arr_new out 0 in
+  let t0 = tgl_now_ms 0 in
+  let _ = ijit_run kF PF PF yg sizeF 1 out out in
+  let t1 = tgl_now_ms 0 in
+  let mF = cmp_arr yc yg out 0 0 in
+  -- ===== 2. LOSS grad  dy = 2*y  (CPU exact; use the CPU forward result) =====
+  let dy = arr_new out 0 in let _ = dy_from_y yc dy out 0 in
+  -- ===== 3. BACKWARD  dx = W^T.dy  (GPU vs CPU) =====
+  let sizeB = out * k + out in
+  let PB = arr_new sizeB 0 in
+  let _ = cpseg W 0 PB 0 (out * k) 0 in
+  let _ = cpseg dy 0 PB (out * k) out 0 in
+  let dxc = arr_new k 0 in let _ = bwd_rows W dy dxc out k 0 in
+  let dxg = arr_new k 0 in
+  let t2 = tgl_now_ms 0 in
+  let _ = ijit_run kB PB PB dxg sizeB 1 k k in
+  let t3 = tgl_now_ms 0 in
+  let mB = cmp_arr dxc dxg k 0 0 in
+  -- ===== 4. UPDATE  W' = W - lr*(dy (x) x)  (GPU vs CPU) =====
+  let sizeU = out * k + k + out in
+  let PU = arr_new sizeU 0 in
+  let _ = cpseg W 0 PU 0 (out * k) 0 in
+  let _ = cpseg x 0 PU (out * k) k 0 in
+  let _ = cpseg dy 0 PU (out * k + k) out 0 in
+  let Wnc = arr_new (out * k) 0 in let _ = wupd_rows W x dy Wnc lr out k 0 in
+  let Wng = arr_new (out * k) 0 in
+  let t4 = tgl_now_ms 0 in
+  let _ = ijit_run kU PU PU Wng sizeU 1 (out * k) out in
+  let t5 = tgl_now_ms 0 in
+  let mU = cmp_arr Wnc Wng (out * k) 0 0 in
+  -- ===== receipt: bind kernels + tensors by sha256, chain, sign =====
+  let hW  = fold64 W  (out * k) in
+  let hx  = sha_tensor x  k in
+  let hy  = sha_tensor yg out in
+  let hdy = sha_tensor dy out in
+  let hdx = sha_tensor dxg k in
+  let hWn = fold64 Wng (out * k) in
+  let hkF = sha256_hex (emit_msl_fx_matmul24_shaped out k) in
+  let hkB = sha256_hex (emit_msl_fx_matmul_bwd_shaped out k) in
+  let hkU = sha256_hex (emit_msl_fx_wupdate24_shaped out k lr) in
+  let digest_b = sha256 (cat [hkF, hkB, hkU, hW, hx, hy, hdy, hdx, hWn]) in
+  let digest = bytes_to_hex digest_b 32 in
+  -- deterministic Ed25519 signature over the 32-byte step digest.  Local
+  -- dev seed (never a prod/live-pulse sign surface) -- swap for the Pi
+  -- attestation key to anchor into the live chain.
+  let seed = sha256 "attested.train.step.local.dev.seed.v1" in
+  let sig = ed25519_sign seed digest_b 32 in
+  let sighex = bytes_to_hex sig 64 in
+  let totmism = mF + mB + mU in
+  let verdict = if totmism == 0 then "ATTESTED-TRAIN-STEP-OK" else "DIVERGE" in
+  let msF = (t1 -. t0) in let msB = (t3 -. t2) in let msU = (t5 -. t4) in
+  let record = cat ["{\n",
+    "  \"schema\": \"attested-train-step-v0\",\n",
+    "  \"model\": \"canonical_bestpass 138M mid GPT\",\n",
+    "  \"tensor\": \"blocks.0.attn.out_proj.weight\", \"shape\": [", show out, ",", show k, "], \"F\": 24, \"lr_fx\": ", show lr, ",\n",
+    "  \"forward\":  {\"kernel_sha256\": \"", hkF, "\", \"y_sha256\": \"",  hy,  "\", \"mismatches\": ", show mF, "},\n",
+    "  \"backward\": {\"kernel_sha256\": \"", hkB, "\", \"dx_sha256\": \"", hdx, "\", \"mismatches\": ", show mB, "},\n",
+    "  \"update\":   {\"kernel_sha256\": \"", hkU, "\", \"W1_fold64\": \"", hWn, "\", \"mismatches\": ", show mU, "},\n",
+    "  \"W_fold64\": \"", hW, "\", \"x_sha256\": \"", hx, "\", \"dy_sha256\": \"", hdy, "\",\n",
+    "  \"step_digest\": \"", digest, "\",\n",
+    "  \"ed25519\": \"", sighex, "\",\n",
+    "  \"verdict\": \"", verdict, "\"\n}\n"] in
+  let _ = write_file "/tmp/agk/train_step_receipt.json" record in
+  let _ = print (cat ["  forward  y=W.x       : ", show mF, " mism   ", show_float msF, " ms   y[0..2]=", show (arr_get yg 0), " ", show (arr_get yg 1), " ", show (arr_get yg 2)]) in
+  let _ = print (cat ["  backward dx=W^T.dy    : ", show mB, " mism   ", show_float msB, " ms   dx[0..2]=", show (arr_get dxg 0), " ", show (arr_get dxg 1), " ", show (arr_get dxg 2)]) in
+  let _ = print (cat ["  update   W'=W-lr*dW   : ", show mU, " mism   ", show_float msU, " ms   dW applied: W[0] ", show (arr_get W 0), " -> ", show (arr_get Wng 0)]) in
+  let _ = print (cat ["  step digest : ", digest]) in
+  let _ = print (cat ["  ed25519 sig : ", str_sub sighex 0 32, "..."]) in
+  let _ = print (cat ["  verdict     : ", verdict, "   (receipt: /tmp/agk/train_step_receipt.json)"]) in
+  if totmism == 0 then 0 else 1

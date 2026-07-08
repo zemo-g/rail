@@ -193,6 +193,1295 @@ emit_msl_silu_hadamard_shaped n =
        "}\n"]
 
 -- ───────────────────────────────────────────────────────────────────────
+-- Integer-exact kernels (attested-GPU track, 2026-07-03).
+--
+-- int32 inputs, int64 accumulate -- no floats anywhere, so the result
+-- is the SAME BITS on every device that runs it.  That is what lets a
+-- GPU dispatch join the attestation chain: the CPU reference (plain
+-- Rail 63-bit integers) and the emitted GPU kernel are twin
+-- implementations of one exact computation, and agreement is
+-- byte-equality, not "close enough".
+--
+-- Caller contract: |A[i]|, |B[j]| < 2^15 and d <= 2^16 keeps every
+-- accumulator below 2^46 -- exact in Metal's int64 AND in Rail's
+-- 63-bit tagged ints, with headroom.
+-- ───────────────────────────────────────────────────────────────────────
+emit_msl_idot_shaped rows d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint D = ",    show d,    ";\n\n",
+       "kernel void idot_matvec(\n",
+       "    device const int  *A [[buffer(0)]],\n",
+       "    device const int  *B [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    long acc = 0;\n",
+       "    uint base = gid * D;\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        acc += (long)A[base + j] * (long)B[j];\n",
+       "    }\n",
+       "    O[gid] = acc;\n",
+       "}\n"]
+
+-- Fixed-point matvec with mul_shr rescale (attested-GPU track, act 2).
+--
+-- Mirrors Rail's mul_shr primitive EXACTLY: full 128-bit product
+-- (mul = low 64, smulh/mulhi = high 64), logical-shift the low half,
+-- arithmetic-shift-combine the high half.  Same formula as the ARM64
+-- emit in tools/compile.rail (search "mul_shr"), so CPU twin and GPU
+-- twin agree bit-for-bit even when a*b overflows int64 -- the
+-- massive-activation regime that motivated mul_shr in the first
+-- place (t173: 3.2e11 * 3.2e11 >> 24).
+--
+-- Caller contract: 1 <= shift < 64, and |mul_shr result| * d must fit
+-- int64 (and Rail's 63-bit ints) for the row accumulator.
+emit_msl_fx_matvec_shaped rows d shift =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ",  show rows,  ";\n",
+       "constant uint D = ",     show d,     ";\n",
+       "constant uint SHIFT = ", show shift, ";\n\n",
+       "// mul_shr(a,b,s) = (a*b) >> s with a full 128-bit product,\n",
+       "// bit-identical to Rail's mul/smulh ARM64 sequence.\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "kernel void fx_matvec(\n",
+       "    device const long *A [[buffer(0)]],\n",
+       "    device const long *B [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    long acc = 0;\n",
+       "    uint base = gid * D;\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        acc += mul_shr_gpu(A[base + j], B[j], SHIFT);\n",
+       "    }\n",
+       "    O[gid] = acc;\n",
+       "}\n"]
+
+-- Fixed-point RMSNorm (attested-GPU track, act 3).
+--
+-- The last transformer-layer op that needed a discovery step: rsqrt.
+-- Computed as a pure-integer binary search -- find the largest r with
+-- mul_shr(mul_shr(r,r,S), v, S) <= ONE -- the same move as Path-B's
+-- bx4_fxsqrt.  Every operation is mul_shr / add / compare / shift, so
+-- a CPU twin using the mul_shr primitive lands on identical bits.
+--
+-- Q32.32 fixed point (S=32).  Caller contract: |x| < 2^34, |g| < 2^33,
+-- d <= 2^12; the search bound hi=2^45 keeps every intermediate inside
+-- int64.  One thread per row; the search is ~45 exact iterations.
+emit_msl_fx_rmsnorm_shaped rows d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint D = ",    show d,    ";\n",
+       "constant long FX_ONE = 4294967296;\n",
+       "constant long FX_EPS = 4295;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "// largest r in [0, 2^45] with mul_shr(mul_shr(r,r,32), v, 32) <= FX_ONE\n",
+       "static inline long fx_rsqrt(long v) {\n",
+       "    long lo = 0;\n",
+       "    long hi = 35184372088832 + 1;\n",
+       "    while (hi - lo > 1) {\n",
+       "        long mid = lo + (hi - lo) / 2;\n",
+       "        long t = mul_shr_gpu(mid, mid, 32);\n",
+       "        if (mul_shr_gpu(t, v, 32) <= FX_ONE) lo = mid; else hi = mid;\n",
+       "    }\n",
+       "    return lo;\n",
+       "}\n\n",
+       "kernel void fx_rmsnorm(\n",
+       "    device const long *X [[buffer(0)]],\n",
+       "    device const long *G [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    uint base = gid * D;\n",
+       "    long ss = 0;\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        long x = X[base + j];\n",
+       "        ss += mul_shr_gpu(x, x, 32);\n",
+       "    }\n",
+       "    long r = fx_rsqrt(ss / (long)D + FX_EPS);\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        O[base + j] = mul_shr_gpu(mul_shr_gpu(X[base + j], r, 32), G[j], 32);\n",
+       "    }\n",
+       "}\n"]
+
+-- Unroll-parameterized fx matvec (attested-GPU track, act 5: kernel
+-- tournament).  Integer addition is associative, so EVERY unroll
+-- factor produces byte-identical output -- the twin oracle stays
+-- exact while an optimization search explores variants.  (A float
+-- kernel can never promise that.)  Caller: d divisible by unroll.
+emit_fx_body u j =
+  if j >= u then []
+  else cons (cat ["        acc += mul_shr_gpu(A[base + j + ", show j, "], B[j + ", show j, "], SHIFT);\n"]) (emit_fx_body u (j + 1))
+
+emit_msl_fx_matvec_unrolled rows d shift unroll =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ",  show rows,  ";\n",
+       "constant uint D = ",     show d,     ";\n",
+       "constant uint SHIFT = ", show shift, ";\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "kernel void fx_matvec(\n",
+       "    device const long *A [[buffer(0)]],\n",
+       "    device const long *B [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    long acc = 0;\n",
+       "    uint base = gid * D;\n",
+       "    for (uint j = 0; j < D; j += ", show unroll, ") {\n",
+       cat (emit_fx_body unroll 0),
+       "    }\n",
+       "    O[gid] = acc;\n",
+       "}\n"]
+
+-- Fixed-point softmax (attested-GPU track, act 7 -- the LAST
+-- discovery item).
+--
+-- exp is the one transcendental a transformer needs (softmax AND
+-- silu).  Fixed-point spec, exact on both twins:
+--   range-reduce:  n = (-x)/LN2  (trunc),  r = x + n*LN2 in (-ln2, 0]
+--   exp(x) = taylor(r) >> n     -- the 2^-n scaling is a pure shift
+--   taylor: 1 + r + r^2/2 + ... + r^7/5040, every power via mul_shr,
+--   every divisor a truncating int64 division -- semantics identical
+--   on ARM64 sdiv and Metal long division.
+-- Softmax rows: m = max, e_j = fx_exp(s_j - m)  (arg <= 0 always),
+-- p_j = (e_j << 16) / (sum >> 16)  ~ e_j * 2^32 / sum.  sum >= ONE
+-- (the max element contributes exp(0) = exactly ONE), so no div-by-0.
+--
+-- Q32.32.  Approximation error ~1e-6 vs real exp; twin agreement is
+-- exact by construction regardless -- the spec IS the computation.
+emit_msl_fx_softmax_shaped rows d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint D = ",    show d,    ";\n",
+       "constant long FX_ONE = 4294967296;\n",
+       "constant long FX_LN2 = 2977044472;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "// exp(x) for x <= 0, Q32.32\n",
+       "static inline long fx_exp(long x) {\n",
+       "    if (x < -137438953472) return 0;\n",
+       "    long n = (0 - x) / FX_LN2;\n",
+       "    long r = x + n * FX_LN2;\n",
+       "    long p2 = mul_shr_gpu(r, r, 32);\n",
+       "    long p3 = mul_shr_gpu(p2, r, 32);\n",
+       "    long p4 = mul_shr_gpu(p3, r, 32);\n",
+       "    long p5 = mul_shr_gpu(p4, r, 32);\n",
+       "    long p6 = mul_shr_gpu(p5, r, 32);\n",
+       "    long p7 = mul_shr_gpu(p6, r, 32);\n",
+       "    long acc = FX_ONE + r + p2/2 + p3/6 + p4/24 + p5/120 + p6/720 + p7/5040;\n",
+       "    return acc >> n;\n",
+       "}\n\n",
+       "kernel void fx_softmax(\n",
+       "    device const long *S [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    uint base = gid * D;\n",
+       "    long m = S[base];\n",
+       "    for (uint j = 1; j < D; j++) { if (S[base + j] > m) m = S[base + j]; }\n",
+       "    long sum = 0;\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        long e = fx_exp(S[base + j] - m);\n",
+       "        O[base + j] = e;\n",
+       "        sum += e;\n",
+       "    }\n",
+       "    long den = sum >> 16;\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        O[base + j] = (O[base + j] << 16) / den;\n",
+       "    }\n",
+       "}\n"]
+
+-- integer sqrt for emit-time constants (d <= 2^12, trivial walk)
+jit_isqrt_walk n i = if (i * i) > n then i - 1 else jit_isqrt_walk n (i + 1)
+jit_isqrt n = jit_isqrt_walk n 1
+
+-- Fused fixed-point single-head attention (attested-GPU track, act 8:
+-- THE COMPOSITION).  No new math -- rmsnorm, matvec, softmax are the
+-- proven acts 2/3/7 device functions, fused into one kernel:
+--   xn = rmsnorm(x)  ->  q,k = Wq,Wk projections  ->  scores/sqrt(D)
+--   ->  softmax  ->  out = x + sum_j p_j * (Wv . xn_j)   (residual)
+-- Params ride in ONE packed buffer (X | G | WQ | WK | WV), the same
+-- shape as a real weights blob.  One thread per query position.
+--
+-- Bounds (|x|<2^29, |g|,|W|<2^27, d<=64, seq<=16) keep every
+-- accumulator under 2^56 -- inside int64 AND Rail's 63-bit ints, so
+-- twin agreement is guaranteed worst-case, not statistically.
+emit_msl_fx_attention_shaped seq d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint SEQ = ", show seq, ";\n",
+       "constant uint D = ",   show d,   ";\n",
+       "constant long FX_ONE = 4294967296;\n",
+       "constant long FX_EPS = 4295;\n",
+       "constant long FX_LN2 = 2977044472;\n",
+       -- 1/sqrt(d) is baked at EMIT time: fx_rsqrt's overflow-free
+       -- contract is v <= 2^36, and d*ONE exceeds it -- on overflow
+       -- Rail wraps at 63 bits vs Metal's 64, the ONE place twins can
+       -- silently diverge.  (Found by the twin harness itself.)
+       "constant long FX_ISD = ", show (4294967296 / (jit_isqrt d)), ";\n",
+       "constant uint OFF_G  = SEQ * D;\n",
+       "constant uint OFF_WQ = SEQ * D + D;\n",
+       "constant uint OFF_WK = SEQ * D + D + D * D;\n",
+       "constant uint OFF_WV = SEQ * D + D + 2 * D * D;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "static inline long fx_rsqrt(long v) {\n",
+       "    long lo = 0;\n",
+       "    long hi = 35184372088832 + 1;\n",
+       "    while (hi - lo > 1) {\n",
+       "        long mid = lo + (hi - lo) / 2;\n",
+       "        long t = mul_shr_gpu(mid, mid, 32);\n",
+       "        if (mul_shr_gpu(t, v, 32) <= FX_ONE) lo = mid; else hi = mid;\n",
+       "    }\n",
+       "    return lo;\n",
+       "}\n\n",
+       "static inline long fx_exp(long x) {\n",
+       "    if (x < -137438953472) return 0;\n",
+       "    long n = (0 - x) / FX_LN2;\n",
+       "    long r = x + n * FX_LN2;\n",
+       "    long p2 = mul_shr_gpu(r, r, 32);\n",
+       "    long p3 = mul_shr_gpu(p2, r, 32);\n",
+       "    long p4 = mul_shr_gpu(p3, r, 32);\n",
+       "    long p5 = mul_shr_gpu(p4, r, 32);\n",
+       "    long p6 = mul_shr_gpu(p5, r, 32);\n",
+       "    long p7 = mul_shr_gpu(p6, r, 32);\n",
+       "    long acc = FX_ONE + r + p2/2 + p3/6 + p4/24 + p5/120 + p6/720 + p7/5040;\n",
+       "    return acc >> n;\n",
+       "}\n\n",
+       "static void rms_row(device const long *P, uint j, thread long *dst) {\n",
+       "    long ss = 0;\n",
+       "    for (uint c = 0; c < D; c++) { long x = P[j * D + c]; ss += mul_shr_gpu(x, x, 32); }\n",
+       "    long r = fx_rsqrt(ss / (long)D + FX_EPS);\n",
+       "    for (uint c = 0; c < D; c++) {\n",
+       "        dst[c] = mul_shr_gpu(mul_shr_gpu(P[j * D + c], r, 32), P[OFF_G + c], 32);\n",
+       "    }\n",
+       "}\n\n",
+       "static void matvec(device const long *P, uint off, thread long *v, thread long *dst) {\n",
+       "    for (uint rr = 0; rr < D; rr++) {\n",
+       "        long acc = 0;\n",
+       "        for (uint c = 0; c < D; c++) acc += mul_shr_gpu(P[off + rr * D + c], v[c], 32);\n",
+       "        dst[rr] = acc;\n",
+       "    }\n",
+       "}\n\n",
+       "kernel void fx_attention(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= SEQ) return;\n",
+       "    long xn[",  show d,   "];\n",
+       "    long xnj[", show d,   "];\n",
+       "    long q[",   show d,   "];\n",
+       "    long w[",   show d,   "];\n",
+       "    long probs[", show seq, "];\n",
+       "    rms_row(P, gid, xn);\n",
+       "    matvec(P, OFF_WQ, xn, q);\n",
+       "    for (uint j = 0; j < SEQ; j++) {\n",
+       "        rms_row(P, j, xnj);\n",
+       "        matvec(P, OFF_WK, xnj, w);\n",
+       "        long s = 0;\n",
+       "        for (uint c = 0; c < D; c++) s += mul_shr_gpu(q[c], w[c], 32);\n",
+       "        probs[j] = mul_shr_gpu(s, FX_ISD, 32);\n",
+       "    }\n",
+       "    long m = probs[0];\n",
+       "    for (uint j = 1; j < SEQ; j++) { if (probs[j] > m) m = probs[j]; }\n",
+       "    long sum = 0;\n",
+       "    for (uint j = 0; j < SEQ; j++) { probs[j] = fx_exp(probs[j] - m); sum += probs[j]; }\n",
+       "    long den = sum >> 16;\n",
+       "    for (uint j = 0; j < SEQ; j++) probs[j] = (probs[j] << 16) / den;\n",
+       "    for (uint c = 0; c < D; c++) O[gid * D + c] = P[gid * D + c];\n",
+       "    for (uint j = 0; j < SEQ; j++) {\n",
+       "        rms_row(P, j, xnj);\n",
+       "        matvec(P, OFF_WV, xnj, w);\n",
+       "        for (uint c = 0; c < D; c++) O[gid * D + c] += mul_shr_gpu(probs[j], w[c], 32);\n",
+       "    }\n",
+       "}\n"]
+
+-- Fused fixed-point SwiGLU FFN (attested-GPU track, act 9).  No new
+-- discovery: silu is x * sigmoid(x), sigmoid reduces to fx_exp (act
+-- 7), the rest is matvec (act 2) + rmsnorm (act 3).  Fused:
+--   xn = rmsnorm(x)  ->  gate = WG.xn,  up = WU.xn
+--   act = silu(gate) * up  ->  down = WD.act  ->  out = x + down
+-- Hidden dim = D (square FFN keeps the packed layout simple; the
+-- twin-exactness point is identical at h != D).
+-- Params packed: X | G | WG(DxD) | WU(DxD) | WD(DxD).
+--
+-- sigmoid is the ONLY division; done overflow-safe as
+-- (num << 16) / (denom >> 16) -- the act-8 lesson: any path that can
+-- overflow int64 is where Rail's 63-bit and Metal's 64-bit wrap
+-- diverge.  This form keeps every intermediate < 2^48.
+emit_msl_fx_ffn_shaped seq d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint SEQ = ", show seq, ";\n",
+       "constant uint D = ",   show d,   ";\n",
+       "constant long FX_ONE = 4294967296;\n",
+       "constant long FX_EPS = 4295;\n",
+       "constant long FX_LN2 = 2977044472;\n",
+       "constant uint OFF_G  = SEQ * D;\n",
+       "constant uint OFF_WG = SEQ * D + D;\n",
+       "constant uint OFF_WU = SEQ * D + D + D * D;\n",
+       "constant uint OFF_WD = SEQ * D + D + 2 * D * D;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "static inline long fx_rsqrt(long v) {\n",
+       "    long lo = 0;\n",
+       "    long hi = 35184372088832 + 1;\n",
+       "    while (hi - lo > 1) {\n",
+       "        long mid = lo + (hi - lo) / 2;\n",
+       "        long t = mul_shr_gpu(mid, mid, 32);\n",
+       "        if (mul_shr_gpu(t, v, 32) <= FX_ONE) lo = mid; else hi = mid;\n",
+       "    }\n",
+       "    return lo;\n",
+       "}\n\n",
+       "static inline long fx_exp(long x) {\n",
+       "    if (x < -137438953472) return 0;\n",
+       "    long n = (0 - x) / FX_LN2;\n",
+       "    long r = x + n * FX_LN2;\n",
+       "    long p2 = mul_shr_gpu(r, r, 32);\n",
+       "    long p3 = mul_shr_gpu(p2, r, 32);\n",
+       "    long p4 = mul_shr_gpu(p3, r, 32);\n",
+       "    long p5 = mul_shr_gpu(p4, r, 32);\n",
+       "    long p6 = mul_shr_gpu(p5, r, 32);\n",
+       "    long p7 = mul_shr_gpu(p6, r, 32);\n",
+       "    long acc = FX_ONE + r + p2/2 + p3/6 + p4/24 + p5/120 + p6/720 + p7/5040;\n",
+       "    return acc >> n;\n",
+       "}\n\n",
+       "// silu(g) = g * sigmoid(g); sigmoid via e = exp(-|g|) so exp's\n",
+       "// arg is always <= 0.  g>=0: sig = ONE/(ONE+e).  g<0: sig = e/(ONE+e).\n",
+       "static inline long fx_silu(long g) {\n",
+       "    long ag = g < 0 ? -g : g;\n",
+       "    long e = fx_exp(-ag);\n",
+       "    long denom = FX_ONE + e;\n",
+       "    long num = g < 0 ? e : FX_ONE;\n",
+       "    long sig = (num << 16) / (denom >> 16);\n",
+       "    return mul_shr_gpu(g, sig, 32);\n",
+       "}\n\n",
+       "static void rms_row(device const long *P, uint j, thread long *dst) {\n",
+       "    long ss = 0;\n",
+       "    for (uint c = 0; c < D; c++) { long x = P[j * D + c]; ss += mul_shr_gpu(x, x, 32); }\n",
+       "    long r = fx_rsqrt(ss / (long)D + FX_EPS);\n",
+       "    for (uint c = 0; c < D; c++) {\n",
+       "        dst[c] = mul_shr_gpu(mul_shr_gpu(P[j * D + c], r, 32), P[OFF_G + c], 32);\n",
+       "    }\n",
+       "}\n\n",
+       "static void matvec(device const long *P, uint off, thread long *v, thread long *dst) {\n",
+       "    for (uint rr = 0; rr < D; rr++) {\n",
+       "        long acc = 0;\n",
+       "        for (uint c = 0; c < D; c++) acc += mul_shr_gpu(P[off + rr * D + c], v[c], 32);\n",
+       "        dst[rr] = acc;\n",
+       "    }\n",
+       "}\n\n",
+       "kernel void fx_ffn(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= SEQ) return;\n",
+       "    long xn[",   show d, "];\n",
+       "    long gate[", show d, "];\n",
+       "    long up[",   show d, "];\n",
+       "    long act[",  show d, "];\n",
+       "    long down[", show d, "];\n",
+       "    rms_row(P, gid, xn);\n",
+       "    matvec(P, OFF_WG, xn, gate);\n",
+       "    matvec(P, OFF_WU, xn, up);\n",
+       "    for (uint c = 0; c < D; c++) act[c] = mul_shr_gpu(fx_silu(gate[c]), up[c], 32);\n",
+       "    matvec(P, OFF_WD, act, down);\n",
+       "    for (uint c = 0; c < D; c++) O[gid * D + c] = P[gid * D + c] + down[c];\n",
+       "}\n"]
+
+-- Fused fixed-point SGD step (attested-GPU track, act 10: the BACKWARD
+-- pass -- attested TRAINING).  One linear layer y=W.x, MSE loss, one
+-- SGD update, all mul_shr/add/shift (no division -> no rounding
+-- trap).  Per review: bounds EXERCISE the 128-bit path (products
+-- >2^63) while results stay <2^62; LR baked at emit time is bound via
+-- the msl hash in the record.  One thread per row i:
+--   y_i  = sum_j mul_shr(W_ij, x_j, 32)     (forward, inline)
+--   g_i  = (y_i - t_i) << 1                  (MSE grad, x2 = shift)
+--   W'_ij = W_ij - mul_shr(LR, mul_shr(g_i, x_j, 32), 32)
+-- Params packed W(d*d) | x(d) | t(d); output = updated W (d*d).
+-- Every transformer weight update is this shape (upstream grad
+-- replaces the MSE term); this proves the training step stays exact
+-- and attestable.  lr_num is the Q32.32 learning-rate constant.
+emit_msl_fx_sgd_step d lr_num =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint D = ",   show d,      ";\n",
+       "constant long FX_LR = ", show lr_num, ";\n",
+       "constant uint OFF_X = D * D;\n",
+       "constant uint OFF_T = D * D + D;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "kernel void fx_sgd_step(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= D) return;\n",
+       "    uint wrow = gid * D;\n",
+       "    long y = 0;\n",
+       "    for (uint j = 0; j < D; j++) y += mul_shr_gpu(P[wrow + j], P[OFF_X + j], 32);\n",
+       "    long g = (y - P[OFF_T + gid]) * 2;\n",
+       "    for (uint j = 0; j < D; j++) {\n",
+       "        long dW = mul_shr_gpu(g, P[OFF_X + j], 32);\n",
+       "        O[wrow + j] = P[wrow + j] - mul_shr_gpu(FX_LR, dW, 32);\n",
+       "    }\n",
+       "}\n"]
+
+-- Fixed-point GPT-style LayerNorm (attested-GPU track, act 11 -- the
+-- REAL-MODEL wiring).  The 138M attested base model is GPT-2 family
+-- (LayerNorm+bias, GELU, learned pos-emb) at F=24, NOT the Llama
+-- family (RMSNorm/SwiGLU, F=32) of acts 3/8/9.  This emitter ports
+-- the model's ACTUAL gp_layernorm (pathb_gpt_forward.rail) exactly:
+-- mean-subtract, population variance, fxrsqrt (128-bit binary-search
+-- sqrt at F=24 with the exact fractional tie-break), affine WITH bias.
+-- S=2^24, eps=168 (round(1e-5 * 2^24)).  One thread per row.
+-- Params packed X(rows*D) | gamma(D) | beta(D).
+emit_msl_fx_layernorm24_shaped rows d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint D = ",    show d,    ";\n",
+       "constant long EPS = 168;\n",
+       "constant uint OFF_G = ROWS * D;\n",
+       "constant uint OFF_B = ROWS * D + D;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "// exact port of bx4_sqrt_le (bx_fixed.rail): r*r>>24 vs xq, with\n",
+       "// the fractional tie-break when the high parts are equal.\n",
+       "static inline bool sqrt_le(long r, long xq) {\n",
+       "    long hr = mul_shr_gpu(r, r, 24);\n",
+       "    if (hr < xq) return true;\n",
+       "    if (hr > xq) return false;\n",
+       "    long c  = r - (r / 16777216) * 16777216;\n",
+       "    long cc = c * c;\n",
+       "    return (cc - (cc / 16777216) * 16777216) == 0;\n",
+       "}\n",
+       "static inline long fxsqrt24(long xq) {\n",
+       "    if (xq < 1) return 0;\n",
+       "    long lo = 0;\n",
+       "    long hi = (16384L * 16384L) * 4096L;\n",
+       "    while ((lo + 1) < hi) {\n",
+       "        long mid = (lo + hi) / 2;\n",
+       "        if (sqrt_le(mid, xq)) lo = mid; else hi = mid;\n",
+       "    }\n",
+       "    return lo;\n",
+       "}\n",
+       "static inline long fxrsqrt24(long xq) {\n",
+       "    long q = fxsqrt24(xq);\n",
+       "    return q == 0 ? 0 : 281474976710656L / q;\n",
+       "}\n\n",
+       "kernel void fx_layernorm(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    uint base = gid * D;\n",
+       "    long s = 0;\n",
+       "    for (uint i = 0; i < D; i++) s += P[base + i];\n",
+       "    long mean = s / (long)D;\n",
+       "    long vs = 0;\n",
+       "    for (uint i = 0; i < D; i++) { long dx = P[base + i] - mean; vs += mul_shr_gpu(dx, dx, 24); }\n",
+       "    long var = vs / (long)D;\n",
+       "    long inv = fxrsqrt24(var + EPS);\n",
+       "    for (uint i = 0; i < D; i++) {\n",
+       "        long dx = P[base + i] - mean;\n",
+       "        O[base + i] = mul_shr_gpu(mul_shr_gpu(dx, inv, 24), P[OFF_G + i], 24) + P[OFF_B + i];\n",
+       "    }\n",
+       "}\n"]
+
+-- GPT matvec with idot semantics (attested-GPU track, act 12).  The
+-- 138M model's projections use `idot` = (sum_i W_i*x_i) >> 24 -- a
+-- FULL-precision accumulate then ONE arithmetic shift (NOT per-element
+-- mul_shr).  GPU: int64 accumulate, then >>24 (arithmetic floor,
+-- matches Rail's smulh-based shift).  Bound: the raw sum must stay
+-- < 2^63; for d<=1024 with normalized activations it stays ~2^55.
+-- Packed W(rows*K) | x(K).  One thread per output row.
+emit_msl_fx_matmul24_shaped rows k =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint K = ",    show k,    ";\n",
+       "constant uint OFF_X = ROWS * K;\n\n",
+       "kernel void fx_matmul(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    long acc = 0;\n",
+       "    uint wrow = gid * K;\n",
+       "    for (uint i = 0; i < K; i++) acc += P[wrow + i] * P[OFF_X + i];\n",
+       "    O[gid] = acc >> 24;\n",
+       "}\n"]
+
+-- BATCHED matvec (act 20 -- the perf item).  Same idot math as fx_matmul but
+-- Y[t,o] = (sum_i W[o,i]*X[t,i])>>24 for ALL L tokens in ONE dispatch: the
+-- weight W is uploaded ONCE (packed P = W(ROWS*K) | X(L*K)) instead of
+-- re-uploaded per token.  Bit-for-bit identical to L separate fx_matmul
+-- dispatches; kills the per-token weight-reupload bottleneck.  One thread per
+-- (t,o) output; O laid out [t][o] = t*ROWS + o (same as the per-token path).
+emit_msl_fx_matmul24_batched rows k seqL =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint K = ",    show k,    ";\n",
+       "constant uint L = ",    show seqL, ";\n",
+       "constant uint OFF_X = ROWS * K;\n\n",
+       "kernel void fx_matmul_b(device const long *P [[buffer(0)]], device const long *U [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= L * ROWS) return;\n",
+       "    uint t = gid / ROWS; uint o = gid % ROWS;\n",
+       "    long acc = 0;\n",
+       "    uint wrow = o * K; uint xrow = OFF_X + t * K;\n",
+       "    for (uint i = 0; i < K; i++) acc += P[wrow + i] * P[xrow + i];\n",
+       "    O[gid] = acc >> 24;\n",
+       "}\n"]
+
+-- BATCHED linear-backward (act 20).  dx[t,i] = (sum_o W[o,i]*dy[t,o])>>24 for
+-- all L tokens in one dispatch.  Packed P = W(OUT*K) | dy(L*OUT), OFF_DY=OUT*K.
+-- One thread per (t,i); O laid out [t][i] = t*K + i.  Bit-for-bit identical to
+-- L separate fx_matmul_bwd dispatches.
+emit_msl_fx_matmul_bwd_batched out k seqL =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint OUT = ", show out,  ";\n",
+       "constant uint K = ",   show k,    ";\n",
+       "constant uint L = ",   show seqL, ";\n",
+       "constant uint OFF_DY = OUT * K;\n\n",
+       "kernel void fx_matmul_bwd_b(device const long *P [[buffer(0)]], device const long *U [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= L * K) return;\n",
+       "    uint t = gid / K; uint i = gid % K;\n",
+       "    long acc = 0;\n",
+       "    uint dyrow = OFF_DY + t * OUT;\n",
+       "    for (uint o = 0; o < OUT; o++) acc += P[o * K + i] * P[dyrow + o];\n",
+       "    O[gid] = acc >> 24;\n",
+       "}\n"]
+
+-- PERSISTENT-WEIGHT variants (act 23): W in buffer(0) (resident, uploaded once
+-- via tgl_ibuf_upload), X/dy in buffer(1) (small, uploaded per dispatch).
+-- Same math as the _batched kernels; bit-for-bit identical.  Eliminates the
+-- per-dispatch re-pack + re-upload of the (unchanging) weight.
+emit_msl_fx_matmul24_wx rows k seqL =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint K = ",    show k,    ";\n",
+       "constant uint L = ",    show seqL, ";\n\n",
+       "kernel void fx_matmul_wx(device const long *W [[buffer(0)]], device const long *X [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= L * ROWS) return;\n",
+       "    uint t = gid / ROWS; uint o = gid % ROWS;\n",
+       "    long acc = 0;\n",
+       "    uint wrow = o * K; uint xrow = t * K;\n",
+       "    for (uint i = 0; i < K; i++) acc += W[wrow + i] * X[xrow + i];\n",
+       "    O[gid] = acc >> 24;\n",
+       "}\n"]
+emit_msl_fx_matmul_bwd_wx out k seqL =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint OUT = ", show out,  ";\n",
+       "constant uint K = ",   show k,    ";\n",
+       "constant uint L = ",   show seqL, ";\n\n",
+       "kernel void fx_matmul_bwd_wx(device const long *W [[buffer(0)]], device const long *DY [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= L * K) return;\n",
+       "    uint t = gid / K; uint i = gid % K;\n",
+       "    long acc = 0;\n",
+       "    uint dyrow = t * OUT;\n",
+       "    for (uint o = 0; o < OUT; o++) acc += W[o * K + i] * DY[dyrow + o];\n",
+       "    O[gid] = acc >> 24;\n",
+       "}\n"]
+
+-- GPT GELU (tanh-approx) device function + elementwise kernel (act 12).
+-- Faithful MSL port of bx4_gelu -> bx4_tanh -> bx4_fxexp -> bx4_exp_poly
+-- (bx_fixed.rail, F=24).  Uses truncating `/` (NOT >>) everywhere to
+-- match Rail's division rounding exactly on negatives.
+emit_msl_fx_gelu24_shaped n =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint N = ", show n, ";\n",
+       "constant long S = 16777216;\n",       -- 2^24
+       "constant long S2 = 33554432;\n",      -- 2^25
+       "constant long S48 = 281474976710656;\n",  -- 2^48
+       "constant long LN2 = 11629080;\n\n",
+       "static inline long fx_pow2(long k) { long a = 1; for (long i = 0; i < k; i++) a += a; return k < 1 ? 1 : a; }\n\n",
+       "static inline long exp_poly(long fq) {\n",
+       "    long p = 416;\n",
+       "    p = 3329 + (p * fq) / S;\n",
+       "    p = 23302 + (p * fq) / S;\n",
+       "    p = 139810 + (p * fq) / S;\n",
+       "    p = 699051 + (p * fq) / S;\n",
+       "    p = 2796203 + (p * fq) / S;\n",
+       "    p = 8388608 + (p * fq) / S;\n",
+       "    p = 16777216 + (p * fq) / S;\n",
+       "    p = 16777216 + (p * fq) / S;\n",
+       "    return p;\n",
+       "}\n",
+       "static inline long fxexp_neg(long ax) {\n",
+       "    long k = ax / LN2;\n",
+       "    long fq = ax - k * LN2;\n",
+       "    long ef = exp_poly(fq);\n",
+       "    long emf = S48 / ef;\n",
+       "    if (k >= 50) return 0;\n",
+       "    long p2 = fx_pow2(k);\n",
+       "    return (emf + p2 / 2) / p2;\n",
+       "}\n",
+       "static inline long tanh_pos(long axq) {\n",
+       "    long em = fxexp_neg(axq + axq);\n",  -- bx4_fxexp(-(2*axq)) = exp_neg(2*axq) since arg<0
+       "    return ((S - em) * S) / (S + em);\n",
+       "}\n",
+       "static inline long fx_tanh(long xq) { return xq < 0 ? -tanh_pos(-xq) : tanh_pos(xq); }\n",
+       "static inline long fx_gelu(long xq) {\n",
+       "    long x2 = (xq * xq) / S;\n",
+       "    long x3 = (x2 * xq) / S;\n",
+       "    long ax3 = (750194 * x3) / S;\n",
+       "    long inner0 = xq + ax3;\n",
+       "    long inner = (13386610 * inner0) / S;\n",
+       "    long th = fx_tanh(inner);\n",
+       "    long onep = S + th;\n",
+       "    return (xq * onep) / S2;\n",
+       "}\n\n",
+       "kernel void fx_gelu(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= N) return;\n",
+       "    O[gid] = fx_gelu(P[gid]);\n",
+       "}\n"]
+
+-- GPT causal multi-head attention, F=24 (attested-GPU track, act 13).
+-- Faithful port of the model's pf_heads: per query token i, per head h,
+-- causal scores (idot(Q_h,K_h)>>24, then *scaleq trunc-div, mask j>i to
+-- -1000*S), softmax over positions (rowmax, fxexp, normalize), then
+-- weighted-V (sum_j P[j]*V_h >>24).  scaleq = 2097152 = 1/sqrt(64) in
+-- F=24.  Q|K|V packed (each L*QDIM, group=1 so kvdim=qdim).  One thread
+-- per query token.  L small (<=64) -> thread-local score/exp arrays fit.
+emit_msl_fx_attn24_shaped seqL qdim nh hd =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint L = ",    show seqL, ";\n",
+       "constant uint QDIM = ", show qdim, ";\n",
+       "constant uint NH = ",   show nh,   ";\n",
+       "constant uint HD = ",   show hd,   ";\n",
+       "constant long SCALEQ = 2097152;\n",
+       "constant long S = 16777216;\n",
+       "constant long S48 = 281474976710656;\n",
+       "constant long LN2 = 11629080;\n",
+       "constant long NEG_INF = -16777216000;\n",
+       "constant uint OFF_K = L * QDIM;\n",
+       "constant uint OFF_V = 2 * L * QDIM;\n\n",
+       "static inline long fx_pow2(long k) { long a = 1; for (long i = 0; i < k; i++) a += a; return k < 1 ? 1 : a; }\n",
+       "static inline long exp_poly(long fq) {\n",
+       "    long p = 416;\n",
+       "    p = 3329 + (p*fq)/S; p = 23302 + (p*fq)/S; p = 139810 + (p*fq)/S;\n",
+       "    p = 699051 + (p*fq)/S; p = 2796203 + (p*fq)/S; p = 8388608 + (p*fq)/S;\n",
+       "    p = 16777216 + (p*fq)/S; p = 16777216 + (p*fq)/S; return p;\n",
+       "}\n",
+       "static inline long fxexp_neg(long ax) {\n",  -- ax = |x|, returns e^{-ax} * S
+       "    long k = ax / LN2; long fq = ax - k*LN2; long ef = exp_poly(fq);\n",
+       "    long emf = S48 / ef; if (k >= 50) return 0;\n",
+       "    long p2 = fx_pow2(k); return (emf + p2/2) / p2;\n",
+       "}\n\n",
+       "kernel void fx_attn(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= L) return;\n",
+       "    long sc[", show seqL, "];\n",
+       "    long ex[", show seqL, "];\n",
+       "    for (uint h = 0; h < NH; h++) {\n",
+       "        uint qb = h * HD;\n",
+       "        for (uint j = 0; j < L; j++) {\n",
+       "            if (j > gid) { sc[j] = NEG_INF; continue; }\n",
+       "            long raw = 0;\n",
+       "            for (uint c = 0; c < HD; c++) raw += P[gid*QDIM + qb + c] * P[OFF_K + j*QDIM + qb + c];\n",
+       "            raw = raw >> 24;\n",
+       "            sc[j] = (raw * SCALEQ) / S;\n",
+       "        }\n",
+       "        long m = sc[0];\n",
+       "        for (uint j = 1; j < L; j++) if (sc[j] > m) m = sc[j];\n",
+       "        long sum = 0;\n",
+       "        for (uint j = 0; j < L; j++) { long e = fxexp_neg(m - sc[j]); ex[j] = e; sum += e; }\n",
+       "        for (uint c = 0; c < HD; c++) {\n",
+       "            long acc = 0;\n",
+       "            for (uint j = 0; j < L; j++) {\n",
+       "                long p = (ex[j] * S) / sum;\n",
+       "                acc += p * P[OFF_V + j*QDIM + qb + c];\n",
+       "            }\n",
+       "            O[gid*QDIM + qb + c] = acc >> 24;\n",
+       "        }\n",
+       "    }\n",
+       "}\n"]
+
+-- Attention forward, PARALLELIZED per (query, head) (act 22 -- the perf item).
+-- Identical math to fx_attn but ONE thread per (query i, head h) = L*NH threads
+-- instead of L threads each looping all NH heads.  On the model shape (L=9,
+-- NH=12) that is 108 threads vs 9 -- 12x more GPU occupancy for the single most
+-- expensive op.  Bit-for-bit identical (each thread does the SAME per-(i,h)
+-- sequential work).  gid -> i = gid/NH, h = gid%NH.
+emit_msl_fx_attn24_par seqL qdim nh hd =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint L = ",    show seqL, ";\n",
+       "constant uint QDIM = ", show qdim, ";\n",
+       "constant uint NH = ",   show nh,   ";\n",
+       "constant uint HD = ",   show hd,   ";\n",
+       "constant long SCALEQ = 2097152;\n",
+       "constant long S = 16777216;\n",
+       "constant long S48 = 281474976710656;\n",
+       "constant long LN2 = 11629080;\n",
+       "constant long NEG_INF = -16777216000;\n",
+       "constant uint OFF_K = L * QDIM;\n",
+       "constant uint OFF_V = 2 * L * QDIM;\n\n",
+       "static inline long fx_pow2(long k) { long a = 1; for (long i = 0; i < k; i++) a += a; return k < 1 ? 1 : a; }\n",
+       "static inline long exp_poly(long fq) {\n",
+       "    long p = 416;\n",
+       "    p = 3329 + (p*fq)/S; p = 23302 + (p*fq)/S; p = 139810 + (p*fq)/S;\n",
+       "    p = 699051 + (p*fq)/S; p = 2796203 + (p*fq)/S; p = 8388608 + (p*fq)/S;\n",
+       "    p = 16777216 + (p*fq)/S; p = 16777216 + (p*fq)/S; return p;\n",
+       "}\n",
+       "static inline long fxexp_neg(long ax) {\n",
+       "    long k = ax / LN2; long fq = ax - k*LN2; long ef = exp_poly(fq);\n",
+       "    long emf = S48 / ef; if (k >= 50) return 0;\n",
+       "    long p2 = fx_pow2(k); return (emf + p2/2) / p2;\n",
+       "}\n\n",
+       "kernel void fx_attn_p(device const long *P [[buffer(0)]], device const long *U [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= L * NH) return;\n",
+       "    uint i = gid / NH; uint h = gid % NH; uint qb = h * HD;\n",
+       "    long sc[", show seqL, "]; long ex[", show seqL, "];\n",
+       "    for (uint j = 0; j < L; j++) {\n",
+       "        if (j > i) { sc[j] = NEG_INF; continue; }\n",
+       "        long raw = 0;\n",
+       "        for (uint c = 0; c < HD; c++) raw += P[i*QDIM + qb + c] * P[OFF_K + j*QDIM + qb + c];\n",
+       "        raw = raw >> 24;\n",
+       "        sc[j] = (raw * SCALEQ) / S;\n",
+       "    }\n",
+       "    long m = sc[0];\n",
+       "    for (uint j = 1; j < L; j++) if (sc[j] > m) m = sc[j];\n",
+       "    long sum = 0;\n",
+       "    for (uint j = 0; j < L; j++) { long e = fxexp_neg(m - sc[j]); ex[j] = e; sum += e; }\n",
+       "    for (uint c = 0; c < HD; c++) {\n",
+       "        long acc = 0;\n",
+       "        for (uint j = 0; j < L; j++) { long p = (ex[j] * S) / sum; acc += p * P[OFF_V + j*QDIM + qb + c]; }\n",
+       "        O[i*QDIM + qb + c] = acc >> 24;\n",
+       "    }\n",
+       "}\n"]
+
+-- BACKWARD pass primitives, F=24 (attested-GPU track, act 15).
+-- Two classes cover transformer backprop:
+--   linear-backward: dx = W^T . dy = (sum_o W[o*K+i]*dy[o]) >> 24
+--                    (dW = dy (x) x is the act-10 outer product/update)
+--   nonlinear-backward: gelu'(x) = bx4_gelu_grad (the transcendental
+--                    DERIVATIVE, a fixed-point algorithm -> bit-exact).
+-- Both twin-verify vs the model's own fixed-point CPU math.
+
+-- dx = W^T . dy ; W is [OUT x K] row-major, packed W(OUT*K) | dy(OUT).
+-- One thread per input index i.  Same idot semantics as the forward.
+emit_msl_fx_matmul_bwd_shaped out k =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint OUT = ", show out, ";\n",
+       "constant uint K = ",   show k,   ";\n",
+       "constant uint OFF_DY = OUT * K;\n\n",
+       "kernel void fx_matmul_bwd(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= K) return;\n",
+       "    long acc = 0;\n",
+       "    for (uint o = 0; o < OUT; o++) acc += P[o * K + gid] * P[OFF_DY + o];\n",
+       "    O[gid] = acc >> 24;\n",
+       "}\n"]
+
+-- gelu'(x), F=24 -- faithful port of bx4_gelu_grad -> bx4_tanh ->
+-- bx4_fxexp.  All truncating `/`.  Elementwise, one thread per element.
+emit_msl_fx_gelu_grad24_shaped n =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint N = ", show n, ";\n",
+       "constant long S = 16777216;\n",
+       "constant long S48 = 281474976710656;\n",
+       "constant long LN2 = 11629080;\n\n",
+       "static inline long fx_pow2(long k) { long a = 1; for (long i = 0; i < k; i++) a += a; return k < 1 ? 1 : a; }\n",
+       "static inline long exp_poly(long fq) {\n",
+       "    long p = 416;\n",
+       "    p = 3329 + (p*fq)/S; p = 23302 + (p*fq)/S; p = 139810 + (p*fq)/S;\n",
+       "    p = 699051 + (p*fq)/S; p = 2796203 + (p*fq)/S; p = 8388608 + (p*fq)/S;\n",
+       "    p = 16777216 + (p*fq)/S; p = 16777216 + (p*fq)/S; return p;\n",
+       "}\n",
+       "static inline long fxexp_neg(long ax) {\n",
+       "    long k = ax / LN2; long fq = ax - k*LN2; long ef = exp_poly(fq);\n",
+       "    long emf = S48 / ef; if (k >= 50) return 0;\n",
+       "    long p2 = fx_pow2(k); return (emf + p2/2) / p2;\n",
+       "}\n",
+       "static inline long tanh_pos(long axq) { long em = fxexp_neg(axq + axq); return ((S - em) * S) / (S + em); }\n",
+       "static inline long fx_tanh(long xq) { return xq < 0 ? -tanh_pos(-xq) : tanh_pos(xq); }\n",
+       "static inline long gelu_grad(long xq) {\n",
+       "    long x2 = (xq * xq) / S;\n",
+       "    long x3 = (x2 * xq) / S;\n",
+       "    long ax3 = (750194 * x3) / S;\n",
+       "    long inner0 = xq + ax3;\n",
+       "    long u = (13386610 * inner0) / S;\n",
+       "    long t = fx_tanh(u);\n",
+       "    long term1 = (S + t) / 2;\n",
+       "    long sech2 = S - (t * t) / S;\n",
+       "    long a3x2 = (3 * (750194 * x2)) / S;\n",
+       "    long inner1 = S + a3x2;\n",
+       "    long dudx = (13386610 * inner1) / S;\n",
+       "    long p1 = (xq * sech2) / S;\n",
+       "    long p2 = (p1 * dudx) / S;\n",
+       "    return term1 + p2 / 2;\n",
+       "}\n\n",
+       "kernel void fx_gelu_grad(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= N) return;\n",
+       "    O[gid] = gelu_grad(P[gid]);\n",
+       "}\n"]
+
+-- Fused weight-gradient + SGD update for a linear layer, F=24 (attested-
+-- GPU track, act 16 -- completes the training step).  For y = W.x with
+-- upstream dy (out), the weight gradient is the outer product
+-- dW[o,i] = dy[o]*x[i] and the SGD step is W'[o,i] = W[o,i] - lr*dW[o,i].
+-- Both products go through mul_shr_gpu (the exact 128-bit-reconstruct port
+-- of Rail's mul_shr, already twin-verified in acts 10/11), so the result
+-- is bit-identical to the CPU twin's mul_shr on every sign.  This is the
+-- F=24 adaptation of the Q32 act-10 sgd_step, split out as update-only so
+-- it composes with the separately-attested matmul24 forward and
+-- matmul_bwd (dx) rather than re-deriving y internally.
+-- Packed P = W(OUT*K) | x(K) | dy(OUT).  One thread per output row; each
+-- writes its whole K-length weight row.  FX_LR is the learning rate in F=24.
+emit_msl_fx_wupdate24_shaped out k lr_num =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint OUT = ",   show out,    ";\n",
+       "constant uint K = ",     show k,      ";\n",
+       "constant long FX_LR = ", show lr_num, ";\n",
+       "constant uint OFF_X = OUT * K;\n",
+       "constant uint OFF_DY = OUT * K + K;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n\n",
+       "kernel void fx_wupdate(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= OUT) return;\n",
+       "    uint wrow = gid * K;\n",
+       "    long dy = P[OFF_DY + gid];\n",
+       "    for (uint i = 0; i < K; i++) {\n",
+       "        long dW = mul_shr_gpu(dy, P[OFF_X + i], 24);\n",
+       "        O[wrow + i] = P[wrow + i] - mul_shr_gpu(FX_LR, dW, 24);\n",
+       "    }\n",
+       "}\n"]
+
+-- LayerNorm-backward, F=24 (attested-GPU track, act 17 -- the first of the
+-- two backward ops the full 16-layer backprop needs).  Input gradient dx for
+-- GPT-style LayerNorm y = gamma*xhat + beta, xhat = (x-mean)/sqrt(var+eps)
+-- (mean-subtract + POPULATION variance, matching gp_layernorm exactly).
+-- The standard row-local result:
+--   dxhat_i = dy_i*gamma_i
+--   dx_i = inv * (dxhat_i - mean(dxhat) - xhat_i*mean(dxhat*xhat))
+-- Recomputes mean/var/inv/xhat/dxhat on the fly (NO d-length thread-local
+-- arrays -- d=768 would blow the per-thread stack), so it is a pure one-
+-- thread-per-row kernel like the forward.  fxrsqrt24 = the exact 128-bit
+-- binary-search rsqrt (same helper the forward uses).  beta does not affect
+-- dx.  Packed P = X(rows*d) | gamma(d) | dy(rows*d).  eps=168.
+emit_msl_fx_layernorm_bwd_shaped rows d =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint ROWS = ", show rows, ";\n",
+       "constant uint D = ",    show d,    ";\n",
+       "constant long EPS = 168;\n",
+       "constant uint OFF_G = ROWS * D;\n",
+       "constant uint OFF_DY = ROWS * D + D;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi  = mulhi(a, b);\n",
+       "    ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n",
+       "static inline bool sqrt_le(long r, long xq) {\n",
+       "    long hr = mul_shr_gpu(r, r, 24);\n",
+       "    if (hr < xq) return true;\n",
+       "    if (hr > xq) return false;\n",
+       "    long c  = r - (r / 16777216) * 16777216;\n",
+       "    long cc = c * c;\n",
+       "    return (cc - (cc / 16777216) * 16777216) == 0;\n",
+       "}\n",
+       "static inline long fxsqrt24(long xq) {\n",
+       "    if (xq < 1) return 0;\n",
+       "    long lo = 0;\n",
+       "    long hi = (16384L * 16384L) * 4096L;\n",
+       "    while ((lo + 1) < hi) { long mid = (lo + hi) / 2; if (sqrt_le(mid, xq)) lo = mid; else hi = mid; }\n",
+       "    return lo;\n",
+       "}\n",
+       "static inline long fxrsqrt24(long xq) { long q = fxsqrt24(xq); return q == 0 ? 0 : 281474976710656L / q; }\n\n",
+       "kernel void fx_layernorm_bwd(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= ROWS) return;\n",
+       "    uint base = gid * D;\n",
+       "    long s = 0;\n",
+       "    for (uint i = 0; i < D; i++) s += P[base + i];\n",
+       "    long mean = s / (long)D;\n",
+       "    long vs = 0;\n",
+       "    for (uint i = 0; i < D; i++) { long dxc = P[base + i] - mean; vs += mul_shr_gpu(dxc, dxc, 24); }\n",
+       "    long var = vs / (long)D;\n",
+       "    long inv = fxrsqrt24(var + EPS);\n",
+       "    long sum1 = 0; long sum2 = 0;\n",
+       "    for (uint i = 0; i < D; i++) {\n",
+       "        long xhat = mul_shr_gpu(P[base + i] - mean, inv, 24);\n",
+       "        long dxh  = mul_shr_gpu(P[OFF_DY + base + i], P[OFF_G + i], 24);\n",
+       "        sum1 += dxh;\n",
+       "        sum2 += mul_shr_gpu(dxh, xhat, 24);\n",
+       "    }\n",
+       "    long mean1 = sum1 / (long)D;\n",
+       "    long mean2 = sum2 / (long)D;\n",
+       "    for (uint i = 0; i < D; i++) {\n",
+       "        long xhat = mul_shr_gpu(P[base + i] - mean, inv, 24);\n",
+       "        long dxh  = mul_shr_gpu(P[OFF_DY + base + i], P[OFF_G + i], 24);\n",
+       "        O[base + i] = mul_shr_gpu(inv, dxh - mean1 - mul_shr_gpu(xhat, mean2, 24), 24);\n",
+       "    }\n",
+       "}\n"]
+
+-- Attention-backward, F=24 (attested-GPU track, act 18 -- the last backward
+-- op the full 16-layer backprop needs).  dQ, dK, dV through the causal MHA
+-- forward (emit_msl_fx_attn24_shaped / pf_heads):
+--   O[i,c] = (sum_{j<=i} p[i,j]*V[j,c]) >> 24,  p = softmax(scaled causal QK^T)
+-- Backward (dm cancels in the softmax Jacobian, so no max-grad):
+--   dp[i,j]   = sum_c dO[i,c]*V[j,c] (>>24 per term)
+--   dsc[i,j]  = p[i,j]*(dp[i,j] - sum_k p[i,k]*dp[i,k])       (softmax Jacobian)
+--   draw[i,j] = dsc[i,j]*SCALEQ/S                              (scale chain)
+--   dQ[i,c]  = sum_{j<=i} draw[i,j]*K[j,c] (>>24 per term)
+--   dK[j,c]  = sum_{i>=j} draw[i,j]*Q[i,c]
+--   dV[j,c]  = sum_{i>=j} dO[i,c]*p[i,j]
+-- SCHEDULE-INDEPENDENT / bit-exact: one thread per position, each doing its
+-- OWN sequential accumulation (dQ per query, dK/dV per key recompute every
+-- query i>=j's softmax) -- no atomics, no cross-thread reduction.  3*L threads:
+-- region gid/L in {0=dQ,1=dK,2=dV}, pos gid%L.  P = Q|K|V, U = dO,
+-- O = dQ|dK|dV (each L*QDIM).  Thread-local arrays sized L,HD -> keep L modest.
+emit_msl_fx_attn_bwd_shaped seqL qdim nh hd =
+  cat ["#include <metal_stdlib>\n",
+       "using namespace metal;\n\n",
+       "constant uint L = ",    show seqL, ";\n",
+       "constant uint QDIM = ", show qdim, ";\n",
+       "constant uint NH = ",   show nh,   ";\n",
+       "constant uint HD = ",   show hd,   ";\n",
+       "constant long SCALEQ = 2097152;\n",
+       "constant long S = 16777216;\n",
+       "constant long S48 = 281474976710656;\n",
+       "constant long LN2 = 11629080;\n",
+       "constant uint OFF_K = L * QDIM;\n",
+       "constant uint OFF_V = 2 * L * QDIM;\n",
+       "constant uint OFF_DK = L * QDIM;\n",
+       "constant uint OFF_DV = 2 * L * QDIM;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) {\n",
+       "    long hi = mulhi(a, b); ulong lo = (ulong)a * (ulong)b;\n",
+       "    return (hi << (64 - s)) | (long)(lo >> s);\n",
+       "}\n",
+       "static inline long fx_pow2(long k) { long a = 1; for (long i = 0; i < k; i++) a += a; return k < 1 ? 1 : a; }\n",
+       "static inline long exp_poly(long fq) {\n",
+       "    long p = 416;\n",
+       "    p = 3329 + (p*fq)/S; p = 23302 + (p*fq)/S; p = 139810 + (p*fq)/S;\n",
+       "    p = 699051 + (p*fq)/S; p = 2796203 + (p*fq)/S; p = 8388608 + (p*fq)/S;\n",
+       "    p = 16777216 + (p*fq)/S; p = 16777216 + (p*fq)/S; return p;\n",
+       "}\n",
+       "static inline long fxexp_neg(long ax) {\n",
+       "    long k = ax / LN2; long fq = ax - k*LN2; long ef = exp_poly(fq);\n",
+       "    long emf = S48 / ef; if (k >= 50) return 0;\n",
+       "    long p2 = fx_pow2(k); return (emf + p2/2) / p2;\n",
+       "}\n",
+       "// softmax probs for query i, head qb -> p[0..i]\n",
+       "static inline void softmax_row(device const long* P, uint i, uint qb, thread long* p) {\n",
+       "    long sc[", show seqL, "];\n",
+       "    for (uint j = 0; j <= i; j++) {\n",
+       "        long raw = 0;\n",
+       "        for (uint c = 0; c < HD; c++) raw += P[i*QDIM+qb+c] * P[OFF_K+j*QDIM+qb+c];\n",
+       "        raw = raw >> 24;\n",
+       "        sc[j] = (raw * SCALEQ) / S;\n",
+       "    }\n",
+       "    long m = sc[0];\n",
+       "    for (uint j = 1; j <= i; j++) if (sc[j] > m) m = sc[j];\n",
+       "    long sm = 0; long e[", show seqL, "];\n",
+       "    for (uint j = 0; j <= i; j++) { long ee = fxexp_neg(m - sc[j]); e[j] = ee; sm += ee; }\n",
+       "    for (uint j = 0; j <= i; j++) p[j] = (e[j] * S) / sm;\n",
+       "}\n",
+       "// dp[j] = sum_c dO[i,c]*V[j,c] (>>24 per term), j<=i\n",
+       "static inline void dp_row(device const long* P, device const long* U, uint i, uint qb, thread long* dp) {\n",
+       "    for (uint j = 0; j <= i; j++) {\n",
+       "        long acc = 0;\n",
+       "        for (uint c = 0; c < HD; c++) acc += mul_shr_gpu(U[i*QDIM+qb+c], P[OFF_V+j*QDIM+qb+c], 24);\n",
+       "        dp[j] = acc;\n",
+       "    }\n",
+       "}\n",
+       "// draw[j] for query i, head qb, j<=i (softmax Jacobian + scale chain)\n",
+       "static inline void draw_row(device const long* P, device const long* U, uint i, uint qb, thread long* draw) {\n",
+       "    long p[", show seqL, "]; long dp[", show seqL, "];\n",
+       "    softmax_row(P, i, qb, p); dp_row(P, U, i, qb, dp);\n",
+       "    long dot = 0;\n",
+       "    for (uint j = 0; j <= i; j++) dot += mul_shr_gpu(p[j], dp[j], 24);\n",
+       "    for (uint j = 0; j <= i; j++) {\n",
+       "        long ds = mul_shr_gpu(p[j], dp[j] - dot, 24);\n",
+       "        draw[j] = (ds * SCALEQ) / S;\n",
+       "    }\n",
+       "}\n\n",
+       "kernel void fx_attn_bwd(\n",
+       "    device const long *P [[buffer(0)]],\n",
+       "    device const long *U [[buffer(1)]],\n",
+       "    device long       *O [[buffer(2)]],\n",
+       "    uint gid [[thread_position_in_grid]])\n",
+       "{\n",
+       "    if (gid >= 3 * L) return;\n",
+       "    uint region = gid / L;\n",
+       "    uint pos = gid % L;\n",
+       "    for (uint h = 0; h < NH; h++) {\n",
+       "        uint qb = h * HD;\n",
+       "        if (region == 0) {\n",
+       "            uint i = pos;\n",
+       "            long draw[", show seqL, "];\n",
+       "            draw_row(P, U, i, qb, draw);\n",
+       "            for (uint c = 0; c < HD; c++) {\n",
+       "                long acc = 0;\n",
+       "                for (uint j = 0; j <= i; j++) acc += mul_shr_gpu(draw[j], P[OFF_K+j*QDIM+qb+c], 24);\n",
+       "                O[i*QDIM+qb+c] = acc;\n",
+       "            }\n",
+       "        } else if (region == 1) {\n",
+       "            uint j = pos;\n",
+       "            long dkacc[", show hd, "];\n",
+       "            for (uint c = 0; c < HD; c++) dkacc[c] = 0;\n",
+       "            for (uint i = j; i < L; i++) {\n",
+       "                long draw[", show seqL, "];\n",
+       "                draw_row(P, U, i, qb, draw);\n",
+       "                for (uint c = 0; c < HD; c++) dkacc[c] += mul_shr_gpu(draw[j], P[i*QDIM+qb+c], 24);\n",
+       "            }\n",
+       "            for (uint c = 0; c < HD; c++) O[OFF_DK + j*QDIM+qb+c] = dkacc[c];\n",
+       "        } else {\n",
+       "            uint j = pos;\n",
+       "            long dvacc[", show hd, "];\n",
+       "            for (uint c = 0; c < HD; c++) dvacc[c] = 0;\n",
+       "            for (uint i = j; i < L; i++) {\n",
+       "                long p[", show seqL, "];\n",
+       "                softmax_row(P, i, qb, p);\n",
+       "                for (uint c = 0; c < HD; c++) dvacc[c] += mul_shr_gpu(U[i*QDIM+qb+c], p[j], 24);\n",
+       "            }\n",
+       "            for (uint c = 0; c < HD; c++) O[OFF_DV + j*QDIM+qb+c] = dvacc[c];\n",
+       "        }\n",
+       "    }\n",
+       "}\n"]
+
+-- Attention-backward, PARALLELIZED per (region, pos, head) (act 24 -- perf).
+-- Identical math to fx_attn_bwd but ONE thread per (region, position, head) =
+-- 3*L*NH threads instead of 3*L threads each looping all NH heads.  On the
+-- model shape that is 3*9*12=324 threads vs 27 -- 12x occupancy for the most
+-- expensive backward op (it recomputes a softmax per output).  Bit-for-bit
+-- identical.  gid -> region = gid/(L*NH), rem = gid%(L*NH), pos = rem/NH, h = rem%NH.
+emit_msl_fx_attn_bwd_par seqL qdim nh hd =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint L = ",    show seqL, ";\n",
+       "constant uint QDIM = ", show qdim, ";\n",
+       "constant uint NH = ",   show nh,   ";\n",
+       "constant uint HD = ",   show hd,   ";\n",
+       "constant long SCALEQ = 2097152;\n",
+       "constant long S = 16777216;\n",
+       "constant long S48 = 281474976710656;\n",
+       "constant long LN2 = 11629080;\n",
+       "constant uint OFF_K = L * QDIM;\n",
+       "constant uint OFF_V = 2 * L * QDIM;\n",
+       "constant uint OFF_DK = L * QDIM;\n",
+       "constant uint OFF_DV = 2 * L * QDIM;\n\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) { long hi = mulhi(a, b); ulong lo = (ulong)a * (ulong)b; return (hi << (64 - s)) | (long)(lo >> s); }\n",
+       "static inline long fx_pow2(long k) { long a = 1; for (long i = 0; i < k; i++) a += a; return k < 1 ? 1 : a; }\n",
+       "static inline long exp_poly(long fq) {\n",
+       "    long p = 416;\n",
+       "    p = 3329 + (p*fq)/S; p = 23302 + (p*fq)/S; p = 139810 + (p*fq)/S;\n",
+       "    p = 699051 + (p*fq)/S; p = 2796203 + (p*fq)/S; p = 8388608 + (p*fq)/S;\n",
+       "    p = 16777216 + (p*fq)/S; p = 16777216 + (p*fq)/S; return p;\n",
+       "}\n",
+       "static inline long fxexp_neg(long ax) { long k = ax / LN2; long fq = ax - k*LN2; long ef = exp_poly(fq); long emf = S48 / ef; if (k >= 50) return 0; long p2 = fx_pow2(k); return (emf + p2/2) / p2; }\n",
+       "static inline void softmax_row(device const long* P, uint i, uint qb, thread long* p) {\n",
+       "    long sc[", show seqL, "];\n",
+       "    for (uint j = 0; j <= i; j++) { long raw = 0; for (uint c = 0; c < HD; c++) raw += P[i*QDIM+qb+c] * P[OFF_K+j*QDIM+qb+c]; raw = raw >> 24; sc[j] = (raw * SCALEQ) / S; }\n",
+       "    long m = sc[0]; for (uint j = 1; j <= i; j++) if (sc[j] > m) m = sc[j];\n",
+       "    long sm = 0; long e[", show seqL, "]; for (uint j = 0; j <= i; j++) { long ee = fxexp_neg(m - sc[j]); e[j] = ee; sm += ee; }\n",
+       "    for (uint j = 0; j <= i; j++) p[j] = (e[j] * S) / sm;\n",
+       "}\n",
+       "static inline void dp_row(device const long* P, device const long* U, uint i, uint qb, thread long* dp) {\n",
+       "    for (uint j = 0; j <= i; j++) { long acc = 0; for (uint c = 0; c < HD; c++) acc += mul_shr_gpu(U[i*QDIM+qb+c], P[OFF_V+j*QDIM+qb+c], 24); dp[j] = acc; }\n",
+       "}\n",
+       "static inline void draw_row(device const long* P, device const long* U, uint i, uint qb, thread long* draw) {\n",
+       "    long p[", show seqL, "]; long dp[", show seqL, "]; softmax_row(P, i, qb, p); dp_row(P, U, i, qb, dp);\n",
+       "    long dot = 0; for (uint j = 0; j <= i; j++) dot += mul_shr_gpu(p[j], dp[j], 24);\n",
+       "    for (uint j = 0; j <= i; j++) { long ds = mul_shr_gpu(p[j], dp[j] - dot, 24); draw[j] = (ds * SCALEQ) / S; }\n",
+       "}\n\n",
+       "kernel void fx_attn_bwd_p(device const long *P [[buffer(0)]], device const long *U [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= 3 * L * NH) return;\n",
+       "    uint region = gid / (L * NH); uint rem = gid % (L * NH); uint pos = rem / NH; uint h = rem % NH; uint qb = h * HD;\n",
+       "    if (region == 0) {\n",
+       "        uint i = pos; long draw[", show seqL, "]; draw_row(P, U, i, qb, draw);\n",
+       "        for (uint c = 0; c < HD; c++) { long acc = 0; for (uint j = 0; j <= i; j++) acc += mul_shr_gpu(draw[j], P[OFF_K+j*QDIM+qb+c], 24); O[i*QDIM+qb+c] = acc; }\n",
+       "    } else if (region == 1) {\n",
+       "        uint j = pos; long dkacc[", show hd, "]; for (uint c = 0; c < HD; c++) dkacc[c] = 0;\n",
+       "        for (uint i = j; i < L; i++) { long draw[", show seqL, "]; draw_row(P, U, i, qb, draw); for (uint c = 0; c < HD; c++) dkacc[c] += mul_shr_gpu(draw[j], P[i*QDIM+qb+c], 24); }\n",
+       "        for (uint c = 0; c < HD; c++) O[OFF_DK + j*QDIM+qb+c] = dkacc[c];\n",
+       "    } else {\n",
+       "        uint j = pos; long dvacc[", show hd, "]; for (uint c = 0; c < HD; c++) dvacc[c] = 0;\n",
+       "        for (uint i = j; i < L; i++) { long p[", show seqL, "]; softmax_row(P, i, qb, p); for (uint c = 0; c < HD; c++) dvacc[c] += mul_shr_gpu(U[i*QDIM+qb+c], p[j], 24); }\n",
+       "        for (uint c = 0; c < HD; c++) O[OFF_DV + j*QDIM+qb+c] = dvacc[c];\n",
+       "    }\n",
+       "}\n"]
+
+-- Backward-glue kernels (attested-GPU track, act 19) -- the small ops that
+-- chain the block backward + one SGD step.  All at F=24, mul_shr_gpu.
+
+-- Elementwise fixed-point multiply O[i]=A[i]*B[i]>>24 (A=buf0, B=buf1).
+-- Used for dh1 = dh2 (x) gelu'(h1) in the MLP backward.
+emit_msl_fx_elemul24 n =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint N = ", show n, ";\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) { long hi=mulhi(a,b); ulong lo=(ulong)a*(ulong)b; return (hi<<(64-s))|(long)(lo>>s); }\n\n",
+       "kernel void fx_elemul(device const long *A [[buffer(0)]], device const long *B [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= N) return;\n",
+       "    O[gid] = mul_shr_gpu(A[gid], B[gid], 24);\n",
+       "}\n"]
+
+-- Weight-gradient accumulate over tokens: dW[o,i] = sum_t dy[t,o]*x[t,i] >>24.
+-- Packed P = dy(L*OUT) | x(L*K); one thread per output row o.  This is the
+-- multi-token weight gradient (the act-16 wupdate was single-token fused).
+emit_msl_fx_wgrad24_shaped out k seqL =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint OUT = ", show out, ";\n",
+       "constant uint K = ",   show k,   ";\n",
+       "constant uint L = ",   show seqL, ";\n",
+       "constant uint OFF_X = L * OUT;\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) { long hi=mulhi(a,b); ulong lo=(ulong)a*(ulong)b; return (hi<<(64-s))|(long)(lo>>s); }\n\n",
+       "kernel void fx_wgrad(device const long *P [[buffer(0)]], device const long *U [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= OUT) return;\n",
+       "    for (uint i = 0; i < K; i++) {\n",
+       "        long acc = 0;\n",
+       "        for (uint t = 0; t < L; t++) acc += mul_shr_gpu(P[t*OUT+gid], P[OFF_X + t*K + i], 24);\n",
+       "        O[gid*K + i] = acc;\n",
+       "    }\n",
+       "}\n"]
+
+-- Elementwise SGD apply: O[i] = W[i] - lr*dW[i]>>24  (W=buf0, dW=buf1).
+emit_msl_fx_sgd_apply n lr_num =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint N = ", show n, ";\n",
+       "constant long FX_LR = ", show lr_num, ";\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) { long hi=mulhi(a,b); ulong lo=(ulong)a*(ulong)b; return (hi<<(64-s))|(long)(lo>>s); }\n\n",
+       "kernel void fx_sgd_apply(device const long *W [[buffer(0)]], device const long *G [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= N) return;\n",
+       "    O[gid] = W[gid] - mul_shr_gpu(FX_LR, G[gid], 24);\n",
+       "}\n"]
+
+-- F=24 AdamW update, twin of the CPU fx_adam (fx_adam_gate.rail). One thread per
+-- weight element. Bias-correction c1,c2 (=1-beta^t) change per step, so they ride
+-- in the packed buffer rather than being baked; lr/beta1/beta2/eps are constants.
+-- fx_sqrt24 = pure-integer binary search matching Path-B bx4_fxsqrt bit-for-bit
+-- (same move as fx_rsqrt above), so a CPU twin using mul_shr lands identical bits.
+--   P (buffer0), size 3N+2: W[0..N) | m[N..2N) | v[2N..3N) | c1@[3N] | c2@[3N+1]
+--   G (buffer1), size N: gradient (already summed; caller means it by scaling lr)
+--   O (buffer2), size 3N: W'[0..N) | m'[N..2N) | v'[2N..3N)
+-- CRITICAL (measured in fx_adam_gate): EPS must be ~1e-3 (16777) in F=24, not the
+-- fp32-default 1e-8 -- else v=g^2 underflows to 0 and the update mhat/eps explodes.
+emit_msl_fx_adam_step n b1 b2 eps lr =
+  cat ["#include <metal_stdlib>\n", "using namespace metal;\n\n",
+       "constant uint N = ", show n, ";\n",
+       "constant long B1 = ", show b1, ";\n",
+       "constant long B2 = ", show b2, ";\n",
+       "constant long EPS = ", show eps, ";\n",
+       "constant long LR = ", show lr, ";\n",
+       "constant long ONE = 16777216;\n",
+       "static inline long mul_shr_gpu(long a, long b, uint s) { long hi=mulhi(a,b); ulong lo=(ulong)a*(ulong)b; return (hi<<(64-s))|(long)(lo>>s); }\n",
+       "static inline long fx_sqrt24(long xq) {\n",
+       "    if (xq < 1) return 0;\n",
+       "    long lo = 0; long hi = 1099511627776;\n",
+       "    while (lo + 1 < hi) {\n",
+       "        long mid = (lo + hi) / 2;\n",
+       "        long hr = mul_shr_gpu(mid, mid, 24);\n",
+       "        bool le;\n",
+       "        if (hr < xq) le = true; else if (hr > xq) le = false;\n",
+       "        else { long c = mid - (mid/ONE)*ONE; long cc = c*c; le = ((cc - (cc/ONE)*ONE) == 0); }\n",
+       "        if (le) lo = mid; else hi = mid;\n",
+       "    }\n",
+       "    return lo;\n",
+       "}\n\n",
+       "kernel void fx_adam(device const long *P [[buffer(0)]], device const long *G [[buffer(1)]], device long *O [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n",
+       "    if (gid >= N) return;\n",
+       "    long g = G[gid];\n",
+       "    long w = P[gid];\n",
+       "    long mprev = P[N + gid];\n",
+       "    long vprev = P[2*N + gid];\n",
+       "    long c1 = P[3*N];\n",
+       "    long c2 = P[3*N + 1];\n",
+       "    long mo = mul_shr_gpu(B1, mprev, 24) + mul_shr_gpu(ONE - B1, g, 24);\n",
+       "    long g2 = mul_shr_gpu(g, g, 24);\n",
+       "    long vo = mul_shr_gpu(B2, vprev, 24) + mul_shr_gpu(ONE - B2, g2, 24);\n",
+       "    long mhat = (mo * ONE) / c1;\n",
+       "    long vhat = (vo * ONE) / c2;\n",
+       "    long denom = fx_sqrt24(vhat) + EPS;\n",
+       "    long upd = (denom == 0) ? 0 : (mhat * ONE) / denom;\n",
+       "    O[gid] = w - mul_shr_gpu(LR, upd, 24);\n",
+       "    O[N + gid] = mo;\n",
+       "    O[2*N + gid] = vo;\n",
+       "}\n"]
+
+-- ───────────────────────────────────────────────────────────────────────
 -- Shape extraction helpers.  Pull SEQ/D out of a JitNode's .shape field.
 -- The rmsnorm node's shape is [seq, d].  The silu node's shape is [seq, d_ff];
 -- its N = seq * d_ff.

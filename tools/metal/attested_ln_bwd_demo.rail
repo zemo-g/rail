@@ -1,0 +1,84 @@
+-- attested_ln_bwd_demo.rail -- twin-kernel attestation, act 17.
+-- LayerNorm-backward on GPU, F=24, twin-verified vs the model's own
+-- fixed-point CPU math.  This is the first of the two backward ops the
+-- full 16-layer backprop needs (attention-backward is act 18).
+--
+-- dx for GPT-style LayerNorm (mean-subtract + population variance + affine),
+-- matching gp_layernorm/bx4_fxrsqrt (pathb) exactly:
+--   dxhat_i = dy_i*gamma_i
+--   dx_i = inv * (dxhat_i - mean(dxhat) - xhat_i*mean(dxhat*xhat))
+--
+-- run: ./rail_native run tools/metal/attested_ln_bwd_demo.rail
+
+import "stdlib/ijit.rail"
+import "stdlib/sha256.rail"
+
+-- ===== F=24 sqrt/rsqrt (verbatim from bx_fixed.rail) =====
+bx4_sqrt_le r xq =
+  let hr = mul_shr r r 24 in
+  if hr < xq then true
+  else if hr > xq then false
+  else let c = r - (r / 16777216) * 16777216 in let cc = c * c in (cc - (cc / 16777216) * 16777216) == 0
+bx4_bsqrt lo hi xq = if (lo + 1) >= hi then lo else let mid = (lo + hi) / 2 in if bx4_sqrt_le mid xq then bx4_bsqrt mid hi xq else bx4_bsqrt lo mid xq
+bx4_fxsqrt xq = if xq < 1 then 0 else let a = 16384 in bx4_bsqrt 0 ((a * a) * 4096) xq
+bx4_fxrsqrt xq = let q = bx4_fxsqrt xq in if q == 0 then 0 else 281474976710656 / q
+
+-- ===== CPU twin: LayerNorm-backward dx (separate x, g, dy arrays) =====
+lnb_sum x base d i acc = if i >= d then acc else lnb_sum x base d (i + 1) (acc + (arr_get x (base + i)))
+lnb_var x base d mean i acc = if i >= d then acc else let dxc = (arr_get x (base + i)) - mean in lnb_var x base d mean (i + 1) (acc + (mul_shr dxc dxc 24))
+lnb_sum1 g dy base d i acc = if i >= d then acc else lnb_sum1 g dy base d (i + 1) (acc + (mul_shr (arr_get dy (base + i)) (arr_get g i) 24))
+lnb_sum2 x g dy base d mean inv i acc = if i >= d then acc else let xhat = mul_shr ((arr_get x (base + i)) - mean) inv 24 in let dxh = mul_shr (arr_get dy (base + i)) (arr_get g i) 24 in lnb_sum2 x g dy base d mean inv (i + 1) (acc + (mul_shr dxh xhat 24))
+lnb_dxrow x g dy dxo base d mean inv m1 m2 i =
+  if i >= d then 0
+  else let xhat = mul_shr ((arr_get x (base + i)) - mean) inv 24 in
+       let dxh = mul_shr (arr_get dy (base + i)) (arr_get g i) 24 in
+       let _ = arr_set dxo (base + i) (mul_shr inv (dxh - m1 - (mul_shr xhat m2 24)) 24) in
+       lnb_dxrow x g dy dxo base d mean inv m1 m2 (i + 1)
+lnb_rows x g dy dxo rows d r =
+  if r >= rows then 0
+  else let base = r * d in
+       let mean = (lnb_sum x base d 0 0) / d in
+       let var = (lnb_var x base d mean 0 0) / d in
+       let inv = bx4_fxrsqrt (var + 168) in
+       let m1 = (lnb_sum1 g dy base d 0 0) / d in
+       let m2 = (lnb_sum2 x g dy base d mean inv 0 0) / d in
+       let _ = lnb_dxrow x g dy dxo base d mean inv m1 m2 0 in
+       lnb_rows x g dy dxo rows d (r + 1)
+
+-- ===== helpers =====
+lcg s = ((s * 1103515245) + 12345) % 2147483648
+fillv a n s i lo rng = if i >= n then s else let s2 = lcg s in let _ = arr_set a i ((s2 % rng) - lo) in fillv a n s2 (i + 1) lo rng
+cpseg src soff dst doff n i = if i >= n then 0 else let _ = arr_set dst (doff + i) (arr_get src (soff + i)) in cpseg src soff dst doff n (i + 1)
+cmp_arr a b n i mism = if i >= n then mism else cmp_arr a b n (i + 1) (if (arr_get a i) == (arr_get b i) then mism else mism + 1)
+seg_text a base m i acc = if i >= m then join " " (reverse acc) else seg_text a base m (i + 1) (cons (show (arr_get a (base + i))) acc)
+sha_arr a n = bytes_to_hex (sha256_finalize (sha256_update_str (sha256_init 0) (seg_text a 0 n 0 []))) 32
+
+run_ln rows d =
+  let x = arr_new (rows * d) 0 in let _ = fillv x (rows * d) 771 0 1048576 2097152 in   -- x ~ +-2^20
+  let g = arr_new d 0 in let _ = fillv g d 553 0 8388608 16777216 in                    -- gamma ~ 0.5..1.5
+  let dy = arr_new (rows * d) 0 in let _ = fillv dy (rows * d) 997 0 524288 1048576 in   -- dy ~ +-2^19
+  -- CPU twin
+  let dxc = arr_new (rows * d) 0 in let _ = lnb_rows x g dy dxc rows d 0 in
+  -- GPU in-process: P = X | gamma | dy
+  let sizeA = (rows * d) + d + (rows * d) in
+  let P = arr_new sizeA 0 in
+  let _ = cpseg x 0 P 0 (rows * d) 0 in
+  let _ = cpseg g 0 P (rows * d) d 0 in
+  let _ = cpseg dy 0 P ((rows * d) + d) (rows * d) 0 in
+  let kid = ijit_compile (emit_msl_fx_layernorm_bwd_shaped rows d) in
+  let _ = if kid < 0 then print (cat ["  COMPILE FAIL kid=", show kid]) else 0 in
+  let dxg = arr_new (rows * d) 0 in
+  let _ = ijit_run kid P P dxg sizeA 1 (rows * d) rows in
+  let mism = cmp_arr dxc dxg (rows * d) 0 0 in
+  let _ = print (cat ["  rows=", show rows, " d=", show d, "  ", show mism, " mism   dx[0..2]=",
+    show (arr_get dxg 0), " ", show (arr_get dxg 1), " ", show (arr_get dxg 2),
+    "   cpu==gpu ", if (sha_arr dxc (rows * d)) == (sha_arr dxg (rows * d)) then "MATCH" else "DIFFER"]) in
+  mism
+
+main =
+  let _ = print "twin-kernel attestation act 17 (LayerNorm-backward on GPU, F=24):" in
+  let m1 = run_ln 2 64 in
+  let m2 = run_ln 8 768 in
+  let total = m1 + m2 in
+  let _ = print (cat ["  verdict: ", if total == 0 then "LN-BWD-TWINS-AGREE" else "DIVERGE"]) in
+  if total == 0 then 0 else 1

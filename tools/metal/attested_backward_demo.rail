@@ -1,0 +1,120 @@
+-- attested_backward_demo.rail — twin-kernel attestation, act 15 (2026-07-04).
+--
+-- THE BACKWARD PASS for the GPT family, F=24.  Two primitive classes
+-- cover transformer backprop, both twin-verified vs the model's own
+-- fixed-point CPU math:
+--   * linear-backward  dx = W^T . dy  (transpose matvec, idot semantics)
+--   * nonlinear-backward gelu'(x) = bx4_gelu_grad (transcendental
+--     derivative -- a fixed-point algorithm, so bit-exact by construction)
+-- (dW = dy (x) x + SGD update is act 10.)  With these + the forward
+-- ops (acts 11-13), an attested training step of the real 138M model
+-- is assembly.
+--
+-- run: ./rail_native run tools/metal/attested_backward_demo.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+-- ==== F=24 exp/tanh/gelu-grad chain (bx_fixed.rail), CPU twin ====
+bx4_pow2_go acc k = if k == 0 then acc else bx4_pow2_go (acc + acc) (k - 1)
+bx4_pow2 k = if k < 1 then 1 else bx4_pow2_go 1 k
+bx4_exp_poly fq =
+  let p8 = 416 in
+  let p7 = 3329 + (p8 * fq) / 16777216 in
+  let p6 = 23302 + (p7 * fq) / 16777216 in
+  let p5 = 139810 + (p6 * fq) / 16777216 in
+  let p4 = 699051 + (p5 * fq) / 16777216 in
+  let p3 = 2796203 + (p4 * fq) / 16777216 in
+  let p2 = 8388608 + (p3 * fq) / 16777216 in
+  let p1 = 16777216 + (p2 * fq) / 16777216 in
+  16777216 + (p1 * fq) / 16777216
+bx4_exp_neg ax =
+  let k = ax / 11629080 in
+  let fq = ax - k * 11629080 in
+  let ef = bx4_exp_poly fq in
+  let emf = 281474976710656 / ef in
+  if k >= 50 then 0 else let p2 = bx4_pow2 k in (emf + p2 / 2) / p2
+bx4_tanh_pos axq = let em = bx4_exp_neg (axq + axq) in ((16777216 - em) * 16777216) / (16777216 + em)
+bx4_tanh xq = if xq < 0 then 0 - (bx4_tanh_pos (0 - xq)) else bx4_tanh_pos xq
+bx4_gelu_grad xq =
+  let x2 = (xq * xq) / 16777216 in
+  let x3 = (x2 * xq) / 16777216 in
+  let ax3 = (750194 * x3) / 16777216 in
+  let inner0 = xq + ax3 in
+  let u = (13386610 * inner0) / 16777216 in
+  let t = bx4_tanh u in
+  let term1 = (16777216 + t) / 2 in
+  let sech2 = 16777216 - (t * t) / 16777216 in
+  let a3x2 = (3 * (750194 * x2)) / 16777216 in
+  let inner1 = 16777216 + a3x2 in
+  let dudx = (13386610 * inner1) / 16777216 in
+  let p1 = (xq * sech2) / 16777216 in
+  let p2 = (p1 * dudx) / 16777216 in
+  term1 + p2 / 2
+
+-- CPU twin: dx = W^T . dy ; W [OUT x K] row-major
+bwd_col w dy out k i o acc = if o >= out then acc else bwd_col w dy out k i (o + 1) (acc + ((arr_get w (o * k + i)) * (arr_get dy o)))
+bwd_dx w dy dx out k i = if i >= k then 0 else let _ = arr_set dx i (mul_shr (bwd_col w dy out k i 0 0) 1 24) in bwd_dx w dy dx out k (i + 1)
+gg_rows inp out n i = if i >= n then 0 else let _ = arr_set out i (bx4_gelu_grad (arr_get inp i)) in gg_rows inp out n (i + 1)
+
+lcg s = ((s * 1103515245) + 12345) % 2147483648
+fillv a n s i lo rng = if i >= n then s else let s2 = lcg s in let _ = arr_set a i ((s2 % rng) - lo) in fillv a n s2 (i + 1) lo rng
+out_text o n i accl = if i >= n then join "\n" (reverse accl) else out_text o n (i + 1) (cons (show (arr_get o i)) accl)
+pi_digits cs acc = if (length cs) == 0 then acc else pi_digits (tail cs) ((acc * 10) + ((char_to_int (head cs)) - 48))
+parse_i s = if (length (chars s)) == 0 then 0 else let cs = chars s in if (head cs) == "-" then 0 - (pi_digits (tail cs) 0) else pi_digits cs 0
+cmp_walk lines cpu i n mism = if i >= n then mism else let g = parse_i (head lines) in cmp_walk (tail lines) cpu (i + 1) n (if g == (arr_get cpu i) then mism else mism + 1)
+copy_seg src soff dst n i = if i >= n then 0 else let _ = arr_set dst i (arr_get src (soff + i)) in copy_seg src soff dst n (i + 1)
+
+main =
+  let d = 768 in
+  let _ = shell "mkdir -p /tmp/agk" in
+  let _ = shell "test -x /tmp/agk/ikernel_harness || clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  -- ===== 1. linear-backward dx = W^T . dy (768x768 W, real-scale) =====
+  let mmtotal = (d * d) + d in
+  let bp = arr_new mmtotal 0 in
+  let s1 = fillv bp (d * d) 771 0 524288 1048576 in
+  let _ = fillv bp mmtotal s1 (d * d) 8388608 16777216 in
+  let _ = write_file "/tmp/agk/bwd_P.txt" (cat [out_text bp mmtotal 0 [], "\n"]) in
+  let w = arr_new (d * d) 0 in let dy = arr_new d 0 in
+  let _ = copy_seg bp 0 w (d * d) 0 in let _ = copy_seg bp (d * d) dy d 0 in
+  let dx = arr_new d 0 in
+  let _ = bwd_dx w dy dx d d 0 in
+  let dxtext = cat [out_text dx d 0 [], "\n"] in
+  let bmsl = emit_msl_fx_matmul_bwd_shaped d d in
+  let _ = write_file "/tmp/agk/fx_mmbwd.metal" bmsl in
+  let bcols = mmtotal / d in
+  let bcmd = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_mmbwd.metal fx_matmul_bwd /tmp/agk/bwd_P.txt /tmp/agk/bwd_P.txt ", show d, " ", show bcols, " /tmp/agk/bwd_gpu.txt i64 on=", show d, " 2>/dev/null"] in
+  let _ = shell bcmd in
+  let bgtext = read_file "/tmp/agk/bwd_gpu.txt" in
+  let b_mism = cmp_walk (split "\n" bgtext) dx 0 d 0 in
+  let b_ch = sha256_hex dxtext in let b_gh = sha256_hex bgtext in
+  -- ===== 2. nonlinear-backward gelu'(x) sweep =====
+  let n = 512 in
+  let gin = arr_new n 0 in
+  let _ = fillv gin n 991 0 100663296 201326592 in
+  let _ = write_file "/tmp/agk/gg_in.txt" (cat [out_text gin n 0 [], "\n"]) in
+  let gcpu = arr_new n 0 in
+  let _ = gg_rows gin gcpu n 0 in
+  let gmsl = emit_msl_fx_gelu_grad24_shaped n in
+  let _ = write_file "/tmp/agk/fx_gg.metal" gmsl in
+  let gcmd = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_gg.metal fx_gelu_grad /tmp/agk/gg_in.txt /tmp/agk/gg_in.txt ", show n, " 1 /tmp/agk/gg_gpu.txt i64 on=", show n, " 2>/dev/null"] in
+  let _ = shell gcmd in
+  let ggtext = read_file "/tmp/agk/gg_gpu.txt" in
+  let g_mism = cmp_walk (split "\n" ggtext) gcpu 0 n 0 in
+  let g_ch = sha256_hex (cat [out_text gcpu n 0 [], "\n"]) in let g_gh = sha256_hex ggtext in
+  let total = b_mism + g_mism in
+  let verdict = if total == 0 then "BACKWARD-TWINS-AGREE" else "BACKWARD-TWINS-DIVERGE" in
+  let record = cat ["{\n",
+    "  \"schema\": \"attested-backward-v0\",\n",
+    "  \"ops\": \"linear-backward (dx=W^T.dy) + nonlinear-backward (gelu') F=24\",\n",
+    "  \"linear\": {\"d\": ", show d, ", \"cpu_sha256\": \"", b_ch, "\", \"gpu_sha256\": \"", b_gh, "\", \"mismatches\": ", show b_mism, "},\n",
+    "  \"gelu_grad\": {\"n\": ", show n, ", \"cpu_sha256\": \"", g_ch, "\", \"gpu_sha256\": \"", g_gh, "\", \"mismatches\": ", show g_mism, "},\n",
+    "  \"verdict\": \"", verdict, "\"\n}\n"] in
+  let _ = write_file "/tmp/agk/backward_record.json" record in
+  let _ = print "twin-kernel attestation act 15 (BACKWARD pass on GPU, F=24):" in
+  let _ = print (cat ["  linear dx=W^T.dy (768):   ", show b_mism, " mismatches; dx[0..2] ", show (arr_get dx 0), " ", show (arr_get dx 1), " ", show (arr_get dx 2)]) in
+  let _ = print (cat ["  gelu' sweep (512):        ", show g_mism, " mismatches; gelu'(0)=", show (bx4_gelu_grad 0), " (~0.5*S=8388608)"]) in
+  let _ = print (cat ["  linear cpu==gpu:          ", if b_ch == b_gh then "MATCH" else "DIFFER"]) in
+  let _ = print (cat ["  gelu'  cpu==gpu:          ", if g_ch == g_gh then "MATCH" else "DIFFER"]) in
+  let _ = print (cat ["  verdict:                  ", verdict]) in
+  if total == 0 then 0 else 1

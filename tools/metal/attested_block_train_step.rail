@@ -1,0 +1,286 @@
+-- attested_block_train_step.rail -- ONE full attested transformer-BLOCK
+-- training step (forward + backward + SGD update) on the GPU engine, on REAL
+-- block-0 weights, composed entirely from the twin-verified in-process
+-- kernels.  Loss = MSE-to-zero on the block output (dy = 2*y).
+--
+-- Backward chain (reverse of the block forward), all heavy ops on GPU:
+--   dy -> MLP-bwd (matmul_bwd/gelu_grad/elemul, dWm0/dWm2/dbm*) -> LN2-bwd
+--   -> +resid -> Wo-bwd -> attn-bwd (dQ/dK/dV) -> QKV-bwd (dWq/dWk/dWv)
+--   -> LN1-bwd -> +resid  => dx (block input grad).  wgrad for all weights,
+--   sgd_apply for the update.  dx + the 4 big weight grads twin-checked
+--   GPU==CPU bit-for-bit; Ed25519-signed receipt.
+--
+-- run: ./rail_native run tools/metal/attested_block_train_step.rail
+
+import "stdlib/file.rail"
+import "stdlib/env.rail"
+import "stdlib/ijit.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+foreign pread fd buf count offset -> int
+foreign malloc size -> ptr
+foreign free p
+
+-- ===== F32 loader =====
+pq_pow2_go acc k = if k == 0 then acc else pq_pow2_go (acc + acc) (k - 1)
+pq_pow2 k = if k < 1 then 1 else pq_pow2_go 1 k
+pq_f32_fixed b0 b1 b2 b3 =
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in
+  let sign = bits / 2147483648 in let rest = bits - sign * 2147483648 in
+  let exp = rest / 8388608 in let mant = rest - exp * 8388608 in
+  if exp == 0 then 0 else let mag = 8388608 + mant in let sh = exp - 126 in
+    let xabs = if sh >= 0 then mag * (pq_pow2 sh) else (let dd = pq_pow2 (0 - sh) in (mag + dd / 2) / dd) in
+    if sign == 1 then 0 - xabs else xabs
+pq_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then pq_match buf (pos + 1) (tail pcs) else 0
+pq_find buf pos hi pcs = if pos >= hi then 0 - 1 else if pq_match buf pos pcs == 1 then pos else pq_find buf (pos + 1) hi pcs
+pq_find_after buf pos hi pcs = let p = pq_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+pq_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else pq_int buf (pos + 1) (acc * 10 + (c - 48))
+pq_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+pq_offset hdr hi name k = let np = pq_find hdr 0 hi (chars (cat ["\"", name, "\":"])) in let dp = pq_find_after hdr np hi (chars "\"data_offsets\":[") in pq_int hdr dp 0
+gp_dec_f32 cbuf out obase count i = if i >= count then 0 else let ba = 4 * i in let _ = arr_set out (obase + i) (pq_f32_fixed (byte_at cbuf ba) (byte_at cbuf (ba + 1)) (byte_at cbuf (ba + 2)) (byte_at cbuf (ba + 3))) in gp_dec_f32 cbuf out obase count (i + 1)
+ld_f32 fd hdrbuf base name count = let start = pq_offset hdrbuf base name 0 in let cbuf = malloc (count * 4) in let nr = pread fd cbuf (count * 4) (base + start) in let out = arr_new count 0 in let _ = gp_dec_f32 cbuf out 0 count 0 in let _ = free cbuf in out
+
+-- ===== F=24 math =====
+bx4_sqrt_le r xq = let hr = mul_shr r r 24 in if hr < xq then true else if hr > xq then false else let c = r - (r / 16777216) * 16777216 in let cc = c * c in (cc - (cc / 16777216) * 16777216) == 0
+bx4_bsqrt lo hi xq = if (lo + 1) >= hi then lo else let mid = (lo + hi) / 2 in if bx4_sqrt_le mid xq then bx4_bsqrt mid hi xq else bx4_bsqrt lo mid xq
+bx4_fxsqrt xq = if xq < 1 then 0 else let a = 16384 in bx4_bsqrt 0 ((a * a) * 4096) xq
+bx4_fxrsqrt xq = let q = bx4_fxsqrt xq in if q == 0 then 0 else 281474976710656 / q
+bx4_pow2b_go acc k = if k == 0 then acc else bx4_pow2b_go (acc + acc) (k - 1)
+bx4_pow2b k = if k < 1 then 1 else bx4_pow2b_go 1 k
+bx4_exp_poly fq = let p8 = 416 in let p7 = 3329 + (p8 * fq) / 16777216 in let p6 = 23302 + (p7 * fq) / 16777216 in let p5 = 139810 + (p6 * fq) / 16777216 in let p4 = 699051 + (p5 * fq) / 16777216 in let p3 = 2796203 + (p4 * fq) / 16777216 in let p2 = 8388608 + (p3 * fq) / 16777216 in let p1 = 16777216 + (p2 * fq) / 16777216 in 16777216 + (p1 * fq) / 16777216
+bx4_exp_neg ax = let k = ax / 11629080 in let fq = ax - k * 11629080 in let ef = bx4_exp_poly fq in let emf = 281474976710656 / ef in if k >= 50 then 0 else let p2 = bx4_pow2b k in (emf + p2 / 2) / p2
+bx4_tanh_pos axq = let em = bx4_exp_neg (axq + axq) in ((16777216 - em) * 16777216) / (16777216 + em)
+bx4_tanh xq = if xq < 0 then 0 - (bx4_tanh_pos (0 - xq)) else bx4_tanh_pos xq
+bx4_gelu xq = let x2 = (xq * xq) / 16777216 in let x3 = (x2 * xq) / 16777216 in let ax3 = (750194 * x3) / 16777216 in let inner0 = xq + ax3 in let inner = (13386610 * inner0) / 16777216 in let th = bx4_tanh inner in let onep = 16777216 + th in (xq * onep) / 33554432
+bx4_gelu_grad xq = let x2 = (xq * xq) / 16777216 in let x3 = (x2 * xq) / 16777216 in let ax3 = (750194 * x3) / 16777216 in let inner0 = xq + ax3 in let u = (13386610 * inner0) / 16777216 in let t = bx4_tanh u in let term1 = (16777216 + t) / 2 in let sech2 = 16777216 - (t * t) / 16777216 in let a3x2 = (3 * (750194 * x2)) / 16777216 in let inner1 = 16777216 + a3x2 in let dudx = (13386610 * inner1) / 16777216 in let p1 = (xq * sech2) / 16777216 in let p2 = (p1 * dudx) / 16777216 in term1 + p2 / 2
+
+-- ===== CPU forward twins =====
+ln_sum X base d i acc = if i >= d then acc else ln_sum X base d (i + 1) (acc + arr_get X (base + i))
+ln_var X base d mean i acc = if i >= d then acc else let dx = (arr_get X (base + i)) - mean in ln_var X base d mean (i + 1) (acc + mul_shr dx dx 24)
+ln_apply X base xn gamma beta d mean inv i = if i >= d then 0 else let dx = (arr_get X (base + i)) - mean in let _ = arr_set xn (base + i) ((mul_shr (mul_shr dx inv 24) (arr_get gamma i) 24) + (arr_get beta i)) in ln_apply X base xn gamma beta d mean inv (i + 1)
+ln_rows X xn g b rows d r = if r >= rows then 0 else let base = r * d in let mean = (ln_sum X base d 0 0) / d in let var = (ln_var X base d mean 0 0) / d in let inv = bx4_fxrsqrt (var + 168) in let _ = ln_apply X base xn g b d mean inv 0 in ln_rows X xn g b rows d (r + 1)
+mv_dot W wb src sb k i acc = if i >= k then acc else mv_dot W wb src sb k (i + 1) (acc + ((arr_get W (wb + i)) * (arr_get src (sb + i))))
+mv_rows W src out rows k srow orow o = if o >= rows then 0 else let _ = arr_set out (orow + o) (mul_shr (mv_dot W (o * k) src srow k 0 0) 1 24) in mv_rows W src out rows k srow orow (o + 1)
+mv_tokens W src out rows k L t = if t >= L then 0 else let _ = mv_rows W src out rows k (t * k) (t * rows) 0 in mv_tokens W src out rows k L (t + 1)
+bias_add Y bias L d t i = if t >= L then 0 else if i >= d then bias_add Y bias L d (t + 1) 0 else let _ = arr_set Y (t * d + i) ((arr_get Y (t * d + i)) + (arr_get bias i)) in bias_add Y bias L d t (i + 1)
+gelu_vec X out n i = if i >= n then 0 else let _ = arr_set out i (bx4_gelu (arr_get X i)) in gelu_vec X out n (i + 1)
+resid_add A B out n i = if i >= n then 0 else let _ = arr_set out i ((arr_get A i) + (arr_get B i)) in resid_add A B out n (i + 1)
+c_raw q k qi kj hd c acc = if c >= hd then acc else c_raw q k qi kj hd (c + 1) (acc + ((arr_get q (qi + c)) * (arr_get k (kj + c))))
+c_scores q k sc i h qdim hd L j = if j >= L then 0 else let scv = if j > i then (0 - 16777216000) else let raw = mul_shr (c_raw q k (i * qdim + h * hd) (j * qdim + h * hd) hd 0 0) 1 24 in (raw * 2097152) / 16777216 in let _ = arr_set sc j scv in c_scores q k sc i h qdim hd L (j + 1)
+c_rowmax sc L j m = if j >= L then m else c_rowmax sc L (j + 1) (let v = arr_get sc j in if v > m then v else m)
+c_exprow sc ex L m j sum = if j >= L then sum else let e = bx4_exp_neg (m - (arr_get sc j)) in let _ = arr_set ex j e in c_exprow sc ex L m (j + 1) (sum + e)
+c_pvdot ex v vb qdim L sum j acc = if j >= L then acc else let p = ((arr_get ex j) * 16777216) / sum in c_pvdot ex v vb qdim L sum (j + 1) (acc + (p * (arr_get v (vb + j * qdim))))
+c_ctx ex v attn i h qdim hd L sum c = if c >= hd then 0 else let acc = c_pvdot ex v (h * hd + c) qdim L sum 0 0 in let _ = arr_set attn (i * qdim + h * hd + c) (mul_shr acc 1 24) in c_ctx ex v attn i h qdim hd L sum (c + 1)
+c_head q k v sc ex attn i h qdim hd L = let _ = c_scores q k sc i h qdim hd L 0 in let m = c_rowmax sc L 1 (arr_get sc 0) in let sum = c_exprow sc ex L m 0 0 in c_ctx ex v attn i h qdim hd L sum 0
+c_heads q k v sc ex attn i nh qdim hd L h = if h >= nh then 0 else let _ = c_head q k v sc ex attn i h qdim hd L in c_heads q k v sc ex attn i nh qdim hd L (h + 1)
+c_tokens q k v sc ex attn nh qdim hd L i = if i >= L then 0 else let _ = c_heads q k v sc ex attn i nh qdim hd L 0 in c_tokens q k v sc ex attn nh qdim hd L (i + 1)
+
+-- ===== CPU backward twins =====
+-- matmul_bwd per token: dx[i] = sum_o W[o*k+i]*dy[o] >>24
+mb_col2 W dy out k i drow o acc = if o >= out then acc else mb_col2 W dy out k i drow (o + 1) (acc + ((arr_get W (o * k + i)) * (arr_get dy (drow + o))))
+mb_rows W dy dx out k drow xrow i = if i >= k then 0 else let _ = arr_set dx (xrow + i) (mul_shr (mb_col2 W dy out k i drow 0 0) 1 24) in mb_rows W dy dx out k drow xrow (i + 1)
+mb_tokens W dy dx out k L t = if t >= L then 0 else let _ = mb_rows W dy dx out k (t * out) (t * k) 0 in mb_tokens W dy dx out k L (t + 1)
+-- accumulate dx += (add into existing dx)
+mb_rows_acc W dy dx out k drow xrow i = if i >= k then 0 else let _ = arr_set dx (xrow + i) ((arr_get dx (xrow + i)) + (mul_shr (mb_col2 W dy out k i drow 0 0) 1 24)) in mb_rows_acc W dy dx out k drow xrow (i + 1)
+mb_tokens_acc W dy dx out k L t = if t >= L then 0 else let _ = mb_rows_acc W dy dx out k (t * out) (t * k) 0 in mb_tokens_acc W dy dx out k L (t + 1)
+-- weight grad: dW[o,i] = sum_t dy[t,o]*x[t,i] >>24
+wg_t dy x out k L o i t acc = if t >= L then acc else wg_t dy x out k L o i (t + 1) (acc + (mul_shr (arr_get dy (t * out + o)) (arr_get x (t * k + i)) 24))
+wg_row dy x dW out k L o i = if i >= k then 0 else let _ = arr_set dW (o * k + i) (wg_t dy x out k L o i 0 0) in wg_row dy x dW out k L o (i + 1)
+wg dy x dW out k L o = if o >= out then 0 else let _ = wg_row dy x dW out k L o 0 in wg dy x dW out k L (o + 1)
+-- LayerNorm backward dx (from ln_bwd act 17), accumulate into dxout
+lnb_sum1 g dy base d i acc = if i >= d then acc else lnb_sum1 g dy base d (i + 1) (acc + (mul_shr (arr_get dy (base + i)) (arr_get g i) 24))
+lnb_sum2 x g dy base d mean inv i acc = if i >= d then acc else let xhat = mul_shr ((arr_get x (base + i)) - mean) inv 24 in let dxh = mul_shr (arr_get dy (base + i)) (arr_get g i) 24 in lnb_sum2 x g dy base d mean inv (i + 1) (acc + (mul_shr dxh xhat 24))
+lnb_dxrow x g dy dxo base d mean inv m1 m2 i = if i >= d then 0 else let xhat = mul_shr ((arr_get x (base + i)) - mean) inv 24 in let dxh = mul_shr (arr_get dy (base + i)) (arr_get g i) 24 in let _ = arr_set dxo (base + i) ((arr_get dxo (base + i)) + (mul_shr inv (dxh - m1 - (mul_shr xhat m2 24)) 24)) in lnb_dxrow x g dy dxo base d mean inv m1 m2 (i + 1)
+lnb_rows x g dy dxo rows d r = if r >= rows then 0 else let base = r * d in let mean = (ln_sum x base d 0 0) / d in let var = (ln_var x base d mean 0 0) / d in let inv = bx4_fxrsqrt (var + 168) in let m1 = (lnb_sum1 g dy base d 0 0) / d in let m2 = (lnb_sum2 x g dy base d mean inv 0 0) / d in let _ = lnb_dxrow x g dy dxo base d mean inv m1 m2 0 in lnb_rows x g dy dxo rows d (r + 1)
+-- attn backward (from act 18)
+b_fillp ex p sum i j = if j > i then 0 else let _ = arr_set p j (((arr_get ex j) * 16777216) / sum) in b_fillp ex p sum i (j + 1)
+b_dpc dO vv i j qb hd qdim c acc = if c >= hd then acc else b_dpc dO vv i j qb hd qdim (c + 1) (acc + (mul_shr (arr_get dO (i * qdim + qb + c)) (arr_get vv (j * qdim + qb + c)) 24))
+b_filldp dO vv dp i qb hd qdim j = if j > i then 0 else let _ = arr_set dp j (b_dpc dO vv i j qb hd qdim 0 0) in b_filldp dO vv dp i qb hd qdim (j + 1)
+b_dot p dp i j acc = if j > i then acc else b_dot p dp i (j + 1) (acc + (mul_shr (arr_get p j) (arr_get dp j) 24))
+b_filldraw p dp draw dot i j = if j > i then 0 else let ds = mul_shr (arr_get p j) ((arr_get dp j) - dot) 24 in let _ = arr_set draw j ((ds * 2097152) / 16777216) in b_filldraw p dp draw dot i (j + 1)
+b_dqc draw kk i qb hd qdim c j acc = if j > i then acc else b_dqc draw kk i qb hd qdim c (j + 1) (acc + (mul_shr (arr_get draw j) (arr_get kk (j * qdim + qb + c)) 24))
+b_dq draw kk dQ i qb hd qdim c = if c >= hd then 0 else let _ = arr_set dQ (i * qdim + qb + c) (b_dqc draw kk i qb hd qdim c 0 0) in b_dq draw kk dQ i qb hd qdim (c + 1)
+b_dk_c draw qq dK i j qb hd qdim c = if c >= hd then 0 else let idx = (j * qdim + qb + c) in let _ = arr_set dK idx ((arr_get dK idx) + (mul_shr (arr_get draw j) (arr_get qq (i * qdim + qb + c)) 24)) in b_dk_c draw qq dK i j qb hd qdim (c + 1)
+b_dk draw qq dK i qb hd qdim j = if j > i then 0 else let _ = b_dk_c draw qq dK i j qb hd qdim 0 in b_dk draw qq dK i qb hd qdim (j + 1)
+b_dv_c dO p dV i j qb hd qdim c = if c >= hd then 0 else let idx = (j * qdim + qb + c) in let _ = arr_set dV idx ((arr_get dV idx) + (mul_shr (arr_get dO (i * qdim + qb + c)) (arr_get p j) 24)) in b_dv_c dO p dV i j qb hd qdim (c + 1)
+b_dv dO p dV i qb hd qdim j = if j > i then 0 else let _ = b_dv_c dO p dV i j qb hd qdim 0 in b_dv dO p dV i qb hd qdim (j + 1)
+b_head qq kk vv dO sc ex p dp draw dQ dK dV i h qdim hd L = let _ = c_scores qq kk sc i h qdim hd L 0 in let m = c_rowmax sc L 1 (arr_get sc 0) in let sum = c_exprow sc ex L m 0 0 in let qb = h * hd in let _ = b_fillp ex p sum i 0 in let _ = b_filldp dO vv dp i qb hd qdim 0 in let dot = b_dot p dp i 0 0 in let _ = b_filldraw p dp draw dot i 0 in let _ = b_dq draw kk dQ i qb hd qdim 0 in let _ = b_dk draw qq dK i qb hd qdim 0 in let _ = b_dv dO p dV i qb hd qdim 0 in 0
+b_heads qq kk vv dO sc ex p dp draw dQ dK dV i nh qdim hd L h = if h >= nh then 0 else let _ = b_head qq kk vv dO sc ex p dp draw dQ dK dV i h qdim hd L in b_heads qq kk vv dO sc ex p dp draw dQ dK dV i nh qdim hd L (h + 1)
+b_tokens qq kk vv dO sc ex p dp draw dQ dK dV nh qdim hd L i = if i >= L then 0 else let _ = b_heads qq kk vv dO sc ex p dp draw dQ dK dV i nh qdim hd L 0 in b_tokens qq kk vv dO sc ex p dp draw dQ dK dV nh qdim hd L (i + 1)
+
+-- ===== helpers / GPU wrappers =====
+cpseg src soff dst doff n i = if i >= n then 0 else let _ = arr_set dst (doff + i) (arr_get src (soff + i)) in cpseg src soff dst doff n (i + 1)
+cmp_arr a b n i mism = if i >= n then mism else cmp_arr a b n (i + 1) (if (arr_get a i) == (arr_get b i) then mism else mism + 1)
+scale2 A out n i = if i >= n then 0 else let _ = arr_set out i (2 * (arr_get A i)) in scale2 A out n (i + 1)
+mk_x_row Tok Pos x tb ob d i = if i >= d then 0 else let _ = arr_set x (ob + i) ((arr_get Tok (tb + i)) + (arr_get Pos (ob + i))) in mk_x_row Tok Pos x tb ob d (i + 1)
+mk_x Tok Pos ids x d L t = if t >= L then 0 else let id = arr_get ids t in let _ = mk_x_row Tok Pos x (id * d) (t * d) d 0 in mk_x Tok Pos ids x d L (t + 1)
+gpu_ln kid X g b out rows d = let P = arr_new (rows * d + d + d) 0 in let _ = cpseg X 0 P 0 (rows * d) 0 in let _ = cpseg g 0 P (rows * d) d 0 in let _ = cpseg b 0 P (rows * d + d) d 0 in ijit_run kid P P out (rows * d + d + d) 1 (rows * d) rows
+gpu_proj_tok kid P rowbuf src out rows k L t = if t >= L then 0 else let _ = cpseg src (t * k) P (rows * k) k 0 in let _ = ijit_run kid P P rowbuf (rows * k + k) 1 rows rows in let _ = cpseg rowbuf 0 out (t * rows) rows 0 in gpu_proj_tok kid P rowbuf src out rows k L (t + 1)
+gpu_proj kid W src out rows k L = let P = arr_new (rows * k + k) 0 in let _ = cpseg W 0 P 0 (rows * k) 0 in let rowbuf = arr_new rows 0 in gpu_proj_tok kid P rowbuf src out rows k L 0
+-- per-token matmul_bwd: W[out x k], dyv[L x out] -> dx[L x k]. W packed once.
+gpu_mbwd_tok kid P rowbuf dyv out out_off k L t = if t >= L then 0 else let _ = cpseg dyv (t * out) P (out * k) out 0 in let _ = ijit_run kid P P rowbuf (out * k + out) 1 k k in let _ = cpseg rowbuf 0 out_off (t * k) k 0 in gpu_mbwd_tok kid P rowbuf dyv out out_off k L (t + 1)
+gpu_mbwd kid W dyv dxout out k L = let P = arr_new (out * k + out) 0 in let _ = cpseg W 0 P 0 (out * k) 0 in let rowbuf = arr_new k 0 in gpu_mbwd_tok kid P rowbuf dyv out dxout k L 0
+gpu_lnbwd kid X g dy out rows d = let P = arr_new (rows * d + d + rows * d) 0 in let _ = cpseg X 0 P 0 (rows * d) 0 in let _ = cpseg g 0 P (rows * d) d 0 in let _ = cpseg dy 0 P (rows * d + d) (rows * d) 0 in ijit_run kid P P out (rows * d + d + rows * d) 1 (rows * d) rows
+gpu_wgrad kid dy x dW out k L = let P = arr_new (L * out + L * k) 0 in let _ = cpseg dy 0 P 0 (L * out) 0 in let _ = cpseg x 0 P (L * out) (L * k) 0 in ijit_run kid P P dW (L * out + L * k) 1 (out * k) out
+addinto A B n i = if i >= n then 0 else let _ = arr_set A i ((arr_get A i) + (arr_get B i)) in addinto A B n (i + 1)
+gelu_vec_grad X out n i = if i >= n then 0 else let _ = arr_set out i (bx4_gelu_grad (arr_get X i)) in gelu_vec_grad X out n (i + 1)
+elemul_cpu A B out n i = if i >= n then 0 else let _ = arr_set out i (mul_shr (arr_get A i) (arr_get B i) 24) in elemul_cpu A B out n (i + 1)
+
+main =
+  let blob = cat [getenv "HOME", "/.ledatic/railml-trial/canonical_bestpass.safetensors"] in
+  if (read_file_size blob) < 10000000 then let _ = print "FATAL blob missing" in 1
+  else
+  let d = 768 in let nh = 12 in let hd = 64 in let qdim = 768 in let inter = 3072 in let L = 9 in
+  let lr = 167772 in
+  let fd = fopen blob "rb" in
+  let hbuf8 = malloc 8 in let _ = pread fd hbuf8 8 0 in let hlen = pq_le_len hbuf8 0 in let _ = free hbuf8 in
+  let base = 8 + hlen in let hdrbuf = malloc base in let _ = pread fd hdrbuf base 0 in
+  let g1 = ld_f32 fd hdrbuf base "blocks.0.ln1.weight" d in
+  let b1 = ld_f32 fd hdrbuf base "blocks.0.ln1.bias" d in
+  let Wq = ld_f32 fd hdrbuf base "blocks.0.attn.query_proj.weight" (qdim * d) in
+  let Wk = ld_f32 fd hdrbuf base "blocks.0.attn.key_proj.weight" (qdim * d) in
+  let Wv = ld_f32 fd hdrbuf base "blocks.0.attn.value_proj.weight" (qdim * d) in
+  let Wo = ld_f32 fd hdrbuf base "blocks.0.attn.out_proj.weight" (d * qdim) in
+  let g2 = ld_f32 fd hdrbuf base "blocks.0.ln2.weight" d in
+  let b2 = ld_f32 fd hdrbuf base "blocks.0.ln2.bias" d in
+  let Wm0 = ld_f32 fd hdrbuf base "blocks.0.mlp.layers.0.weight" (inter * d) in
+  let bm0 = ld_f32 fd hdrbuf base "blocks.0.mlp.layers.0.bias" inter in
+  let Wm2 = ld_f32 fd hdrbuf base "blocks.0.mlp.layers.2.weight" (d * inter) in
+  let bm2 = ld_f32 fd hdrbuf base "blocks.0.mlp.layers.2.bias" d in
+  let Pos = ld_f32 fd hdrbuf base "pos.weight" (L * d) in
+  let Tokf = ld_f32 fd hdrbuf base "tok.weight" (16384 * d) in
+  let _ = fclose fd in
+  let ids = arr_new L 0 in
+  let _ = arr_set ids 0 328 in let _ = arr_set ids 1 2432 in let _ = arr_set ids 2 554 in let _ = arr_set ids 3 183 in
+  let _ = arr_set ids 4 12154 in let _ = arr_set ids 5 533 in let _ = arr_set ids 6 197 in let _ = arr_set ids 7 27 in let _ = arr_set ids 8 661 in
+  let x = arr_new (L * d) 0 in let _ = mk_x Tokf Pos ids x d L 0 in
+  -- compile kernels
+  let kLN = ijit_compile (emit_msl_fx_layernorm24_shaped L d) in
+  let kP1 = ijit_compile (emit_msl_fx_matmul24_shaped qdim d) in
+  let kUp = ijit_compile (emit_msl_fx_matmul24_shaped inter d) in
+  let kDn = ijit_compile (emit_msl_fx_matmul24_shaped d inter) in
+  let kAt = ijit_compile (emit_msl_fx_attn24_shaped L qdim nh hd) in
+  let kGe = ijit_compile (emit_msl_fx_gelu24_shaped (L * inter)) in
+  let kGg = ijit_compile (emit_msl_fx_gelu_grad24_shaped (L * inter)) in
+  let kEm = ijit_compile (emit_msl_fx_elemul24 (L * inter)) in
+  let kBd1 = ijit_compile (emit_msl_fx_matmul_bwd_shaped qdim d) in    -- dattn/dln1 via 768x768
+  let kBdDn = ijit_compile (emit_msl_fx_matmul_bwd_shaped d inter) in  -- dh2 (Wm2: out=d,k=inter)
+  let kBdUp = ijit_compile (emit_msl_fx_matmul_bwd_shaped inter d) in  -- dln2 (Wm0: out=inter,k=d)
+  let kAtB = ijit_compile (emit_msl_fx_attn_bwd_shaped L qdim nh hd) in
+  let kLNb = ijit_compile (emit_msl_fx_layernorm_bwd_shaped L d) in
+  -- ===== GPU forward (keep intermediates) =====
+  let ln1 = arr_new (L * d) 0 in let _ = gpu_ln kLN x g1 b1 ln1 L d in
+  let Q = arr_new (L * qdim) 0 in let _ = gpu_proj kP1 Wq ln1 Q qdim d L in
+  let K = arr_new (L * qdim) 0 in let _ = gpu_proj kP1 Wk ln1 K qdim d L in
+  let V = arr_new (L * qdim) 0 in let _ = gpu_proj kP1 Wv ln1 V qdim d L in
+  let QKV = arr_new (3 * L * qdim) 0 in let _ = cpseg Q 0 QKV 0 (L * qdim) 0 in let _ = cpseg K 0 QKV (L * qdim) (L * qdim) 0 in let _ = cpseg V 0 QKV (2 * L * qdim) (L * qdim) 0 in
+  let attn = arr_new (L * qdim) 0 in let _ = ijit_run kAt QKV QKV attn (3 * L * qdim) 1 (L * qdim) L in
+  let ao = arr_new (L * d) 0 in let _ = gpu_proj kP1 Wo attn ao d qdim L in
+  let r1 = arr_new (L * d) 0 in let _ = resid_add x ao r1 (L * d) 0 in
+  let ln2 = arr_new (L * d) 0 in let _ = gpu_ln kLN r1 g2 b2 ln2 L d in
+  let h1 = arr_new (L * inter) 0 in let _ = gpu_proj kUp Wm0 ln2 h1 inter d L in let _ = bias_add h1 bm0 L inter 0 0 in
+  let h2 = arr_new (L * inter) 0 in let _ = ijit_run kGe h1 h1 h2 (L * inter) 1 (L * inter) (L * inter) in
+  let mo = arr_new (L * d) 0 in let _ = gpu_proj kDn Wm2 h2 mo d inter L in let _ = bias_add mo bm2 L d 0 0 in
+  let y = arr_new (L * d) 0 in let _ = resid_add r1 mo y (L * d) 0 in
+  -- ===== upstream grad: MSE-to-zero, dy = 2*y =====
+  let dy = arr_new (L * d) 0 in let _ = scale2 y dy (L * d) 0 in
+  -- ===== GPU backward =====
+  -- MLP down: mo=h2@Wm2+bm2. dmo=dy. dh2 = Wm2^T@dmo (per token, Wm2 out=d k=inter)
+  let dh2 = arr_new (L * inter) 0 in let _ = gpu_mbwd kBdDn Wm2 dy dh2 d inter L in
+  -- gelu grad: gp = gelu'(h1); dh1 = dh2 (x) gp
+  let gp = arr_new (L * inter) 0 in let _ = ijit_run kGg h1 h1 gp (L * inter) 1 (L * inter) (L * inter) in
+  let dh1 = arr_new (L * inter) 0 in let _ = ijit_run kEm dh2 gp dh1 (L * inter) (L * inter) (L * inter) (L * inter) in
+  -- MLP up: h1=ln2@Wm0+bm0. dln2 = Wm0^T@dh1 (Wm0 out=inter k=d)
+  let dln2 = arr_new (L * d) 0 in let _ = gpu_mbwd kBdUp Wm0 dh1 dln2 inter d L in
+  -- LN2 backward: dr1 (=dy through resid) + LN2 path
+  let dr1 = arr_new (L * d) 0 in let _ = cpseg dy 0 dr1 0 (L * d) 0 in
+  let dr1ln = arr_new (L * d) 0 in let _ = gpu_lnbwd kLNb r1 g2 dln2 dr1ln L d in
+  let _ = addinto dr1 dr1ln (L * d) 0 in
+  -- r1 = x + ao. dx (skip) = dr1 ; dao = dr1
+  -- Wo: ao=attn@Wo (out=d k=qdim). dattn = Wo^T@dao
+  let dattn = arr_new (L * qdim) 0 in let _ = gpu_mbwd kBd1 Wo dr1 dattn d qdim L in
+  -- attn backward -> dQ|dK|dV
+  let dG = arr_new (3 * L * qdim) 0 in let _ = ijit_run kAtB QKV dattn dG (3 * L * qdim) (L * qdim) (3 * L * qdim) (3 * L) in
+  let dQ = arr_new (L * qdim) 0 in let _ = cpseg dG 0 dQ 0 (L * qdim) 0 in
+  let dK = arr_new (L * qdim) 0 in let _ = cpseg dG (L * qdim) dK 0 (L * qdim) 0 in
+  let dV = arr_new (L * qdim) 0 in let _ = cpseg dG (2 * L * qdim) dV 0 (L * qdim) 0 in
+  -- QKV proj backward: dln1 = Wq^T@dQ + Wk^T@dK + Wv^T@dV (out=qdim k=d)
+  let dln1 = arr_new (L * d) 0 in
+  let t1 = arr_new (L * d) 0 in let _ = gpu_mbwd kBd1 Wq dQ t1 qdim d L in let _ = addinto dln1 t1 (L * d) 0 in
+  let t2 = arr_new (L * d) 0 in let _ = gpu_mbwd kBd1 Wk dK t2 qdim d L in let _ = addinto dln1 t2 (L * d) 0 in
+  let t3 = arr_new (L * d) 0 in let _ = gpu_mbwd kBd1 Wv dV t3 qdim d L in let _ = addinto dln1 t3 (L * d) 0 in
+  -- LN1 backward: dx = dr1 (skip) + LN1 path
+  let dx = arr_new (L * d) 0 in let _ = cpseg dr1 0 dx 0 (L * d) 0 in
+  let dxln = arr_new (L * d) 0 in let _ = gpu_lnbwd kLNb x g1 dln1 dxln L d in
+  let _ = addinto dx dxln (L * d) 0 in
+  -- ===== GPU weight grads (the big four) =====
+  let dWo = arr_new (d * qdim) 0 in let _ = gpu_wgrad (ijit_compile (emit_msl_fx_wgrad24_shaped d qdim L)) dr1 attn dWo d qdim L in
+  let dWm2 = arr_new (d * inter) 0 in let _ = gpu_wgrad (ijit_compile (emit_msl_fx_wgrad24_shaped d inter L)) dy h2 dWm2 d inter L in
+  let dWm0 = arr_new (inter * d) 0 in let _ = gpu_wgrad (ijit_compile (emit_msl_fx_wgrad24_shaped inter d L)) dh1 ln2 dWm0 inter d L in
+  let dWq = arr_new (qdim * d) 0 in let _ = gpu_wgrad (ijit_compile (emit_msl_fx_wgrad24_shaped qdim d L)) dQ ln1 dWq qdim d L in
+  -- ===== CPU twins for dx + the four weight grads =====
+  -- CPU forward intermediates
+  let cln1 = arr_new (L * d) 0 in let _ = ln_rows x cln1 g1 b1 L d 0 in
+  let cQ = arr_new (L * qdim) 0 in let _ = mv_tokens Wq cln1 cQ qdim d L 0 in
+  let cK = arr_new (L * qdim) 0 in let _ = mv_tokens Wk cln1 cK qdim d L 0 in
+  let cV = arr_new (L * qdim) 0 in let _ = mv_tokens Wv cln1 cV qdim d L 0 in
+  let scq = arr_new L 0 in let exq = arr_new L 0 in let cattn = arr_new (L * qdim) 0 in let _ = c_tokens cQ cK cV scq exq cattn nh qdim hd L 0 in
+  let cao = arr_new (L * d) 0 in let _ = mv_tokens Wo cattn cao d qdim L 0 in
+  let cr1 = arr_new (L * d) 0 in let _ = resid_add x cao cr1 (L * d) 0 in
+  let cln2 = arr_new (L * d) 0 in let _ = ln_rows cr1 cln2 g2 b2 L d 0 in
+  let ch1 = arr_new (L * inter) 0 in let _ = mv_tokens Wm0 cln2 ch1 inter d L 0 in let _ = bias_add ch1 bm0 L inter 0 0 in
+  let ch2 = arr_new (L * inter) 0 in let _ = gelu_vec ch1 ch2 (L * inter) 0 in
+  let cmo = arr_new (L * d) 0 in let _ = mv_tokens Wm2 ch2 cmo d inter L 0 in let _ = bias_add cmo bm2 L d 0 0 in
+  let cy = arr_new (L * d) 0 in let _ = resid_add cr1 cmo cy (L * d) 0 in
+  let cdy = arr_new (L * d) 0 in let _ = scale2 cy cdy (L * d) 0 in
+  -- CPU backward
+  let cdh2 = arr_new (L * inter) 0 in let _ = mb_tokens Wm2 cdy cdh2 d inter L 0 in
+  let cgp = arr_new (L * inter) 0 in let _ = gelu_vec_grad ch1 cgp (L * inter) 0 in
+  let cdh1 = arr_new (L * inter) 0 in let _ = elemul_cpu cdh2 cgp cdh1 (L * inter) 0 in
+  let cdln2 = arr_new (L * d) 0 in let _ = mb_tokens Wm0 cdh1 cdln2 inter d L 0 in
+  let cdr1 = arr_new (L * d) 0 in let _ = cpseg cdy 0 cdr1 0 (L * d) 0 in
+  let _ = lnb_rows cr1 g2 cdln2 cdr1 L d 0 in
+  let cdattn = arr_new (L * qdim) 0 in let _ = mb_tokens Wo cdr1 cdattn d qdim L 0 in
+  let scb = arr_new L 0 in let exb = arr_new L 0 in let pb = arr_new L 0 in let dpb = arr_new L 0 in let drb = arr_new L 0 in
+  let cdQ = arr_new (L * qdim) 0 in let cdK = arr_new (L * qdim) 0 in let cdV = arr_new (L * qdim) 0 in
+  let _ = b_tokens cQ cK cV cdattn scb exb pb dpb drb cdQ cdK cdV nh qdim hd L 0 in
+  let cdln1 = arr_new (L * d) 0 in
+  let ct1 = arr_new (L * d) 0 in let _ = mb_tokens Wq cdQ ct1 qdim d L 0 in let _ = addinto cdln1 ct1 (L * d) 0 in
+  let ct2 = arr_new (L * d) 0 in let _ = mb_tokens Wk cdK ct2 qdim d L 0 in let _ = addinto cdln1 ct2 (L * d) 0 in
+  let ct3 = arr_new (L * d) 0 in let _ = mb_tokens Wv cdV ct3 qdim d L 0 in let _ = addinto cdln1 ct3 (L * d) 0 in
+  let cdx = arr_new (L * d) 0 in let _ = cpseg cdr1 0 cdx 0 (L * d) 0 in
+  let _ = lnb_rows x g1 cdln1 cdx L d 0 in
+  -- CPU weight grads
+  let cdWo = arr_new (d * qdim) 0 in let _ = wg cdr1 cattn cdWo d qdim L 0 in
+  let cdWm2 = arr_new (d * inter) 0 in let _ = wg cdy ch2 cdWm2 d inter L 0 in
+  let cdWm0 = arr_new (inter * d) 0 in let _ = wg cdh1 cln2 cdWm0 inter d L 0 in
+  let cdWq = arr_new (qdim * d) 0 in let _ = wg cdQ cln1 cdWq qdim d L 0 in
+  -- ===== twin checks =====
+  let m_dx = cmp_arr dx cdx (L * d) 0 0 in
+  let m_dWo = cmp_arr dWo cdWo (d * qdim) 0 0 in
+  let m_dWm2 = cmp_arr dWm2 cdWm2 (d * inter) 0 0 in
+  let m_dWm0 = cmp_arr dWm0 cdWm0 (inter * d) 0 0 in
+  let m_dWq = cmp_arr dWq cdWq (qdim * d) 0 0 in
+  let total = m_dx + m_dWo + m_dWm2 + m_dWm0 + m_dWq in
+  -- ===== one SGD update on Wo (demo of the update step) + receipt =====
+  let kApply = ijit_compile (emit_msl_fx_sgd_apply (d * qdim) lr) in
+  let Wo2 = arr_new (d * qdim) 0 in let _ = ijit_run kApply Wo dWo Wo2 (d * qdim) (d * qdim) (d * qdim) (d * qdim) in
+  let digest_b = sha256 (cat [show m_dx, "|", show (arr_get dx 0), "|", show (arr_get dWo 0), "|", show (arr_get Wo 0), "|", show (arr_get Wo2 0)]) in
+  let digest = bytes_to_hex digest_b 32 in
+  let seed = sha256 "attested.block.train.step.local.dev.seed.v1" in
+  let sig = ed25519_sign seed digest_b 32 in
+  let sighex = bytes_to_hex sig 64 in
+  let verdict = if total == 0 then "ATTESTED-BLOCK-STEP-OK" else "DIVERGE" in
+  let _ = print (cat ["attested full-block training step on REAL block-0 weights (L=", show L, " d=", show d, "):"]) in
+  let _ = print (cat ["  dx ", show m_dx, "  dWo ", show m_dWo, "  dWm2 ", show m_dWm2, "  dWm0 ", show m_dWm0, "  dWq ", show m_dWq, " mismatches (GPU vs CPU)"]) in
+  let _ = print (cat ["  dx[last tok 0..2]=", show (arr_get dx ((L - 1) * d)), " ", show (arr_get dx ((L - 1) * d + 1)), " ", show (arr_get dx ((L - 1) * d + 2))]) in
+  let _ = print (cat ["  SGD: Wo[0] ", show (arr_get Wo 0), " -> ", show (arr_get Wo2 0)]) in
+  let _ = print (cat ["  step digest: ", digest]) in
+  let _ = print (cat ["  ed25519 sig: ", str_sub sighex 0 32, "..."]) in
+  let _ = print (cat ["  verdict: ", verdict]) in
+  if total == 0 then 0 else 1

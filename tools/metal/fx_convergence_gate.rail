@@ -1,0 +1,264 @@
+-- fx_convergence_gate.rail -- THE GATE (define-success-first, 2026-07-05).
+--
+-- Question this answers: does F=24 fixed-point TRAINING actually CONVERGE?
+-- Bit-exact GPU==CPU is already proven (twin kernels). What is UNMEASURED is
+-- whether fixed-point SGD, over many steps, actually descends a nonlinear loss
+-- -- or whether update underflow / rounding accumulation makes it plateau or
+-- diverge.
+--
+-- Because the F=24 numerics are IDENTICAL on CPU and GPU by construction
+-- (that is the whole twin-verification premise), the cheapest faithful gate is
+-- a small pure-CPU F=24 training loop -- same bits the GPU would produce, runs
+-- in a second, no Metal/JIT/safetensors needed.
+--
+-- Setup: a tiny 2-layer MLP classifier  x -> W1 -> GELU -> W2 -> softmax-CE,
+-- trained FROM RANDOM INIT to MEMORIZE N (input -> class) pairs. If fixed-point
+-- training converges, CE loss -> ~0 and all N examples classify correctly.
+-- An fp32 twin (native floats, SAME init+data+lr) runs alongside as the
+-- reference curve: F=24 should TRACK fp32 down, not plateau far above it.
+--
+-- Uses the EXACT F=24 ops the model uses: mul_shr (Q39.24), bx4_gelu,
+-- bx4_gelu_grad, bx4_exp_neg -- copied verbatim from attested_model_train_*.
+--
+-- All model+scratch pointers are bundled into one array-of-arrays `bag` (int
+-- and float arrays are both just pointers, so both live in one bag) plus a
+-- small int `cfg`, so every orchestrator stays low-arity (Rail high-arity fns
+-- SIGSEGV; multi-line calls also don't parse).
+--
+-- bag: 0 X 1 Y 2 W1 3 b1 4 W2 5 b2 6 dW1 7 db1 8 dW2 9 db2 10 h 11 act
+--      12 logits 13 exs 14 p 15 dlog 16 dh   (F=24, int arrays)
+--      17 fX 18 fW1 19 fb1 20 fW2 21 fb2 22 fdW1 23 fdb1 24 fdW2 25 fdb2
+--      26 fh 27 fact 28 flg 29 fexs 30 fp 31 fdlog 32 fdh   (fp32, float arrays)
+-- cfg: 0 N 1 d 2 hid 3 C 4 lr(F=24) 5 maxsteps 6 every
+--
+-- run: ./rail_native run tools/metal/fx_convergence_gate.rail
+
+import "stdlib/math.rail"
+import "stdlib/float_arr.rail"
+
+-- ===== F=24 nonlinear helpers (verbatim from attested_model_train_fast.rail) =====
+bx4_pow2b_go acc k = if k == 0 then acc else bx4_pow2b_go (acc + acc) (k - 1)
+bx4_pow2b k = if k < 1 then 1 else bx4_pow2b_go 1 k
+bx4_exp_poly fq = let p8 = 416 in let p7 = 3329 + (p8 * fq) / 16777216 in let p6 = 23302 + (p7 * fq) / 16777216 in let p5 = 139810 + (p6 * fq) / 16777216 in let p4 = 699051 + (p5 * fq) / 16777216 in let p3 = 2796203 + (p4 * fq) / 16777216 in let p2 = 8388608 + (p3 * fq) / 16777216 in let p1 = 16777216 + (p2 * fq) / 16777216 in 16777216 + (p1 * fq) / 16777216
+bx4_exp_neg ax = let k = ax / 11629080 in let fq = ax - k * 11629080 in let ef = bx4_exp_poly fq in let emf = 281474976710656 / ef in if k >= 50 then 0 else let p2 = bx4_pow2b k in (emf + p2 / 2) / p2
+bx4_tanh_pos axq = let em = bx4_exp_neg (axq + axq) in ((16777216 - em) * 16777216) / (16777216 + em)
+bx4_tanh xq = if xq < 0 then 0 - (bx4_tanh_pos (0 - xq)) else bx4_tanh_pos xq
+bx4_gelu xq = let x2 = (xq * xq) / 16777216 in let x3 = (x2 * xq) / 16777216 in let ax3 = (750194 * x3) / 16777216 in let inner0 = xq + ax3 in let inner = (13386610 * inner0) / 16777216 in let th = bx4_tanh inner in let onep = 16777216 + th in (xq * onep) / 33554432
+bx4_gelu_grad xq = let x2 = (xq * xq) / 16777216 in let x3 = (x2 * xq) / 16777216 in let ax3 = (750194 * x3) / 16777216 in let inner0 = xq + ax3 in let u = (13386610 * inner0) / 16777216 in let t = bx4_tanh u in let term1 = (16777216 + t) / 2 in let sech2 = 16777216 - (t * t) / 16777216 in let a3x2 = (3 * (750194 * x2)) / 16777216 in let inner1 = 16777216 + a3x2 in let dudx = (13386610 * inner1) / 16777216 in let p1 = (xq * sech2) / 16777216 in let p2 = (p1 * dudx) / 16777216 in term1 + p2 / 2
+
+-- ===== small utilities =====
+lcg_next s = ((s * 1103515245) + 12345) % 2147483648
+zero A n i = if i >= n then 0 else let _ = arr_set A i 0 in zero A n (i + 1)
+fzero A n i = if i >= n then 0 else let _ = float_arr_set A i 0.0 in fzero A n (i + 1)
+fill_i a n s i span = if i >= n then s else let s2 = lcg_next s in let v = (s2 % span) - (span / 2) in let _ = arr_set a i v in fill_i a n s2 (i + 1) span
+y_fix Y N C i = if i >= N then 0 else let v = arr_get Y i in let _ = arr_set Y i (let m = v % C in if m < 0 then m + C else m) in y_fix Y N C (i + 1)
+i2f_copy src dst n i = if i >= n then 0 else let _ = float_arr_set dst i ((to_float (arr_get src i)) /. 16777216.0) in i2f_copy src dst n (i + 1)
+
+-- ===== F=24 inner row helpers (low-arity) =====
+fx_copyrow X xb x d i = if i >= d then 0 else let _ = arr_set x i (arr_get X (xb + i)) in fx_copyrow X xb x d (i + 1)
+fx_dot W off x k j acc = if j >= k then acc else fx_dot W off x k (j + 1) (acc + mul_shr (arr_get W (off + j)) (arr_get x j) 24)
+fx_lin1 W1 b1 x h hid d i = if i >= hid then 0 else let _ = arr_set h i ((fx_dot W1 (i * d) x d 0 0) + (arr_get b1 i)) in fx_lin1 W1 b1 x h hid d (i + 1)
+fx_gelu_row h act hid i = if i >= hid then 0 else let _ = arr_set act i (bx4_gelu (arr_get h i)) in fx_gelu_row h act hid (i + 1)
+fx_lin2 W2 b2 act logits C hid c = if c >= C then 0 else let _ = arr_set logits c ((fx_dot W2 (c * hid) act hid 0 0) + (arr_get b2 c)) in fx_lin2 W2 b2 act logits C hid (c + 1)
+fx_smax lg C i m = if i >= C then m else fx_smax lg C (i + 1) (let v = arr_get lg i in if v > m then v else m)
+fx_sexp lg ex C m i sum = if i >= C then sum else let ev = bx4_exp_neg (m - (arr_get lg i)) in let _ = arr_set ex i ev in fx_sexp lg ex C m (i + 1) (sum + ev)
+fx_snorm ex p C sum i = if i >= C then 0 else let _ = arr_set p i (((arr_get ex i) * 16777216) / sum) in fx_snorm ex p C sum (i + 1)
+fx_argmax lg C i best bi = if i >= C then bi else let v = arr_get lg i in if v > best then fx_argmax lg C (i + 1) v i else fx_argmax lg C (i + 1) best bi
+fx_setdlog p dlog C i = if i >= C then 0 else let _ = arr_set dlog i (arr_get p i) in fx_setdlog p dlog C (i + 1)
+fx_dW2_row dlog act dW2 db2 C hid c j =
+  if c >= C then 0
+  else if j >= hid then (let _ = arr_set db2 c ((arr_get db2 c) + (arr_get dlog c)) in fx_dW2_row dlog act dW2 db2 C hid (c + 1) 0)
+  else let _ = arr_set dW2 (c * hid + j) ((arr_get dW2 (c * hid + j)) + (mul_shr (arr_get dlog c) (arr_get act j) 24)) in fx_dW2_row dlog act dW2 db2 C hid c (j + 1)
+fx_da_col W2 dlog C hid j c acc = if c >= C then acc else fx_da_col W2 dlog C hid j (c + 1) (acc + mul_shr (arr_get W2 (c * hid + j)) (arr_get dlog c) 24)
+fx_dh_row W2 dlog h dh C hid j = if j >= hid then 0 else let da = fx_da_col W2 dlog C hid j 0 0 in let _ = arr_set dh j (mul_shr da (bx4_gelu_grad (arr_get h j)) 24) in fx_dh_row W2 dlog h dh C hid (j + 1)
+fx_dW1_row dh x dW1 db1 hid d i j =
+  if i >= hid then 0
+  else if j >= d then (let _ = arr_set db1 i ((arr_get db1 i) + (arr_get dh i)) in fx_dW1_row dh x dW1 db1 hid d (i + 1) 0)
+  else let _ = arr_set dW1 (i * d + j) ((arr_get dW1 (i * d + j)) + (mul_shr (arr_get dh i) (arr_get x j) 24)) in fx_dW1_row dh x dW1 db1 hid d i (j + 1)
+fx_update W dW n lr N i = if i >= n then 0 else let g = (arr_get dW i) / N in let _ = arr_set W i ((arr_get W i) - (mul_shr lr g 24)) in fx_update W dW n lr N (i + 1)
+
+-- ===== F=24 orchestrators (arity <= 5, unpack from bag) =====
+fx_fwd bag cfg x =
+  let d = arr_get cfg 1 in let hid = arr_get cfg 2 in let C = arr_get cfg 3 in
+  let W1 = arr_get bag 2 in let b1 = arr_get bag 3 in let W2 = arr_get bag 4 in let b2 = arr_get bag 5 in
+  let h = arr_get bag 10 in let act = arr_get bag 11 in let logits = arr_get bag 12 in let exs = arr_get bag 13 in let p = arr_get bag 14 in
+  let _ = fx_lin1 W1 b1 x h hid d 0 in
+  let _ = fx_gelu_row h act hid 0 in
+  let _ = fx_lin2 W2 b2 act logits C hid 0 in
+  let mx = fx_smax logits C 1 (arr_get logits 0) in
+  let ssum = fx_sexp logits exs C mx 0 0 in
+  let _ = fx_snorm exs p C ssum 0 in
+  0
+fx_example bag cfg n =
+  let d = arr_get cfg 1 in let hid = arr_get cfg 2 in let C = arr_get cfg 3 in
+  let X = arr_get bag 0 in let Y = arr_get bag 1 in let W2 = arr_get bag 4 in
+  let dW1 = arr_get bag 6 in let db1 = arr_get bag 7 in let dW2 = arr_get bag 8 in let db2 = arr_get bag 9 in
+  let h = arr_get bag 10 in let act = arr_get bag 11 in let p = arr_get bag 14 in let dlog = arr_get bag 15 in let dh = arr_get bag 16 in
+  let x = arr_new d 0 in let _ = fx_copyrow X (n * d) x d 0 in
+  let _ = fx_fwd bag cfg x in
+  let tgt = arr_get Y n in
+  let _ = fx_setdlog p dlog C 0 in
+  let _ = arr_set dlog tgt ((arr_get dlog tgt) - 16777216) in
+  let _ = fx_dW2_row dlog act dW2 db2 C hid 0 0 in
+  let _ = fx_dh_row W2 dlog h dh C hid 0 in
+  let _ = fx_dW1_row dh x dW1 db1 hid d 0 0 in
+  0
+fx_batch bag cfg N n = if n >= N then 0 else let _ = fx_example bag cfg n in fx_batch bag cfg N (n + 1)
+fx_step bag cfg =
+  let N = arr_get cfg 0 in let d = arr_get cfg 1 in let hid = arr_get cfg 2 in let C = arr_get cfg 3 in let lr = arr_get cfg 4 in
+  let dW1 = arr_get bag 6 in let db1 = arr_get bag 7 in let dW2 = arr_get bag 8 in let db2 = arr_get bag 9 in
+  let W1 = arr_get bag 2 in let b1 = arr_get bag 3 in let W2 = arr_get bag 4 in let b2 = arr_get bag 5 in
+  let _ = zero dW1 (hid * d) 0 in let _ = zero db1 hid 0 in let _ = zero dW2 (C * hid) 0 in let _ = zero db2 C 0 in
+  let _ = fx_batch bag cfg N 0 in
+  let _ = fx_update W1 dW1 (hid * d) lr N 0 in
+  let _ = fx_update b1 db1 hid lr N 0 in
+  let _ = fx_update W2 dW2 (C * hid) lr N 0 in
+  let _ = fx_update b2 db2 C lr N 0 in
+  0
+-- eval: returns correct-count, accumulates total CE (float) into closs[0]
+fx_eval bag cfg closs n corr =
+  let N = arr_get cfg 0 in let d = arr_get cfg 1 in let C = arr_get cfg 3 in
+  if n >= N then corr
+  else let X = arr_get bag 0 in let Y = arr_get bag 1 in let logits = arr_get bag 12 in let p = arr_get bag 14 in
+       let x = arr_new d 0 in let _ = fx_copyrow X (n * d) x d 0 in
+       let _ = fx_fwd bag cfg x in
+       let tgt = arr_get Y n in let am = fx_argmax logits C 1 (arr_get logits 0) 0 in
+       let pc = (let v = arr_get p tgt in if v < 1 then 1 else v) in
+       let ce = 0.0 -. (log ((to_float pc) /. 16777216.0)) in
+       let _ = float_arr_set closs 0 ((float_arr_get closs 0) +. ce) in
+       fx_eval bag cfg closs (n + 1) (if am == tgt then corr + 1 else corr)
+
+-- ===== fp32 TWIN inner helpers =====
+ff_copyrow X xb x d i = if i >= d then 0 else let _ = float_arr_set x i (float_arr_get X (xb + i)) in ff_copyrow X xb x d (i + 1)
+ff_dot W off x k j acc = if j >= k then acc else ff_dot W off x k (j + 1) (acc +. ((float_arr_get W (off + j)) *. (float_arr_get x j)))
+ff_gelu_f v = let c = 0.7978845608028654 in let a = 0.044715 in let inner = c *. (v +. (a *. (v *. (v *. v)))) in let th = (exp (inner +. inner) -. 1.0) /. (exp (inner +. inner) +. 1.0) in (v *. (1.0 +. th)) *. 0.5
+ff_gelu_grad_f v = let c = 0.7978845608028654 in let a = 0.044715 in let u = c *. (v +. (a *. (v *. (v *. v)))) in let th = (exp (u +. u) -. 1.0) /. (exp (u +. u) +. 1.0) in let sech2 = 1.0 -. (th *. th) in let dudx = c *. (1.0 +. (3.0 *. (a *. (v *. v)))) in (0.5 *. (1.0 +. th)) +. (0.5 *. ((v *. sech2) *. dudx))
+ff_lin1 W1 b1 x h hid d i = if i >= hid then 0 else let _ = float_arr_set h i ((ff_dot W1 (i * d) x d 0 0.0) +. (float_arr_get b1 i)) in ff_lin1 W1 b1 x h hid d (i + 1)
+ff_gelu_row h act hid i = if i >= hid then 0 else let _ = float_arr_set act i (ff_gelu_f (float_arr_get h i)) in ff_gelu_row h act hid (i + 1)
+ff_lin2 W2 b2 act lg C hid c = if c >= C then 0 else let _ = float_arr_set lg c ((ff_dot W2 (c * hid) act hid 0 0.0) +. (float_arr_get b2 c)) in ff_lin2 W2 b2 act lg C hid (c + 1)
+ff_max lg C i m = if i >= C then m else ff_max lg C (i + 1) (let v = float_arr_get lg i in if v >. m then v else m)
+ff_sexp lg ex C m i s = if i >= C then s else let e = exp ((float_arr_get lg i) -. m) in let _ = float_arr_set ex i e in ff_sexp lg ex C m (i + 1) (s +. e)
+ff_snorm ex p C s i = if i >= C then 0 else let _ = float_arr_set p i ((float_arr_get ex i) /. s) in ff_snorm ex p C s (i + 1)
+ff_argmax lg C i best bi = if i >= C then bi else let v = float_arr_get lg i in if v >. best then ff_argmax lg C (i + 1) v i else ff_argmax lg C (i + 1) best bi
+ff_setdlog p dlog C i = if i >= C then 0 else let _ = float_arr_set dlog i (float_arr_get p i) in ff_setdlog p dlog C (i + 1)
+ff_dW2_row dlog act dW2 db2 C hid c j =
+  if c >= C then 0
+  else if j >= hid then (let _ = float_arr_set db2 c ((float_arr_get db2 c) +. (float_arr_get dlog c)) in ff_dW2_row dlog act dW2 db2 C hid (c + 1) 0)
+  else let _ = float_arr_set dW2 (c * hid + j) ((float_arr_get dW2 (c * hid + j)) +. ((float_arr_get dlog c) *. (float_arr_get act j))) in ff_dW2_row dlog act dW2 db2 C hid c (j + 1)
+ff_da_col W2 dlog C hid j c acc = if c >= C then acc else ff_da_col W2 dlog C hid j (c + 1) (acc +. ((float_arr_get W2 (c * hid + j)) *. (float_arr_get dlog c)))
+ff_dh_row W2 dlog h dh C hid j = if j >= hid then 0 else let da = ff_da_col W2 dlog C hid j 0 0.0 in let _ = float_arr_set dh j (da *. (ff_gelu_grad_f (float_arr_get h j))) in ff_dh_row W2 dlog h dh C hid (j + 1)
+ff_dW1_row dh x dW1 db1 hid d i j =
+  if i >= hid then 0
+  else if j >= d then (let _ = float_arr_set db1 i ((float_arr_get db1 i) +. (float_arr_get dh i)) in ff_dW1_row dh x dW1 db1 hid d (i + 1) 0)
+  else let _ = float_arr_set dW1 (i * d + j) ((float_arr_get dW1 (i * d + j)) +. ((float_arr_get dh i) *. (float_arr_get x j))) in ff_dW1_row dh x dW1 db1 hid d i (j + 1)
+ff_update W dW n lrf N i = if i >= n then 0 else let g = (float_arr_get dW i) /. (to_float N) in let _ = float_arr_set W i ((float_arr_get W i) -. (lrf *. g)) in ff_update W dW n lrf N (i + 1)
+
+-- ===== fp32 orchestrators =====
+ff_fwd bag cfg x =
+  let d = arr_get cfg 1 in let hid = arr_get cfg 2 in let C = arr_get cfg 3 in
+  let W1 = arr_get bag 18 in let b1 = arr_get bag 19 in let W2 = arr_get bag 20 in let b2 = arr_get bag 21 in
+  let h = arr_get bag 26 in let act = arr_get bag 27 in let lg = arr_get bag 28 in let exs = arr_get bag 29 in let p = arr_get bag 30 in
+  let _ = ff_lin1 W1 b1 x h hid d 0 in
+  let _ = ff_gelu_row h act hid 0 in
+  let _ = ff_lin2 W2 b2 act lg C hid 0 in
+  let mx = ff_max lg C 1 (float_arr_get lg 0) in
+  let ssum = ff_sexp lg exs C mx 0 0.0 in
+  let _ = ff_snorm exs p C ssum 0 in
+  0
+ff_example bag cfg n =
+  let d = arr_get cfg 1 in let hid = arr_get cfg 2 in let C = arr_get cfg 3 in
+  let X = arr_get bag 17 in let Y = arr_get bag 1 in let W2 = arr_get bag 20 in
+  let dW1 = arr_get bag 22 in let db1 = arr_get bag 23 in let dW2 = arr_get bag 24 in let db2 = arr_get bag 25 in
+  let h = arr_get bag 26 in let act = arr_get bag 27 in let p = arr_get bag 30 in let dlog = arr_get bag 31 in let dh = arr_get bag 32 in
+  let x = float_arr_new d 0.0 in let _ = ff_copyrow X (n * d) x d 0 in
+  let _ = ff_fwd bag cfg x in
+  let tgt = arr_get Y n in
+  let _ = ff_setdlog p dlog C 0 in
+  let _ = float_arr_set dlog tgt ((float_arr_get dlog tgt) -. 1.0) in
+  let _ = ff_dW2_row dlog act dW2 db2 C hid 0 0 in
+  let _ = ff_dh_row W2 dlog h dh C hid 0 in
+  let _ = ff_dW1_row dh x dW1 db1 hid d 0 0 in
+  0
+ff_batch bag cfg N n = if n >= N then 0 else let _ = ff_example bag cfg n in ff_batch bag cfg N (n + 1)
+ff_step bag cfg =
+  let N = arr_get cfg 0 in let d = arr_get cfg 1 in let hid = arr_get cfg 2 in let C = arr_get cfg 3 in
+  let lrf = (to_float (arr_get cfg 4)) /. 16777216.0 in
+  let W1 = arr_get bag 18 in let b1 = arr_get bag 19 in let W2 = arr_get bag 20 in let b2 = arr_get bag 21 in
+  let dW1 = arr_get bag 22 in let db1 = arr_get bag 23 in let dW2 = arr_get bag 24 in let db2 = arr_get bag 25 in
+  let _ = fzero dW1 (hid * d) 0 in let _ = fzero db1 hid 0 in let _ = fzero dW2 (C * hid) 0 in let _ = fzero db2 C 0 in
+  let _ = ff_batch bag cfg N 0 in
+  let _ = ff_update W1 dW1 (hid * d) lrf N 0 in
+  let _ = ff_update b1 db1 hid lrf N 0 in
+  let _ = ff_update W2 dW2 (C * hid) lrf N 0 in
+  let _ = ff_update b2 db2 C lrf N 0 in
+  0
+ff_eval bag cfg closs n corr =
+  let N = arr_get cfg 0 in let d = arr_get cfg 1 in let C = arr_get cfg 3 in
+  if n >= N then corr
+  else let X = arr_get bag 17 in let Y = arr_get bag 1 in let lg = arr_get bag 28 in let p = arr_get bag 30 in
+       let x = float_arr_new d 0.0 in let _ = ff_copyrow X (n * d) x d 0 in
+       let _ = ff_fwd bag cfg x in
+       let tgt = arr_get Y n in let am = ff_argmax lg C 1 (float_arr_get lg 0) 0 in
+       let pc = (let v = float_arr_get p tgt in if v <. 0.0000001 then 0.0000001 else v) in
+       let _ = float_arr_set closs 0 ((float_arr_get closs 0) +. (0.0 -. (log pc))) in
+       ff_eval bag cfg closs (n + 1) (if am == tgt then corr + 1 else corr)
+
+-- ===== driver =====
+report bag cfg step =
+  let N = arr_get cfg 0 in
+  let cl = float_arr_new 1 0.0 in let fc = fx_eval bag cfg cl 0 0 in let cm = (float_arr_get cl 0) /. (to_float N) in
+  let fl = float_arr_new 1 0.0 in let ffc = ff_eval bag cfg fl 0 0 in let fm = (float_arr_get fl 0) /. (to_float N) in
+  print (cat ["step ", show step, "   F24: loss=", show cm, " acc=", show fc, "/", show N, "   fp32: loss=", show fm, " acc=", show ffc, "/", show N])
+train_loop bag cfg step =
+  let maxsteps = arr_get cfg 5 in let every = arr_get cfg 6 in
+  if step > maxsteps then 0
+  else let _ = if (step % every) == 0 then report bag cfg step else 0 in
+       let _ = fx_step bag cfg in
+       let _ = ff_step bag cfg in
+       train_loop bag cfg (step + 1)
+
+main =
+  let d = 16 in let hid = 32 in let C = 8 in let N = 6 in
+  let maxsteps = 400 in let every = 20 in
+  let lr = 5033165 in    -- 0.2999... in F=24 (full-batch memorization LR)
+  let seed = 20260705 in
+  let cfg = arr_new 7 0 in
+  let _ = arr_set cfg 0 N in let _ = arr_set cfg 1 d in let _ = arr_set cfg 2 hid in let _ = arr_set cfg 3 C in
+  let _ = arr_set cfg 4 lr in let _ = arr_set cfg 5 maxsteps in let _ = arr_set cfg 6 every in
+  let bag = arr_new 33 0 in
+  -- data
+  let X = arr_new (N * d) 0 in let s1 = fill_i X (N * d) seed 0 33554432 in
+  let Y = arr_new N 0 in let s2 = fill_i Y N s1 0 C in let _ = y_fix Y N C 0 in
+  let fX = float_arr_new (N * d) 0.0 in let _ = i2f_copy X fX (N * d) 0 in
+  -- init weights ~N(0,0.05) in F=24
+  let W1 = arr_new (hid * d) 0 in let s3 = fill_i W1 (hid * d) s2 0 1677721 in
+  let b1 = arr_new hid 0 in let _ = zero b1 hid 0 in
+  let W2 = arr_new (C * hid) 0 in let s4 = fill_i W2 (C * hid) s3 0 1677721 in
+  let b2 = arr_new C 0 in let _ = zero b2 C 0 in
+  -- fp32 twins of the SAME init
+  let fW1 = float_arr_new (hid * d) 0.0 in let _ = i2f_copy W1 fW1 (hid * d) 0 in
+  let fb1 = float_arr_new hid 0.0 in let _ = fzero fb1 hid 0 in
+  let fW2 = float_arr_new (C * hid) 0.0 in let _ = i2f_copy W2 fW2 (C * hid) 0 in
+  let fb2 = float_arr_new C 0.0 in let _ = fzero fb2 C 0 in
+  -- scratch (F=24)
+  let dW1 = arr_new (hid * d) 0 in let db1 = arr_new hid 0 in let dW2 = arr_new (C * hid) 0 in let db2 = arr_new C 0 in
+  let h = arr_new hid 0 in let act = arr_new hid 0 in let logits = arr_new C 0 in let exs = arr_new C 0 in let p = arr_new C 0 in let dlog = arr_new C 0 in let dh = arr_new hid 0 in
+  -- scratch (fp32)
+  let fdW1 = float_arr_new (hid * d) 0.0 in let fdb1 = float_arr_new hid 0.0 in let fdW2 = float_arr_new (C * hid) 0.0 in let fdb2 = float_arr_new C 0.0 in
+  let fh = float_arr_new hid 0.0 in let fact = float_arr_new hid 0.0 in let flg = float_arr_new C 0.0 in let fexs = float_arr_new C 0.0 in let fp = float_arr_new C 0.0 in let fdlog = float_arr_new C 0.0 in let fdh = float_arr_new hid 0.0 in
+  -- pack the bag
+  let _ = arr_set bag 0 X in let _ = arr_set bag 1 Y in let _ = arr_set bag 2 W1 in let _ = arr_set bag 3 b1 in let _ = arr_set bag 4 W2 in let _ = arr_set bag 5 b2 in
+  let _ = arr_set bag 6 dW1 in let _ = arr_set bag 7 db1 in let _ = arr_set bag 8 dW2 in let _ = arr_set bag 9 db2 in
+  let _ = arr_set bag 10 h in let _ = arr_set bag 11 act in let _ = arr_set bag 12 logits in let _ = arr_set bag 13 exs in let _ = arr_set bag 14 p in let _ = arr_set bag 15 dlog in let _ = arr_set bag 16 dh in
+  let _ = arr_set bag 17 fX in let _ = arr_set bag 18 fW1 in let _ = arr_set bag 19 fb1 in let _ = arr_set bag 20 fW2 in let _ = arr_set bag 21 fb2 in
+  let _ = arr_set bag 22 fdW1 in let _ = arr_set bag 23 fdb1 in let _ = arr_set bag 24 fdW2 in let _ = arr_set bag 25 fdb2 in
+  let _ = arr_set bag 26 fh in let _ = arr_set bag 27 fact in let _ = arr_set bag 28 flg in let _ = arr_set bag 29 fexs in let _ = arr_set bag 30 fp in let _ = arr_set bag 31 fdlog in let _ = arr_set bag 32 fdh in
+  let _ = print (cat ["THE GATE: F=24 vs fp32 training, MLP memorization (d=", show d, " hid=", show hid, " C=", show C, " N=", show N, ", lr=0.30, ", show maxsteps, " steps)"]) in
+  let _ = print "-------------------------------------------------------------------------------" in
+  let _ = train_loop bag cfg 0 in
+  let cl = float_arr_new 1 0.0 in let fc = fx_eval bag cfg cl 0 0 in let cm = (float_arr_get cl 0) /. (to_float N) in
+  let _ = print "-------------------------------------------------------------------------------" in
+  let _ = print (cat ["FINAL F=24: loss=", show cm, "  correct=", show fc, "/", show N]) in
+  let pass = if (fc == N) && (cm <. 0.15) then 1 else 0 in
+  let _ = print (cat ["VERDICT: ", if pass == 1 then "GATE-PASS -- F=24 fixed-point training CONVERGES (memorized, all correct)" else "GATE-FAIL -- F=24 training did not converge (see loss/acc above)"]) in
+  if pass == 1 then 0 else 1

@@ -1861,6 +1861,194 @@ int tgl_jit_dispatch_1in1out(int kid, const double *X, double *Y, int N) {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Integer-exact JIT dispatch (attested-GPU track, 2026-07-04).
+//
+// In-process, bit-for-bit twin of tools/metal/ikernel_harness.m — but
+// with NO subprocess spawn, NO Metal re-init, NO text I/O.  This is the
+// engine that turns the per-op text-file proofs into a real training
+// loop (Phase 0).  All F=24 shaped kernels emitted by
+// stdlib/jit_emit.rail use `device long*` buffers at indices 0,1,2 and
+// dispatch one thread per output-group; dims are baked as MSL constants,
+// so no setBytes is needed (identical to ikernel_harness).
+//
+// Marshalling: Rail integer arrays (arr_new) are laid out as
+//   word 0 = 7 (type tag)   word 1 = length   word 2+i = (value<<1)|1
+// i.e. every element is a tagged 63-bit Rail int.  We untag on upload
+// (arithmetic >>1) and re-tag on download (<<1 | 1).  The GPU does the
+// same int64 accumulate-then->>24 the CPU twin does via mul_shr, so the
+// result is bit-identical and lands directly in a caller-allocated
+// arr_new array — ready to chain into the next op with no round-trip.
+//
+// The pipeline id comes from tgl_jit_compile_from_tmp_file (compilation
+// is dtype-agnostic, so the existing compile path is reused).  Args are
+// kept at the Rail FFI 8-arg cap: kid; A/B/O array pointers; sizeA/sizeB
+// (element counts to upload); sizeO (outputs to download); nthreads
+// (grid size).  B may be unused by a kernel that packs everything into
+// buffer 0, but a valid pointer + sizeB>=1 must still be passed.
+// Integer-kernel compile.  Mirrors tools/metal/ikernel_harness.m exactly
+// (newLibraryWithSource:options:nil) rather than the float path's
+// [MTLCompileOptions new], because the default-constructed options pin an
+// older MSL version that rejects 64-bit `long` in device buffer pointees
+// — which every F=24 shaped kernel uses.  Reads its own tmp file so it
+// never races the float JIT path's /tmp/rail_jit_kernel.metal.  Appends to
+// the shared g_jit_pipes cache; the returned kid is dispatched by
+// tgl_ijit_dispatch below.
+int tgl_ijit_compile(int dummy) {
+    (void)dummy;
+    if (ensure_init() != 1) return -1;
+    if (!g_jit_pipes) g_jit_pipes = [NSMutableArray array];
+    NSError *err = nil;
+    NSString *src = [NSString stringWithContentsOfFile:@"/tmp/rail_ijit_kernel.metal"
+                                              encoding:NSUTF8StringEncoding
+                                                 error:&err];
+    if (!src) {
+        fprintf(stderr, "tgl_ijit_compile: read /tmp/rail_ijit_kernel.metal failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "?");
+        return -1;
+    }
+    // 64-bit `long` in device buffers needs a modern MSL version; the
+    // default-constructed / nil options pin an older one that rejects it.
+    MTLCompileOptions *opts = [MTLCompileOptions new];
+    if (@available(macOS 14.0, *))      opts.languageVersion = MTLLanguageVersion3_1;
+    else if (@available(macOS 13.0, *)) opts.languageVersion = MTLLanguageVersion3_0;
+    id<MTLLibrary> lib = [g_device newLibraryWithSource:src options:opts error:&err];
+    if (!lib) {
+        fprintf(stderr, "tgl_ijit_compile: newLibraryWithSource failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "?");
+        return -1;
+    }
+    NSArray *names = [lib functionNames];
+    if (names.count == 0) { fprintf(stderr, "tgl_ijit_compile: no functions\n"); return -1; }
+    id<MTLFunction> fn = [lib newFunctionWithName:names[0]];
+    if (!fn) return -1;
+    id<MTLComputePipelineState> p = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!p) { fprintf(stderr, "tgl_ijit_compile: pipeline failed: %s\n",
+                      err ? [[err localizedDescription] UTF8String] : "?"); return -1; }
+    [g_jit_pipes addObject:p];
+    return (int)(g_jit_pipes.count - 1);
+}
+
+int tgl_ijit_dispatch(int kid, const long *A, const long *B, long *O,
+                      int sizeA, int sizeB, int sizeO, int nthreads) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (ensure_init() != 1) return -1;
+    if (sizeA < 1 || sizeO < 1 || nthreads < 1) return -3;
+    int nB = sizeB < 1 ? 1 : sizeB;
+    const long *Ap = A + 2;   // skip [tag, len]
+    const long *Bp = B + 2;
+    long       *Op = O + 2;
+    @autoreleasepool {
+        id<MTLBuffer> bA = pool_acquire((NSUInteger)sizeA * 8);
+        id<MTLBuffer> bB = pool_acquire((NSUInteger)nB * 8);
+        id<MTLBuffer> bO = pool_acquire((NSUInteger)sizeO * 8);
+        long *Ai = (long*)bA.contents;
+        long *Bi = (long*)bB.contents;
+        for (int t = 0; t < sizeA; t++) Ai[t] = Ap[t] >> 1;   // untag
+        for (int t = 0; t < sizeB; t++) Bi[t] = Bp[t] >> 1;
+
+        id<MTLComputePipelineState> p = g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bA offset:0 atIndex:0];
+        [enc setBuffer:bB offset:0 atIndex:1];
+        [enc setBuffer:bO offset:0 atIndex:2];
+        dispatch_1d(enc, (uint32_t)nthreads);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) {
+            pool_release(bA); pool_release(bB); pool_release(bO);
+            return -2;
+        }
+        long *Ol = (long*)bO.contents;
+        for (int t = 0; t < sizeO; t++) Op[t] = (Ol[t] << 1) | 1;  // re-tag
+        pool_release(bA); pool_release(bB); pool_release(bO);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Persistent int64 GPU buffers (attested-GPU track, act 23 -- the perf item).
+//
+// The weight-cache + saved-activations work moved the bottleneck off the GPU
+// dispatch and onto the CPU-side re-packing + re-upload of every weight to a
+// fresh GPU staging buffer on EVERY dispatch (a 768x3072 weight = 19 MB copied
+// + uploaded 16x/step for nothing -- it never changes within a step).
+//
+// tgl_ibuf_upload uploads a Rail integer array ONCE into a resident MTLBuffer
+// and returns a handle.  tgl_ijit_dispatch_wx then dispatches a kernel with
+// that resident weight bound at buffer(0) and only the small activation X
+// uploaded per call at buffer(1) -- eliminating the per-dispatch weight copy.
+// Bit-for-bit identical to the packed path (same untag -> int64 -> kernel).
+static NSMutableArray *g_ibufs = nil;
+
+int tgl_ibuf_upload(const long *arr, int n) {
+    if (ensure_init() != 1) return -1;
+    if (n < 1) return -1;
+    if (!g_ibufs) g_ibufs = [NSMutableArray array];
+    const long *ap = arr + 2;   // skip [tag, len]
+    id<MTLBuffer> b = [g_device newBufferWithLength:(NSUInteger)n * 8
+                                            options:MTLResourceStorageModeShared];
+    if (!b) return -1;
+    long *dst = (long *)b.contents;
+    for (int i = 0; i < n; i++) dst[i] = ap[i] >> 1;   // untag once
+    [g_ibufs addObject:b];
+    return (int)(g_ibufs.count - 1);
+}
+
+// tgl_ibuf_update overwrites the resident buffer `wid` IN PLACE with a Rail
+// integer array (same untag as upload). No new allocation -> no leak across a
+// training loop that re-writes weights every step. StorageModeShared means the
+// GPU sees the new contents on the next dispatch. Returns 0 on success.
+int tgl_ibuf_update(int wid, const long *arr, int n) {
+    if (!g_ibufs || wid < 0 || wid >= (int)g_ibufs.count) return -1;
+    if (n < 1) return -1;
+    id<MTLBuffer> b = g_ibufs[wid];
+    if ((NSUInteger)n * 8 > b.length) return -2;
+    const long *ap = arr + 2;   // skip [tag, len]
+    long *dst = (long *)b.contents;
+    for (int i = 0; i < n; i++) dst[i] = ap[i] >> 1;   // untag once
+    return 0;
+}
+
+// Dispatch kernel `kid` with resident weight buffer `wid` at buffer(0), Rail
+// array X uploaded to buffer(1), output downloaded from buffer(2).  Kernel must
+// be a *_wx variant that reads W from buffer(0) and X from buffer(1).
+int tgl_ijit_dispatch_wx(int kid, int wid, const long *X, long *O,
+                         int sizeX, int sizeO, int nthreads) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (wid < 0 || !g_ibufs || wid >= (int)g_ibufs.count) return -1;
+    if (ensure_init() != 1) return -1;
+    if (sizeX < 1 || sizeO < 1 || nthreads < 1) return -3;
+    const long *Xp = X + 2;
+    long       *Op = O + 2;
+    @autoreleasepool {
+        id<MTLBuffer> bW = g_ibufs[wid];
+        id<MTLBuffer> bX = pool_acquire((NSUInteger)sizeX * 8);
+        id<MTLBuffer> bO = pool_acquire((NSUInteger)sizeO * 8);
+        long *Xi = (long *)bX.contents;
+        for (int t = 0; t < sizeX; t++) Xi[t] = Xp[t] >> 1;
+        id<MTLComputePipelineState> p = g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bX offset:0 atIndex:1];
+        [enc setBuffer:bO offset:0 atIndex:2];
+        dispatch_1d(enc, (uint32_t)nthreads);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) {
+            pool_release(bX); pool_release(bO); return -2;
+        }
+        long *Ol = (long *)bO.contents;
+        for (int t = 0; t < sizeO; t++) Op[t] = (Ol[t] << 1) | 1;
+        pool_release(bX); pool_release(bO);
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
 // bf16 host-side staging helpers (added 2026-05-14).
 // bf16 layout = upper 16 bits of f32 representation; conversion is
 // just a bit-shift with round-to-nearest-even.
