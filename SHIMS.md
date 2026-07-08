@@ -157,6 +157,6 @@ Plus ~17 files under `tools/uav/archive/` (ES, GRU/MapGRU eval kernels, weight I
 | **In-tree total** | **31** | **413,806** |
 | 7. UAV (gitignored, private) | 8 | ~213,000 |
 
-Public-thesis count: **31 non-Rail files**. Everything else in this repo — the compiler, the stdlib (101 modules), the deploy tooling, the JIT tracer, the v5 assembler, the test harness, the package manager, the docs generator — is Rail.
+Public-thesis count: **31 non-Rail files**. Everything else in this repo — the compiler, the stdlib (102 modules), the deploy tooling, the JIT tracer, the v5 assembler, the test harness, the package manager, the docs generator — is Rail.
 
 Removable on next cleanup pass (no live caller, scaffolding only): `tensor_gpu_lib_stub.m`, `test_dylib.c`, `bench_matmul.m`, `fp16_probe.m`, `_dormant/plasma_3d_host.m`. Net would drop to 26 files / ~377 KB.
