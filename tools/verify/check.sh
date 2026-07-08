@@ -33,9 +33,9 @@ if [ -f grammar/rail.ebnf ]; then ok "grammar/rail.ebnf ($(wc -l < grammar/rail.
 else no "grammar/rail.ebnf missing"; fi
 
 echo "== 4. Status matrix regenerates live (cannot drift) =="
-if RAIL_ARENA_MB=4096 ./rail_native run tools/deploy/gen_status.rail >/tmp/_verify_status.log 2>&1 \
-   && [ -f docs/STATUS.md ]; then ok "docs/STATUS.md regenerated from the tree"
-else no "gen_status failed (see /tmp/_verify_status.log)"; fi
+if RAIL_ARENA_MB=4096 ./rail_native --out-prefix /tmp/_verify_gen_status run tools/deploy/gen_status.rail >/tmp/_verify_status.log 2>&1 \
+   && git diff --exit-code --quiet -- docs/STATUS.md; then ok "docs/STATUS.md regenerated and matches the committed copy"
+else no "gen_status failed or docs/STATUS.md has drifted (see /tmp/_verify_status.log; git diff docs/STATUS.md)"; fi
 
 echo "== 5. Release attestation =="
 if [ -f tools/attest/attest.rail ]; then ok "tools/attest/ present — verify a tagged release with attest.rail"

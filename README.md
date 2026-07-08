@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="#install"><img src="https://img.shields.io/badge/tests-178%2F178-brightgreen" alt="tests 178/178"></a>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/tests-178%2F178-brightgreen" alt="tests 178/178"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
   <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
@@ -45,7 +45,7 @@ cd rail
 ./rail_native run examples/hello.rail
 ```
 
-Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, WebAssembly, Cortex-M4, and RISC-V rv32imc backends are supported.
+Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, WebAssembly (experimental), Cortex-M4, and RISC-V rv32imc backends are supported.
 
 ```bash
 ./rail_native <file.rail>        # compile to /tmp/rail_out
@@ -113,7 +113,7 @@ The compiler is the fitness function. Programs that compile become training data
 - **Byte-identical self-compile.** `./rail_native self` produces output identical to the binary that produced it. The compiler's own source is the regression suite.
 - **One binary checks everything.** Training loops, tests, site generation, HTTPS clients — all compiled by the same binary you cloned. That makes the compiler a single, reproducible *checker* you can re-run yourself — not a proof of correctness: a program can compile and still be wrong. Compilation proves a program is *accepted by the binary you run*, nothing more.
 - **Production surface is narrow and honest.** Rail v3.0.0 ships the crypto it uses (ChaCha20-Poly1305, x25519, SHA-256/384/512, ECDSA-P256/P384, RSA-PSS/PKCS1) and nothing more. Every primitive is NIST- or RFC-vector-validated.
-- **Six backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), Linux x86_64, WebAssembly, Cortex-M4 (Thumb-2), and RISC-V rv32imc — the same compiler cross-compiles to all of them.
+- **Six backends travel with the language.** macOS ARM64, Linux ARM64 (Pi Zero 2 W), Linux x86_64, WebAssembly (experimental), Cortex-M4 (Thumb-2), and RISC-V rv32imc — the same compiler cross-compiles to all of them.
 
 ## The language
 
@@ -180,7 +180,7 @@ Tail-recursive loops match C `-O2` (5 instructions per iteration). The full arch
 The compiler assembles, links, and code-signs **itself** — in pure Rail, in-process — with no Apple `as`, `ld`, or `codesign` in the build. v5.0.0 removed `as`/`ld` from the Linux ELF path; v5.2.0 closes the loop on the macOS host, including the ad-hoc signature arm64 requires, and extends it to FFI binaries.
 
 - **The full Rail toolchain.** A two-pass AArch64 assembler (gate-validated **1248/1248** instruction forms byte-identical to `as`), a Mach-O linker that bakes `@PAGE`/`@PAGEOFF` relocs + `LC_DYLD_INFO` rebase/bind + stubs/`__got`, and an N-page ad-hoc signer — all in Rail.
-- **Bit-reproducible.** Rail owns every byte, including the `LC_UUID` and padding `ld` randomizes, so the self-compile is deterministic: the committed seed reproduces itself byte-for-byte (sha256 `b02dd228…`) in one cycle, verified identical across two independent Macs. Attestation goes from tamper-evident to source-reproducible. **Check it yourself:** clone this repo and run `RAIL_ARENA_MB=6000 ./verify_reproducible.sh` — it rebuilds the committed binary from source and confirms the hash.
+- **Bit-reproducible.** Rail owns every byte, including the `LC_UUID` and padding `ld` randomizes, so the self-compile is deterministic: the committed seed reproduces itself byte-for-byte in one cycle (sha256 `b02dd228…` at the v5.2.0 tag; the current seed's hash lives in [docs/STATUS.md](docs/STATUS.md)), verified identical across two independent Macs. Attestation goes from tamper-evident to source-reproducible. **Check it yourself:** clone this repo and run `RAIL_ARENA_MB=6000 ./verify_reproducible.sh` — it rebuilds the committed binary from source and confirms the hash.
 - **In-process by default**, with the `as`/`ld` path preserved byte-for-byte as a fallback (`RAIL_ARENA_MB < 5000`). FFI programs stand alone too: multi-dylib linking binds `libsqlite3` with no `ld`. 178/178 tests.
 
 ### v5.1.0 — 2026-05-15 — *Rail emits its own GPU kernels*
