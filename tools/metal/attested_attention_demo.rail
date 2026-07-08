@@ -1,0 +1,249 @@
+-- attested_attention_demo.rail — twin-kernel attestation, act 8 (2026-07-04).
+--
+-- THE COMPOSITION: fused single-head attention on GPU, assembled
+-- entirely from the proven fixed-point device functions (mul_shr,
+-- rsqrt, exp -- acts 2/3/7).  rmsnorm -> Q/K projections -> scaled
+-- scores -> softmax -> V-weighted sum -> residual.  Weights ride in
+-- one packed buffer (X | G | WQ | WK | WV), the same shape as a real
+-- inference blob.  The CPU twin below mirrors every operation on the
+-- mul_shr primitive; bounds keep all accumulators under 2^56, so twin
+-- agreement is guaranteed worst-case (Rail 63-bit vs int64 wrap can
+-- never be reached).
+--
+-- run from repo root: ./rail_native run tools/metal/attested_attention_demo.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+lcg_next s = ((s * 1103515245) + 12345) % 2147483648
+
+fill_q a n s i m1 m2 off =
+  if i >= n then s
+  else
+    let s2 = lcg_next s in
+    let s3 = lcg_next s2 in
+    let v = (((s2 % m1) * m2) + (s3 % m2)) - off in
+    let _ = arr_set a i v in
+    fill_q a n s3 (i + 1) m1 m2 off
+
+-- proven fixed-point primitives, CPU side (identical to acts 3 + 7)
+fxr_search v lo hi =
+  if (hi - lo) <= 1 then lo
+  else
+    let mid = lo + ((hi - lo) / 2) in
+    let t = mul_shr mid mid 32 in
+    if (mul_shr t v 32) <= 4294967296 then fxr_search v mid hi
+    else fxr_search v lo mid
+
+fx_rsqrt v = fxr_search v 0 35184372088833
+
+fx_exp x =
+  if x < (0 - 137438953472) then 0
+  else
+    let n = (0 - x) / 2977044472 in
+    let r = x + (n * 2977044472) in
+    let p2 = mul_shr r r 32 in
+    let p3 = mul_shr p2 r 32 in
+    let p4 = mul_shr p3 r 32 in
+    let p5 = mul_shr p4 r 32 in
+    let p6 = mul_shr p5 r 32 in
+    let p7 = mul_shr p6 r 32 in
+    let acc = ((((((4294967296 + r) + (p2 / 2)) + (p3 / 6)) + (p4 / 24)) + (p5 / 120)) + (p6 / 720)) + (p7 / 5040) in
+    acc / (shl 1 n)
+
+-- rmsnorm of packed row (x at base, gain at g_off) into dst
+rss p d base j acc =
+  if j >= d then acc
+  else
+    let x = arr_get p (base + j) in
+    rss p d base (j + 1) (acc + (mul_shr x x 32))
+
+rwrite p d g_off base dst r j =
+  if j >= d then 0
+  else
+    let y = mul_shr (mul_shr (arr_get p (base + j)) r 32) (arr_get p (g_off + j)) 32 in
+    let _ = arr_set dst j y in
+    rwrite p d g_off base dst r (j + 1)
+
+rms_row p d g_off base dst =
+  let ss = rss p d base 0 0 in
+  let r = fx_rsqrt ((ss / d) + 4295) in
+  rwrite p d g_off base dst r 0
+
+-- matvec from packed weights at off, vector v, into dst
+adot p base v d j acc =
+  if j >= d then acc
+  else adot p base v d (j + 1) (acc + (mul_shr (arr_get p (base + j)) (arr_get v j) 32))
+
+amv p off v dst d rr =
+  if rr >= d then 0
+  else
+    let _ = arr_set dst rr (adot p (off + (rr * d)) v d 0 0) in
+    amv p off v dst d (rr + 1)
+
+qk_dot q k d c acc =
+  if c >= d then acc
+  else qk_dot q k d (c + 1) (acc + (mul_shr (arr_get q c) (arr_get k c) 32))
+
+-- scores for query i against all positions
+score_loop p seq d g_off wk_off q xnj kv probs isd j =
+  if j >= seq then 0
+  else
+    let _ = rms_row p d g_off (j * d) xnj in
+    let _ = amv p wk_off xnj kv d 0 in
+    let s = qk_dot q kv d 0 0 in
+    let _ = arr_set probs j (mul_shr s isd 32) in
+    score_loop p seq d g_off wk_off q xnj kv probs isd (j + 1)
+
+pmax probs seq j m =
+  if j >= seq then m
+  else
+    let v = arr_get probs j in
+    let m2 = if v > m then v else m in
+    pmax probs seq (j + 1) m2
+
+pexp probs seq m j sum =
+  if j >= seq then sum
+  else
+    let e = fx_exp ((arr_get probs j) - m) in
+    let _ = arr_set probs j e in
+    pexp probs seq m (j + 1) (sum + e)
+
+pdiv probs seq den j =
+  if j >= seq then 0
+  else
+    let _ = arr_set probs j (((arr_get probs j) * 65536) / den) in
+    pdiv probs seq den (j + 1)
+
+-- out[i*d + c] += p_j * v_c, per j
+vacc out base vv probs j d c =
+  if c >= d then 0
+  else
+    let _ = arr_set out (base + c) ((arr_get out (base + c)) + (mul_shr (arr_get probs j) (arr_get vv c) 32)) in
+    vacc out base vv probs j d (c + 1)
+
+vloop p seq d g_off wv_off out base xnj vv probs j =
+  if j >= seq then 0
+  else
+    let _ = rms_row p d g_off (j * d) xnj in
+    let _ = amv p wv_off xnj vv d 0 in
+    let _ = vacc out base vv probs j d 0 in
+    vloop p seq d g_off wv_off out base xnj vv probs (j + 1)
+
+res_init p out base d c =
+  if c >= d then 0
+  else
+    let _ = arr_set out (base + c) (arr_get p (base + c)) in
+    res_init p out base d (c + 1)
+
+attn_row p seq d g_off wq_off wk_off wv_off out xn xnj q kv probs isd i =
+  if i >= seq then 0
+  else
+    let _ = rms_row p d g_off (i * d) xn in
+    let _ = amv p wq_off xn q d 0 in
+    let _ = score_loop p seq d g_off wk_off q xnj kv probs isd 0 in
+    let m = pmax probs seq 1 (arr_get probs 0) in
+    let sum = pexp probs seq m 0 0 in
+    let _ = pdiv probs seq (sum / 65536) 0 in
+    let _ = res_init p out (i * d) d 0 in
+    let _ = vloop p seq d g_off wv_off out (i * d) xnj kv probs 0 in
+    attn_row p seq d g_off wq_off wk_off wv_off out xn xnj q kv probs isd (i + 1)
+
+out_text o n i accl =
+  if i >= n then join "\n" (reverse accl)
+  else out_text o n (i + 1) (cons (show (arr_get o i)) accl)
+
+pi_digits cs acc =
+  if (length cs) == 0 then acc
+  else pi_digits (tail cs) ((acc * 10) + ((char_to_int (head cs)) - 48))
+
+parse_i s =
+  let cs = chars s in
+  if (head cs) == "-" then 0 - (pi_digits (tail cs) 0)
+  else pi_digits cs 0
+
+cmp_walk lines cpu i n mism =
+  if i >= n then mism
+  else
+    let g = parse_i (head lines) in
+    let c = arr_get cpu i in
+    let m2 = if g == c then mism else mism + 1 in
+    cmp_walk (tail lines) cpu (i + 1) n m2
+
+fill_rest p total s from = fill_q p total s from 16384 16384 134217728
+
+-- 1/sqrt(d) as an exact constant (same emit-time formula the MSL
+-- bakes in): fx_rsqrt's contract is v <= 2^36 and d*ONE breaks it --
+-- overflow wraps differently on Rail (63-bit) vs Metal (64-bit).
+isqrt_walk n i = if (i * i) > n then i - 1 else isqrt_walk n (i + 1)
+isqrt n = isqrt_walk n 1
+
+main =
+  let seq = 8 in
+  let d = 64 in
+  let seed = 4321 in
+  let total = (seq * d) + d + (3 * (d * d)) in
+  let _ = shell "mkdir -p /tmp/agk" in
+  let _ = shell "test -x /tmp/agk/ikernel_harness || clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  -- 1. emit the fused GPU twin
+  let msl = emit_msl_fx_attention_shaped seq d in
+  let _ = write_file "/tmp/agk/fx_attention.metal" msl in
+  -- 2. packed params: X (+/-2^29) | G,WQ,WK,WV (+/-2^27)
+  let p = arr_new total 0 in
+  let s1 = fill_q p (seq * d) seed 0 32768 32768 536870912 in
+  let _ = fill_rest p total s1 (seq * d) in
+  let ptext = cat [out_text p total 0 [], "\n"] in
+  let _ = write_file "/tmp/agk/atP.txt" ptext in
+  -- 3. CPU twin
+  let g_off = seq * d in
+  let wq_off = g_off + d in
+  let wk_off = wq_off + (d * d) in
+  let wv_off = wk_off + (d * d) in
+  let out = arr_new (seq * d) 0 in
+  let xn = arr_new d 0 in
+  let xnj = arr_new d 0 in
+  let q = arr_new d 0 in
+  let kv = arr_new d 0 in
+  let probs = arr_new seq 0 in
+  let isd = 4294967296 / (isqrt d) in
+  let _ = attn_row p seq d g_off wq_off wk_off wv_off out xn xnj q kv probs isd 0 in
+  let ctext = cat [out_text out (seq * d) 0 [], "\n"] in
+  -- 4. GPU twin, twice (harness reads A as rows*d: pass rows=seq, d=total/seq)
+  let hd = total / seq in
+  let onarg = cat ["on=", show (seq * d)] in
+  let cmd1 = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_attention.metal fx_attention /tmp/agk/atP.txt /tmp/agk/atP.txt ", show seq, " ", show hd, " /tmp/agk/at_gpu_out1.txt i64 ", onarg, " 2>/dev/null"] in
+  let cmd2 = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_attention.metal fx_attention /tmp/agk/atP.txt /tmp/agk/atP.txt ", show seq, " ", show hd, " /tmp/agk/at_gpu_out2.txt i64 ", onarg, " 2>/dev/null"] in
+  let _ = shell cmd1 in
+  let _ = shell cmd2 in
+  -- 5. verify
+  let gtext = read_file "/tmp/agk/at_gpu_out1.txt" in
+  let mism = cmp_walk (split "\n" gtext) out 0 (seq * d) 0 in
+  let c_h = sha256_hex ctext in
+  let g_h = sha256_hex gtext in
+  let det = if g_h == (sha256_hex (read_file "/tmp/agk/at_gpu_out2.txt")) then "true" else "false" in
+  let verdict = if mism == 0 then "ATTENTION-TWINS-AGREE" else "ATTENTION-TWINS-DIVERGE" in
+  let record = cat ["{\n",
+    "  \"schema\": \"twin-kernel-attest-v0\",\n",
+    "  \"kernel\": \"fx_attention (fused: rmsnorm+QK+softmax+V+residual)\",\n",
+    "  \"composition\": \"acts 2/3/7 device functions, zero new math\",\n",
+    "  \"emitter\": \"stdlib/jit_emit.rail:emit_msl_fx_attention_shaped\",\n",
+    "  \"seq\": ", show seq, ", \"d\": ", show d, ", \"seed\": ", show seed, ",\n",
+    "  \"msl_sha256\": \"", sha256_hex msl, "\",\n",
+    "  \"params_sha256\": \"", sha256_hex ptext, "\",\n",
+    "  \"cpu_out_sha256\": \"", c_h, "\",\n",
+    "  \"gpu_out_sha256\": \"", g_h, "\",\n",
+    "  \"gpu_deterministic\": ", det, ",\n",
+    "  \"mismatches\": ", show mism, ",\n",
+    "  \"verdict\": \"", verdict, "\"\n",
+    "}\n"] in
+  let _ = write_file "/tmp/agk/at_attest_record.json" record in
+  let _ = print "twin-kernel attestation act 8 (fused attested ATTENTION on GPU):" in
+  let _ = print (cat ["  seq x d:         ", show seq, " x ", show d, " (", show (seq * d), " outputs)"]) in
+  let _ = print (cat ["  sample out[0]:   ", show (arr_get out 0)]) in
+  let _ = print (cat ["  mismatches:      ", show mism, " of ", show (seq * d)]) in
+  let _ = print (cat ["  cpu_out sha256:  ", c_h]) in
+  let _ = print (cat ["  gpu_out sha256:  ", g_h]) in
+  let _ = print (cat ["  gpu run1==run2:  ", det]) in
+  let _ = print (cat ["  verdict:         ", verdict]) in
+  let _ = print "  record:          /tmp/agk/at_attest_record.json" in
+  if mism == 0 then 0 else 1

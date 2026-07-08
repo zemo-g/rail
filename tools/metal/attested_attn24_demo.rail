@@ -1,0 +1,122 @@
+-- attested_attn24_demo.rail — twin-kernel attestation, act 13 core (2026-07-04).
+--
+-- GPT causal multi-head attention at F=24 -- the one new forward op the
+-- 138M block needs beyond LayerNorm/matvec/GELU (acts 11-12).  The CPU
+-- twin below is a faithful port of the model's pf_heads (causal scores
+-- + softmax + weighted-V, F=24, scaleq=1/sqrt(64)).  Verified GPU vs CPU
+-- byte-exact on deterministic real-scale Q/K/V.  With this, every op a
+-- GPT block needs is twin-verified; a full attested block is assembly.
+--
+-- run: ./rail_native run tools/metal/attested_attn24_demo.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+-- ==== F=24 exp chain (bx_fixed.rail), copied for the CPU twin ====
+bx4_pow2_go acc k = if k == 0 then acc else bx4_pow2_go (acc + acc) (k - 1)
+bx4_pow2 k = if k < 1 then 1 else bx4_pow2_go 1 k
+bx4_exp_poly fq =
+  let p8 = 416 in
+  let p7 = 3329 + (p8 * fq) / 16777216 in
+  let p6 = 23302 + (p7 * fq) / 16777216 in
+  let p5 = 139810 + (p6 * fq) / 16777216 in
+  let p4 = 699051 + (p5 * fq) / 16777216 in
+  let p3 = 2796203 + (p4 * fq) / 16777216 in
+  let p2 = 8388608 + (p3 * fq) / 16777216 in
+  let p1 = 16777216 + (p2 * fq) / 16777216 in
+  16777216 + (p1 * fq) / 16777216
+bx4_exp_neg ax =
+  let k = ax / 11629080 in
+  let fq = ax - k * 11629080 in
+  let ef = bx4_exp_poly fq in
+  let emf = 281474976710656 / ef in
+  if k >= 50 then 0 else let p2 = bx4_pow2 k in (emf + p2 / 2) / p2
+
+-- ==== CPU twin: pf_heads (causal MHA, F=24, group=1 so kvdim=qdim) ====
+c_raw q k qi kj hd c acc = if c >= hd then acc else c_raw q k qi kj hd (c + 1) (acc + ((arr_get q (qi + c)) * (arr_get k (kj + c))))
+c_scores q k sc i h qdim hd seqL j =
+  if j >= seqL then 0
+  else
+    let scv = if j > i then (0 - 16777216000)
+              else let raw = mul_shr (c_raw q k (i * qdim + h * hd) (j * qdim + h * hd) hd 0 0) 1 24 in (raw * 2097152) / 16777216 in
+    let _ = arr_set sc j scv in
+    c_scores q k sc i h qdim hd seqL (j + 1)
+c_rowmax sc seqL j m = if j >= seqL then m else c_rowmax sc seqL (j + 1) (let v = arr_get sc j in if v > m then v else m)
+c_exprow sc ex seqL m j sum = if j >= seqL then sum else let e = bx4_exp_neg (m - (arr_get sc j)) in let _ = arr_set ex j e in c_exprow sc ex seqL m (j + 1) (sum + e)
+c_pvdot ex v vb qdim seqL sum j acc =
+  if j >= seqL then acc
+  else let p = ((arr_get ex j) * 16777216) / sum in
+       c_pvdot ex v vb qdim seqL sum (j + 1) (acc + (p * (arr_get v (vb + j * qdim))))
+c_ctx ex v attn i h qdim hd seqL sum c =
+  if c >= hd then 0
+  else
+    let acc = c_pvdot ex v (h * hd + c) qdim seqL sum 0 0 in
+    let _ = arr_set attn (i * qdim + h * hd + c) (mul_shr acc 1 24) in
+    c_ctx ex v attn i h qdim hd seqL sum (c + 1)
+c_head q k v sc ex attn i h qdim hd seqL =
+  let _ = c_scores q k sc i h qdim hd seqL 0 in
+  let m = c_rowmax sc seqL 1 (arr_get sc 0) in
+  let sum = c_exprow sc ex seqL m 0 0 in
+  c_ctx ex v attn i h qdim hd seqL sum 0
+c_heads q k v sc ex attn i nh qdim hd seqL h =
+  if h >= nh then 0
+  else let _ = c_head q k v sc ex attn i h qdim hd seqL in c_heads q k v sc ex attn i nh qdim hd seqL (h + 1)
+c_tokens q k v sc ex attn nh qdim hd seqL i =
+  if i >= seqL then 0
+  else let _ = c_heads q k v sc ex attn i nh qdim hd seqL 0 in c_tokens q k v sc ex attn nh qdim hd seqL (i + 1)
+
+-- ==== io ====
+lcg s = ((s * 1103515245) + 12345) % 2147483648
+fill_qkv a n s i = if i >= n then s else let s2 = lcg s in let _ = arr_set a i (((s2 % 8388608) - 4194304)) in fill_qkv a n s2 (i + 1)
+out_text o n i accl = if i >= n then join "\n" (reverse accl) else out_text o n (i + 1) (cons (show (arr_get o i)) accl)
+pi_digits cs acc = if (length cs) == 0 then acc else pi_digits (tail cs) ((acc * 10) + ((char_to_int (head cs)) - 48))
+parse_i s = if (length (chars s)) == 0 then 0 else let cs = chars s in if (head cs) == "-" then 0 - (pi_digits (tail cs) 0) else pi_digits cs 0
+cmp_walk lines cpu i n mism = if i >= n then mism else let g = parse_i (head lines) in cmp_walk (tail lines) cpu (i + 1) n (if g == (arr_get cpu i) then mism else mism + 1)
+copy_seg src soff dst n i = if i >= n then 0 else let _ = arr_set dst i (arr_get src (soff + i)) in copy_seg src soff dst n (i + 1)
+
+main =
+  let seqL = 9 in
+  let qdim = 768 in
+  let nh = 12 in
+  let hd = 64 in
+  let _ = shell "mkdir -p /tmp/agk" in
+  let _ = shell "test -x /tmp/agk/ikernel_harness || clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  -- deterministic real-scale Q/K/V (+/-2^22), packed Q|K|V
+  let lq = seqL * qdim in
+  let p = arr_new (3 * lq) 0 in
+  let _ = fill_qkv p (3 * lq) 4242 0 in
+  let _ = write_file "/tmp/agk/attn_P.txt" (cat [out_text p (3 * lq) 0 [], "\n"]) in
+  -- split into q,k,v views for the CPU twin
+  let q = arr_new lq 0 in let k = arr_new lq 0 in let v = arr_new lq 0 in
+  let _ = copy_seg p 0 q lq 0 in let _ = copy_seg p lq k lq 0 in let _ = copy_seg p (2 * lq) v lq 0 in
+  let sc = arr_new seqL 0 in let ex = arr_new seqL 0 in
+  let attn = arr_new lq 0 in
+  let _ = c_tokens q k v sc ex attn nh qdim hd seqL 0 in
+  let ctext = cat [out_text attn lq 0 [], "\n"] in
+  let c_h = sha256_hex ctext in
+  -- GPU twin
+  let msl = emit_msl_fx_attn24_shaped seqL qdim nh hd in
+  let _ = write_file "/tmp/agk/fx_attn.metal" msl in
+  let hcols = (3 * lq) / seqL in
+  let cmd = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_attn.metal fx_attn /tmp/agk/attn_P.txt /tmp/agk/attn_P.txt ", show seqL, " ", show hcols, " /tmp/agk/attn_gpu.txt i64 on=", show lq, " 2>/dev/null"] in
+  let _ = shell cmd in
+  let gtext = read_file "/tmp/agk/attn_gpu.txt" in
+  let g_h = sha256_hex gtext in
+  let mism = cmp_walk (split "\n" gtext) attn 0 lq 0 in
+  let verdict = if mism == 0 then "ATTN24-TWINS-AGREE" else "ATTN24-TWINS-DIVERGE" in
+  let record = cat ["{\n",
+    "  \"schema\": \"twin-kernel-attest-v0\",\n",
+    "  \"kernel\": \"fx_attn (GPT causal MHA, F=24, scaleq=1/sqrt(64))\",\n",
+    "  \"emitter\": \"stdlib/jit_emit.rail:emit_msl_fx_attn24_shaped\",\n",
+    "  \"L\": ", show seqL, ", \"qdim\": ", show qdim, ", \"nh\": ", show nh, ", \"hd\": ", show hd, ",\n",
+    "  \"cpu_sha256\": \"", c_h, "\", \"gpu_sha256\": \"", g_h, "\",\n",
+    "  \"mismatches\": ", show mism, ",\n",
+    "  \"verdict\": \"", verdict, "\"\n}\n"] in
+  let _ = write_file "/tmp/agk/attn24_record.json" record in
+  let _ = print "twin-kernel attestation act 13 core (GPT causal MHA on GPU, F=24):" in
+  let _ = print (cat ["  L x qdim (nh x hd):  ", show seqL, " x ", show qdim, " (", show nh, " x ", show hd, ")"]) in
+  let _ = print (cat ["  attn[0..2]:          ", show (arr_get attn 0), " ", show (arr_get attn 1), " ", show (arr_get attn 2)]) in
+  let _ = print (cat ["  mismatches:          ", show mism, " of ", show lq]) in
+  let _ = print (cat ["  cpu==gpu sha:        ", if c_h == g_h then "MATCH" else "DIFFER"]) in
+  let _ = print (cat ["  verdict:             ", verdict]) in
+  if mism == 0 then 0 else 1

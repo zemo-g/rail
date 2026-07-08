@@ -1,0 +1,110 @@
+-- safetensors_write_demo.rail -- a pure-Rail safetensors WRITER + round-trip test
+-- (2026-07-05). The checkpoint write-back half the training loop needs: the model
+-- engine already READS .safetensors (ld_f32 / pq_f32_fixed); this WRITES them so
+-- weight updates persist.
+--
+-- Weights live as F=24 int arrays (Q39.24). The writer encodes value = int/2^24
+-- to F32 (via the float_arr_to_f32_file builtin, a real binary write) and emits
+-- the standard safetensors layout: 8-byte LE header length | JSON header | F32
+-- payloads. The only non-string-safe part is the 8-byte length prefix (interior
+-- NUL bytes -- Rail string concat drops NULs), assembled with a one-line shell
+-- printf of octal escapes computed in Rail.
+--
+-- GATE: write 2 tensors, read them back with the SAME pq_* reader the model uses,
+-- assert the F=24 values round-trip (int -> f32 -> int24) within f32 precision.
+--
+-- run: ./rail_native run tools/metal/safetensors_write_demo.rail
+
+import "stdlib/file.rail"
+import "stdlib/float_arr.rail"
+
+foreign pread fd buf count offset -> int
+foreign malloc size -> ptr
+foreign free p
+
+-- ===== F32 reader (verbatim from attested_model_train_fast.rail) =====
+pq_pow2_go acc k = if k == 0 then acc else pq_pow2_go (acc + acc) (k - 1)
+pq_pow2 k = if k < 1 then 1 else pq_pow2_go 1 k
+pq_f32_fixed b0 b1 b2 b3 = let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in let sign = bits / 2147483648 in let rest = bits - sign * 2147483648 in let exp = rest / 8388608 in let mant = rest - exp * 8388608 in if exp == 0 then 0 else let mag = 8388608 + mant in let sh = exp - 126 in let xabs = if sh >= 0 then mag * (pq_pow2 sh) else (let dd = pq_pow2 (0 - sh) in (mag + dd / 2) / dd) in if sign == 1 then 0 - xabs else xabs
+pq_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then pq_match buf (pos + 1) (tail pcs) else 0
+pq_find buf pos hi pcs = if pos >= hi then 0 - 1 else if pq_match buf pos pcs == 1 then pos else pq_find buf (pos + 1) hi pcs
+pq_find_after buf pos hi pcs = let p = pq_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+pq_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else pq_int buf (pos + 1) (acc * 10 + (c - 48))
+pq_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+pq_offset hdr hi name k = let np = pq_find hdr 0 hi (chars (cat ["\"", name, "\":"])) in let dp = pq_find_after hdr np hi (chars "\"data_offsets\":[") in pq_int hdr dp 0
+gp_dec_f32 cbuf out obase count i = if i >= count then 0 else let ba = 4 * i in let _ = arr_set out (obase + i) (pq_f32_fixed (byte_at cbuf ba) (byte_at cbuf (ba + 1)) (byte_at cbuf (ba + 2)) (byte_at cbuf (ba + 3))) in gp_dec_f32 cbuf out obase count (i + 1)
+ld_f32 fd hdrbuf base name count = let start = pq_offset hdrbuf base name 0 in let cbuf = malloc (count * 4) in let nr = pread fd cbuf (count * 4) (base + start) in let out = arr_new count 0 in let _ = gp_dec_f32 cbuf out 0 count 0 in let _ = free cbuf in out
+
+-- ===== WRITER =====
+-- 3-digit octal escape of a byte (0..255): "\NNN" (the leading backslash is a
+-- single \ once Rail's "\\" reaches /bin/sh's printf).
+oct3 v = let d0 = v / 64 in let r0 = v - d0 * 64 in let d1 = r0 / 8 in let d2 = r0 - d1 * 8 in cat ["\\", show d0, show d1, show d2]
+le8_esc h = cat [oct3 (h - (h / 256) * 256), oct3 ((h / 256) - (h / 65536) * 256), oct3 ((h / 65536) - (h / 16777216) * 256), oct3 ((h / 16777216) - (h / 4294967296) * 256), "\\000\\000\\000\\000"]
+-- copy F=24 int array -> float payload slice (value = int / 2^24)
+i2f_into src n dst dbase i = if i >= n then 0 else let _ = float_arr_set dst (dbase + i) ((to_float (arr_get src i)) /. 16777216.0) in i2f_into src n dst dbase (i + 1)
+
+-- header JSON entry: "name":{"dtype":"F32","shape":[SHAPE],"data_offsets":[S,E]}
+st_entry name shape s e = cat ["\"", name, "\":{\"dtype\":\"F32\",\"shape\":[", shape, "],\"data_offsets\":[", show s, ",", show e, "]}"]
+
+st_write path names shapes sizes arrs count =
+  -- 1. build one float payload (all tensors concatenated, F=24 -> float) + header
+  let total = st_sumsizes sizes count 0 0 in
+  let payload = float_arr_new total 0.0 in
+  let hdr = st_build names shapes sizes arrs payload count 0 0 "{" in
+  let hdrfull = cat [hdr, "}"] in
+  let H = length hdrfull in
+  let payfile = cat [path, ".payload.f32"] in
+  let hdrfile = cat [path, ".header.json"] in
+  let _ = float_arr_to_f32_file payfile payload total in
+  let _ = write_file hdrfile hdrfull in
+  -- 2. assemble: 8-byte LE header length | header | payload
+  let _ = shell (cat ["printf '", le8_esc H, "' > ", path, ".len8"]) in
+  let _ = shell (cat ["cat ", path, ".len8 ", hdrfile, " ", payfile, " > ", path]) in
+  let _ = shell (cat ["rm -f ", path, ".len8 ", hdrfile, " ", payfile]) in
+  0
+st_sumsizes sizes count i acc = if i >= count then acc else st_sumsizes sizes count (i + 1) (acc + (arr_get sizes i))
+-- recursively emit each tensor's header entry + fill its payload slice; off tracks payload byte offset
+st_build names shapes sizes arrs payload count i off hdr =
+  if i >= count then hdr
+  else let sz = arr_get sizes i in
+       let e = off + sz * 4 in
+       let _ = i2f_into (arr_get arrs i) sz payload (off / 4) 0 in
+       let sep = if i == 0 then "" else "," in
+       let entry = st_entry (nth_str names i) (nth_str shapes i) off e in
+       st_build names shapes sizes arrs payload count (i + 1) e (cat [hdr, sep, entry])
+nth_str xs i = if i <= 0 then head xs else nth_str (tail xs) (i - 1)
+
+-- ===== round-trip check =====
+cmp_close a b n i maxd = if i >= n then maxd else let d = (let x = (arr_get a i) - (arr_get b i) in if x < 0 then 0 - x else x) in cmp_close a b n (i + 1) (if d > maxd then d else maxd)
+
+main =
+  let path = "/tmp/agk_st/test.safetensors" in
+  let _ = shell "mkdir -p /tmp/agk_st" in
+  -- two F=24 int tensors (values in Q39.24; here ~[-1,1])
+  let alpha = arr_new 6 0 in
+  let _ = arr_set alpha 0 16777216 in let _ = arr_set alpha 1 (0 - 8388608) in let _ = arr_set alpha 2 4194304 in
+  let _ = arr_set alpha 3 (0 - 12582912) in let _ = arr_set alpha 4 335544 in let _ = arr_set alpha 5 16000000 in
+  let beta = arr_new 4 0 in
+  let _ = arr_set beta 0 (0 - 16777216) in let _ = arr_set beta 1 100 in let _ = arr_set beta 2 8388608 in let _ = arr_set beta 3 (0 - 2000000) in
+  let names = ["alpha", "beta"] in
+  let shapes = ["2,3", "4"] in
+  let sizes = arr_new 2 0 in let _ = arr_set sizes 0 6 in let _ = arr_set sizes 1 4 in
+  let arrs = arr_new 2 0 in let _ = arr_set arrs 0 alpha in let _ = arr_set arrs 1 beta in
+  let _ = st_write path names shapes sizes arrs 2 in
+  let _ = print (cat ["wrote ", path, " (", show (read_file_size path), " bytes)"]) in
+  -- read back with the model's own reader
+  let fd = fopen path "rb" in
+  let hbuf8 = malloc 8 in let _ = pread fd hbuf8 8 0 in let hlen = pq_le_len hbuf8 0 in let _ = free hbuf8 in
+  let base = 8 + hlen in let hdrbuf = malloc base in let _ = pread fd hdrbuf base 0 in
+  let a2 = ld_f32 fd hdrbuf base "alpha" 6 in
+  let b2 = ld_f32 fd hdrbuf base "beta" 4 in
+  let _ = fclose fd in
+  let da = cmp_close alpha a2 6 0 0 in
+  let db = cmp_close beta b2 4 0 0 in
+  let _ = print (cat ["  header length = ", show hlen, " bytes"]) in
+  let _ = print (cat ["  alpha  in: ", show (arr_get alpha 0), " ", show (arr_get alpha 1), " ", show (arr_get alpha 4), "   back: ", show (arr_get a2 0), " ", show (arr_get a2 1), " ", show (arr_get a2 4)]) in
+  let _ = print (cat ["  beta   in: ", show (arr_get beta 0), " ", show (arr_get beta 3), "   back: ", show (arr_get b2 0), " ", show (arr_get b2 3)]) in
+  let _ = print (cat ["  max round-trip |delta| (F=24 units): alpha ", show da, "  beta ", show db, "   (< ~4 = f32 precision)"]) in
+  let ok = if (da <= 4) && (db <= 4) then 1 else 0 in
+  let _ = print (cat ["  verdict: ", if ok == 1 then "SAFETENSORS-WRITE-ROUNDTRIP-OK" else "ROUNDTRIP-FAIL"]) in
+  if ok == 1 then 0 else 1

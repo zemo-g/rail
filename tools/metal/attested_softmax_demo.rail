@@ -1,0 +1,164 @@
+-- attested_softmax_demo.rail — twin-kernel attestation, act 7 (2026-07-04).
+--
+-- The LAST discovery item: fixed-point exp -- the one transcendental
+-- a transformer needs (softmax for attention, sigmoid/silu for FFN).
+-- Spec: range-reduce by ln2 (exp(x) = taylor(r) >> n), Taylor through
+-- r^7/5040 built from mul_shr + truncating division -- semantics
+-- identical on ARM64 sdiv and Metal long division, so the CPU twin
+-- (this file, using the mul_shr primitive) and the GPU twin (emitted
+-- MSL) agree bit-for-bit.  After this, a full attested transformer
+-- forward on GPU has ZERO unknowns left.
+--
+-- run from repo root: ./rail_native run tools/metal/attested_softmax_demo.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+lcg_next s = ((s * 1103515245) + 12345) % 2147483648
+
+fill_q a n s i m1 m2 off =
+  if i >= n then s
+  else
+    let s2 = lcg_next s in
+    let s3 = lcg_next s2 in
+    let v = (((s2 % m1) * m2) + (s3 % m2)) - off in
+    let _ = arr_set a i v in
+    fill_q a n s3 (i + 1) m1 m2 off
+
+-- CPU twin of the GPU fx_exp: identical constants, identical ops
+fx_exp x =
+  if x < (0 - 137438953472) then 0
+  else
+    let n = (0 - x) / 2977044472 in
+    let r = x + (n * 2977044472) in
+    let p2 = mul_shr r r 32 in
+    let p3 = mul_shr p2 r 32 in
+    let p4 = mul_shr p3 r 32 in
+    let p5 = mul_shr p4 r 32 in
+    let p6 = mul_shr p5 r 32 in
+    let p7 = mul_shr p6 r 32 in
+    let acc = ((((((4294967296 + r) + (p2 / 2)) + (p3 / 6)) + (p4 / 24)) + (p5 / 120)) + (p6 / 720)) + (p7 / 5040) in
+    acc / (shl 1 n)
+
+sm_max s d base j m =
+  if j >= d then m
+  else
+    let v = arr_get s (base + j) in
+    let m2 = if v > m then v else m in
+    sm_max s d base (j + 1) m2
+
+sm_exp s out d base m j sum =
+  if j >= d then sum
+  else
+    let e = fx_exp ((arr_get s (base + j)) - m) in
+    let _ = arr_set out (base + j) e in
+    sm_exp s out d base m (j + 1) (sum + e)
+
+sm_div out d base den j =
+  if j >= d then 0
+  else
+    let _ = arr_set out (base + j) (((arr_get out (base + j)) * 65536) / den) in
+    sm_div out d base den (j + 1)
+
+sm_rows s out rows d i =
+  if i >= rows then 0
+  else
+    let base = i * d in
+    let m = sm_max s d base 1 (arr_get s base) in
+    let sum = sm_exp s out d base m 0 0 in
+    let _ = sm_div out d base (sum / 65536) 0 in
+    sm_rows s out rows d (i + 1)
+
+row_str a base d j accl =
+  if j >= d then join " " (reverse accl)
+  else row_str a base d (j + 1) (cons (show (arr_get a (base + j))) accl)
+
+rows_text a rows d i accl =
+  if i >= rows then join "\n" (reverse accl)
+  else rows_text a rows d (i + 1) (cons (row_str a (i * d) d 0 []) accl)
+
+out_text o n i accl =
+  if i >= n then join "\n" (reverse accl)
+  else out_text o n (i + 1) (cons (show (arr_get o i)) accl)
+
+pi_digits cs acc =
+  if (length cs) == 0 then acc
+  else pi_digits (tail cs) ((acc * 10) + ((char_to_int (head cs)) - 48))
+
+parse_i s =
+  let cs = chars s in
+  if (head cs) == "-" then 0 - (pi_digits (tail cs) 0)
+  else pi_digits cs 0
+
+cmp_walk lines cpu i n mism =
+  if i >= n then mism
+  else
+    let g = parse_i (head lines) in
+    let c = arr_get cpu i in
+    let m2 = if g == c then mism else mism + 1 in
+    cmp_walk (tail lines) cpu (i + 1) n m2
+
+sum_row o d j acc =
+  if j >= d then acc
+  else sum_row o d (j + 1) (acc + (arr_get o j))
+
+main =
+  let rows = 64 in
+  let d = 512 in
+  let seed = 7890 in
+  let _ = shell "mkdir -p /tmp/agk" in
+  let _ = shell "test -x /tmp/agk/ikernel_harness || clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  -- 1. emit the GPU twin
+  let msl = emit_msl_fx_softmax_shaped rows d in
+  let _ = write_file "/tmp/agk/fx_softmax.metal" msl in
+  -- 2. deterministic scores in [-2^34, 2^34) (~ +/-4.0 in Q32.32)
+  let s = arr_new (rows * d) 0 in
+  let _ = fill_q s (rows * d) seed 0 262144 131072 17179869184 in
+  let stext = cat [rows_text s rows d 0 [], "\n"] in
+  let _ = write_file "/tmp/agk/smS.txt" stext in
+  -- 3. CPU twin
+  let cpu = arr_new (rows * d) 0 in
+  let _ = sm_rows s cpu rows d 0 in
+  let ctext = cat [out_text cpu (rows * d) 0 [], "\n"] in
+  -- 4. run the GPU twin twice (B arg unused by the kernel; reuse S file)
+  let onarg = cat ["on=", show (rows * d)] in
+  let cmd1 = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_softmax.metal fx_softmax /tmp/agk/smS.txt /tmp/agk/smS.txt ", show rows, " ", show d, " /tmp/agk/sm_gpu_out1.txt i64 ", onarg, " 2>/dev/null"] in
+  let cmd2 = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_softmax.metal fx_softmax /tmp/agk/smS.txt /tmp/agk/smS.txt ", show rows, " ", show d, " /tmp/agk/sm_gpu_out2.txt i64 ", onarg, " 2>/dev/null"] in
+  let _ = shell cmd1 in
+  let _ = shell cmd2 in
+  -- 5. verify twins + determinism
+  let gtext = read_file "/tmp/agk/sm_gpu_out1.txt" in
+  let gtext2 = read_file "/tmp/agk/sm_gpu_out2.txt" in
+  let mism = cmp_walk (split "\n" gtext) cpu 0 (rows * d) 0 in
+  let c_h = sha256_hex ctext in
+  let g_h = sha256_hex gtext in
+  let det = if g_h == (sha256_hex gtext2) then "true" else "false" in
+  let verdict = if mism == 0 then "TWINS-AGREE" else "TWINS-DIVERGE" in
+  -- honesty check: row-0 probabilities should sum to ~ONE (4294967296)
+  let row0sum = sum_row cpu d 0 0 in
+  let record = cat ["{\n",
+    "  \"schema\": \"twin-kernel-attest-v0\",\n",
+    "  \"kernel\": \"fx_softmax\",\n",
+    "  \"semantics\": \"Q32.32 softmax; exp = ln2 range-reduction + Taylor r^7, all mul_shr + trunc division\",\n",
+    "  \"emitter\": \"stdlib/jit_emit.rail:emit_msl_fx_softmax_shaped\",\n",
+    "  \"rows\": ", show rows, ", \"d\": ", show d, ", \"seed\": ", show seed, ",\n",
+    "  \"msl_sha256\": \"", sha256_hex msl, "\",\n",
+    "  \"cpu_out_sha256\": \"", c_h, "\",\n",
+    "  \"gpu_out_sha256\": \"", g_h, "\",\n",
+    "  \"gpu_deterministic\": ", det, ",\n",
+    "  \"row0_prob_sum\": ", show row0sum, ",\n",
+    "  \"fx_one\": 4294967296,\n",
+    "  \"mismatches\": ", show mism, ",\n",
+    "  \"verdict\": \"", verdict, "\"\n",
+    "}\n"] in
+  let _ = write_file "/tmp/agk/sm_attest_record.json" record in
+  let _ = print "twin-kernel attestation act 7 (fixed-point softmax on GPU):" in
+  let _ = print (cat ["  rows x d:        ", show rows, " x ", show d, " (", show (rows * d), " outputs)"]) in
+  let _ = print (cat ["  mismatches:      ", show mism, " of ", show (rows * d)]) in
+  let _ = print (cat ["  cpu_out sha256:  ", c_h]) in
+  let _ = print (cat ["  gpu_out sha256:  ", g_h]) in
+  let _ = print (cat ["  gpu run1==run2:  ", det]) in
+  let _ = print (cat ["  row0 prob sum:   ", show row0sum, "  (ONE = 4294967296)"]) in
+  let _ = print (cat ["  verdict:         ", verdict]) in
+  let _ = print "  record:          /tmp/agk/sm_attest_record.json" in
+  if mism == 0 then 0 else 1

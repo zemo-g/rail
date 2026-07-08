@@ -1,0 +1,157 @@
+-- attested_rmsnorm_demo.rail — twin-kernel attestation, act 3 (2026-07-03).
+--
+-- RMSNorm was the last transformer-layer op that needed a discovery
+-- step on the attested-GPU track: rsqrt.  Solved the Path-B way -- a
+-- pure-integer binary search (largest r with (r*r>>32)*v>>32 <= ONE),
+-- every step made of mul_shr / add / compare, so the CPU twin (using
+-- the mul_shr PRIMITIVE) and the GPU twin (emitted MSL) land on
+-- identical bits.  With matvec (act 2) and rmsnorm (this), a full
+-- attested transformer layer on GPU is assembly, not discovery.
+--
+-- run from repo root: ./rail_native run tools/metal/attested_rmsnorm_demo.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+lcg_next s = ((s * 1103515245) + 12345) % 2147483648
+
+-- fill n slots with values in [-off, m1*m2 - off); two draws per value
+fill_q a n s i m1 m2 off =
+  if i >= n then s
+  else
+    let s2 = lcg_next s in
+    let s3 = lcg_next s2 in
+    let v = (((s2 % m1) * m2) + (s3 % m2)) - off in
+    let _ = arr_set a i v in
+    fill_q a n s3 (i + 1) m1 m2 off
+
+-- CPU twin of the GPU fx_rsqrt: identical binary search, identical bound
+fxr_search v lo hi =
+  if (hi - lo) <= 1 then lo
+  else
+    let mid = lo + ((hi - lo) / 2) in
+    let t = mul_shr mid mid 32 in
+    if (mul_shr t v 32) <= 4294967296 then fxr_search v mid hi
+    else fxr_search v lo mid
+
+fx_rsqrt v = fxr_search v 0 35184372088833
+
+rn_ss a d base j acc =
+  if j >= d then acc
+  else
+    let x = arr_get a (base + j) in
+    rn_ss a d base (j + 1) (acc + (mul_shr x x 32))
+
+rn_write a g out d base r j =
+  if j >= d then 0
+  else
+    let y = mul_shr (mul_shr (arr_get a (base + j)) r 32) (arr_get g j) 32 in
+    let _ = arr_set out (base + j) y in
+    rn_write a g out d base r (j + 1)
+
+rn_rows a g out rows d i =
+  if i >= rows then 0
+  else
+    let ss = rn_ss a d (i * d) 0 0 in
+    let r = fx_rsqrt ((ss / d) + 4295) in
+    let _ = rn_write a g out d (i * d) r 0 in
+    rn_rows a g out rows d (i + 1)
+
+row_str a base d j accl =
+  if j >= d then join " " (reverse accl)
+  else row_str a base d (j + 1) (cons (show (arr_get a (base + j))) accl)
+
+rows_text a rows d i accl =
+  if i >= rows then join "\n" (reverse accl)
+  else rows_text a rows d (i + 1) (cons (row_str a (i * d) d 0 []) accl)
+
+out_text o n i accl =
+  if i >= n then join "\n" (reverse accl)
+  else out_text o n (i + 1) (cons (show (arr_get o i)) accl)
+
+pi_digits cs acc =
+  if (length cs) == 0 then acc
+  else pi_digits (tail cs) ((acc * 10) + ((char_to_int (head cs)) - 48))
+
+parse_i s =
+  let cs = chars s in
+  if (head cs) == "-" then 0 - (pi_digits (tail cs) 0)
+  else pi_digits cs 0
+
+cmp_walk lines cpu i n mism =
+  if i >= n then mism
+  else
+    let g = parse_i (head lines) in
+    let c = arr_get cpu i in
+    let m2 = if g == c then mism else mism + 1 in
+    cmp_walk (tail lines) cpu (i + 1) n m2
+
+main =
+  let rows = 64 in
+  let d = 512 in
+  let seed = 9012 in
+  let _ = shell "mkdir -p /tmp/agk" in
+  -- 1. emit the GPU twin
+  let msl = emit_msl_fx_rmsnorm_shaped rows d in
+  let _ = write_file "/tmp/agk/fx_rmsnorm.metal" msl in
+  -- 2. deterministic inputs: x in [-2^34, 2^34), g in [-2^33, 2^33)
+  let a = arr_new (rows * d) 0 in
+  let g = arr_new d 0 in
+  let s1 = fill_q a (rows * d) seed 0 262144 131072 17179869184 in
+  let _ = fill_q g d s1 0 131072 131072 8589934592 in
+  let atext = cat [rows_text a rows d 0 [], "\n"] in
+  let gtext_in = cat [row_str g 0 d 0 [], "\n"] in
+  let _ = write_file "/tmp/agk/rnX.txt" atext in
+  let _ = write_file "/tmp/agk/rnG.txt" gtext_in in
+  -- 3. CPU twin via the mul_shr primitive
+  let cpu = arr_new (rows * d) 0 in
+  let _ = rn_rows a g cpu rows d 0 in
+  let ctext = cat [out_text cpu (rows * d) 0 [], "\n"] in
+  let _ = write_file "/tmp/agk/rn_cpu_out.txt" ctext in
+  -- 4. build + run the GPU twin twice (output = rows*d values)
+  let _ = shell "test -x /tmp/agk/ikernel_harness || clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  let onarg = cat ["on=", show (rows * d)] in
+  let cmd1 = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_rmsnorm.metal fx_rmsnorm /tmp/agk/rnX.txt /tmp/agk/rnG.txt ", show rows, " ", show d, " /tmp/agk/rn_gpu_out1.txt i64 ", onarg, " 2>/tmp/agk/rn_gpu_ms1.txt"] in
+  let cmd2 = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_rmsnorm.metal fx_rmsnorm /tmp/agk/rnX.txt /tmp/agk/rnG.txt ", show rows, " ", show d, " /tmp/agk/rn_gpu_out2.txt i64 ", onarg, " 2>/tmp/agk/rn_gpu_ms2.txt"] in
+  let _ = shell cmd1 in
+  let _ = shell cmd2 in
+  -- 5. verify twins + determinism
+  let gtext = read_file "/tmp/agk/rn_gpu_out1.txt" in
+  let gtext2 = read_file "/tmp/agk/rn_gpu_out2.txt" in
+  let lines = split "\n" gtext in
+  let mism = cmp_walk lines cpu 0 (rows * d) 0 in
+  let msl_h = sha256_hex msl in
+  let c_h = sha256_hex ctext in
+  let g_h = sha256_hex gtext in
+  let g2_h = sha256_hex gtext2 in
+  let det = if g_h == g2_h then "true" else "false" in
+  let verdict = if mism == 0 then "TWINS-AGREE" else "TWINS-DIVERGE" in
+  -- 6. attestation record
+  let record = cat ["{\n",
+    "  \"schema\": \"twin-kernel-attest-v0\",\n",
+    "  \"kernel\": \"fx_rmsnorm\",\n",
+    "  \"semantics\": \"Q32.32 RMSNorm, integer binary-search rsqrt (Path-B style)\",\n",
+    "  \"emitter\": \"stdlib/jit_emit.rail:emit_msl_fx_rmsnorm_shaped\",\n",
+    "  \"rows\": ", show rows, ",\n",
+    "  \"d\": ", show d, ",\n",
+    "  \"seed\": ", show seed, ",\n",
+    "  \"msl_sha256\": \"", msl_h, "\",\n",
+    "  \"cpu_out_sha256\": \"", c_h, "\",\n",
+    "  \"gpu_out_sha256\": \"", g_h, "\",\n",
+    "  \"gpu_run2_sha256\": \"", g2_h, "\",\n",
+    "  \"gpu_deterministic\": ", det, ",\n",
+    "  \"mismatches\": ", show mism, ",\n",
+    "  \"verdict\": \"", verdict, "\"\n",
+    "}\n"] in
+  let _ = write_file "/tmp/agk/rn_attest_record.json" record in
+  -- 7. report
+  let _ = print "twin-kernel attestation act 3 (fixed-point RMSNorm on GPU):" in
+  let _ = print (cat ["  rows x d:        ", show rows, " x ", show d, " (", show (rows * d), " outputs)"]) in
+  let _ = print (cat ["  sample cpu[0]:   ", show (arr_get cpu 0)]) in
+  let _ = print (cat ["  mismatches:      ", show mism, " of ", show (rows * d)]) in
+  let _ = print (cat ["  cpu_out sha256:  ", c_h]) in
+  let _ = print (cat ["  gpu_out sha256:  ", g_h]) in
+  let _ = print (cat ["  gpu run1==run2:  ", det]) in
+  let _ = print (cat ["  verdict:         ", verdict]) in
+  let _ = print "  record:          /tmp/agk/rn_attest_record.json" in
+  if mism == 0 then 0 else 1

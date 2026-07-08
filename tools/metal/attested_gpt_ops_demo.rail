@@ -1,0 +1,134 @@
+-- attested_gpt_ops_demo.rail — twin-kernel attestation, act 12 (2026-07-04).
+--
+-- Completes the GPT-family primitive set for the real 138M model:
+--   * matvec (idot semantics: full-precision accumulate then >>24) on
+--     the REAL blocks.0.attn.query_proj weights x the real ln1 output
+--   * GELU (tanh-approx, F=24) swept across the activation range
+-- Both twin-verified GPU vs the model's own fixed-point CPU math.
+-- With LayerNorm (act 11), these three are every op a GPT block needs
+-- (attention = matvec + softmax[act 7 form] + matvec; FFN = matvec +
+-- GELU + matvec) -> a full attested 138M layer on GPU is now assembly.
+--
+-- prep: python3 $CLAUDE_JOB_DIR/tmp/extract_gpt_ops.py
+-- run:  ./rail_native run tools/metal/attested_gpt_ops_demo.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+-- ==== the model's own GELU chain (bx_fixed.rail), copied verbatim ====
+bx4_pow2_go acc k = if k == 0 then acc else bx4_pow2_go (acc + acc) (k - 1)
+bx4_pow2 k = if k < 1 then 1 else bx4_pow2_go 1 k
+bx4_exp_poly fq =
+  let p8 = 416 in
+  let p7 = 3329 + (p8 * fq) / 16777216 in
+  let p6 = 23302 + (p7 * fq) / 16777216 in
+  let p5 = 139810 + (p6 * fq) / 16777216 in
+  let p4 = 699051 + (p5 * fq) / 16777216 in
+  let p3 = 2796203 + (p4 * fq) / 16777216 in
+  let p2 = 8388608 + (p3 * fq) / 16777216 in
+  let p1 = 16777216 + (p2 * fq) / 16777216 in
+  let p0 = 16777216 + (p1 * fq) / 16777216 in
+  p0
+bx4_exp_neg ax =
+  let k = ax / 11629080 in
+  let fq = ax - k * 11629080 in
+  let ef = bx4_exp_poly fq in
+  let emf = 281474976710656 / ef in
+  if k >= 50 then 0
+  else let p2 = bx4_pow2 k in (emf + p2 / 2) / p2
+bx4_tanh_pos axq =
+  let em = bx4_exp_neg (axq + axq) in
+  ((16777216 - em) * 16777216) / (16777216 + em)
+bx4_tanh xq = if xq < 0 then 0 - (bx4_tanh_pos (0 - xq)) else bx4_tanh_pos xq
+bx4_gelu xq =
+  let x2 = (xq * xq) / 16777216 in
+  let x3 = (x2 * xq) / 16777216 in
+  let ax3 = (750194 * x3) / 16777216 in
+  let inner0 = xq + ax3 in
+  let inner = (13386610 * inner0) / 16777216 in
+  let th = bx4_tanh inner in
+  let onep = 16777216 + th in
+  (xq * onep) / 33554432
+
+-- ==== CPU matvec twin: idot = (sum W_i*x_i) >> 24 via mul_shr(acc,1,24) ====
+mm_dot p wrow xoff k i acc =
+  if i >= k then acc
+  else mm_dot p wrow xoff k (i + 1) (acc + ((arr_get p (wrow + i)) * (arr_get p (xoff + i))))
+
+mm_rows p out rows k xoff o =
+  if o >= rows then 0
+  else
+    let acc = mm_dot p (o * k) xoff k 0 0 in
+    let _ = arr_set out o (mul_shr acc 1 24) in
+    mm_rows p out rows k xoff (o + 1)
+
+gelu_rows inp out n i =
+  if i >= n then 0
+  else
+    let _ = arr_set out i (bx4_gelu (arr_get inp i)) in
+    gelu_rows inp out n (i + 1)
+
+pi_digits cs acc = if (length cs) == 0 then acc else pi_digits (tail cs) ((acc * 10) + ((char_to_int (head cs)) - 48))
+parse_i s =
+  if (length (chars s)) == 0 then 0
+  else let cs = chars s in if (head cs) == "-" then 0 - (pi_digits (tail cs) 0) else pi_digits cs 0
+load_lines lines a i n = if i >= n then 0 else let _ = arr_set a i (parse_i (head lines)) in load_lines (tail lines) a (i + 1) n
+out_text o n i accl = if i >= n then join "\n" (reverse accl) else out_text o n (i + 1) (cons (show (arr_get o i)) accl)
+cmp_walk lines cpu i n mism =
+  if i >= n then mism
+  else let g = parse_i (head lines) in let c = arr_get cpu i in
+    cmp_walk (tail lines) cpu (i + 1) n (if g == c then mism else mism + 1)
+
+main =
+  let d = 768 in
+  let _ = shell "mkdir -p /tmp/agk" in
+  let _ = shell "test -x /tmp/agk/ikernel_harness || clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  -- ===== 1. GPT matvec on REAL query_proj weights =====
+  let mmtotal = (d * d) + d in
+  let mp = arr_new mmtotal 0 in
+  let _ = load_lines (split "\n" (read_file "/tmp/agk/mm_P.txt")) mp 0 mmtotal in
+  let mcpu = arr_new d 0 in
+  let _ = mm_rows mp mcpu d d (d * d) 0 in
+  let mmsl = emit_msl_fx_matmul24_shaped d d in
+  let _ = write_file "/tmp/agk/fx_matmul.metal" mmsl in
+  -- harness dispatches argv[5] threads; matvec needs one per output row (d),
+  -- so rows=d and cols=mmtotal/d (kernel has its own baked K).
+  let mcols = mmtotal / d in
+  let mcmd = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_matmul.metal fx_matmul /tmp/agk/mm_P.txt /tmp/agk/mm_P.txt ", show d, " ", show mcols, " /tmp/agk/mm_gpu.txt i64 on=", show d, " 2>/dev/null"] in
+  let _ = shell mcmd in
+  let mgtext = read_file "/tmp/agk/mm_gpu.txt" in
+  let mm_mism = cmp_walk (split "\n" mgtext) mcpu 0 d 0 in
+  let mm_ch = sha256_hex (cat [out_text mcpu d 0 [], "\n"]) in
+  let mm_gh = sha256_hex mgtext in
+  -- ===== 2. GELU on the swept activation range =====
+  let n = 512 in
+  let gin = arr_new n 0 in
+  let _ = load_lines (split "\n" (read_file "/tmp/agk/gelu_in.txt")) gin 0 n in
+  let gcpu = arr_new n 0 in
+  let _ = gelu_rows gin gcpu n 0 in
+  let gmsl = emit_msl_fx_gelu24_shaped n in
+  let _ = write_file "/tmp/agk/fx_gelu.metal" gmsl in
+  let gcmd = cat ["/tmp/agk/ikernel_harness /tmp/agk/fx_gelu.metal fx_gelu /tmp/agk/gelu_in.txt /tmp/agk/gelu_in.txt ", show n, " 1 /tmp/agk/gelu_gpu.txt i64 on=", show n, " 2>/dev/null"] in
+  let _ = shell gcmd in
+  let ggtext = read_file "/tmp/agk/gelu_gpu.txt" in
+  let g_mism = cmp_walk (split "\n" ggtext) gcpu 0 n 0 in
+  let g_ch = sha256_hex (cat [out_text gcpu n 0 [], "\n"]) in
+  let g_gh = sha256_hex ggtext in
+  let total_mism = mm_mism + g_mism in
+  let verdict = if total_mism == 0 then "GPT-OPS-TWINS-AGREE" else "GPT-OPS-TWINS-DIVERGE" in
+  let record = cat ["{\n",
+    "  \"schema\": \"twin-kernel-attest-v0\",\n",
+    "  \"ops\": \"GPT matvec (idot F=24) on REAL query_proj + GELU sweep\",\n",
+    "  \"model\": \"canonical_bestpass.safetensors (138M)\",\n",
+    "  \"matvec\": {\"d\": ", show d, ", \"cpu_sha256\": \"", mm_ch, "\", \"gpu_sha256\": \"", mm_gh, "\", \"mismatches\": ", show mm_mism, "},\n",
+    "  \"gelu\": {\"n\": ", show n, ", \"cpu_sha256\": \"", g_ch, "\", \"gpu_sha256\": \"", g_gh, "\", \"mismatches\": ", show g_mism, "},\n",
+    "  \"verdict\": \"", verdict, "\"\n",
+    "}\n"] in
+  let _ = write_file "/tmp/agk/gpt_ops_record.json" record in
+  let _ = print "twin-kernel attestation act 12 (GPT matvec + GELU on REAL 138M weights):" in
+  let _ = print (cat ["  matvec (query_proj 768x768): ", show mm_mism, " mismatches; cpu[0..2] ", show (arr_get mcpu 0), " ", show (arr_get mcpu 1), " ", show (arr_get mcpu 2)]) in
+  let _ = print (cat ["  gelu (512-pt sweep):         ", show g_mism, " mismatches; gelu(1.0)=", show (bx4_gelu 16777216), " (~0.8412*S=14116306)"]) in
+  let _ = print (cat ["  matvec cpu==gpu sha:         ", if mm_ch == mm_gh then "MATCH" else "DIFFER"]) in
+  let _ = print (cat ["  gelu   cpu==gpu sha:         ", if g_ch == g_gh then "MATCH" else "DIFFER"]) in
+  let _ = print (cat ["  verdict:                     ", verdict]) in
+  if total_mism == 0 then 0 else 1

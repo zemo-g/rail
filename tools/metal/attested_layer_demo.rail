@@ -1,0 +1,179 @@
+-- attested_layer_demo.rail — twin-kernel attestation, act 6 (2026-07-03).
+--
+-- The "assembly, not discovery" claim, demonstrated: a transformer
+-- layer's front half -- RMSNorm -> Q/K/V projections -- chained on
+-- GPU from the ALREADY-PROVEN kernels (act 3 rmsnorm, act 2 matvec),
+-- twin-verified end to end against a CPU chain built on the mul_shr
+-- primitive.  No new kernels; pure composition.
+--
+-- Each stage's record carries its input and output hashes, so the
+-- four stages form a hash CHAIN: tampering with any intermediate
+-- breaks every link downstream.  This is the shape of an attested
+-- forward pass at GPU speed.
+--
+-- Q32.32 throughout.  x in [-2^34,2^34), g/W in [-2^33,2^33); the
+-- matvec accumulator peaks ~2^58, inside int64 and Rail's 63-bit.
+--
+-- run from repo root: ./rail_native run tools/metal/attested_layer_demo.rail
+
+import "stdlib/jit_emit.rail"
+import "stdlib/sha256.rail"
+
+lcg_next s = ((s * 1103515245) + 12345) % 2147483648
+
+fill_q a n s i m1 m2 off =
+  if i >= n then s
+  else
+    let s2 = lcg_next s in
+    let s3 = lcg_next s2 in
+    let v = (((s2 % m1) * m2) + (s3 % m2)) - off in
+    let _ = arr_set a i v in
+    fill_q a n s3 (i + 1) m1 m2 off
+
+-- CPU twin: rmsnorm (same integer binary-search rsqrt as act 3)
+fxr_search v lo hi =
+  if (hi - lo) <= 1 then lo
+  else
+    let mid = lo + ((hi - lo) / 2) in
+    let t = mul_shr mid mid 32 in
+    if (mul_shr t v 32) <= 4294967296 then fxr_search v mid hi
+    else fxr_search v lo mid
+
+fx_rsqrt v = fxr_search v 0 35184372088833
+
+rn_ss a d j acc =
+  if j >= d then acc
+  else
+    let x = arr_get a j in
+    rn_ss a d (j + 1) (acc + (mul_shr x x 32))
+
+rn_write a g out d r j =
+  if j >= d then 0
+  else
+    let y = mul_shr (mul_shr (arr_get a j) r 32) (arr_get g j) 32 in
+    let _ = arr_set out j y in
+    rn_write a g out d r (j + 1)
+
+-- CPU twin: matvec row (W row-major; row c = output c)
+mv_dot w xn d base j acc =
+  if j >= d then acc
+  else mv_dot w xn d base (j + 1) (acc + (mul_shr (arr_get w (base + j)) (arr_get xn j) 32))
+
+mv_rows w xn out rows d i =
+  if i >= rows then 0
+  else
+    let _ = arr_set out i (mv_dot w xn d (i * d) 0 0) in
+    mv_rows w xn out rows d (i + 1)
+
+row_str a base d j accl =
+  if j >= d then join " " (reverse accl)
+  else row_str a base d (j + 1) (cons (show (arr_get a (base + j))) accl)
+
+rows_text a rows d i accl =
+  if i >= rows then join "\n" (reverse accl)
+  else rows_text a rows d (i + 1) (cons (row_str a (i * d) d 0 []) accl)
+
+vec_text a n = cat [row_str a 0 n 0 [], "\n"]
+
+pi_digits cs acc =
+  if (length cs) == 0 then acc
+  else pi_digits (tail cs) ((acc * 10) + ((char_to_int (head cs)) - 48))
+
+parse_i s =
+  let cs = chars s in
+  if (head cs) == "-" then 0 - (pi_digits (tail cs) 0)
+  else pi_digits cs 0
+
+cmp_walk lines cpu i n mism =
+  if i >= n then mism
+  else
+    let g = parse_i (head lines) in
+    let c = arr_get cpu i in
+    let m2 = if g == c then mism else mism + 1 in
+    cmp_walk (tail lines) cpu (i + 1) n m2
+
+-- run one GPU matvec stage: W-file x input-file -> out-file; returns out text
+gpu_matvec wfile infile outfile d =
+  let cmd = cat ["/tmp/agk/ikernel_harness /tmp/agk/layer_matvec.metal fx_matvec ", wfile, " ", infile, " ",
+                 show d, " ", show d, " ", outfile, " i64 2>/dev/null"] in
+  let _ = shell cmd in
+  read_file outfile
+
+-- one projection: GPU stage + CPU twin + verify; returns [mism, in_h, out_h]
+proj_stage name wfile infile outfile w xn cpu d =
+  let gtext = gpu_matvec wfile infile outfile d in
+  let _ = mv_rows w xn cpu d d 0 in
+  let mism = cmp_walk (split "\n" gtext) cpu 0 d 0 in
+  [mism, sha256_hex (read_file infile), sha256_hex gtext]
+
+stage_json name h =
+  cat ["    {\"stage\": \"", name, "\", \"in_sha256\": \"", head (tail h), "\", \"out_sha256\": \"", head (tail (tail h)), "\", \"mismatches\": ", show (head h), "}"]
+
+main =
+  let d = 512 in
+  let seed = 3456 in
+  let _ = shell "mkdir -p /tmp/agk" in
+  let _ = shell "test -x /tmp/agk/ikernel_harness || clang -fobjc-arc -O2 -framework Metal -framework Foundation -o /tmp/agk/ikernel_harness tools/metal/ikernel_harness.m 2>/tmp/agk/clang_err.txt" in
+  -- emit the two kernels this layer needs (both already proven solo)
+  let _ = write_file "/tmp/agk/layer_rmsnorm.metal" (emit_msl_fx_rmsnorm_shaped 1 d) in
+  let _ = write_file "/tmp/agk/layer_matvec.metal" (emit_msl_fx_matvec_shaped d d 32) in
+  -- deterministic weights + input: x, g, Wq, Wk, Wv
+  let x = arr_new d 0 in
+  let g = arr_new d 0 in
+  let wq = arr_new (d * d) 0 in
+  let wk = arr_new (d * d) 0 in
+  let wv = arr_new (d * d) 0 in
+  let s1 = fill_q x d seed 0 262144 131072 17179869184 in
+  let s2 = fill_q g d s1 0 131072 131072 8589934592 in
+  let s3 = fill_q wq (d * d) s2 0 131072 131072 8589934592 in
+  let s4 = fill_q wk (d * d) s3 0 131072 131072 8589934592 in
+  let _ = fill_q wv (d * d) s4 0 131072 131072 8589934592 in
+  let _ = write_file "/tmp/agk/lx.txt" (vec_text x d) in
+  let _ = write_file "/tmp/agk/lg.txt" (vec_text g d) in
+  let _ = write_file "/tmp/agk/lwq.txt" (cat [rows_text wq d d 0 [], "\n"]) in
+  let _ = write_file "/tmp/agk/lwk.txt" (cat [rows_text wk d d 0 [], "\n"]) in
+  let _ = write_file "/tmp/agk/lwv.txt" (cat [rows_text wv d d 0 [], "\n"]) in
+  -- STAGE 1: rmsnorm on GPU (1 row) + CPU twin
+  let rn_cmd = cat ["/tmp/agk/ikernel_harness /tmp/agk/layer_rmsnorm.metal fx_rmsnorm /tmp/agk/lx.txt /tmp/agk/lg.txt 1 ", show d, " /tmp/agk/lxn.txt i64 on=", show d, " 2>/dev/null"] in
+  let _ = shell rn_cmd in
+  let xn_gpu_text = read_file "/tmp/agk/lxn.txt" in
+  let xn = arr_new d 0 in
+  let ss = rn_ss x d 0 0 in
+  let r = fx_rsqrt ((ss / d) + 4295) in
+  let _ = rn_write x g xn d r 0 in
+  let rn_mism = cmp_walk (split "\n" xn_gpu_text) xn 0 d 0 in
+  let rn_rec = [rn_mism, sha256_hex (read_file "/tmp/agk/lx.txt"), sha256_hex xn_gpu_text] in
+  -- STAGES 2-4: Q/K/V projections, GPU output of stage 1 feeds the GPU stages
+  let q_cpu = arr_new d 0 in
+  let k_cpu = arr_new d 0 in
+  let v_cpu = arr_new d 0 in
+  let q_rec = proj_stage "q_proj" "/tmp/agk/lwq.txt" "/tmp/agk/lxn.txt" "/tmp/agk/lq.txt" wq xn q_cpu d in
+  let k_rec = proj_stage "k_proj" "/tmp/agk/lwk.txt" "/tmp/agk/lxn.txt" "/tmp/agk/lk.txt" wk xn k_cpu d in
+  let v_rec = proj_stage "v_proj" "/tmp/agk/lwv.txt" "/tmp/agk/lxn.txt" "/tmp/agk/lv.txt" wv xn v_cpu d in
+  let total_mism = rn_mism + (head q_rec) + (head k_rec) + (head v_rec) in
+  let verdict = if total_mism == 0 then "LAYER-TWINS-AGREE" else "LAYER-TWINS-DIVERGE" in
+  let stages = [cat ["    {\"stage\": \"rmsnorm\", \"in_sha256\": \"", head (tail rn_rec), "\", \"out_sha256\": \"", head (tail (tail rn_rec)), "\", \"mismatches\": ", show rn_mism, "}"],
+                stage_json "q_proj" q_rec,
+                stage_json "k_proj" k_rec,
+                stage_json "v_proj" v_rec] in
+  let record = cat ["{\n",
+    "  \"schema\": \"attested-layer-v0\",\n",
+    "  \"layer\": \"rmsnorm -> q/k/v projections (transformer front half)\",\n",
+    "  \"composition\": \"acts 2+3 kernels, zero new discovery\",\n",
+    "  \"d\": ", show d, ", \"seed\": ", show seed, ",\n",
+    "  \"chain\": [\n",
+    join ",\n" stages,
+    "\n  ],\n",
+    "  \"total_mismatches\": ", show total_mism, ",\n",
+    "  \"verdict\": \"", verdict, "\"\n",
+    "}\n"] in
+  let _ = write_file "/tmp/agk/layer_attest_record.json" record in
+  let _ = print "twin-kernel attestation act 6 (attested transformer front-half on GPU):" in
+  let _ = print (cat ["  stage rmsnorm:   ", show rn_mism, " mismatches of ", show d]) in
+  let _ = print (cat ["  stage q_proj:    ", show (head q_rec), " mismatches of ", show d]) in
+  let _ = print (cat ["  stage k_proj:    ", show (head k_rec), " mismatches of ", show d]) in
+  let _ = print (cat ["  stage v_proj:    ", show (head v_rec), " mismatches of ", show d]) in
+  let _ = print (cat ["  q_out sha256:    ", head (tail (tail q_rec))]) in
+  let _ = print (cat ["  verdict:         ", verdict]) in
+  let _ = print "  record:          /tmp/agk/layer_attest_record.json (per-stage hash chain)" in
+  if total_mism == 0 then 0 else 1

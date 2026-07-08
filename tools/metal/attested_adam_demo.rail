@@ -1,0 +1,109 @@
+-- attested_adam_demo.rail -- twin-kernel attestation for the F=24 AdamW step
+-- (2026-07-05). The optimizer the mid15 scale-up run needs, now on the GPU.
+--
+-- emit_msl_fx_adam_step is twin-verified here: the GPU kernel result is compared
+-- bit-for-bit against a CPU replica computed with the mul_shr primitive + the
+-- Path-B bx4_fxsqrt (the exact fixed-point sqrt the kernel's fx_sqrt24 mirrors).
+-- GPU==CPU exactly => the AdamW optimizer joins the attested training step.
+--
+-- The Adam ALGORITHM (does F=24 AdamW converge, and the eps~1e-3 requirement)
+-- was validated separately in tools/metal/fx_adam_gate.rail. This demo proves
+-- the GPU kernel computes that same update bit-for-bit.
+--
+-- Packed buffers (see emit_msl_fx_adam_step):
+--   P: W(N) | m(N) | v(N) | c1 | c2      (size 3N+2)
+--   G: grad(N)                            (size N)
+--   O: W'(N) | m'(N) | v'(N)             (size 3N)
+--
+-- run: ./rail_native run tools/metal/attested_adam_demo.rail
+
+import "stdlib/ijit.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- ===== F=24 sqrt (verbatim Path-B; the kernel's fx_sqrt24 mirrors this) =====
+bx4_sqrt_le r xq = let hr = mul_shr r r 24 in if hr < xq then true else if hr > xq then false else let c = r - (r / 16777216) * 16777216 in let cc = c * c in (cc - (cc / 16777216) * 16777216) == 0
+bx4_bsqrt lo hi xq = if (lo + 1) >= hi then lo else let mid = (lo + hi) / 2 in if bx4_sqrt_le mid xq then bx4_bsqrt mid hi xq else bx4_bsqrt lo mid xq
+bx4_fxsqrt xq = if xq < 1 then 0 else let a = 16384 in bx4_bsqrt 0 ((a * a) * 4096) xq
+
+-- ===== utilities =====
+lcg_next s = ((s * 1103515245) + 12345) % 2147483648
+fill_sym a n s i span = if i >= n then s else let s2 = lcg_next s in let _ = arr_set a i ((s2 % span) - (span / 2)) in fill_sym a n s2 (i + 1) span
+fill_pos a n s i span = if i >= n then s else let s2 = lcg_next s in let _ = arr_set a i (s2 % span) in fill_pos a n s2 (i + 1) span
+cpseg src soff dst doff n i = if i >= n then 0 else let _ = arr_set dst (doff + i) (arr_get src (soff + i)) in cpseg src soff dst doff n (i + 1)
+
+-- ===== CPU twin: identical arithmetic + packed indexing to the kernel =====
+cpu_adam P G O N b1 b2 eps lr i =
+  if i >= N then 0
+  else let g = arr_get G i in
+       let w = arr_get P i in
+       let mprev = arr_get P (N + i) in
+       let vprev = arr_get P (2 * N + i) in
+       let c1 = arr_get P (3 * N) in
+       let c2 = arr_get P (3 * N + 1) in
+       let mo = (mul_shr b1 mprev 24) + (mul_shr (16777216 - b1) g 24) in
+       let g2 = mul_shr g g 24 in
+       let vo = (mul_shr b2 vprev 24) + (mul_shr (16777216 - b2) g2 24) in
+       let mhat = (mo * 16777216) / c1 in
+       let vhat = (vo * 16777216) / c2 in
+       let denom = (bx4_fxsqrt vhat) + eps in
+       let upd = if denom == 0 then 0 else (mhat * 16777216) / denom in
+       let _ = arr_set O i (w - (mul_shr lr upd 24)) in
+       let _ = arr_set O (N + i) mo in
+       let _ = arr_set O (2 * N + i) vo in
+       cpu_adam P G O N b1 b2 eps lr (i + 1)
+
+cmp_arr a b n i mism = if i >= n then mism else cmp_arr a b n (i + 1) (if (arr_get a i) == (arr_get b i) then mism else mism + 1)
+sumabs A n i acc = if i >= n then acc else sumabs A n (i + 1) (acc + (let v = arr_get A i in if v < 0 then 0 - v else v))
+
+main =
+  let N = 256 in
+  let b1 = 15099494 in    -- 0.9
+  let b2 = 16760439 in    -- 0.999
+  let eps = 16777 in      -- ~1e-3 (the measured fixed-point Adam eps floor)
+  let lr = 83886 in       -- 0.005
+  let c1 = 1677722 in     -- 1-beta1^1 = 0.1  (early-step bias correction)
+  let c2 = 16777 in       -- 1-beta2^1 = 0.001 (small -> large vhat -> exercises sqrt)
+  let seed = 424242 in
+  -- packed P: W | m | v | c1 | c2
+  let P = arr_new (3 * N + 2) 0 in
+  let s1 = fill_sym P N seed 0 33554432 in                 -- W in [-1,1)
+  let s2 = fill_sym P (2 * N) s1 N 8388608 in              -- m in [-0.25,0.25)
+  let s3 = fill_pos P (3 * N) s2 (2 * N) 16777216 in       -- v in [0,1)
+  let _ = arr_set P (3 * N) c1 in let _ = arr_set P (3 * N + 1) c2 in
+  let G = arr_new N 0 in let _ = fill_sym G N s3 0 8388608 in  -- grad in [-0.25,0.25)
+  -- CPU twin
+  let Ocpu = arr_new (3 * N) 0 in
+  let _ = cpu_adam P G Ocpu N b1 b2 eps lr 0 in
+  -- GPU
+  let kid = ijit_compile (emit_msl_fx_adam_step N b1 b2 eps lr) in
+  let Ogpu = arr_new (3 * N) 0 in
+  let _ = ijit_run kid P G Ogpu (3 * N + 2) N (3 * N) N in
+  let Ogpu2 = arr_new (3 * N) 0 in
+  let _ = ijit_run kid P G Ogpu2 (3 * N + 2) N (3 * N) N in
+  -- verify twins + determinism
+  let mism = cmp_arr Ocpu Ogpu (3 * N) 0 0 in
+  let det = cmp_arr Ogpu Ogpu2 (3 * N) 0 0 in
+  -- receipt
+  let wsum = sumabs Ogpu N 0 0 in
+  let msum = sumabs Ogpu (2 * N) N 0 in
+  let vsum = sumabs Ogpu (3 * N) (2 * N) 0 in
+  let digest_b = sha256 (cat [show N, "|", show mism, "|", show (arr_get Ogpu 0), "|", show wsum, "|", show msum, "|", show vsum]) in
+  let digest = bytes_to_hex digest_b 32 in
+  let sd = sha256 "attested.adam.step.local.dev.seed.v1" in
+  let sig = ed25519_sign sd digest_b 32 in
+  let sighex = bytes_to_hex sig 64 in
+  let ok = if (mism == 0) && (det == 0) then 1 else 0 in
+  let _ = print (cat ["attested F=24 AdamW step, twin-verified GPU vs CPU (N=", show N, ", eps~1e-3):"]) in
+  let _ = print (cat ["  W[0]: ", show (arr_get P 0), " --Adam--> ", show (arr_get Ogpu 0), "   (m[0]=", show (arr_get Ogpu N), " v[0]=", show (arr_get Ogpu (2 * N)), ")"]) in
+  let _ = print (cat ["  GPU vs CPU mismatches over 3N=", show (3 * N), ": ", show mism]) in
+  let _ = print (cat ["  determinism (run1 vs run2) mismatches: ", show det]) in
+  let _ = print (cat ["  sum|W'|=", show wsum, " sum|m'|=", show msum, " sum|v'|=", show vsum]) in
+  let _ = print (cat ["  step digest: ", digest]) in
+  let _ = print (cat ["  ed25519 sig: ", str_sub sighex 0 32, "..."]) in
+  let _ = print (cat ["  verdict: ", if ok == 1 then "ATTESTED-ADAM-STEP-OK" else "ADAM-TWINS-DIVERGE"]) in
+  if ok == 1 then 0 else 1
