@@ -1,7 +1,7 @@
 # tools/orch — autonomous training-arm orchestrator
 
 Pure-Rail tooling driven by Claude Code's `ScheduleWakeup` + `Bash`.
-Reads `EXPERIMENT_PLAN.md` (repo root), launches arms in parallel up to
+Reads `docs/archive/EXPERIMENT_PLAN.md` (archived 2026-07-08; the May-2026 queue), launches arms in parallel up to
 budget, polls every 30 min, kills laggards, benches winners, writes
 LEADERBOARD.md + HANDOFF.md. Commits after every arm.
 
