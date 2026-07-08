@@ -2049,6 +2049,93 @@ int tgl_ijit_dispatch_wx(int kid, int wid, const long *X, long *O,
 }
 
 // ────────────────────────────────────────────────────────────────────
+// RESIDENT ACTIVATIONS (2026-07-08).  The measured bottleneck: the trainer is
+// ~79% CPU-bound on per-dispatch untag/retag + Rail-side pack + readback, NOT
+// GPU math.  These primitives keep activations UNTAGGED int64 in resident GPU
+// buffers (same representation the kernels already consume after untag), so a
+// chain of kernels reads/writes GPU-side with ZERO CPU touch between ops.  Only
+// the first upload (abuf_upload = ibuf_update) and final abuf_download retag.
+// Bit-for-bit identical to the staged path: same untag -> int64 -> kernel -> raw.
+// Activation buffers share the g_ibufs handle space with resident weights.
+
+// Allocate a zeroed resident int64 activation buffer of n elements; return handle.
+int tgl_abuf_alloc(int n) {
+    if (ensure_init() != 1) return -1;
+    if (n < 1) return -1;
+    if (!g_ibufs) g_ibufs = [NSMutableArray array];
+    id<MTLBuffer> b = [g_device newBufferWithLength:(NSUInteger)n * 8
+                                            options:MTLResourceStorageModeShared];
+    if (!b) return -1;
+    memset(b.contents, 0, (NSUInteger)n * 8);
+    [g_ibufs addObject:b];
+    return (int)(g_ibufs.count - 1);
+}
+
+// Read resident buffer `h` (untagged int64) back into Rail array `arr`, retagging.
+int tgl_abuf_download(int h, long *arr, int n) {
+    if (!g_ibufs || h < 0 || h >= (int)g_ibufs.count) return -1;
+    if (n < 1) return -1;
+    id<MTLBuffer> b = g_ibufs[h];
+    if ((NSUInteger)n * 8 > b.length) return -2;
+    const long *src = (const long *)b.contents;
+    long *ap = arr + 2;   // skip [tag, len]
+    for (int i = 0; i < n; i++) ap[i] = (src[i] << 1) | 1;
+    return 1;
+}
+
+// Dispatch a *_wx kernel with W@0, X@1, O@2 ALL resident (no CPU untag/retag/readback).
+int tgl_ijit_dispatch_wxrr(int kid, int wid, int xh, int oh, int nthreads) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (!g_ibufs || wid < 0 || wid >= (int)g_ibufs.count) return -1;
+    if (xh < 0 || xh >= (int)g_ibufs.count || oh < 0 || oh >= (int)g_ibufs.count) return -1;
+    if (ensure_init() != 1) return -1;
+    if (nthreads < 1) return -3;
+    @autoreleasepool {
+        id<MTLBuffer> bW = g_ibufs[wid];
+        id<MTLBuffer> bX = g_ibufs[xh];
+        id<MTLBuffer> bO = g_ibufs[oh];
+        id<MTLComputePipelineState> p = g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bX offset:0 atIndex:1];
+        [enc setBuffer:bO offset:0 atIndex:2];
+        dispatch_1d(enc, (uint32_t)nthreads);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) return -2;
+    }
+    return 1;
+}
+
+// Dispatch a non-weight kernel with input resident @0 and @1 (same buf, matching
+// the `ijit_run k A A O` pattern) and output resident @2.  No CPU touch.
+int tgl_ijit_dispatch_rr(int kid, int ih, int oh, int nthreads) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (!g_ibufs || ih < 0 || ih >= (int)g_ibufs.count) return -1;
+    if (oh < 0 || oh >= (int)g_ibufs.count) return -1;
+    if (ensure_init() != 1) return -1;
+    if (nthreads < 1) return -3;
+    @autoreleasepool {
+        id<MTLBuffer> bI = g_ibufs[ih];
+        id<MTLBuffer> bO = g_ibufs[oh];
+        id<MTLComputePipelineState> p = g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bI offset:0 atIndex:0];
+        [enc setBuffer:bI offset:0 atIndex:1];
+        [enc setBuffer:bO offset:0 atIndex:2];
+        dispatch_1d(enc, (uint32_t)nthreads);
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) return -2;
+    }
+    return 1;
+}
+
+// ────────────────────────────────────────────────────────────────────
 // bf16 host-side staging helpers (added 2026-05-14).
 // bf16 layout = upper 16 bits of f32 representation; conversion is
 // just a bit-shift with round-to-nearest-even.

@@ -1,0 +1,47 @@
+-- resident_proof.rail (2026-07-08): prove GPU-resident activations are
+-- (1) BYTE-IDENTICAL to the staged ijit_run_wx path (attestation preserved) and
+-- (2) much cheaper CPU-side. Two chained matmuls (MLP up-proj -> down-proj):
+--   staged:   X(Rail) -wx-> h(Rail) -wx-> o(Rail)      [h round-trips CPU]
+--   resident: X->xh; wxrr-> hh; wxrr-> oh; download o  [h stays GPU-side]
+-- Same resident weights for both -> isolates the activation-staging cost.
+import "stdlib/ijit.rail"
+
+fill a n i = if i >= n then 0 else let _ = arr_set a i (((i * 2654435761 + 12345) - ((i * 2654435761 + 12345) / 97) * 97) - 48) in fill a n (i + 1)
+firstdiff a b n i = if i >= n then (0 - 1) else (if (arr_get a i) == (arr_get b i) then firstdiff a b n (i + 1) else i)
+
+staged_iter k1 k2 w1 w2 X h o Ld Li reps t = if t >= reps then 0 else
+  let _ = ijit_run_wx k1 w1 X h Ld Li Li in
+  let _ = ijit_run_wx k2 w2 h o Li Ld Ld in
+  staged_iter k1 k2 w1 w2 X h o Ld Li reps (t + 1)
+resident_iter k1 k2 w1 w2 xh hh oh Ld Li reps t = if t >= reps then 0 else
+  let _ = ijit_run_wxrr k1 w1 xh hh Li in
+  let _ = ijit_run_wxrr k2 w2 hh oh Ld in
+  resident_iter k1 k2 w1 w2 xh hh oh Ld Li reps (t + 1)
+
+main =
+  let d = 768 in let inter = 3072 in let L = 64 in
+  let Ld = L * d in let Li = L * inter in
+  let k1 = ijit_compile (emit_msl_fx_matmul24_wx inter d L) in   -- up: inter x d
+  let k2 = ijit_compile (emit_msl_fx_matmul24_wx d inter L) in   -- down: d x inter
+  let W1 = arr_new (inter * d) 0 in let _ = fill W1 (inter * d) 0 in
+  let W2 = arr_new (d * inter) 0 in let _ = fill W2 (d * inter) 0 in
+  let X  = arr_new Ld 0 in let _ = fill X Ld 0 in
+  let w1 = ibuf_upload W1 (inter * d) in
+  let w2 = ibuf_upload W2 (d * inter) in
+  -- staged result
+  let h = arr_new Li 0 in let o1 = arr_new Ld 0 in
+  let _ = staged_iter k1 k2 w1 w2 X h o1 Ld Li 1 0 in
+  -- resident result
+  let xh = abuf_alloc Ld in let _ = abuf_upload xh X Ld in
+  let hh = abuf_alloc Li in let oh = abuf_alloc Ld in
+  let _ = resident_iter k1 k2 w1 w2 xh hh oh Ld Li 1 0 in
+  let o2 = arr_new Ld 0 in let _ = abuf_download oh o2 Ld in
+  let df = firstdiff o1 o2 Ld 0 in
+  let _ = if df < 0 then print "BYTE-EXACT: resident == staged (all L*d match)" else print (cat ["MISMATCH at ", show df, " staged=", show (arr_get o1 df), " resident=", show (arr_get o2 df)]) in
+  -- shell-timed: mode "staged" or "resident" (200 reps); default just byte-check
+  let mode = if (length args) > 0 then head args else "check" in
+  let reps = 200 in
+  let _ = if mode == "staged" then let _ = staged_iter k1 k2 w1 w2 X h o1 Ld Li reps 0 in print "staged 200 reps done"
+          else (if mode == "resident" then let _ = resident_iter k1 k2 w1 w2 xh hh oh Ld Li reps 0 in print "resident 200 reps done"
+          else print "check-only (pass mode: staged|resident)") in
+  0
