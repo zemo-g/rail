@@ -29,7 +29,7 @@ Apple's Metal API is Objective-C. Rail can call C ABI but cannot speak ObjC sele
 
 | Path | Lang | Bytes | Reason | To retire |
 |---|---|---|---|---|
-| `tools/metal/tensor_gpu_lib.m` | ObjC | 92,147 | Metal tensor kernels (23 ops: matmul, rmsnorm, rope, silu, etc.) as a dylib that Rail's `stdlib/tensor.rail` FFIs into. | When Rail emits MSL + drives the Metal driver itself — Phase 3 of `rail-jit-fused-kernels-plan.md`. |
+| `tools/metal/tensor_gpu_lib.m` | ObjC | 98,135 | Metal tensor kernels (23 ops: matmul, rmsnorm, rope, silu, etc.) as a dylib that Rail's `stdlib/tensor.rail` FFIs into. | When Rail emits MSL + drives the Metal driver itself — Phase 3 of `rail-jit-fused-kernels-plan.md`. |
 | `tools/metal/tensor_gpu.m` | ObjC | 29,318 | Persistent stdin-protocol Metal compute server (predecessor of the dylib path). | Superseded by `tensor_gpu_lib.m`; kept while Rail self-train scripts still spawn the server. |
 | `tools/metal/tensor_daemond.m` | ObjC | 20,321 | Unix-socket daemon that keeps Metal device + pipelines warm across Rail invocations (avoids ~200 ms cold-start per call). | When Rail has a long-lived process model that owns the Metal handle directly. |
 | `tools/metal/libtensor_gpu_linux_stub.c` | C | 1,807 | No-op stub exporting the ~25 `tgl_*` symbols so Linux ELF programs that `import "stdlib/tensor.rail"` link — Metal is macOS-only. | When linker-level optional symbols land in the Rail backend. |
@@ -147,16 +147,16 @@ Plus ~17 files under `tools/uav/archive/` (ES, GRU/MapGRU eval kernels, weight I
 | Category | Files | Bytes |
 |---|---|---|
 | 1. Kernel / syscall | 4 | 101,747 |
-| 2. GPU driver interop (active) | 7 | 147,084 |
+| 2. GPU driver interop (active) | 7 | 154,072 |
 | 2. GPU driver (test scaffolds) | 5 | 29,831 |
 | 3. Framework bridges | 6 | 101,183 |
 | 4. CPU bringup (M4 + RISC-V) | 2 | 4,086 |
 | 4. v5 assembler fixtures | 5 | 1,997 |
 | 5. External device drivers | 1 | 4,571 |
 | 6. GC / concurrent runtime | 1 | 16,319 |
-| **In-tree total** | **31** | **406,818** |
+| **In-tree total** | **31** | **413,806** |
 | 7. UAV (gitignored, private) | 8 | ~213,000 |
 
-Public-thesis count: **31 non-Rail files**. Everything else in this repo — the compiler, the stdlib (94 modules), the deploy tooling, the JIT tracer, the v5 assembler, the test harness, the package manager, the docs generator — is Rail.
+Public-thesis count: **31 non-Rail files**. Everything else in this repo — the compiler, the stdlib (101 modules), the deploy tooling, the JIT tracer, the v5 assembler, the test harness, the package manager, the docs generator — is Rail.
 
 Removable on next cleanup pass (no live caller, scaffolding only): `tensor_gpu_lib_stub.m`, `test_dylib.c`, `bench_matmul.m`, `fp16_probe.m`, `_dormant/plasma_3d_host.m`. Net would drop to 26 files / ~377 KB.

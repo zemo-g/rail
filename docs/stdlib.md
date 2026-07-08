@@ -1,6 +1,6 @@
 # Rail Standard Library
 
-22 modules in `stdlib/`. Import with:
+101 modules in `stdlib/` (`ls stdlib/*.rail`). This page documents the core set; every module is import-able the same way:
 
 ```rail
 import "stdlib/<module>.rail"
