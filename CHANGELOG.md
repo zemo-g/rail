@@ -2,6 +2,49 @@
 
 All notable changes to Rail are documented here.
 
+## v5.3.0 — 2026-07-08 — Independence + 3× faster self-compile
+
+Consolidation release: 19 PRs since v5.2.0.  Two headlines — a
+**non-Rail independence checker** (the trusting-trust answer: the
+committed seed no longer asks you to trust Rail to check Rail), and the
+**self-compile dropping 61 s → 19.2 s (3.2×)**.
+
+### Verify & trust
+- **Independence checker, Phase 3a** (#37): a reference checker written
+  outside Rail re-derives the integer core independently.
+- **One-command "check me" kit** (#32): `VERIFY.md` +
+  `tools/verify/check.sh`.
+- **Public reproducible-build check** (#23): `verify_reproducible.sh`
+  rebuilds the committed seed from source and compares hashes; verified
+  cross-host (#22) and re-verified nightly since.
+- **Self-generated truth matrix** (#31): `docs/STATUS.md` is emitted by
+  Rail from its own verified state.
+- **Grounding contracts** (#34): numerics, attested subset, threat model.
+- **Differential fuzzer covers integer div/mod** (#35), with a ±inf
+  false-positive fix.
+- **Leak-guard pre-check + pre-push hook** (#25).
+
+### Performance
+- **Self-compile 61 s → 34.6 s** (#29: parser cursor O(N²) → O(N))
+  **→ 19.2 s** (#36: exact-size GC free-list buckets, 16/24 B).
+- **Autograd and JIT tapes O(n²) → O(n)** (#27, #28): array-backed
+  tape build and backprop.
+
+### Language & robustness
+- **Multi-argument lambdas** `\a b -> e` (#33).
+- Free-var/env empty-checks use `== []`, not `length==0` — removes a
+  latent O(N³) on deep programs (#39).
+
+### Docs & ops
+- Truth reconciliation: getting-started/README/builtins reconciled with
+  v5.2.0 reality (#26); public claims scoped to what is true (#30);
+  Fugu re-review addressed (#38).
+- Fleet TB self-heal from hardware truth (#24); audit walkers lose two
+  cry-wolf false-positives (#40).
+
+178/178 tests.  The committed seed remains bit-reproducible — the
+nightly reproducibility witness stayed green throughout the series.
+
 ## v5.2.0 — 2026-06-19 — Rail stands alone (no as/ld/codesign)
 
 Major milestone.  The compiler now assembles, links, and code-signs
