@@ -2,6 +2,27 @@
 
 All notable changes to Rail are documented here.
 
+## Unreleased
+
+### Tests
+- **Ed25519 pinned to RFC 8032 published vectors** (#48): sign + verify
+  + tamper-rejection known-answer tests; suite 178 → 182.
+- **TLS stack pinned to published vectors** (#49): RFC 8448 §3 full
+  offline handshake (key schedule + transcript + server/client Finished),
+  ECDSA-P256 verify per RFC 6979 §A.2.5 plus a 4-way invalid-signature
+  rejection test, the CertificateVerify path (ASN.1 parse → SPKI extract
+  → DER sig parse → ECDSA), and SAN hostname validation against a real
+  captured leaf (accept exact + case-fold, reject other host and parent
+  domain); suite 182 → 187. The handshake, cert-verify, and hostname
+  paths — the code that decides who to trust — were previously covered
+  only by manual tests in `tools/tls/`.
+- **Suite harness: per-test `arena_mark`/`arena_reset`** (#49). Adding
+  the TLS tests exposed that `run_test` kept every compile's garbage
+  live across the whole run: by test ~183 the default 1GB arena was
+  full and the GC crawled — a test that compiles in seconds standalone
+  spun for 20+ minutes in-suite. Each test now compiles inside a
+  mark/reset window, so suite memory stays flat at any test count.
+
 ## v5.3.0 — 2026-07-08 — Independence + 3× faster self-compile
 
 Consolidation release: 19 PRs since v5.2.0.  Two headlines — a
