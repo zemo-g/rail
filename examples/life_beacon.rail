@@ -1,0 +1,207 @@
+-- examples/life_beacon.rail — Conway's Game of Life, born from the entropy beacon.
+--
+-- One page demonstrating: pure-Rail HTTPS (TLS 1.3), JSON parsing,
+-- SHA-256 hash chaining, and deterministic replay.
+--
+-- Live mode (no args): fetch the current pulse from the public beacon at
+-- https://ledatic.org/entropy/pulse — the SHA-256 of a live MHD plasma
+-- frame, a new pulse every ~2 s — and grow a 40x20 toroidal Life universe
+-- from it. Each generation is folded into a SHA-256 chain:
+--   h_0 = sha256(seed ++ board_0),  h_{n+1} = sha256(h_n ++ board_{n+1})
+-- so the final head commits the pulse and all 33 states.
+--
+-- Replay mode: pass a pulse's id and hash — its birth certificate — and
+-- the identical universe unfolds to the identical head. There is no
+-- randomness anywhere: the history is implied by the pulse the moment it
+-- lands; running the program discovers it rather than creates it.
+--
+-- Build + run:
+--   ./rail_native --out-prefix /tmp/life examples/life_beacon.rail
+--   /tmp/life                    # live: universe from the current pulse
+--   /tmp/life <pulse_id> <hash>  # replay: must reproduce the same head
+--
+-- Reference vectors (offline, no network):
+--   /tmp/life 2935383 7f0af947a58e2a2c4705f792bde5cf8a62e6121875349e3a3533881f557dbfcb
+--     → head 2c3152defa243cd8728744d8b6b01c8ced8c84d452259e596d65dc98da192b7b
+--   /tmp/life 2935395 14cd912d68d78f9f47aca40f8c408423e6077fa97ebb51317b5ffdc1b0af7532
+--     → head 98184f764a9565fc498a945d6ae06f24ef16ee4374ce39e95694025a9eabe89f
+--
+-- The same algorithm runs in-browser at https://ledatic.org/life — heads
+-- from this binary, that page, and any other faithful implementation
+-- agree bit-for-bit.
+--
+-- Implementation notes:
+-- * sha256 arrives transitively via https_client -> tls13 -> hkdf -> hmac
+--   (Rail imports are textual and NOT deduped — importing sha256.rail
+--   directly here would double-define its symbols).
+-- * Transport is leaf-verified TLS 1.3 (https_get_url_unsafe_noverify)
+--   rather than the chain-walked default: integrity doesn't ride on the
+--   pipe here. The pulse is printed, publicly archived, and hash-chained —
+--   a spoofed pulse births a universe whose birth certificate matches
+--   nothing in the public record.
+
+import "stdlib/https_client.rail"
+import "stdlib/json.rail"
+
+-- ── board helpers (40x20 torus) ───────────────────────────────────────────
+
+wrapv v n = if v < 0 then (v + n) else (if v >= n then (v - n) else v)
+
+nbr b x y dx dy =
+  let xx = wrapv (x + dx) 40
+  let yy = wrapv (y + dy) 20
+  arr_get b ((yy * 40) + xx)
+
+nbrs b x y =
+  let m1 = 0 - 1
+  let n1 = nbr b x y m1 m1
+  let n2 = nbr b x y 0 m1
+  let n3 = nbr b x y 1 m1
+  let n4 = nbr b x y m1 0
+  let n5 = nbr b x y 1 0
+  let n6 = nbr b x y m1 1
+  let n7 = nbr b x y 0 1
+  let n8 = nbr b x y 1 1
+  n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8
+
+step_cell b b2 i =
+  if i >= 800 then b2
+  else
+    let y = i / 40
+    let x = i - (y * 40)
+    let n = nbrs b x y
+    let alive = arr_get b i
+    let v = if alive == 1 then (if n == 2 then 1 else (if n == 3 then 1 else 0)) else (if n == 3 then 1 else 0)
+    let _ = arr_set b2 i v
+    step_cell b b2 (i + 1)
+
+life_step b = step_cell b (arr_new 800 0) 0
+
+popcount b i acc =
+  if i >= 800 then acc
+  else popcount b (i + 1) (acc + arr_get b i)
+
+-- ── serialization + render ────────────────────────────────────────────────
+
+ser_cells b i acc =
+  if i < 0 then acc
+  else ser_cells b (i - 1) (cons (if arr_get b i == 1 then "1" else "0") acc)
+
+serialize b = join "" (ser_cells b 799 [])
+
+row_cells b y x acc =
+  if x < 0 then acc
+  else
+    let v = arr_get b ((y * 40) + x)
+    row_cells b y (x - 1) (cons (if v == 1 then "██" else "· ") acc)
+
+pb_row b y =
+  if y >= 20 then 0
+  else
+    let _ = print (join "" (row_cells b y 39 []))
+    pb_row b (y + 1)
+
+print_board b =
+  let _ = pb_row b 0
+  print ""
+
+-- ── genesis: seed the board from the pulse ────────────────────────────────
+
+fill32 b d base j =
+  if j >= 32 then 0
+  else
+    let byte = arr_get d j
+    let idx = base + j
+    let v = if byte < 90 then 1 else 0
+    let _ = if idx < 800 then arr_set b idx v else 0
+    fill32 b d base (j + 1)
+
+seed_board b seed k =
+  if k >= 25 then b
+  else
+    let d = sha256 (join "" [seed, ":", show k])
+    let _ = fill32 b d (k * 32) 0
+    seed_board b seed (k + 1)
+
+pad2 s = if length s >= 2 then s else pad2 (append " " s)
+pad3 s = if length s >= 3 then s else pad3 (append " " s)
+
+-- ── the run: evolve + chain ───────────────────────────────────────────────
+
+life_run b h gen =
+  let pop = popcount b 0 0
+  let line = join "" ["gen ", pad2 (show gen), "   pop ", pad3 (show pop), "   chain ", str_sub h 0 16]
+  let _ = print line
+  let _ = if gen - ((gen / 16) * 16) == 0 then print_board b else 0
+  if gen >= 32 then h
+  else
+    let b2 = life_step b
+    let h2 = sha256_hex (append h (serialize b2))
+    life_run b2 h2 (gen + 1)
+
+-- ── beacon fetch (pure-Rail TLS 1.3, leaf-verified) ───────────────────────
+
+-- Strip headers at CRLFCRLF *before* scanning for '{' — Cloudflare's
+-- Report-To/NEL headers contain JSON objects that a naive first-brace
+-- scan happily parses instead of the body. \r can't be written as a
+-- literal in Rail strings; synthesize it.
+json_body raw =
+  let cr = char_from_int 13
+  let lf = char_from_int 10
+  let eoh = join "" [cr, lf, cr, lf]
+  let i = str_find eoh raw
+  let rest = if i < 0 then raw else str_sub raw (i + 4) (length raw - i - 4)
+  let j = str_find "{" rest
+  if j < 0 then ""
+  else str_sub rest j (length rest - j)
+
+fetch_pulse _ =
+  let result = https_get_url_unsafe_noverify "https://ledatic.org/entropy/pulse"
+  let status = let (a, _) = result in a
+  let raw = let (_, b) = result in b
+  if status != 200 then
+    let _ = print (join "" ["beacon fetch failed: HTTP ", show status])
+    []
+  else
+    let obj = parse_json (json_body raw)
+    let pid = json_int (json_get obj "pulse_id")
+    let vhex = json_str (json_get obj "value_hex")
+    let ts = json_str (json_get obj "timestamp_utc")
+    [show pid, vhex, ts]
+
+-- ── universe from a pulse ─────────────────────────────────────────────────
+
+run_universe pid vhex =
+  if length vhex != 64 then
+    let _ = print "bad value_hex (want 64 hex chars)"
+    1
+  else
+    let seed = join "" ["rail-life:v2:beacon:", pid, ":", vhex]
+    let _ = print (join "" ["seed    ", seed])
+    let _ = print ""
+    let b0 = arr_new 800 0
+    let b1 = seed_board b0 seed 0
+    let h0 = sha256_hex (append seed (serialize b1))
+    let head_h = life_run b1 h0 0
+    let _ = print ""
+    let _ = print (join "" ["replay  ./life_beacon ", pid, " ", vhex])
+    let _ = print "chain head (commits pulse + all 33 states):"
+    let _ = print head_h
+    0
+
+main =
+  let a = args
+  if length a >= 3 then
+    let pid = head (tail a)
+    let vhex = head (tail (tail a))
+    let _ = print (join "" ["pulse   #", pid, "   (replay)"])
+    run_universe pid vhex
+  else
+    let p = fetch_pulse 0
+    if p == [] then 1
+    else
+      let pid = head p
+      let vhex = head (tail p)
+      let ts = head (tail (tail p))
+      let _ = print (join "" ["pulse   #", pid, "   ", ts, "   (live: SHA-256 of 2D MHD Orszag-Tang plasma frame, node mini)"])
+      run_universe pid vhex
