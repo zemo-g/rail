@@ -650,8 +650,11 @@ main =
   let blob = cat [getenv "HOME", "/.ledatic/railml-trial/canonical_bestpass.safetensors"] in
   if (read_file_size blob) < 10000000 then let _ = print "FATAL blob missing" in 1
   else
-  let corpus = cat [getenv "HOME", "/projects/rail-training/attested-base/pilot/data/train.bin"] in
-  if (read_file_size corpus) < 1000 then let _ = print "FATAL train.bin missing" in 1
+  -- BUILD 4: MB_CORPUS overrides the stream source (a corpus the ckpt has NOT converged on
+  -- = real signal). Window hashes bind the actual content into the chain either way.
+  let corpusenv = getenv "MB_CORPUS" in
+  let corpus = if corpusenv == "" then cat [getenv "HOME", "/projects/rail-training/attested-base/pilot/data/train.bin"] else corpusenv in
+  if (read_file_size corpus) < 1000 then let _ = print "FATAL corpus missing" in 1
   else
   let d = 768 in let nh = 12 in let hd = 64 in let qdim = 768 in let inter = 3072 in let L = 9 in let vocab = 16384 in let nlayers = 16 in
   -- arm selection (env): MB_ARM picks B, MB_ALR picks the rate; tag names the artifacts.
@@ -659,12 +662,23 @@ main =
   let arm = if (getenv "MB_ARM") == "B1" then "B1" else "B8" in
   let B = if arm == "B1" then 1 else 8 in
   let cool = if (getenv "MB_ALR") == "a1e4" then 1 else 0 in
+  -- BUILD 4: MB_ALR=a0 = pure-measurement probe (adam alr, decay floor AND embedding SGD lr
+  -- all zero) -> 25 steps of pre-update CE on the exact window schedule, model untouched.
+  let probe = if (getenv "MB_ALR") == "a0" then 1 else 0 in
   let schedf = if (getenv "MB_SCHED") == "wsd" then 1 else 0 in
-  let tag = cat [arm, if cool == 1 then "_a1e4" else "_a005", if schedf == 1 then "_wsd" else ""] in
-  let maxmb = 24 in let winstride = 100000 in let winstart = 4096 in
+  let alrtag = if probe == 1 then "_a0" else (if cool == 1 then "_a1e4" else "_a005") in
+  let tag = cat [if corpusenv == "" then "" else "SIG_", arm, alrtag, if schedf == 1 then "_wsd" else ""] in
+  let maxmb = 24 in
+  -- BUILD 4: on an override corpus the stream spans the WHOLE file: winstart 0, stride
+  -- auto-derived so the last window's final token lands inside the file (fresh guaranteed).
+  let ntok = (read_file_size corpus) / 2 in
+  let winstride = if corpusenv == "" then 100000 else (ntok - L - 2) / ((maxmb * B) + (B - 1)) in
+  let winstart = if corpusenv == "" then 4096 else 0 in
+  if winstride < (L + 1) then let _ = print (cat ["FATAL override corpus too small for fresh (non-overlapping) windows: stride ", show winstride, " < ", show (L + 1)]) in 1
+  else
   -- landmine 4: pread past EOF silently zero-fills -> guard the whole stream schedule up front
   let needtok = winstart + ((maxmb * B) + (B - 1)) * winstride + L + 1 in
-  if ((read_file_size corpus) / 2) <= needtok then let _ = print (cat ["FATAL corpus too short for stream schedule: need > ", show needtok, " tokens"]) in 1
+  if ntok <= needtok then let _ = print (cat ["FATAL corpus too short for stream schedule: need > ", show needtok, " tokens"]) in 1
   else
   let fd = fopen blob "rb" in
   let hbuf8 = malloc 8 in let _ = pread fd hbuf8 8 0 in let hlen = pq_le_len hbuf8 0 in let _ = free hbuf8 in
@@ -716,12 +730,12 @@ main =
   let beta1 = 15099494 in  -- 0.9   in F=24
   let beta2 = 16760439 in  -- 0.999 in F=24
   let eps = 16777 in       -- ~1e-3 in F=24 (fixed-point Adam floor -- NOT 1e-8)
-  let alr = if cool == 1 then 1677 else 83886 in
+  let alr = if probe == 1 then 0 else (if cool == 1 then 1677 else 83886) in
                            -- the cohort PEAK rate. a005 = 0.005, THE documented divergence rate
                            -- (B=1 streaming -> mean CE 13.85): measured 07-10, NO B stabilizes it.
                            -- a1e4 = 1e-4, the documented-stable rate. Build 3: with MB_SCHED=wsd
                            -- this is the warmup TARGET; decay floor = peak/10.
-  let alrfloor = if cool == 1 then 168 else 8389 in
+  let alrfloor = if probe == 1 then 0 else (if cool == 1 then 168 else 8389) in
   -- Build 3: runtime-LR kernels (twin-verified == baked kernels, fx_adam_lr_twin.rail);
   -- the per-step rate rides in the packed buffer, so ONE kernel serves the whole schedule
   let kAdamQ = ijit_compile (emit_msl_fx_adam_step_lr (qdim * d) beta1 beta2 eps) in   -- Wq/Wk/Wv/Wo (589824)
@@ -742,7 +756,7 @@ main =
   let logits = arr_new vocab 0 in let ex = arr_new vocab 0 in let p = arr_new vocab 0 in let dl = arr_new vocab 0 in
   let target = realtarget in    -- the TRUE next token from the corpus
   let w0sha = file_sha blob in  -- segment base checkpoint digest (binds the chain to the starting weights)
-  let lr = 8388 in         -- 0.0005 in F=24 (embedding SGD step from the dense summed grad / B)
+  let lr = if probe == 1 then 0 else 8388 in  -- 0.0005 in F=24 (embedding SGD step from the dense summed grad / B); a0 probe: frozen
   -- B / maxmb / winstride / winstart bound at the top of main (arm selection + stream guard)
   let closs = float_arr_new 1 0.0 in
   let ce_hist = arr_new (maxmb + 1) 0 in
