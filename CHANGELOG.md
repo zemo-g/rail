@@ -4,6 +4,18 @@ All notable changes to Rail are documented here.
 
 ## Unreleased
 
+### Fixed
+- **`is_float` local-shadowing guard** (the 811d7f2 delta): the V-case's
+  global `__float_ret_<name>` consult (added 4f689b7) ran unconditionally,
+  so a local int shadowing a float-returning global was typed float and
+  crashed — `gv = 2.5` + `addone gv = gv + 1` SIGSEGV'd on the previous
+  seed. The global marker is now consulted only when the name is not a
+  local. Regression pair t183 (`global_float_const_mul`, the original
+  SGP4 crash shape) + t184 (`local_shadows_float_global`); suite 187 → 189.
+  Known remaining, separately tracked: `mark_float_params` can over-taint
+  a local int used alongside float ops in the same body (`show(n*4)`
+  prints raw bits as a subnormal — the Build-4 safetensors-header bug).
+
 ### Tests
 - **Ed25519 pinned to RFC 8032 published vectors** (#48): sign + verify
   + tamper-rejection known-answer tests; suite 178 → 182.
