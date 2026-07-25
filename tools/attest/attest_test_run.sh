@@ -82,3 +82,22 @@ echo "----"
 cat "$result"
 echo "----"
 echo "build attested: $dest/"
+
+# Latest-record pointer. Written here, at the moment a record exists, rather
+# than derived later by listing directories: the pure-Rail origin that serves
+# this is single-threaded and also carries the site's live pulse, so it must
+# read a file, not fork a subprocess, per request. Kept outside the checkout
+# so the pristine master worktree stays clean.
+POINTER_DIR=${POINTER_DIR:-$HOME/.ledatic/attest}
+mkdir -p "$POINTER_DIR"
+python3 -c "
+import json, sys, time
+print(json.dumps({
+  'kind': 'ledatic.builds.latest',
+  'short': sys.argv[1],
+  'updated_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+}))
+" "$short" > "$POINTER_DIR/builds_latest.json.tmp" \
+  && mv -f "$POINTER_DIR/builds_latest.json.tmp" "$POINTER_DIR/builds_latest.json"
+echo "latest pointer: $POINTER_DIR/builds_latest.json -> $short"
+
