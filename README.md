@@ -1,8 +1,8 @@
 <h1 align="center">Rail</h1>
 
 <p align="center">
-  <em>A self-hosting systems language that speaks TLS alone.</em><br>
-  <sub>No C in the runtime. GC in ARM64 assembly. HTTPS in pure Rail.</sub>
+  <em>A self-hosting language built to be an oracle — a checker you can re-run yourself.</em><br>
+  <sub>No C in the runtime. GC in ARM64 assembly. HTTPS in pure Rail. Every answer re-derivable.</sub>
 </p>
 
 <p align="center">
@@ -36,6 +36,24 @@ Rail compiles itself. The compiler — ~9,200 lines of Rail — produces a ~0.9 
 ./rail_native self && cmp rail_native /tmp/rail_self   # cycle 2 — byte-identical
 ./rail_native test                                     # 187/187
 ```
+
+### What the self-hosting is *for*
+
+Self-compilation is not the point; it is the prerequisite. The point is that
+one small binary can act as an **oracle** — a deterministic, reproducible
+checker that a third party can re-run without trusting whoever ran it first.
+
+That matters most where trust is currently the only option: machine-generated
+code. A model's claim that a program is correct is unfalsifiable. `rail_native`
+compiling that program is a fact anyone can reproduce from the same seed. So we
+use the compiler as the fitness function — training on programs it accepts,
+binding each corpus and each training step into a hash chain, and signing that
+chain against a public physics beacon with a key on a separate machine.
+
+The chain proves *the computation happened as claimed*. It says nothing about
+whether the result is any good — those are different questions, and conflating
+them is the most expensive mistake in this repo's history (see
+[Honest limits](#honest-limits)).
 
 ## Quick start
 
@@ -97,15 +115,32 @@ main =
 
 The full X.509 chain for `api.anthropic.com` (leaf → WE1 intermediate → GTS Root R4) validates end-to-end to the macOS `/etc/ssl/cert.pem` trust store — ECDSA-P256-SHA256 at the leaf, ECDSA-P384-SHA384 at the root edge, all verified in Rail.
 
-### 3. Trains its own AI, verified by the compiler
+### 3. Is the oracle for an attested training loop
 
-```rail
--- The self-training loop, in one flow:
---   LLM generates Rail → rail_native compiles (the oracle) →
---   passes harvested → training data feeds next round
+```
+generator (seeded) → corpus → rail_native verifies every program → signed ledger
+      → training → checkpoints → same oracle scores them → chain extends
 ```
 
-The compiler is the fitness function. Programs that compile become training data; programs that don't are the gradient. Three independent lineages (LoRA on Gemma, Metal-GPU MLP, PCFG-REINFORCE) all use the same compiler as the binary verifier. 92 % strict pass rate on the PCFG lineage in 30 ticks.
+The compiler is the fitness function: programs it accepts become training data,
+programs it rejects are the gradient. Nothing in that path requires trusting us.
+
+The furthest this has been carried is a **from-scratch 138M model that writes
+Rail**, trained only on oracle-verified `comment → program` pairs. On its
+frozen benchmark it reaches **16/16 compile@1 and 16/16 function-correctness**.
+The corpus (52,243 pairs, sha `1a6941af`) is **bit-reproducible** — regenerating
+it from seed 1234 twice gives identical bytes — and is bound into a hash-chained
+ledger signed by a Pi-hosted Ed25519 witness against entropy pulse `2641877`.
+
+The loop also closes back into the language: a pure-Rail integer-exact forward
+pass reproduces the MLX implementation's greedy argmax **12/12 exactly**, then
+its output is handed to `rail_native`, compiled, and run. Rail writes the
+corpus, runs the model, and checks the model's work.
+
+**What that benchmark does not say:** the same model generalizes **0/10** to
+novel function names. At this size it memorizes header-shape → body rather than
+composing from the comment. The number is real and the limit is real, and we
+publish both — a benchmark quoted without its failure mode is marketing.
 
 ## Why Rail
 
@@ -277,6 +312,36 @@ Things Rail v5.3.0 **doesn't** do, so you don't hit them as surprises:
 - Each HTTPS connection costs seconds of wall time (public-key verify dominates). Great for one-shot API calls, not for an HTTP proxy.
 - Response body is assembled via `join ""` — O(N²), caps cleanly around 64 KB. Streaming is an open item.
 - Rail is not ANSI-standardised. There is no formal type system or soundness proof. Use it because it's fast, small, and honest — not because it's Haskell.
+- The attested-training model generalizes **0/10** to unseen function names (see [above](#3-is-the-oracle-for-an-attested-training-loop)). Composition needs scale or a differently-shaped corpus; it is not a corpus-tuning problem.
+
+### The most expensive thing we've learned
+
+In July 2026 we ran a self-improvement loop for about a week: a local model
+proposed changes, a deterministic executor applied them, every generation was
+scored on a held-out reward and signed into a tamper-evident chain. It reported
+a clean climb across ~11 signed generations — 58 → 69 on one lineage, 131 → 139
+on another. Every step of it was reproducible and cryptographically attested.
+
+It was noise. Re-scoring the identical lineage on a held-out sample **5× wider**
+(1920 tokens instead of 384) flattened the entire curve: the "improved" frontier
+scored *exactly* what the base it started from scored — 672/1920 versus
+672/1920.
+
+The apparatus was sound and the conclusion was worthless, because the held-out
+reward was itself a tiny sample. A deterministic optimizer maximizing a small
+reward will fit *that sample* — reward hacking one layer beneath the defense we
+had built against reward hacking.
+
+**The lesson, which now governs this repo: attestation of a computation is not
+validation of its metric.** A signed chain proves the numbers were produced the
+way we said. Whether the numbers *mean* anything is a separate question, and the
+signature is silent on it. Any reported gain here must be re-measured on a
+disjoint, much wider sample before it is believed — including, especially, gains
+that flatter us.
+
+We keep this in the README rather than a postmortem folder because a project
+whose entire premise is "check me, don't trust me" has no business hiding the
+time it fooled itself.
 
 ## License
 
