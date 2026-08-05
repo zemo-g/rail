@@ -98,15 +98,83 @@ inner_step buffers parity ctx coeffs fxr fxl fyu fyd i =
     let _ = float_arr_set ctx 1 dt
     inner_step buffers (1 - parity) ctx coeffs fxr fxl fyu fyd (i + 1)
 
+-- Fresh OS entropy, as a phase in [0, 2π), for the reset perturbation.
+--
+-- /dev/urandom rather than an in-language PRNG: Rail's 63-bit tagged ints
+-- overflow multiplicative generators (see the traps index), and this value
+-- must be genuinely unpredictable — it is the only thing standing between
+-- the beacon and an exactly periodic output.  shell() inherits no PATH, so
+-- every binary is spelled out in full.
+--
+-- If the read ever fails, parse_int returns 0 and the phase is 0, which is
+-- exactly the old always-identical behaviour — degraded, not broken, and
+-- visible in the reset log line below.
+beacon_reset_phase _ =
+  let s = shell "/bin/dd if=/dev/urandom bs=4 count=1 2>/dev/null | /usr/bin/od -An -tu4 | /usr/bin/tr -d ' \n'"
+  let n = parse_int s
+  to_float (n % 1000000) * 0.0000062831853
+
+-- Perturb one cell after the deterministic init: a small phase-shifted
+-- velocity kick, with the energy adjusted so PRESSURE IS UNCHANGED.
+--
+-- Adding momentum without touching energy would silently lower the thermal
+-- pressure every cycle and eventually drive it negative, turning a fixed
+-- beacon into a crashing one.  So the thermal term is recomputed from the
+-- pre-kick pressure: e = p/(γ-1) + ke + me, with γ-1 = 2/3 exactly as
+-- mk_init_cell builds it.
+mk_perturb_cell state ph i =
+  let x = i % mk_nn
+  let y = i / mk_nn
+  let xp = to_float x * 0.04908738521234052
+  let yp = to_float y * 0.04908738521234052
+  let rho = mk_get state mk_f_rho x y
+  let mx  = mk_get state mk_f_mx x y
+  let my  = mk_get state mk_f_my x y
+  let bx  = mk_get state mk_f_bx x y
+  let by  = mk_get state mk_f_by x y
+  let en  = mk_get state mk_f_en x y
+  let me  = 0.5 * (bx * bx + by * by)
+  let ke0 = 0.5 * (mx * mx + my * my) / rho
+  let p   = (en - ke0 - me) * 0.6666666666666667
+  let mx2 = mx + rho * 0.02 * sin (yp + ph)
+  let my2 = my + rho * 0.02 * sin (xp + ph)
+  let ke1 = 0.5 * (mx2 * mx2 + my2 * my2) / rho
+  let _ = mk_put state mk_f_mx x y mx2
+  let _ = mk_put state mk_f_my x y my2
+  mk_put state mk_f_en x y (p / 0.6666666666666667 + ke1 + me)
+
+mk_perturb_loop state ph i =
+  if i >= mk_nn2 then 0
+  else
+    let _ = mk_perturb_cell state ph i
+    mk_perturb_loop state ph (i + 1)
+
 -- Reset in place — re-run mk_init_loop on the current buffer.  Avoids
 -- the 768 KB allocation that mk_init_state would do.  Returns 0 (parity
 -- unchanged).
+--
+-- ★ The reset is then PERTURBED with fresh entropy, and that is the whole
+-- point.  mk_init_cell is a pure function of the cell index, so re-running
+-- it produced byte-identical state every cycle; a deterministic PDE from
+-- identical initial conditions retraces the identical trajectory, and the
+-- beacon therefore REPLAYED its values on a fixed period.  Measured
+-- 2026-08-05 over 20,000 contiguous archived pulses: only 5,996 distinct
+-- values (70% duplication), repeat gap clustered at ~5,258 pulses ≈ 4h.
+-- A public randomness beacon that repeats itself is the one bug that can
+-- be used to discredit "check me, don't trust me", and it is checkable by
+-- anyone who pulls /pulse/log.
+--
+-- The comment this replaces said the reset "keeps the chaos live"; it did
+-- the exact opposite, which is why it survived review for months.  Chaos
+-- needs a different starting point each cycle, not the same one.
 maybe_reset buffers parity ctx =
   let t = float_arr_get ctx 0
   if t > t_reset then
-    let _ = print "beacon: t > pi, resetting"
+    let ph = beacon_reset_phase 0
+    let _ = print (cat ["beacon: t > pi, resetting with fresh phase ", show ph])
     let _ = float_arr_set ctx 0 0.0
     let _ = mk_init_loop (arr_get buffers parity) 0
+    let _ = mk_perturb_loop (arr_get buffers parity) ph 0
     0
   else 0
 
