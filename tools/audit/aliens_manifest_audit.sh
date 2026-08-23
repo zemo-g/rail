@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
 # tools/audit/aliens_manifest_audit.sh
 #
-# /pursue manifest re-hash audit. Picks the smallest record, verifies
-# size + sha256 against what the manifest claims.
+# /pursue manifest re-hash audit.
+#
+# Reworked 2026-07-25 for the free-tier posture. The old version sampled the
+# smallest DOCUMENT and required it to be fetchable — true only while R2 was
+# mirroring 10.5 GB of PDFs. Document bytes are now deliberately withheld (CF
+# ToS §2.8 on a Free zone; war.gov 403s us, so there is no upstream to
+# redirect to either), which made this audit exit FATAL every day on a policy
+# rather than a fault.
+#
+# The invariant that still earns its keep is the one the archive rests on:
+# NOTHING IS SERVED THAT FAILS ITS OWN ATTESTATION. So this samples what we do
+# serve — the digest-verified thumbnails — and re-hashes them against the
+# manifest. Withheld is expected and never a failure; drift on a served
+# artifact is.
 #
 # See docs/plans/ALIENS_MANIFEST_AUDIT.md.
 #
@@ -23,6 +35,7 @@ done
 BASE="${LEDATIC_BASE:-https://ledatic.org}"
 MANIFEST_PATH="${MANIFEST_PATH:-/pursue/manifest.jsonl}"
 MANIFEST=/tmp/aliens_manifest.jsonl
+SAMPLE_N="${SAMPLE_N:-3}"
 
 log()    { (( QUIET )) || echo "  $*"; }
 header() { (( QUIET )) || echo "--- $* ---"; }
@@ -36,87 +49,109 @@ records=$(wc -l <"$MANIFEST" | tr -d ' ')
 (( QUIET )) || echo "manifest: $BASE$MANIFEST_PATH ($records records)"
 (( QUIET )) || echo
 
-# ---- 2. Pick smallest record --------------------------------------------
+# ---- 2. Candidate served artifacts (thumbnails, smallest first) ----------
+# A thumbnail path is published only when every record citing it agrees on one
+# digest, so sampling by path is well-defined. Smallest-first keeps the audit
+# cheap and deterministic. Serial fetches on purpose: hammering our own CDN in
+# parallel trips bot protection, and then you are hashing a challenge page.
 header "sample selection"
-# Extract size_bytes + local_path + sha256 per line; tolerate whitespace.
-# Find smallest by size. One line per JSON record.
-sample=$(while IFS= read -r line; do
-  s=$(echo "$line" | grep -oE '"size_bytes"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | head -1)
-  p=$(echo "$line" | grep -oE '"local_path"[[:space:]]*:[[:space:]]*"[^"]+"' | sed 's/.*"local_path"[[:space:]]*:[[:space:]]*"//;s/"$//' | head -1)
-  # First sha256 in record is the main file's (thumbnail_sha256 comes later)
-  h=$(echo "$line" | grep -oE '"sha256"[[:space:]]*:[[:space:]]*"[0-9a-f]+"' | head -1 | grep -oE '[0-9a-f]{64}')
-  [[ -n "$s" && -n "$p" && -n "$h" ]] && printf '%s\t%s\t%s\n' "$s" "$p" "$h"
-done <"$MANIFEST" | sort -n | head -1)
-size_claimed=$(echo "$sample" | cut -f1)
-local_path=$(echo "$sample" | cut -f2)
-sha_claimed=$(echo "$sample" | cut -f3)
-log "smallest record: $local_path"
-log "claimed size: $size_claimed bytes"
-log "claimed sha256: ${sha_claimed:0:16}..."
+candidates=$(python3 - "$MANIFEST" "$SAMPLE_N" <<'PY'
+import json, sys, collections
+path, n = sys.argv[1], int(sys.argv[2])
+recs = [json.loads(l) for l in open(path) if l.strip()]
+digests = collections.defaultdict(set)
+for r in recs:
+    t = r.get("thumbnail_local")
+    if t:
+        digests[t].add(r.get("thumbnail_sha256"))
+rows = {}
+for r in recs:
+    t = r.get("thumbnail_local")
+    if not t or len(digests[t]) != 1:
+        continue                      # ambiguous path — correctly withheld
+    rows[t] = (r.get("thumbnail_size_bytes") or 0, t, r.get("thumbnail_sha256"))
+for size, t, sha in sorted(rows.values())[:n]:
+    print(f"{size}\t{t}\t{sha}")
+PY
+)
+[[ -n "$candidates" ]] || { echo "FATAL: no unambiguous thumbnail records in manifest"; exit 2; }
 
-if [[ -z "$size_claimed" || -z "$local_path" || -z "$sha_claimed" ]]; then
-  echo "FATAL: could not parse manifest fields"
-  exit 2
-fi
+# ---- 3. Verify each served candidate ------------------------------------
+fail=0; served=0; withheld=0
+while IFS=$'\t' read -r size_claimed local_path sha_claimed; do
+  [[ -n "$local_path" ]] || continue
+  rel=${local_path#files/}
+  encoded=$(python3 -c "import sys,urllib.parse;print('/'.join(urllib.parse.quote(p) for p in sys.argv[1].split('/')))" "$rel")
+  url="$BASE/pursue/files/$encoded"
+  tmp=/tmp/aliens_audit_sample.bin
+  rm -f "$tmp"
+  if ! curl -sf --max-time 40 "$url" -o "$tmp"; then
+    withheld=$((withheld + 1))
+    log "withheld (expected, not a failure): $rel"
+    continue
+  fi
+  served=$((served + 1))
+  size_actual=$(wc -c <"$tmp" | tr -d ' ')
+  sha_actual=$(shasum -a 256 "$tmp" | awk '{print $1}')
+  if [[ "$size_actual" != "$size_claimed" ]]; then
+    log "FAIL: size drift on $rel ($size_claimed claimed vs $size_actual actual)"
+    fail=1
+  elif [[ "$sha_actual" != "$sha_claimed" ]]; then
+    log "FAIL: sha256 drift on $rel"
+    log "  claimed: $sha_claimed"
+    log "  actual:  $sha_actual"
+    fail=1
+  else
+    log "ok  $rel  (${size_actual} B, ${sha_actual:0:16}…)"
+  fi
+  rm -f "$tmp"
+done <<<"$candidates"
 
-# ---- 3. HEAD: size check ------------------------------------------------
-header "size check"
-# URL-encode path segments (R2 keys with spaces, etc.)
-encoded_path=$(python3 -c "import sys, urllib.parse; print('/'.join(urllib.parse.quote(p) for p in sys.argv[1].split('/')))" "$local_path")
-url="$BASE/pursue/$encoded_path"
-size_actual=$(curl -sfI "$url" | grep -i '^content-length:' | awk '{print $2}' | tr -d '\r')
-log "url: $url"
-log "actual size: $size_actual bytes"
-
-fail=0
-if [[ "$size_actual" != "$size_claimed" ]]; then
-  log "FAIL: size drift ($size_claimed claimed vs $size_actual actual)"
+# A served set of zero means thumbnail publication silently lapsed — the
+# archive would render as placeholders and nobody would notice.
+if (( served == 0 )); then
+  log "FAIL: no sampled thumbnail was served — publication may have lapsed"
   fail=1
 fi
 
-# ---- 4. GET: sha256 check -----------------------------------------------
-header "sha256 check"
-tmp=/tmp/aliens_audit_sample.bin
-rm -f "$tmp"
-curl -sf "$url" -o "$tmp" || { echo "FATAL: GET failed for $url"; exit 2; }
-sha_actual=$(shasum -a 256 "$tmp" | awk '{print $1}')
-log "actual sha256: ${sha_actual:0:16}..."
-
-if [[ "$sha_actual" != "$sha_claimed" ]]; then
-  log "FAIL: sha256 drift"
-  log "  claimed: $sha_claimed"
-  log "  actual:  $sha_actual"
-  fail=1
+# ---- 4. Policy check: document bytes stay withheld -----------------------
+header "document withholding"
+doc=$(python3 - "$MANIFEST" <<'PY'
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+recs = [r for r in recs if r.get("local_path")]
+r = min(recs, key=lambda r: r.get("size_bytes") or 0)
+print(r["local_path"][len("files/"):])
+PY
+)
+doc_enc=$(python3 -c "import sys,urllib.parse;print('/'.join(urllib.parse.quote(p) for p in sys.argv[1].split('/')))" "$doc")
+doc_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$BASE/pursue/files/$doc_enc")
+if [[ "$doc_code" == "404" ]]; then
+  log "ok  documents withheld as intended (sampled → 404)"
+else
+  log "NOTE: document bytes are being served again (sampled → $doc_code)"
+  log "      not a failure — but re-check the ToS §2.8 exposure decision"
 fi
-rm -f "$tmp"
 
 # ---- 5. Verdict ----------------------------------------------------------
 echo
 echo "=== SUMMARY ==="
-echo "sampled: $local_path"
+echo "sampled=$((served + withheld)) served=$served withheld=$withheld doc_probe=$doc_code"
 
 if (( LAB_MODE == 1 )); then
-  size_match=$([[ "$size_actual" == "$size_claimed" ]] && echo 1 || echo 0)
-  sha_match=$([[ "$sha_actual" == "$sha_claimed" ]] && echo 1 || echo 0)
   echo "===RAIL_LAB_COUNTERS==="
-  echo "{\"counter\": \"size_match\", \"value\": $size_match}"
-  echo "{\"counter\": \"sha_match\", \"value\": $sha_match}"
-  echo "{\"counter\": \"sampled_size_bytes\", \"value\": ${size_claimed:-0}}"
+  echo "{\"counter\": \"served_verified\", \"value\": $served}"
+  echo "{\"counter\": \"served_drifted\", \"value\": $fail}"
   echo "{\"counter\": \"manifest_records\", \"value\": ${records:-0}}"
   echo "===END==="
-  if (( fail == 0 )); then
-    echo "===VERDICT=== PASS"
-    exit 0
-  else
-    echo "===VERDICT=== FALSIFIED"
-    exit 0  # exit 0 in --lab mode: runner succeeded, verdict is the falsification claim
-  fi
+  if (( fail == 0 )); then echo "===VERDICT=== PASS"; else echo "===VERDICT=== FALSIFIED"; fi
+  exit 0
 fi
 
 if (( fail == 0 )); then
-  echo "VERDICT=PASS — sampled record matches manifest (size + sha256)"
+  echo "VERDICT=PASS — every served artifact matches its attestation"
   exit 0
 else
-  echo "VERDICT=FALSIFIED — drift detected on $local_path"
+  echo "VERDICT=FALSIFIED — a served artifact drifted from the manifest"
   exit 1
 fi
