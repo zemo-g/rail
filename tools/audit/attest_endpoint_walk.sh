@@ -4,8 +4,8 @@
 # Endpoint audit walker — Phase 1 of docs/plans/ATTEST_ENDPOINT_AUDIT.md.
 # Probes each public attestation surface, reports per-class verdict + counters.
 #
-# READ-ONLY. No healing. No chain write yet (Phase 2 — gated on a planned
-# internal lab-entry route).
+# READ-ONLY. No healing. No chain write yet (Phase 2 — gated on Studio :9101
+# /lab/entry route from the lab integration plan).
 #
 # Exit code: 0 if every class PASS, 1 if any class FAIL, 2 on probe error.
 #
@@ -111,6 +111,55 @@ class_witness() {
 }
 
 # ============================================================================
+# CLASS: frame_attest — frame side-car fresh (pulse-lag age) + digest coherent
+# ============================================================================
+# Added 2026-06-09: the frame publisher was dead 2026-05-28..06-09 and nothing
+# alarmed, because no walker checked the side-car's age. Age axis is pulse-lag,
+# not wall-clock — the side-car carries no timestamp, and pulse_id is the house
+# clock anyway.
+#
+# Threshold recalibrated 2026-07-26: 20 -> 90. The original assumed the beacon
+# ticked ~30s/pulse, so a 30s publisher was ~1 pulse behind. The beacon now runs
+# at ~1.15s/pulse (measured: 26 pulses in 30s), so a publisher ticking every 32s
+# is ~28 pulses behind BY CONSTRUCTION — permanently past a threshold of 20. The
+# class was failing on a completely healthy publisher. 90 pulses ~= 100s ~= three
+# publisher intervals: still catches a genuinely dead publisher inside two
+# minutes, without alarming on the baseline. If the beacon cadence changes again,
+# this number has to move with it.
+class_frame_attest() {
+  local payload att_pulse cur_pulse frame_sha wit_sha lag
+  payload=$(curl -sf "$BASE/entropy/frame/latest.attestation.json")
+  if [[ -z "$payload" ]]; then
+    log "FAIL: latest.attestation.json unreachable"
+    verdict frame_attest FAIL; return
+  fi
+  # Publisher emits python-default JSON ('": "' separators) — json_int/json_str
+  # are compact-only, so extract space-tolerantly here.
+  att_pulse=$(grep -oE '"pulse_id"[[:space:]]*:[[:space:]]*[0-9]+' <<<"$payload" | grep -oE '[0-9]+$' | head -1)
+  frame_sha=$(grep -oE '"sha256"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' <<<"$payload" | grep -oE '[0-9a-f]{64}' | head -1)
+  wit_sha=$(grep -oE '"digest_sha256"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' <<<"$payload" | grep -oE '[0-9a-f]{64}' | head -1)
+  cur_pulse=$(json_int "$(curl -sf "$BASE/entropy/pulse")" pulse_id)
+  if [[ -z "$att_pulse" || -z "$cur_pulse" || -z "$frame_sha" ]]; then
+    log "FAIL: missing fields (att_pulse=$att_pulse cur_pulse=$cur_pulse sha=${frame_sha:0:8})"
+    verdict frame_attest FAIL; return
+  fi
+  lag=$(( cur_pulse - att_pulse ))
+  log "attestation pulse=$att_pulse current=$cur_pulse lag=${lag} pulses; sha=${frame_sha:0:12}"
+  if (( lag < 0 )); then
+    log "FAIL: attestation pulse ahead of beacon ($att_pulse > $cur_pulse)"
+    verdict frame_attest FAIL
+  elif (( lag > 90 )); then
+    log "FAIL: frame attestation stale (lag=${lag} pulses > 90 ~= publisher dead)"
+    verdict frame_attest FAIL
+  elif [[ -n "$wit_sha" && "$wit_sha" != "$frame_sha" ]]; then
+    log "FAIL: witness digest ($wit_sha) != frame sha ($frame_sha)"
+    verdict frame_attest FAIL
+  else
+    verdict frame_attest PASS
+  fi
+}
+
+# ============================================================================
 # CLASS: fleet — status.json fresh AND pi-alive matches our own probe
 # ============================================================================
 class_fleet() {
@@ -132,8 +181,14 @@ for n in d.get('nodes', []):
         break
 " 2>/dev/null)
   log "status age: ${age}s; pi: ${pi_alive_pub}"
-  if (( age > 300 )); then
-    log "FAIL: status stale (${age}s > 300s)"; verdict fleet FAIL; return
+  # Threshold raised 300 → 900 on 2026-07-25. The free-tier pivot (2026-07-24)
+  # throttles the fleet-status KV write to once per 600s to stay inside the
+  # 1k/day free write cap, so the published record is now legitimately up to
+  # ~600s old. The old 300s bound described the pre-throttle write cadence and
+  # had become a guaranteed daily false alarm. 900s = throttle + one missed
+  # tick, so a genuinely wedged publisher still trips it.
+  if (( age > 900 )); then
+    log "FAIL: status stale (${age}s > 900s)"; verdict fleet FAIL; return
   fi
   token=$(cat ~/.fleet/token 2>/dev/null || true)
   if [[ -z "$token" ]]; then
@@ -283,21 +338,31 @@ class_releases() {
 }
 
 # ============================================================================
-# CLASS: dda — index reachable + well-formed JSON
+# CLASS: dda — engagement CLOSURE holds (closed + paid 2026-05-12)
+#
+# Reworked 2026-07-25. The old check asserted /dda/index.json was reachable
+# and well-formed — true only while the engagement was live. It had been
+# FAILING every day since the rollup went dark, which is alert fatigue on a
+# route that is correctly retired.
+#
+# The assertion that still earns its keep is the inverse: a closed client
+# surface must STAY closed. 410 Gone = pass. Serving content again is the
+# real regression — that would mean client material leaked back onto a
+# public surface after closeout.
 # ============================================================================
 class_dda() {
-  local idx
-  idx=$(curl -sf "$BASE/dda/index.json")
-  if [[ -z "$idx" ]]; then
-    log "FAIL: dda/index.json unreachable"
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/dda/index.json")
+  if [[ "$code" == "410" ]]; then
+    log "closure holds: dda/index.json → 410 Gone"
+    verdict dda PASS; return
+  fi
+  if [[ "$code" == "200" ]]; then
+    log "FAIL: dda/index.json serving 200 — closed engagement is public again"
     verdict dda FAIL; return
   fi
-  if grep -q '"kind"' <<<"$idx" || grep -q '"version"' <<<"$idx"; then
-    verdict dda PASS
-  else
-    log "FAIL: dda/index.json malformed (no kind/version)"
-    verdict dda FAIL
-  fi
+  log "FAIL: dda/index.json → $code (expected 410 Gone for a closed engagement)"
+  verdict dda FAIL
 }
 
 # ============================================================================
@@ -309,6 +374,7 @@ class_dda() {
 
 header beacon;          class_beacon
 header witness;         class_witness
+header frame_attest;    class_frame_attest
 header fleet;           class_fleet
 header builds_badge;    class_builds_badge
 header selfhost_badge;  class_selfhost_badge

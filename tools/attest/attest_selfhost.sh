@@ -85,3 +85,22 @@ else
   echo "NOT a fixed point: pass1=${pass1_sha:0:16} pass2=${pass2_sha:0:16}" >&2
 fi
 echo "selfhost attested: $dest/"
+
+# Latest-record pointer. Written here, at the moment a record exists, rather
+# than derived later by listing directories: the pure-Rail origin that serves
+# this is single-threaded and also carries the site's live pulse, so it must
+# read a file, not fork a subprocess, per request. Kept outside the checkout
+# so the pristine master worktree stays clean.
+POINTER_DIR=${POINTER_DIR:-$HOME/.ledatic/attest}
+mkdir -p "$POINTER_DIR"
+python3 -c "
+import json, sys, time
+print(json.dumps({
+  'kind': 'ledatic.selfhost.latest',
+  'short': sys.argv[1],
+  'updated_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+}))
+" "$short" > "$POINTER_DIR/selfhost_latest.json.tmp" \
+  && mv -f "$POINTER_DIR/selfhost_latest.json.tmp" "$POINTER_DIR/selfhost_latest.json"
+echo "latest pointer: $POINTER_DIR/selfhost_latest.json -> $short"
+
