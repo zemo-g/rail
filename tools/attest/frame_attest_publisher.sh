@@ -68,7 +68,15 @@ out = {
     "kind": "ledatic.frame.attestation",
     "version": 1,
     "frame": {
-        "url": "https://ledatic.org/entropy/frame/current",
+        # NOT a fetch locator. /entropy/frame/current serves the viewer's
+        # 6-channel render frame; this attestation covers the 9-channel
+        # solver state, which we do not publish (binary, rewritten every
+        # ~32 s — no free-tier shelf for it). Naming that URL here made the
+        # attestation assert a locator whose bytes could never match its own
+        # digest. Verify the signature over the digest; the bytes are held,
+        # not served.
+        "bytes_published": False,
+        "note": "solver-state frame; digest signed, bytes not published",
         "size_bytes": int(size),
         "sha256": digest,
         "header": json.loads(header_json),
@@ -79,6 +87,16 @@ out = {
 print(json.dumps(out))
 PY
 )
+
+# 2026-07-25: the attestation is fully built and witness-signed by this point.
+# The R2-backed PUT below has returned 500 on every tick since the free-tier
+# pivot retired R2 — ~2,700 silent failures a day, while /entropy and /ot kept
+# offering a prove button with nothing behind it. Write the signed attestation
+# to local state FIRST so the pure-Rail beacon origin can serve it; the PUT is
+# now best-effort and its failure no longer costs us the public surface.
+LOCAL_OUT=${LOCAL_OUT:-$HOME/.ledatic/entropy/frame.latest.attestation.json}
+mkdir -p "$(dirname "$LOCAL_OUT")"
+printf '%s' "$published" > "$LOCAL_OUT.tmp" && mv -f "$LOCAL_OUT.tmp" "$LOCAL_OUT"
 
 code=$(curl -sS -X PUT \
   -H "x-beacon-token: $TOKEN" \

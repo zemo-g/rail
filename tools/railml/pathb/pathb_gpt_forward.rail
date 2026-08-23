@@ -1,0 +1,265 @@
+-- pathb_gpt_forward.rail -- INTEGER-EXACT FULL 16-LAYER forward for the 138M "mid" GPT.
+-- "The model that writes Rail, run BY Rail." Reuses the Path-B substrate (pathb_lib.rail) VERBATIM
+-- for matmul (idot) / attention / softmax / argmax / residual / LM head; adds the GPT-2-family deltas:
+--   1. F32 loader via pread slice-streaming (weights are F32, not bf16; blob is 530MB -> we NEVER load
+--      the whole thing as a 1-int-per-byte array. fopen returns a real kernel fd; pread reads exactly
+--      the tensor byte-slice we decode. pq_f32_fixed(b0,b1,b2,b3) -> fixed-point F=24 (S=2^24)).
+--   2. LayerNorm (mean-center + POPULATION variance + affine weight/bias) -- gp_layernorm, the key kernel.
+--   3. Learned positional embedding (pos.weight row t added to token-embed row t). NO RoPE.
+--   4. GELU MLP: Linear(768->3072)+bias -> GELU(tanh-approx bx4_gelu) -> Linear(3072->768)+bias.
+--   5. Standard MHA (12 heads, group=1, no GQA), NO bias on q/k/v/out proj, scale = 1/sqrt(head_dim).
+--   6. UNTIED LM head (head.weight, [vocab,dim]) at the last position; argmax.
+--
+-- Model (config "mid"): d=768 layers=16 heads=12 head_dim=64 inter=3072 vocab=16384 ctx=512, LN eps=1e-5.
+-- Weights: canonical_bestpass.safetensors (F32). Validated incrementally vs MLX (loader/LN/layer-0/argmax).
+--
+-- Build: ./rail_native tools/railml/pathb/pathb_gpt_forward.rail
+-- Run:   RAIL_ARENA_MB=4096 /tmp/rail_out     (run the BINARY directly -- ./rail_native run SIGBUSes on big loads)
+
+import "tools/railml/pathb/pathb_lib.rail"
+import "stdlib/env.rail"
+
+foreign pread fd buf count offset -> int
+
+-- ===== dims (GPT "mid") =====
+gp_d _       = 768
+gp_nh _      = 12
+gp_hd _      = 64
+gp_inter _   = 3072
+gp_vocab _   = 16384
+gp_nlayers _ = 16
+gp_ctx _     = 512
+gp_eps _     = 168        -- round(1e-5 * 2^24)
+gp_S _       = 16777216
+
+gp_blob _ = let e = getenv "GPT_BLOB" in if e == "" then cat [getenv "HOME", "/.ledatic/railml-trial/canonical_bestpass.safetensors"] else e
+gp_bname li suffix = cat ["blocks.", show li, ".", suffix]
+
+-- ===== F32 pread-slice loader (delta vs ld_decode's 2-byte bf16 read of a preloaded blob array) =====
+-- decode `count` F32 elems from a malloc'd C byte buffer cbuf[0..] into out[obase..obase+count)
+gp_dec_f32 cbuf out obase count i =
+  if i >= count then 0
+  else
+    let ba = 4 * i in
+    let _ = arr_set out (obase + i) (pq_f32_fixed (byte_at cbuf ba) (byte_at cbuf (ba + 1)) (byte_at cbuf (ba + 2)) (byte_at cbuf (ba + 3))) in
+    gp_dec_f32 cbuf out obase count (i + 1)
+-- pread the named tensor's byte-slice, decode `count` F32 into a fresh int array (S=2^24 fixed-point)
+ld_f32 fd hdrbuf base name count =
+  let start = pq_offset hdrbuf base name 0 in
+  let dataoff = base + start in
+  let nb = count * 4 in
+  let cbuf = malloc nb in
+  let nr = pread fd cbuf nb dataoff in
+  let out = arr_new count 0 in
+  let _ = gp_dec_f32 cbuf out 0 count 0 in
+  let _ = free cbuf in
+  out
+
+-- ===== LayerNorm (THE key delta): mean, population var (squares via mul_shr, overflow-safe), affine =====
+gp_ln_sum X base d i acc = if i >= d then acc else gp_ln_sum X base d (i + 1) (acc + arr_get X (base + i))
+gp_ln_var X base d mean i acc = if i >= d then acc else let dx = (arr_get X (base + i)) - mean in gp_ln_var X base d mean (i + 1) (acc + mul_shr dx dx 24)
+gp_ln_apply X base xn gamma beta d mean inv i =
+  if i >= d then xn
+  else let dx = (arr_get X (base + i)) - mean in
+       let _ = arr_set xn i ((mul_shr (mul_shr dx inv 24) (arr_get gamma i) 24) + (arr_get beta i)) in
+       gp_ln_apply X base xn gamma beta d mean inv (i + 1)
+-- normalized+affine LayerNorm of X[base..base+d) into xn[0..d). eps is S-scaled.
+gp_layernorm X base xn gamma beta d eps =
+  let s = gp_ln_sum X base d 0 0 in
+  let mean = s / d in
+  let vs = gp_ln_var X base d mean 0 0 in
+  let var = vs / d in
+  let inv = bx4_fxrsqrt (var + eps) in
+  gp_ln_apply X base xn gamma beta d mean inv 0
+
+-- ===== bias broadcast + GELU vector (MLP deltas) =====
+pf_add_bias Y base bias n i = if i >= n then 0 else let _ = arr_set Y (base + i) ((arr_get Y (base + i)) + (arr_get bias i)) in pf_add_bias Y base bias n (i + 1)
+gp_gelu_vec X n i = if i >= n then 0 else let _ = arr_set X i (bx4_gelu (arr_get X i)) in gp_gelu_vec X n (i + 1)
+
+-- ===== per-token LayerNorm(ln1) + QKV projection (NO RoPE; Q/K/V go straight to attention) =====
+gp_attn_proj H xn Wq Wk Wv Q K V d L qdim kvdim g1 b1 eps acc t =
+  if t >= L then 0
+  else
+    let _ = gp_layernorm H (t * d) xn g1 b1 d eps in
+    let _ = pf_proj Wq xn 0 d Q (t * qdim) qdim acc 0 in
+    let _ = pf_proj Wk xn 0 d K (t * kvdim) kvdim acc 0 in
+    let _ = pf_proj Wv xn 0 d V (t * kvdim) kvdim acc 0 in
+    gp_attn_proj H xn Wq Wk Wv Q K V d L qdim kvdim g1 b1 eps acc (t + 1)
+
+-- ===== per-token LayerNorm(ln2) + GPT MLP (Linear+bias, GELU, Linear+bias) =====
+gp_mlp_tokens Y hn Wm0 bm0 Wm2 bm2 hid M d L inter g2 b2 eps acc t =
+  if t >= L then 0
+  else
+    let _ = gp_layernorm Y (t * d) hn g2 b2 d eps in
+    let _ = pf_proj Wm0 hn 0 d hid 0 inter acc 0 in
+    let _ = pf_add_bias hid 0 bm0 inter 0 in
+    let _ = gp_gelu_vec hid inter 0 in
+    let _ = pf_proj Wm2 hid 0 inter M (t * d) d acc 0 in
+    let _ = pf_add_bias M (t * d) bm2 d 0 in
+    gp_mlp_tokens Y hn Wm0 bm0 Wm2 bm2 hid M d L inter g2 b2 eps acc (t + 1)
+
+-- ===== learned positional embedding: add Pos row t (Pos[t*d+c]) to H token t (H[t*d+c]) =====
+gp_addpos Pos H d L t = if t >= L then H else let _ = pf_addrow Pos H d (t * d) 0 in gp_addpos Pos H d L (t + 1)
+
+-- ===== ONE transformer block over hidden H (L x d). Streams its weights via pread. Returns NEW hidden. =====
+gp_layer fd hdrbuf base H li d nh hd inter qdim kvdim eps scaleq L acc =
+  let g1  = ld_f32 fd hdrbuf base (gp_bname li "ln1.weight") d in
+  let b1  = ld_f32 fd hdrbuf base (gp_bname li "ln1.bias") d in
+  let Wq  = ld_f32 fd hdrbuf base (gp_bname li "attn.query_proj.weight") (qdim * d) in
+  let Wk  = ld_f32 fd hdrbuf base (gp_bname li "attn.key_proj.weight") (kvdim * d) in
+  let Wv  = ld_f32 fd hdrbuf base (gp_bname li "attn.value_proj.weight") (kvdim * d) in
+  let Wo  = ld_f32 fd hdrbuf base (gp_bname li "attn.out_proj.weight") (d * qdim) in
+  let g2  = ld_f32 fd hdrbuf base (gp_bname li "ln2.weight") d in
+  let b2  = ld_f32 fd hdrbuf base (gp_bname li "ln2.bias") d in
+  let Wm0 = ld_f32 fd hdrbuf base (gp_bname li "mlp.layers.0.weight") (inter * d) in
+  let bm0 = ld_f32 fd hdrbuf base (gp_bname li "mlp.layers.0.bias") inter in
+  let Wm2 = ld_f32 fd hdrbuf base (gp_bname li "mlp.layers.2.weight") (d * inter) in
+  let bm2 = ld_f32 fd hdrbuf base (gp_bname li "mlp.layers.2.bias") d in
+  -- attention
+  let xn = arr_new d 0 in
+  let Q = arr_new (L * qdim) 0 in
+  let K = arr_new (L * kvdim) 0 in
+  let V = arr_new (L * kvdim) 0 in
+  let _ = gp_attn_proj H xn Wq Wk Wv Q K V d L qdim kvdim g1 b1 eps acc 0 in
+  let attn = arr_new (L * qdim) 0 in
+  let S = arr_new (L * L) 0 in
+  let E = arr_new (L * L) 0 in
+  let P = arr_new (L * L) 0 in
+  let _ = pf_heads Q K V attn S E P qdim kvdim hd L scaleq nh 1 0 acc in
+  let Y = pf_resid H attn Wo (arr_new (L * d) 0) d qdim L acc 0 in
+  -- MLP
+  let hn = arr_new d 0 in
+  let hid = arr_new inter 0 in
+  let M = arr_new (L * d) 0 in
+  let _ = gp_mlp_tokens Y hn Wm0 bm0 Wm2 bm2 hid M d L inter g2 b2 eps acc 0 in
+  pf_add_resid Y M d L 0
+
+-- loop all layers. Hcur is the PERSISTENT hidden (allocated outside the per-layer mark).
+gp_layers fd hdrbuf base Hcur li nlayers d nh hd inter qdim kvdim eps scaleq L acc vb =
+  if li >= nlayers then Hcur
+  else
+    let m = arena_mark 0 in
+    let Yf = gp_layer fd hdrbuf base Hcur li d nh hd inter qdim kvdim eps scaleq L acc in
+    let _ = pf_copy Yf Hcur (L * d) 0 in
+    let _ = arena_reset m in
+    let _ = if vb == 1 then print (cat ["  layer ", show li, " done  last-tok absum(S)=", show (pf_absum Hcur ((L - 1) * d) d 0 0),
+      "  last[0..2]=", show (arr_get Hcur ((L - 1) * d)), " ", show (arr_get Hcur ((L - 1) * d + 1)), " ", show (arr_get Hcur ((L - 1) * d + 2))]) else 0 in
+    gp_layers fd hdrbuf base Hcur (li + 1) nlayers d nh hd inter qdim kvdim eps scaleq L acc vb
+
+-- ===== full forward over the L-token prompt; returns logits (vocab long). Tok/Head/Pos preloaded. =====
+gp_run_full fd hdrbuf base Tok Head Pos ids L vb =
+  let d = gp_d 0 in
+  let nh = gp_nh 0 in
+  let hd = gp_hd 0 in
+  let inter = gp_inter 0 in
+  let nlayers = gp_nlayers 0 in
+  let qdim = nh * hd in
+  let kvdim = nh * hd in
+  let eps = gp_eps 0 in
+  let scaleq = bx4_fxrsqrt (hd * 16777216) in
+  let acc = arr_new 2 0 in
+  -- embed input rows + learned positional embedding
+  let H = pf_embed_g Tok ids (arr_new (L * d) 0) d L 0 in
+  let _ = gp_addpos Pos H d L 0 in
+  let _ = if vb == 1 then print (cat ["    [diag] embed last-tok[0..2]=", show (arr_get H ((L - 1) * d)), " ", show (arr_get H ((L - 1) * d + 1)), " ", show (arr_get H ((L - 1) * d + 2))]) else 0 in
+  -- all 16 transformer layers (weights streamed per layer via pread, arena reset per layer)
+  let _ = gp_layers fd hdrbuf base H 0 nlayers d nh hd inter qdim kvdim eps scaleq L acc vb in
+  -- final LayerNorm at LAST position + UNTIED LM head over full vocab
+  let gnf = ld_f32 fd hdrbuf base "lnf.weight" d in
+  let bnf = ld_f32 fd hdrbuf base "lnf.bias" d in
+  let last = L - 1 in
+  let xnf = arr_new d 0 in
+  let _ = gp_layernorm H (last * d) xnf gnf bnf d eps in
+  let vocab = gp_vocab 0 in
+  let logits = arr_new vocab 0 in
+  let _ = pf_lmhead xnf Head vocab d logits acc 0 in
+  logits
+
+-- ===== set the 9 prompt ids [328,2432,554,183,12154,533,197,27,661] =====
+gp_set_prompt ids =
+  let _ = arr_set ids 0 328 in
+  let _ = arr_set ids 1 2432 in
+  let _ = arr_set ids 2 554 in
+  let _ = arr_set ids 3 183 in
+  let _ = arr_set ids 4 12154 in
+  let _ = arr_set ids 5 533 in
+  let _ = arr_set ids 6 197 in
+  let _ = arr_set ids 7 27 in
+  let _ = arr_set ids 8 661 in
+  ids
+
+-- expected 12 greedy steps
+gp_expected e =
+  let _ = arr_set e 0 5836 in let _ = arr_set e 1 1192 in let _ = arr_set e 2 5376 in let _ = arr_set e 3 11222 in
+  let _ = arr_set e 4 27 in let _ = arr_set e 5 581 in let _ = arr_set e 6 229 in let _ = arr_set e 7 9078 in
+  let _ = arr_set e 8 328 in let _ = arr_set e 9 2432 in let _ = arr_set e 10 554 in let _ = arr_set e 11 183 in
+  e
+
+-- ===== 12-step greedy generation loop; re-runs the forward each step (no KV cache). Counts matches. =====
+gp_gen fd hdrbuf base Tok Head Pos ids exp L step maxsteps nmatch =
+  if step >= maxsteps then nmatch
+  else
+    let m = arena_mark 0 in
+    let logits = gp_run_full fd hdrbuf base Tok Head Pos ids L 0 in
+    let am = pf_argmax logits (gp_vocab 0) 1 0 (arr_get logits 0) in
+    let _ = arena_reset m in
+    let want = arr_get exp step in
+    let ok = if am == want then 1 else 0 in
+    let _ = arr_set ids L am in
+    let _ = print (cat ["  step ", show step, "  argmax=", show am, "  expect=", show want, "  ", if ok == 1 then "MATCH" else "DIFF"]) in
+    gp_gen fd hdrbuf base Tok Head Pos ids exp (L + 1) (step + 1) maxsteps (nmatch + ok)
+
+main =
+  let blob = gp_blob 0 in
+  let bsz = read_file_size blob in
+  if bsz < 10000000 then
+    let _ = print (cat ["pathb_gpt_forward: FATAL -- blob missing or too small (", show bsz, " bytes): ", blob]) in 1
+  else
+  let d = gp_d 0 in
+  let vocab = gp_vocab 0 in
+  let ctx = gp_ctx 0 in
+  let fd = fopen blob "rb" in
+  -- read the 8-byte LE header length, then the header JSON window [0, base)
+  let hbuf8 = malloc 8 in
+  let _ = pread fd hbuf8 8 0 in
+  let hlen = pq_le_len hbuf8 0 in
+  let _ = free hbuf8 in
+  let base = 8 + hlen in
+  let hdrbuf = malloc base in
+  let _ = pread fd hdrbuf base 0 in
+  let _ = print (cat ["pathb_gpt_forward: 138M 'mid' GPT (16-layer) exact-integer forward  d=", show d, " heads=12 hd=64 inter=3072  vocab=", show vocab]) in
+  let _ = print (cat ["  blob bytes=", show bsz, "  headerlen=", show hlen, "  base=", show base, "  fd=", show fd]) in
+  -- preload tok / pos / head (full) ONCE (persistent across all generation steps)
+  let _ = print "  loading tok.weight / pos.weight / head.weight ..." in
+  let Tok = ld_f32 fd hdrbuf base "tok.weight" (vocab * d) in
+  let Pos = ld_f32 fd hdrbuf base "pos.weight" (ctx * d) in
+  let Head = ld_f32 fd hdrbuf base "head.weight" (vocab * d) in
+  let _ = print (cat ["  loaded. tok[328][0..2]=", show (arr_get Tok (328 * d)), " ", show (arr_get Tok (328 * d + 1)), " ", show (arr_get Tok (328 * d + 2))]) in
+  -- prompt ids
+  let L0 = 9 in
+  let idsmax = L0 + 12 in
+  let ids = gp_set_prompt (arr_new idsmax 0) in
+  -- ===== DIAG: LayerNorm(ln1 block0) of the last embedded token (task step b) =====
+  let Hd = pf_embed_g Tok ids (arr_new (L0 * d) 0) d L0 0 in
+  let _ = gp_addpos Pos Hd d L0 0 in
+  let g1d = ld_f32 fd hdrbuf base "blocks.0.ln1.weight" d in
+  let b1d = ld_f32 fd hdrbuf base "blocks.0.ln1.bias" d in
+  let xnd = arr_new d 0 in
+  let _ = gp_layernorm Hd ((L0 - 1) * d) xnd g1d b1d d (gp_eps 0) in
+  let _ = print (cat ["  [DIAG loader] embed last[0..2]=", show (arr_get Hd ((L0 - 1) * d)), " ", show (arr_get Hd ((L0 - 1) * d + 1)), " ", show (arr_get Hd ((L0 - 1) * d + 2)), "  (MLX S: -580727 1514463 518567)"]) in
+  let _ = print (cat ["  [DIAG LN]     ln1 last[0..2]=", show (arr_get xnd 0), " ", show (arr_get xnd 1), " ", show (arr_get xnd 2), "  (MLX S: -3450268 6448591 1702770)"]) in
+  -- ===== step-0 forward (verbose per-layer) =====
+  let _ = print "  === step-0 forward (verbose) ===" in
+  let logits0 = gp_run_full fd hdrbuf base Tok Head Pos ids L0 1 in
+  let am0 = pf_argmax logits0 vocab 1 0 (arr_get logits0 0) in
+  let _ = print (cat ["  step-0 argmax = ", show am0, "   (TARGET 5836)   logit(S)=", show (arr_get logits0 am0)]) in
+  let _ = print (if am0 == 5836 then "  *** STEP-0 MATCH: pure-Rail GPT reproduces the MLX greedy argmax (5836) ***" else "  step-0 MISMATCH") in
+  -- ===== 12-step greedy generation =====
+  let _ = print "  === 12-step greedy generation ===" in
+  let exp = gp_expected (arr_new 12 0) in
+  let _ = arr_set ids (L0 - 1) 661 in
+  let ids2 = gp_set_prompt (arr_new idsmax 0) in
+  let matches = gp_gen fd hdrbuf base Tok Head Pos ids2 exp L0 0 12 0 in
+  let _ = print (cat ["  === 12-step greedy match: ", show matches, "/12 ==="]) in
+  let _ = fclose fd in
+  if am0 == 5836 then 0 else 1

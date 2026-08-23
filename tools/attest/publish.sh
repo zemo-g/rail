@@ -52,6 +52,16 @@ publish_dir() {
     [ -f "$dir/rail_native"  ] && files+=("$dir/rail_native")
     [ -f "$dir/compile.rail" ] && files+=("$dir/compile.rail")
   fi
+  # bash 3.2 (what /bin/bash is on macOS, and what launchd runs) treats
+  # "${arr[@]}" on an EMPTY array as an unbound variable under `set -u`, so an
+  # attest run that produced no records killed this script with a cryptic
+  # "files[@]: unbound variable" instead of saying so. That is exactly what had
+  # been happening on the daily job. Say it plainly and fail — an empty record
+  # set means the attestation upstream did not finish, which is worth an alarm.
+  if [ ${#files[@]} -eq 0 ]; then
+    echo "no publishable records in $dir — attestation upstream produced nothing" >&2
+    return 1
+  fi
   for f in "${files[@]}"; do
     local file content_type
     file=$(basename "$f")
