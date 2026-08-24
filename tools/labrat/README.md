@@ -51,7 +51,7 @@ shell-out side effects.
 ## Known constraints (Rail-specific)
 
 - `stdlib/llm.rail` / `stdlib/mlx_client.rail` handle the LLM call. MLX
-  on `:8080` serves `Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-6bit` —
+  on `:8092` serves `Qwen3.8-27B-MLX-6bit` —
   adequate for this task class (the paper equivalent used Claude).
 - Concurrent Metal kernel work contends with live training; gate via a
   sentinel file or explicit queue.
