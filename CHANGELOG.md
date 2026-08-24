@@ -5,6 +5,11 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Fixed
+- **speak + labrat repointed at the live Studio server** (Qwen3.8-27B on
+  `:8092`): both tools pinned the retired Qwen3.5-Opus-distill id — and
+  labrat a dead `:8080` — which would have dragged a second 27B onto the
+  Studio GPU the moment either ran (the mlx server loads any model a
+  request names).
 - **`is_float` local-shadowing guard** (the 811d7f2 delta): the V-case's
   global `__float_ret_<name>` consult (added 4f689b7) ran unconditionally,
   so a local int shadowing a float-returning global was typed float and
