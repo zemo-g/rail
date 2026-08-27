@@ -281,11 +281,40 @@ handle_stream cfd body st prev step max_cap =
       let _ = append_ledger ledger_path (cat ["{\"canon\":", canon, ",\"record_hash\":\"", rec_hash, "\"}\n"])
       rec_hash
 
+-- ── PC0: the single-slot prefix cache, as a DECLARED input ────────────
+-- A request that sends "cache": "reuse" opts into the resident slot: if
+-- its prompt EXTENDS the token sequence the slot holds, only the new
+-- suffix is prefilled. The declaration rides into the ledger canon --
+-- cache behavior is part of the attested transcript, never an ambient
+-- optimization. Correctness is structural: prefix rows' K/V are
+-- computed by the same row-independent loops whether they ran in this
+-- request or a previous one (the kv0_gate parity argument), so hit and
+-- cold produce identical bytes -- and the gate checks exactly that.
+-- The slot is a 3-cell box inside st: [valid(0/1), ids_list, caches].
+PC_SEQ = 512
+
+box_get box i = arr_get box i
+box_put box i v = arr_set box i v
+
+-- common prefix length of two id lists. Any common prefix is safely
+-- reusable in either direction: cache rows at positions >= the current
+-- one are IGNORED by the causal attention loops (j <= pos), so a cache
+-- longer than the prompt (a re-ask) or diverging later (an edit) still
+-- reuses everything up to the divergence.
+prefix_match a b n =
+  if length a == 0 then n
+  else if length b == 0 then n
+  else if head a == head b then prefix_match (tail a) (tail b) (n + 1)
+  else n
+
+drop_n n xs = if n <= 0 then xs else drop_n (n - 1) (tail xs)
+
 -- ── the /generate handler ─────────────────────────────────────────────
--- st = [mdl, blocks, vocab, ledger_path]; returns (resp, new_prev)
+-- st = [mdl, blocks, vocab, ledger_path, cache_box]; returns (resp, new_prev)
 handle_generate body st prev step max_cap =
   let prompt = json_str_field body "prompt"
   let want = json_int_field body "max" 32
+  let cache_req = json_str_field body "cache"
   let n_gen = if want > max_cap then max_cap else want
   if length (chars prompt) == 0 then
     (http_json 400 "{\"error\": \"prompt is required (plain text, no quotes/backslashes in v0)\"}", prev)
@@ -294,16 +323,42 @@ handle_generate body st prev step max_cap =
     let blocks = list_nth 1 st
     let vocab = list_nth 2 st
     let ledger_path = list_nth 3 st
+    let box = list_nth 4 st
     let raw_ids = encode vocab prompt
     let prompt_ids = sanitize_loop raw_ids []
     if length prompt_ids == 0 then
       (http_json 400 "{\"error\": \"prompt has no tokens in this model's vocabulary\"}", prev)
     else
       let d = head (reverse (tensor_shape (list_nth 0 mdl)))
-      let max_seq = length prompt_ids + n_gen + 1
-      let caches = kv_cache_new (length blocks) max_seq d
+      let want_reuse = cache_req == "reuse"
+      let fits = length prompt_ids + n_gen + 1 <= PC_SEQ
+      -- a reuse request runs in the resident PC_SEQ caches; anything else
+      -- gets fresh right-sized ones
+      let cached_ids = if want_reuse then box_get box 1 else []
+      let matched = if want_reuse then
+                      if box_get box 0 == 1 then prefix_match cached_ids prompt_ids 0
+                      else 0
+                    else 0
+      let hit = if want_reuse then if fits then matched > 0 else false else false
+      let caches =
+        if want_reuse then
+          if fits then
+            let c0 = if box_get box 0 == 1 then box_get box 2
+                     else kv_cache_new (length blocks) PC_SEQ d
+            if hit then c0 else kv_cache_new (length blocks) PC_SEQ d
+          else kv_cache_new (length blocks) (length prompt_ids + n_gen + 1) d
+        else kv_cache_new (length blocks) (length prompt_ids + n_gen + 1) d
+      let feed_ids = if hit then drop_n matched prompt_ids else prompt_ids
+      let feed_pos = if hit then matched else 0
+      let cache_note = if hit then "hit" else if want_reuse then "cold" else "off"
       let t0 = now_ms 0
-      let last_probs = srv_feed_loop mdl blocks caches prompt_ids 0 0
+      let last_probs =
+        if length feed_ids == 0 then
+          -- prompt exactly equals the cached sequence: re-run its last
+          -- token so the returned distribution is the same one a cold
+          -- pass would end on (cache rows for it are simply rewritten)
+          srv_feed_loop mdl blocks caches (cons (list_nth (matched - 1) prompt_ids) []) (matched - 1) 0
+        else srv_feed_loop mdl blocks caches feed_ids feed_pos 0
       let first_id = srv_argmax last_probs
       let t1 = now_ms 0
       let rest_ids = srv_gen_loop mdl blocks caches first_id (length prompt_ids) (n_gen - 1) []
@@ -316,19 +371,43 @@ handle_generate body st prev step max_cap =
       let prompt_sha = sha256_hex prompt
       let decode_ms = t2 - t1
       let tps10 = if decode_ms > 0 then ((osl - 1) * 10000) / decode_ms else 0
-      -- ledger: canon record -> hash -> chain
+      -- PC0: update the resident slot. The FINAL generated token's K/V
+      -- row was never written (the loop stops after producing it), so
+      -- the slot records prompt + gen[:-1] -- exactly the rows the
+      -- caches hold; a follow-up prompt re-feeds from there.
+      let _ = if want_reuse then
+                if fits then
+                  let kept = srv_append prompt_ids (srv_all_but_last gen_ids)
+                  let _ = box_put box 1 kept
+                  let _ = box_put box 2 caches
+                  box_put box 0 1
+                else 0
+              else 0
+      -- ledger: canon record -> hash -> chain; the cache declaration is
+      -- part of the canon -- execution path as attested input
       let canon = cat ["{\"step\":", show step, ",\"prompt_sha256\":\"", prompt_sha,
         "\",\"output_sha256\":\"", out_sha, "\",\"isl\":", show isl,
-        ",\"osl\":", show osl, ",\"prev\":\"", prev, "\"}"]
+        ",\"osl\":", show osl, ",\"cache\":\"", cache_note,
+        "\",\"prev\":\"", prev, "\"}"]
       let rec_hash = sha256_hex canon
       let line = cat ["{\"canon\":", canon, ",\"record_hash\":\"", rec_hash, "\"}\n"]
       let _ = append_ledger ledger_path line
       let resp = cat ["{\"text\":\"", json_escape text, "\",\"isl\":", show isl,
         ",\"osl\":", show osl, ",\"ttft_ms\":", show (t1 - t0),
         ",\"tps_x10\":", show tps10, ",\"total_ms\":", show (t2 - t0),
-        ",\"output_sha256\":\"", out_sha, "\",\"record_hash\":\"", rec_hash,
+        ",\"cache\":\"", cache_note,
+        "\",\"output_sha256\":\"", out_sha, "\",\"record_hash\":\"", rec_hash,
         "\",\"prev_hash\":\"", prev, "\",\"step\":", show step, "}"]
       (http_json 200 resp, rec_hash)
+
+srv_all_but_last xs =
+  if length xs <= 1 then [] else reverse (tail (reverse xs))
+
+srv_rev_append rxs ys =
+  if length rxs == 0 then ys
+  else srv_rev_append (tail rxs) (cons (head rxs) ys)
+
+srv_append xs ys = srv_rev_append (reverse xs) ys
 
 append_ledger path line =
   let old = read_file path
@@ -455,7 +534,9 @@ main =
 
   -- fresh ledger per boot (v0): the genesis pins the model identity
   let _ = write_file ledger_path ""
-  let st = cons mdl (cons blocks (cons vocab (cons ledger_path [])))
+  -- PC0 resident slot: [valid, ids, caches]
+  let cache_box = arr_new 3 0
+  let st = cons mdl (cons blocks (cons vocab (cons ledger_path (cons cache_box []))))
 
   let listen_fd = bind_tcp "127.0.0.1" port
   if listen_fd < 0 then

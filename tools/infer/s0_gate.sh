@@ -106,9 +106,35 @@ else
   fail "stream not incremental: first byte ${TS}s vs total ${TT}s"
 fi
 
+# ── PC0: prefix cache as a declared input ──
+# cold with cache declared, then the same request again (a hit: the
+# resident slot holds prompt+gen[:-1], and this prompt is a prefix-match
+# re-ask). Hit output must BYTE-EQUAL cold output -- the cache may never
+# change the bytes -- and both must equal the undeclared run's bytes.
+CREQ='{"prompt": "the rail language", "max": 24, "cache": "reuse"}'
+C1=$(curl -sm 60 -X POST "http://127.0.0.1:$PORT/generate" -d "$CREQ")
+C2=$(curl -sm 60 -X POST "http://127.0.0.1:$PORT/generate" -d "$CREQ")
+CH1=$(echo "$C1" | sed -n 's/.*"output_sha256":"\([0-9a-f]*\)".*/\1/p')
+CH2=$(echo "$C2" | sed -n 's/.*"output_sha256":"\([0-9a-f]*\)".*/\1/p')
+CN1=$(echo "$C1" | sed -n 's/.*"cache":"\([a-z]*\)".*/\1/p')
+CN2=$(echo "$C2" | sed -n 's/.*"cache":"\([a-z]*\)".*/\1/p')
+if [ "$CN1" = "cold" ] && [ "$CN2" = "hit" ]; then
+  note "prefix cache: first declared run cold, second is a hit"
+else
+  fail "cache notes wrong: first=$CN1 second=$CN2"
+fi
+if [ "$CH1" = "$H1" ] && [ "$CH2" = "$H1" ]; then
+  note "prefix cache never changes the bytes: cold == hit == undeclared"
+else
+  fail "cache changed output: cold=$CH1 hit=$CH2 undeclared=$H1"
+fi
+grep -q '"cache":"hit"' "$LEDGER" && grep -q '"cache":"cold"' "$LEDGER" \
+  && note "cache declaration rides in the ledger canon" \
+  || fail "cache declaration missing from ledger"
+
 V=$(curl -sm 10 "http://127.0.0.1:$PORT/ledger/verify")
-echo "$V" | grep -q '"ok":true' && echo "$V" | grep -q '"records":6' \
-  && note "ledger self-verifies: 6 records (3 json + 3 streamed), chain intact" \
+echo "$V" | grep -q '"ok":true' && echo "$V" | grep -q '"records":8' \
+  && note "ledger self-verifies: 8 records, chain intact" \
   || fail "ledger verify failed: $V"
 
 # a tampered ledger must FAIL verification
