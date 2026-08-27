@@ -1,0 +1,236 @@
+-- tools/gpt/ng0_spec.rail — NG0: n-gram speculative decoding inside the
+-- deterministic envelope.
+--
+-- THE CLAIM: speculation changes the SCHEDULE, never the OUTPUT. Greedy
+-- decoding with speculation on produces byte-identical tokens to greedy
+-- decoding with it off -- provably, not empirically-usually.
+--
+-- Why it holds here (the NG0 keystone, ng0_gate.rail): a chunk of K rows
+-- through this engine is bit-identical to K sequential single-row steps,
+-- caches included. So:
+--   1. propose K draft tokens from an n-gram dictionary built over the
+--      context (no draft model, no training, no second set of weights);
+--   2. feed [last_committed, d1..dK-1] as ONE chunk -- the chunk's K
+--      argmaxes are exactly what K greedy steps would have produced;
+--   3. accept drafts while argmax[i] == draft[i+1], stopping at the first
+--      miss; the argmax at the miss is itself a correct greedy token, so
+--      it commits too.
+-- Every accepted token is a token plain greedy decoding would emit, in
+-- the same order. The only thing that varies is how many forward passes
+-- it took -- and the ledger can record that honestly without it ever
+-- being a claim about the content.
+--
+-- The dictionary: for each position i in the context, map ids[i] ->
+-- ids[i+1..i+K-1] (last occurrence wins). Output that resembles the input
+-- is where this pays -- the book's case for n-grams over draft models.
+-- It covers the WHOLE context and keeps learning during generation: a
+-- prompt-only dictionary proposes nothing once the model leaves the
+-- prompt's vocabulary (measured: 0 drafts accepted over 40 tokens), and
+-- everything a decoder repeats -- its own phrasing above all -- is
+-- exactly what a live dictionary catches.
+--
+-- Usage: ./rail_native run tools/gpt/ng0_spec.rail [--max N] [--k K]
+--   Runs the SAME generation twice (spec off, spec on) and compares.
+--   Prints tokens, forward passes, and the acceptance rate.
+import "stdlib/tensor.rail"
+import "stdlib/sha256.rail"
+import "tools/infer/f9_engine.rail"
+
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if head xs == key then (if length (tail xs) > 0 then head (tail xs) else "")
+  else argv_get_loop (tail xs) key
+argv_get argv key dflt =
+  let v = argv_get_loop argv key
+  if length (chars v) == 0 then dflt else v
+
+-- ── the n-gram dictionary ──
+-- flat int arr: slot id*8 + 0 = valid, +1..+7 = the following ids.
+-- Last occurrence wins, so the most recent continuation is proposed.
+dict_new dummy = arr_new 131072 0
+dict_add d ids n i kmax =
+  if i >= n - 1 then 0
+  else
+    let base = (arr_get ids i) * 8
+    let _ = arr_set d base 1
+    let _ = dict_fill d base ids n (i + 1) 1 kmax
+    dict_add d ids n (i + 1) kmax
+dict_fill d base ids n j slot kmax =
+  if slot >= kmax then 0
+  else if j >= n then 0
+  else
+    let _ = arr_set d (base + slot) (arr_get ids j)
+    dict_fill d base ids n (j + 1) (slot + 1) kmax
+-- drafts for `id`: [] when unseen
+dict_get d id kmax =
+  if arr_get d (id * 8) == 0 then []
+  else dict_collect d (id * 8) 1 kmax []
+dict_collect d base slot kmax acc =
+  if slot >= kmax then reverse acc
+  else
+    let v = arr_get d (base + slot)
+    dict_collect d base (slot + 1) kmax (cons v acc)
+
+-- ── plain greedy (spec off) ──
+plain_gen t k emb pos last_id p remaining acc passes =
+  if remaining <= 0 then (reverse acc, passes)
+  else
+    let _ = cb_feed t k emb pos (cons last_id []) p 1
+    let am = arr_new 1 0
+    let _ = cb_heads t k 1 am
+    let nid = arr_get am 0
+    plain_gen t k emb pos nid (p + 1) (remaining - 1) (cons nid acc) (passes + 1)
+
+-- ── speculative greedy (spec on) ──
+-- Feed [last_id, drafts...] as one chunk of cnt rows. Chunk argmax[i] is
+-- the greedy token following row i, so:
+--   nid0 = am[0] always commits;
+--   draft[j] is accepted iff draft[j] == am[j] (the token the model
+--   itself would have produced at that position);
+--   the first miss's am[j] commits and the rest are dropped.
+spec_gen t k emb pos d last_id p remaining kmax acc passes accepted =
+  if remaining <= 0 then (reverse acc, passes, accepted)
+  else
+    let drafts = dict_get d last_id kmax
+    let room = if remaining - 1 < length drafts then remaining - 1 else length drafts
+    let dr = take_n drafts room []
+    let cnt = 1 + length dr
+    let _ = cb_feed t k emb pos (cons last_id dr) p cnt
+    let am = arr_new 8 0
+    let _ = cb_heads t k cnt am
+    let (committed, nacc) = spec_accept am dr 0 []
+    let ncomm = length committed
+    let newlast = last_of committed
+    -- keep learning: the tokens just committed, prefixed by the token
+    -- they followed, are new n-grams. Purely a proposal source -- a wrong
+    -- entry costs a rejected draft, never a wrong output.
+    let _ = dict_learn d (cons last_id committed) kmax
+    spec_gen t k emb pos d newlast (p + ncomm) (remaining - ncomm) kmax
+      (append_rev committed acc) (passes + 1) (accepted + nacc)
+
+-- add every (id -> following ids) pair from a token list
+dict_learn d xs kmax =
+  if length xs <= 1 then 0
+  else
+    let base = (head xs) * 8
+    let _ = arr_set d base 1
+    let _ = dict_learn_fill d base (tail xs) 1 kmax
+    dict_learn d (tail xs) kmax
+dict_learn_fill d base ys slot kmax =
+  if slot >= kmax then 0
+  else if length ys == 0 then 0
+  else
+    let _ = arr_set d (base + slot) (head ys)
+    dict_learn_fill d base (tail ys) (slot + 1) kmax
+
+-- walk the chunk's argmaxes against the drafts
+spec_accept am dr i acc =
+  let tok = arr_get am i
+  let acc2 = cons tok acc
+  if length dr == 0 then (reverse acc2, i)
+  else if head dr == tok then spec_accept am (tail dr) (i + 1) acc2
+  else (reverse acc2, i)
+
+take_n xs n acc = if n <= 0 then reverse acc else if length xs == 0 then reverse acc
+  else take_n (tail xs) (n - 1) (cons (head xs) acc)
+last_of xs = head (reverse xs)
+append_rev xs acc = if length xs == 0 then acc else append_rev (tail xs) (cons (head xs) acc)
+
+ids_csv ids = join "," (map show_one ids)
+show_one i = show i
+eq_lists a b =
+  if length a == 0 then (if length b == 0 then 1 else 0)
+  else if length b == 0 then 0
+  else if head a == head b then eq_lists (tail a) (tail b)
+  else 0
+
+-- prompt: a repetitive, code-like id pattern -- the regime the book says
+-- n-grams win (output resembling input). Deterministic, no file needed.
+-- --pattern picks the input regime. "cycle6" = a 6-token cycle;
+-- "const" = one repeated token; "pair" = a 2-token alternation. The
+-- regime decides whether n-grams pay: acceptance is a property of the
+-- INPUT, never of correctness.
+mk_prompt ids n i =
+  let mode = argv_get args "--pattern" "cycle6"
+  mk_prompt_go ids n i mode
+mk_prompt_go ids n i mode =
+  if i >= n then 0
+  else
+    let v = if mode == "const" then 88
+            else if mode == "pair" then (if (i % 2) == 0 then 88 else 1201)
+            else if (i % 6) == 0 then 1201 else if (i % 6) == 1 then 88
+            else if (i % 6) == 2 then 4004 else if (i % 6) == 3 then 88
+            else if (i % 6) == 4 then 1201 else 512
+    let _ = arr_set ids i v
+    mk_prompt_go ids n (i + 1) mode
+ids_list ids n i acc = if i >= n then reverse acc else ids_list ids n (i + 1) (cons (arr_get ids i) acc)
+
+feed_prompt t k emb pos idl p =
+  if length idl == 0 then 0
+  else
+    let _ = cb_feed t k emb pos (cons (head idl) []) p 1
+    feed_prompt t k emb pos (tail idl) (p + 1)
+
+main =
+  let max_gen = parse_int (argv_get args "--max" "40")
+  let kmax = parse_int (argv_get args "--k" "6")
+  let plen = 32
+  let k = f9_kernels 0
+  let _ = print "18 kernels compiled"
+
+  let tA = arr_new 460 0
+  let ep = f9_load "/tmp/b75/b9full_init.safetensors" tA
+  let emb = head ep
+  let pos = head (tail ep)
+  let _ = inc_alloc tA 0
+  let tB = arr_new 460 0
+  let _ = copy_params tA tB 0
+  let _ = inc_alloc tB 0
+  let _ = print "138M loaded; two buffer sets (spec-off / spec-on)"
+
+  let pids = arr_new plen 0
+  let _ = mk_prompt pids plen 0
+  let pl = ids_list pids plen 0 []
+
+  -- dictionary over the prompt only (what a server has at prefill time)
+  let d = dict_new 0
+  let _ = dict_add d pids plen 0 kmax
+
+  -- spec OFF
+  let _ = feed_prompt tA k emb pos (init_of pl) 0
+  let _ = cb_feed tA k emb pos (cons (last_of pl) []) (plen - 1) 1
+  let am0 = arr_new 1 0
+  let _ = cb_heads tA k 1 am0
+  let first0 = arr_get am0 0
+  let (rest0, passes0) = plain_gen tA k emb pos first0 plen (max_gen - 1) [] 1
+  let out0 = cons first0 rest0
+
+  -- spec ON
+  let _ = feed_prompt tB k emb pos (init_of pl) 0
+  let _ = cb_feed tB k emb pos (cons (last_of pl) []) (plen - 1) 1
+  let am1 = arr_new 1 0
+  let _ = cb_heads tB k 1 am1
+  let first1 = arr_get am1 0
+  let (rest1, passes1, accepted) = spec_gen tB k emb pos d first1 plen (max_gen - 1) kmax [] 1 0
+  let out1 = cons first1 rest1
+
+  let n0 = length out0
+  let n1 = length out1
+  let speedup10 = if passes1 > 0 then (passes0 * 10) / passes1 else 0
+  let _ = print (cat ["spec OFF: ", show n0, " tokens in ", show passes0, " forward passes"])
+  let _ = print (cat ["spec ON : ", show n1, " tokens in ", show passes1, " forward passes (",
+                      show accepted, " drafts accepted), speedup x",
+                      show (speedup10 / 10), ".", show (speedup10 % 10)])
+  let _ = print (cat ["OFF ids: ", ids_csv out0])
+  let _ = print (cat ["ON  ids: ", ids_csv out1])
+  let same = eq_lists (take_n out0 n1 []) (take_n out1 n0 [])
+  if same == 1 then
+    let _ = print "PASS: speculation changed the schedule, not the output"
+    0
+  else
+    let _ = print "FAIL: speculative output differs from plain greedy"
+    1
+
+init_of xs = reverse (tail (reverse xs))
+copy_params tA tB i = if i >= 203 then 0 else
+  let _ = arr_set tB i (arr_get tA i) in copy_params tA tB (i + 1)

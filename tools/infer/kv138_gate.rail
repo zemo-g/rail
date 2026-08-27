@@ -1,0 +1,155 @@
+-- fgpt_kv138.rail — BS0 gate: KV-cache incremental decode for the REAL
+-- 138M model, bit-identical to the B9 full-sequence forward.
+--
+-- The engine (kernels, loaders, incremental path) lives in f9_engine.rail
+-- and is shared with the server and NG0; this file holds the reference
+-- full-sequence path and the comparison. Full argument + result history in
+-- the BS0 commit (1969d42): row GEMMs via 8-row padding on the same
+-- simdgroup fgemm; incremental attention keeps the full kernels'
+-- per-element fma order; masked-tail denormals sit below half-ulp. Gate:
+-- max|X16_full - X16_inc| == 0.0 over 98304 values, last-row logits
+-- bitwise equal, argmax equal, FBUF hash cross-device (M4P == M1U
+-- 92f66837d5a34199 on 2026-08-27).
+--
+-- Weights: /tmp/b75/b9full_init.safetensors (rebuild:
+-- tools/gpt/optimizer/bonsai/b10_init.py <pool-ckpt>).
+-- Run: ./rail_native run tools/gpt/fgpt_kv138.rail
+import "stdlib/tensor.rail"
+import "stdlib/sha256.rail"
+import "tools/infer/f9_engine.rail"
+
+-- ── deterministic gate input: fixed patterned token ids ──
+mk_ids ids i = if i >= 128 then 0 else let _ = arr_set ids i ((i * 613 + 29) % 16384) in mk_ids ids (i + 1)
+mk_x emb pos ids xa r j =
+  if r >= 128 then 0
+  else if j >= 768 then mk_x emb pos ids xa (r + 1) 0
+  else
+    let _ = float_arr_set xa (r * 768 + j) ((float_arr_get emb ((arr_get ids r) * 768 + j)) +. (float_arr_get pos (r * 768 + j))) in
+    mk_x emb pos ids xa r (j + 1)
+
+-- ── reference: fgpt_train9f block_fwd with shared scratch (fwd only) ──
+-- ref slots: 300+li = Xin(li) [316 = X16]; scratch 330..355
+ref_block t k li =
+  let pb = li * 12 in
+  let _ = tgl_flnf_r (arr_get k 1) (arr_get t (300 + li)) (arr_get t (pb + 6)) (arr_get t (pb + 7)) (arr_get t 330) (arr_get t 331) (arr_get t 332) 128 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 331) (arr_get t (pb + 0)) (arr_get t 333) 128 768 768 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 331) (arr_get t (pb + 1)) (arr_get t 334) 128 768 768 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 331) (arr_get t (pb + 2)) (arr_get t 335) 128 768 768 in
+  let _ = tgl_f2_r (arr_get k 5) (arr_get t 333) (arr_get t 334) (arr_get t 336) 196608 in
+  let _ = tgl_f1_r (arr_get k 3) (arr_get t 336) (arr_get t 337) 1536 in
+  let _ = tgl_f2_r (arr_get k 6) (arr_get t 337) (arr_get t 335) (arr_get t 338) 98304 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 338) (arr_get t (pb + 3)) (arr_get t 339) 128 768 768 in
+  let _ = tgl_f2_r (arr_get k 4) (arr_get t (300 + li)) (arr_get t 339) (arr_get t 350) 98304 in
+  let _ = tgl_flnf_r (arr_get k 1) (arr_get t 350) (arr_get t (pb + 8)) (arr_get t (pb + 9)) (arr_get t 330) (arr_get t 351) (arr_get t 332) 128 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 351) (arr_get t (pb + 4)) (arr_get t 352) 128 768 3072 in
+  let _ = tgl_f2_r (arr_get k 7) (arr_get t 352) (arr_get t (pb + 10)) (arr_get t 352) 393216 in
+  let _ = tgl_f1_r (arr_get k 2) (arr_get t 352) (arr_get t 353) 393216 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 353) (arr_get t (pb + 5)) (arr_get t 339) 128 3072 768 in
+  let _ = tgl_f2_r (arr_get k 8) (arr_get t 339) (arr_get t (pb + 11)) (arr_get t 339) 98304 in
+  let _ = tgl_f2_r (arr_get k 4) (arr_get t 350) (arr_get t 339) (arr_get t (300 + li + 1)) 98304 in
+  0
+ref_all t k li = if li >= 16 then 0 else let _ = ref_block t k li in ref_all t k (li + 1)
+
+ref_alloc_x t li = if li > 16 then 0 else
+  let _ = alloc_at t (300 + li) 98304 in ref_alloc_x t (li + 1)
+
+ref_alloc t dummy =
+  let _ = ref_alloc_x t 0
+  let _ = alloc_at t 330 98304
+  let _ = alloc_at t 331 98304
+  let _ = alloc_at t 332 128
+  let _ = alloc_at t 333 98304
+  let _ = alloc_at t 334 98304
+  let _ = alloc_at t 335 98304
+  let _ = alloc_at t 336 196608
+  let _ = alloc_at t 337 196608
+  let _ = alloc_at t 338 98304
+  let _ = alloc_at t 339 98304
+  let _ = alloc_at t 350 98304
+  let _ = alloc_at t 351 98304
+  let _ = alloc_at t 352 393216
+  let _ = alloc_at t 353 393216
+  let _ = alloc_at t 355 2097152
+  0
+
+inc_steps t k emb pos ids incx p =
+  if p >= 128 then 0
+  else
+    let xr = float_arr_new 768 0.0
+    let _ = mk_xrow emb pos (arr_get ids p) p xr 0
+    let _ = tgl_fabuf_upload (arr_get t 418) xr 768
+    let _ = tgl_f1_r (arr_get k 13) (arr_get t 418) (arr_get t 400) 768
+    let la = float_arr_new 1 0.0
+    let _ = float_arr_set la 0 (int_to_float p)
+    let _ = tgl_fabuf_upload (arr_get t 417) la 1
+    let _ = inc_all t k 0
+    let ob = float_arr_new 768 0.0
+    let _ = tgl_fabuf_download (arr_get t 400) ob 768
+    let _ = write_row ob incx p 0
+    inc_steps t k emb pos ids incx (p + 1)
+
+slice16k src dst j = if j >= 16384 then 0 else
+  let _ = float_arr_set dst j (float_arr_get src (2080768 + j)) in slice16k src dst (j + 1)
+
+main =
+  let k = f9_kernels 0
+  let _ = print "14 kernels compiled"
+  let t = arr_new 460 0
+  let ep = f9_load "/tmp/b75/b9full_init.safetensors" t
+  let emb = head ep
+  let pos = head (tail ep)
+  let _ = print "138M loaded: 16 blocks + lnf + head + emb + pos"
+
+  let _ = ref_alloc t 0
+  let _ = inc_alloc t 0
+
+  let ids = arr_new 128 0
+  let _ = mk_ids ids 0
+
+  -- reference full forward
+  let xa = float_arr_new 98304 0.0
+  let _ = mk_x emb pos ids xa 0 0
+  let _ = tgl_fabuf_upload (arr_get t 300) xa 98304
+  let _ = ref_all t k 0
+  let refx = float_arr_new 98304 0.0
+  let _ = tgl_fabuf_download (arr_get t 316) refx 98304
+  let _ = tgl_flnf_r (arr_get k 1) (arr_get t 316) (arr_get t 200) (arr_get t 201) (arr_get t 330) (arr_get t 331) (arr_get t 332) 128
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 331) (arr_get t 202) (arr_get t 355) 128 768 16384
+  let reflg = float_arr_new 2097152 0.0
+  let _ = tgl_fabuf_download (arr_get t 355) reflg 2097152
+  let _ = print "reference forward done"
+
+  -- incremental: 128 steps through the caches
+  let incx = float_arr_new 98304 0.0
+  let _ = inc_steps t k emb pos ids incx 0
+  let _ = print "incremental decode done (128 positions)"
+
+  -- final-row lnf + head on the incremental last hidden
+  let _ = tgl_flnf_r (arr_get k 1) (arr_get t 400) (arr_get t 200) (arr_get t 201) (arr_get t 401) (arr_get t 402) (arr_get t 403) 1
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 402) (arr_get t 202) (arr_get t 430) 8 768 16384
+  let inclg = float_arr_new 16384 0.0
+  let _ = tgl_fabuf_download (arr_get t 430) inclg 16384
+
+  -- compare
+  let m1 = float_arr_new 1 0.0
+  let _ = cmp_all refx incx 98304 m1 0
+  let hInc = tgl_fabuf_alloc 98304
+  let _ = tgl_fabuf_upload hInc incx 98304
+  let _ = print "incremental X16 hash:"
+  let _ = tgl_fabuf_hashprint hInc 98304
+  let lastrow = float_arr_new 16384 0.0
+  let _ = slice16k reflg lastrow 0
+  let m2 = float_arr_new 1 0.0
+  let _ = cmp_all lastrow inclg 16384 m2 0
+  let am_ref = fargmax reflg 2080768 16384 0 (0.0 -. 1000000000000.0) 0
+  let am_inc = fargmax inclg 0 16384 0 (0.0 -. 1000000000000.0) 0
+  let d1 = float_arr_get m1 0
+  let d2 = float_arr_get m2 0
+  let _ = print (cat ["max |X16_full - X16_inc| over 98304: ", show_float d1])
+  let _ = print (cat ["max |logits_full - logits_inc| last row: ", show_float d2])
+  let _ = print (cat ["argmax full=", show am_ref, " inc=", show am_inc])
+  if am_ref == am_inc then
+    if 0.0 <. d1 then let _ = print "FAIL: hidden states diverge" in 1
+    else if 0.0 <. d2 then let _ = print "FAIL: logits diverge" in 1
+    else let _ = print "PASS" in 0
+  else let _ = print "FAIL: argmax mismatch" in 1
