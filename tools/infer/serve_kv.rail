@@ -209,6 +209,78 @@ srv_gen_loop mdl blocks caches last_id pos remaining acc =
     let nid = srv_argmax probs
     srv_gen_loop mdl blocks caches nid (pos + 1) (remaining - 1) (cons nid acc)
 
+-- ── S1: streaming generation ──────────────────────────────────────────
+-- POST /generate_stream sends headers, then each token's text the moment
+-- it exists, then closes -- close-delimited streaming, no chunked encoder
+-- needed, curl -N sees tokens live. The body is the RAW text (no JSON):
+-- streaming changes the transport, never the bytes, so sha256(stream) ==
+-- the output_sha256 that /generate reports for the same request, and the
+-- ledger record is identical in shape. Metadata lives in the ledger, not
+-- a trailer.
+stream_headers _ =
+  "HTTP/1.1 200 OK\nContent-Type: text/plain; charset=utf-8\nConnection: close\n\n"
+
+-- st = [mdl, blocks, vocab, ledger_path]; coll = int arr collecting ids
+srv_stream_loop cfd st caches last_id pos remaining coll =
+  if remaining <= 0 then 0
+  else
+    let mdl = list_nth 0 st
+    let blocks = list_nth 1 st
+    let vocab = list_nth 2 st
+    let probs = srv_step mdl blocks caches last_id pos
+    let nid = srv_argmax probs
+    -- cat-wrap before send: the single-char strings id_char returns hit
+    -- the runtime-string -> foreign char* marshaling trap (send wrote the
+    -- right LENGTH but a header byte, 0x09, instead of the char). A cat
+    -- copy lands the data where the foreign call expects it.
+    let _ = send_all_tcp cfd (cat [id_char vocab nid, ""])
+    let n = arr_get coll 0
+    let _ = arr_set coll (n + 1) nid
+    let _ = arr_set coll 0 (n + 1)
+    srv_stream_loop cfd st caches nid (pos + 1) (remaining - 1) coll
+
+coll_to_text coll vocab i n acc =
+  if i > n then acc
+  else coll_to_text coll vocab (i + 1) n (cat [acc, id_char vocab (arr_get coll i)])
+
+-- returns new prev hash (or prev unchanged on a bad request)
+handle_stream cfd body st prev step max_cap =
+  let prompt = json_str_field body "prompt"
+  let want = json_int_field body "max" 32
+  let n_gen = if want > max_cap then max_cap else want
+  if length (chars prompt) == 0 then
+    let _ = send_all_tcp cfd (http_json 400 "{\"error\": \"prompt is required\"}")
+    prev
+  else
+    let mdl = list_nth 0 st
+    let blocks = list_nth 1 st
+    let vocab = list_nth 2 st
+    let ledger_path = list_nth 3 st
+    let prompt_ids = sanitize_loop (encode vocab prompt) []
+    if length prompt_ids == 0 then
+      let _ = send_all_tcp cfd (http_json 400 "{\"error\": \"prompt has no tokens in this model's vocabulary\"}")
+      prev
+    else
+      let d = head (reverse (tensor_shape (list_nth 0 mdl)))
+      let max_seq = length prompt_ids + n_gen + 1
+      let caches = kv_cache_new (length blocks) max_seq d
+      let _ = send_all_tcp cfd (stream_headers 0)
+      let last_probs = srv_feed_loop mdl blocks caches prompt_ids 0 0
+      let first_id = srv_argmax last_probs
+      let _ = send_all_tcp cfd (cat [id_char vocab first_id, ""])
+      let coll = arr_new (n_gen + 2) 0
+      let _ = arr_set coll 1 first_id
+      let _ = arr_set coll 0 1
+      let _ = srv_stream_loop cfd st caches first_id (length prompt_ids) (n_gen - 1) coll
+      let n_out = arr_get coll 0
+      let text = coll_to_text coll vocab 1 n_out ""
+      let canon = cat ["{\"step\":", show step, ",\"prompt_sha256\":\"", sha256_hex prompt,
+        "\",\"output_sha256\":\"", sha256_hex text, "\",\"isl\":", show (length prompt_ids),
+        ",\"osl\":", show n_out, ",\"prev\":\"", prev, "\"}"]
+      let rec_hash = sha256_hex canon
+      let _ = append_ledger ledger_path (cat ["{\"canon\":", canon, ",\"record_hash\":\"", rec_hash, "\"}\n"])
+      rec_hash
+
 -- ── the /generate handler ─────────────────────────────────────────────
 -- st = [mdl, blocks, vocab, ledger_path]; returns (resp, new_prev)
 handle_generate body st prev step max_cap =
@@ -316,8 +388,16 @@ serve_loop listen_fd st prev step genesis max_cap =
   else
     let req = recv_http_request cfd
     let (method, path, _hdrs, body) = parse_request req
-    let (resp, new_prev) = route method path body st prev step genesis max_cap
-    let _ = send_all_tcp cfd resp
+    -- streaming writes to the socket as tokens exist; everything else
+    -- builds a response and sends it whole
+    let new_prev =
+      if path == "/generate_stream" then
+        if method == "POST" then handle_stream cfd body st prev step max_cap
+        else let _ = send_all_tcp cfd (http_json 404 "{\"error\":\"POST only\"}") in prev
+      else
+        let (resp, np) = route method path body st prev step genesis max_cap
+        let _ = send_all_tcp cfd resp
+        np
     let _ = close_socket cfd
     let next_step = if new_prev == prev then step else step + 1
     serve_loop listen_fd st new_prev next_step genesis max_cap

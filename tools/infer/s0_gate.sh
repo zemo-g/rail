@@ -20,11 +20,18 @@ fails=0
 note() { echo "  $1"; }
 fail() { echo "  FAIL: $1"; fails=$((fails+1)); }
 
+# kill any orphan first: rail_native run execs the compiled binary as a
+# child, so killing the launcher pid alone leaves the actual server alive
+# and holding the port -- the next run then talks to STALE code. (Bit this
+# gate once: every check failed against a server from a previous run.)
+pkill -f "$OUT" 2>/dev/null
+sleep 1
+
 # compile + launch (own --out-prefix: concurrent rail runs race /tmp/rail_out)
 ./rail_native run tools/infer/serve_kv.rail --out-prefix "$OUT" \
   --port $PORT --ledger "$LEDGER" > "$LOG" 2>&1 &
 SRV=$!
-trap 'kill $SRV 2>/dev/null' EXIT
+trap 'kill $SRV 2>/dev/null; pkill -f "$OUT" 2>/dev/null' EXIT
 
 ready=""
 for _ in $(seq 1 60); do
@@ -74,9 +81,34 @@ PH2=$(echo "$R2" | sed -n 's/.*"prev_hash":"\([0-9a-f]*\)".*/\1/p')
 [ "$PH2" = "$RH1" ] && note "chain: response n+1 carries response n's record hash" \
   || fail "chain link mismatch in responses"
 
+# ── S1: streaming ──
+# the streamed raw bytes must hash to EXACTLY the output_sha256 that the
+# JSON endpoint reported for the same request -- streaming changes the
+# transport, never the bytes
+S1=$(curl -sm 60 -N -X POST "http://127.0.0.1:$PORT/generate_stream" -d "$REQ")
+SH=$(printf '%s' "$S1" | shasum -a 256 | cut -d' ' -f1)
+if [ "$SH" = "$H1" ]; then
+  note "stream: sha256(streamed bytes) == /generate's output_sha256"
+else
+  fail "stream hash $SH != generate hash $H1 (text: $S1)"
+fi
+S2=$(curl -sm 60 -N -X POST "http://127.0.0.1:$PORT/generate_stream" -d "$REQ")
+[ "$S1" = "$S2" ] && note "stream determinism: same request twice -> same stream" \
+  || fail "stream nondeterministic"
+# tokens arrive before the response completes (long generation, timing split)
+TW=$(curl -sm 120 -N -o /dev/null -w '%{time_starttransfer} %{time_total}' \
+  -X POST "http://127.0.0.1:$PORT/generate_stream" \
+  -d '{"prompt": "the rail language", "max": 200}')
+TS=$(echo "$TW" | cut -d' ' -f1); TT=$(echo "$TW" | cut -d' ' -f2)
+if awk -v a="$TS" -v b="$TT" 'BEGIN{exit !(a < b/2)}'; then
+  note "stream is live: first byte at ${TS}s of ${TT}s total"
+else
+  fail "stream not incremental: first byte ${TS}s vs total ${TT}s"
+fi
+
 V=$(curl -sm 10 "http://127.0.0.1:$PORT/ledger/verify")
-echo "$V" | grep -q '"ok":true' && echo "$V" | grep -q '"records":3' \
-  && note "ledger self-verifies: 3 records, chain intact" \
+echo "$V" | grep -q '"ok":true' && echo "$V" | grep -q '"records":6' \
+  && note "ledger self-verifies: 6 records (3 json + 3 streamed), chain intact" \
   || fail "ledger verify failed: $V"
 
 # a tampered ledger must FAIL verification
@@ -93,6 +125,6 @@ curl -sm 2 "http://127.0.0.1:$PORT/health" | grep -q '"ok":true' \
   && note "server survives a garbage request" \
   || fail "server died after garbage request"
 
-kill $SRV 2>/dev/null
+kill $SRV 2>/dev/null; pkill -f "$OUT" 2>/dev/null
 trap - EXIT
 if [ "$fails" -eq 0 ]; then echo "PASS"; exit 0; else echo "FAIL ($fails)"; exit 1; fi
