@@ -27,9 +27,12 @@ fail() { echo "  FAIL: $1"; fails=$((fails+1)); }
 pkill -f "$OUT" 2>/dev/null
 sleep 1
 
+# throwaway signing key for the head-endpoint check
+echo "s0-gate-test-key" > /tmp/s0_gate_key
+
 # compile + launch (own --out-prefix: concurrent rail runs race /tmp/rail_out)
 ./rail_native run tools/infer/serve_kv.rail --out-prefix "$OUT" \
-  --port $PORT --ledger "$LEDGER" > "$LOG" 2>&1 &
+  --port $PORT --ledger "$LEDGER" --key-seed /tmp/s0_gate_key > "$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; pkill -f "$OUT" 2>/dev/null' EXIT
 
@@ -136,6 +139,16 @@ V=$(curl -sm 10 "http://127.0.0.1:$PORT/ledger/verify")
 echo "$V" | grep -q '"ok":true' && echo "$V" | grep -q '"records":8' \
   && note "ledger self-verifies: 8 records, chain intact" \
   || fail "ledger verify failed: $V"
+
+# the Ed25519-signed head: server must self-verify its own signature
+# (verify:1 is checked by the server, not asserted), and the head must be
+# the last record hash issued
+HD=$(curl -sm 120 "http://127.0.0.1:$PORT/ledger/head")
+LAST=$(echo "$C2" | sed -n 's/.*"record_hash":"\([0-9a-f]*\)".*/\1/p')
+echo "$HD" | grep -q '"signed":true' && echo "$HD" | grep -q '"verify":1' \
+  && echo "$HD" | grep -q "\"head\":\"$LAST\"" \
+  && note "signed head: Ed25519 over the chain head, self-verified" \
+  || fail "head endpoint wrong: $HD (expected head $LAST)"
 
 # a tampered ledger must FAIL verification
 sed -i '' 's/"isl":[0-9]*/"isl":999/' "$LEDGER"
