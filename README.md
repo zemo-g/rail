@@ -347,7 +347,9 @@ time it fooled itself.
 
 ## License
 
-[Business Source License 1.1](LICENSE). Free for non-production use; the Additional Use Grant covers research, education, and personal projects. Converts to MIT on 2030-03-14.
+[Business Source License 1.1](LICENSE). You may use Rail in production, including commercially; the one carve-out is offering it to third parties on a hosted or embedded basis that competes with the Licensor's products. It converts to MIT on 2030-03-14.
+
+BSL rather than a permissive license from day one for a narrow reason: Rail is one person's research surface, and the only outcome worth guarding against is someone reselling it as a hosted service before it has established itself. Everything else, including commercial use inside your own product, is already granted. The MIT conversion date is fixed and unconditional, so the guard expires whether or not anyone is paying attention.
 
 ## Notes
 

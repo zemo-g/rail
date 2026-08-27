@@ -3,11 +3,13 @@
 A transformer inference engine where the same request produces the same
 bytes, on three different Apple GPUs, verified by tests that demand exact
 equality rather than closeness. Written in Rail, running on Metal, with no
-CUDA, no PyTorch, and no Python anywhere in the path.
+CUDA, no PyTorch, and no Python in the inference path.
 
-This directory is the whole thing: the engine, the kernels it emits, and
-the gates that check the claims. Everything below is reproducible from a
-clone of this repo plus your own model weights.
+This directory is the engine, the kernels it emits, the server, and the
+gates that check the claims. Two of those gates need nothing but a Mac and
+this clone. The rest are the same claims at production scale on a 138M
+model whose weights are not distributed, so treat their exact hashes as
+ours and the zeros as the thing that should reproduce for you.
 
 ## The claims, and what checks them
 
@@ -49,12 +51,27 @@ against plain greedy across three input regimes:
 
 | input regime | drafts accepted | forward passes | output |
 |---|---|---|---|
-| cycle6 | 0 | 40 of 40 | identical |
+| cycle6 (control) | 0 | 40 of 40 | identical |
 | const | 3 | 37 of 40 | identical |
 | pair | 20 | **20 of 40, 2.0x** | identical |
 
 Acceptance is a property of the input. Correctness is a property of the
 engine. That separation is the point.
+
+Read the table honestly: the `cycle6` row accepts nothing, so it runs one
+row per pass and is the same code path as plain greedy. It is a control,
+not a third independent test. `pair` is the row that actually exercises
+the claim, and `const` is a weak middle. One regime doing real work is
+what this table shows.
+
+**3b. The gates fail on a dead engine.** Max-difference alone cannot: an
+all-NaN run leaves every running max at 0.0, because IEEE says every
+comparison with NaN is false, and an all-zero run agrees perfectly while
+proving nothing. Both were live holes until an outside review found them
+on 2026-08-27. Every parity gate now counts finite nonzero values first
+and fails if the tensor is mostly dead. Verified by removing the weights
+file: the gate that used to report `max diff 0.0, argmax 0 == 0, PASS`
+now reports `hidden 0/98304 live` and fails.
 
 **4. All of it holds across three chips and three OS versions.**
 
@@ -94,12 +111,21 @@ correctly rounded. `rsqrt_probe.rail` measures the gap:
 differing elements: 1161 of 4096; max |rsqrt - 1/sqrt| = 4.76837158203125e-07
 ```
 
-About an ulp, on 28% of values. Interestingly, both forms are byte-identical
-across all three machines, so this was never a portability problem in
-practice: Apple ships the same approximation across generations. It is
-still replaced with `1.0f/sqrt(x)`, because sqrt and divide are
+About an ulp, on 28% of values. Both forms are nonetheless byte-identical
+across all three machines: Apple ships the same approximation across
+generations, so portability was never actually at risk. It is still
+replaced with `1.0f/sqrt(x)`, because sqrt and divide are
 IEEE-exact-required, which turns an empirical agreement into a
 specification-backed one for the price of one ulp of speed.
+
+The probe exists because the Studio briefly appeared to disagree with the
+other two machines, which would have killed the central claim. It had
+not: it was running a stale copy of the gate, and the check meant to
+catch that compared the wrong file. Worth stating plainly, because it is
+the strongest argument for binding the compiled kernel source hash, the
+OS build, and the Metal compiler version into any receipt. A stale binary
+should be detectable rather than silently authoritative, and right now
+that binding does not exist.
 
 ## What this is not
 
@@ -148,7 +174,14 @@ why speculative decoding occasionally flips a greedy token elsewhere.
 Requires a Mac with Apple Silicon and Xcode command line tools. The dylib
 builds automatically on first compile.
 
+**Start here if you have no model weights.** `kv0_gate.rail` proves the
+same incremental-equals-full property on a small patterned model with no
+files and no downloads, and `rsqrt_probe.rail` needs nothing either. The
+138M gates below are the same claims at production scale, on weights that
+are not distributed.
+
 ```bash
+./rail_native run tools/infer/kv0_gate.rail             # no weights needed
 ./rail_native run tools/infer/rsqrt_probe.rail          # no weights needed
 ./rail_native run tools/infer/kv138_gate.rail           # needs weights
 ./rail_native run tools/infer/ng0_keystone_gate.rail    # needs weights
@@ -176,6 +209,10 @@ each gate, and by the server in the companion work.
 | `ng0_keystone_gate.rail` | chunk of K equals K sequential steps, caches included |
 | `ng0_spec.rail` | n-gram speculative decoding, and the proof it changes nothing |
 | `rsqrt_probe.rail` | measures rsqrt against 1/sqrt, and both across machines |
+| `kv0_gate.rail` | the same parity claim with **no weights required**: start here |
+| `serve_kv.rail` | the serving loop: same request bytes give same response bytes, hash-chained ledger, signed head, live token streaming, prefix cache as a declared input |
+| `s0_gate.sh` | 15 checks on the running server, including that a tampered ledger fails verification |
+| `agree_check.sh` | sends one request to two machines and compares hashes: disagreement is an alarm |
 
 Built 2026-08-27. Rail is a self-hosting language: the compiler is written
 in Rail and compiles itself, with no C dependencies.
