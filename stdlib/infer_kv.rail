@@ -1,0 +1,219 @@
+-- stdlib/infer_kv.rail — KV-cache incremental decode for the v3 CPU
+-- reference path (RMSNorm + RoPE + SwiGLU, single-head attention).
+--
+-- KV0, 2026-08-27. The existing generate paths re-run the FULL prefix
+-- forward for every produced token (tools/train/lm_infer_cpu.rail
+-- gen_loop) -- O(n^2) generation. This module adds the incremental step:
+-- one new token's row flows through each block while K and V rows for
+-- every previous position come from a cache, so generation is O(n).
+--
+-- THE CONTRACT IS BIT-PARITY, not approximation: every loop here matches
+-- the accumulation order of the corresponding stdlib/tensor.rail CPU loop
+-- (matmul_k ascending-k scalar accumulator; softmax_row max/exp/normalize
+-- ascending), so a token stream generated through this module is
+-- byte-identical to the full re-forward path. tools/infer/kv0_gate.rail
+-- enforces this against the same weights, every step, every probability.
+-- Why bit-parity is achievable: row p of any layer depends only on rows
+-- 0..p (causality), the mask's -1e9 entries underflow to exactly +0.0
+-- under exp(x - max), and +0.0 contributions are additive identities --
+-- so omitting them, in the same order, changes no bits.
+--
+-- Prereq: import "stdlib/transformer.rail" BEFORE this module (imports do
+-- not dedupe; transformer pulls tensor). CPU-only by construction: no
+-- dylib dispatch on any path in this file, which is what makes the
+-- determinism claim inspectable.
+--
+-- Cache layout: a flat list [k0, v0, k1, v1, ...] -- two float_arrs per
+-- block, each sized max_seq * d, filled row-by-row as positions arrive.
+-- Preallocate once, never reset mid-generation (the arena_reset-in-
+-- gen-loop corruption of 2026-04-30 is why: see lm_infer_cpu.rail:267).
+
+-- Force-CPU matmul, same shape as lm_infer_cpu's wrapper: bypasses the
+-- gpu_available gate so this module is deterministic regardless of
+-- dylib/.no_gpu state.
+kv_matmul_cpu a b = match a
+  | Tensor a_data a_shape a_strides -> match b
+    | Tensor b_data b_shape b_strides ->
+      let m_dim = head a_shape
+      let k_dim = head (tail a_shape)
+      let n_dim = head (tail b_shape)
+      let c = tensor_zeros (cons m_dim (cons n_dim []))
+      let acc = float_arr_new 1 0.0
+      match c
+        | Tensor c_data c_shape c_strides ->
+          let _ = matmul_i a_data b_data c_data acc m_dim n_dim k_dim 0
+          c
+
+-- Fresh cache list for n_blocks layers, positions up to max_seq, width d.
+kv_cache_build n_blocks max_seq d i acc =
+  if i >= n_blocks then reverse acc
+  else
+    let ck = float_arr_new (max_seq * d + 0) 0.0
+    let cv = float_arr_new (max_seq * d + 0) 0.0
+    kv_cache_build n_blocks max_seq d (i + 1) (cons cv (cons ck acc))
+
+kv_cache_new n_blocks max_seq d = kv_cache_build n_blocks max_seq d 0 []
+
+-- Copy one 1-row tensor's data into cache row `pos`.
+kv_row_store src dst pos d j =
+  if j >= d then 0
+  else
+    let _ = float_arr_set dst (pos * d + j) (float_arr_get src j)
+    kv_row_store src dst pos d (j + 1)
+
+-- score(j) = (q . K[j]) * scale -- dot ascending over d, one scalar
+-- accumulator, then a single scale multiply: matches matmul_k(q, K^T)
+-- followed by tensor_scale, bit for bit.
+kv_score_dot qd ck base d kk acc =
+  if kk >= d then 0
+  else
+    let qv = float_arr_get qd kk
+    let kv = float_arr_get ck (base + kk)
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur + qv * kv)
+    kv_score_dot qd ck base d (kk + 1) acc
+
+kv_scores_loop qd ck sd pos d scale j =
+  if j > pos then 0
+  else
+    let acc = float_arr_new 1 0.0
+    let _ = kv_score_dot qd ck (j * d) d 0 acc
+    let _ = float_arr_set sd j ((float_arr_get acc 0) * scale)
+    kv_scores_loop qd ck sd pos d scale (j + 1)
+
+-- ctx[c] = sum_j probs[j] * V[j][c], j ascending -- matmul_k order for
+-- attn @ V restricted to the causal window.
+kv_ctx_dot pd cv pos d c j acc =
+  if j > pos then 0
+  else
+    let av = float_arr_get pd j
+    let vv = float_arr_get cv (j * d + c)
+    let cur = float_arr_get acc 0
+    let _ = float_arr_set acc 0 (cur + av * vv)
+    kv_ctx_dot pd cv pos d c (j + 1) acc
+
+kv_ctx_loop pd cv ctxd pos d c =
+  if c >= d then 0
+  else
+    let acc = float_arr_new 1 0.0
+    let _ = kv_ctx_dot pd cv pos d c 0 acc
+    let _ = float_arr_set ctxd c (float_arr_get acc 0)
+    kv_ctx_loop pd cv ctxd pos d (c + 1)
+
+-- One attention step: q row (already RoPE'd) against cache rows 0..pos.
+-- Returns the context row as a float_arr of width d. softmax_row is the
+-- stdlib CPU softmax -- same max-subtract, same order.
+kv_attention_step qd ck cv pos d scale =
+  let sd = float_arr_new (pos + 1) 0.0
+  let _ = kv_scores_loop qd ck sd pos d scale 0
+  let pdst = float_arr_new (pos + 1) 0.0
+  let _ = softmax_row sd pdst (pos + 1) 0
+  let ctxd = float_arr_new (d + 0) 0.0
+  let _ = kv_ctx_loop pdst cv ctxd pos d 0
+  ctxd
+
+-- Force-CPU elementwise add (tensor_add would GPU-dispatch through f32
+-- when the dylib is present -- a silent precision change; add_loop is
+-- tensor.rail's own CPU fallback).
+kv_add_cpu a b = match a
+  | Tensor a_data a_shape a_st -> match b
+    | Tensor b_data b_shape b_st ->
+      let n = list_product a_shape
+      let cd = float_arr_new (n + 0) 0.0
+      let _ = add_loop a_data b_data cd n 0
+      Tensor cd a_shape a_st
+
+-- Elementwise product of two 1-row tensors (SwiGLU gate * up).
+kv_had_loop ad bd cd n i =
+  if i >= n then 0
+  else
+    let a = float_arr_get ad i
+    let b = float_arr_get bd i
+    let _ = float_arr_set cd i (a * b)
+    kv_had_loop ad bd cd n (i + 1)
+
+kv_hadamard a b = match a
+  | Tensor ad a_shape _ -> match b
+    | Tensor bd _ _ ->
+      let n = list_product a_shape
+      let cd = float_arr_new n 0.0
+      let _ = kv_had_loop ad bd cd n 0
+      Tensor cd a_shape (compute_strides a_shape)
+
+-- One block, one new position. x_row is [1,d]; ck/cv are this block's
+-- cache arrays; pos is the new token's absolute position. Mirrors
+-- lm_infer_cpu.rail infer_block_fwd stage for stage; RoPE reuses
+-- rope_row_pairs directly with the explicit position.
+kv_block_step x_row w_block ck cv pos d =
+  let w_q = list_nth 0 w_block
+  let w_k = list_nth 1 w_block
+  let w_v = list_nth 2 w_block
+  let w_o = list_nth 3 w_block
+  let w_gate = list_nth 4 w_block
+  let w_up = list_nth 5 w_block
+  let w_down = list_nth 6 w_block
+  let g1 = list_nth 7 w_block
+  let g2 = list_nth 8 w_block
+
+  let pack1 = rmsnorm_save x_row g1
+  let ln1 = head pack1
+
+  let q = kv_matmul_cpu ln1 w_q
+  let k = kv_matmul_cpu ln1 w_k
+  let v = kv_matmul_cpu ln1 w_v
+  let qd = kv_unwrap q
+  let kd = kv_unwrap k
+  let vd = kv_unwrap v
+  let _ = rope_row_pairs qd 0 d pos 0 1.0
+  let _ = rope_row_pairs kd 0 d pos 0 1.0
+  let _ = kv_row_store kd ck pos d 0
+  let _ = kv_row_store vd cv pos d 0
+
+  let scale = 1.0 / sqrt (int_to_float d)
+  let ctxd = kv_attention_step qd ck cv pos d scale
+  let ctx_shape = cons 1 (cons d [])
+  let ctx = Tensor ctxd ctx_shape (compute_strides ctx_shape)
+  let attn_out = kv_matmul_cpu ctx w_o
+  let x_attn = kv_add_cpu x_row attn_out
+
+  let pack2 = rmsnorm_save x_attn g2
+  let ln2 = head pack2
+
+  let h_gate = kv_matmul_cpu ln2 w_gate
+  let h_up = kv_matmul_cpu ln2 w_up
+  let silu_pack = silu_forward h_gate
+  let h_gate_silu = head silu_pack
+  let h_act = kv_hadamard h_gate_silu h_up
+  let h_out = kv_matmul_cpu h_act w_down
+  let x_out = kv_add_cpu x_attn h_out
+  x_out
+
+kv_unwrap t = match t | Tensor d _ _ -> d
+
+kv_blocks_step_loop x blocks caches pos d i n =
+  if i >= n then x
+  else
+    let b_weights = list_nth i blocks
+    let ck = list_nth (2 * i) caches
+    let cv = list_nth (2 * i + 1) caches
+    let next_x = kv_block_step x b_weights ck cv pos d
+    kv_blocks_step_loop next_x blocks caches pos d (i + 1) n
+
+-- Full incremental forward for ONE token: one-hot row -> embed -> blocks
+-- (caches updated at `pos`) -> final RMSNorm -> logits -> probs row.
+-- we_t is tensor_transpose w_e, computed once by the caller. Returns the
+-- [1,V] probs tensor for the next-token decision. CPU softmax forced
+-- (softmax_row), matching the reference path's documented .no_gpu config.
+kv_forward_step x_row w_e we_t blocks caches gf pos d =
+  let x_embed = kv_matmul_cpu x_row w_e
+  let n_blocks = length blocks
+  let x_last = kv_blocks_step_loop x_embed blocks caches pos d 0 n_blocks
+  let packf = rmsnorm_save x_last gf
+  let x_final = head packf
+  let logits = kv_matmul_cpu x_final we_t
+  match logits
+    | Tensor ld l_shape l_st ->
+      let vw = head (tail l_shape)
+      let pd = float_arr_new (vw + 0) 0.0
+      let _ = softmax_row ld pd vw 0
+      Tensor pd l_shape l_st
