@@ -1,0 +1,308 @@
+-- tools/infer/rl0_gate.rail — where is this engine actually spending time?
+--
+-- Batch-1 autoregressive decode reads every weight once per token and does
+-- almost no arithmetic per byte read. That makes it memory-bound in theory.
+-- This measures whether it is memory-bound in FACT on this machine, and how
+-- much of the memory system it is actually getting.
+--
+-- The number that matters is not tokens per second. It is the fraction of
+-- achievable bandwidth reached, because that says what to do next: an
+-- engine at 15% of bandwidth should be fixed, an engine at 85% should be
+-- quantized, and you cannot tell which you have without measuring both
+-- terms. Optimizing the wrong one is the most expensive mistake available.
+--
+-- The ceiling is MEASURED, not quoted. A spec-sheet bandwidth figure is a
+-- marketing number for a memory system under ideal conditions that no real
+-- kernel meets; dividing by it flatters every engine equally. So the probe
+-- below streams a large buffer through a trivially coalesced kernel and
+-- reports what this chip, this OS, and this Metal compiler actually
+-- deliver. Comparing the engine to that is a comparison between two things
+-- measured the same way on the same day.
+--
+-- Two self-checks, because a benchmark that cannot report its own failure
+-- is decoration:
+--   * the bandwidth probe runs TWICE on identical input and must agree
+--     within 15%. A memory measurement that is not repeatable is not a
+--     measurement, and this is exactly the discipline that RSS-as-a-leak
+--     metric cost us before it was a rule.
+--   * efficiency above 100% is physically impossible, so it is treated as
+--     a failed measurement rather than a good result. A benchmark happy to
+--     print an impossible number would have been happy to print a wrong
+--     possible one.
+--
+-- Usage: ./rail_native run tools/infer/rl0_gate.rail [--steps N]
+import "stdlib/tensor.rail"
+import "tools/infer/f9_engine.rail"   -- brings compile_k, mk_xrow, abs_f and the
+                                      -- tgl_* foreigns; Rail does not dedup imports,
+                                      -- so redeclaring any of them is a duplicate
+                                      -- symbol error at assembly time, not a shadow.
+
+foreign tgl_now_ms x -> float
+
+parse_int s = parse_int_acc (chars s) 0
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = char_to_int (head cs) - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if head xs == key then (if length (tail xs) > 0 then head (tail xs) else "")
+  else argv_get_loop (tail xs) key
+argv_get argv key dflt =
+  let v = argv_get_loop argv key
+  if length (chars v) == 0 then dflt else v
+
+-- Each thread walks the buffer with a stride of the thread count, so
+-- neighbouring threads touch neighbouring addresses on every iteration.
+-- That is the access pattern the memory system is built for; anything less
+-- coalesced would measure the kernel, not the hardware. The sum is written
+-- out so the compiler cannot delete the loads it was asked to time.
+k_stream nelem nth = cat [
+  "#include <metal_stdlib>\nusing namespace metal;\n",
+  "#define N ", show nelem, "u\n#define T ", show nth, "u\n",
+  "kernel void bwr(device const float* X, device float* O, uint i [[thread_position_in_grid]]){\n",
+  "  float s = 0.0f;\n  for (uint j = i; j < N; j += T) { s += X[j]; }\n  O[i] = s;\n}\n"]
+
+-- Best of N, not one sample.
+--
+-- Achievable bandwidth is a MAXIMUM: contention, scheduling and thermal
+-- noise can only ever make a run slower, never faster. So the fastest of
+-- several trials is the best estimate of what the hardware can do, and
+-- averaging deliberately mixes in noise that has a known sign. Two
+-- single-shot samples spread 16.7% apart on 2026-08-28 and correctly
+-- failed the repeatability check; the fix is a better estimator, not a
+-- looser threshold. Repeatability is then checked between two INDEPENDENT
+-- batches, so the check still has something real to catch.
+-- Trials alternate between the two batches instead of running batch A
+-- fully before batch B. Sequential batches make any drift in machine load
+-- over the probe's lifetime look like disagreement between them, and this
+-- machine runs a GPU beacon at ~9fps plus whatever else, so that drift is
+-- real. Interleaving makes both batches sample the same time window, so
+-- the repeatability check measures the estimator rather than the weather.
+best_of2 kid hX hO nelem nth n a b =
+  if n <= 0 then cons a (cons b [])
+  else
+    let ga = stream_gbs kid hX hO nelem nth
+    let gb = stream_gbs kid hX hO nelem nth
+    best_of2 kid hX hO nelem nth (n - 1)
+      (if ga >. a then ga else a) (if gb >. b then gb else b)
+
+fill_ramp a n i =
+  if i >= n then 0
+  else
+    let _ = float_arr_set a i (int_to_float (i % 97))
+    fill_ramp a n (i + 1)
+
+-- One timed streaming pass. Downloading one float forces the queue to
+-- drain before the clock is read; without it the timer measures how fast
+-- Metal accepts work, which is fast and meaningless.
+stream_gbs kid hX hO nelem nth =
+  let t0 = tgl_now_ms 0
+  let _ = tgl_f1_r kid hX hO nth
+  let sink = float_arr_new 1 0.0
+  let _ = tgl_fabuf_download hO sink 1
+  let t1 = tgl_now_ms 0
+  let ms = t1 -. t0
+  let bytes = (int_to_float nelem) *. 4.0
+  if ms <=. 0.0 then 0.0 else (bytes /. (ms /. 1000.0)) /. 1000000000.0
+
+-- A dispatch that does no work worth naming. Timing many of these against
+-- one of them separates "the GPU is busy" from "we are paying a fixed cost
+-- per launch and there are hundreds of launches per token".
+k_noop dummy = cat [
+  "#include <metal_stdlib>\nusing namespace metal;\n",
+  "kernel void nop(device const float* X, device float* O, uint i [[thread_position_in_grid]]){O[i]=X[i];}\n"]
+
+nop_burst kid hX hO n i = if i >= n then 0 else let _ = tgl_f1_r kid hX hO 1 in nop_burst kid hX hO n (i + 1)
+
+-- n dispatches, ONE download at the end: exactly the shape inc_all uses.
+-- If the cost scales with n, each launch is being committed and waited on
+-- separately and the engine is launch-bound, not memory-bound.
+burst_ms kid hX hO n =
+  let t0 = tgl_now_ms 0
+  let _ = nop_burst kid hX hO n 0
+  let sink = float_arr_new 1 0.0
+  let _ = tgl_fabuf_download hO sink 1
+  let t1 = tgl_now_ms 0
+  t1 -. t0
+
+mk_ids ids n i = if i >= n then 0 else let _ = arr_set ids i ((i * 37) % 16000) in mk_ids ids n (i + 1)
+
+-- One decode step, exactly as kv138_gate drives it: build the row, upload,
+-- run all 16 blocks against the caches, download the result. The download
+-- is what makes the step synchronous, so timing N steps is honest.
+dstep t k emb pos ids p =
+  let xr = float_arr_new 768 0.0
+  let _ = mk_xrow emb pos (arr_get ids p) p xr 0
+  let _ = tgl_fabuf_upload (arr_get t 418) xr 768
+  let _ = tgl_f1_r (arr_get k 13) (arr_get t 418) (arr_get t 400) 768
+  let la = float_arr_new 1 0.0
+  let _ = float_arr_set la 0 (int_to_float p)
+  let _ = tgl_fabuf_upload (arr_get t 417) la 1
+  let _ = inc_all t k 0
+  let ob = float_arr_new 768 0.0
+  let _ = tgl_fabuf_download (arr_get t 400) ob 768
+  float_arr_get ob 0
+
+foreign tgl_batch_begin d -> int
+foreign tgl_batch_end d -> int
+
+-- The same step, submitted as ONE command buffer instead of 288.
+-- Uploads are memcpy into shared-storage buffers, so they are safe inside
+-- an open batch; the download must come after batch_end, which is where
+-- the single wait now happens.
+dstep_b t k emb pos ids p =
+  let xr = float_arr_new 768 0.0
+  let _ = mk_xrow emb pos (arr_get ids p) p xr 0
+  let _ = tgl_batch_begin 0
+  let _ = tgl_fabuf_upload (arr_get t 418) xr 768
+  let _ = tgl_f1_r (arr_get k 13) (arr_get t 418) (arr_get t 400) 768
+  let la = float_arr_new 1 0.0
+  let _ = float_arr_set la 0 (int_to_float p)
+  let _ = tgl_fabuf_upload (arr_get t 417) la 1
+  let _ = inc_all t k 0
+  let _ = tgl_batch_end 0
+  let ob = float_arr_new 768 0.0
+  let _ = tgl_fabuf_download (arr_get t 400) ob 768
+  float_arr_get ob 0
+
+dloop_b t k emb pos ids n p acc =
+  if p >= n then acc
+  else dloop_b t k emb pos ids n (p + 1) (acc +. (dstep_b t k emb pos ids p))
+
+dloop t k emb pos ids n p acc =
+  if p >= n then acc
+  else dloop t k emb pos ids n (p + 1) (acc +. (dstep t k emb pos ids p))
+
+main =
+  let steps = parse_int (argv_get args "--steps" "64")
+
+  -- ── 1. what this machine's memory system actually delivers ──
+  let nelem = 67108864          -- 256 MB of f32: far past any cache
+  let nth = 262144
+  let kid = compile_k (k_stream nelem nth)
+  let host = float_arr_new nelem 0.0
+  let _ = fill_ramp host nelem 0
+  let hX = tgl_fabuf_alloc nelem
+  let _ = tgl_fabuf_upload hX host nelem
+  let hO = tgl_fabuf_alloc nth
+  let _ = stream_gbs kid hX hO nelem nth        -- warm: first touch pays page-in
+  let bws = best_of2 kid hX hO nelem nth 8 0.0 0.0
+  let bw1 = head bws
+  let bw2 = head (tail bws)
+  let bw = if bw1 >. bw2 then bw1 else bw2
+  let spread = if bw <=. 0.0 then 1.0 else (abs_f (bw1 -. bw2)) /. bw
+  let _ = print (cat ["measured read bandwidth: ", show_float bw1, " and ", show_float bw2,
+                      " GB/s  (2 interleaved batches of 8; spread ", show_float (spread *. 100.0), "%)"])
+
+  -- ── 2. what the engine gets ──
+  let k = f9_kernels 0
+  let t = arr_new 460 0
+  let ep = f9_load "/tmp/b75/b9full_init.safetensors" t
+  let emb = head ep
+  let pos = head (tail ep)
+  let _ = inc_alloc t 0
+  let ids = arr_new 512 0
+  let _ = mk_ids ids 512 0
+  let _ = dstep t k emb pos ids 0                -- warm
+  let d0 = tgl_now_ms 0
+  let sum = dloop t k emb pos ids steps 0 0.0
+  let d1 = tgl_now_ms 0
+  let total_ms = d1 -. d0
+  let ms_tok = total_ms /. (int_to_float steps)
+  let tok_s = if ms_tok <=. 0.0 then 0.0 else 1000.0 /. ms_tok
+
+  -- ── 2a. the same decode, batched into one command buffer ──
+  -- Run second, from the same cache state, so the comparison is like for
+  -- like. The checksums must match EXACTLY: batching changes when the CPU
+  -- waits, never what the GPU computes, and a drifted checksum would mean
+  -- the change is not the no-op it claims to be.
+  let _ = inc_alloc t 0
+  let _ = dstep_b t k emb pos ids 0
+  let b0 = tgl_now_ms 0
+  let sumb = dloop_b t k emb pos ids steps 0 0.0
+  let b1 = tgl_now_ms 0
+  let ms_tok_b = (b1 -. b0) /. (int_to_float steps)
+  let tok_s_b = if ms_tok_b <=. 0.0 then 0.0 else 1000.0 /. ms_tok_b
+  let delta = abs_f (sumb -. sum)
+  let same = if delta >. 0.0 then "DIVERGED" else "IDENTICAL"
+
+  -- ── 2b. is it launch-bound? ──
+  let knop = compile_k (k_noop 0)
+  let nX = tgl_fabuf_alloc 64
+  let nO = tgl_fabuf_alloc 64
+  let _ = burst_ms knop nX nO 32                 -- warm
+  let one_ms = burst_ms knop nX nO 1
+  let many = 288                                 -- 18 dispatches x 16 blocks
+  let many_ms = burst_ms knop nX nO many
+  let per_disp = many_ms /. (int_to_float many)
+  let _ = print ""
+  let _ = print (cat ["1 empty dispatch       : ", show_float one_ms, " ms"])
+  let _ = print (cat [show many, " empty dispatches   : ", show_float many_ms, " ms = ",
+                      show_float per_disp, " ms each"])
+
+  -- ── 3. the roofline ──
+  -- Per token the 16 blocks read wq,wk,wv,wo (4 x 768x768) and w1,w2
+  -- (768x3072 twice) = 7,077,888 f32 each, 16 times over. Norms and the
+  -- KV cache are rounding error at this context length and are left out,
+  -- which makes the efficiency figure a slight UNDER-estimate: honest
+  -- direction for a number used to decide what to optimise.
+  let per_layer = 4 * 768 * 768 + 2 * 768 * 3072
+  let wbytes = (int_to_float (per_layer * 16)) *. 4.0
+  let gb_tok = wbytes /. 1000000000.0
+  let ach = if ms_tok <=. 0.0 then 0.0 else gb_tok /. (ms_tok /. 1000.0)
+  let eff = if bw <=. 0.0 then 0.0 else (ach /. bw) *. 100.0
+  let ceiling_tok_s = if gb_tok <=. 0.0 then 0.0 else bw /. gb_tok
+
+  let _ = print ""
+  let _ = print (cat ["weights read per token : ", show_float gb_tok, " GB (", show (per_layer * 16), " f32)"])
+  let _ = print (cat ["decode                 : ", show_float ms_tok, " ms/token = ",
+                      show_float tok_s, " tok/s   (", show steps, " steps, checksum ", show_float sum, ")"])
+  let _ = print (cat ["achieved bandwidth     : ", show_float ach, " GB/s"])
+  let _ = print (cat ["decode, batched        : ", show_float ms_tok_b, " ms/token = ",
+                      show_float tok_s_b, " tok/s   (", show_float (ms_tok /. ms_tok_b), "x faster)"])
+  let _ = print (cat ["batched checksum       : ", show_float sumb, "  vs unbatched ",
+                      show_float sum, "  -> ", same])
+  let _ = print (cat ["measured ceiling       : ", show_float bw, " GB/s = ",
+                      show_float ceiling_tok_s, " tok/s if perfectly memory-bound"])
+  let _ = print (cat ["EFFICIENCY             : ", show_float eff, "% of achievable bandwidth"])
+  let launch_ms = per_disp *. (int_to_float many)
+  let launch_share = if ms_tok <=. 0.0 then 0.0 else (launch_ms /. ms_tok) *. 100.0
+  let _ = print (cat ["launch overhead alone  : ", show_float launch_ms, " ms/token = ",
+                      show_float launch_share, "% of the decode step"])
+  let _ = print ""
+
+  -- ── 4. the gate ──
+  let bad_spread = spread >. 0.15
+  let bad_eff = eff >. 100.0
+  let dead = abs_f sum <=. 0.0
+  let drift = delta >. 0.0
+  let _ = if bad_spread
+          then print (cat ["FAIL  bandwidth probe not repeatable: ", show_float (spread *. 100.0),
+                           "% spread between two identical runs. An unrepeatable measurement is not a measurement."])
+          else print "ok    bandwidth probe repeatable across two identical runs"
+  let _ = if bad_eff
+          then print (cat ["FAIL  ", show_float eff, "% of achievable bandwidth is physically impossible; the measurement is wrong, not the engine fast."])
+          else print "ok    efficiency is physically possible"
+  let _ = if drift
+          then print "FAIL  batching CHANGED the output. It is meant to move only when the CPU waits, so this is a correctness bug, not a speedup."
+          else print "ok    batched output is bit-identical to unbatched"
+  let _ = if dead
+          then print "FAIL  decode checksum is zero: the engine produced nothing and the timing measures an empty loop."
+          else print "ok    decode produced live output (timing measures real work)"
+  let _ = print ""
+  let _ = print ""
+  let _ = if launch_share >. 50.0
+          then print (cat ["DIAGNOSIS: launch-bound. ", show_float launch_share,
+                           "% of each token is fixed per-dispatch cost across ", show many,
+                           " dispatches. Quantizing weights cuts bytes read, which is not what this engine is waiting on."])
+          else if eff >. 50.0
+          then print "DIAGNOSIS: memory-bound. Weight bytes per token is the lever; quantization pays here."
+          else print "DIAGNOSIS: neither launch-bound nor near the bandwidth roof. Profile before optimising anything."
+  let _ = print ""
+  let _ = if bad_spread then print "RESULT: FAIL" else if bad_eff then print "RESULT: FAIL" else if dead then print "RESULT: FAIL" else if drift then print "RESULT: FAIL" else
+            print (cat ["RESULT: PASS  -  engine reaches ", show_float eff, "% of measured bandwidth"])
+  0

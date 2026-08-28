@@ -2511,9 +2511,65 @@ long tgl_fabuf_digest(int h, int n){
     return (long)(hh & 0x3FFFFFFFFFFFFFFFULL);
 }
 #define FB(h) ((id<MTLBuffer>)g_fbufs[h])
+// ── batched submission ──────────────────────────────────────────────────
+//
+// Every f-kernel call below used to build its own command buffer, encode
+// one dispatch, commit, and waitUntilCompleted. That is one full CPU-GPU
+// round trip per dispatch. Batch-1 transformer decode issues 18 dispatches
+// per block across 16 blocks, so 288 round trips per token, and
+// tools/infer/rl0_gate.rail measured what that costs on 2026-08-28: 288
+// EMPTY dispatches took 24.7 ms while a real decode step took 36.1 ms.
+// Roughly 80% of every token was the submission boundary, and the engine
+// was running at ~6% of this machine's measured read bandwidth. It was
+// never memory-bound; it was waiting.
+//
+// Between tgl_batch_begin and tgl_batch_end, dispatches encode into one
+// shared command buffer and nothing commits or waits until the end. The
+// kernels, their arguments, and their order are untouched, so the numbers
+// cannot move: only when the CPU stops to listen changes. Determinism is
+// checked rather than assumed -- the parity gates must stay byte-identical
+// across this change, which is the whole reason they exist.
+//
+// The encoder is the default MTLDispatchTypeSerial, so Metal keeps
+// dispatches ordered and memory-coherent within the buffer exactly as
+// separate command buffers did. A concurrent encoder would need explicit
+// barriers and would not be a drop-in.
+//
+// Opt-in and re-entrant-safe: with no batch open, every call behaves
+// exactly as before, so existing callers are unaffected.
+static id<MTLCommandBuffer>        g_bcmd = nil;
+static id<MTLComputeCommandEncoder> g_benc = nil;
+static int g_batching = 0;
+
+int tgl_batch_begin(int dummy){
+    (void)dummy;
+    if (ensure_init() != 1) return -1;
+    if (g_batching) return 1;                 // nesting collapses to one batch
+    g_bcmd = [g_queue commandBuffer];
+    g_benc = [g_bcmd computeCommandEncoder];
+    if (!g_bcmd || !g_benc) { g_bcmd = nil; g_benc = nil; return -1; }
+    g_batching = 1;
+    return 1;
+}
+
+// Commits and blocks until the GPU is done, so results are readable after
+// this returns exactly as they were after each individual call before.
+int tgl_batch_end(int dummy){
+    (void)dummy;
+    if (!g_batching) return 1;
+    [g_benc endEncoding];
+    [g_bcmd commit];
+    [g_bcmd waitUntilCompleted];
+    int st = (g_bcmd.status == MTLCommandBufferStatusCompleted) ? 1 : -2;
+    g_benc = nil; g_bcmd = nil; g_batching = 0;
+    return st;
+}
+
 #define FSTART(kid) if(kid<0||!g_jit_pipes||kid>=(int)g_jit_pipes.count) return -1; if(!g_fbufs) return -1; if(ensure_init()!=1) return -1; \
-    id<MTLCommandBuffer> cmd=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> enc=[cmd computeCommandEncoder]; [enc setComputePipelineState:g_jit_pipes[kid]];
-#define FDONE [enc endEncoding];[cmd commit];[cmd waitUntilCompleted]; return (cmd.status==MTLCommandBufferStatusCompleted)?1:-2;
+    id<MTLCommandBuffer> cmd=nil; id<MTLComputeCommandEncoder> enc=nil; \
+    if(g_batching){ enc=g_benc; } else { cmd=[g_queue commandBuffer]; enc=[cmd computeCommandEncoder]; } \
+    [enc setComputePipelineState:g_jit_pipes[kid]];
+#define FDONE if(g_batching) return 1; [enc endEncoding];[cmd commit];[cmd waitUntilCompleted]; return (cmd.status==MTLCommandBufferStatusCompleted)?1:-2;
 
 int tgl_fgemm_r(int kid,int hA,int hB,int hC,int M,int K,int N){
     if(M%8||N%8||K%8) return -3;
