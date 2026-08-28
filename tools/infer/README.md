@@ -127,6 +127,72 @@ OS build, and the Metal compiler version into any receipt. A stale binary
 should be detectable rather than silently authoritative, and right now
 that binding does not exist.
 
+**5. It is fast enough to be worth timing, and the timing found the real
+bottleneck.** `rl0_gate.rail` measures two things, because throughput
+alone means nothing without a ceiling to read it against. The ceiling is
+measured on the spot with a coalesced streaming kernel rather than quoted
+from a spec sheet, since spec bandwidth describes ideal conditions no
+real kernel meets and flatters every engine equally.
+
+Batch-1 decode reads 0.45 GB of weights per token and should therefore be
+memory-bound. It was not. It reached about 6% of measured bandwidth, so
+the gate measured the other term and found 288 empty dispatches cost
+24-34 ms against a 36 ms decode step. Roughly nine tenths of every token
+was the submission boundary: each kernel call built its own command
+buffer, committed, and waited, and decode issues 18 dispatches per block
+across 16 blocks.
+
+`tgl_batch_begin`/`tgl_batch_end` encode the whole step into one command
+buffer and commit once. Nothing about the kernels, their arguments, or
+their order changes, so only the moment the CPU stops to listen moves.
+
+| | ms/token | tok/s | % of measured bandwidth |
+|---|---|---|---|
+| one command buffer per dispatch | 36.1 | 27.6 | 5.7% |
+| one command buffer per token | 7.5 | 132.9 | 27.1% |
+
+4.8x, with the decode checksum bit-identical and all three gates above
+unchanged. That is the point of having them: a speedup that moved a
+single bit would have been caught immediately.
+
+The gate also failed itself twice before it was trustworthy, reporting
+16.7% and then 20.6% spread between two supposedly identical bandwidth
+runs. Both were fixed by improving the estimator rather than relaxing the
+threshold: best-of-N, because contention can only slow a run and never
+speed one up, and the two batches interleaved rather than sequential,
+because this machine runs a GPU beacon at ~9fps and back-to-back batches
+turn drift in machine load into fake disagreement. Spread is now 0.7-2.2%.
+
+The remaining gap is honest and named: at 27% of bandwidth with launch
+cost removed, what is left is kernel efficiency at batch 1, small GEMMs
+and low occupancy. Weight quantization would cut bytes read per token,
+which is not the binding term yet.
+
+**6. The ids are language.** `tok0.rail` is the byte-level BPE tokenizer
+the 240M base run was trained with: 173 base bytes plus 15,404 merges,
+vocabulary 15,577. Every other gate here proves something about integers,
+which makes the claims checkable and the output unreadable. This is the
+bridge back.
+
+Encoding is deliberately the slow obvious algorithm, every merge applied
+in learn order as one left-to-right non-overlapping pass, because that is
+what `stdlib/bpe.rail` did when this vocabulary was trained. A faster
+encoder producing different ids would be worse than none: the model would
+receive tokens it never saw and every number downstream would look fine
+while measuring nothing.
+
+`tok0_gate.sh` checks it two independent ways. It compares Rail's ids
+against `bpe_replica.py`, the Python implementation the corpus pipeline
+used, over seven cases picked for what breaks byte-level BPE: multi-byte
+UTF-8, digits, deep runs, empty input. Skipping a single merge in the
+Rail encoder is caught by four of the seven. But that check is blind to
+its own input, since both sides read whatever files they are given:
+truncating the merges file by 100 lines left all seven still reporting
+ok. So the gate also verifies the merges against the run's recorded
+`tokenizer.sha256`, and pins the alphabet hash, which that recording
+never covered. The alphabet is half the tokenizer and changing one byte
+of it shifts every id while the recorded hash stays valid.
+
 ## What this is not
 
 Being precise about the size of the claim, because it is smaller than it
@@ -138,6 +204,12 @@ the same time you spent. That makes it a fraud-proof primitive: useful
 when a party who already has your model wants to check what you claimed,
 useless as a succinct proof to a stranger. zkML and TEE attestation give a
 verifier an asymptotic advantage. This does not.
+
+**The tokenizer is not a trained model's voice.** `tok0.rail` reproduces
+the 240M run's vocabulary exactly, but the weights the gates here run on
+are a 138M initialisation, not that trained model. Encoding text and
+decoding ids works; expecting the engine to answer in language does not,
+and would need the 240M checkpoint ported to this engine's shape.
 
 **Batch-1 is a choice, not a requirement.** This engine serves one request
 at a time, which makes the reduction shape constant for free. That is
@@ -186,6 +258,9 @@ are not distributed.
 ./rail_native run tools/infer/kv138_gate.rail           # needs weights
 ./rail_native run tools/infer/ng0_keystone_gate.rail    # needs weights
 ./rail_native run tools/infer/ng0_spec.rail --max 40 --pattern pair
+./rail_native run tools/infer/rl0_gate.rail             # needs weights
+./rail_native run tools/infer/tok0.rail --text FILE     # needs the tokenizer
+tools/infer/tok0_gate.sh                                # needs the tokenizer
 ```
 
 The weight-dependent gates read
@@ -213,6 +288,9 @@ each gate, and by the server in the companion work.
 | `serve_kv.rail` | the serving loop: same request bytes give same response bytes, hash-chained ledger, signed head, live token streaming, prefix cache as a declared input |
 | `s0_gate.sh` | 15 checks on the running server, including that a tampered ledger fails verification |
 | `agree_check.sh` | sends one request to two machines and compares hashes: disagreement is an alarm |
+| `rl0_gate.rail` | the roofline: measured bandwidth ceiling, launch overhead, batched vs unbatched, and checks on its own repeatability |
+| `tok0.rail` | the byte-level BPE tokenizer the 240M base run was trained with |
+| `tok0_gate.sh` | Rail's ids against the training tokenizer, plus the file hashes that differential check cannot see |
 
-Built 2026-08-27. Rail is a self-hosting language: the compiler is written
+Built 2026-08-27, extended 2026-08-28. Rail is a self-hosting language: the compiler is written
 in Rail and compiles itself, with no C dependencies.
