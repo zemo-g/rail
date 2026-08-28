@@ -259,7 +259,7 @@ are not distributed.
 ./rail_native run tools/infer/ng0_keystone_gate.rail    # needs weights
 ./rail_native run tools/infer/ng0_spec.rail --max 40 --pattern pair
 ./rail_native run tools/infer/rl0_gate.rail             # needs weights
-./rail_native run tools/infer/tok0.rail --text FILE     # needs the tokenizer
+./rail_native run tools/infer/tok0.rail --tokdir DIR --text FILE
 tools/infer/tok0_gate.sh                                # needs the tokenizer
 ```
 
