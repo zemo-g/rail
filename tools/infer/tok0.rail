@@ -1,0 +1,173 @@
+-- tools/infer/tok0.rail — the byte-level BPE tokenizer, in Rail.
+--
+-- The inference engine in this directory speaks token ids. That makes its
+-- determinism checkable but its output unreadable: every gate here proves
+-- something about integers, and a stranger cannot see language in them.
+-- This is the missing half. It turns bytes into ids and ids back into
+-- bytes, using the real tokenizer the 240M base run was trained with.
+--
+-- Byte-level, not character-level. The vocabulary is 173 distinct BYTES in
+-- first-appearance order over the training corpus, then 15,404 learned
+-- merges numbered 173..15576. A multi-byte UTF-8 character is several base
+-- tokens that merges may or may not have joined, which is why the alphabet
+-- file looks like mojibake when printed: it is not text, it is a byte set.
+--
+-- Encoding is deliberately the slow, obvious algorithm: apply every merge
+-- in learn order, each as ONE left-to-right non-overlapping pass. That is
+-- what stdlib/bpe.rail did when this vocabulary was trained, so it is what
+-- reproduces those ids. A faster encoder that computed different ids would
+-- be worse than no encoder at all.
+--
+-- Checked, not asserted: tok0_gate.sh encodes real text here and in the
+-- Python replica the corpus pipeline used, and requires every id to match.
+-- Round-tripping decode(encode(x)) == x is a weaker check that passes even
+-- when both sides are wrong together, so it is reported but never trusted
+-- as the gate.
+--
+-- Usage:
+--   ./rail_native run tools/infer/tok0.rail --text FILE [--ids-out FILE]
+--     [--alphabet FILE] [--merges FILE]
+
+parse_int s = parse_int_acc (chars s) 0
+parse_int_acc cs acc =
+  if length cs == 0 then acc
+  else
+    let d = char_to_int (head cs) - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else parse_int_acc (tail cs) (acc * 10 + d)
+
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if head xs == key then (if length (tail xs) > 0 then head (tail xs) else "")
+  else argv_get_loop (tail xs) key
+argv_get argv key dflt =
+  let v = argv_get_loop argv key
+  if length (chars v) == 0 then dflt else v
+
+-- ── loading ──
+
+-- byte value -> base id, or -1. A byte the corpus never contained has no
+-- id and is dropped, matching the replica's `if c in cid` filter. Silent
+-- dropping is a real lossiness: decode(encode(x)) != x for such input, and
+-- the gate reports it rather than hiding it.
+build_b2i cs i b2i =
+  if length cs == 0 then i
+  else
+    let _ = arr_set b2i (char_to_int (head cs)) i
+    build_b2i (tail cs) (i + 1) b2i
+
+-- merges flattened: slot 3k = a, 3k+1 = b, 3k+2 = new id.
+parse_merges lines m k =
+  if length lines == 0 then k
+  else
+    let ln = head lines
+    if length (chars ln) == 0 then parse_merges (tail lines) m k
+    else
+      let p = split " " ln
+      if length p < 3 then parse_merges (tail lines) m k
+      else
+        let _ = arr_set m (k * 3) (parse_int (head p))
+        let _ = arr_set m (k * 3 + 1) (parse_int (head (tail p)))
+        let _ = arr_set m (k * 3 + 2) (parse_int (head (tail (tail p))))
+        parse_merges (tail lines) m (k + 1)
+
+-- ── encoding ──
+
+fill_ids cs b2i arr w =
+  if length cs == 0 then w
+  else
+    let id = arr_get b2i (char_to_int (head cs))
+    if id < 0 then fill_ids (tail cs) b2i arr w
+    else
+      let _ = arr_set arr w id
+      fill_ids (tail cs) b2i arr (w + 1)
+
+-- One left-to-right pass replacing every non-overlapping (a,b) with nid.
+-- Compacts in place: the write cursor never passes the read cursor, so no
+-- second buffer is needed. Written with nested ifs because Rail has no
+-- short-circuit &&: both sides of an && always evaluate, so the guarded
+-- `arr_get arr (i+1)` would read off the end on the last element.
+pass1 arr n a b nid i w =
+  if i >= n then w
+  else
+    let x = arr_get arr i
+    if i + 1 >= n then
+      let _ = arr_set arr w x
+      pass1 arr n a b nid (i + 1) (w + 1)
+    else if x == a then
+      if arr_get arr (i + 1) == b then
+        let _ = arr_set arr w nid
+        pass1 arr n a b nid (i + 2) (w + 1)
+      else
+        let _ = arr_set arr w x
+        pass1 arr n a b nid (i + 1) (w + 1)
+    else
+      let _ = arr_set arr w x
+      pass1 arr n a b nid (i + 1) (w + 1)
+
+apply_all arr n m nmerges k =
+  if k >= nmerges then n
+  else
+    let n2 = pass1 arr n (arr_get m (k * 3)) (arr_get m (k * 3 + 1)) (arr_get m (k * 3 + 2)) 0 0
+    apply_all arr n2 m nmerges (k + 1)
+
+-- ── decoding ──
+
+-- A merged id is a tree: expand left then right down to base bytes. Built
+-- by prepending onto an accumulator, so the right child is expanded first
+-- and the bytes come out in order.
+expand id base m alpha acc =
+  if id < base then cons (str_sub alpha id 1) acc
+  else
+    let j = (id - base) * 3
+    expand (arr_get m j) base m alpha (expand (arr_get m (j + 1)) base m alpha acc)
+
+decode_ids arr n base m alpha i acc =
+  if i < 0 then join "" acc
+  else decode_ids arr n base m alpha (i - 1) (expand (arr_get arr i) base m alpha acc)
+
+ids_to_str arr n i acc =
+  if i >= n then join " " (reverse acc)
+  else ids_to_str arr n (i + 1) (cons (show (arr_get arr i)) acc)
+
+main =
+  let tokdir = argv_get args "--tokdir" "/Users/ledaticempire/.ledatic/base_run/artifacts/tokenizer"
+  let apath = argv_get args "--alphabet" (cat [tokdir, "/tok_uniq.cache"])
+  let mpath = argv_get args "--merges" (cat [tokdir, "/digittok.merges"])
+  let tpath = argv_get args "--text" ""
+  let outp  = argv_get args "--ids-out" "/tmp/tok0.ids"
+
+  let alpha = read_file apath
+  let acs = chars alpha
+  let b2i = arr_new 256 (0 - 1)
+  let base = build_b2i acs 0 b2i
+
+  let mtext = read_file mpath
+  let mlines = split "\n" mtext
+  let m = arr_new (16384 * 3) 0
+  let nmerges = parse_merges mlines m 0
+  let _ = print (cat ["alphabet: ", show base, " bytes   merges: ", show nmerges,
+                      "   vocab: ", show (base + nmerges)])
+
+  if length (chars tpath) == 0 then
+    let _ = print "no --text given; loaded tokenizer only"
+    0
+  else
+    let text = read_file tpath
+    let tcs = chars text
+    let nbytes = length tcs
+    let arr = arr_new (nbytes + 1) 0
+    let n0 = fill_ids tcs b2i arr 0
+    let n = apply_all arr n0 m nmerges 0
+    let _ = write_file outp (ids_to_str arr n 0 [])
+    let back = decode_ids arr n base m alpha (n - 1) []
+    let rt = if back == text then "yes" else "no"
+    let _ = print (cat ["bytes: ", show nbytes, "  base tokens: ", show n0,
+                        "  encoded: ", show n])
+    let _ = print (cat ["compression: ", show ((nbytes * 100) / (if n == 0 then 1 else n)),
+                        "% (bytes per token x100)"])
+    let _ = print (cat ["dropped bytes (not in alphabet): ", show (nbytes - n0)])
+    let _ = print (cat ["round-trip decode == input: ", rt])
+    let _ = print (cat ["ids written: ", outp])
+    0
