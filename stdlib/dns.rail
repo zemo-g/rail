@@ -9,20 +9,36 @@
 --
 -- Caller must have socket.rail loaded.
 
--- Read /etc/resolv.conf, find first "nameserver X.Y.Z.W" line.
-dns_default_server _ =
+-- Read /etc/resolv.conf and collect EVERY IPv4 nameserver, in order,
+-- with 1.1.1.1 appended as a last resort.
+--
+-- Using only the first nameserver was a single point of failure. On
+-- 2026-08-28 Tailscale's MagicDNS sat at the top of resolv.conf,
+-- accepted our query, and never answered it (sent=29, got=-1), while
+-- the very next server answered normally. A resolver that accepts and
+-- drops is indistinguishable from having no network at all, so every
+-- Rail HTTPS consumer went dark at once, attestation signing included.
+dns_servers _ =
   let s = read_file "/etc/resolv.conf"
-  dns_scan_lines (split_lines s)
+  dns_collect_ns (split_lines s)
 
 -- Split a string on newlines.
 split_lines s = split "\n" s
 
-dns_scan_lines lines =
-  if length lines == 0 then "1.1.1.1"
+dns_collect_ns lines =
+  if length lines == 0 then ["1.1.1.1"]
   else
     let line = head lines
-    if dns_is_nameserver line == 1 then dns_extract_ns line
-    else dns_scan_lines (tail lines)
+    let rest = dns_collect_ns (tail lines)
+    if dns_is_nameserver line == 1 then dns_prepend_ns (dns_extract_ns line) rest
+    else rest
+
+-- Unusable entries are dropped rather than replaced with a default:
+-- the fallback belongs at the end of the list exactly once, not
+-- substituted in the middle where it would mask the real ordering.
+dns_prepend_ns ip rest =
+  if length ip == 0 then rest
+  else cons ip rest
 
 dns_is_nameserver line =
   if length line < 11 then 0
@@ -30,12 +46,15 @@ dns_is_nameserver line =
 
 dns_extract_ns line =
   let parts = split " " line
-  if length parts < 2 then "1.1.1.1"
+  if length parts < 2 then ""
   else
     let candidate = head (tail parts)
     -- Skip IPv6 (contains ':').
-    if str_find ":" candidate >= 0 then "1.1.1.1"
+    if str_find ":" candidate >= 0 then ""
     else candidate
+
+-- First usable resolver, for callers that only want one.
+dns_default_server _ = head (dns_servers 0)
 
 -- ── Query packet construction ─────────────────────────────────────
 
@@ -211,18 +230,27 @@ dns_set_recv_timeout fd secs =
   rc
 
 dns_resolve_a host =
-  dns_resolve_a_try host 0
+  dns_try_pass host (dns_servers 0) 0
 
--- Up to 3 attempts at 2-second timeout each.  Total worst-case 6 s.
-dns_resolve_a_try host attempt =
-  if attempt >= 3 then ""
+-- Two passes over the whole server list at a 2-second timeout each.  A
+-- transient drop still gets a retry, but a resolver that never answers
+-- now costs one timeout instead of three, and never starves the servers
+-- listed behind it.
+dns_try_pass host servers pass =
+  if pass >= 2 then ""
   else
-    let ip = dns_resolve_a_once host
+    let ip = dns_try_each host servers
     if length ip > 0 then ip
-    else dns_resolve_a_try host (attempt + 1)
+    else dns_try_pass host servers (pass + 1)
 
-dns_resolve_a_once host =
-  let server = dns_default_server 0
+dns_try_each host servers =
+  if length servers == 0 then ""
+  else
+    let ip = dns_resolve_a_once host (head servers)
+    if length ip > 0 then ip
+    else dns_try_each host (tail servers)
+
+dns_resolve_a_once host server =
   let fd = udp_socket 0
   if fd < 0 then ""
   else

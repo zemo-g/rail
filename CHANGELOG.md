@@ -5,6 +5,29 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Fixed
+- **`rail_native run` discarded the program's exit code** (returned a
+  hardcoded 0).  Every caller that branched on a Rail program's status
+  silently saw success.  This is what let the daily attestation job
+  "pass" for two days while `attest.rail` was returning 4 and writing no
+  attestation at all: `publish.sh` then uploaded the lone `result.json`,
+  and ledatic.org served a NEW artifact beside the OLD signature, which
+  reads to anyone running our own `verify.sh` as tampering rather than as
+  a broken cron.  `compile_and_run` now carries the child's status home on
+  a sentinel line and returns it; a missing sentinel reports 0 loudly
+  rather than silently.  Regression t185 `driver_run_returns_exit_code`
+  exercises the driver path itself, which `run_test` cannot reach because
+  it executes the built binary directly.  Suite 189 -> 190.
+- **`stdlib/dns.rail` used only the FIRST nameserver in `/etc/resolv.conf`.**
+  Tailscale's MagicDNS sits at the top of that file, accepts a query, and
+  never answers it (`sent=29 got=-1`), while the very next resolver
+  answers normally.  A resolver that accepts and drops is indistinguishable
+  from having no network, so every Rail HTTPS consumer went dark at once.
+  `dns_resolve_a` now walks every IPv4 nameserver in order with 1.1.1.1 as
+  a final fallback, two passes instead of three retries against one dead
+  server.
+- **`publish.sh` refuses to upload an artifact with no attestation beside
+  it.**  A partial publish is worse than none: it replaces a verifiable
+  pair with an unverifiable one.
 - **speak + labrat repointed at the live Studio server** (Qwen3.8-27B on
   `:8092`): both tools pinned the retired Qwen3.5-Opus-distill id — and
   labrat a dead `:8080` — which would have dragged a second 27B onto the

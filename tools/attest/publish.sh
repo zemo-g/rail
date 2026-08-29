@@ -62,6 +62,19 @@ publish_dir() {
     echo "no publishable records in $dir — attestation upstream produced nothing" >&2
     return 1
   fi
+  # Never publish an artifact without its signature. On 2026-08-28 attest.rail
+  # failed to reach the beacon and wrote no attestation, this loop uploaded the
+  # lone result.json, and ledatic.org served a NEW artifact beside the OLD
+  # signature — which reads to any outsider running our own verify.sh as
+  # tampering, not as a broken cron. A partial publish is worse than none.
+  for f in "${files[@]}"; do
+    case "$f" in *.attestation.json) continue ;; esac
+    if [ ! -s "$f.attestation.json" ]; then
+      echo "refusing to publish $f: no $f.attestation.json beside it." >&2
+      echo "  Publishing the artifact alone would leave a stale signature live." >&2
+      return 1
+    fi
+  done
   for f in "${files[@]}"; do
     local file content_type
     file=$(basename "$f")

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="#quick-start"><img src="https://img.shields.io/badge/tests-187%2F187-brightgreen" alt="tests 187/187"></a>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/tests-190%2F190-brightgreen" alt="tests 190/190"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
   <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
@@ -34,7 +34,7 @@ Rail compiles itself. The compiler — ~9,200 lines of Rail — produces a ~0.9 
 ```
 ./rail_native self && cp /tmp/rail_self ./rail_native  # cycle 1
 ./rail_native self && cmp rail_native /tmp/rail_self   # cycle 2 — byte-identical
-./rail_native test                                     # 187/187
+./rail_native test                                     # 190/190
 ```
 
 ### What the self-hosting is *for*
@@ -68,7 +68,7 @@ Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, We
 ```bash
 ./rail_native <file.rail>        # compile to /tmp/rail_out
 ./rail_native run <file.rail>    # compile + execute
-./rail_native test               # run the 187-test suite
+./rail_native test               # run the 190-test suite
 ./rail_native self               # self-compile, fixed point at gen2
 ./rail_native x86 <file.rail>    # cross-compile to Linux x86_64
 ./rail_native linux <file.rail>  # cross-compile to Linux ARM64
@@ -83,7 +83,7 @@ Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, We
 
 ```
 ./rail_native self                    -- ~9,200 lines of Rail →
-                                      --   a ~1.0 MB ARM64 binary
+                                      --   a ~0.9 MB ARM64 binary
 cp /tmp/rail_self ./rail_native       -- cycle 1: install gen1
 ./rail_native self                    -- cycle 2: that binary compiles
                                       --   the compiler again (gen2)
@@ -127,7 +127,9 @@ programs it rejects are the gradient. Nothing in that path requires trusting us.
 
 The furthest this has been carried is a **from-scratch 138M model that writes
 Rail**, trained only on oracle-verified `comment → program` pairs. On its
-frozen benchmark it reaches **16/16 compile@1 and 16/16 function-correctness**.
+frozen benchmark it reaches **16/16 compile@1 and 11/16 function-correctness**.
+The ledger we publish records `pass_at_1: 11`: everything it compiles is not
+everything it gets right.
 The corpus (52,243 pairs, sha `1a6941af`) is **bit-reproducible** — regenerating
 it from seed 1234 twice gives identical bytes — and is bound into a hash-chained
 ledger signed by a Pi-hosted Ed25519 witness against entropy pulse `2641877`.
