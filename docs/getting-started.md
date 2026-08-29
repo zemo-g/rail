@@ -126,7 +126,7 @@ diff /tmp/rail_self /tmp/rail_out
 # Step 5: If not identical, repeat steps 2-4 until stable
 
 # Step 6: Run tests
-./rail_native test    # should be 178/178
+./rail_native test    # should be 190/190
 ```
 
 ## Other Commands

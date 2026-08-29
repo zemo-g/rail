@@ -5859,6 +5859,24 @@ strip_trailing_ws_loop s n =
 
 strip_trailing_ws s = strip_trailing_ws_loop s (length s)
 
+-- t185. The `run` driver must hand back the program's exit code. It returned
+-- a hardcoded 0 until 2026-08-28, so every caller that branched on a Rail
+-- program's status silently saw success. That is how the daily attestation
+-- job "passed" for two days while attest.rail was returning 4 and writing no
+-- attestation, leaving a live artifact next to a stale signature.
+--
+-- Driver-level, so it cannot use run_test (which executes the built binary
+-- directly and never touches the `run` path). --out-prefix keeps the nested
+-- compile off /tmp/rail_out, which the suite is already using.
+driver_run_returns_exit_code _ =
+  let _ = print "  --- driver_run_returns_exit_code ---"
+  let src = trim (shell "mktemp -u /tmp/rail_rc_XXXXXX.rail")
+  let _ = write_file src "main = 7\n"
+  let got = trim (shell (cat
+    ["./rail_native --out-prefix /tmp/rail_rc_probe run ", src, " >/dev/null 2>&1; echo $?"]))
+  let _ = shell (cat ["rm -f ", src, " /tmp/rail_rc_probe*"])
+  got == "7"
+
 run_test name src expected =
   let _ = print (cat ["  --- ", name, " ---"])
   -- Mark/reset per test: each compile_program allocates ~MBs that nothing
@@ -6362,9 +6380,11 @@ run_tests _ =
   -- __float_ret_ consult typed local gv as float and SIGSEGV'd (this crashed on the pre-guard seed).
   let t184 = run_test "local_shadows_float_global" "gv = 2.5\naddone gv = gv + 1\nmain = let _ = print (show (addone 41)) in 0" "42"
   let s_flt = (if t183 then 1 else 0) + (if t184 then 1 else 0)
-  let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s_inf + s_bx + s_ed + s_tls + s_flt
-  let _ = print (cat [show total, "/189 tests passed"])
-  if total == 189 then 0 else 1
+  let t185 = driver_run_returns_exit_code 0
+  let s_drv = if t185 then 1 else 0
+  let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s_inf + s_bx + s_ed + s_tls + s_flt + s_drv
+  let _ = print (cat [show total, "/190 tests passed"])
+  if total == 190 then 0 else 1
 
 -- ===========================================================================
 -- M6 — self-hosted emit path. Replaces as/ld/codesign with the pure-Rail
@@ -6451,14 +6471,57 @@ join_args_quoted lst n =
     else join_args_quoted (tail lst) (n - 1)
   else shell_quote_join lst
 
+-- Run the compiled program and RETURN ITS EXIT CODE.
+--
+-- This used to end in a hardcoded 0, so `rail_native run prog.rail` always
+-- reported success no matter what the program returned. Every caller that
+-- branched on a Rail program's exit status silently saw success: on
+-- 2026-08-28 the daily attestation job "succeeded" for two days while
+-- attest.rail was returning 4 (beacon unreachable) and writing no
+-- attestation file at all, which left ledatic.org serving a signature that
+-- did not match the artifact beside it.
+--
+-- `shell` hands back stdout only, so the status rides home on a sentinel
+-- final line that is stripped before the output is printed.
 compile_and_run prefix path extra =
   let rc = compile_file prefix path
   if rc != 0 then rc
   else
-    let cmd = if length extra > 0 then cat [prefix, " ", extra, " 2>&1"] else cat [prefix, " 2>&1"]
-    let out = shell cmd
-    let _ = if length out > 0 then print out else 0
-    0
+    let base = if length extra > 0 then cat [prefix, " ", extra] else prefix
+    let out = shell (cat [base, " 2>&1; echo \"__rail_rc:$?\""])
+    let lines = split "\n" out
+    run_report lines
+
+-- Split the sentinel off the tail of the captured output, print the rest,
+-- and return the child's code. If the sentinel is missing something ate it,
+-- and reporting 0 would recreate the bug this function exists to fix.
+run_report lines0 =
+  -- echo leaves a trailing newline, so split yields a final empty element.
+  let lines = strip_trailing_blank lines0
+  let n = length lines
+  if n == 0 then 0
+  else
+    let marker = last_of lines
+    if str_find "__rail_rc:" marker != 0 then
+      let _ = print (join "\n" lines)
+      0
+    else
+      let body = drop_last lines
+      let _ = if length body > 0 then print (join "\n" body) else 0
+      str_to_int (str_sub marker 10 (length marker - 10))
+
+strip_trailing_blank xs =
+  if length xs == 0 then xs
+  else if length (last_of xs) == 0 then strip_trailing_blank (drop_last xs)
+  else xs
+
+last_of xs =
+  if length xs <= 1 then head xs
+  else last_of (tail xs)
+
+drop_last xs =
+  if length xs <= 1 then []
+  else cons (head xs) (drop_last (tail xs))
 
 -- Parse-only check. Runs tokenize + pprog + ce_decls. Skips codegen + as + ld.
 -- Returns 0 if the file parses cleanly, 1 if there are parse errors.
