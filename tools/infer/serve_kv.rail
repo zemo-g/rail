@@ -1,0 +1,603 @@
+-- tools/infer/serve_kv.rail — S0: the attested serving loop.
+--
+-- A pure-Rail HTTP server over stdlib/socket.rail (the fleet_agent_v3
+-- pattern) that serves greedy text generation through the KV0 incremental
+-- path. Its contract is the one no mainstream engine can state:
+--
+--   SAME REQUEST BYTES -> SAME RESPONSE BYTES.
+--
+-- Enforced by construction: batch-1, serial FIFO (the accept loop IS the
+-- scheduler), greedy decoding, the bit-parity KV path (kv0_gate), CPU
+-- loops with fixed accumulation order. Every /generate is appended to a
+-- hash-chained ledger, and the server verifies its own chain on demand --
+-- check-me, not trust-me.
+--
+-- Endpoints:
+--   GET  /health          -> model + contract description
+--   POST /generate        {"prompt": "...", "max": N}
+--        -> {"text", "isl", "osl", "ttft_ms", "tps", "total_ms",
+--            "output_sha256", "record_hash", "prev_hash", "step"}
+--   GET  /ledger/verify   -> walks the ledger file, recomputes every
+--                            record hash, checks the chain links
+--
+-- Model: --prefix loads any v3 checkpoint (RMSNorm+RoPE+SwiGLU, the
+-- 2+9*N weight scheme); with no checkpoint on disk it serves a built-in
+-- deterministic demo model (patterned weights, char vocab from the seed
+-- text below) -- the CONTRACT and the ledger are what S0 ships; the
+-- weights are a plug.
+--
+-- Args: --port (default 9180) --ledger (default /tmp/railserve_ledger.jsonl)
+--       --prefix (v3 checkpoint; optional) --corpus (vocab text for checkpoints)
+--       --max-cap (per-request generation cap, default 256)
+-- Bind is 127.0.0.1 only. Run:
+--   ./rail_native run tools/infer/serve_kv.rail --port 9180
+import "stdlib/transformer.rail"
+import "stdlib/optim.rail"
+import "stdlib/infer_kv.rail"
+import "stdlib/tokenizer.rail"
+import "stdlib/checkpoint.rail"
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/socket.rail"
+
+-- ── deterministic demo model (no checkpoint on disk) ──────────────────
+demo_seed_text = cat [
+  "the rail language compiles itself. a server that answers twice with ",
+  "different bytes is guessing; this one is built not to. tokens 0-9: ",
+  "0123456789.\n"]
+
+srv_fill arr n mulr addr divr i =
+  if i >= n then 0
+  else
+    let raw = ((i * mulr + addr) % 1000) - 500
+    let _ = float_arr_set arr i ((int_to_float raw) / divr)
+    srv_fill arr n mulr addr divr (i + 1)
+
+srv_mkw rows cols mulr addr divr =
+  let n = rows * cols
+  let a = float_arr_new (n + 0) 0.0
+  let _ = srv_fill a n mulr addr divr 0
+  let shape = cons rows (cons cols [])
+  Tensor a shape (compute_strides shape)
+
+srv_fill_gamma arr n i =
+  if i >= n then 0
+  else
+    let raw = ((i * 7 + 3) % 11) - 5
+    let _ = float_arr_set arr i (1.0 + (int_to_float raw) / 100.0)
+    srv_fill_gamma arr n (i + 1)
+
+srv_mkgamma n =
+  let a = float_arr_new (n + 0) 0.0
+  let _ = srv_fill_gamma a n 0
+  let shape = cons n []
+  Tensor a shape (compute_strides shape)
+
+srv_mkblock d ff b =
+  let w_q = srv_mkw d d (89 + b) (41 + b) 2500.0
+  let w_k = srv_mkw d d (103 + b) (7 + b) 2500.0
+  let w_v = srv_mkw d d (127 + b) (19 + b) 2500.0
+  let w_o = srv_mkw d d (167 + b) (23 + b) 2500.0
+  let w_gate = srv_mkw d ff (181 + b) (13 + b) 2500.0
+  let w_up = srv_mkw d ff (193 + b) (29 + b) 2500.0
+  let w_down = srv_mkw ff d (199 + b) (31 + b) 2500.0
+  let g1 = srv_mkgamma d
+  let g2 = srv_mkgamma d
+  cons w_q (cons w_k (cons w_v (cons w_o (cons w_gate (cons w_up (cons w_down (cons g1 (cons g2 []))))))))
+
+-- demo model: [w_e, we_t, gf] + blocks, over the demo vocab
+demo_model vw =
+  let d = 16
+  let w_e = srv_mkw vw d 131 7 500.0
+  let we_t = srv_transpose_cpu w_e
+  let gf = srv_mkgamma d
+  let blocks = cons (srv_mkblock d 32 0) (cons (srv_mkblock d 32 5) [])
+  cons (cons w_e (cons we_t (cons gf []))) (cons blocks [])
+
+srv_transpose_cpu t = match t
+  | Tensor t_data t_shape t_st ->
+    let rows = head t_shape
+    let cols = head (tail t_shape)
+    let n = rows * cols
+    let new_data = float_arr_new (n + 0) 0.0
+    let _ = transpose_copy_loop t_data new_data rows cols 0
+    Tensor new_data (cons cols (cons rows [])) (compute_strides (cons cols (cons rows [])))
+
+-- ── helpers ───────────────────────────────────────────────────────────
+-- Wall clock from the dylib, not a shell. This forked a Perl interpreter
+-- three times per request until 2026-08-27, inside a loop whose whole
+-- claim is being pure Rail, and it meant ttft_ms was partly measuring
+-- Perl's startup.
+foreign tgl_now_ms x -> float
+now_ms _ = float_to_int (tgl_now_ms 0)
+
+argv_get_loop xs key =
+  if length xs == 0 then ""
+  else if head xs == key then
+    if length (tail xs) > 0 then head (tail xs) else ""
+  else argv_get_loop (tail xs) key
+
+argv_get argv key default_val =
+  let v = argv_get_loop argv key
+  if length (chars v) == 0 then default_val else v
+
+-- minimal JSON string field: value of "key":"..." with no escape support
+-- (v0 -- a prompt with a backslash or double quote is rejected upstream)
+json_str_field body key =
+  let pat = cat ["\"", key, "\""]
+  let i = str_find pat body
+  if i < 0 then ""
+  else
+    let rest = str_sub body (i + length (chars pat)) (length (chars body))
+    let q1 = str_find "\"" rest
+    if q1 < 0 then ""
+    else
+      let rest2 = str_sub rest (q1 + 1) (length (chars rest))
+      let q2 = str_find "\"" rest2
+      if q2 < 0 then "" else str_sub rest2 0 q2
+
+json_int_field body key default_val =
+  let pat = cat ["\"", key, "\""]
+  let i = str_find pat body
+  if i < 0 then default_val
+  else
+    let rest = str_sub body (i + length (chars pat)) (length (chars body))
+    let c = str_find ":" rest
+    if c < 0 then default_val
+    else
+      -- parse_int stops at the first non-digit and a LEADING space makes
+      -- it return 0, so strip spaces from the slice first
+      let v = parse_int (str_replace " " "" (str_sub rest (c + 1) 12))
+      if v <= 0 then default_val else v
+
+json_escape s =
+  let a = str_replace "\\" "\\\\" s
+  let b = str_replace "\"" "\\\"" a
+  str_replace "\n" "\\n" b
+
+http_json code body =
+  let status = if code == 200 then "200 OK" else if code == 400 then "400 Bad Request" else "404 Not Found"
+  cat ["HTTP/1.1 ", status, "\nContent-Type: application/json\nContent-Length: ",
+       show (length (chars body)), "\nConnection: close\n\n", body]
+
+sanitize_loop ids acc =
+  if length ids == 0 then reverse acc
+  else
+    let id = head ids
+    if id < 0 then sanitize_loop (tail ids) acc
+    else sanitize_loop (tail ids) (cons id acc)
+
+ids_to_text_loop ids vocab acc =
+  if length ids == 0 then acc
+  else ids_to_text_loop (tail ids) vocab (cat [acc, id_char vocab (head ids)])
+
+-- ── generation over the KV0 path ──────────────────────────────────────
+srv_onehot vw id =
+  let a = float_arr_new (vw + 0) 0.0
+  let _ = float_arr_set a id 1.0
+  let shape = cons 1 (cons vw [])
+  Tensor a shape (compute_strides shape)
+
+srv_argmax_loop pd vw best_id best_val v =
+  if v >= vw then best_id
+  else
+    let cur = float_arr_get pd v
+    if cur > best_val then srv_argmax_loop pd vw v cur (v + 1)
+    else srv_argmax_loop pd vw best_id best_val (v + 1)
+
+srv_argmax probs = match probs
+  | Tensor pd shape _ ->
+    let vw = head (tail shape)
+    srv_argmax_loop pd vw 0 (float_arr_get pd 0) 1
+
+-- one incremental step: token id in, probs out. mdl = [w_e, we_t, gf]
+srv_step mdl blocks caches id pos =
+  let w_e = list_nth 0 mdl
+  let we_t = list_nth 1 mdl
+  let gf = list_nth 2 mdl
+  let d = head (reverse (tensor_shape w_e))
+  let vw = head (tensor_shape w_e)
+  let x_row = srv_onehot vw id
+  kv_forward_step x_row w_e we_t blocks caches gf pos d
+
+srv_feed_loop mdl blocks caches ids pos last =
+  if length ids == 0 then last
+  else
+    let probs = srv_step mdl blocks caches (head ids) pos
+    srv_feed_loop mdl blocks caches (tail ids) (pos + 1) probs
+
+srv_gen_loop mdl blocks caches last_id pos remaining acc =
+  if remaining <= 0 then reverse acc
+  else
+    let probs = srv_step mdl blocks caches last_id pos
+    let nid = srv_argmax probs
+    srv_gen_loop mdl blocks caches nid (pos + 1) (remaining - 1) (cons nid acc)
+
+-- ── S1: streaming generation ──────────────────────────────────────────
+-- POST /generate_stream sends headers, then each token's text the moment
+-- it exists, then closes -- close-delimited streaming, no chunked encoder
+-- needed, curl -N sees tokens live. The body is the RAW text (no JSON):
+-- streaming changes the transport, never the bytes, so sha256(stream) ==
+-- the output_sha256 that /generate reports for the same request, and the
+-- ledger record is identical in shape. Metadata lives in the ledger, not
+-- a trailer.
+stream_headers _ =
+  "HTTP/1.1 200 OK\nContent-Type: text/plain; charset=utf-8\nConnection: close\n\n"
+
+-- st = [mdl, blocks, vocab, ledger_path]; coll = int arr collecting ids
+srv_stream_loop cfd st caches last_id pos remaining coll =
+  if remaining <= 0 then 0
+  else
+    let mdl = list_nth 0 st
+    let blocks = list_nth 1 st
+    let vocab = list_nth 2 st
+    let probs = srv_step mdl blocks caches last_id pos
+    let nid = srv_argmax probs
+    -- cat-wrap before send: the single-char strings id_char returns hit
+    -- the runtime-string -> foreign char* marshaling trap (send wrote the
+    -- right LENGTH but a header byte, 0x09, instead of the char). A cat
+    -- copy lands the data where the foreign call expects it.
+    let _ = send_all_tcp cfd (cat [id_char vocab nid, ""])
+    let n = arr_get coll 0
+    let _ = arr_set coll (n + 1) nid
+    let _ = arr_set coll 0 (n + 1)
+    srv_stream_loop cfd st caches nid (pos + 1) (remaining - 1) coll
+
+coll_to_text coll vocab i n acc =
+  if i > n then acc
+  else coll_to_text coll vocab (i + 1) n (cat [acc, id_char vocab (arr_get coll i)])
+
+-- returns new prev hash (or prev unchanged on a bad request)
+handle_stream cfd body st prev step max_cap =
+  let prompt = json_str_field body "prompt"
+  let want = json_int_field body "max" 32
+  let n_gen = if want > max_cap then max_cap else want
+  if length (chars prompt) == 0 then
+    let _ = send_all_tcp cfd (http_json 400 "{\"error\": \"prompt is required\"}")
+    prev
+  else
+    let mdl = list_nth 0 st
+    let blocks = list_nth 1 st
+    let vocab = list_nth 2 st
+    let ledger_path = list_nth 3 st
+    let prompt_ids = sanitize_loop (encode vocab prompt) []
+    if length prompt_ids == 0 then
+      let _ = send_all_tcp cfd (http_json 400 "{\"error\": \"prompt has no tokens in this model's vocabulary\"}")
+      prev
+    else
+      let d = head (reverse (tensor_shape (list_nth 0 mdl)))
+      let max_seq = length prompt_ids + n_gen + 1
+      let caches = kv_cache_new (length blocks) max_seq d
+      let _ = send_all_tcp cfd (stream_headers 0)
+      let last_probs = srv_feed_loop mdl blocks caches prompt_ids 0 0
+      let first_id = srv_argmax last_probs
+      let _ = send_all_tcp cfd (cat [id_char vocab first_id, ""])
+      let coll = arr_new (n_gen + 2) 0
+      let _ = arr_set coll 1 first_id
+      let _ = arr_set coll 0 1
+      let _ = srv_stream_loop cfd st caches first_id (length prompt_ids) (n_gen - 1) coll
+      let n_out = arr_get coll 0
+      let text = coll_to_text coll vocab 1 n_out ""
+      let canon = cat ["{\"step\":", show step, ",\"prompt_sha256\":\"", sha256_hex prompt,
+        "\",\"output_sha256\":\"", sha256_hex text, "\",\"isl\":", show (length prompt_ids),
+        ",\"osl\":", show n_out, ",\"prev\":\"", prev, "\"}"]
+      let rec_hash = sha256_hex canon
+      let _ = append_ledger ledger_path (cat ["{\"canon\":", canon, ",\"record_hash\":\"", rec_hash, "\"}\n"])
+      rec_hash
+
+-- ── PC0: the single-slot prefix cache, as a DECLARED input ────────────
+-- A request that sends "cache": "reuse" opts into the resident slot: if
+-- its prompt EXTENDS the token sequence the slot holds, only the new
+-- suffix is prefilled. The declaration rides into the ledger canon --
+-- cache behavior is part of the attested transcript, never an ambient
+-- optimization. Correctness is structural: prefix rows' K/V are
+-- computed by the same row-independent loops whether they ran in this
+-- request or a previous one (the kv0_gate parity argument), so hit and
+-- cold produce identical bytes -- and the gate checks exactly that.
+-- The slot is a 3-cell box inside st: [valid(0/1), ids_list, caches].
+PC_SEQ = 512
+
+box_get box i = arr_get box i
+box_put box i v = arr_set box i v
+
+-- common prefix length of two id lists. Any common prefix is safely
+-- reusable in either direction: cache rows at positions >= the current
+-- one are IGNORED by the causal attention loops (j <= pos), so a cache
+-- longer than the prompt (a re-ask) or diverging later (an edit) still
+-- reuses everything up to the divergence.
+prefix_match a b n =
+  if length a == 0 then n
+  else if length b == 0 then n
+  else if head a == head b then prefix_match (tail a) (tail b) (n + 1)
+  else n
+
+drop_n n xs = if n <= 0 then xs else drop_n (n - 1) (tail xs)
+
+-- ── the /generate handler ─────────────────────────────────────────────
+-- st = [mdl, blocks, vocab, ledger_path, cache_box]; returns (resp, new_prev)
+handle_generate body st prev step max_cap =
+  let prompt = json_str_field body "prompt"
+  let want = json_int_field body "max" 32
+  let cache_req = json_str_field body "cache"
+  let n_gen = if want > max_cap then max_cap else want
+  if length (chars prompt) == 0 then
+    (http_json 400 "{\"error\": \"prompt is required (plain text, no quotes/backslashes in v0)\"}", prev)
+  else
+    let mdl = list_nth 0 st
+    let blocks = list_nth 1 st
+    let vocab = list_nth 2 st
+    let ledger_path = list_nth 3 st
+    let box = list_nth 4 st
+    let raw_ids = encode vocab prompt
+    let prompt_ids = sanitize_loop raw_ids []
+    if length prompt_ids == 0 then
+      (http_json 400 "{\"error\": \"prompt has no tokens in this model's vocabulary\"}", prev)
+    else
+      let d = head (reverse (tensor_shape (list_nth 0 mdl)))
+      let want_reuse = cache_req == "reuse"
+      let fits = length prompt_ids + n_gen + 1 <= PC_SEQ
+      -- a reuse request runs in the resident PC_SEQ caches; anything else
+      -- gets fresh right-sized ones
+      let cached_ids = if want_reuse then box_get box 1 else []
+      let matched = if want_reuse then
+                      if box_get box 0 == 1 then prefix_match cached_ids prompt_ids 0
+                      else 0
+                    else 0
+      let hit = if want_reuse then if fits then matched > 0 else false else false
+      let caches =
+        if want_reuse then
+          if fits then
+            let c0 = if box_get box 0 == 1 then box_get box 2
+                     else kv_cache_new (length blocks) PC_SEQ d
+            if hit then c0 else kv_cache_new (length blocks) PC_SEQ d
+          else kv_cache_new (length blocks) (length prompt_ids + n_gen + 1) d
+        else kv_cache_new (length blocks) (length prompt_ids + n_gen + 1) d
+      let feed_ids = if hit then drop_n matched prompt_ids else prompt_ids
+      let feed_pos = if hit then matched else 0
+      let cache_note = if hit then "hit" else if want_reuse then "cold" else "off"
+      let t0 = now_ms 0
+      let last_probs =
+        if length feed_ids == 0 then
+          -- prompt exactly equals the cached sequence: re-run its last
+          -- token so the returned distribution is the same one a cold
+          -- pass would end on (cache rows for it are simply rewritten)
+          srv_feed_loop mdl blocks caches (cons (list_nth (matched - 1) prompt_ids) []) (matched - 1) 0
+        else srv_feed_loop mdl blocks caches feed_ids feed_pos 0
+      let first_id = srv_argmax last_probs
+      let t1 = now_ms 0
+      let rest_ids = srv_gen_loop mdl blocks caches first_id (length prompt_ids) (n_gen - 1) []
+      let t2 = now_ms 0
+      let gen_ids = cons first_id rest_ids
+      let text = ids_to_text_loop gen_ids vocab ""
+      let isl = length prompt_ids
+      let osl = length gen_ids
+      let out_sha = sha256_hex text
+      let prompt_sha = sha256_hex prompt
+      let decode_ms = t2 - t1
+      let tps10 = if decode_ms > 0 then ((osl - 1) * 10000) / decode_ms else 0
+      -- PC0: update the resident slot. The FINAL generated token's K/V
+      -- row was never written (the loop stops after producing it), so
+      -- the slot records prompt + gen[:-1] -- exactly the rows the
+      -- caches hold; a follow-up prompt re-feeds from there.
+      let _ = if want_reuse then
+                if fits then
+                  let kept = srv_append prompt_ids (srv_all_but_last gen_ids)
+                  let _ = box_put box 1 kept
+                  let _ = box_put box 2 caches
+                  box_put box 0 1
+                else 0
+              else 0
+      -- ledger: canon record -> hash -> chain; the cache declaration is
+      -- part of the canon -- execution path as attested input
+      let canon = cat ["{\"step\":", show step, ",\"prompt_sha256\":\"", prompt_sha,
+        "\",\"output_sha256\":\"", out_sha, "\",\"isl\":", show isl,
+        ",\"osl\":", show osl, ",\"cache\":\"", cache_note,
+        "\",\"prev\":\"", prev, "\"}"]
+      let rec_hash = sha256_hex canon
+      let line = cat ["{\"canon\":", canon, ",\"record_hash\":\"", rec_hash, "\"}\n"]
+      let _ = append_ledger ledger_path line
+      let resp = cat ["{\"text\":\"", json_escape text, "\",\"isl\":", show isl,
+        ",\"osl\":", show osl, ",\"ttft_ms\":", show (t1 - t0),
+        ",\"tps_x10\":", show tps10, ",\"total_ms\":", show (t2 - t0),
+        ",\"cache\":\"", cache_note,
+        "\",\"output_sha256\":\"", out_sha, "\",\"record_hash\":\"", rec_hash,
+        "\",\"prev_hash\":\"", prev, "\",\"step\":", show step, "}"]
+      (http_json 200 resp, rec_hash)
+
+srv_all_but_last xs =
+  if length xs <= 1 then [] else reverse (tail (reverse xs))
+
+srv_rev_append rxs ys =
+  if length rxs == 0 then ys
+  else srv_rev_append (tail rxs) (cons (head rxs) ys)
+
+srv_append xs ys = srv_rev_append (reverse xs) ys
+
+append_ledger path line =
+  let old = read_file path
+  write_file path (cat [old, line])
+
+-- ── /ledger/verify: recompute every record hash, check the links ──────
+verify_lines lines prev n =
+  if length lines == 0 then (n, "ok")
+  else
+    let line = head lines
+    if length (chars line) == 0 then verify_lines (tail lines) prev n
+    else
+      let canon = extract_canon line
+      let claimed = json_str_field line "record_hash"
+      let actual = sha256_hex canon
+      if not (actual == claimed) then (n, "record hash mismatch")
+      else
+        let rec_prev = json_str_field canon "prev"
+        if not (rec_prev == prev) then (n, "chain link broken")
+        else verify_lines (tail lines) claimed (n + 1)
+
+-- the canon object is everything between "canon": and ,"record_hash"
+extract_canon line =
+  let i = str_find "{\"canon\":" line
+  let j = str_find ",\"record_hash\"" line
+  if i < 0 then ""
+  else if j < 0 then ""
+  else str_sub line 9 (j - 9)
+
+handle_verify ledger_path genesis =
+  let content = read_file ledger_path
+  let lines = str_split "\n" content
+  let (n, verdict) = verify_lines lines genesis 0
+  if verdict == "ok" then
+    http_json 200 (cat ["{\"ok\":true,\"records\":", show n, ",\"head_note\":\"every record hash recomputed, every link checked\"}"])
+  else
+    http_json 200 (cat ["{\"ok\":false,\"records_verified\":", show n, ",\"error\":\"", verdict, "\"}"])
+
+-- ── /ledger/head: the chain head, Ed25519-signed on demand ────────────
+-- The head hash commits to every record beneath it; a signature over the
+-- head is a signature over the whole serving history. The server runs
+-- ed25519_verify on its own signature before answering -- "verify":1 in
+-- the response is checked, not asserted. Key: --key-seed FILE; the seed
+-- is sha256(file contents), fleet-style file-based secrets. Without a
+-- key the endpoint answers unsigned, honestly.
+handle_head st prev step genesis =
+  let key_seed = list_nth 5 st
+  if length (chars key_seed) == 0 then
+    http_json 200 (cat ["{\"head\":\"", prev, "\",\"step\":", show step,
+      ",\"genesis\":\"", genesis, "\",\"signed\":false}"])
+  else
+    let seed = sha256 key_seed
+    let pk = ed25519_pk_from_sk seed
+    let head_b = hex_to_bytes prev
+    let sig = ed25519_sign seed head_b 32
+    let ok = ed25519_verify pk head_b 32 sig
+    http_json 200 (cat ["{\"head\":\"", prev, "\",\"step\":", show step,
+      ",\"genesis\":\"", genesis, "\",\"signed\":true",
+      ",\"pubkey\":\"", bytes_to_hex pk 32,
+      "\",\"sig\":\"", bytes_to_hex sig 64,
+      "\",\"verify\":", show ok, "}"])
+
+-- ── routing + serve loop ──────────────────────────────────────────────
+route method path body st prev step genesis max_cap =
+  if path == "/health" then
+    let vocab = list_nth 2 st
+    (http_json 200 (cat ["{\"ok\":true,\"engine\":\"rail-kv0\",\"contract\":",
+      "\"greedy, batch-1, serial FIFO, bit-parity KV decode: same request bytes, same response bytes\",",
+      "\"vocab\":", show (vocab_size vocab), ",\"step\":", show step,
+      ",\"genesis\":\"", genesis, "\"}"]), prev)
+  else if path == "/ledger/verify" then
+    (handle_verify (list_nth 3 st) genesis, prev)
+  else if path == "/ledger/head" then
+    (handle_head st prev step genesis, prev)
+  else if method == "POST" then
+    if path == "/generate" then handle_generate body st prev step max_cap
+    else (http_json 404 "{\"error\":\"no such path\"}", prev)
+  else (http_json 404 "{\"error\":\"no such path\"}", prev)
+
+serve_loop listen_fd st prev step genesis max_cap =
+  let cfd = accept_tcp listen_fd
+  if cfd < 0 then serve_loop listen_fd st prev step genesis max_cap
+  else
+    let req = recv_http_request cfd
+    let (method, path, _hdrs, body) = parse_request req
+    -- streaming writes to the socket as tokens exist; everything else
+    -- builds a response and sends it whole
+    let new_prev =
+      if path == "/generate_stream" then
+        if method == "POST" then handle_stream cfd body st prev step max_cap
+        else let _ = send_all_tcp cfd (http_json 404 "{\"error\":\"POST only\"}") in prev
+      else
+        let (resp, np) = route method path body st prev step genesis max_cap
+        let _ = send_all_tcp cfd resp
+        np
+    let _ = close_socket cfd
+    let next_step = if new_prev == prev then step else step + 1
+    serve_loop listen_fd st new_prev next_step genesis max_cap
+
+-- request parsing (fleet_agent_v3 shapes)
+parse_request_line line =
+  let parts = str_split " " line
+  if length parts >= 2 then (head parts, head (tail parts), "")
+  else ("GET", "/", "")
+
+parse_request raw =
+  -- strip CR first: the header/body split is \r\n\r\n on the wire, and
+  -- str_find "\n\n" would sail right past it otherwise. CR must be
+  -- synthesized at runtime -- "\r" in Rail source is a literal
+  -- backslash-r, not a carriage return (trap #8; this line shipped with
+  -- the literal first and every POST body silently vanished).
+  let clean = str_replace (char_from_int 13) "" raw
+  let split_at = str_find "\n\n" clean
+  let head_part = if split_at < 0 then clean else str_sub clean 0 split_at
+  let body = if split_at < 0 then ""
+             else str_sub clean (split_at + 2) (length (chars clean))
+  let lines = str_split "\n" head_part
+  if length lines == 0 then ("GET", "/", [], "")
+  else
+    let (method, path, v) = parse_request_line (head lines)
+    (method, path, [], body)
+
+main =
+  let port_s = argv_get args "--port" "9180"
+  let ledger_path = argv_get args "--ledger" "/tmp/railserve_ledger.jsonl"
+  let prefix = argv_get args "--prefix" ""
+  let corpus_path = argv_get args "--corpus" ""
+  let max_cap = parse_int (argv_get args "--max-cap" "256")
+  let port = parse_int port_s
+
+  -- model: checkpoint if given and present, else the deterministic demo
+  let use_ckpt = if length (chars prefix) > 0 then ckpt_exists prefix else false
+  let vocab_text = if use_ckpt then read_file corpus_path else demo_seed_text
+  let vocab = build_vocab vocab_text
+  let vw = vocab_size vocab
+  let packed =
+    if use_ckpt then
+      let weights = load_model prefix
+      let w_e = list_nth 0 weights
+      let gf = list_nth 1 weights
+      let n_blocks = (length weights - 2) / 9
+      let blocks = srv_unpack_blocks weights 2 n_blocks []
+      cons (cons w_e (cons (srv_transpose_cpu w_e) (cons gf []))) (cons blocks [])
+    else demo_model vw
+  let mdl = list_nth 0 packed
+  let blocks = list_nth 1 packed
+  let model_desc = if use_ckpt then cat ["v3-checkpoint:", prefix]
+                   else cat ["demo-patterned:vocab", show vw]
+  let genesis = sha256_hex (cat ["railserve-genesis:", model_desc])
+
+  -- fresh ledger per boot (v0): the genesis pins the model identity
+  let _ = write_file ledger_path ""
+  -- PC0 resident slot: [valid, ids, caches]
+  let cache_box = arr_new 3 0
+  -- signing key seed material (optional): sha256 of the key file's bytes
+  let key_path = argv_get args "--key-seed" ""
+  let key_seed = if length (chars key_path) > 0 then read_file key_path else ""
+  let st = cons mdl (cons blocks (cons vocab (cons ledger_path (cons cache_box (cons key_seed [])))))
+
+  let listen_fd = bind_tcp "127.0.0.1" port
+  if listen_fd < 0 then
+    let _ = print (cat ["ERROR: could not bind 127.0.0.1:", show port])
+    1
+  else
+    let _ = print (cat ["railserve S0 on 127.0.0.1:", show port,
+      " model=", model_desc, " genesis=", genesis])
+    serve_loop listen_fd st genesis 0 genesis max_cap
+
+srv_unpack_blocks weights idx count acc =
+  if count <= 0 then reverse acc
+  else
+    let b = srv_unpack_one weights idx
+    srv_unpack_blocks weights (idx + 9) (count - 1) (cons b acc)
+
+srv_unpack_one weights base =
+  let w0 = list_nth base weights
+  let w1 = list_nth (base + 1) weights
+  let w2 = list_nth (base + 2) weights
+  let w3 = list_nth (base + 3) weights
+  let w4 = list_nth (base + 4) weights
+  let w5 = list_nth (base + 5) weights
+  let w6 = list_nth (base + 6) weights
+  let w7 = list_nth (base + 7) weights
+  let w8 = list_nth (base + 8) weights
+  cons w0 (cons w1 (cons w2 (cons w3 (cons w4 (cons w5 (cons w6 (cons w7 (cons w8 []))))))))

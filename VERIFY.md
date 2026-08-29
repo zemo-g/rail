@@ -36,7 +36,7 @@ you run is exactly what the source you read produces. (Apple Silicon macOS;
 ./rail_native quick            # ~30s core subset
 ```
 
-The runner prints its own pass count. (The expected total — 182 — is an explicit gate inside `tools/compile.rail`; growing the suite moves the gate in the same diff, so a silently-skipped test still fails the run.)
+The runner prints its own pass count. (The expected total, 189, is an explicit gate inside `tools/compile.rail`; growing the suite moves the gate in the same diff, so a silently-skipped test still fails the run.)
 
 ## 3. The self-compile reaches a byte-identical fixed point
 

@@ -2374,3 +2374,244 @@ int tgl_exact_matmul_tiled(const double *Aq, const double *Bq,
     }
     return 1;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// ATTESTED FLOAT LAYER (ported 2026-08-27 from the beat-MLX engine).
+//
+// The determinism knob is fastMathEnabled = NO in tgl_fjit_compile:
+// with fast math on, the compiler reassociates float arithmetic and
+// substitutes approximate transcendentals, and reproducibility dies.
+// With it off, plus reduction order pinned in the kernels themselves
+// (single-accumulator fma loops, never a tree), simdgroup float GEMM
+// is byte-identical across devices: verified on M4 Pro (macOS 26.3),
+// M1 Ultra (26.4.1) and base M1 (26.5.1).
+//
+// This is what tools/infer/f9_engine.rail dispatches against.
+// ────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────────
+// ATTESTED FLOAT JIT (beat-MLX, 2026-07-15).  fastMath OFF is the
+// determinism knob: with it off + pinned reduction order, simdgroup float
+// GEMM is byte-identical cross-device (M1U==M4P, validated standalone in
+// ~/.ledatic/beat-mlx).  Reads /tmp/rail_fjit_kernel.metal (own tmp file);
+// appends to g_jit_pipes (shared kid space).  Parallel to the int path.
+int tgl_fjit_compile(int dummy) {
+    (void)dummy;
+    if (ensure_init() != 1) return -1;
+    if (!g_jit_pipes) g_jit_pipes = [NSMutableArray array];
+    NSError *err = nil;
+    NSString *src = [NSString stringWithContentsOfFile:@"/tmp/rail_fjit_kernel.metal"
+                                              encoding:NSUTF8StringEncoding error:&err];
+    if (!src) { fprintf(stderr, "tgl_fjit_compile: read failed: %s\n", err?[[err localizedDescription] UTF8String]:"?"); return -1; }
+    MTLCompileOptions *opts = [MTLCompileOptions new];
+    opts.fastMathEnabled = NO;                       // determinism-critical
+    if (@available(macOS 14.0, *)) opts.languageVersion = MTLLanguageVersion3_1;
+    id<MTLLibrary> lib = [g_device newLibraryWithSource:src options:opts error:&err];
+    if (!lib) { fprintf(stderr, "tgl_fjit_compile: compile failed: %s\n", err?[[err localizedDescription] UTF8String]:"?"); return -1; }
+    NSArray *names = [lib functionNames];
+    if (names.count == 0) { fprintf(stderr, "tgl_fjit_compile: no functions\n"); return -1; }
+    id<MTLFunction> fn = [lib newFunctionWithName:names[0]];
+    if (!fn) return -1;
+    id<MTLComputePipelineState> p = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!p) { fprintf(stderr, "tgl_fjit_compile: pipeline failed: %s\n", err?[[err localizedDescription] UTF8String]:"?"); return -1; }
+    [g_jit_pipes addObject:p];
+    return (int)(g_jit_pipes.count - 1);
+}
+
+// Tiled simdgroup float GEMM: C[MxN] = A[MxK] @ B[KxN].  Kernel = v1 (8x8
+// tile/threadgroup, 32 threads, sequential-K -> deterministic).  M,N,K must
+// be multiples of 8.  A/B/C are Rail float arrays (skip 1 header word).
+int tgl_fgemm(int kid, const double *A, const double *B, double *C, int M, int K, int N) {
+    if (kid < 0 || !g_jit_pipes || kid >= (int)g_jit_pipes.count) return -1;
+    if (ensure_init() != 1) return -1;
+    if (M<1||K<1||N<1||(M%8)||(N%8)||(K%8)) return -3;
+    const double *Ap=A+1,*Bp=B+1; double *Cp=C+1;
+    @autoreleasepool {
+        id<MTLBuffer> bA=pool_acquire((NSUInteger)M*K*4);
+        id<MTLBuffer> bB=pool_acquire((NSUInteger)K*N*4);
+        id<MTLBuffer> bC=pool_acquire((NSUInteger)M*N*4);
+        f64_to_f32(Ap,(float*)bA.contents,M*K);
+        f64_to_f32(Bp,(float*)bB.contents,K*N);
+        id<MTLComputePipelineState> p=g_jit_pipes[kid];
+        id<MTLCommandBuffer> cmd=[g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc=[cmd computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bA offset:0 atIndex:0];
+        [enc setBuffer:bB offset:0 atIndex:1];
+        [enc setBuffer:bC offset:0 atIndex:2];
+        uint32_t mu=M,ku=K,nu=N;
+        [enc setBytes:&mu length:4 atIndex:3];
+        [enc setBytes:&ku length:4 atIndex:4];
+        [enc setBytes:&nu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(N/8,M/8,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        [enc endEncoding];
+        [cmd commit]; [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) { pool_release(bA);pool_release(bB);pool_release(bC); return -2; }
+        f32_to_f64((float*)bC.contents,Cp,M*N);
+        pool_release(bA);pool_release(bB);pool_release(bC);
+    }
+    return 1;
+}
+
+// ── Resident FLOAT buffers + dispatch (beat-MLX B7.2).  Handles index g_fbufs.
+// Kernels bake ALL dims/constants as MSL constants and take only device float
+// buffers + thread id, so dispatch = bind handles + set grid.  Resident =
+// activations stay on GPU across the step (fast, no per-op round-trip).
+static NSMutableArray *g_fbufs = nil;
+int tgl_fabuf_alloc(int n){
+    if(ensure_init()!=1) return -1; if(n<1) return -1;
+    if(!g_fbufs) g_fbufs=[NSMutableArray array];
+    id<MTLBuffer> b=[g_device newBufferWithLength:(NSUInteger)n*4 options:MTLResourceStorageModeShared];
+    if(!b) return -1; memset(b.contents,0,(NSUInteger)n*4);
+    [g_fbufs addObject:b]; return (int)(g_fbufs.count-1);
+}
+int tgl_fabuf_upload(int h, const double* arr, int n){
+    if(!g_fbufs||h<0||h>=(int)g_fbufs.count) return -1;
+    id<MTLBuffer> b=g_fbufs[h]; if((NSUInteger)n*4>b.length) return -2;
+    f64_to_f32(arr+1,(float*)b.contents,n); return 0;
+}
+// dump resident f32 buffer to /tmp/rail_fdump.bin (weight-export glue; the
+// ledger binds buffer digests, so the dump itself is not part of the proof).
+int tgl_fabuf_dump(int h, int n){
+    if(!g_fbufs||h<0||h>=(int)g_fbufs.count) return -1;
+    id<MTLBuffer> b=g_fbufs[h]; if((NSUInteger)n*4>b.length) return -2;
+    FILE* f=fopen("/tmp/rail_fdump.bin","wb"); if(!f) return -3;
+    size_t w=fwrite(b.contents,4,(size_t)n,f); fclose(f);
+    return (w==(size_t)n)?0:-4;
+}
+// bulk f32 load: fread n floats at byte offset from /tmp/rail_fload.bin straight
+// into the resident buffer (the pure-Rail decode is exact but ~15s for 138M; this
+// is ~1s). Loader glue -- the ledger binds the loaded buffer digests either way.
+int tgl_fabuf_load_at(int h, int n, long off){
+    if(!g_fbufs||h<0||h>=(int)g_fbufs.count) return -1;
+    id<MTLBuffer> b=g_fbufs[h]; if((NSUInteger)n*4>b.length) return -2;
+    FILE* f=fopen("/tmp/rail_fload.bin","rb"); if(!f) return -3;
+    if(fseek(f,off,SEEK_SET)!=0){ fclose(f); return -4; }
+    size_t r=fread(b.contents,4,(size_t)n,f); fclose(f);
+    return (r==(size_t)n)?0:-5;
+}
+int tgl_fabuf_download(int h, double* arr, int n){
+    if(!g_fbufs||h<0||h>=(int)g_fbufs.count) return -1;
+    id<MTLBuffer> b=g_fbufs[h]; f32_to_f64((float*)b.contents,arr+1,n); return 0;
+}
+// fnv1a over the resident f32 buffer -> prints hex (Rail 63-bit int can't hold u64).
+int tgl_fabuf_hashprint(int h, int n){
+    if(!g_fbufs||h<0||h>=(int)g_fbufs.count) return -1;
+    id<MTLBuffer> b=g_fbufs[h]; const unsigned char* p=(const unsigned char*)b.contents;
+    unsigned long long hh=1469598103934665603ULL;
+    for(int i=0;i<n*4;i++){ hh^=p[i]; hh*=1099511628211ULL; }
+    fprintf(stdout,"FBUF_HASH %016llx\n", hh); fflush(stdout); return 0;
+}
+// fnv1a over the resident f32 buffer, returned masked to Rail's 62-bit int range
+// (for building a hash-chained ledger in Rail).
+long tgl_fabuf_digest(int h, int n){
+    if(!g_fbufs||h<0||h>=(int)g_fbufs.count) return -1;
+    id<MTLBuffer> b=g_fbufs[h]; const unsigned char* p=(const unsigned char*)b.contents;
+    unsigned long long hh=1469598103934665603ULL;
+    for(int i=0;i<n*4;i++){ hh^=p[i]; hh*=1099511628211ULL; }
+    return (long)(hh & 0x3FFFFFFFFFFFFFFFULL);
+}
+#define FB(h) ((id<MTLBuffer>)g_fbufs[h])
+// ── batched submission ──────────────────────────────────────────────────
+//
+// Every f-kernel call below used to build its own command buffer, encode
+// one dispatch, commit, and waitUntilCompleted. That is one full CPU-GPU
+// round trip per dispatch. Batch-1 transformer decode issues 18 dispatches
+// per block across 16 blocks, so 288 round trips per token, and
+// tools/infer/rl0_gate.rail measured what that costs on 2026-08-28: 288
+// EMPTY dispatches took 24.7 ms while a real decode step took 36.1 ms.
+// Roughly 80% of every token was the submission boundary, and the engine
+// was running at ~6% of this machine's measured read bandwidth. It was
+// never memory-bound; it was waiting.
+//
+// Between tgl_batch_begin and tgl_batch_end, dispatches encode into one
+// shared command buffer and nothing commits or waits until the end. The
+// kernels, their arguments, and their order are untouched, so the numbers
+// cannot move: only when the CPU stops to listen changes. Determinism is
+// checked rather than assumed -- the parity gates must stay byte-identical
+// across this change, which is the whole reason they exist.
+//
+// The encoder is the default MTLDispatchTypeSerial, so Metal keeps
+// dispatches ordered and memory-coherent within the buffer exactly as
+// separate command buffers did. A concurrent encoder would need explicit
+// barriers and would not be a drop-in.
+//
+// Opt-in and re-entrant-safe: with no batch open, every call behaves
+// exactly as before, so existing callers are unaffected.
+static id<MTLCommandBuffer>        g_bcmd = nil;
+static id<MTLComputeCommandEncoder> g_benc = nil;
+static int g_batching = 0;
+
+int tgl_batch_begin(int dummy){
+    (void)dummy;
+    if (ensure_init() != 1) return -1;
+    if (g_batching) return 1;                 // nesting collapses to one batch
+    g_bcmd = [g_queue commandBuffer];
+    g_benc = [g_bcmd computeCommandEncoder];
+    if (!g_bcmd || !g_benc) { g_bcmd = nil; g_benc = nil; return -1; }
+    g_batching = 1;
+    return 1;
+}
+
+// Commits and blocks until the GPU is done, so results are readable after
+// this returns exactly as they were after each individual call before.
+int tgl_batch_end(int dummy){
+    (void)dummy;
+    if (!g_batching) return 1;
+    [g_benc endEncoding];
+    [g_bcmd commit];
+    [g_bcmd waitUntilCompleted];
+    int st = (g_bcmd.status == MTLCommandBufferStatusCompleted) ? 1 : -2;
+    g_benc = nil; g_bcmd = nil; g_batching = 0;
+    return st;
+}
+
+#define FSTART(kid) if(kid<0||!g_jit_pipes||kid>=(int)g_jit_pipes.count) return -1; if(!g_fbufs) return -1; if(ensure_init()!=1) return -1; \
+    id<MTLCommandBuffer> cmd=nil; id<MTLComputeCommandEncoder> enc=nil; \
+    if(g_batching){ enc=g_benc; } else { cmd=[g_queue commandBuffer]; enc=[cmd computeCommandEncoder]; } \
+    [enc setComputePipelineState:g_jit_pipes[kid]];
+#define FDONE if(g_batching) return 1; [enc endEncoding];[cmd commit];[cmd waitUntilCompleted]; return (cmd.status==MTLCommandBufferStatusCompleted)?1:-2;
+
+int tgl_fgemm_r(int kid,int hA,int hB,int hC,int M,int K,int N){
+    if(M%8||N%8||K%8) return -3;
+    FSTART(kid) [enc setBuffer:FB(hA) offset:0 atIndex:0];[enc setBuffer:FB(hB) offset:0 atIndex:1];[enc setBuffer:FB(hC) offset:0 atIndex:2];
+    uint32_t mu=M,ku=K,nu=N;[enc setBytes:&mu length:4 atIndex:3];[enc setBytes:&ku length:4 atIndex:4];[enc setBytes:&nu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(N/8,M/8,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)]; FDONE
+}
+int tgl_ftr_r(int kid,int hI,int hO,int R,int C){
+    FSTART(kid) [enc setBuffer:FB(hI) offset:0 atIndex:0];[enc setBuffer:FB(hO) offset:0 atIndex:1];
+    uint32_t ru=R,cu=C;[enc setBytes:&ru length:4 atIndex:2];[enc setBytes:&cu length:4 atIndex:3];
+    [enc dispatchThreads:MTLSizeMake(C,R,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)]; FDONE
+}
+int tgl_f1_r(int kid,int hI,int hO,int nth){
+    FSTART(kid) [enc setBuffer:FB(hI) offset:0 atIndex:0];[enc setBuffer:FB(hO) offset:0 atIndex:1];
+    dispatch_1d(enc,(uint32_t)nth); FDONE
+}
+int tgl_f2_r(int kid,int hA,int hB,int hO,int nth){
+    FSTART(kid) [enc setBuffer:FB(hA) offset:0 atIndex:0];[enc setBuffer:FB(hB) offset:0 atIndex:1];[enc setBuffer:FB(hO) offset:0 atIndex:2];
+    dispatch_1d(enc,(uint32_t)nth); FDONE
+}
+int tgl_flnf_r(int kid,int hH,int hg,int hb,int hxh,int hHn,int hri,int rows){
+    FSTART(kid) [enc setBuffer:FB(hH) offset:0 atIndex:0];[enc setBuffer:FB(hg) offset:0 atIndex:1];[enc setBuffer:FB(hb) offset:0 atIndex:2];
+    [enc setBuffer:FB(hxh) offset:0 atIndex:3];[enc setBuffer:FB(hHn) offset:0 atIndex:4];[enc setBuffer:FB(hri) offset:0 atIndex:5];
+    dispatch_1d(enc,(uint32_t)rows); FDONE
+}
+int tgl_flnb_r(int kid,int hdHn,int hxh,int hri,int hg,int hdH,int rows){
+    FSTART(kid) [enc setBuffer:FB(hdHn) offset:0 atIndex:0];[enc setBuffer:FB(hxh) offset:0 atIndex:1];[enc setBuffer:FB(hri) offset:0 atIndex:2];
+    [enc setBuffer:FB(hg) offset:0 atIndex:3];[enc setBuffer:FB(hdH) offset:0 atIndex:4];
+    dispatch_1d(enc,(uint32_t)rows); FDONE
+}
+int tgl_flnp_r(int kid,int hdHn,int hxh,int hdg,int hdb,int nth){
+    FSTART(kid) [enc setBuffer:FB(hdHn) offset:0 atIndex:0];[enc setBuffer:FB(hxh) offset:0 atIndex:1];[enc setBuffer:FB(hdg) offset:0 atIndex:2];[enc setBuffer:FB(hdb) offset:0 atIndex:3];
+    dispatch_1d(enc,(uint32_t)nth); FDONE
+}
+// step (int) instead of float c1/c2 args: Rail FFI mixes int+float args
+// unreliably (floats go to d-registers separately from x-register ints), so
+// keep the foreign ALL-INT and compute bias-correction c1=1-b1^step, c2=1-b2^step
+// here in C from the integer step.
+int tgl_fadam_r(int kid,int hW,int hM,int hV,int hG,int n,int step){
+    double p1=1.0,p2=1.0; for(int i=0;i<step;i++){ p1*=0.9; p2*=0.999; }
+    float c1f=(float)(1.0-p1), c2f=(float)(1.0-p2);
+    FSTART(kid) [enc setBuffer:FB(hW) offset:0 atIndex:0];[enc setBuffer:FB(hM) offset:0 atIndex:1];[enc setBuffer:FB(hV) offset:0 atIndex:2];[enc setBuffer:FB(hG) offset:0 atIndex:3];
+    [enc setBytes:&c1f length:4 atIndex:4];[enc setBytes:&c2f length:4 atIndex:5];
+    dispatch_1d(enc,(uint32_t)n); FDONE
+}

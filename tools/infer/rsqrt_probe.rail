@@ -1,0 +1,81 @@
+-- tools/infer/rsqrt_probe.rail — is 1.0f/sqrt(x) actually IEEE-portable?
+--
+-- Written 2026-08-27 to settle whether rsqrt is portable, and kept
+-- because the answer is useful and the investigation is instructive.
+--
+-- RESULT: rsqrt(x) is NOT correctly rounded. It differs from
+-- 1.0f/sqrt(x) on about 28% of inputs by roughly one ulp. But BOTH forms
+-- hash identically on M4 Pro (macOS 26.3), M1 Ultra (26.4.1) and base M1
+-- (26.5.1), so Apple ships the same approximation across generations and
+-- portability was never actually at risk. LayerNorm uses 1.0f/sqrt
+-- anyway: sqrt and divide are IEEE-exact-required, which upgrades an
+-- empirical agreement to a specification-backed one.
+--
+-- The instructive part: this probe was written because the Studio
+-- appeared to disagree with the other two machines, which would have
+-- been fatal to the whole determinism claim. It had not. The Studio was
+-- running a STALE COPY of the gate, and the file-hash check that was
+-- supposed to catch that compared the wrong file. Four steps of chasing
+-- a physics ghost that was really a scp I never made. This is the
+-- argument for binding the compiled kernel source hash, OS build, and
+-- Metal version into any receipt: a stale binary should be detectable,
+-- not silently authoritative.
+import "stdlib/tensor.rail"
+
+foreign tgl_fjit_compile dummy -> int
+foreign tgl_fabuf_alloc n -> int
+foreign tgl_fabuf_upload h arr n -> int
+foreign tgl_fabuf_download h arr n -> int
+foreign tgl_fabuf_hashprint h n -> int
+foreign tgl_f1_r kid i o nth -> int
+
+compile_k msl = let _ = write_file "/tmp/rail_fjit_kernel.metal" msl in tgl_fjit_compile 0
+
+k_rsq = cat ["#include <metal_stdlib>\nusing namespace metal;\n",
+  "kernel void rsq(device const float* X, device float* O, uint i [[thread_position_in_grid]]){O[i]=rsqrt(X[i]);}\n"]
+k_div = cat ["#include <metal_stdlib>\nusing namespace metal;\n",
+  "kernel void dvs(device const float* X, device float* O, uint i [[thread_position_in_grid]]){O[i]=1.0f/sqrt(X[i]);}\n"]
+
+fill a n i =
+  if i >= n then 0
+  else
+    let v = 0.00001 +. (int_to_float ((i * 7919) % 100000)) /. 1000.0
+    let _ = float_arr_set a i v
+    fill a n (i + 1)
+
+main =
+  let n = 4096
+  let kr = compile_k k_rsq
+  let kd = compile_k k_div
+  let a = float_arr_new n 0.0
+  let _ = fill a n 0
+  let hX = tgl_fabuf_alloc n
+  let _ = tgl_fabuf_upload hX a n
+  let hR = tgl_fabuf_alloc n
+  let hD = tgl_fabuf_alloc n
+  let _ = tgl_f1_r kr hX hR n
+  let _ = tgl_f1_r kd hX hD n
+  let _ = print "rsqrt(x)      hash:"
+  let _ = tgl_fabuf_hashprint hR n
+  let _ = print "1.0f/sqrt(x)  hash:"
+  let _ = tgl_fabuf_hashprint hD n
+  -- how many of the 4096 differ, and by how much
+  let ra = float_arr_new n 0.0
+  let da = float_arr_new n 0.0
+  let _ = tgl_fabuf_download hR ra n
+  let _ = tgl_fabuf_download hD da n
+  let cnt = arr_new 1 0
+  let mx = float_arr_new 1 0.0
+  let _ = diffs ra da n cnt mx 0
+  let _ = print (cat ["differing elements: ", show (arr_get cnt 0), " of ", show n,
+                      "; max |rsqrt - 1/sqrt| = ", show_float (float_arr_get mx 0)])
+  0
+
+diffs ra da n cnt mx i =
+  if i >= n then 0
+  else
+    let d = (float_arr_get ra i) -. (float_arr_get da i)
+    let ad = if d <. 0.0 then 0.0 -. d else d
+    let _ = if 0.0 <. ad then arr_set cnt 0 ((arr_get cnt 0) + 1) else 0
+    let _ = if (float_arr_get mx 0) <. ad then float_arr_set mx 0 ad else 0
+    diffs ra da n cnt mx (i + 1)
