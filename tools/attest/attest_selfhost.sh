@@ -40,13 +40,30 @@ src_sha=$(shasum -a 256 "$src"   | awk '{print $1}')
 pulse_start=$(get_pulse)
 echo "selfhost: commit=$short seed=${seed_sha:0:16} pulse_start=$pulse_start"
 
-echo "  pass 1 ..."
-./"$bin" self >"$dest/pass1.log" 2>&1
+# Attest the reproducible path, not the fallback. verify_reproducible.sh says
+# it outright: RAIL_ARENA_MB below 5000 "selects the as/ld fallback (not
+# bit-reproducible)". This script had no arena set, so it ran at the 1GB
+# default and was certifying a fixed point in the mode the project's own
+# verifier documents as not bit-reproducible. It read green because the seed
+# it happened to be handed also converged there; the committed seed is built
+# at 6000, and at 6000 it reproduces itself exactly.
+#
+# Same value and same default as verify_reproducible.sh and the nightly repro
+# witness, so all three checkers now attest the same thing.
+ARENA="${RAIL_ARENA_MB:-6000}"
+if [ "$ARENA" -lt 5000 ]; then
+  echo "selfhost: RAIL_ARENA_MB=$ARENA < 5000 is the as/ld fallback, which is not" >&2
+  echo "selfhost: bit-reproducible. Refusing to attest a fixed point from it." >&2
+  exit 2
+fi
+
+echo "  pass 1 ... (arena=${ARENA}MB)"
+RAIL_ARENA_MB="$ARENA" ./"$bin" self >"$dest/pass1.log" 2>&1
 mv /tmp/rail_self "$dest/rail_self_1"
 pass1_sha=$(shasum -a 256 "$dest/rail_self_1" | awk '{print $1}')
 
 echo "  pass 2 ..."
-./"$dest/rail_self_1" self >"$dest/pass2.log" 2>&1
+RAIL_ARENA_MB="$ARENA" ./"$dest/rail_self_1" self >"$dest/pass2.log" 2>&1
 mv /tmp/rail_self "$dest/rail_self_2"
 pass2_sha=$(shasum -a 256 "$dest/rail_self_2" | awk '{print $1}')
 
