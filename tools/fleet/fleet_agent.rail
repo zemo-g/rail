@@ -103,6 +103,7 @@ resp_ok body   = mk_resp 200 "OK"          body
 resp_403       = mk_resp 403 "Forbidden"   (cat ["{", q, "error", q, ": ", q, "forbidden", q, "}"])
 resp_404       = mk_resp 404 "Not Found"   (cat ["{", q, "error", q, ": ", q, "not found", q, "}"])
 resp_400       = mk_resp 400 "Bad Request" (cat ["{", q, "error", q, ": ", q, "missing cmd", q, "}"])
+resp_bad_ident = mk_resp 400 "Bad Request" (cat ["{", q, "error", q, ": ", q, "invalid identifier", q, "}"])
 resp_deny      = mk_resp 403 "Forbidden"   (cat ["{", q, "error", q, ": ", q, "command not whitelisted", q, "}"])
 
 -- JSON helpers ---------------------------------------------------------------
@@ -116,15 +117,39 @@ jobj pairs = cat ["{", join ", " pairs, "}"]
 
 -- Auth -----------------------------------------------------------------------
 
+-- Read the token without relying on the environment.
+--
+-- Rail's Linux runtime does not propagate envp: measured on the Pi, shell()
+-- sees ONE environment variable and no HOME, while the same probe on macOS
+-- sees 43. The macOS prologue takes envp from x2, the main(argc,argv,envp)
+-- convention, which a static Linux binary with its own _start never gets.
+-- So `~` does not expand there and this returned empty, which fed straight
+-- into check_auth's fail-open branch below.
+--
+-- `~` stays first because that is what works on the Macs. The getent form
+-- is the fallback and was verified under Rail's actual Linux shell(), not
+-- just under `env -i /bin/sh`: an earlier attempt passed the latter and
+-- still failed the former, and shipping it denied every request on the Pi.
+-- No ${...} braces: Rail treats { } inside a string as interpolation.
 load_token _ =
-  trim (shell "cat ~/.fleet/token 2>/dev/null || echo ''")
+  trim (shell "cat ~/.fleet/token 2>/dev/null || cat \"$(getent passwd $(id -u) | cut -d: -f6)/.fleet/token\" 2>/dev/null || printf ''")
 
 clean s =
   let _ = write_file "/tmp/_fleet_clean.txt" s
   trim (shell "sed 's/^[[:space:]]*//' /tmp/_fleet_clean.txt | tr -d '\\015'")
 
+-- Fail CLOSED: no readable token means deny, not allow.
+--
+-- This said `then true`. Combined with load_token returning empty on the
+-- Pi, it meant the control plane accepted a wrong token and no token
+-- alike, which is what it had been doing. v3 was hardened to deny in
+-- 519a18b; v2 was never updated, and v2 is what the Pi runs.
+--
+-- Only safe to change alongside the load_token fix above. On its own it
+-- denies every request, which is exactly what happened when it was tried
+-- first: the Pi's control plane went dark until it was rolled back.
 check_auth headers token =
-  if length token == 0 then true
+  if length token == 0 then false
   else
     let raw = get_header headers "X-Fleet-Token"
     let provided = clean raw
@@ -201,10 +226,36 @@ handle_status _ =
   let body = cat ["{", jstr "hostname" hostname, ", ", jstr "cpu" cpu, ", ", jstr "mem" mem, ", ", jstr "disk" disk, ", ", jstr "arch" arch, ", ", jstr "uptime" uptime, ", ", jstr "train_level" train_level, ", ", jstr "train_round" train_round, ", ", jstr "train_harvested" train_harvested, ", ", jstr "train_rate" train_last, ", ", q, "services", q, ": ", svc_arr, "}"]
   resp_ok body
 
+-- Strict allowlist for request-derived identifiers (service names, job ids)
+-- before they are interpolated into shell(). Ported from the v3 fix
+-- (710cd72), which patched fleet_agent_v3.rail only. This file is the v2
+-- agent, and it is what runs on the Pi, where v3 cannot be built at all
+-- (cross-compile duplicate symbols plus 416MB of RAM). So the node that
+-- could not take the fix was the node left holding the bug.
+--
+-- Denylists miss characters like '*', '?', '~', quotes and '='; an
+-- allowlist is the safe form. Letters, digits, '.', '_' and '-' only, which
+-- excludes every shell metacharacter, whitespace and '/'.
+ident_allowed _ =
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+
+ident_ok_chars cs =
+  if length cs == 0 then true
+  else if str_find (head cs) (ident_allowed 0) < 0 then false
+  else ident_ok_chars (tail cs)
+
+-- true iff s is non-empty and every character is in the allowlist.
+safe_ident s =
+  let cs = chars s
+  if length cs == 0 then false
+  else ident_ok_chars cs
+
 -- GET /logs/<svc>?lines=N ----------------------------------------------------
 
 handle_logs rest =
   let svc = strip_query rest
+  if safe_ident svc == false then resp_bad_ident
+  else
   let lines_n = parse_query_lines (query_of rest)
   let cmd = cat ["for p in ~/empire/logs/", svc, ".log /tmp/", svc, ".log ~/Library/Logs/", svc, "/", svc, ".log /var/log/", svc, ".log; do [ -f \"$p\" ] && tail -", show lines_n, " \"$p\" && break; done 2>/dev/null"]
   let output = shell cmd
@@ -243,6 +294,8 @@ handle_job_create body whitelist =
 
 handle_job_get id_raw =
   let id = strip_query id_raw
+  if safe_ident id == false then resp_bad_ident
+  else
   let dir = jobs_dir 0
   let status = trim (shell (cat ["cat ", dir, "/", id, ".status 2>/dev/null || echo not_found"]))
   let output = shell (cat ["head -c 20000 ", dir, "/", id, ".out 2>/dev/null"])
