@@ -1,4 +1,4 @@
-# A2 — GLM divergence cleaning: success metric, written before implementing
+# A2. GLM divergence cleaning: success metric, written before implementing
 
 **Date:** 2026-08-30
 **Rule being followed:** define success in user-facing terms BEFORE building, and

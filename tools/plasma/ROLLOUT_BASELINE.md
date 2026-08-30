@@ -1,7 +1,7 @@
-# Neural MHD surrogate — rollout baseline
+# Neural MHD surrogate: rollout baseline
 
 **Harness:** `tools/plasma/neural_mhd_rollout.rail`
-**Model:** `tools/plasma/neural_mhd_lib.rail` — MLP 30 -> 32 (ReLU) -> 6, 1190 params
+**Model:** `tools/plasma/neural_mhd_lib.rail`, MLP 30 -> 32 (ReLU) -> 6, 1190 params
 **Truth:** 32x32 Orszag-Tang, Lax-Friedrichs, gamma = 5/3
 **Measured:** 2026-08-30. Runs in ~3.5 s (trains, then rolls out).
 
@@ -43,7 +43,7 @@ improving. The diffusive LxF truth is decaying toward the same mean the
 collapsed model already sits at, so the two converge without the model ever
 having learned anything.
 
-## Where the folklore came from — the part worth keeping
+## Where the folklore came from: the part worth keeping
 
 The claim in circulation was **"0.5% single-step error, +/-3.2% over 200
 steps"**. The archived write-up
@@ -54,8 +54,8 @@ into a claim about the whole state, which it cannot support.
 
 The two columns in the baseline table above show why, directly. At step 40:
 
-- aggregate state error **36.4%** — the solution is unusable
-- total mass drift **0.23%** — the diagnostic looks excellent
+- aggregate state error **36.4%**: the solution is unusable
+- total mass drift **0.23%**: the diagnostic looks excellent
 
 **Total mass is a sum over cells, so errors cancel inside it. Aggregate L2 is
 a norm, so they do not.** A model can hold a conserved scalar to a fraction of
