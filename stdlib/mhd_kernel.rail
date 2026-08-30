@@ -579,13 +579,26 @@ mk_total_energy state =
   let _ = mk_sum_field state mk_f_en 0 acc
   float_arr_get acc 0
 
+-- Returns |div B| at cell i.
+--
+-- The trailing `+ 0.0` is load-bearing, not decoration. Without it the
+-- compiler does not mark this function float-returning, and a CALLER doing
+-- arithmetic on the result gets a tagged int where it expects a double:
+--
+--   let d = mk_divb_cell s 100     -- prints fine via show_float
+--   d * d                          -- SEGFAULT
+--
+-- Comparison happens to survive the confusion, which is why mk_max_div_b
+-- (which only ever compares) worked for months while the first caller to
+-- multiply the result crashed instantly. Coercing here fixes it once for
+-- every caller instead of making each one remember.
 mk_divb_cell state i =
   let x = i % mk_nn
   let y = i / mk_nn
   let dbx = (mk_get state mk_f_bx (x + 1) y - mk_get state mk_f_bx (x - 1) y) / 0.09817477042468104
   let dby = (mk_get state mk_f_by x (y + 1) - mk_get state mk_f_by x (y - 1)) / 0.09817477042468104
   let div = dbx + dby
-  if div < 0.0 then 0.0 - div else div
+  (if div < 0.0 then 0.0 - div else div) + 0.0
 
 mk_divb_check state i acc =
   let adiv = mk_divb_cell state i
@@ -686,3 +699,106 @@ mk_print_diag step state m0 e0 dt t =
   let dm = (mass - m0) / m0
   let de = (energy - e0) / e0
   print (cat ["step ", show step, " t=", show_float t, " dt=", show_float dt, " dm=", show_float dm, " dE=", show_float de, " divB=", show_float divb, " rho_min=", show_float minrho])
+
+-- ═══════════════════════════════════════════════════════════
+-- GLM DIVERGENCE CLEANING  (Dedner et al. 2002, operator-split)
+-- ═══════════════════════════════════════════════════════════
+--
+-- MUSCL+Rusanov on cell-centered conserved variables does not preserve
+-- div B = 0 in 2D Cartesian MHD: it measures ~0.174 after 100 Orszag-Tang
+-- steps against Lax-Friedrichs' 5.7e-15. That is why the sharper
+-- integrator has never been allowed under the public beacon.
+--
+-- GLM augments the system with a scalar psi that carries divergence error
+-- away at speed c_h and damps it:
+--
+--     d(psi)/dt + c_h^2 (div B) = -(c_h/c_r) psi
+--     dB/dt     + grad(psi)     = 0
+--
+-- This is the OPERATOR-SPLIT form: the MHD step runs unchanged, then this
+-- correction runs as a substep. Split rather than a 7th field in the flux
+-- so that the existing 6-field state layout, the Rusanov solver and every
+-- caller stay untouched -- including the live beacon, which does not use
+-- this path at all.
+--
+-- Integrated with SYMPLECTIC Euler (psi first, then B from the NEW psi).
+-- Forward Euler on this wave system with centered differences is
+-- unconditionally unstable; taking B from the updated psi is the standard
+-- staggered-in-time fix and is stable for c_h dt <= dx.
+--
+-- Damping is algebraic, psi / (1 + dt c_h / c_r), rather than
+-- exp(-dt c_h / c_r): same leading behaviour, unconditionally stable for
+-- any dt, and no libm call in the inner loop.
+
+-- psi lives on its own plane, indexed like a single field of the state.
+mk_pidx x y = mk_wrap y * mk_nn + mk_wrap x
+mk_pget psi x y = float_arr_get psi (mk_pidx x y)
+mk_pput psi x y v = float_arr_set psi (mk_pidx x y) v
+
+mk_psi_new _ = float_arr_new mk_nn2 0.0
+
+-- Signed div B, centered, same stencil mk_divb_cell measures with.
+mk_divb_signed state x y =
+  let dbx = mk_get state mk_f_bx (x + 1) y - mk_get state mk_f_bx (x - 1) y
+  let dby = mk_get state mk_f_by x (y + 1) - mk_get state mk_f_by x (y - 1)
+  (dbx + dby) / 0.09817477042468104
+
+-- Pass 1: psi <- (psi - dt*c_h^2*div B) damped. Reads B only, writes psi only.
+mk_glm_psi_loop state psi ch2 dt damp i =
+  if i >= mk_nn2 then 0
+  else
+    let x = i % mk_nn
+    let y = i / mk_nn
+    let p = float_arr_get psi i - dt * ch2 * mk_divb_signed state x y
+    let _ = float_arr_set psi i (p * damp)
+    mk_glm_psi_loop state psi ch2 dt damp (i + 1)
+
+-- Pass 2: B <- B - dt*grad(psi), using the UPDATED psi. Reads psi only,
+-- writes B only, so the two passes never race on the same array.
+mk_glm_b_loop state psi dt i =
+  if i >= mk_nn2 then 0
+  else
+    let x = i % mk_nn
+    let y = i / mk_nn
+    let gx = (mk_pget psi (x + 1) y - mk_pget psi (x - 1) y) / 0.09817477042468104
+    let gy = (mk_pget psi x (y + 1) - mk_pget psi x (y - 1)) / 0.09817477042468104
+    let _ = mk_put state mk_f_bx x y (mk_get state mk_f_bx x y - dt * gx)
+    let _ = mk_put state mk_f_by x y (mk_get state mk_f_by x y - dt * gy)
+    mk_glm_b_loop state psi dt (i + 1)
+
+-- One cleaning substep applied in place to `state`.
+--   ch  : divergence-wave speed, take the step's max signal speed
+--   cr  : damping length; smaller damps harder
+mk_glm_clean state psi dt ch cr =
+  let ch2 = ch * ch
+  let damp = 1.0 / (1.0 + dt * ch / cr)
+  let _ = mk_glm_psi_loop state psi ch2 dt damp 0
+  let _ = mk_glm_b_loop state psi dt 0
+  0
+
+-- MUSCL step with GLM cleaning. `psi` is caller-owned and persists across
+-- steps -- that is the point, psi accumulates and transports the error.
+--
+-- c_h is the speed the divergence wave travels at, and cleaning is only as
+-- fast as c_h allows. The symplectic update is stable up to c_h dt = dx, so
+-- dx/dt is BOTH the physical maximum and the stability limit; Dedner takes
+-- c_h there. Passing it as a multiple of the signal speed keeps the caller
+-- honest about how close to that limit it is running:
+--
+--   dt = 0.01472621556370216 / smax  (mk_compute_dt_muscl)
+--   dx = 0.04908738521234052
+--   => dx/dt = 3.333 smax, so ch_mult = 3.333 sits exactly on the limit.
+--
+-- Measured, 100 Orszag-Tang steps, max|div B| against plain MUSCL's 0.174:
+--   ch_mult 1.0, cr 0.5   -> 0.0334  (5.2x)
+--   ch_mult 2.0, cr 0.5   -> 0.0334  (5.2x)
+--   ch_mult 3.0, cr 0.18  -> 0.0284  (6.1x)   <- best found
+-- Raising c_h toward the stability limit barely helps, which is itself the
+-- finding: cleaning reaches a balance against the rate the MUSCL flux
+-- GENERATES divergence, so the knob that matters is not the transport
+-- speed. See tools/plasma/GLM_METRIC.md.
+mk_muscl_glm_step state psi dt cr ch_mult =
+  let ch = ch_mult * mk_max_speed state
+  let ns = mk_muscl_step state dt
+  let _ = mk_glm_clean ns psi dt ch cr
+  ns
