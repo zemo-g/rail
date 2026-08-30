@@ -1,0 +1,214 @@
+-- tools/plasma/neural_mhd_rollout.rail — the rollout harness.
+--
+-- WHAT THIS IS FOR
+--
+-- A surrogate's training loss says nothing about whether it can actually
+-- replace the solver. The only question that matters is: fed its OWN output
+-- back in, how long does it track the truth before it drifts?
+--
+-- This measures that. It runs the surrogate autoregressively against the
+-- 32x32 Lax-Friedrichs ground truth it was trained on, and reports per-field
+-- and aggregate relative L2 error at every step, plus the step at which the
+-- aggregate first crosses 1%, 5% and 10%.
+--
+-- HISTORY, AND WHY IT IS BEING WRITTEN AGAIN
+--
+-- The memory entry for this model claimed "0.5% single-step error, +/-3.2%
+-- over 200 steps". On 2026-06-21 a session built a harness like this one and
+-- FALSIFIED that claim: the real single-step aggregate was 0.493, roughly
+-- 100x worse, with the four signed fields collapsed to near-constant zero.
+-- The claim had never been measured.
+--
+-- That harness was never committed -- the session's guardrail said push
+-- nothing, and nothing was pushed. It is gone from every clone. The only
+-- surviving trace of the falsification is prose in a handoff file.
+--
+-- A falsification with no reproducible artifact behind it decays back into
+-- folklore, which is precisely how the original claim got there. So this is
+-- committed.
+--
+-- Usage:
+--   ./rail_native run tools/plasma/neural_mhd_rollout.rail
+--
+-- Reports to stdout. ~3.5 s end to end (measured): it trains, then measures.
+
+import "tools/plasma/neural_mhd_lib.rail"
+
+foreign sqrt x -> float
+
+rollout_steps = 40
+report_every = 5
+
+-- ═══════════════════════════════════════════════════════════
+-- ERROR METRIC
+-- Relative L2 per field:  ||pred - truth|| / ||truth||
+-- Float accumulators live in float_arr, never as TCO loop args
+-- (the estate's float-in-TCO trap).
+-- ═══════════════════════════════════════════════════════════
+
+-- acc[0] += (a-b)^2 over field f ; acc[1] += b^2 over field f
+l2_field_loop a b f acc i =
+  if i >= nn2 then 0
+  else
+    let pa = float_arr_get a (f * nn2 + i)
+    let pb = float_arr_get b (f * nn2 + i)
+    let d = pa - pb
+    let _ = float_arr_set acc 0 (float_arr_get acc 0 + d * d)
+    let _ = float_arr_set acc 1 (float_arr_get acc 1 + pb * pb)
+    l2_field_loop a b f acc (i + 1)
+
+-- Relative L2 for one field. Guarded: a truth field that is identically zero
+-- has no scale to be relative to, so report 0 rather than a division blowup.
+rel_l2_field a b f =
+  let acc = float_arr_new 2 0.0
+  let _ = l2_field_loop a b f acc 0
+  let num = float_arr_get acc 0
+  let den = float_arr_get acc 1
+  if den <= 0.0 then 0.0 else sqrt (num / den)
+
+-- Aggregate over all six fields together (one ratio, not a mean of ratios --
+-- a mean of ratios lets a well-predicted field mask a collapsed one).
+rel_l2_all_loop a b acc f =
+  if f >= nfields then 0
+  else
+    let _ = l2_field_loop a b f acc 0
+    rel_l2_all_loop a b acc (f + 1)
+
+rel_l2_all a b =
+  let acc = float_arr_new 2 0.0
+  let _ = rel_l2_all_loop a b acc 0
+  let num = float_arr_get acc 0
+  let den = float_arr_get acc 1
+  if den <= 0.0 then 0.0 else sqrt (num / den)
+
+copy_state src dst i =
+  if i >= state_size then 0
+  else
+    let _ = float_arr_set dst i (float_arr_get src i)
+    copy_state src dst (i + 1)
+
+-- ═══════════════════════════════════════════════════════════
+-- THE ROLLOUT
+-- ctx[0..2] = step at which aggregate first crossed 1% / 5% / 10%
+--             (0 means "not yet crossed")
+-- ═══════════════════════════════════════════════════════════
+
+note_crossing ctx slot thresh err step =
+  if float_arr_get ctx slot > 0.0 then 0
+  else if err > thresh then float_arr_set ctx slot (to_float step)
+  else 0
+
+rollout_loop nn_s truth mdl pf ps cbuf z1b a1b cacc ctx step =
+  if step > rollout_steps then 0
+  else
+    -- truth advances with its own CFL dt, exactly as training data was made
+    let dt = compute_dt truth
+    let nt = lxf_step truth dt
+    -- surrogate is fed its OWN previous output: that is the whole point
+    let _ = predict_grid nn_s mdl pf cbuf z1b a1b cacc 0
+    let _ = unpack_pred pf ps 0
+    let _ = copy_state ps nn_s 0
+    let agg = rel_l2_all nn_s nt
+    -- Mass drift alongside the state error, deliberately. The archived
+    -- claim "+/-3.2% over 200 steps" was about TOTAL MASS, a single scalar
+    -- summed over every cell -- and a sum cancels errors that an L2 norm
+    -- does not. Printing both in the same row is the whole point: it shows
+    -- a model can hold mass to a few percent while its state is unusable.
+    let mdrift = (total_mass nn_s - total_mass nt) / total_mass nt + 0.0
+    let amd = if mdrift < 0.0 then 0.0 - mdrift else mdrift
+    let _ = note_crossing ctx 0 0.01 agg step
+    let _ = note_crossing ctx 1 0.05 agg step
+    let _ = note_crossing ctx 2 0.10 agg step
+    let _ = if step == 1 then
+              print (cat ["  step ", show step, "  agg=", show_float agg,
+                          "  |dm/m|=", show_float amd,
+                          "   rho=", show_float (rel_l2_field nn_s nt 0),
+                          " mx=", show_float (rel_l2_field nn_s nt 1),
+                          " my=", show_float (rel_l2_field nn_s nt 2),
+                          " bx=", show_float (rel_l2_field nn_s nt 3),
+                          " by=", show_float (rel_l2_field nn_s nt 4),
+                          " en=", show_float (rel_l2_field nn_s nt 5)])
+            else if step % report_every == 0 then
+              print (cat ["  step ", show step, "  agg=", show_float agg,
+                          "   |dm/m|=", show_float amd])
+            else 0
+    rollout_loop nn_s nt mdl pf ps cbuf z1b a1b cacc ctx (step + 1)
+
+crossing_str ctx slot =
+  let v = float_arr_get ctx slot
+  if v <= 0.0 then "never" else show (float_to_int v)
+
+main =
+  let _ = print ""
+  let _ = print "  NEURAL MHD SURROGATE — AUTOREGRESSIVE ROLLOUT"
+  let _ = print "  metric: relative L2 vs the 32x32 LxF ground truth"
+  let _ = print ""
+
+  let _ = print "Generating training data (32x32, 20 steps)..."
+  let dx = float_arr_new 614400 0.0
+  let dy = float_arr_new 122880 0.0
+  let _ = gen_data dx dy
+
+  let mdl = arr_new 4 0
+  let w1 = float_arr_new w1_size 0.0
+  let _ = init_w_arr w1 w1_size 0
+  let _ = arr_set mdl 0 w1
+  let _ = arr_set mdl 1 (float_arr_new hidden 0.0)
+  let w2 = float_arr_new w2_size 0.0
+  let _ = init_w_arr w2 w2_size 0
+  let _ = arr_set mdl 2 w2
+  let _ = arr_set mdl 3 (float_arr_new out_dim 0.0)
+
+  let grads = arr_new 4 0
+  let _ = arr_set grads 0 (float_arr_new w1_size 0.0)
+  let _ = arr_set grads 1 (float_arr_new hidden 0.0)
+  let _ = arr_set grads 2 (float_arr_new w2_size 0.0)
+  let _ = arr_set grads 3 (float_arr_new out_dim 0.0)
+
+  let buf = arr_new 4 0
+  let _ = arr_set buf 0 (float_arr_new (batch_sz * hidden) 0.0)
+  let _ = arr_set buf 1 (float_arr_new (batch_sz * hidden) 0.0)
+  let _ = arr_set buf 2 (float_arr_new (batch_sz * out_dim) 0.0)
+  let _ = arr_set buf 3 (float_arr_new 1 0.0)
+
+  let extra = arr_new 5 0
+  let _ = arr_set extra 0 (float_arr_new (batch_sz * out_dim) 0.0)
+  let _ = arr_set extra 1 (float_arr_new (batch_sz * hidden) 0.0)
+  let _ = arr_set extra 2 (float_arr_new (batch_sz * hidden) 0.0)
+  let lr_arr = float_arr_new 1 0.001
+  let _ = arr_set extra 3 lr_arr
+  let _ = arr_set extra 4 (float_arr_new 1 0.0)
+
+  let _ = print "Training..."
+  let _ = train_mlp dx dy mdl grads buf extra 20480 0
+  let _ = print ""
+
+  let _ = print (cat ["Rolling out ", show rollout_steps, " steps, surrogate fed its own output:"])
+  let nn_s = init_state
+  let truth = init_state
+  let pf = float_arr_new (nn2 * 6) 0.0
+  let ps = float_arr_new state_size 0.0
+  let cbuf = float_arr_new 30 0.0
+  let z1b = float_arr_new hidden 0.0
+  let a1b = float_arr_new hidden 0.0
+  let cacc = float_arr_new 1 0.0
+  let ctx = float_arr_new 3 0.0
+  let _ = rollout_loop nn_s truth mdl pf ps cbuf z1b a1b cacc ctx 1
+
+  let _ = print ""
+  let _ = print "  ── crossings (aggregate relative L2) ──"
+  let _ = print (cat ["  first step above  1% : ", crossing_str ctx 0])
+  let _ = print (cat ["  first step above  5% : ", crossing_str ctx 1])
+  let _ = print (cat ["  first step above 10% : ", crossing_str ctx 2])
+  let _ = print ""
+  let _ = print "  Read the per-field row at step 1. If the signed fields"
+  let _ = print "  (mx, my, bx, by) sit near 1.0 the model has collapsed them"
+  let _ = print "  to a constant and the aggregate is being carried by rho"
+  let _ = print "  and energy alone."
+  let _ = print ""
+  let _ = print "  Compare the two columns. Total mass is a SUM over cells, so"
+  let _ = print "  errors cancel in it; aggregate L2 is a norm, so they do not."
+  let _ = print "  The archived '+/-3.2% over 200 steps' figure was the mass"
+  let _ = print "  column. It was never wrong -- it was promoted into a claim"
+  let _ = print "  about the whole state, which it cannot support."
+  0
