@@ -26,6 +26,22 @@ All notable changes to Rail are documented here.
   rather than re-signed. `VERIFY.md` and `README.md` now say the seed links
   `libSystem` and that `gpu_map` needs a Metal device.
 
+- **`run_test` compared only the FIRST line of a test program's output.**
+  `trim` ran before the stdout/exit split, so a crash (exit 139), a nonzero
+  status, and any extra line after a matching first line were all invisible,
+  and a correct multi-line expectation could not pass. The runner now keeps
+  full stdout and the exit status apart: a silent program asserts on its
+  exit status, a printing program on its whole output and must not have
+  died by signal. Re-running the 190 existing tests under the new rule
+  flipped no verdict. `t191 runner_judges_evidence` holds the review's
+  table as a test of the runner itself. Suite 190 -> 191.
+- **`docs/STATUS.md` was stale and could not be checked for staleness.**
+  It embedded the generation minute, so `check.sh` section 4 could never
+  match byte-for-byte, and the committed copy still carried the pre-#61
+  compiler size and seed hash. The generator no longer prints a timestamp,
+  names an untagged checkout instead of leaving the release blank, states
+  the `libSystem` and `as`/`ld` boundary, and the committed copy is
+  regenerated.
 - **`rail_native run` discarded the program's exit code** (returned a
   hardcoded 0).  Every caller that branched on a Rail program's status
   silently saw success.  This is what let the daily attestation job
