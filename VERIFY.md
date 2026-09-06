@@ -63,12 +63,14 @@ less grammar/rail.ebnf
 ## 5. The status numbers are recomputed live
 
 ```bash
-./rail_native run tools/deploy/gen_status.rail && cat docs/STATUS.md
+./rail_native run tools/deploy/gen_status.rail && git diff --exit-code docs/STATUS.md
 ```
 
-[`docs/STATUS.md`](docs/STATUS.md) is regenerated from the source tree on every
-run (compiler LOC, stdlib count, seed hash/size, dependency boundary), so it
-cannot drift. Each row carries the command to re-verify it.
+[`docs/STATUS.md`](docs/STATUS.md) is a pure function of the source tree
+(compiler LOC, stdlib count, seed hash/size, dependency boundary): no timestamp,
+so a clean `git diff` after regeneration means the committed copy is current,
+and `check.sh` section 4 fails when it is not. Each row carries the command to
+re-verify it. Regenerate and commit it whenever the compiler or the seed changes.
 
 ## 6. A release is attested against a public beacon
 
