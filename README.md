@@ -146,7 +146,7 @@ publish both — a benchmark quoted without its failure mode is marketing.
 
 ## Why Rail
 
-- **No C in the core.** The seed binary needs only the kernel — since v5.2.0 it assembles, links, and signs itself (no `as`/`ld`/`codesign`). No glibc, no OpenSSL, no runtime C; the GC is ~300 lines of ARM64 assembly inside the compiler. Optional concurrency, GPU (Metal), and JIT features use a small asm/ObjC/C boundary, tracked honestly in [`SHIMS.md`](SHIMS.md).
+- **No C in the core.** The seed binary links only `libSystem` (macOS's kernel interface; `otool -L rail_native` shows nothing else). Since v5.2.0 it assembles, links, and signs itself (no `as`/`ld`/`codesign`). No glibc, no OpenSSL, no runtime C; the GC is ~300 lines of ARM64 assembly inside the compiler. Optional concurrency, GPU (Metal), and JIT features use a small asm/ObjC/C boundary, tracked honestly in [`SHIMS.md`](SHIMS.md).
 - **Byte-identical self-compile.** `./rail_native self` produces output identical to the binary that produced it. The compiler's own source is the regression suite.
 - **One binary checks everything.** Training loops, tests, site generation, HTTPS clients — all compiled by the same binary you cloned. That makes the compiler a single, reproducible *checker* you can re-run yourself — not a proof of correctness: a program can compile and still be wrong. Compilation proves a program is *accepted by the binary you run*, nothing more.
 - **Production surface is narrow and honest.** Rail ships the crypto it uses (ChaCha20-Poly1305, x25519, SHA-256/384/512, ECDSA-P256/P384/P521, RSA-PSS/PKCS1) and nothing more. Every primitive is NIST- or RFC-vector-validated.

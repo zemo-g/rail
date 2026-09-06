@@ -5,6 +5,27 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Fixed
+- **The shell attestation verifier never bound the file to the signature.**
+  `tools/attest/verify.sh` compared the file's hash with the UNSIGNED
+  `artifact.sha256` sidecar field and verified the Ed25519 signature over
+  `witness.digest_sha256`, without requiring the two digests to agree. A
+  replacement artifact plus an edited sidecar reused a real signature and
+  printed `ok`. Both digests must now equal the file's, and
+  `tools/attest/verify_selftest.sh` holds the positive control and the
+  replacement-artifact negative control against both verifiers (the Rail
+  verifier already rejected it). Found by an outside first-pass review,
+  2026-09-06.
+- **`tools/verify/check.sh` inferred success from the absence of the word
+  FAIL**, so a test process that crashed without printing it (exit 139)
+  produced `passed: 4 failed: 0`. Section 2 now requires exit 0 and an
+  N/N summary line; section 5 runs the Rail verifier against the newest
+  release's attested compiler source instead of testing that a file exists;
+  section 6 runs the verifier selftest.
+- **`selfhost/f86f082`**: its sidecar signs bytes the public-surface scrub
+  (`c4f6050`) later rewrote. Retired to `.stale` with a `PROVENANCE.md`
+  rather than re-signed. `VERIFY.md` and `README.md` now say the seed links
+  `libSystem` and that `gpu_map` needs a Metal device.
+
 - **`rail_native run` discarded the program's exit code** (returned a
   hardcoded 0).  Every caller that branched on a Rail program's status
   silently saw success.  This is what let the daily attestation job
