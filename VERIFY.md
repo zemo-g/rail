@@ -9,7 +9,7 @@ section for exactly what each check does and does not establish).
 
 ```bash
 tools/verify/check.sh          # full self-audit (~25 min: rebuild + tests)
-tools/verify/check.sh --quick  # fast pass (~1 min: skips the rebuild, quick tests)
+tools/verify/check.sh --quick  # fast pass (~2 min: skips the rebuild, quick tests)
 ```
 
 …or run any single check below on its own.
@@ -29,14 +29,20 @@ binary is byte-for-byte identical to the committed one. A match proves the binar
 you run is exactly what the source you read produces. (Apple Silicon macOS;
 `RAIL_ARENA_MB>=6000`.)
 
-## 2. The tests pass — and the runner reports its own count
+## 2. The tests pass, and the runner reports its own count
 
 ```bash
-./rail_native test             # full suite, self-reports N/N
-./rail_native quick            # ~30s core subset
+./rail_native test; echo "exit $?"      # full suite, self-reports N/N and exits 0 iff N == N
+./rail_native quick                    # ~30s core subset
 ```
 
-The runner prints its own pass count. (The expected total — 182 — is an explicit gate inside `tools/compile.rail`; growing the suite moves the gate in the same diff, so a silently-skipped test still fails the run.)
+The runner prints its own pass count and its exit status carries the verdict.
+The expected total is an explicit gate inside `tools/compile.rail` (grep
+`tests passed`); growing the suite moves the gate in the same diff, so a
+silently-skipped test still fails the run. One test, `gpu_map`, needs a Metal
+device: on a machine without one it reports "No Metal device" and counts as a
+failure, which is honest but means GPU behaviour is only verified on Apple
+Silicon with a GPU attached.
 
 ## 3. The self-compile reaches a byte-identical fixed point
 
@@ -67,11 +73,19 @@ cannot drift. Each row carries the command to re-verify it.
 ## 6. A release is attested against a public beacon
 
 ```bash
-ls tools/attest/               # attest.rail (Rail verifier), release_index.rail, ...
+tools/attest/verify_selftest.sh        # positive control + a replacement artifact both verifiers must reject
+git show 28ad78be16259b7c9af48bbf3e2a06810aa6491e:tools/compile.rail > /tmp/v530_compile.rail
+./rail_native run tools/attest/verify.rail /tmp/v530_compile.rail releases/v5.3.0/compile.rail.attestation.json
 ```
 
 Tagged releases are Ed25519-signed and anchored to a public entropy beacon; the
-verifier is itself Rail. See `tools/attest/`.
+verifier is itself Rail (`tools/attest/verify.rail`), and `check.sh` runs it
+against the newest `releases/v*/index.json`. The witness public key is fetched
+from `https://ledatic.org/attest/fleet0.pub.pem` on first use; that fetch trusts
+the site's TLS, nothing more. A verifier passes only when the file's digest
+equals the digest inside the signed witness; the unsigned `artifact.sha256`
+field in the sidecar must agree with both (until 2026-09-06 the shell verifier
+compared only the unsigned field, see `verify_selftest.sh`).
 
 ---
 
@@ -82,6 +96,11 @@ verifier is itself Rail. See `tools/attest/`.
 - **They do *not* prove correctness.** A program (or the compiler) can compile,
   reproduce, and be signed, and still be wrong. Compilation means *accepted by
   the binary you run*, not *correct*.
+- **Platform boundary:** "no C" means no C in the source-owned compiler and
+  runtime, and no external assembler, linker, or signer on the reproducible
+  path. The macOS seed still links `libSystem` (the kernel interface), and the
+  everyday `./rail_native file.rail` builds use the system `as` and `ld`. GPU
+  paths are only exercised where a Metal device exists.
 - **One honest gap:** a Rail compiler verifying a Rail compiler is not an
   *independent* check — it does not defeat a trusting-trust attack. Closing that
   (diverse double-compilation or a non-Rail reference checker) is open work, not

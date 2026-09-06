@@ -45,8 +45,16 @@ import json,sys
 a = json.load(open('$att'))
 print((a.get('artifact') or a.get('frame') or {}).get('sha256',''))
 ")
+signed_digest=$(python3 -c "import json;print(json.load(open('$att'))['witness'].get('digest_sha256',''))")
 [ -n "$want_digest" ] || { echo "no sha256 in attestation" >&2; exit 5; }
-[ "$have_digest" = "$want_digest" ] || { echo "digest mismatch: file=$have_digest att=$want_digest" >&2; exit 5; }
+[ -n "$signed_digest" ] || { echo "no witness.digest_sha256 in attestation" >&2; exit 5; }
+# Bind the file to the SIGNATURE, not just to the unsigned sidecar field.
+# The signature covers witness.digest_sha256; artifact.sha256 is plain text
+# anyone can edit. Until 2026-09-06 only the unsigned field was compared, so a
+# replacement artifact plus an edited sidecar reused a real signature and
+# printed ok (found by an outside first-pass review). All three must agree.
+[ "$have_digest" = "$signed_digest" ] || { echo "digest mismatch: file=$have_digest signed=$signed_digest" >&2; exit 5; }
+[ "$want_digest" = "$signed_digest" ] || { echo "sidecar digest $want_digest does not match signed digest $signed_digest" >&2; exit 5; }
 
 # Reconstruct canonical message and verify Ed25519 sig.
 python3 - "$att" > /tmp/attest_msg.bin <<'PY'
