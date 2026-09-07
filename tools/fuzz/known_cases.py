@@ -57,7 +57,8 @@ def main():
         if a.only and name != a.only:
             continue
         got = observe(a.compiler, repo, KNOWN / f"{name}.rail", a.timeout)
-        passed = got == expected
+        # an expected value of "compile error:" means the program must be REFUSED
+        passed = got.startswith(expected) if expected == "compile error:" else got == expected
         if status == "live":
             if passed:
                 bad += 1
