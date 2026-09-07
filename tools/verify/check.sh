@@ -62,15 +62,24 @@ else
     no "$tag: no witness pubkey at $PUB (set RAIL_WITNESS_PUB or fetch https://ledatic.org/attest/fleet0.pub.pem)"
   else
     git show "$commit:tools/compile.rail" > "$tmp/compile.rail"
-    v=$(RAIL_ARENA_MB=2000 ./rail_native --out-prefix "$tmp/verify" run tools/attest/verify.rail \
-          "$tmp/compile.rail" "$idx/compile.rail.attestation.json" "$PUB" 2>&1 | grep -E '^(ok|BAD)' | tail -1)
-    case "$v" in ok*) ok "$tag compile.rail @ ${commit:0:7}: $v";; *) no "$tag compile.rail: ${v:-verifier produced no verdict}";; esac
+    # Both signals, captured separately: the verifier's exit status AND its
+    # verdict line. A verifier that prints ok and then dies (exit 139) is not
+    # a pass; neither is one that exits 0 without saying ok.
+    RAIL_ARENA_MB=2000 ./rail_native --out-prefix "$tmp/verify" run tools/attest/verify.rail \
+          "$tmp/compile.rail" "$idx/compile.rail.attestation.json" "$PUB" >"$tmp/verify.log" 2>&1; vrc=$?
+    v=$(grep -E '^(ok|BAD)' "$tmp/verify.log" | tail -1)
+    if [ "$vrc" = 0 ] && [ "${v#ok}" != "$v" ]; then ok "$tag compile.rail @ ${commit:0:7}: $v (exit 0)"
+    else no "$tag compile.rail: exit $vrc, verdict '${v:-none}'"; fi
   fi
 fi
 
 echo "== 6. The verifier binds the file to the signature (rejects a replacement artifact) =="
 if tools/attest/verify_selftest.sh "$PUB" >"$tmp/selftest.log" 2>&1; then ok "positive and replacement-artifact controls behave (tools/attest/verify_selftest.sh)"
 else no "verify_selftest failed:"; sed 's/^/     /' "$tmp/selftest.log"; fi
+
+echo "== 7. This script fails on a crashing test process and on a verifier that says ok then dies =="
+if tools/verify/check_selftest.sh >"$tmp/check_selftest.log" 2>&1; then ok "umbrella negative controls behave (tools/verify/check_selftest.sh)"
+else no "check_selftest failed:"; sed 's/^/     /' "$tmp/check_selftest.log"; fi
 
 echo
 echo "passed: $pass   failed: $fail"
