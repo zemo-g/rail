@@ -1,12 +1,24 @@
 # SHIMS.md — Non-Rail surface in the Rail build/runtime
 
-Rail aims at zero non-Rail dependencies in the user program. The compiler is written in Rail and emits its own assembly; stdlib is Rail; tooling is Rail. The files below exist because kernel boundaries, GPU drivers, framework C ABIs, and bare-metal CPU bringup demand a small irreducible surface in another language. Each entry names the boundary, the byte cost, and what would let us delete it.
+Rail aims at zero non-Rail dependencies in the user program. The compiler is written in Rail and emits its own assembly; stdlib is Rail; tooling is primarily Rail, with external verification tools listed below. The files below exist because kernel boundaries, GPU drivers, framework C ABIs, and bare-metal CPU bringup demand a small irreducible surface in another language. Each entry names the boundary, the byte cost, and what would let us delete it.
 
 Totals below: **33 in-tree files in the build and runtime**, ~420 KB, plus a **7-file tree-sitter grammar** (~437 KB, almost all of it machine-generated `parser.c`) that ships for editors and is not part of the compiler, the runtime, or any build. Plus 8 gitignored UAV files (~213 KB) in their own section.
 
 **Scope of the claim.** This document accounts for the non-Rail surface in the build and runtime. It is not a claim that the repository contains no other language: 153 tracked Python, shell, and JavaScript files (~714 KB) carry deploy, attestation, and CI plumbing that runs *around* Rail rather than inside it. The thesis is that nothing between your source and the binary is written in C, not that no script exists anywhere in the tree.
 
 ---
+
+## External semantic verification tooling (excluded from the 33 build/runtime files)
+
+| Path | Language | Purpose |
+|---|---|---|
+| `tools/fuzz/semantic.py` | Python | Independent reference interpreter, generator, native comparison, reducer and replay. Runs in CPython so both evaluations do not depend on Rail's compiler. |
+| `tools/fuzz/test_semantic.py` | Python | Hand-calculated oracle controls and injected process-failure/replay tests. |
+
+These two files add testing infrastructure, not dependencies of the compiler or
+generated binaries. They are additional to the historical 153-file tooling
+inventory above and do not change the **33 build/runtime files** count. Obtain
+their current byte sizes with `wc -c tools/fuzz/semantic.py tools/fuzz/test_semantic.py`.
 
 ## 1. Kernel / syscall boundary
 
