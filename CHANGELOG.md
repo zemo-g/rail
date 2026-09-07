@@ -26,6 +26,14 @@ All notable changes to Rail are documented here.
   rather than re-signed. `VERIFY.md` and `README.md` now say the seed links
   `libSystem` and that `gpu_map` needs a Metal device.
 
+- **`check.sh` section 5 read the Rail verifier's verdict through a pipe and
+  lost its exit status**, so a verifier that printed `ok` and then died
+  (exit 139) still passed the umbrella 5/5 (found by the same outside
+  reviewer, 2026-09-07). The verdict line and the exit status are now
+  captured separately and both must agree, in `check.sh` and in
+  `verify_selftest.sh`. New `tools/verify/check_selftest.sh` runs the
+  umbrella against a stub `rail_native` three ways (well-behaved, test
+  process exit 139, verifier ok-then-139) and `check.sh` section 7 runs it.
 - **`run_test` compared only the FIRST line of a test program's output.**
   `trim` ran before the stdout/exit split, so a crash (exit 139), a nonzero
   status, and any extra line after a matching first line were all invisible,
