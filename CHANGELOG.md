@@ -44,6 +44,32 @@ All notable changes to Rail are documented here.
   name. Same test.
 
 ### Added
+- **Items 5 to 7 of the consolidation (2026-09-07):**
+  - *A 0x00 byte inside a string stays a documented limit.* A version of
+    append/join/chars that built length-tagged results in the GC arena
+    passed the full suite at generation 1, because generation 1 still
+    ran on the old runtime (a compiler embeds ITS OWN runtime into what
+    it builds, so a runtime change reaches the compiler itself only at
+    generation 2), and then wedged the compiler in the in-process linker
+    at generation 2: the compiler resets arena windows while holding
+    strings, which was safe only because join/append allocate outside
+    the arena. Reverted; `known/char_from_int_nul` stays live with the
+    reason. Binary travels as hex or int arrays.
+  - *`++` was never a Rail operator.* Not in the grammar, not in the
+    stdlib; `+` concatenates strings. The parser now says so instead of
+    "unexpected operator '+'".
+  - *`show_float_exact`* prints `%.17g`, which round-trips the exact double. t196.
+  - *`tools/fuzz/semantic.py` milestone 2:* floats compared bit-exactly
+    through `show_float_exact`, hoisted multi-parameter functions, tail
+    loops, static kind checking of every subtree, deterministic names.
+    Mixed int/float arithmetic excluded by default (`--mixed`). Its first
+    hour found `known/float_param_bare_mul_lsb`: a bare `*` on two float
+    parameters returns 2 ulp high, invisible at 15 digits for months, and
+    `known/mixed_int_from_fn`: an int from a function or builtin read as
+    float bits in mixed arithmetic. The first is fixed the same day (the
+    raw-register param convention was chosen by a syntactic check that
+    could not see the call-site float proof, so float params were untagged
+    and retagged as ints; t197). The second is recorded live.
 - **Core consolidation, four fixes with their corpus cases (2026-09-07):**
   - *Float results whose float-ness came only from call sites were int to
     their consumers.* `mul2 a b = a * b` called with literals is proven
