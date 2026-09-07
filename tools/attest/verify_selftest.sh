@@ -35,9 +35,13 @@ a["artifact"]["sha256"] = sys.argv[3]          # unsigned field only; witness un
 json.dump(a, open(sys.argv[2], "w"), indent=2)
 PY
 
-rail_verify() {  # <input> <attestation> -> prints the verdict line; its own exit is not the signal
-  RAIL_ARENA_MB="${RAIL_ARENA_MB:-2000}" ./rail_native --out-prefix "$tmp/rv" run tools/attest/verify.rail "$1" "$2" "$pub" > "$tmp/rv.log" 2>&1
-  grep -E '^(ok|BAD)' "$tmp/rv.log"
+rail_verify() {  # <input> <attestation> <want: ok|BAD> -> 0 iff the verdict line AND the exit status agree with want
+  RAIL_ARENA_MB="${RAIL_ARENA_MB:-2000}" ./rail_native --out-prefix "$tmp/rv" run tools/attest/verify.rail "$1" "$2" "$pub" > "$tmp/rv.log" 2>&1; rc=$?
+  v=$(grep -E '^(ok|BAD)' "$tmp/rv.log" | tail -1)
+  case "$3" in
+    ok)  [ "$rc" = 0 ] && [ "${v#ok}" != "$v" ];;
+    BAD) [ "$rc" != 0 ] && [ "${v#BAD}" != "$v" ];;
+  esac
 }
 
 fail=0
@@ -48,7 +52,7 @@ expect() {  # <label> <want: 0|nonzero> <got>
 }
 
 tools/attest/verify.sh "$ctl_in" "$ctl_att" "$pub" >/dev/null 2>&1; expect "shell verifier accepts the control" 0 $?
-rail_verify "$ctl_in" "$ctl_att" | grep -q '^ok'; expect "Rail verifier accepts the control" 0 $?
+rail_verify "$ctl_in" "$ctl_att" ok; expect "Rail verifier accepts the control (ok + exit 0)" 0 $?
 tools/attest/verify.sh "$tmp/replacement.json" "$tmp/tampered.attestation.json" "$pub" >/dev/null 2>&1; expect "shell verifier rejects a replacement artifact" nonzero $?
-rail_verify "$tmp/replacement.json" "$tmp/tampered.attestation.json" | grep -q '^BAD'; expect "Rail verifier rejects a replacement artifact" 0 $?
+rail_verify "$tmp/replacement.json" "$tmp/tampered.attestation.json" BAD; expect "Rail verifier rejects a replacement artifact (BAD + nonzero exit)" 0 $?
 exit $fail
