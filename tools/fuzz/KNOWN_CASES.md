@@ -6,8 +6,8 @@ runs them all against a compiler and exits 0 iff every fixed case passes and
 every live case still fails (a live case that starts passing is reported as
 PROMOTE so its status gets updated rather than the pass going unnoticed).
 
-Statuses were measured on 2026-09-07 against the master seed after #66, not
-copied from notes. Older notes about several of these lived only in a private
+Statuses were measured on 2026-09-07 against the master seed, not copied from
+notes, and re-measured after the consolidation fixes the same day. Older notes about several of these lived only in a private
 memory index; this directory is now the shared record.
 
 ## Why this list exists
@@ -25,20 +25,17 @@ be able to emit its shape, and the oracle should predict its expected output.
 
 | Case | Shape | What happens |
 |---|---|---|
-| `float_result_compose_bare` | `mul2 a b = a * b` (bare ops, float-ness only from call sites); `let y = mul2 0.5 0.25` then `mse y 1.0` | 5.27e+36. The callee's return type is never inferred float, so the consumer's param is treated as int bits. Dotted ops (`*.`) in either function fix it; t140 passes only because its `relu` has a `0.0` literal seeding the lattice. |
-| `float_result_square_bare` | same, one-param consumer `sq y = y * y` | 1.4e+306 |
-| `head_on_string` | `head "abc"` | SIGSEGV. Strings are not cons lists; `chars` first. |
 | `char_from_int_nul` | `join "" ["A", char_from_int 0, "A"]` | length 2, the NUL is dropped: strings are strlen-bounded. Binary must travel as hex. |
-| `under_application` | 3-param fn called with 2 args | runs with a garbage third param (no closure, no error) |
-| `over_application` | 2-param fn called with 3 args | runs with the extra arg dropped |
 | `concat_in_let` | `let s = "ab" ++ "cd"` | parse error; `++` only in return position |
 
-The two float cases are the ones a differential oracle can find more of:
-milestone 2 should generate float user functions with bare operators whose
-float-ness comes only from call-site literals, and compose their results
-through a second function. The arity cases are a language decision (Rail has no
-arity check); the oracle should treat wrong-arity programs as out of domain
-until that changes.
+Closed on 2026-09-07 (kept below as regression templates): the two float
+result-composition cases, head/tail on a non-list, constants outside the
+immediate range in tail self-call arguments, and wrong-arity calls, which are
+now a compile error. The generator for milestone 2 should still produce the
+float shapes: user functions with bare operators whose float-ness comes only
+from call-site literals, composed through a second function, since that is
+where the inference is thinnest. Wrong-arity programs are out of domain for
+the oracle: the compiler refuses them.
 
 ## Fixed cases (regression templates; the generator should reach each shape)
 
@@ -58,6 +55,9 @@ until that changes.
 | `filter_lambda` | `filter (\x -> ...)` | 2026-05 |
 | `wide_mixed_params` | 22-param self-loop, int next to float | passes in this shape; original was inside a training loop |
 | `float_params_callsite` | float params inferred from call sites: arithmetic, int-into-float, arity 5 | t137, t139 |
+| `float_result_compose_bare`, `float_result_square_bare` | `mul2 a b = a * b` (float only from call sites), result composed into a second bare-operator fn | 2026-09-07, t193: a second call-site round after the param-aware float-return pass |
+| `selfloop_bigconst`, `selfloop_addbig` | constants above 65535 (`*`, `/`) or 4095 (`+`, `-`) as tail self-call arguments; the first was silently wrong, the second refused by the assembler | 2026-09-07, t194: every constant through the register loader, no bail to the fallback |
+| `under_application`, `over_application` | wrong number of arguments to a top-level fn | 2026-09-07: compile error from the arity check in `compile_checked` |
 
 The self-loop family is the richest template: tail self-recursion with 1 to 3
 int params in registers, argument expressions that read other params, constant
@@ -71,6 +71,7 @@ of 32767 and their negatives, in tail, comparison, and argument positions.
 | `and_or_eager` | `&&` and `||` evaluate both sides; no short-circuit |
 | `div_mod_truncate` | `/` truncates toward zero; `%` takes the dividend's sign |
 | `split_single_char` | `split` uses only the first character of its delimiter |
+| `head_on_string` | `head`/`tail` walk cons cells only; a string, tuple, or other heap object yields 0 / `[]` like an empty list (was SIGSEGV before 2026-09-07, t195) |
 
 Also: ints are 63-bit tagged (`n * 2 + 1`); overflow wraps at 63 bits, which
 `semantic.py` excludes by bounding values at 2^40. `head []` is 0 and `tail []`

@@ -44,6 +44,31 @@ All notable changes to Rail are documented here.
   name. Same test.
 
 ### Added
+- **Core consolidation, four fixes with their corpus cases (2026-09-07):**
+  - *Float results whose float-ness came only from call sites were int to
+    their consumers.* `mul2 a b = a * b` called with literals is proven
+    float-returning by the param-aware pass, but the call-site analysis that
+    ran before it had already seen the result as int, so `let y = mul2 0.5
+    0.25` fed `mse y 1.0` as int bits (5.27e+36). `get_arities` now runs a
+    second call-site round once `__float_ret_` is known (and `infer_call_ty`
+    consults it), gated on floats being present so float-free programs,
+    the compiler included, are byte-identical. t193.
+  - *Wrong-arity calls are a compile error.* Rail has no currying: a call
+    with too few arguments ran the body with garbage params and one with
+    too many dropped the extras. `check_arities` walks every body; names
+    bound locally are skipped. Both compile entry points now share
+    `compile_checked`, because the check was first hooked into
+    `compile_program` only and never ran for `rail_native file`.
+  - *`head` and `tail` walk cons cells only.* A string or tuple was
+    dereferenced as a cons cell (SIGSEGV); it now yields 0 / `[]` like an
+    empty list. t195.
+  - *Tail self-call constants go through the register loader.* A `*` or
+    `/` constant above 65535 bailed to the tag-corrupting fallback and was
+    silently wrong (`acc * 100000` gave 4340285440); a `+` or `-` constant
+    above 4095 was emitted as a 12-bit immediate and refused by the
+    assembler. t194. Suite 192 -> 195; seed rebuilt, gen2 == gen3, and the
+    suite run on the rebuilt seed. The whole tree (tools, examples, stdlib)
+    compiles under the arity check.
 - **`tools/fuzz/known/`: the known-miscompile corpus, 24 runnable cases**
   with `KNOWN_CASES.md` (target list for semantic testing) and
   `known_cases.py` (fixed cases must pass, live cases must still fail, a
