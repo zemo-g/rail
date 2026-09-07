@@ -887,7 +887,13 @@ str_to_int s =
     else str_to_int_acc cs 0
   else 0
 
-emit_load_int v =
+emit_load_int v = emit_load_int_reg "x0" v
+
+-- Same as emit_load_int but into any register. Exists so the early-return
+-- prologue can materialize a big or negative constant into x9 WITHOUT going
+-- through x0, which still holds the first argument at that point (2026-09-07:
+-- routing via x0 there miscompiled the compiler itself on the 2nd generation).
+emit_load_int_reg r v =
   let n = str_to_int v
   -- Compute 2^16, 2^32, 2^48 via runtime shifts so `opt` can't fold them
   -- into bare 64-bit literals that the seed compiler can't emit yet.
@@ -897,27 +903,27 @@ emit_load_int v =
   if n < 0 then
     let pos = 0 - n
     let inv = pos - 1
-    if inv <= 65535 then cat ["    movn x0, #", show inv, "\n"]
+    if inv <= 65535 then cat ["    movn ", r, ", #", show inv, "\n"]
     else
       let c0 = inv % k16
       let c1 = (inv / k16) % k16
       let c2 = (inv / k32) % k16
       let c3 = (inv / k48) % k16
-      let head = cat ["    movn x0, #", show c0, "\n"]
-      let part1 = cat [head, "    movk x0, #", show (65535 - c1), ", lsl #16\n"]
-      let part2 = if c2 == 0 then part1 else cat [part1, "    movk x0, #", show (65535 - c2), ", lsl #32\n"]
-      if c3 == 0 then part2 else cat [part2, "    movk x0, #", show (65535 - c3), ", lsl #48\n"]
-  else if n <= 65535 then cat ["    mov x0, #", v, "\n"]
+      let head = cat ["    movn ", r, ", #", show c0, "\n"]
+      let part1 = cat [head, "    movk ", r, ", #", show (65535 - c1), ", lsl #16\n"]
+      let part2 = if c2 == 0 then part1 else cat [part1, "    movk ", r, ", #", show (65535 - c2), ", lsl #32\n"]
+      if c3 == 0 then part2 else cat [part2, "    movk ", r, ", #", show (65535 - c3), ", lsl #48\n"]
+  else if n <= 65535 then cat ["    mov ", r, ", #", v, "\n"]
   else
     let lo = n % k16
     let hi = n / k16
-    if hi <= 65535 then cat ["    movz x0, #", show lo, "\n    movk x0, #", show hi, ", lsl #16\n"]
+    if hi <= 65535 then cat ["    movz ", r, ", #", show lo, "\n    movk ", r, ", #", show hi, ", lsl #16\n"]
     else
       let hi1 = hi % k16
       let hi2 = (n / k32) % k16
       let hi3 = (n / k48) % k16
-      let base = cat ["    movz x0, #", show lo, "\n    movk x0, #", show hi1, ", lsl #16\n    movk x0, #", show hi2, ", lsl #32\n"]
-      if hi3 == 0 then base else cat [base, "    movk x0, #", show hi3, ", lsl #48\n"]
+      let base = cat ["    movz ", r, ", #", show lo, "\n    movk ", r, ", #", show hi1, ", lsl #16\n    movk ", r, ", #", show hi2, ", lsl #32\n"]
+      if hi3 == 0 then base else cat [base, "    movk ", r, ", #", show hi3, ", lsl #48\n"]
 
 -- Authoritative float operators (Option A). The lexer emits a distinct token
 -- for the dotted forms `+. -. *. /. <. >.` so float-ness is carried by the op
@@ -4530,7 +4536,7 @@ mk_early_ret nm ps bd lc =
         let simple = if ttg == "I" then true else if ttg == "V" then is_in (head (tail then_br)) ps else false
         if simple == false || cl_ok == false || cr_ok == false then ""
         else
-          let skip = cat [".Learly_", show lc]
+          let skip = cat [".Learly_", nm, "_", show lc]
           let l8 = er_load cl ps "x8"
           let r9 = er_load cr ps "x9"
           let neg = if cop == "<" then cat ["b.ge ", skip] else if cop == ">" then cat ["b.le ", skip] else if cop == "<=" then cat ["b.gt ", skip] else if cop == ">=" then cat ["b.lt ", skip] else if cop == "==" then cat ["b.ne ", skip] else cat ["b.eq ", skip]
@@ -4541,11 +4547,15 @@ mk_early_ret nm ps bd lc =
 -- chain when the tagged value exceeds the 16-bit `mov` immediate (C6 fix:
 -- previously `mov reg, #<tagged>` was emitted unguarded and the assembler
 -- rejected tagged values > 65535, i.e. source ints >= 32768 in value position).
+-- 2026-09-07: the guard was `tgv <= 65535`, which every NEGATIVE tagged value
+-- satisfies, so `if 0 < (0 - (65536 * 5))` emitted `mov x9, #-655359` and the
+-- assembler rejected it (found by tools/fuzz/semantic.py, t192). Only
+-- 0..65535 fits the 16-bit `mov`; everything else goes through movz/movk.
 er_emit_tagged reg v =
   let tgv = str_to_int v * 2 + 1 in
-  if tgv <= 65535 then cat ["    mov ", reg, ", #", show tgv, "\n"]
-  else if reg == "x0" then emit_load_int (show tgv)
-  else cat [emit_load_int (show tgv), "    mov ", reg, ", x0\n"]
+  let fits = if tgv >= 0 then tgv <= 65535 else false in
+  if fits then cat ["    mov ", reg, ", #", show tgv, "\n"]
+  else emit_load_int_reg reg (show tgv)
 
 er_load node ps reg =
   if head node == "I" then er_emit_tagged reg (head (tail node))
@@ -6419,10 +6429,14 @@ run_tests _ =
   let s_flt = (if t183 then 1 else 0) + (if t184 then 1 else 0)
   let t185 = driver_run_returns_exit_code 0
   let t191 = runner_judges_evidence 0
-  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0)
+  -- t192: a large NEGATIVE folded constant as a comparison operand inside a
+  -- user fn. Pre-fix: `mov x9, #-655359`, assembler error. Two prints, so the
+  -- multi-line assertion the runner gained in #64 carries both operand sides.
+  let t192 = run_test "neg_const_cmp_operand" "probe _ = if 0 < (0 - (65536 * 5)) then 0 else 1\nprobe2 x = if (0 - (65536 * 5)) < x then 1 else 0\nmain =\n  let _ = print (show (probe 0))\n  let _ = print (show (probe2 5))\n  0" "1\n1"
+  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s_inf + s_bx + s_ed + s_tls + s_flt + s_drv
-  let _ = print (cat [show total, "/191 tests passed"])
-  if total == 191 then 0 else 1
+  let _ = print (cat [show total, "/192 tests passed"])
+  if total == 192 then 0 else 1
 
 -- ===========================================================================
 -- M6 — self-hosted emit path. Replaces as/ld/codesign with the pure-Rail

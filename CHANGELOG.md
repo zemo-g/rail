@@ -26,6 +26,35 @@ All notable changes to Rail are documented here.
   rather than re-signed. `VERIFY.md` and `README.md` now say the seed links
   `libSystem` and that `gpu_map` needs a Metal device.
 
+- **A large negative folded constant as a comparison operand inside a user
+  function failed to assemble** (`probe _ = if 0 < (0 - (65536 * 5)) then 0
+  else 1` gave `mov x9, #-655359`, rejected). The early-return prologue's
+  16-bit `mov` guard was `tgv <= 65535`, which every negative tagged value
+  satisfies; the positive half was fixed in f851882, the negative half was
+  not. `emit_load_int` is now parameterized by target register
+  (`emit_load_int_reg`) so the prologue never routes through `x0`, which
+  still holds the first argument there: the first attempt did, and the
+  compiler miscompiled ITSELF on the second generation (188/192, float
+  garbage) while still reaching a byte-identical gen3 == gen4. A fixed
+  point is not a correctness proof; the suite is. Found by
+  `tools/fuzz/semantic.py` within 14 generated cases once probes were
+  rendered in tail position. `t192 neg_const_cmp_operand`. Suite 191 -> 192.
+- **Two early-return functions in one program collided on `.Learly_<n>`**
+  (assembler: symbol already defined). The label now carries the function
+  name. Same test.
+
+### Added
+- **`tools/fuzz/semantic.py`: an independent semantic oracle in CPython**
+  (Astra, 2026-09-06/07). A bounded AST interpreter that imports no Rail
+  code evaluates seeded random expressions; each is rendered in four codegen
+  positions (function tail, `show` argument, let-bound value, comparison
+  operand), compiled with `rail_native`, and the outputs must agree. Greedy
+  reducer, saved JSON repros with replay, `--keep-going`, a `semantic` CI
+  job (seed 42). Leaf literals include the 16-bit tagged-immediate boundary.
+  `tools/fuzz/SEMANTICS.md` states the subset and the trust boundary; the
+  two Python files are listed in `SHIMS.md` as tooling outside the 33
+  build/runtime files. Its first campaign in tail position found the
+  comparison-operand bug above on the pre-f851882 seed AND on current master.
 - **`check.sh` section 5 read the Rail verifier's verdict through a pipe and
   lost its exit status**, so a verifier that printed `ok` and then died
   (exit 139) still passed the umbrella 5/5 (found by the same outside
