@@ -44,6 +44,17 @@ All notable changes to Rail are documented here.
   name. Same test.
 
 ### Added
+- **`tools/fuzz/known/`: the known-miscompile corpus, 24 runnable cases**
+  with `KNOWN_CASES.md` (target list for semantic testing) and
+  `known_cases.py` (fixed cases must pass, live cases must still fail, a
+  live case that starts passing is reported as PROMOTE). Measured on the
+  post-#66 seed: 14 fixed regressions, 7 live defects, 3 defined
+  semantics. Two of the live ones are new float miscompiles found while
+  measuring: a float result from a bare-operator function whose
+  float-ness comes only from call sites poisons the consumer's parameter
+  (`mse y 1.0` gives 5.27e+36). `check.sh` section 8 and the `semantic`
+  CI job run the corpus. Until now this list lived in a private memory
+  index the outside reviewers could not see.
 - **`tools/fuzz/semantic.py`: an independent semantic oracle in CPython**
   (Astra, 2026-09-06/07). A bounded AST interpreter that imports no Rail
   code evaluates seeded random expressions; each is rendered in four codegen
