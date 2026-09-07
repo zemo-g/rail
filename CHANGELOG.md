@@ -5,6 +5,43 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Fixed
+- **The shell attestation verifier never bound the file to the signature.**
+  `tools/attest/verify.sh` compared the file's hash with the UNSIGNED
+  `artifact.sha256` sidecar field and verified the Ed25519 signature over
+  `witness.digest_sha256`, without requiring the two digests to agree. A
+  replacement artifact plus an edited sidecar reused a real signature and
+  printed `ok`. Both digests must now equal the file's, and
+  `tools/attest/verify_selftest.sh` holds the positive control and the
+  replacement-artifact negative control against both verifiers (the Rail
+  verifier already rejected it). Found by an outside first-pass review,
+  2026-09-06.
+- **`tools/verify/check.sh` inferred success from the absence of the word
+  FAIL**, so a test process that crashed without printing it (exit 139)
+  produced `passed: 4 failed: 0`. Section 2 now requires exit 0 and an
+  N/N summary line; section 5 runs the Rail verifier against the newest
+  release's attested compiler source instead of testing that a file exists;
+  section 6 runs the verifier selftest.
+- **`selfhost/f86f082`**: its sidecar signs bytes the public-surface scrub
+  (`c4f6050`) later rewrote. Retired to `.stale` with a `PROVENANCE.md`
+  rather than re-signed. `VERIFY.md` and `README.md` now say the seed links
+  `libSystem` and that `gpu_map` needs a Metal device.
+
+- **`run_test` compared only the FIRST line of a test program's output.**
+  `trim` ran before the stdout/exit split, so a crash (exit 139), a nonzero
+  status, and any extra line after a matching first line were all invisible,
+  and a correct multi-line expectation could not pass. The runner now keeps
+  full stdout and the exit status apart: a silent program asserts on its
+  exit status, a printing program on its whole output and must not have
+  died by signal. Re-running the 190 existing tests under the new rule
+  flipped no verdict. `t191 runner_judges_evidence` holds the review's
+  table as a test of the runner itself. Suite 190 -> 191.
+- **`docs/STATUS.md` was stale and could not be checked for staleness.**
+  It embedded the generation minute, so `check.sh` section 4 could never
+  match byte-for-byte, and the committed copy still carried the pre-#61
+  compiler size and seed hash. The generator no longer prints a timestamp,
+  names an untagged checkout instead of leaving the release blank, states
+  the `libSystem` and `as`/`ld` boundary, and the committed copy is
+  regenerated.
 - **`rail_native run` discarded the program's exit code** (returned a
   hardcoded 0).  Every caller that branched on a Rail program's status
   silently saw success.  This is what let the daily attestation job
