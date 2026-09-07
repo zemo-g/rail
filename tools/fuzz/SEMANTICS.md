@@ -1,4 +1,4 @@
-# Independent semantic differential testing, milestone 1
+# Independent semantic differential testing, milestones 1 and 2
 
 `semantic.py` complements `diff_fuzz.rail`. Its reference evaluator runs in
 CPython rather than in a binary built by Rail. It imports no Rail compiler code
@@ -41,6 +41,34 @@ replay format; Python version and schema version are recorded.
 The `semantic` CI job runs the oracle tests and a fixed seed-42 campaign of 20
 generated cases plus the eight controls. Failure repros are uploaded as a CI
 artifact. Larger local campaigns can use different seeds and depths.
+
+## Milestone 2 (2026-09-07): floats, functions, loops
+
+- **Floats are compared bit-exactly.** Rail prints with `show_float_exact`
+  (`%.17g`) and CPython formats the same double with the same spec; both are
+  correctly rounded, so the strings agree iff the bits agree. Float literals
+  are dyadic rationals and a few boundary values (`2^52`, `1 + 2^-52`, `0.1`),
+  rendered with 17 significant digits, which `atof` parses exactly. Dotted
+  operators (`+. -. *. /.`) require two floats; bare operators on two floats
+  are IEEE binary64 as in Python; `%` on floats is out of domain; results must
+  be finite, zero or normal, and at most 1e30 in magnitude.
+- **Mixed int/float arithmetic is excluded by default** (`--mixed` includes
+  it) because it is a known live defect (`known/mixed_int_from_fn`).
+- **Hoisted user functions** (`fn2`): one to four parameters, body drawn from
+  the same grammar in bare operators, applied to generated arguments. This is
+  the thin-inference zone (float-ness known only from call sites).
+- **Tail-recursive loops** (`loop`): `name n acc = if n == 0 then acc else
+  name (n - 1) (acc OP c)` with int or float accumulators and constants from
+  the boundary set; `n` in 0..12.
+- **Static kinds.** Every subtree, taken or not, must be well-kinded (no
+  mixed if-branches, no dotted op on ints, no mixed comparison), so a dead
+  branch cannot smuggle an ill-typed program past the evaluator.
+- Hoisted names come from a per-campaign counter, so a seed is deterministic.
+  `--no-floats` restores the milestone 1 grammar.
+
+First campaign result: 8 of 8 remaining failures on seeds 42 and 2026 reduce
+to one program, `mul2c a b = a * b` returning 0.12500000000000006
+(`known/float_param_bare_mul_lsb`).
 
 ## Specified subset
 
