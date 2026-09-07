@@ -76,6 +76,7 @@ re-verify it. Regenerate and commit it whenever the compiler or the seed changes
 
 ```bash
 tools/attest/verify_selftest.sh        # positive control + a replacement artifact both verifiers must reject
+tools/verify/check_selftest.sh         # the umbrella itself must fail on a crashed test run or an ok-then-crash verifier
 git show 28ad78be16259b7c9af48bbf3e2a06810aa6491e:tools/compile.rail > /tmp/v530_compile.rail
 ./rail_native run tools/attest/verify.rail /tmp/v530_compile.rail releases/v5.3.0/compile.rail.attestation.json
 ```
@@ -84,8 +85,8 @@ Tagged releases are Ed25519-signed and anchored to a public entropy beacon; the
 verifier is itself Rail (`tools/attest/verify.rail`), and `check.sh` runs it
 against the newest `releases/v*/index.json`. The witness public key is fetched
 from `https://ledatic.org/attest/fleet0.pub.pem` on first use; that fetch trusts
-the site's TLS, nothing more. A verifier passes only when the file's digest
-equals the digest inside the signed witness; the unsigned `artifact.sha256`
+the site's TLS, nothing more. A verifier passes only when it exits 0 AND
+prints `ok`, and the file's digest equals the digest inside the signed witness; the unsigned `artifact.sha256`
 field in the sidecar must agree with both (until 2026-09-06 the shell verifier
 compared only the unsigned field, see `verify_selftest.sh`).
 
