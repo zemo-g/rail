@@ -81,6 +81,10 @@ echo "== 7. This script fails on a crashing test process and on a verifier that 
 if tools/verify/check_selftest.sh >"$tmp/check_selftest.log" 2>&1; then ok "umbrella negative controls behave (tools/verify/check_selftest.sh)"
 else no "check_selftest failed:"; sed 's/^/     /' "$tmp/check_selftest.log"; fi
 
+echo "== 8. Known-miscompile corpus (fixed cases pass, live cases still fail, tools/fuzz/KNOWN_CASES.md) =="
+if python3 tools/fuzz/known_cases.py >"$tmp/known.log" 2>&1; then ok "$(tail -1 "$tmp/known.log")"
+else no "known corpus: $(tail -1 "$tmp/known.log")"; grep -E '^\s+(NO|PROMOTE)' "$tmp/known.log" | sed 's/^/     /'; fi
+
 echo
 echo "passed: $pass   failed: $fail"
 [ "$fail" = 0 ]
