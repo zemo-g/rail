@@ -17,7 +17,35 @@ class ReferenceTests(unittest.TestCase):
             self.assertEqual(s.evaluate(["mod", ["int", a], ["int", b]]), r)
 
     def test_hand_calculated_controls(self):
-        self.assertEqual([s.evaluate(e) for e in s.controls()], [42, -2, -1, 1, 12, 11, 7, 0])
+        s.ALLOW_MIXED[0] = True
+        got = [s.evaluate(e) for e in s.controls()]
+        s.ALLOW_MIXED[0] = False
+        self.assertEqual(got[:6], [0.1 + 0.2, 1.0000000000000002 / 3.0, 0.125, 0.765625, 10**10, 1.0999999999999999])
+        self.assertEqual(got[7], 1)
+        self.assertEqual(got[8:], [42, -2, -1, 1, 12, 11, 7, 0])
+
+    def test_float_semantics_and_rendering(self):
+        self.assertEqual(s.evaluate(["fdiv", ["float", 1.0], ["float", 4.0]]), 0.25)
+        s.ALLOW_MIXED[0] = True
+        self.assertEqual(s.evaluate(["add", ["int", 1], ["float", 0.5]]), 1.5)
+        self.assertEqual(s.evaluate(["div", ["float", 1.0], ["int", 4]]), 0.25)
+        s.ALLOW_MIXED[0] = False
+        with self.assertRaises(s.DomainError):
+            s.kind_of(["iflt", ["int", 0], ["int", 1], ["float", 0.5], ["int", 0]])
+        with self.assertRaises(s.DomainError):
+            s.kind_of(["iflt", ["int", 1], ["int", 0], ["int", 0], ["fmul", ["int", 0], ["int", 0]]])
+        self.assertEqual(s.evaluate(["loop", "l", ["int", 4], ["float", 0.0], "fadd", ["float", 0.1]]), 0.1 + 0.1 + 0.1 + 0.1)
+        self.assertEqual(s.expected_text(0.1 + 0.2), "0.30000000000000004")
+        self.assertEqual(s.render(["float", -0.5]), "(0.0 -. 0.5)")
+        self.assertEqual(s.render(["float", 2.0]), "2.0")
+        for tree in [["fdiv", ["float", 1.0], ["float", 0.0]], ["mod", ["float", 1.5], ["int", 2]],
+                     ["iflt", ["int", 1], ["float", 2.0], ["int", 1], ["int", 0]],
+                     ["fmul", ["float", 1e20], ["float", 1e20]], ["fadd", ["int", 1], ["float", 1.0]]]:
+            with self.assertRaises(s.DomainError):
+                s.evaluate(tree)
+        src = s.source(["fn2", "g", ["a"], ["mul", ["var", "a"], ["var", "a"]], [["float", 0.5]]], "tail")
+        self.assertIn("g a = (a * a)\n", src)
+        self.assertIn("show_float_exact", src)
 
     def test_domain_errors(self):
         for tree in [["div", ["int", 1], ["int", 0]], ["head", ["list"]],
@@ -30,7 +58,8 @@ class ReferenceTests(unittest.TestCase):
         with self.assertRaises(s.DomainError):
             s.evaluate(["int", 1], fuel=[0])
         a, b = random.Random(42), random.Random(42)
-        self.assertEqual([s.generate(a, 3) for _ in range(100)], [s.generate(b, 3) for _ in range(100)])
+        ca, cb = [0], [0]
+        self.assertEqual([s.generate(a, 3, (), True, ca) for _ in range(100)], [s.generate(b, 3, (), True, cb) for _ in range(100)])
 
     def test_position_rendering(self):
         tree = ["int", -7]
@@ -55,7 +84,7 @@ class ReferenceTests(unittest.TestCase):
                 self.assertEqual(s.main(), 1)
                 return len(visited), save.call_count
         self.assertEqual(run(False), (1, 1))
-        self.assertEqual(run(True), (32, 2))
+        self.assertEqual(run(True), (len([c for c in s.controls() if s.allowed(c)]) * len(s.POSITIONS), 2))
 
 
 class RunnerTests(unittest.TestCase):

@@ -25,17 +25,15 @@ be able to emit its shape, and the oracle should predict its expected output.
 
 | Case | Shape | What happens |
 |---|---|---|
-| `char_from_int_nul` | `join "" ["A", char_from_int 0, "A"]` | length 2, the NUL is dropped: strings are strlen-bounded. Binary must travel as hex. |
-| `concat_in_let` | `let s = "ab" ++ "cd"` | parse error; `++` only in return position |
+| `char_from_int_nul` | a 0x00 byte through join, +, cat, chars | dropped: those routines measure with strlen. Their results live outside the GC arena on purpose (the compiler resets arena windows while holding strings); a length-tagged in-arena version passed the suite at gen 1, which still ran on the old runtime, and wedged the compiler at gen 2. Needs a representation decision. Binary travels as hex or int arrays. |
+| `mixed_int_from_fn` | `0.1 - (gint 0)`, `2^52 - (length [0])` | an int from a user fn or builtin is read as float bits; an int literal promotes correctly. `semantic.py` excludes mixed arithmetic by default (`--mixed` includes it). |
 
 Closed on 2026-09-07 (kept below as regression templates): the two float
 result-composition cases, head/tail on a non-list, constants outside the
-immediate range in tail self-call arguments, and wrong-arity calls, which are
-now a compile error. The generator for milestone 2 should still produce the
-float shapes: user functions with bare operators whose float-ness comes only
-from call-site literals, composed through a second function, since that is
-where the inference is thinnest. Wrong-arity programs are out of domain for
-the oracle: the compiler refuses them.
+immediate range in tail self-call arguments, wrong-arity calls (now a compile
+error), and `++` (never an operator; the parser now
+says so). Wrong-arity programs are out of domain for the oracle: the compiler
+refuses them.
 
 ## Fixed cases (regression templates; the generator should reach each shape)
 
@@ -58,6 +56,7 @@ the oracle: the compiler refuses them.
 | `float_result_compose_bare`, `float_result_square_bare` | `mul2 a b = a * b` (float only from call sites), result composed into a second bare-operator fn | 2026-09-07, t193: a second call-site round after the param-aware float-return pass |
 | `selfloop_bigconst`, `selfloop_addbig` | constants above 65535 (`*`, `/`) or 4095 (`+`, `-`) as tail self-call arguments; the first was silently wrong, the second refused by the assembler | 2026-09-07, t194: every constant through the register loader, no bail to the fallback |
 | `under_application`, `over_application` | wrong number of arguments to a top-level fn | 2026-09-07: compile error from the arity check in `compile_checked` |
+| `float_param_bare_mul_lsb` | `mul2c a b = a * b` called with floats | 2026-09-07, t197: the raw-register param convention was chosen syntactically and could not see the call-site float proof, so floats were untagged and retagged as ints, 2 ulp high. Hidden for months by 15-digit printing; found within an hour of bit-exact comparison |
 
 The self-loop family is the richest template: tail self-recursion with 1 to 3
 int params in registers, argument expressions that read other params, constant
@@ -71,6 +70,7 @@ of 32767 and their negatives, in tail, comparison, and argument positions.
 | `and_or_eager` | `&&` and `||` evaluate both sides; no short-circuit |
 | `div_mod_truncate` | `/` truncates toward zero; `%` takes the dividend's sign |
 | `split_single_char` | `split` uses only the first character of its delimiter |
+| `concat_in_let` | `++` is not an operator anywhere in Rail; strings concatenate with `+` or `join "" [..]`; since 2026-09-07 the parser says exactly that |
 | `head_on_string` | `head`/`tail` walk cons cells only; a string, tuple, or other heap object yields 0 / `[]` like an empty list (was SIGSEGV before 2026-09-07, t195) |
 
 Also: ints are 63-bit tagged (`n * 2 + 1`); overflow wraps at 63 bits, which
