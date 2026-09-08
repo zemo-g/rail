@@ -44,6 +44,15 @@ All notable changes to Rail are documented here.
   name. Same test.
 
 ### Added
+- **Chip-away (2026-09-07):** the last 48 em-dashes in `tools/compile.rail`
+  (43 comments, 4 strings: two parser messages, an asm comment, the
+  generate prompt) replaced per the house style. The x86_64 "literal bug"
+  carried in notes since May is not in the code: `x86_emit_rcx` and the
+  x86 `both_s` predicate already carry the ARM64 fix, and x86-64 `mov`
+  takes a 64-bit immediate; it stays unverified at runtime because no
+  x86 machine remains. Stdlib survey: 5 of 102 modules (`date`, `heap`,
+  `http_server`, `prng`, `set`) are imported by nothing in the tree; all
+  five compile; they are library API, not dead code, and stay.
 - **Items 5 to 7 of the consolidation (2026-09-07):**
   - *A 0x00 byte inside a string stays a documented limit.* A version of
     append/join/chars that built length-tagged results in the GC arena
