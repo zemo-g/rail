@@ -82,7 +82,10 @@ is `[]` by design.
 FFI: a `foreign` returning a pointer as `int` gets tagged and corrupted; use the
 builtin allocator. `foreign sleep` is int-only. GPU: an in-place tensor mutation
 between two GPU matmuls is invisible to the second. Backends: the x86_64 backend
-still has the pre-f851882 literal bug; WASM is fragile. Performance, not
+carries the same top-level-const guard as ARM64 (`x86_emit_rcx`, `both_s` with
+`cl_local_v`) and x86-64 `mov r64, imm64` takes any immediate, but nothing here can
+run or even assemble x86_64 since the last x86 machine left, so it is unverified
+rather than known-broken; WASM is fragile. Performance, not
 semantics: `length xs == 0` is O(N) per call, a top-level float const reference
 is a runtime `atof` on every evaluation, the bump arena has a cliff for repeated
 TLS handshakes. Runtime: `read_file` on a missing path leaks and later hangs;
