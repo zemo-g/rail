@@ -55,7 +55,7 @@ fi
 # Pre-flight: rail_native present and runnable.
 if [[ ! -x "$RAIL_NATIVE" ]]; then
     echo "ERROR: rail_native not found or not executable at $RAIL_NATIVE" >&2
-    echo "  Build with: ./rail_native self && cp /tmp/rail_self rail_native" >&2
+    echo "  Build with: RAIL_ARENA_MB=6000 ./rail_native self && cp /tmp/rail_self rail_native" >&2
     echo "  (or fetch the seed binary; see CLAUDE.md > Rail Compiler)" >&2
     exit 2
 fi
