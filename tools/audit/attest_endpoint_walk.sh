@@ -243,9 +243,16 @@ class_selfhost_badge() {
     log "FAIL: selfhost badge sha $badge_sha != origin/master $head_sha"
     verdict selfhost_badge FAIL; return
   fi
-  # Same-sha: color should reflect current truth. We can cheaply re-verify:
+  # Same-sha: color should reflect current truth. We can cheaply re-verify.
+  # RAIL_ARENA_MB=6000 is not optional: below 2000 the self-compile thrashes
+  # (this walker sat in one for 36 hours on 2026-09-09), and only the 6000
+  # in-process link reproduces the committed seed byte for byte; the as/ld
+  # path at 4000 would cmp as "DIVERGED" every day. The alarm bounds it.
   cd "$RAIL_DIR"
-  ./rail_native self >/dev/null 2>&1
+  if ! RAIL_ARENA_MB=6000 perl -e 'alarm 600; exec @ARGV' -- ./rail_native self >/dev/null 2>&1; then
+    log "FAIL: local self-compile did not finish (rc=$?, 600 s cap, RAIL_ARENA_MB=6000)"
+    verdict selfhost_badge FAIL; return
+  fi
   if cmp -s rail_native /tmp/rail_self; then
     if [[ "$color" == "brightgreen" || "$color" == "green" ]]; then
       verdict selfhost_badge PASS
