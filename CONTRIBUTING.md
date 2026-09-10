@@ -9,8 +9,8 @@ git clone https://github.com/zemo-g/rail
 cd rail
 
 ./rail_native test       # 182/182 core tests
-./rail_native self       # self-compile → /tmp/rail_self
-./rail_native self && cmp rail_native /tmp/rail_self
+RAIL_ARENA_MB=6000 ./rail_native self       # self-compile → /tmp/rail_self
+RAIL_ARENA_MB=6000 ./rail_native self && cmp rail_native /tmp/rail_self
 # ↑ may print a one-byte-or-more difference on a clean tree; that is
 #   expected — the shipped seed differs from its own emit by one
 #   bootstrap cycle. Run `cp /tmp/rail_self rail_native` once and
@@ -37,7 +37,7 @@ The compiler is `tools/compile.rail` (~9,200 lines of Rail). It compiles itself.
 # 1. Edit tools/compile.rail.
 
 # 2. Compile the compiler with the OLD binary.
-./rail_native self                        # → /tmp/rail_self
+RAIL_ARENA_MB=6000 ./rail_native self                        # → /tmp/rail_self
 
 # 3. Install the new binary.
 cp /tmp/rail_self ./rail_native
@@ -46,8 +46,8 @@ cp /tmp/rail_self ./rail_native
 ./rail_native test                        # must be 182/182
 
 # 5. Verify the fixed-point property (≥2 cycles).
-./rail_native self && cp /tmp/rail_self ./rail_native
-./rail_native self
+RAIL_ARENA_MB=6000 ./rail_native self && cp /tmp/rail_self ./rail_native
+RAIL_ARENA_MB=6000 ./rail_native self
 cmp rail_native /tmp/rail_self            # must be silent
 ```
 

@@ -5,6 +5,16 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Fixed
+- **A bare `./rail_native self` spun for hours instead of finishing.** The
+  compiler's own source no longer fits the 1 GB default arena's bump window;
+  allocation falls to the free-list scan and a self-compile that takes 18 s at
+  `RAIL_ARENA_MB=2000` was still running at 240 s without it (the daily attest
+  audit sat in one for 36 hours on 2026-09-09). CI had set 4000 since June; the
+  README, the audit walker, the status page and two tools still ran it bare.
+  `self` now refuses below 2000 MB with the command to run (`RAIL_ARENA_MB=6000`
+  reproduces the committed seed; 4000 is the as/ld fallback CI uses), exits 2,
+  and t205 checks the refusal. Every caller in the tree sets the arena, and the
+  audit walker caps the compile at 600 s.
 - **The shell attestation verifier never bound the file to the signature.**
   `tools/attest/verify.sh` compared the file's hash with the UNSIGNED
   `artifact.sha256` sidecar field and verified the Ed25519 signature over
