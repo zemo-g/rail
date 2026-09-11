@@ -69,11 +69,14 @@ All notable changes to Rail are documented here.
   a function's locals, so every local lookup in cg walked past all of them
   first. They now sit behind the locals (keys are disjoint, so nothing else
   changes). The call-site analysis carries more kinds and costs 4 s more on
-  the same source (11.3 s to 15.9 s); the self-compile as a whole goes from
-  21.5 s to 18.2 s at `RAIL_ARENA_MB=6000`, a small fixed source from 0.27 s
-  to 0.31 s. Generated code is unchanged in speed (the perf agent's six
-  benches within noise, outputs identical). Seed sha256 and suite count (203)
-  updated.
+  the same source, and recording a call-site slot used to rebuild the whole
+  marker map on every observation; the map is now touched only when a slot
+  narrows. Self-compile of the compiler's source: 21.5 s to 17.5 s at
+  `RAIL_ARENA_MB=6000`; at CI's 4000 MB, 19 s to 16 s with the peak
+  footprint 2.4 GB to 1.5 GB and no collection. A small fixed source goes
+  from 0.27 s to 0.31 s. Generated code is unchanged in speed (the perf
+  agent's six benches within noise, outputs identical). Seed sha256 and
+  suite count (203) updated.
 - `tools/fuzz/semantic.py` generates mixed int-and-float arithmetic by
   default (`--no-mixed` restores the old grammar) now that
   `known/mixed_int_from_fn` is closed; its loop family gained the compound,
