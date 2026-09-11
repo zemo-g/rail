@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Environment
 
-This machine is the Mac Studio (not the Mini). When working on Thunderbolt bridge / Studio↔Mini coordination, confirm host with `hostname` before assuming a side. Parallel session prompts labeled for other lanes (Stream 4, Session B, Mini-side) should be declined unless explicitly retargeted.
+Sessions run on either the Mac Mini or the Mac Studio: confirm with `hostname` before assuming a side. Parallel session prompts labeled for other lanes (Stream 4, Session B, Mini-side) should be declined unless explicitly retargeted.
 
 ## Project Conventions
 
@@ -36,9 +36,9 @@ Before declaring a hypothesis confirmed, run the falsification test (e.g., for f
 
 Self-hosting programming language. Compiler written in Rail, compiles itself to ARM64, x86_64, and Linux ARM64.
 
-- **Compiler source**: `tools/compile.rail` (~6,719 lines, 335 functions)
+- **Compiler source**: `tools/compile.rail` (~9,900 lines)
 - **Seed binary**: `rail_native` (729K ARM64) — checked into repo, self-compile produces byte-identical output (fixed point)
-- **Native floats (v2.0)**: unboxed IEEE 754 doubles in ARM64 d-registers. No heap allocation. `fadd`/`fmul`/`fdiv`/`fcmp` directly. Float arrays, foreign float calls (`sin`/`cos`/`tanh`/`sqrt`), auto int→float promotion.
+- **Native floats**: unboxed IEEE 754 doubles in ARM64 d-registers wherever the compiler has proved float; boxed (tag 6) only when stored into a tuple, list or ADT field or passed generically, and read back through `_rail_fval` (docs/NUMERICS.md, 2026-09-11). Float arrays, foreign float calls (`sin`/`cos`/`tanh`/`sqrt`), auto int→float promotion.
 - **REPL**: `./rail_native run tools/repl.rail` — interactive, persistent definitions
 - **HTTP server**: `stdlib/http_server.rail` + `tools/http_demo.rail` — compile handler binary, serve via `tools/http_server.py`
 - **Error messages**: `file:line:col: error: message` — parse errors halt cleanly instead of segfaulting.
@@ -48,7 +48,7 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 - **Effect handlers**: `try body handler` — setjmp/longjmp non-local error recovery. Deep unwinding, nested handlers.
 - **Type checker**: Forward inference pass emits warnings (not errors) for: head/tail on non-list, arithmetic on non-numeric, wrong arity, calling non-functions.
 - **Package manager**: `import math` (bare imports), `rail get github.com/...`, `rail pkg` reads `rail.toml`.
-- **Tests**: `./rail_native test` — 141 tests, should be 141/141. Count fluctuates only when concurrent sessions collide on `/tmp/rail_out` — rerun to confirm. (Was 137 prior to 2026-05-12; t132/t133/t134 cover 3-/4-movk integer literal codegen. t135 added 2026-05-22 — `float_user_fn_sqrt_arg`, locks the conservative mark_float_params pass.)
+- **Tests**: `./rail_native test` — 203/203 on master (2026-09-11). Count fluctuates only when concurrent sessions collide on `/tmp/rail_out` — rerun with `--out-prefix` to confirm.
 - **Checkpoints**: `stdlib/checkpoint.rail` — `save_checkpoint prefix weights adams step best_val` + `load_checkpoint` / in-place `load_model_into` / `load_adam_states_into`. Atomic via `<prefix>.committed` sentinel. `corpus_split text val_pct` for eval splits. `tools/train/lm_transformer.rail:run_segments` wires resume + periodic checkpoint into the training loop.
 - **Performance**: Tail-recursive loops match C -O2 (5 instructions/iteration). Self-loop optimization, untagged register params, bottom-test with `subs`.
 - **Targets**: macOS ARM64 (native), Linux ARM64 (Pi Zero), Linux x86_64 (cross-compile)
@@ -56,7 +56,7 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 ### Key Commands
 
 ```bash
-./rail_native test                    # run 141-test suite
+./rail_native test                    # run the suite (203/203)
 RAIL_ARENA_MB=6000 ./rail_native self # self-compile. The compiler now INLINES the pure-Rail
                                       #   Mach-O linker (tools/v5/link_lib.rail), so self_compile
                                       #   DEFAULTS to in-process rail-link (NO as/ld/codesign) when
@@ -71,43 +71,6 @@ RAIL_ARENA_MB=6000 ./rail_native self # self-compile. The compiler now INLINES t
 ./rail_native linux file.rail         # cross-compile to Linux ARM64 → /tmp/rail_linux
 ./rail_native get <package>           # install package (stdlib name or github.com/user/pkg)
 ./rail_native pkg                     # install dependencies from rail.toml
-```
-
-### Rail Syntax Quick Reference
-
-```rail
--- Comments start with --
-add a b = a + b                       -- named function (BEFORE main)
-main = let _ = print (show (add 3 4)) -- main returns int
-  0                                       -- newline-based let
-double x = let y = x * 2 in y            -- explicit 'in' also works
-
-type Option = | Some x | None         -- ADT definition
-getOrDefault opt = match opt           -- pattern match (NO 'with' keyword)
-  | Some x -> x
-  | None -> 0
-
-fold add 0 [1,2,3,4,5]               -- fold (named 2-arg fns OR \a b -> ... multi-arg lambdas both work)
-map f list, filter f list             -- list ops
-head xs, tail xs, length xs, reverse xs, cons x xs
-range N                               -- [0..N-1]
-\x -> x + 1                          -- single lambda OK
-\a -> \b -> a + b                    -- nested lambdas work (flattened to multi-param)
-write_file path content, read_file path
-let _ = shell "command"
-join sep list, split "c" str          -- split: 1-char delimiter (first char if multiple), NOT substring
-str_split ", " str                    -- multi-char split
-str_find "needle" "haystack"          -- returns index or -1
-str_contains "needle" "haystack"      -- returns bool
-str_replace "old" "new" str           -- replaces all occurrences
-str_sub str start len                 -- substring extraction
-read_line                             -- read line from stdin
-show n                                -- int to string
-int_to_float n                         -- tagged int → raw f64 bits (scvtf)
-float_to_int x                         -- raw f64 → tagged int (fcvtzs, truncation)
-x |> f                                -- pipe operator (f x)
-error "msg", is_error x, err_msg x   -- error handling
-arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 ```
 
 ### Runtime Safety
@@ -128,57 +91,9 @@ arr_new size default, arr_get a i, arr_set a i v, arr_len a  -- mutable arrays
 - **Deeply-nested `match` chains**: A `match | ADT -> match | ADT -> ...` chain 5+ levels deep inside a function body with side-effecting `let`s after it triggers "expected decl" parse errors. **Workaround**: flatten multiple `match`es into a single chained form on one indent level — all ADT destructures at the top of the function body followed by a linear `let` stream. See `tools/train/three_class_mlp.rail:train_step` for the pattern that works.
 - **Mixed float+int arithmetic (v2.1.2)**: `0.0 + int_expr` now promotes correctly even when the int operand's type can't be statically inferred. The O-handler emits a runtime `tst x, #1` path that picks scvtf or fmov based on the tag bit. Regression test: `t106 mixed_float_int_op`.
 
-### Performance Optimizations (in compile.rail)
-
-- **Self-loop → bottom-test**: Tail-recursive self-calls become tight loops with `subs + b.gt`
-- **Untagged register params**: First 3 int params stored raw in x19/x20/x21, untagged on entry
-- **Direct register arithmetic**: Self-loop args computed with raw `add`/`sub`/`mul` on registers
-- **Dependency-aware write scheduling**: Minimizes temp registers in self-loop arg writes
-- **Auto-memoization**: Pure self-recursive single-arg int functions get transparent memo tables
-- **Per-function frame sizing**: Stack frames sized to actual need (not fixed 2048)
-- **Constant folding**: `3 + 4` → `7` at compile time
-- **Type guard elimination**: Skip runtime type checks when operands are provably int
-- **Fused compare-and-branch**: Direct `cmp + b.cc` without intermediate booleans
-- **Native float arithmetic**: Float ops via `fadd`/`fmul` in d-registers, no heap boxing (~10x vs boxed)
-- **Float type inference**: `is_float` + `__float_` env markers propagate through let bindings
-- **Int→float auto-promotion**: Mixed int/float ops: `asr + scvtf` for int operand, `fmov` for float
-- **Cross-function float return**: `__fret_` markers in arity map for float-returning user functions
-
 ### Modifying the Compiler
 
-After editing `tools/compile.rail` (prefix every `self` with `RAIL_ARENA_MB=6000` — the
-inlined linker makes the compiler bigger; default rail-link path needs the arena):
-1. `RAIL_ARENA_MB=6000 ./rail_native self` — self-compile (in-process rail-link)
-2. `cp /tmp/rail_self rail_native` — install new binary
-3. `./rail_native test` — verify 141/141
-4. `RAIL_ARENA_MB=6000 ./rail_native self && cmp rail_native /tmp/rail_self` — verify fixed point. **Needs ≥2 cycles**: gen0's shipped runtime asm doesn't necessarily match what gen0's source emits, so cycle 1 typically differs. Cycle 2 always lands the byte-identical fixed point (gen2 == gen3 == gen4). See `notes/bootstrap_convergence_audit_2026-05-13.md` for the empirical proof. Verify by running self twice after installing and `cmp`-ing the two outputs.
-
-**NOTE**: Self-compile works cleanly since the 256MB stack fix. No gen2_head bootstrap needed.
-
-**IMPORTANT**: If you change the runtime (`rt_core`, `rt_list`, `rt_string`, etc.), the old binary generates the old runtime. You must bootstrap: compile → install → compile again with new binary.
-
-**DATA SECTION BUG**: Changes to the `data` string literal in `compile_program` may not propagate. If you need new data section labels, construct strings at runtime via `malloc` + byte stores in the ARM64 assembly instead. See polymorphic show implementation in `rshow` for the pattern.
-
-**BOOTSTRAP CYCLE PATTERN**: The self-hosting bootstrap has subtleties that have wasted hours. Use this mental model:
-
-| Edit type | Cycles needed | Why |
-|---|---|---|
-| Source-only logic (e.g., `all_params_int` predicate, parser branches) | **1 cycle** | Compile-time decisions take effect when next binary parses code |
-| String literals embedded in `rt_*` runtime asm constants (e.g., `_rail_alloc` body) | **2 cycles** | Cycle 1 puts new strings in data section; cycle 2's emit USES them as runtime |
-| New runtime functions or data section symbols | **2 cycles** | Same — needs cycle 2 to bake the new emit pattern |
-| Both source + runtime asm in one edit | **2 cycles** | Source effect is immediate; runtime effect needs one more |
-| Verifying byte-identical fixed point | **3 cycles** | Cycle 3 compares to cycle 2 to prove convergence |
-
-**Diagnostic pattern**: After bootstrapping, if your edit doesn't seem to take, check:
-
-1. `grep <new-symbol-or-string> tools/compile.rail` — confirm source has it
-2. `grep <new-symbol-or-string> /tmp/rail_self.s` — confirm asm output has it
-3. `nm rail_native | grep <symbol>` — confirm binary has it
-4. Test the actual behavior
-
-If steps 1–3 pass but 4 fails, you probably need another cycle. If step 2 fails despite step 1 passing, the running compiler doesn't know how to emit your new construct — that's almost always "cycle 1 has the new strings in data, but its compile_program function still uses the old data_section_asm or runtime_asm constant". Run cycle 2 to land it.
-
-**ASCII-only inside string literals emitted to asm**: avoid em-dashes (—), curly quotes, etc. inside any string that flows into `.asciz` output. The lexer handles UTF-8 in literals but the assembler can be unhappy with multi-byte content in some contexts. Use `-` (hyphen-minus) and `'` (apostrophe). Comments (outside string literals) can use anything Unicode you want.
+Read `docs/COMPILER_BOOTSTRAP.md` before editing `tools/compile.rail`: bootstrap cycles, the diagnostic pattern, the data-section and ASCII-only traps. Always: `RAIL_ARENA_MB=6000 ./rail_native self`, then `./rail_native test` (203/203), then self again and `cmp` for the fixed point.
 
 ## Substrate beyond compile.rail (shipped 2026-05-11)
 
