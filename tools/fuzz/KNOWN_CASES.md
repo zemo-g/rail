@@ -26,7 +26,6 @@ be able to emit its shape, and the oracle should predict its expected output.
 | Case | Shape | What happens |
 |---|---|---|
 | `char_from_int_nul` | a 0x00 byte through join, +, cat, chars | dropped: those routines measure with strlen. Their results live outside the GC arena on purpose (the compiler resets arena windows while holding strings); a length-tagged in-arena version passed the suite at gen 1, which still ran on the old runtime, and wedged the compiler at gen 2. Needs a representation decision. Binary travels as hex or int arrays. |
-| `mixed_int_from_fn` | `0.1 - (gint 0)`, `2^52 - (length [0])` | an int from a user fn or builtin is read as float bits; an int literal promotes correctly. `semantic.py` excludes mixed arithmetic by default (`--mixed` includes it). |
 
 Closed on 2026-09-07 (kept below as regression templates): the two float
 result-composition cases, head/tail on a non-list, constants outside the
@@ -57,6 +56,12 @@ refuses them.
 | `selfloop_bigconst`, `selfloop_addbig` | constants above 65535 (`*`, `/`) or 4095 (`+`, `-`) as tail self-call arguments; the first was silently wrong, the second refused by the assembler | 2026-09-07, t194: every constant through the register loader, no bail to the fallback |
 | `under_application`, `over_application` | wrong number of arguments to a top-level fn | 2026-09-07: compile error from the arity check in `compile_checked` |
 | `float_param_bare_mul_lsb` | `mul2c a b = a * b` called with floats | 2026-09-07, t197: the raw-register param convention was chosen syntactically and could not see the call-site float proof, so floats were untagged and retagged as ints, 2 ulp high. Hidden for months by 15-digit printing; found within an hour of bit-exact comparison |
+| `selfloop_compound_arg`, `selfloop_literal_arg` | a tail self-call argument the direct lowering cannot express (`(acc + 2) / 3`, `(n - 1) * 1`, a let-bound value) and a plain literal argument | 2026-09-11, t206 (findings F-1003-22/901/902/903): the bottom-test loop refuses unless every argument is direct, the fallback stacks and untags the general values, the literal loads raw |
+| `string_ordering` | `<` `>` `<=` `>=` on two strings, both let orders, cat-built operands | 2026-09-11, t207 (F-5000-3): the runtime routines had no string branch and compared offset 8 of each object; they now dispatch like `_rail_eq` |
+| `string_param_plus` | a 1..3-param fn using only `+` or an ordering op on its params, called with strings | 2026-09-11, t208 (F-5000-1): `used_in_arith` counted the string-polymorphic `+` as int evidence; the call-site proof (argf slot 3 or 0) now vetoes raw registers, the syntactic int mark and the early-return raw compare |
+| `frame_sibling_lets` | five sibling lets in one list literal; lets beside applied lambdas | 2026-09-11, t209 (F-1002-114): `max_sl_list` threads siblings cumulatively, and compile_func re-sizes the frame from the slot cg actually reached |
+| `float_from_container` | a float out of a tuple, a list, an ADT field, with bare and dotted operators, comparisons, through a 2-param fn | 2026-09-11, t210 (F-5000-2): the float representation boundary (a raw float entering a generic location is boxed; a generic value read as a float goes through `_rail_fval`) |
+| `mixed_int_from_fn` | `0.1 - (gint 0)`, `2^52 - (length [0])` | 2026-09-11, with the boundary above: a generic operand of a float op is read through `_rail_fval`, which converts a tagged int instead of reinterpreting its bits. `semantic.py` generates mixed arithmetic by default since then (`--no-mixed` restores the old grammar) |
 
 The self-loop family is the richest template: tail self-recursion with 1 to 3
 int params in registers, argument expressions that read other params, constant
