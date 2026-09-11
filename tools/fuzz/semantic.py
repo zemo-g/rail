@@ -101,7 +101,17 @@ def evaluate(tree, env=None, fuel=None):
         acc = number(ev(acc_tree))
         c = number(ev(ctree))
         for _ in range(n):
-            acc = arith(step, acc, c)
+            # 2026-09-11 shapes (findings F-1003-22/901/902/903): a compound
+            # operand, a let-bound argument, a literal argument. Each was
+            # lowered wrongly by the tail self-call loop while `acc OP c` passed.
+            if step == "cdiv":
+                acc = arith("div", arith("add", acc, c), 3)
+            elif step == "letmul":
+                acc = arith("mul", acc, c)
+            elif step == "lit":
+                acc = c
+            else:
+                acc = arith(step, acc, c)
         return acc
     if op == "var":
         if args[0] not in env:
@@ -209,6 +219,8 @@ def kind_of(tree, env=None):
         name, n, acc, step, c = a
         if kind_of(n, env) not in ("int", "any"):
             raise DomainError("loop count must be int")
+        if step in ("cdiv", "letmul", "lit"):
+            return join_kind("add", kind_of(acc, env), kind_of(c, env))
         return join_kind(step, kind_of(acc, env), kind_of(c, env))
     if op in ("iflt", "fiflt"):
         kl, kr = kind_of(a[0], env), kind_of(a[1], env)
@@ -301,9 +313,16 @@ def decls(e, acc=None):
     elif op == "loop":
         name, n, a, step, c = e[1:]
         decls(n, acc); decls(a, acc); decls(c, acc)
-        sym = {"add": "+", "sub": "-", "mul": "*", "div": "/", "mod": "%",
-               "fadd": "+.", "fsub": "-.", "fmul": "*.", "fdiv": "/."}[step]
-        acc.setdefault(name, f"{name} n acc = if n == 0 then acc else {name} (n - 1) (acc {sym} {render(c)})")
+        if step == "cdiv":
+            acc.setdefault(name, f"{name} n acc = if n == 0 then acc else {name} (n - 1) ((acc + {render(c)}) / 3)")
+        elif step == "letmul":
+            acc.setdefault(name, f"{name} n acc = if n == 0 then acc else let v = acc * {render(c)} in {name} (n - 1) v")
+        elif step == "lit":
+            acc.setdefault(name, f"{name} n acc = if n == 0 then acc else {name} (n - 1) {render(c)}")
+        else:
+            sym = {"add": "+", "sub": "-", "mul": "*", "div": "/", "mod": "%",
+                   "fadd": "+.", "fsub": "-.", "fmul": "*.", "fdiv": "/."}[step]
+            acc.setdefault(name, f"{name} n acc = if n == 0 then acc else {name} (n - 1) (acc {sym} {render(c)})")
     else:
         for x in e[1:]:
             if isinstance(x, list):
@@ -370,7 +389,7 @@ def generate(rng, depth, names=(), floats=True, counter=None):
             params = tuple(f"p{i}" for i in range(k))
             body = generate(rng, depth - 1, params, floats, counter)
             return ["fn2", fresh("f"), list(params), body, [child() for _ in params]]
-        step = rng.choice(["add", "sub", "mul", "add", "fadd", "fmul", "fsub"])
+        step = rng.choice(["add", "sub", "mul", "add", "fadd", "fmul", "fsub", "cdiv", "letmul", "lit"])
         cval = (["float", rng.choice(FLOATS)] if step.startswith("f")
                 else ["int", rng.choice([1, 2, 3, 7, 4096, 65536, 100000, -3])])
         acc = ["float", rng.choice(FLOATS)] if step.startswith("f") else child()
@@ -561,7 +580,8 @@ def main():
     parser.add_argument("--replay", type=Path, help="re-evaluate and run a saved case.json")
     parser.add_argument("--keep-going", action="store_true", help="save every failure and finish the campaign")
     parser.add_argument("--no-floats", action="store_true", help="milestone-1 integer grammar only")
-    parser.add_argument("--mixed", action="store_true", help="include int-op-float arithmetic (live compiler defects, see KNOWN_CASES.md)")
+    parser.add_argument("--mixed", dest="mixed", action="store_true", default=True, help="include int-op-float arithmetic (the default since 2026-09-11, when the float representation boundary closed known/mixed_int_from_fn)")
+    parser.add_argument("--no-mixed", dest="mixed", action="store_false", help="exclude int-op-float arithmetic (the pre-2026-09-11 default)")
     args = parser.parse_args()
     if args.cases < 0 or not 0 <= args.depth <= 5 or args.timeout <= 0 or args.reduce_steps < 0:
         parser.error("cases/reduce-steps >= 0, depth 0..5, timeout > 0 required")
