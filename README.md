@@ -181,7 +181,8 @@ main =
 ```
 
 ```rail
--- Native floats (unboxed IEEE 754 in ARM64 d-registers)
+-- Native floats (unboxed IEEE 754 in ARM64 d-registers; boxed only when stored
+-- into a tuple, list or ADT field, see docs/NUMERICS.md)
 -- Effect handlers (setjmp/longjmp non-local error recovery)
 -- WASM output (closures + ADTs + pattern matching in the browser)
 -- Metal GPU IR (JIT-compiled GPU kernels from Rail AST)

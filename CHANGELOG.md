@@ -5,6 +5,82 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Fixed
+- **Seven miscompiles behind a green suite, found by the 2026-09-11 hardening
+  loop** (a fuzzer, a reducer, a bisector and a perf agent on a shared findings
+  bus; every one passed 198/198, the fixed point and the CI fuzz seed). Each
+  ships with its minimal program as a suite test (t206..t210) and a
+  `tools/fuzz/known/` case, and `tools/fuzz/semantic.py`'s loop family now
+  generates the shapes that were missing.
+  - **Tail self-call arguments.** `sl (n - 1) ((acc + 2) / 3)` printed a heap
+    address: the bottom-test loop had no fallback and emitted `mov x20, x9`
+    with x9 never written. `let v = acc * 2 in sl (n - 1) v` gave 401 for 200
+    and `dn ((n - 1) * 1)` never terminated: the fallback moved general (tagged)
+    values into the raw loop registers as they were. A plain literal argument
+    (`f (n - 1) 5`) was loaded tagged, so the loop ran with 11. The bottom-test
+    form is refused unless every argument is direct, the fallback stacks the
+    general values and untags them on the way into the registers, and the
+    literal loads raw (t206).
+  - **String ordering.** `"abc" < "abd"` was 0, and 1 with the two lets
+    swapped: `_rail_lt/gt/le/ge` had no string branch and compared offset 8 of
+    each object. They dispatch like `_rail_eq` now (t207). `tools/x86_rt.s`
+    still lacks the branch and says so.
+  - **String parameters read as ints.** `app1 a = a + "x"` returned a heap
+    address and `f a b = length (a + b)` returned 0: a fn whose params are used
+    only in `+` or an ordering op took the raw-register convention, the
+    syntactic int mark, and the early-return raw compare, whatever its call
+    sites passed. The call-site proof (every site heap, or sites disagree)
+    now vetoes all three, and the proof reaches through a param handed on to
+    another fn (t208).
+  - **Frames under-sized for sibling slots.** Five sibling lets in one list
+    literal predicted one slot and consumed five; the fifth wrote past the
+    frame (SIGBUS). `max_sl_list` threads siblings cumulatively, an
+    application spine reserves its closure slot, and `compile_func` re-sizes
+    the frame from the slot cg actually reached, saying so when the predictor
+    was short (t209).
+  - **Floats out of containers.** `let (a, b) = (1.5, 2.25)` then `a + b`
+    was SIGSEGV at 0x3ff8000000000000 (1.5's bits dereferenced as a pointer);
+    through a 2-param fn it was 4.9e-324 (a tagged int read as float bits).
+    Two conventions coexisted with no boundary: raw binary64 bits for
+    statically-known floats, tag-6 boxes for the generic runtime, and the
+    runtime's own mixed arms read the untagged operand as raw bits in one
+    routine and as a box in the next. The boundary is now explicit (see
+    docs/NUMERICS.md): a raw float entering a generic location (a tuple,
+    list or ADT field, a closure-call argument, a parameter without an
+    all-sites float proof, a match result, a non-float-returning fn's return)
+    is boxed; a generic value read as a float goes through `_rail_fval`,
+    which converts a tagged int, loads a box and takes anything else as raw
+    bits. Every generic runtime routine reads through it too, which also
+    closes `known/mixed_int_from_fn` (`0.1 - (gint 0)` was 0.1). A float
+    accumulator loop `if n == 0 then acc else go (n - 1) (acc +. x)` is now
+    recognised as float-returning (the fn may assume its own recursive call),
+    and `float_arr_new n v` no longer marks its LENGTH float (the argument
+    positions were read off the application spine) (t210).
+- **`RAIL_ARENA_MB=6000 ./rail_native self` fell off the allocator cliff
+  once the compile allocated a few hundred MB more.** The in-process
+  self-hosted linker inherited an arena the compile had nearly filled and
+  ran on the free-list scan for minutes (or died in it). The assembly is on
+  disk before the linker starts and nothing from the compile is needed
+  after, so `self` resets the arena to its pre-compile mark first, the way
+  `run_test` does after every in-process compile.
+
+### Changed
+- **Codegen of the compiler's own source: 7.6 s to 1.7 s.** `compile_func`
+  injected the program's ~2,500 `__ret_`/`__float_ret_` markers in FRONT of
+  a function's locals, so every local lookup in cg walked past all of them
+  first. They now sit behind the locals (keys are disjoint, so nothing else
+  changes). The call-site analysis carries more kinds and costs 4 s more on
+  the same source, and recording a call-site slot used to rebuild the whole
+  marker map on every observation; the map is now touched only when a slot
+  narrows. Self-compile of the compiler's source: 21.5 s to 17.5 s at
+  `RAIL_ARENA_MB=6000`; at CI's 4000 MB, 19 s to 16 s with the peak
+  footprint 2.4 GB to 1.5 GB and no collection. A small fixed source goes
+  from 0.27 s to 0.31 s. Generated code is unchanged in speed (the perf
+  agent's six benches within noise, outputs identical). Seed sha256 and
+  suite count (203) updated.
+- `tools/fuzz/semantic.py` generates mixed int-and-float arithmetic by
+  default (`--no-mixed` restores the old grammar) now that
+  `known/mixed_int_from_fn` is closed; its loop family gained the compound,
+  let-bound and literal argument shapes.
 - **A bare `./rail_native self` spun for hours instead of finishing.** The
   compiler's own source no longer fits the 1 GB default arena's bump window;
   allocation falls to the free-list scan and a self-compile that takes 18 s at
