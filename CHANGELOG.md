@@ -4,7 +4,23 @@ All notable changes to Rail are documented here.
 
 ## Unreleased
 
+### Added
+- **`\r` is an escape in string literals** (carriage return, byte 13), lexed like `\n` and
+  `\t` and emitted through `esc_asm_char` as `\r`. Until now a `\r` literal was the two
+  characters backslash and r, and CRLF had to be built with `char_from_int 13`. Test t211.
+  Written by DeepSeek V4.1 Flash through the clerk's letters door on the night of 2026-09-20
+  (the Rail ladder, rung C), judged by `tools/fuzz/ladder/judge.py C` through a real rebuild.
+- **`tools/fuzz/ladder/`**: the night ladder's rungs and judge. A rung is a pointed task for the
+  local night worker with a check program, an expected output and a code judge that rebuilds the
+  compiler for compiler rungs, bounds wall clock and memory, and runs the suite. Rungs A and C
+  climbed on 2026-09-21; B (the live miscompile `mixed_int_from_fn`) is still open.
+
 ### Fixed
+- **`bytes_to_str` in `stdlib/http_client.rail` is linear.** It joined once per byte, copying
+  the accumulator every step: 100 KB of response took 5.5 GB of resident memory, which was the
+  real reason HTTPS responses were capped near 64 KB. It now collects the characters into a list
+  and joins once; the result is byte-identical. Test t212 checks 100,000 bytes; the ladder judge
+  (`judge.py A`) caps the check at 1 GB. Written by DeepSeek V4.1 Flash (rung A, 2026-09-21).
 - **Seven miscompiles behind a green suite, found by the 2026-09-11 hardening
   loop** (a fuzzer, a reducer, a bisector and a perf agent on a shared findings
   bus; every one passed 198/198, the fixed point and the CI fuzz seed). Each
