@@ -98,15 +98,60 @@ inner_step buffers parity ctx coeffs fxr fxl fyu fyd i =
     let _ = float_arr_set ctx 1 dt
     inner_step buffers (1 - parity) ctx coeffs fxr fxl fyu fyd (i + 1)
 
+-- Fresh OS entropy for the reset perturbation, reduced to [0, 1e6).
+--
+-- /dev/urandom rather than an in-language PRNG: Rail's 63-bit tagged ints
+-- overflow multiplicative generators (see the traps index), and this value
+-- must be genuinely unpredictable: it is the only thing standing between
+-- the beacon and an exactly periodic output.  shell() inherits no PATH, so
+-- every binary is spelled out in full.
+--
+-- If the read ever fails, parse_int returns 0 and the seed is 0, which is
+-- exactly the old always-identical behaviour: degraded, not broken, and
+-- visible in the reset log line below.
+--
+-- Returns the SEED (an integer), not the phase. The seed is the whole
+-- epoch: init -> mk_perturb_seed(seed) -> N steps reproduces every frame
+-- bit-for-bit, so recording this one integer makes the epoch replayable
+-- by anyone. mk_phase_of_seed turns it into the phase the kick uses.
+beacon_reset_seed _ =
+  let s = shell "/bin/dd if=/dev/urandom bs=4 count=1 2>/dev/null | /usr/bin/od -An -tu4 | /usr/bin/tr -d ' \n'"
+  parse_int s % 1000000
+
+-- The seeded perturbation now lives in stdlib/mhd_kernel.rail as
+-- mk_perturb_seed, so this beacon and any epoch verifier share ONE
+-- implementation of it. Two copies of that arithmetic would drift, and
+-- a verifier that has drifted from the producer proves nothing.
+
 -- Reset in place — re-run mk_init_loop on the current buffer.  Avoids
 -- the 768 KB allocation that mk_init_state would do.  Returns 0 (parity
 -- unchanged).
+--
+-- ★ The reset is then PERTURBED with fresh entropy, and that is the whole
+-- point.  mk_init_cell is a pure function of the cell index, so re-running
+-- it produced byte-identical state every cycle; a deterministic PDE from
+-- identical initial conditions retraces the identical trajectory, and the
+-- beacon therefore REPLAYED its values on a fixed period.  Measured
+-- 2026-08-05 over 20,000 contiguous archived pulses: only 5,996 distinct
+-- values (70% duplication), repeat gap clustered at ~5,258 pulses ≈ 4h.
+-- A public randomness beacon that repeats itself is the one bug that can
+-- be used to discredit "check me, don't trust me", and it is checkable by
+-- anyone who pulls /pulse/log.
+--
+-- The comment this replaces said the reset "keeps the chaos live"; it did
+-- the exact opposite, which is why it survived review for months.  Chaos
+-- needs a different starting point each cycle, not the same one.
 maybe_reset buffers parity ctx =
   let t = float_arr_get ctx 0
   if t > t_reset then
-    let _ = print "beacon: t > pi, resetting"
+    let seed = beacon_reset_seed 0
+    let ph = mk_phase_of_seed seed
+    let _ = print (cat ["beacon: t > pi, resetting with fresh phase ", show ph,
+                        " seed=", show seed])
     let _ = float_arr_set ctx 0 0.0
     let _ = mk_init_loop (arr_get buffers parity) 0
+    let _ = mk_perturb_seed (arr_get buffers parity) seed
+    let _ = float_arr_set ctx 8 (to_float seed)
     0
   else 0
 
@@ -181,7 +226,9 @@ main =
   --   [1] dt of last step           [5] last energy diagnostic
   --   [2] initial mass m0           [6] last divB diagnostic
   --   [3] initial energy e0         [7] last rho_min diagnostic
-  let ctx = float_arr_new 8 0.0
+  -- ctx[0..7] as before; ctx[8] carries the current epoch SEED so the
+  -- frame loop can record it alongside the frames it produced.
+  let ctx = float_arr_new 9 0.0
   let _ = float_arr_set ctx 2 m0
   let _ = float_arr_set ctx 3 e0
   -- Seed the diagnostic slots so the first frame's metrics aren't all zero.
@@ -199,7 +246,12 @@ main =
   let fxl = float_arr_new 6 0.0
   let fyu = float_arr_new 6 0.0
   let fyd = float_arr_new 6 0.0
-  -- 100k frames at 4 fps is ~7 hours — plenty for one process lifetime;
-  -- the launchd wrapper restarts on exit.
-  let _ = beacon_loop buffers 0 ctx buf coeffs fxr fxl fyu fyd 0 100000
+  -- Frame budget is a LEAK BOUND, not a time budget. target_fps is 1 (not the
+  -- 4 this once assumed), so the old 100000 cap ran ~28 h and let the residual
+  -- bump-arena leak fill swap to 19 GB (2026-07-07). ~330 KB/frame residual
+  -- observed then (a regression from 30 KB/frame, 2026-05-02 -- see the
+  -- plasma-beacon-leak memory; the residual itself still wants bisecting).
+  -- 6000 frames ~= 100 min ~= <2 GB peak before mhd_beacon.sh's while-loop
+  -- respawns a fresh arena.
+  let _ = beacon_loop buffers 0 ctx buf coeffs fxr fxl fyu fyd 0 6000
   0
