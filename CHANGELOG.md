@@ -4,6 +4,8 @@ All notable changes to Rail are documented here.
 
 ## Unreleased
 
+## v5.4.0 (2026-09-22): Hardening, and the beacon replays from one integer
+
 ### Added
 - **`\r` is an escape in string literals** (carriage return, byte 13), lexed like `\n` and
   `\t` and emitted through `esc_asm_char` as `\r`. Until now a `\r` literal was the two
