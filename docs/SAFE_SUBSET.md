@@ -43,5 +43,5 @@ HTTPS fetch), the hermetic boundary moves to the *artifact* it produces — pin 
 sign that artifact, and treat the non-hermetic step as trusted input, not as part of
 the verified computation.
 
-A future `tools/lint/check_quirks.rail` pass can flag out-of-subset constructs in
+A future a lint pass can flag out-of-subset constructs in
 code annotated as attested; today the boundary is enforced by convention and review.

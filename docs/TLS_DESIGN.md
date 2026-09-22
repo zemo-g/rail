@@ -54,7 +54,7 @@ This blocks Option A (pure Rail) until compile.rail is extended.
 Already in stdlib: `dlopen`/`dlsym`/`dlclose` bindings. Both macOS (Security.framework/SecureTransport or CommonCrypto) and Linux (libcrypto) ship audited TLS stacks.
 
 1. Wrap `libssl.dylib` (macOS) or `libssl.so.3` (Linux) — `SSL_new`, `SSL_connect`, `SSL_read`, `SSL_write`, `SSL_CTX_new`, etc. via dlsym.
-2. Build `stdlib/tls.rail` on top: `tls_connect ip port sni -> handle`, `tls_send handle bytes -> int`, `tls_recv handle -> string`, `tls_close handle`.
+2. Build `stdlib/tls13_client.rail` on top: `tls_connect ip port sni -> handle`, `tls_send handle bytes -> int`, `tls_recv handle -> string`, `tls_close handle`.
 3. Wire into `http_client.rail`: new entry points `https_get`/`https_post_json` that tunnel through the TLS handle instead of raw `socket.rail` send/recv.
 
 **Pro:** 2-3 days to working HTTPS. Production-quality crypto (AES-NI, ChaCha20 SIMD, audited for decades). Cross-platform.
@@ -91,7 +91,7 @@ Three reasons:
 
 Today's deliverable target, scoped to 3-4 hours:
 
-- `stdlib/tls.rail` — FFI declarations for `libssl` (SSL_new, SSL_CTX_new, SSL_set_fd, SSL_connect, SSL_read, SSL_write, SSL_free, SSL_CTX_free, SSL_library_init)
+- `stdlib/tls13_client.rail` — FFI declarations for `libssl` (SSL_new, SSL_CTX_new, SSL_set_fd, SSL_connect, SSL_read, SSL_write, SSL_free, SSL_CTX_free, SSL_library_init)
 - `tls_connect_fd fd sni -> handle` — wraps an existing socket.rail fd, drives the handshake
 - `tls_send handle s -> int` and `tls_recv handle max -> string`
 - Basic test: `tls_connect` to `api.anthropic.com:443`, `SSL_write` a GET /, `SSL_read` the response. Print status line.
