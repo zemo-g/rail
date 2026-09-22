@@ -6,11 +6,11 @@
 </p>
 
 <p align="center">
-  <a href="#releases"><img src="https://img.shields.io/badge/v5.3.0-Independence%20%2B%203%C3%97%20faster%20self--compile-ff5500?style=for-the-badge" alt="v5.3.0"></a>
+  <a href="#releases"><img src="https://img.shields.io/badge/v5.4.0-Hardening%2C%20and%20the%20beacon%20replays-ff5500?style=for-the-badge" alt="v5.3.0"></a>
 </p>
 
 <p align="center">
-  <a href="#quick-start"><img src="https://img.shields.io/badge/tests-198%2F198-brightgreen" alt="tests 198/198"></a>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/tests-209%2F209-brightgreen" alt="tests 209/209"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
   <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
@@ -29,12 +29,12 @@
 
 ---
 
-Rail compiles itself. The compiler — ~9,200 lines of Rail — produces a ~0.9 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. The TLS 1.3 client is also Rail: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat. As of **v5.2.0**, the toolchain stands entirely alone: Rail assembles, links, and code-signs its own Mach-O binaries in-process — no `as`, no `ld`, no `codesign` — so the self-compile is bit-reproducible (the committed seed reproduces itself byte-for-byte). It also emits its own aarch64 Linux ELF binaries and its own GPU kernels, generating Metal Shading Language from an op-DAG and JIT-compiling it at runtime (35× fused rmsnorm+QKV, 18× fused silu+hadamard). A frontier model + 1 KB Rail spec still compiles 30/30 on a held-out hard-bench — publicly reproducible.
+Rail compiles itself. The compiler — ~10,000 lines of Rail — produces a ~0.9 MB ARM64 binary that compiles the compiler again and reaches a byte-identical fixed point in 2 cycles. There is no C in the runtime, no libc in the binary. The garbage collector is ARM64 assembly. The TLS 1.3 client is also Rail: `import "stdlib/anthropic_client.rail"` and your program talks HTTPS to `api.anthropic.com` with zero OpenSSL, zero curl, zero socat. As of **v5.2.0**, the toolchain stands entirely alone: Rail assembles, links, and code-signs its own Mach-O binaries in-process — no `as`, no `ld`, no `codesign` — so the self-compile is bit-reproducible (the committed seed reproduces itself byte-for-byte). It also emits its own aarch64 Linux ELF binaries and its own GPU kernels, generating Metal Shading Language from an op-DAG and JIT-compiling it at runtime (35× fused rmsnorm+QKV, 18× fused silu+hadamard). A frontier model + 1 KB Rail spec still compiles 30/30 on a held-out hard-bench — publicly reproducible.
 
 ```
 RAIL_ARENA_MB=6000 ./rail_native self && cp /tmp/rail_self ./rail_native  # cycle 1
 RAIL_ARENA_MB=6000 ./rail_native self && cmp rail_native /tmp/rail_self   # cycle 2 — byte-identical
-./rail_native test                                     # 198/198
+./rail_native test                                     # 209/209
 ```
 
 ### What the self-hosting is *for*
@@ -82,7 +82,7 @@ RAIL_ARENA_MB=6000 ./rail_native self               # self-compile, fixed point 
 ### 1. Compiles itself, byte-identical
 
 ```
-RAIL_ARENA_MB=6000 ./rail_native self                    -- ~9,200 lines of Rail →
+RAIL_ARENA_MB=6000 ./rail_native self                    -- ~10,000 lines of Rail →
                                       --   a ~0.9 MB ARM64 binary
 cp /tmp/rail_self ./rail_native       -- cycle 1: install gen1
 RAIL_ARENA_MB=6000 ./rail_native self                    -- cycle 2: that binary compiles
@@ -204,6 +204,15 @@ Tail-recursive loops match C `-O2` (5 instructions per iteration). The full arch
 
 ## Releases
 
+### v5.4.0 (2026-09-22): *Hardening, and the beacon replays from one integer*
+
+- Seven miscompiles found by the hardening loop, each fixed with the minimal program that exposed it, and the known-miscompile corpus is a runnable suite (`tools/fuzz/known/`).
+- The bit-exact float oracle closes a 2 ulp drift; float results compose across calls; wrong arity is a compile error.
+- `bytes_to_str` is linear (the HTTPS response cap is gone); the lexer knows `\r`; a bare self-compile refuses instead of thrashing.
+- The entropy beacon replays any epoch from one logged integer and ships the verifier; GLM divergence cleaning; the MHD kernel has suite coverage (t186 to t189).
+- Fleet agents: identifier allowlists on `/logs` and `/jobs`, the v2 agent's injection and fail-open auth fixed; Linux `_start` passes envp.
+- 209/209 tests.
+
 ### v5.3.0 — 2026-07-08 — *Independence + 3× faster self-compile*
 
 19 PRs of consolidation: the trusting-trust answer plus a big perf cut.
@@ -307,7 +316,7 @@ Native floats in ARM64 d-registers, effect handlers via setjmp/longjmp, GC in as
 
 ## Honest limits
 
-Things Rail v5.3.0 **doesn't** do, so you don't hit them as surprises:
+Things Rail v5.4.0 **doesn't** do, so you don't hit them as surprises:
 
 - TLS ships one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one ECDHE group (`x25519`), and three CertificateVerify sig-algs (`rsa_pss_rsae_sha256 | ecdsa_secp256r1_sha256 | ecdsa_secp521r1_sha512`). Modern CDN fronts work; legacy servers may not.
 - No TLS session resumption, no 0-RTT, no client certificates.
