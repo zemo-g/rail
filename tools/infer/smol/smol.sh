@@ -3,6 +3,7 @@
 # verification of what it generates. Run from the repository root.
 #
 #   smol.sh gen "<prompt>" <n> <transcript>   produce n greedy tokens, print the text
+#   smol.sh spec "<prompt>" <n> <transcript>  the same transcript, with n-gram speculation
 #   smol.sh verify <transcript> [<i> <tok>]   check it in one pass (optionally forge token i)
 #   smol.sh parity <transcript>               1-row vs 8-row vs all-at-once bit parity
 #   smol.sh ref <transcript>                  the numpy reference's greedy tokens, compared
@@ -44,6 +45,10 @@ case "${1:-}" in
     rail gen "$WORK/prompt.ids" "$3" "$4"
     (head -1 "$4"; sed -n 2p "$4") | tr '\n' ' ' > "$WORK/all.ids"
     echo "--- text ---"; "$PY" "$HERE/ref.py" decode "$WORK/all.ids" ;;
+  spec)
+    need_py
+    "$PY" "$HERE/ref.py" tokenize "$2" > "$WORK/prompt.ids"
+    rail spec "$WORK/prompt.ids" "$3" "$4" ;;
   verify)
     rail verify "${@:2}" ;;
   parity)
@@ -59,5 +64,5 @@ case "${1:-}" in
     else
       echo "numpy reference DISAGREES:"; cat "$WORK/ref.txt"; exit 1
     fi ;;
-  *) sed -n '2,12p' "$0"; exit 2 ;;
+  *) sed -n '2,13p' "$0"; exit 2 ;;
 esac

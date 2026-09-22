@@ -13,7 +13,9 @@ All notable changes to Rail are documented here.
   logit row for logit row (FNV-64 of all 49,152 logits), with no tolerance: 240 tokens produced
   in 3,734 ms verify in 77 ms on an M4 Pro, and the same transcript verifies on a base M1. The
   M4 Pro and the M1 write byte-identical transcripts. A numpy reference agrees on every greedy
-  token tried. Greedy only; see the directory's README for what it is not.
+  token tried. `spec.rail` adds n-gram speculation (no draft model) and writes the byte-identical
+  transcript in fewer passes: 240 tokens in 55 passes and 821 ms. Greedy only; see the
+  directory's README for what it is not.
 
 ### Fixed
 - **A closure call hands over the closure, and the lambda fetches its own captures.** The caller

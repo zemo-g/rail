@@ -38,6 +38,22 @@ The two machines are different GPU generations on different macOS versions; the 
 own Metal shim from source. The transcript files are byte-identical: 64 tokens and 64
 fingerprints of full logit rows. The mini's 240-token transcript verifies 240/240 on the Air.
 
+The same property makes the producer faster without changing a bit of its output.
+`spec.rail` guesses upcoming tokens from earlier text (the last three tokens' most recent
+occurrence; no draft model) and checks up to seven guesses in the pass that decodes the
+current token, keeping the ones the model's own greedy choice confirms. Its transcripts are
+byte-identical to plain decoding's, fingerprints included (`cmp`), on all four prompts tried:
+
+| prompt | tokens | passes | ms (plain decoding) |
+|---|---|---|---|
+| "The Rail programming language compiles itself, and" | 240 | 55 | 821 (3,734) |
+| same | 64 | 33 | 461 (917) |
+| "In the winter of 1905, a young clerk in the Swiss patent office" | 48 | 34 | 492 (698) |
+| "The first law of thermodynamics states that" | 40 | 38 | 527 (561) |
+
+How much it saves depends on how much the text repeats itself, which a 135M base model does a
+lot; the output never depends on it.
+
 Correctness is judged by something outside Rail: `ref.py`, a numpy float32 Llama written
 from the model card, reads the checkpoint itself. It agrees on every greedy token tried (64
 of 64, 48 of 48 and 40 of 40 across three prompts) and on the logits to 7.4e-5 absolute
@@ -51,6 +67,8 @@ and a python3 that has `numpy` and `tokenizers`:
 
 ```
 tools/infer/smol/smol.sh gen "The Rail programming language compiles itself, and" 64 /tmp/t.txt
+tools/infer/smol/smol.sh spec "The Rail programming language compiles itself, and" 64 /tmp/s.txt
+cmp /tmp/s.txt /tmp/t.txt                           # same bytes, fewer passes
 tools/infer/smol/smol.sh verify /tmp/t.txt          # VERIFIED, exit 0
 tools/infer/smol/smol.sh verify /tmp/t.txt 40 1789  # forge token 40: REJECTED at 40, exit 1
 tools/infer/smol/smol.sh parity /tmp/t.txt          # 1-row == 8-row == all-at-once
@@ -96,6 +114,7 @@ another Mac and `verify` it there: that is the cross-device check.
 |---|---|
 | `smol_engine.rail` | kernels, loader, RoPE table, the forward pass, fingerprints |
 | `gen.rail` | the producer: prefill, then decode, then write the transcript |
+| `spec.rail` | the producer with n-gram speculation: same transcript, fewer passes |
 | `verify.rail` | the verifier: one pass, token and fingerprint per position, first divergence |
 | `parity.rail` | 1-row vs 8-row vs all-at-once over every logit row and every K/V cache |
 | `ref.py` | the independent numpy reference and the tokenizer glue |
