@@ -218,6 +218,24 @@ import "stdlib/<name>.rail"
 
 > subjectAltName OID = 2.5.29.17 = 55 1d 11
 
+### `asn1_oid_basic_constraints _`
+
+> basicConstraints OID = 2.5.29.19 = 55 1d 13
+
+### `asn1_is_ca cert cert_len`
+
+> ── CA check (RFC 5280 basicConstraints) ─────────────────────────────
+> Returns 1 iff the cert asserts basicConstraints with cA=TRUE, else 0.
+> Per RFC 5280 4.2.1.9, cA is DEFAULT FALSE, so an absent extension, an
+> empty BasicConstraints SEQUENCE, or an explicit BOOLEAN FALSE all mean
+> "not a CA". A cert that is not a CA MUST NOT be trusted to sign other
+> certificates — enforcing this on every issuer is what blocks the
+> classic "any leaf becomes an intermediate" MITM.
+> BasicConstraints := SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+> pathLenConstraint INTEGER OPTIONAL }
+> extnValue is an OCTET STRING wrapping that DER SEQUENCE; asn1_find_extension
+> returns the OCTET STRING contents, i.e. the SEQUENCE TLV itself.
+
 ### `asn1_find_validity cert cert_len`
 
 
@@ -274,19 +292,30 @@ import "stdlib/<name>.rail"
 
 ### `ag_tape_new _`
 
-> ag_tape_new: create an empty tape
+> ag_tape_new: create an empty tape. Slot 0 = count (0); entries start at slot 1.
+
+### `ag_tape_len tape`
+
+> ag_tape_len: number of entries on the tape (O(1)).
 
 ### `ag_tape_push tape entry`
 
-> ag_tape_push: append an entry, return (new_tape, index_of_new_entry)
-> Index = length of tape before push (0-based).
+> ag_tape_push: store entry at slot count+1, growing (doubling) if full.
+> Returns (tape, index); index = entry count before push (0-based), matching
+> the old list semantics so every tracked_* caller is unchanged.
+
+### `ag_tape_grow tape`
+
+> ag_tape_grow: allocate a 2x array and copy slots 0..count across.
+
+### `ag_tape_copy src dst k`
+
+> ag_tape_copy: copy slots k..0 from src to dst (tail-recursive -> loop).
 
 ### `ag_tape_get tape i`
 
-> ag_tape_get: retrieve entry at index i
-
-### `ag_tape_get_acc tape i cur`
-
+> ag_tape_get: retrieve entry at 0-based index i (O(1)). Slot 0 is the count,
+> so entry i lives at slot i+1.
 
 ### `ag_param t`
 
@@ -1054,7 +1083,11 @@ import "stdlib/<name>.rail"
 ### `cc_try_inter store certs lens count i cur cur_len`
 
 > Step 3: neither SPKI match nor issuer match — try the next cert in
-> the server-supplied chain.
+> the server-supplied chain. The next cert is being used as an issuing
+> CA, so it MUST carry basicConstraints cA=TRUE (RFC 5280 6.1.4). Without
+> this check any end-entity cert (e.g. an attacker's ordinary DV cert)
+> that itself chains to a trusted root could sign a forged leaf and have
+> the walk accept it — a universal MITM. Reject non-CA issuers up front.
 
 
 ## `stdlib/cert_p384.rail`
@@ -1861,22 +1894,40 @@ import "stdlib/<name>.rail"
 
 ## `stdlib/dns.rail`
 
-### `dns_default_server _`
+### `dns_servers _`
 
-> Read /etc/resolv.conf, find first "nameserver X.Y.Z.W" line.
+> Read /etc/resolv.conf and collect EVERY IPv4 nameserver, in order,
+> with 1.1.1.1 appended as a last resort.
+> 
+> Using only the first nameserver was a single point of failure. On
+> 2026-08-28 Tailscale's MagicDNS sat at the top of resolv.conf,
+> accepted our query, and never answered it (sent=29, got=-1), while
+> the very next server answered normally. A resolver that accepts and
+> drops is indistinguishable from having no network at all, so every
+> Rail HTTPS consumer went dark at once, attestation signing included.
 
 ### `split_lines s`
 
 > Split a string on newlines.
 
-### `dns_scan_lines lines`
+### `dns_collect_ns lines`
 
+
+### `dns_prepend_ns ip rest`
+
+> Unusable entries are dropped rather than replaced with a default:
+> the fallback belongs at the end of the list exactly once, not
+> substituted in the middle where it would mask the real ordering.
 
 ### `dns_is_nameserver line`
 
 
 ### `dns_extract_ns line`
 
+
+### `dns_default_server _`
+
+> First usable resolver, for callers that only want one.
 
 ### `dns_encode_name host`
 
@@ -1936,11 +1987,17 @@ import "stdlib/<name>.rail"
 ### `dns_resolve_a host`
 
 
-### `dns_resolve_a_try host attempt`
+### `dns_try_pass host servers pass`
 
-> Up to 3 attempts at 2-second timeout each.  Total worst-case 6 s.
+> Two passes over the whole server list at a 2-second timeout each.  A
+> transient drop still gets a retry, but a resolver that never answers
+> now costs one timeout instead of three, and never starves the servers
+> listed behind it.
 
-### `dns_resolve_a_once host`
+### `dns_try_each host servers`
+
+
+### `dns_resolve_a_once host server`
 
 
 ### `dns_send_udp fd buf len ip port`
@@ -3394,7 +3451,11 @@ import "stdlib/<name>.rail"
 ### `bytes_to_str buf off n acc`
 
 > Copy bytes [start .. start+n) out of `buf` into a Rail string.
-> Uses char_from_int + join. O(N) work, O(N²) alloc; fine for responses up to ~64KB.
+> Collects the characters into a list (head-first) and joins once, so the
+> work and allocation are O(N) instead of the old O(N²) accumulator copy.
+
+### `bytes_to_str_chars buf off n cs`
+
 
 ### `parse_response raw`
 
@@ -3995,6 +4056,10 @@ import "stdlib/<name>.rail"
 ### `ibuf_upload arr n`
 
 
+### `ibuf_update wid arr n`
+
+> overwrite a resident weight buffer IN PLACE (training loop: no leak). returns 0 ok.
+
 ### `ijit_run_wx kid wid x o sizeX sizeO nthreads`
 
 
@@ -4436,15 +4501,28 @@ import "stdlib/<name>.rail"
 
 ### `jit_tape_new _`
 
+> Array-backed op-DAG tape: slot 0 holds the node count, slots 1..count hold
+> JitNodes. Push is O(1) amortized (doubling) and get is O(1); the old list
+> form did `length` + `append` per push (O(n^2) build) and an O(i) walk per get.
+
+### `jit_tape_len tape`
+
+> jit_tape_len: number of nodes on the tape (O(1)).
 
 ### `jit_tape_push tape node`
+
+> jit_tape_push: store node at slot count+1 (growing if full), return [tape, idx].
+
+### `jit_tape_grow tape`
+
+
+### `jit_tape_copy src dst k`
 
 
 ### `jit_tape_get tape i`
 
-
-### `jit_tape_get_acc tape i cur`
-
+> jit_tape_get: O(1) random access; slot 0 is the count, node i lives at slot i+1.
+> Out-of-range (i<0 or i>=count) returns the "missing" sentinel, as before.
 
 ### `jit_nth n xs`
 
@@ -5285,6 +5363,29 @@ import "stdlib/<name>.rail"
 ### `mk_init_state`
 
 
+### `mk_phase_of_seed raw`
+
+> Seed (a raw u32 from /dev/urandom) to a phase in [0, 2*pi).
+> Reduced mod 1e6 first so the multiply stays exact in a 63-bit tagged
+> int, and so the integer is recoverable from the printed phase.
+
+### `mk_perturb_cell state ph i`
+
+> A small phase-shifted velocity kick, with energy adjusted so PRESSURE
+> IS UNCHANGED. Adding momentum without touching energy would silently
+> lower the thermal pressure every cycle and eventually drive it
+> negative, turning a fixed beacon into a crashing one. The thermal term
+> is therefore recomputed from the pre-kick pressure:
+> e = p/(gamma-1) + ke + me,  with gamma-1 = 2/3 as mk_init_cell builds it.
+
+### `mk_perturb_loop state ph i`
+
+
+### `mk_perturb_seed state raw`
+
+> Perturb a state in place from a raw seed. This is the whole epoch
+> entry point: mk_init_loop then mk_perturb_seed reproduces any epoch.
+
 ### `mk_pressure state x y`
 
 
@@ -5431,6 +5532,19 @@ import "stdlib/<name>.rail"
 
 ### `mk_divb_cell state i`
 
+> Returns |div B| at cell i.
+> 
+> The trailing `+ 0.0` is load-bearing, not decoration. Without it the
+> compiler does not mark this function float-returning, and a CALLER doing
+> arithmetic on the result gets a tagged int where it expects a double:
+> 
+> let d = mk_divb_cell s 100     -- prints fine via show_float
+> d * d                          -- SEGFAULT
+> 
+> Comparison happens to survive the confusion, which is why mk_max_div_b
+> (which only ever compares) worked for months while the first caller to
+> multiply the result crashed instantly. Coercing here fixes it once for
+> every caller instead of making each one remember.
 
 ### `mk_divb_check state i acc`
 
@@ -5472,6 +5586,62 @@ import "stdlib/<name>.rail"
 
 ### `mk_print_diag step state m0 e0 dt t`
 
+
+### `mk_pidx x y`
+
+> psi lives on its own plane, indexed like a single field of the state.
+
+### `mk_pget psi x y`
+
+
+### `mk_pput psi x y v`
+
+
+### `mk_psi_new _`
+
+
+### `mk_divb_signed state x y`
+
+> Signed div B, centered, same stencil mk_divb_cell measures with.
+
+### `mk_glm_psi_loop state psi ch2 dt damp i`
+
+> Pass 1: psi <- (psi - dt*c_h^2*div B) damped. Reads B only, writes psi only.
+
+### `mk_glm_b_loop state psi dt i`
+
+> Pass 2: B <- B - dt*grad(psi), using the UPDATED psi. Reads psi only,
+> writes B only, so the two passes never race on the same array.
+
+### `mk_glm_clean state psi dt ch cr`
+
+> One cleaning substep applied in place to `state`.
+> ch  : divergence-wave speed, take the step's max signal speed
+> cr  : damping length; smaller damps harder
+
+### `mk_muscl_glm_step state psi dt cr ch_mult`
+
+> MUSCL step with GLM cleaning. `psi` is caller-owned and persists across
+> steps -- that is the point, psi accumulates and transports the error.
+> 
+> c_h is the speed the divergence wave travels at, and cleaning is only as
+> fast as c_h allows. The symplectic update is stable up to c_h dt = dx, so
+> dx/dt is BOTH the physical maximum and the stability limit; Dedner takes
+> c_h there. Passing it as a multiple of the signal speed keeps the caller
+> honest about how close to that limit it is running:
+> 
+> dt = 0.01472621556370216 / smax  (mk_compute_dt_muscl)
+> dx = 0.04908738521234052
+> => dx/dt = 3.333 smax, so ch_mult = 3.333 sits exactly on the limit.
+> 
+> Measured, 100 Orszag-Tang steps, max|div B| against plain MUSCL's 0.174:
+> ch_mult 1.0, cr 0.5   -> 0.0334  (5.2x)
+> ch_mult 2.0, cr 0.5   -> 0.0334  (5.2x)
+> ch_mult 3.0, cr 0.18  -> 0.0284  (6.1x)   <- best found
+> Raising c_h toward the stability limit barely helps, which is itself the
+> finding: cleaning reaches a balance against the rate the MUSCL flux
+> GENERATES divergence, so the knob that matters is not the transport
+> speed. See tools/plasma/GLM_METRIC.md.
 
 
 ## `stdlib/mhd_mpd.rail`
