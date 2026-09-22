@@ -21,7 +21,7 @@ is additive, never unsafe.
 - C6-C8 (Track B generational runtime): young alloc + Cheney scavenge + write barrier
 - C9-C11 (Track C compacting): sliding compaction + forward pointers + auto-trigger
 - C12 (Track D polish): tuning + docs + retire `_rail_stack_top` kludge
-**Motivation:** BPE segfault post-mortem (`docs/gc-phase0-findings.md`) proved conservative scan is fine for correctness but can't support compaction. Precise roots + compaction are needed for long training runs without `arena_mark`/`reset` workarounds. Generational is the perf win on top.
+**Motivation:** BPE segfault post-mortem (`docs/archive/gc-phase0-findings.md`) proved conservative scan is fine for correctness but can't support compaction. Precise roots + compaction are needed for long training runs without `arena_mark`/`reset` workarounds. Generational is the perf win on top.
 
 ## Architectural decisions
 
@@ -67,7 +67,7 @@ is additive, never unsafe.
 1. `./rail_native test` → 113/113
 2. `./rail_native self && cmp rail_native /tmp/rail_self` → byte-identical
 3. Phase-specific smoke (see per-phase doc)
-4. `./rail_native run tools/train/three_class_mlp.rail` → 100%
+4. `./rail_native run three_class_mlp.rail (now in the private rail-lab repo)` → 100%
 
 Regression = rollback that commit, diagnose, retry.
 

@@ -202,6 +202,10 @@ main =
 
 Tail-recursive loops match C `-O2` (5 instructions per iteration). The full architecture is documented in [`CHANGELOG.md`](CHANGELOG.md) — see v2.0.0 for the compiler/runtime; v3.0.0 for the TLS stack.
 
+## What moved out
+
+On 2026-09-22 the tool shed left this repo for a private one (`rail-lab`): the LM experiments and ports (`tools/train`, `tools/railml`), the watch-firmware fuzzing (`tools/garmin`), the autodiff oracles (`tools/ad`), orchestration, agents, MCP, and a dozen small probes. What stays is the language: the compiler, the stdlib, the suite, the fuzz corpus, attestation and verification, the beacon, the playground, and the backends. The x86, WASM and Cortex-M backends are experimental: each has a handful of tests; ARM64 (macOS and Linux) is the supported target.
+
 ## Releases
 
 ### v5.4.0 (2026-09-22): *Hardening, and the beacon replays from one integer*
