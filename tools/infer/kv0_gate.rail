@@ -1,0 +1,290 @@
+-- tools/infer/kv0_gate.rail — the KV0 parity gate.
+--
+-- Claim under test: generation through stdlib/infer_kv.rail's incremental
+-- KV-cache path is BIT-IDENTICAL to the full re-forward reference path
+-- (lm_infer_cpu.rail's structure), token for token AND probability for
+-- probability, at every step.
+--
+-- Method: a tiny v3 model (V=24, d=16, FF=32, 2 blocks) with fixed
+-- patterned weights -- no checkpoint dependency, fully deterministic.
+-- The reference path here is a faithful copy of lm_infer_cpu.rail's
+-- forward (force-CPU matmul; CPU softmax via softmax_rows, which is the
+-- documented .no_gpu reference config). Both paths run interleaved for
+-- 24 greedy tokens after a 3-token prompt; at every step the full
+-- probability rows are compared with an exact max-|diff| that must be
+-- 0.0 -- not small, zero.
+--
+-- Convention: exit 0 + last line PASS (tools/test/rail_test.rail).
+-- Run: ./rail_native run tools/infer/kv0_gate.rail
+
+import "stdlib/transformer.rail"
+import "stdlib/infer_kv.rail"
+
+-- ── deterministic patterned weights (fgpt_fwd.rail's mkw pattern) ──
+g_fill arr n mulr addr divr i =
+  if i >= n then 0
+  else
+    let raw = ((i * mulr + addr) % 1000) - 500
+    let _ = float_arr_set arr i ((int_to_float raw) / divr)
+    g_fill arr n mulr addr divr (i + 1)
+
+g_mkw rows cols mulr addr divr =
+  let n = rows * cols
+  let a = float_arr_new (n + 0) 0.0
+  let _ = g_fill a n mulr addr divr 0
+  let shape = cons rows (cons cols [])
+  Tensor a shape (compute_strides shape)
+
+g_fill_gamma arr n i =
+  if i >= n then 0
+  else
+    let raw = ((i * 7 + 3) % 11) - 5
+    let _ = float_arr_set arr n 0.0
+    let _ = float_arr_set arr i (1.0 + (int_to_float raw) / 100.0)
+    g_fill_gamma arr n (i + 1)
+
+g_mkgamma n =
+  let a = float_arr_new (n + 1) 0.0
+  let _ = g_fill_gamma a n 0
+  let shape = cons n []
+  Tensor a shape (compute_strides shape)
+
+-- one block's 9 weights, seeds offset by b so blocks differ
+g_mkblock d ff b =
+  let w_q = g_mkw d d (89 + b) (41 + b) 2500.0
+  let w_k = g_mkw d d (103 + b) (7 + b) 2500.0
+  let w_v = g_mkw d d (127 + b) (19 + b) 2500.0
+  let w_o = g_mkw d d (167 + b) (23 + b) 2500.0
+  let w_gate = g_mkw d ff (181 + b) (13 + b) 2500.0
+  let w_up = g_mkw d ff (193 + b) (29 + b) 2500.0
+  let w_down = g_mkw ff d (199 + b) (31 + b) 2500.0
+  let g1 = g_mkgamma d
+  let g2 = g_mkgamma d
+  cons w_q (cons w_k (cons w_v (cons w_o (cons w_gate (cons w_up (cons w_down (cons g1 (cons g2 []))))))))
+
+-- ── reference path: faithful copy of lm_infer_cpu.rail forward ──
+g_matmul_cpu a b = match a
+  | Tensor a_data a_shape a_strides -> match b
+    | Tensor b_data b_shape b_strides ->
+      let m_dim = head a_shape
+      let k_dim = head (tail a_shape)
+      let n_dim = head (tail b_shape)
+      let c = tensor_zeros (cons m_dim (cons n_dim []))
+      let acc = float_arr_new 1 0.0
+      match c
+        | Tensor c_data c_shape c_strides ->
+          let _ = matmul_i a_data b_data c_data acc m_dim n_dim k_dim 0
+          c
+
+-- Force-CPU transpose/scale/add: like tensor_softmax, the tensor.rail
+-- wrappers GPU-dispatch through f32 when the dylib exists. The first run
+-- of this gate caught exactly that: max|diff| 5.1e-9 from the reference
+-- path's tensor_transpose(k) rounding K through f32 while the kv path
+-- kept f64. The reference config is .no_gpu; these force it.
+g_transpose_cpu t = match t
+  | Tensor t_data t_shape t_st ->
+    let rows = head t_shape
+    let cols = head (tail t_shape)
+    let n = rows * cols
+    let new_data = float_arr_new (n + 0) 0.0
+    let _ = transpose_copy_loop t_data new_data rows cols 0
+    Tensor new_data (cons cols (cons rows [])) (compute_strides (cons cols (cons rows [])))
+
+g_scale_cpu t s = match t
+  | Tensor t_data t_shape t_st ->
+    let n = list_product t_shape
+    let cd = float_arr_new (n + 0) 0.0
+    let _ = scale_loop t_data cd n 0 s
+    Tensor cd t_shape t_st
+
+-- CPU softmax over a [rows,cols] tensor (softmax_rows is the pure-CPU
+-- stdlib loop; tensor_softmax would GPU-dispatch when the dylib exists,
+-- and the reference config is .no_gpu).
+g_softmax_cpu t = match t
+  | Tensor td t_shape t_st ->
+    let n = list_product t_shape
+    let cols = head (reverse t_shape)
+    let rows = n / cols
+    let cd = float_arr_new (n + 0) 0.0
+    let _ = softmax_rows td cd rows cols 0
+    Tensor cd t_shape t_st
+
+g_block_fwd x w_block seq d =
+  let w_q = list_nth 0 w_block
+  let w_k = list_nth 1 w_block
+  let w_v = list_nth 2 w_block
+  let w_o = list_nth 3 w_block
+  let w_gate = list_nth 4 w_block
+  let w_up = list_nth 5 w_block
+  let w_down = list_nth 6 w_block
+  let g1 = list_nth 7 w_block
+  let g2 = list_nth 8 w_block
+
+  let pack1 = rmsnorm_save x g1
+  let ln1 = head pack1
+
+  let q = g_matmul_cpu ln1 w_q
+  let k = g_matmul_cpu ln1 w_k
+  let v = g_matmul_cpu ln1 w_v
+  let _ = rope_apply q
+  let _ = rope_apply k
+
+  let kt = g_transpose_cpu k
+  let scores = g_matmul_cpu q kt
+  let scale = 1.0 / sqrt (int_to_float d)
+  let scaled = g_scale_cpu scores scale
+  let sd = kv_unwrap scaled
+  let _ = apply_causal_mask_loop sd seq 0 0
+  let attn = g_softmax_cpu scaled
+  let attn_val = g_matmul_cpu attn v
+  let attn_out = g_matmul_cpu attn_val w_o
+  let x_attn = kv_add_cpu x attn_out
+
+  let pack2 = rmsnorm_save x_attn g2
+  let ln2 = head pack2
+
+  let h_gate = g_matmul_cpu ln2 w_gate
+  let h_up = g_matmul_cpu ln2 w_up
+  let silu_pack = silu_forward h_gate
+  let h_gate_silu = head silu_pack
+  let h_act = kv_hadamard h_gate_silu h_up
+  let h_out = g_matmul_cpu h_act w_down
+  let x_out = kv_add_cpu x_attn h_out
+  x_out
+
+g_blocks_loop x blocks seq d i n =
+  if i >= n then x
+  else
+    let b_weights = list_nth i blocks
+    let next_x = g_block_fwd x b_weights seq d
+    g_blocks_loop next_x blocks seq d (i + 1) n
+
+g_infer_forward x w_e blocks gf seq d =
+  let x_embed = g_matmul_cpu x w_e
+  let n_blocks = length blocks
+  let x_last = g_blocks_loop x_embed blocks seq d 0 n_blocks
+  let packf = rmsnorm_save x_last gf
+  let x_final = head packf
+  let we_t = g_transpose_cpu w_e
+  let logits = g_matmul_cpu x_final we_t
+  g_softmax_cpu logits
+
+-- ── shared small pieces ──
+g_argmax pd base vw best_id best_val v =
+  if v >= vw then best_id
+  else
+    let cur = float_arr_get pd (base + v)
+    if cur > best_val then g_argmax pd base vw v cur (v + 1)
+    else g_argmax pd base vw best_id best_val (v + 1)
+
+g_argmax_row pd base vw =
+  let v0 = float_arr_get pd base
+  g_argmax pd base vw 0 v0 1
+
+-- exact max-|diff| between reference row (at baseF) and kv row (at 0),
+-- folded into maxarr slot 0
+g_row_maxdiff fd baseF kd vw maxarr j =
+  if j >= vw then 0
+  else
+    let a = float_arr_get fd (baseF + j)
+    let b = float_arr_get kd j
+    let df = a - b
+    let ad = if df <. 0.0 then 0.0 - df else df
+    let cur = float_arr_get maxarr 0
+    let _ = if cur <. ad then float_arr_set maxarr 0 ad else 0
+    g_row_maxdiff fd baseF kd vw maxarr (j + 1)
+
+g_onehot_row vw id =
+  let a = float_arr_new (vw + 0) 0.0
+  let _ = float_arr_set a id 1.0
+  let shape = cons 1 (cons vw [])
+  Tensor a shape (compute_strides shape)
+
+-- feed prompt tokens through the kv path; returns probs after last one
+g_kv_prompt ids w_e we_t blocks caches gf d vw pos last =
+  if length ids == 0 then last
+  else
+    let id = head ids
+    let x_row = g_onehot_row vw id
+    let probs = kv_forward_step x_row w_e we_t blocks caches gf pos d
+    g_kv_prompt (tail ids) w_e we_t blocks caches gf d vw (pos + 1) probs
+
+-- ── the interleaved generation loop ──
+-- state arrays: maxarr[0] = running max |diff|; mism[0] = id mismatches.
+g_gen_loop xd_full w_e we_t blocks caches gf d vw cur end_pos kv_probs maxarr mism acc =
+  if cur >= end_pos then reverse acc
+  else
+    let active_shape = cons cur (cons vw [])
+    let x_active = Tensor xd_full active_shape (compute_strides active_shape)
+    let probs_full = g_infer_forward x_active w_e blocks gf cur d
+    let fd = kv_unwrap probs_full
+    let kd = kv_unwrap kv_probs
+    let baseF = (cur - 1) * vw
+    let _ = g_row_maxdiff fd baseF kd vw maxarr 0
+    let id_full = g_argmax_row fd baseF vw
+    let id_kv = g_argmax_row kd 0 vw
+    let _ = if id_full != id_kv then arr_set mism 0 ((arr_get mism 0) + 1) else 0
+    let _ = float_arr_set xd_full (cur * vw + id_full) 1.0
+    let x_row = g_onehot_row vw id_kv
+    let next_kv = kv_forward_step x_row w_e we_t blocks caches gf cur d
+    g_gen_loop xd_full w_e we_t blocks caches gf d vw (cur + 1) end_pos next_kv maxarr mism (cons id_full acc)
+
+g_fill_prompt xd ids vw pos =
+  if length ids == 0 then pos
+  else
+    let id = head ids
+    let _ = float_arr_set xd (pos * vw + id) 1.0
+    g_fill_prompt xd (tail ids) vw (pos + 1)
+
+g_show_one i = show i
+g_show_ids ids = join "," (map g_show_one ids)
+
+-- One full parity case: build the model, run both paths interleaved,
+-- return 0 on exact parity. `blocks` pre-built by caller (block count
+-- varies per case); `emb_seed` differentiates the embedding table.
+g_run_case name vw d blocks gf emb_seed prompt_ids max_gen =
+  let seq_cap = 64
+  let w_e = g_mkw vw d emb_seed 7 500.0
+  let we_t = g_transpose_cpu w_e
+  let n_blocks = length blocks
+  let prompt_len = length prompt_ids
+
+  let xd_full = float_arr_new (seq_cap * vw + 0) 0.0
+  let _ = g_fill_prompt xd_full prompt_ids vw 0
+
+  let caches = kv_cache_new n_blocks seq_cap d
+  let kv_probs0 = g_kv_prompt prompt_ids w_e we_t blocks caches gf d vw 0 (g_onehot_row vw 0)
+
+  let maxarr = float_arr_new 1 0.0
+  let mism = arr_new 1 0
+  let end_pos = prompt_len + max_gen
+  let gen_ids = g_gen_loop xd_full w_e we_t blocks caches gf d vw prompt_len end_pos kv_probs0 maxarr mism []
+
+  let mismatches = arr_get mism 0
+  let maxdiff = float_arr_get maxarr 0
+  let _ = print (cat [name, ": ", show (length gen_ids), " tokens: ", g_show_ids gen_ids])
+  let _ = print (cat [name, ": id mismatches ", show mismatches,
+                      ", max |p_full - p_kv| = ", show_float maxdiff])
+  if mismatches == 0 then
+    if 0.0 <. maxdiff then 1 else 0
+  else 1
+
+main =
+  -- case A: 2 blocks, d=16, V=24
+  let blocks_a = cons (g_mkblock 16 32 0) (cons (g_mkblock 16 32 5) [])
+  let ra = g_run_case "caseA" 24 16 blocks_a (g_mkgamma 16) 131
+             (cons 1 (cons 2 (cons 3 []))) 24
+  -- case B: 3 blocks, d=24, V=32, different seeds and prompt
+  let blocks_b = cons (g_mkblock 24 48 11) (cons (g_mkblock 24 48 17) (cons (g_mkblock 24 48 23) []))
+  let rb = g_run_case "caseB" 32 24 blocks_b (g_mkgamma 24) 239
+             (cons 5 (cons 1 (cons 7 (cons 2 [])))) 20
+  if ra == 0 then
+    if rb == 0 then
+      let _ = print "PASS"
+      0
+    else
+      let _ = print "FAIL: caseB diverged"
+      1
+  else
+    let _ = print "FAIL: caseA diverged"
+    1

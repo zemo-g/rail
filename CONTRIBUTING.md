@@ -99,4 +99,4 @@ See [SECURITY.md](SECURITY.md). Rail v3.0.0 is **not** constant-time and has no 
 
 ## License
 
-By contributing, you agree your contributions are licensed under the same terms as Rail (Business Source License 1.1, converts to Apache 2.0 on 2030-04-06). See [LICENSE](LICENSE).
+By contributing, you agree your contributions are licensed under the same terms as Rail (Business Source License 1.1, converts to MIT on 2030-03-14). See [LICENSE](LICENSE).

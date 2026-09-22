@@ -1,0 +1,135 @@
+-- tools/infer/ng0_keystone_gate.rail — NG0 part 1: the chunk-parity keystone.
+--
+-- Claim: feeding K tokens through the engine as ONE K-row chunk
+-- (cb_feed/cb_all) produces bit-identical hidden states, cache rows and
+-- logits to feeding them as K sequential single-row steps -- on the real
+-- 138M. This is what licenses speculative decoding without distribution
+-- drift: verifying K drafts in one pass IS K greedy steps, in exact bytes.
+-- Row independence carries the argument (fgemm rows are independent
+-- silicon dataflows -- the KV1 proof; the chunk kernels compute each row
+-- with the single-row kernels' fma order at that position).
+--
+-- Method: 48 fixed patterned ids. Path A: 48 single-row steps. Path B:
+-- prompt of 8, then 5 chunks of 8. Compare the final hidden row, the
+-- final logits row (bitwise), and every K/V cache row of every layer
+-- (bitwise) -- caches are the state speculation depends on.
+-- Run: ./rail_native run tools/infer/ng0_keystone_gate.rail
+import "stdlib/tensor.rail"
+import "stdlib/sha256.rail"
+import "tools/infer/f9_engine.rail"
+
+mk_ids ids i = if i >= 48 then 0 else let _ = arr_set ids i ((i * 613 + 29) % 16384) in mk_ids ids (i + 1)
+
+-- single-row feed (the BS0/BS1 path)
+seq_feed t k emb pos ids p =
+  if p >= 48 then 0
+  else
+    let xr = float_arr_new 768 0.0
+    let _ = mk_xrow emb pos (arr_get ids p) p xr 0
+    let _ = tgl_fabuf_upload (arr_get t 418) xr 768
+    let _ = tgl_f1_r (arr_get k 13) (arr_get t 418) (arr_get t 400) 768
+    let la = float_arr_new 1 0.0
+    let _ = float_arr_set la 0 (int_to_float p)
+    let _ = tgl_fabuf_upload (arr_get t 417) la 1
+    let _ = inc_all t k 0
+    seq_feed t k emb pos ids (p + 1)
+
+-- chunked feed: 6 chunks of 8 over the same 48 ids
+ids_slice ids from n acc = if n <= 0 then reverse acc else ids_slice ids (from + 1) (n - 1) (cons (arr_get ids from) acc)
+chunk_feed t k emb pos ids base =
+  if base >= 48 then 0
+  else
+    let idl = ids_slice ids base 8 []
+    let _ = cb_feed t k emb pos idl base 8
+    chunk_feed t k emb pos ids (base + 8)
+
+-- download + hash-compare helpers
+grab h n = let a = float_arr_new n 0.0 in let _ = tgl_fabuf_download h a n in a
+
+cmp_named name a b n maxarr =
+  let _ = float_arr_set maxarr 0 0.0
+  let _ = cmp_all a b n maxarr 0
+  let d = float_arr_get maxarr 0
+  let _ = if 0.0 <. d then print (cat ["  DIVERGE ", name, " maxdiff ", show_float d]) else 0
+  if 0.0 <. d then 1 else 0
+
+-- compare all 16 layers' K and V cache rows 0..47
+cmp_caches tA tB maxarr li bad =
+  if li >= 16 then bad
+  else
+    let ka = grab (arr_get tA (240 + li * 2)) 36864
+    let kb = grab (arr_get tB (240 + li * 2)) 36864
+    let va = grab (arr_get tA (241 + li * 2)) 36864
+    let vb = grab (arr_get tB (241 + li * 2)) 36864
+    let b1 = cmp_named (cat ["K cache L", show li]) ka kb 36864 maxarr
+    let b2 = cmp_named (cat ["V cache L", show li]) va vb 36864 maxarr
+    cmp_caches tA tB maxarr (li + 1) (bad + b1 + b2)
+
+main =
+  let k = f9_kernels 0
+  let _ = print "18 kernels compiled"
+  let tA = arr_new 460 0
+  let ep = f9_load "/tmp/b75/b9full_init.safetensors" tA
+  let emb = head ep
+  let pos = head (tail ep)
+  let _ = inc_alloc tA 0
+  -- second buffer set for the chunk path; weights shared via slot copy
+  let tB = arr_new 460 0
+  let _ = copy_params tA tB 0
+  let _ = inc_alloc tB 0
+  let _ = print "138M loaded; two independent buffer sets (shared weights)"
+
+  let ids = arr_new 48 0
+  let _ = mk_ids ids 0
+
+  let _ = seq_feed tA k emb pos ids 0
+  let amA = arr_new 1 0
+  let _ = cb_heads tA k 1 amA
+  let lgA = grab (arr_get tA 430) 16384
+  let hidA = grab (arr_get tA 400) 768
+  let _ = print "sequential path done (48 single-row steps)"
+
+  let _ = chunk_feed tB k emb pos ids 0
+  -- final hidden row of the chunk path is row 7 of the last chunk; move it
+  -- to row 0 so the head compare shapes match the sequential path
+  let hB = grab (arr_get tB 400) 6144
+  let row7 = float_arr_new 768 0.0
+  let _ = take_row hB row7 7 0
+  let _ = tgl_fabuf_upload (arr_get tB 418) row7 768
+  let _ = tgl_f1_r (arr_get k 13) (arr_get tB 418) (arr_get tB 400) 768
+  let amB = arr_new 1 0
+  let _ = cb_heads tB k 1 amB
+  let lgB = grab (arr_get tB 430) 16384
+  let hidB = grab (arr_get tB 400) 768
+  let _ = print "chunked path done (6 chunks of 8)"
+
+  -- Liveness before agreement: two dead paths agree perfectly and prove
+  -- nothing (NaN never updates a max; zeros match zeros). Review 08-27.
+  let liveA = live_count hidA 768 0 0
+  let _ = print (cat ["live values in final hidden row: ", show liveA, "/768"])
+  let maxarr = float_arr_new 1 0.0
+  let b_hid = cmp_named "final hidden row" hidA hidB 768 maxarr
+  let b_lg = cmp_named "final logits row" lgA lgB 16384 maxarr
+  let b_c = cmp_caches tA tB maxarr 0 0
+  let _ = print (cat ["argmax sequential=", show (arr_get amA 0), " chunked=", show (arr_get amB 0)])
+  let bad = b_hid + b_lg + b_c
+  let _ = print (cat ["divergent comparisons: ", show bad, " (of 34)"])
+  if liveA * 2 < 768 then
+    let _ = print "FAIL: hidden row is mostly zero or NaN, the engine is dead"
+    1
+  else if bad == 0 then
+    if (arr_get amA 0) == (arr_get amB 0) then
+      let _ = print "PASS"
+      0
+    else
+      let _ = print "FAIL: argmax mismatch"
+      1
+  else
+    let _ = print "FAIL: chunk path diverges from sequential"
+    1
+
+take_row src dst r j = if j >= 768 then 0 else
+  let _ = float_arr_set dst j (float_arr_get src (r * 768 + j)) in take_row src dst r (j + 1)
+
+copy_params tA tB i = if i >= 203 then 0 else
+  let _ = arr_set tB i (arr_get tA i) in copy_params tA tB (i + 1)

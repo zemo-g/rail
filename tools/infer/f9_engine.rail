@@ -1,0 +1,360 @@
+-- tools/infer/f9_engine.rail -- the 138M deterministic-float engine, importable.
+-- Extracted from kv138_gate.rail (BS0) so the parity gate, the server and
+-- NG0 share one implementation. No main. Prereq: import "stdlib/tensor.rail"
+-- BEFORE this module (imports do not dedupe). Foreign decls live HERE only.
+--
+-- Surface: f9_kernels -> k table (18 slots) | f9_load path t -> [emb, pos]
+-- (blocks at t[li*12..], lnf 200/201, headw 202) | inc_alloc t 0 (buffers
+-- 400.., caches 240..) | inc_block/inc_all | mk_xrow | write_row | fargmax
+-- | cmp_all | alloc_at | fup. Kernel indices: 0 fgemm 1 lfwd 2 gfwd 3 smax
+-- 4 vadd 5 ascore 6 av 7 badd3072 8 badd768 9 kscore 10 ksmax 11 kav
+-- 12 kapp 13 rcopy.
+
+foreign tgl_fjit_compile dummy -> int
+foreign tgl_fabuf_alloc n -> int
+foreign tgl_fabuf_upload h arr n -> int
+foreign tgl_fabuf_download h arr n -> int
+foreign tgl_fabuf_hashprint h n -> int
+foreign tgl_fgemm_r kid a b c m k n -> int
+foreign tgl_f1_r kid i o nth -> int
+foreign tgl_f2_r kid a b o nth -> int
+foreign tgl_flnf_r kid h g b xh hn ri rows -> int
+foreign fopen path mode -> int
+foreign pread fd buf count offset -> int
+compile_k msl = let _ = write_file "/tmp/rail_fjit_kernel.metal" msl in tgl_fjit_compile 0
+
+-- ── kernels shared with / lifted from fgpt_train9f (forward set) ──
+k_fgemm = cat ["#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n",
+  "kernel void fgemm(device const float* A, device const float* B, device float* C, constant uint& M, constant uint& K, constant uint& N, uint2 tg [[threadgroup_position_in_grid]]){\n",
+  "  uint row0=tg.y*8,col0=tg.x*8; simdgroup_float8x8 acc=make_filled_simdgroup_matrix<float,8,8>(0.0f);\n",
+  "  for(uint k=0;k<K;k+=8){ simdgroup_float8x8 a,b; simdgroup_load(a,A+row0*K+k,K); simdgroup_load(b,B+k*N+col0,N); simdgroup_multiply_accumulate(acc,a,b,acc);} simdgroup_store(acc,C+row0*N+col0,N);}\n"]
+k_lfwd = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint DH=768;constant float EPS=0.00001f;\n",
+  "kernel void lfwd(device const float* H, device const float* g, device const float* b, device float* xhat, device float* Hn, device float* rinv, uint r [[thread_position_in_grid]]){\n",
+  "  float mu=0;for(uint j=0;j<DH;j++)mu+=H[r*DH+j];mu/=(float)DH; float var=0;for(uint j=0;j<DH;j++){float d=H[r*DH+j]-mu;var=fma(d,d,var);}var/=(float)DH;\n",
+  "  float ri=1.0f/sqrt(var+EPS);rinv[r]=ri; for(uint j=0;j<DH;j++){float xh=(H[r*DH+j]-mu)*ri;xhat[r*DH+j]=xh;Hn[r*DH+j]=fma(g[j],xh,b[j]);}}\n"]
+k_gfwd = cat ["#include <metal_stdlib>\nusing namespace metal;\n",
+  "inline float ep(float x){float t=x*1.4426950408889634f;float k=floor(t+0.5f);float f=t-k;float p=0.0013333558f;p=fma(p,f,0.0096181291f);p=fma(p,f,0.0555041087f);p=fma(p,f,0.2402265069f);p=fma(p,f,0.6931471805f);p=fma(p,f,1.0f);int ki=clamp((int)k,-126,127);return p*as_type<float>((ki+127)<<23);}\n",
+  "inline float tp(float x){float ax=fabs(x);float em=ep(-2.0f*ax);float t=(1.0f-em)/(1.0f+em);return x<0.0f?-t:t;}\n",
+  "inline float gf(float x){float g=0.7978845608f*fma(0.044715f,x*x*x,x);return 0.5f*x*(1.0f+tp(g));}\n",
+  "kernel void gfwd(device const float* H, device float* A, uint i [[thread_position_in_grid]]){A[i]=gf(H[i]);}\n"]
+k_smax = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint N=128;\n",
+  "inline float ep(float x){float t=x*1.4426950408889634f;float k=floor(t+0.5f);float f=t-k;float p=0.0013333558f;p=fma(p,f,0.0096181291f);p=fma(p,f,0.0555041087f);p=fma(p,f,0.2402265069f);p=fma(p,f,0.6931471805f);p=fma(p,f,1.0f);int ki=clamp((int)k,-126,127);return p*as_type<float>((ki+127)<<23);}\n",
+  "kernel void smax(device const float* S, device float* A, uint r [[thread_position_in_grid]]){float mx=S[r*N];for(uint j=1;j<N;j++)mx=max(mx,S[r*N+j]);float sum=0;for(uint j=0;j<N;j++){float e=ep(S[r*N+j]-mx);A[r*N+j]=e;sum+=e;}float inv=1.0f/sum;for(uint j=0;j<N;j++)A[r*N+j]*=inv;}\n"]
+k_vadd = cat ["#include <metal_stdlib>\nusing namespace metal;\nkernel void vadd(device const float* a, device const float* b, device float* o, uint i [[thread_position_in_grid]]){o[i]=a[i]+b[i];}\n"]
+k_ascore = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint S=128;constant uint D=768;constant uint HD=64;constant float SC=0.125f;\n",
+  "kernel void ascore(device const float* Q, device const float* K, device float* Sc, uint i [[thread_position_in_grid]]){\n",
+  "  uint h=i/(S*S); uint rem=i%(S*S); uint r=rem/S; uint c=rem%S; float acc=0; uint qo=r*D+h*HD; uint ko=c*D+h*HD;\n",
+  "  for(uint j=0;j<HD;j++) acc=fma(Q[qo+j],K[ko+j],acc); Sc[i]=(c>r)?-1e30f:acc*SC;}\n"]
+k_av = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint S=128;constant uint D=768;constant uint HD=64;\n",
+  "kernel void av(device const float* P, device const float* V, device float* O, uint i [[thread_position_in_grid]]){\n",
+  "  uint r=i/D; uint d=i%D; uint h=d/HD; float acc=0; uint po=h*S*S+r*S;\n",
+  "  for(uint c=0;c<S;c++) acc=fma(P[po+c],V[c*D+d],acc); O[i]=acc;}\n"]
+k_badd3072 = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint C=3072;\n",
+  "kernel void badd3072(device const float* A, device const float* b, device float* O, uint i [[thread_position_in_grid]]){O[i]=A[i]+b[i%C];}\n"]
+k_badd768 = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint C=768;\n",
+  "kernel void badd768(device const float* A, device const float* b, device float* O, uint i [[thread_position_in_grid]]){O[i]=A[i]+b[i%C];}\n"]
+
+-- ── incremental kernels: same per-element fma order, causal window ──
+-- scores for the new row at position p (p rides in L[0]): thread over
+-- h*128+c; identical j-loop to ascore's row r=p, q read from row 0 of
+-- the padded Q tile.
+k_kscore = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint S=128;constant uint D=768;constant uint HD=64;constant float SC=0.125f;\n",
+  "kernel void kscore(device const float* Q8, device const float* L, device float* KC_Sc, uint i [[thread_position_in_grid]]){\n",
+  "  device const float* KC = KC_Sc; device float* Sc = (device float*)(KC_Sc + S*D);\n",
+  "  uint p=(uint)L[0]; uint h=i/S; uint c=i%S; float acc=0; uint qo=h*HD; uint ko=c*D+h*HD;\n",
+  "  for(uint j=0;j<HD;j++) acc=fma(Q8[qo+j],KC[ko+j],acc); Sc[i]=(c>p)?-1e30f:acc*SC;}\n"]
+-- per-head softmax over the 12x128 score row-set, window 0..p; the
+-- masked tail is written as ep(-1e30-mx)*inv exactly like the full smax
+-- so downstream bits match the reference by the same-value argument
+-- rather than a below-ulp one.
+k_ksmax = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint N=128;constant uint SD=98304;\n",
+  "inline float ep(float x){float t=x*1.4426950408889634f;float k=floor(t+0.5f);float f=t-k;float p=0.0013333558f;p=fma(p,f,0.0096181291f);p=fma(p,f,0.0555041087f);p=fma(p,f,0.2402265069f);p=fma(p,f,0.6931471805f);p=fma(p,f,1.0f);int ki=clamp((int)k,-126,127);return p*as_type<float>((ki+127)<<23);}\n",
+  "kernel void ksmax(device const float* KCS, device float* A, uint r [[thread_position_in_grid]]){device const float* S=KCS+SD;float mx=S[r*N];for(uint j=1;j<N;j++)mx=max(mx,S[r*N+j]);float sum=0;for(uint j=0;j<N;j++){float e=ep(S[r*N+j]-mx);A[r*N+j]=e;sum+=e;}float inv=1.0f/sum;for(uint j=0;j<N;j++)A[r*N+j]*=inv;}\n"]
+-- ctx row: thread d over 768; c-loop ascending over the FULL cache width
+-- exactly like av's row r=p (cache cols beyond p hold zeros from alloc
+-- and probs there are the same sub-ulp values as the reference's).
+k_kav = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint S=128;constant uint D=768;constant uint HD=64;\n",
+  "kernel void kav(device const float* P, device const float* VC, device float* O8, uint d [[thread_position_in_grid]]){\n",
+  "  uint h=d/HD; float acc=0; uint po=h*S;\n",
+  "  for(uint c=0;c<S;c++) acc=fma(P[po+c],VC[c*D+d],acc); O8[d]=acc;}\n"]
+-- append the new k or v row (row 0 of an 8-pad tile) into cache row p
+k_kapp = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint D=768;\n",
+  "kernel void kapp(device const float* R8, device const float* L, device float* C, uint d [[thread_position_in_grid]]){uint p=(uint)L[0]; C[p*D+d]=R8[d];}\n"]
+k_rcopy = cat ["#include <metal_stdlib>\nusing namespace metal;\n",
+  "kernel void rcopy(device const float* a, device float* o, uint i [[thread_position_in_grid]]){o[i]=a[i];}\n"]
+
+-- ── safetensors parse + exact f32 decode (verbatim from fgpt_train9f) ──
+pq_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then pq_match buf (pos + 1) (tail pcs) else 0
+pq_find buf pos hi pcs = if pos >= hi then 0 - 1 else if pq_match buf pos pcs == 1 then pos else pq_find buf (pos + 1) hi pcs
+pq_find_after buf pos hi pcs = let p = pq_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+pq_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else pq_int buf (pos + 1) (acc * 10 + (c - 48))
+pq_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+pq_offset hdr hi name = let np = pq_find hdr 0 hi (chars (cat ["\"", name, "\":"])) in let dp = pq_find_after hdr np hi (chars "\"data_offsets\":[") in pq_int hdr dp 0
+p2_down v k = if k <= 0 then v else p2_down (v /. 2.0) (k - 1)
+p2_build a v e = if e > 255 then 0 else let _ = float_arr_set a e v in p2_build a (v *. 2.0) (e + 1)
+mk_p2 = let a = float_arr_new 256 0.0 in let _ = p2_build a (p2_down 1.0 150) 0 in a
+f32_val p2 b0 b1 b2 b3 =
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 in
+  let sign = bits / 2147483648 in
+  let rest = bits - sign * 2147483648 in
+  let exp = rest / 8388608 in
+  let mant = rest - exp * 8388608 in
+  let xabs = if exp == 0 then (int_to_float mant) *. ((float_arr_get p2 1) /. 2.0) else (int_to_float (8388608 + mant)) *. (float_arr_get p2 exp) in
+  if sign == 1 then 0.0 -. xabs else xabs
+fdec_loop p2 cbuf out count i = if i >= count then 0 else let ba = 4 * i in let _ = float_arr_set out i (f32_val p2 (byte_at cbuf ba) (byte_at cbuf (ba + 1)) (byte_at cbuf (ba + 2)) (byte_at cbuf (ba + 3))) in fdec_loop p2 cbuf out count (i + 1)
+fld_f32 p2 fd hdr base name count =
+  let start = pq_offset hdr base name in
+  let cbuf = malloc (count * 4) in
+  let nr = pread fd cbuf (count * 4) (base + start) in
+  let out = float_arr_new count 0.0 in
+  let _ = fdec_loop p2 cbuf out count 0 in
+  let _ = free cbuf in out
+fup n arr = let h = tgl_fabuf_alloc n in let _ = tgl_fabuf_upload h arr n in h
+fldup p2 fd hdr base name count = fup count (fld_f32 p2 fd hdr base name count)
+lname li s = cat ["L", show li, ".", s]
+load_block t p2 fd hdr base li = if li >= 16 then 0 else
+  let pb = li * 12 in
+  let _ = arr_set t (pb + 0) (fldup p2 fd hdr base (lname li "wq") 589824) in
+  let _ = arr_set t (pb + 1) (fldup p2 fd hdr base (lname li "wk") 589824) in
+  let _ = arr_set t (pb + 2) (fldup p2 fd hdr base (lname li "wv") 589824) in
+  let _ = arr_set t (pb + 3) (fldup p2 fd hdr base (lname li "wo") 589824) in
+  let _ = arr_set t (pb + 4) (fldup p2 fd hdr base (lname li "w1") 2359296) in
+  let _ = arr_set t (pb + 5) (fldup p2 fd hdr base (lname li "w2") 2359296) in
+  let _ = arr_set t (pb + 6) (fldup p2 fd hdr base (lname li "g1") 768) in
+  let _ = arr_set t (pb + 7) (fldup p2 fd hdr base (lname li "b1") 768) in
+  let _ = arr_set t (pb + 8) (fldup p2 fd hdr base (lname li "g2") 768) in
+  let _ = arr_set t (pb + 9) (fldup p2 fd hdr base (lname li "b2") 768) in
+  let _ = arr_set t (pb + 10) (fldup p2 fd hdr base (lname li "bm1") 3072) in
+  let _ = arr_set t (pb + 11) (fldup p2 fd hdr base (lname li "bm2") 768) in
+  load_block t p2 fd hdr base (li + 1)
+alloc_at t slot n = arr_set t slot (tgl_fabuf_alloc n)
+
+-- ── deterministic gate input: fixed patterned token ids ──
+mk_xrow emb pos id p xr j = if j >= 768 then 0 else
+  let _ = float_arr_set xr j ((float_arr_get emb (id * 768 + j)) +. (float_arr_get pos (p * 768 + j))) in
+  mk_xrow emb pos id p xr (j + 1)
+
+-- ── reference: fgpt_train9f block_fwd with shared scratch (fwd only) ──
+-- ref slots: 300+li = Xin(li) [316 = X16]; scratch 330..339; k-table below
+inc_block t k li =
+  let pb = li * 12 in
+  let kc = arr_get t (240 + li * 2) in
+  let vc = arr_get t (241 + li * 2) in
+  let xin = arr_get t 400 in
+  let _ = tgl_flnf_r (arr_get k 1) xin (arr_get t (pb + 6)) (arr_get t (pb + 7)) (arr_get t 401) (arr_get t 402) (arr_get t 403) 1 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 402) (arr_get t (pb + 0)) (arr_get t 404) 8 768 768 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 402) (arr_get t (pb + 1)) (arr_get t 405) 8 768 768 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 402) (arr_get t (pb + 2)) (arr_get t 406) 8 768 768 in
+  let _ = tgl_f2_r (arr_get k 12) (arr_get t 405) (arr_get t 417) kc 768 in
+  let _ = tgl_f2_r (arr_get k 12) (arr_get t 406) (arr_get t 417) vc 768 in
+  let _ = tgl_f2_r (arr_get k 9) (arr_get t 404) (arr_get t 417) kc 1536 in
+  let _ = tgl_f1_r (arr_get k 10) kc (arr_get t 408) 12 in
+  let _ = tgl_f2_r (arr_get k 11) (arr_get t 408) vc (arr_get t 409) 768 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 409) (arr_get t (pb + 3)) (arr_get t 410) 8 768 768 in
+  let _ = tgl_f2_r (arr_get k 4) xin (arr_get t 410) (arr_get t 411) 768 in
+  let _ = tgl_flnf_r (arr_get k 1) (arr_get t 411) (arr_get t (pb + 8)) (arr_get t (pb + 9)) (arr_get t 401) (arr_get t 412) (arr_get t 403) 1 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 412) (arr_get t (pb + 4)) (arr_get t 413) 8 768 3072 in
+  let _ = tgl_f2_r (arr_get k 7) (arr_get t 413) (arr_get t (pb + 10)) (arr_get t 413) 3072 in
+  let _ = tgl_f1_r (arr_get k 2) (arr_get t 413) (arr_get t 414) 3072 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 414) (arr_get t (pb + 5)) (arr_get t 415) 8 3072 768 in
+  let _ = tgl_f2_r (arr_get k 8) (arr_get t 415) (arr_get t (pb + 11)) (arr_get t 415) 768 in
+  let _ = tgl_f2_r (arr_get k 4) (arr_get t 411) (arr_get t 415) (arr_get t 400) 768 in
+  0
+inc_all t k li = if li >= 16 then 0 else let _ = inc_block t k li in inc_all t k (li + 1)
+write_row src dst r j = if j >= 768 then 0 else
+  let _ = float_arr_set dst (r * 768 + j) (float_arr_get src j) in write_row src dst r (j + 1)
+-- Count entries that are finite and nonzero.
+--
+-- This exists because max-diff alone cannot fail on a dead engine, which
+-- an outside reviewer demonstrated on 2026-08-27. Two ways a parity gate
+-- passes while proving nothing:
+--   * every value NaN. IEEE says every comparison with NaN is false, so
+--     the running max is never updated and stays 0.0, and `0.0 <. max`
+--     reports PASS.
+--   * every value zero (bad fopen, garbage pread, unloaded weights).
+--     Both paths agree perfectly on nothing, and argmax is 0 on both.
+-- `0.0 <. abs(v)` is false for NaN AND false for zero, so one counter
+-- rejects both. A gate that asserts a healthy fraction of live values
+-- before comparing cannot pass on a corpse.
+live_count a n i acc =
+  if i >= n then acc
+  else
+    let v = float_arr_get a i
+    let av = if v <. 0.0 then 0.0 -. v else v
+    live_count a n (i + 1) (if 0.0 <. av then acc + 1 else acc)
+
+cmp_all a b n maxarr i =
+  if i >= n then 0
+  else
+    let df = (float_arr_get a i) -. (float_arr_get b i)
+    let ad = if df <. 0.0 then 0.0 -. df else df
+    let cur = float_arr_get maxarr 0
+    let _ = if cur <. ad then float_arr_set maxarr 0 ad else 0
+    cmp_all a b n maxarr (i + 1)
+fargmax a off n i best bi = if i >= n then bi else let v = float_arr_get a (off + i) in if v >. best then fargmax a off n (i + 1) v i else fargmax a off n (i + 1) best bi
+inc_alloc t dummy =
+  let _ = alloc_at t 400 (8 * 768)
+  let _ = alloc_at t 401 (8 * 768)
+  let _ = alloc_at t 402 (8 * 768)
+  let _ = alloc_at t 403 8
+  let _ = alloc_at t 404 (8 * 768)
+  let _ = alloc_at t 405 (8 * 768)
+  let _ = alloc_at t 406 (8 * 768)
+  let _ = alloc_at t 408 1536
+  let _ = alloc_at t 409 (8 * 768)
+  let _ = alloc_at t 410 (8 * 768)
+  let _ = alloc_at t 411 (8 * 768)
+  let _ = alloc_at t 412 (8 * 768)
+  let _ = alloc_at t 413 (8 * 3072)
+  let _ = alloc_at t 414 (8 * 3072)
+  let _ = alloc_at t 415 (8 * 768)
+  let _ = alloc_at t 417 1
+  let _ = alloc_at t 418 (8 * 768)
+  let _ = alloc_at t 430 (8 * 16384)
+  let _ = alloc_at t 431 12288
+  let _ = inc_alloc_c t 0
+  0
+
+-- one packed buffer per layer: K cache (128*768) then scores (12*128);
+-- kscore addresses the scores region as KC + S*D. The score region's
+-- handle alias lives at slot 240+li*2+32 -- NO: kscore packs, ksmax needs
+-- the scores handle; we allocate KC+Sc packed and register the SAME
+-- handle at both 240+li*2 and 272+li (offset addressing is inside the
+-- kernel); ksmax reads from the packed buffer at offset S*D via a
+-- second kernel arg trick is not available with f1 -- so scores are
+-- read from the packed buffer by dispatching ksmax with the PACKED
+-- handle and an in-kernel offset.
+inc_alloc_c t li = if li >= 16 then 0 else
+  let _ = alloc_at t (240 + li * 2) (98304 + 12288)
+  let _ = alloc_at t (241 + li * 2) 98304
+  inc_alloc_c t (li + 1)
+
+-- ── NG0 chunk kernels: K rows (K <= 8) per pass, bit-identical to K
+-- sequential single-row steps. Row independence does all the work: fgemm
+-- rows are independent silicon dataflows (the KV1 argument), and each
+-- chunk kernel below computes its row with the SAME single-accumulator
+-- fma order as the single-row kernel at that position. L buffer carries
+-- [base_pos, cnt]. This is what makes speculative decoding free of
+-- distribution drift: verifying K drafts in one pass produces the exact
+-- bytes K sequential steps would.
+k_ckscore = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint S=128;constant uint D=768;constant uint HD=64;constant float SC=0.125f;\n",
+  "kernel void ckscore(device const float* Q8, device const float* L, device float* KC_Sc, uint i [[thread_position_in_grid]]){\n",
+  "  device const float* KC = KC_Sc; device float* Sc = KC_Sc + S*D;\n",
+  "  uint base=(uint)L[0]; uint kk=i/(12*S); uint rem=i%(12*S); uint h=rem/S; uint c=rem%S;\n",
+  "  uint p=base+kk; float acc=0; uint qo=kk*D+h*HD; uint ko=c*D+h*HD;\n",
+  "  for(uint j=0;j<HD;j++) acc=fma(Q8[qo+j],KC[ko+j],acc); Sc[i]=(c>p)?-1e30f:acc*SC;}\n"]
+k_cksmax = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint N=128;constant uint SD=98304;\n",
+  "inline float ep(float x){float t=x*1.4426950408889634f;float k=floor(t+0.5f);float f=t-k;float p=0.0013333558f;p=fma(p,f,0.0096181291f);p=fma(p,f,0.0555041087f);p=fma(p,f,0.2402265069f);p=fma(p,f,0.6931471805f);p=fma(p,f,1.0f);int ki=clamp((int)k,-126,127);return p*as_type<float>((ki+127)<<23);}\n",
+  "kernel void cksmax(device const float* KCS, device float* A, uint r [[thread_position_in_grid]]){device const float* S=KCS+SD;float mx=S[r*N];for(uint j=1;j<N;j++)mx=max(mx,S[r*N+j]);float sum=0;for(uint j=0;j<N;j++){float e=ep(S[r*N+j]-mx);A[r*N+j]=e;sum+=e;}float inv=1.0f/sum;for(uint j=0;j<N;j++)A[r*N+j]*=inv;}\n"]
+k_ckav = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint S=128;constant uint D=768;constant uint HD=64;\n",
+  "kernel void ckav(device const float* P, device const float* VC, device float* O8, uint i [[thread_position_in_grid]]){\n",
+  "  uint kk=i/D; uint d=i%D; uint h=d/HD; float acc=0; uint po=kk*12*S+h*S;\n",
+  "  for(uint c=0;c<S;c++) acc=fma(P[po+c],VC[c*D+d],acc); O8[i]=acc;}\n"]
+k_ckapp = cat ["#include <metal_stdlib>\nusing namespace metal;\nconstant uint D=768;\n",
+  "kernel void ckapp(device const float* R8, device const float* L, device float* C, uint i [[thread_position_in_grid]]){\n",
+  "  uint base=(uint)L[0]; uint kk=i/D; uint d=i%D; C[(base+kk)*D+d]=R8[kk*D+d];}\n"]
+
+-- one block, one K-row chunk. Same slot layout as inc_block; the chunk
+-- score/prob scratch needs 8*12*128 floats -- slot 431 (probs) and the
+-- per-layer packed KC buffer's score region is reused for cnt*12*128.
+cb_block t k li cnt =
+  let pb = li * 12 in
+  let kc = arr_get t (240 + li * 2) in
+  let vc = arr_get t (241 + li * 2) in
+  let xin = arr_get t 400 in
+  let _ = tgl_flnf_r (arr_get k 1) xin (arr_get t (pb + 6)) (arr_get t (pb + 7)) (arr_get t 401) (arr_get t 402) (arr_get t 403) cnt in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 402) (arr_get t (pb + 0)) (arr_get t 404) 8 768 768 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 402) (arr_get t (pb + 1)) (arr_get t 405) 8 768 768 in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 402) (arr_get t (pb + 2)) (arr_get t 406) 8 768 768 in
+  let _ = tgl_f2_r (arr_get k 17) (arr_get t 405) (arr_get t 417) kc (cnt * 768) in
+  let _ = tgl_f2_r (arr_get k 17) (arr_get t 406) (arr_get t 417) vc (cnt * 768) in
+  let _ = tgl_f2_r (arr_get k 14) (arr_get t 404) (arr_get t 417) kc (cnt * 1536) in
+  let _ = tgl_f1_r (arr_get k 15) kc (arr_get t 431) (cnt * 12) in
+  let _ = tgl_f2_r (arr_get k 16) (arr_get t 431) vc (arr_get t 409) (cnt * 768) in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 409) (arr_get t (pb + 3)) (arr_get t 410) 8 768 768 in
+  let _ = tgl_f2_r (arr_get k 4) xin (arr_get t 410) (arr_get t 411) (cnt * 768) in
+  let _ = tgl_flnf_r (arr_get k 1) (arr_get t 411) (arr_get t (pb + 8)) (arr_get t (pb + 9)) (arr_get t 401) (arr_get t 412) (arr_get t 403) cnt in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 412) (arr_get t (pb + 4)) (arr_get t 413) 8 768 3072 in
+  let _ = tgl_f2_r (arr_get k 7) (arr_get t 413) (arr_get t (pb + 10)) (arr_get t 413) (cnt * 3072) in
+  let _ = tgl_f1_r (arr_get k 2) (arr_get t 413) (arr_get t 414) (cnt * 3072) in
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 414) (arr_get t (pb + 5)) (arr_get t 415) 8 3072 768 in
+  let _ = tgl_f2_r (arr_get k 8) (arr_get t 415) (arr_get t (pb + 11)) (arr_get t 415) (cnt * 768) in
+  let _ = tgl_f2_r (arr_get k 4) (arr_get t 411) (arr_get t 415) (arr_get t 400) (cnt * 768) in
+  0
+cb_all t k li cnt = if li >= 16 then 0 else let _ = cb_block t k li cnt in cb_all t k (li + 1) cnt
+
+-- host side of a chunk: build cnt embedding rows (ids from `idl`, absolute
+-- positions base..base+cnt-1), stage, and set L=[base]. Rows beyond cnt in
+-- the staging tile are stale -- row independence makes them harmless.
+cb_rows emb pos idl base xr kk =
+  if length idl == 0 then 0
+  else
+    let _ = cb_one emb pos (head idl) (base + kk) xr kk 0
+    cb_rows emb pos (tail idl) base xr (kk + 1)
+cb_one emb pos id p xr kk j = if j >= 768 then 0 else
+  let _ = float_arr_set xr (kk * 768 + j) ((float_arr_get emb (id * 768 + j)) +. (float_arr_get pos (p * 768 + j))) in
+  cb_one emb pos id p xr kk (j + 1)
+
+cb_feed t k emb pos idl base cnt =
+  let xr = float_arr_new (8 * 768) 0.0
+  let _ = cb_rows emb pos idl base xr 0
+  let _ = tgl_fabuf_upload (arr_get t 418) xr (8 * 768)
+  let _ = tgl_f1_r (arr_get k 13) (arr_get t 418) (arr_get t 400) (cnt * 768)
+  let la = float_arr_new 1 0.0
+  let _ = float_arr_set la 0 (int_to_float base)
+  let _ = tgl_fabuf_upload (arr_get t 417) la 1
+  cb_all t k 0 cnt
+
+-- lnf + head over all cnt chunk rows; per-row argmax written into `am`
+-- (an int arr of size >= cnt)
+cb_heads t k cnt am =
+  let _ = tgl_flnf_r (arr_get k 1) (arr_get t 400) (arr_get t 200) (arr_get t 201) (arr_get t 401) (arr_get t 402) (arr_get t 403) cnt
+  let _ = tgl_fgemm_r (arr_get k 0) (arr_get t 402) (arr_get t 202) (arr_get t 430) 8 768 16384
+  let lg = float_arr_new (cnt * 16384) 0.0
+  let _ = tgl_fabuf_download (arr_get t 430) lg (cnt * 16384)
+  cb_am lg am cnt 0
+cb_am lg am cnt kk = if kk >= cnt then 0 else
+  let _ = arr_set am kk (fargmax lg (kk * 16384) 16384 0 (0.0 -. 1000000000000.0) 0) in
+  cb_am lg am cnt (kk + 1)
+
+-- compile the full kernel table
+f9_kernels dummy =
+  let k = arr_new 18 0
+  let _ = arr_set k 0 (compile_k k_fgemm)
+  let _ = arr_set k 1 (compile_k k_lfwd)
+  let _ = arr_set k 2 (compile_k k_gfwd)
+  let _ = arr_set k 3 (compile_k k_smax)
+  let _ = arr_set k 4 (compile_k k_vadd)
+  let _ = arr_set k 5 (compile_k k_ascore)
+  let _ = arr_set k 6 (compile_k k_av)
+  let _ = arr_set k 7 (compile_k k_badd3072)
+  let _ = arr_set k 8 (compile_k k_badd768)
+  let _ = arr_set k 9 (compile_k k_kscore)
+  let _ = arr_set k 10 (compile_k k_ksmax)
+  let _ = arr_set k 11 (compile_k k_kav)
+  let _ = arr_set k 12 (compile_k k_kapp)
+  let _ = arr_set k 13 (compile_k k_rcopy)
+  let _ = arr_set k 14 (compile_k k_ckscore)
+  let _ = arr_set k 15 (compile_k k_cksmax)
+  let _ = arr_set k 16 (compile_k k_ckav)
+  let _ = arr_set k 17 (compile_k k_ckapp)
+  k
+
+-- open + load the whole model into t; returns [emb, pos] float_arrs
+f9_load path t =
+  let p2 = mk_p2
+  let fd = fopen path "rb"
+  let hb8 = malloc 8
+  let _ = pread fd hb8 8 0
+  let hlen = pq_le_len hb8 0
+  let _ = free hb8
+  let base = 8 + hlen
+  let hdr = malloc base
+  let _ = pread fd hdr base 0
+  let _ = load_block t p2 fd hdr base 0
+  let _ = arr_set t 200 (fldup p2 fd hdr base "lnfg" 768)
+  let _ = arr_set t 201 (fldup p2 fd hdr base "lnfb" 768)
+  let _ = arr_set t 202 (fldup p2 fd hdr base "headw" 12582912)
+  let emb = fld_f32 p2 fd hdr base "emb" 12582912
+  let pos = fld_f32 p2 fd hdr base "pos" 98304
+  cons emb (cons pos [])

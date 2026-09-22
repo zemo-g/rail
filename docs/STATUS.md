@@ -11,7 +11,7 @@
 | Compiler | 10023 lines of Rail | `wc -l tools/compile.rail` |
 | Seed binary | 957816 bytes | `wc -c rail_native` |
 | Seed sha256 | `32ef7e1b9ccb04624c6b46f677b31e5f1721e4861fba8fe1c4a6f9557c7d5b0e` | `shasum -a 256 rail_native` |
-| Stdlib | 102 modules | `ls stdlib/*.rail \| wc -l` |
+| Stdlib | 103 modules | `ls stdlib/*.rail \| wc -l` |
 | Non-Rail surface | 33 in-tree files | `SHIMS.md` |
 | Tests | runner self-reports N/N and exits 0 iff N == N; `gpu_map` needs a Metal device | `./rail_native test; echo $?` |
 | Self-host | byte-identical fixed point | `RAIL_ARENA_MB=6000 ./rail_native self && cmp rail_native /tmp/rail_self` |
