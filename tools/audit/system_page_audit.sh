@@ -57,21 +57,34 @@ verdict() {
 
 curl -sf "$BASE/system" -o "$PAGE" || { echo "FATAL: could not fetch /system"; exit 2; }
 
+# Text of the page's Figure for a data-src key. The page's numbers are
+# <data class="fig" data-src="KEY">…</data> elements, injected from the
+# substrate at deploy (one element per line by the site's contract), so this
+# is the page's claim; anything else matching the same shape is prose or a
+# recipe. Empty when the page carries no such Figure, which then fails the
+# class loudly rather than matching something that merely looks like one.
+fig_text() {
+  grep -oE "<data[^>]*data-src=\"$1\"[^>]*>[^<]*</data>" "$PAGE" | head -1 \
+    | sed -E 's/.*>([^<]*)<\/data>$/\1/'
+}
+
 # ============================================================================
 # CLASS: rail_version — header version matches latest git tag
 # ============================================================================
 class_rail_version() {
   local page_ver tag_ver
-  # Page carries the version as an attested <data> element, e.g.
-  # <data pulse="...">v5.2.0</data> (format moved off the old "RAIL v5.1.0"
-  # header string 2026-07 — match the bare vX.Y.Z anywhere).
-  page_ver=$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' "$PAGE" | head -1)
+  # The page's version is its Figure: <data class="fig" data-src="repo:version">.
+  # Until 2026-09-15 this took the FIRST vX.Y.Z anywhere in the HTML, which
+  # was the verify recipe's release URL, so a correct footer failed on a
+  # recipe example for two weeks (and the reason never reached the log,
+  # because -q silenced it). FAIL lines print regardless of -q now.
+  page_ver=$(fig_text repo:version)
   tag_ver=$(cd "$RAIL_DIR" && git tag --list 'v*' | sort -V | tail -1)
   log "page: $page_ver  substrate: $tag_ver"
-  if [[ "$page_ver" == "$tag_ver" ]]; then
+  if [[ -n "$page_ver" && "$page_ver" == "$tag_ver" ]]; then
     verdict rail_version PASS
   else
-    log "FAIL: header version $page_ver != latest tag $tag_ver"
+    echo "  FAIL: page repo:version Figure '${page_ver:-<none>}' != latest tag '$tag_ver'"
     verdict rail_version FAIL
   fi
 }
@@ -81,14 +94,16 @@ class_rail_version() {
 # ============================================================================
 class_test_count() {
   local page_count truth_count
-  # Header reads "RAIL v5.1.0 · 141/141"
-  page_count=$(grep -oE '[0-9]+/[0-9]+' "$PAGE" | head -1)
+  # The page's count is its Figure: <data class="fig" data-src="tests:total"
+  # data-fmt="ratio">N/N</data>. The substrate is the suite itself, run here
+  # on the master-tracking clone.
+  page_count=$(fig_text tests:total)
   truth_count=$(cd "$RAIL_DIR" && ./rail_native test 2>&1 | tail -1 | grep -oE '[0-9]+/[0-9]+' | head -1)
   log "page: $page_count  substrate: $truth_count"
-  if [[ "$page_count" == "$truth_count" ]]; then
+  if [[ -n "$page_count" && "$page_count" == "$truth_count" ]]; then
     verdict test_count PASS
   else
-    log "FAIL: page $page_count != substrate $truth_count"
+    echo "  FAIL: page tests:total Figure '${page_count:-<none>}' != suite '$truth_count'"
     verdict test_count FAIL
   fi
 }
