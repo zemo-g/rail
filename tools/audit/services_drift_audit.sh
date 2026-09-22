@@ -3,7 +3,8 @@
 #
 # Cross-checks CLAUDE.md's "Currently running" service table against
 # launchctl reality. Originally task #7 (sitestats source-of-truth);
-# broadened because the table itself has drifted.
+# broadened because the table itself has drifted. Also fails when a plist
+# names a path that is gone, or a script it runs names a missing checkout.
 #
 # See docs/plans/SERVICES_DRIFT_AUDIT.md.
 #
@@ -103,6 +104,26 @@ while IFS= read -r svc; do
         paths_ok=0
         bad_paths+=("$svc: $p")
       fi
+    done <<<"$paths"
+
+    # One hop further: a checkout (~/projects/<name>) that a script the plist
+    # runs names in code, not in a comment. The 2026-09-22 cleanup removed
+    # ~/projects/rail-attest as stale while attest_daily.sh still cd'd into it;
+    # the plist's own paths all existed, so nothing here saw it.
+    while IFS= read -r p; do
+      [[ -f "$p" ]] && grep -Iq . "$p" 2>/dev/null || continue
+      while IFS= read -r ref; do
+        [[ -z "$ref" ]] && continue
+        ref="${ref/#\~/$HOME}"
+        ref="${ref/#\$\{HOME\}/$HOME}"
+        ref="${ref/#\$HOME/$HOME}"
+        if [[ ! -e "$ref" ]]; then
+          paths_ok=0
+          bad_paths+=("$svc: $ref (named in $p)")
+        fi
+      done < <(grep -vE '^[[:space:]]*#' "$p" \
+                 | grep -oE '(~|\$HOME|\$\{HOME\}|/Users/[A-Za-z0-9._-]+)/projects/[A-Za-z0-9._-]+' \
+                 | sort -u)
     done <<<"$paths"
   fi
 
