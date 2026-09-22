@@ -302,15 +302,8 @@ check_witness() {
 slack_post() {
   local msg="$1"
   [ "$DRY" = "1" ] && { log "[DRY] would slack: $msg"; return; }
-  [ -s "$SLACK_TOKEN_FILE" ] || { log "no slack token; skip"; return; }
-  local token
-  token=$(tr -d '\n' < "$SLACK_TOKEN_FILE")
   local resp
-  resp=$(curl -s --max-time 8 -X POST "https://slack.com/api/chat.postMessage" \
-    -H "Authorization: Bearer $token" \
-    -H "Content-Type: application/json; charset=utf-8" \
-    -d "$(jq -nc --arg ch "$SLACK_CHANNEL" --arg t "$msg" \
-        '{channel:$ch, text:$t, mrkdwn:true}')" 2>/dev/null)
+  if "${HOME}/.fleet/scripts/notify.py" -s "attest drift audit" "$msg"; then resp='{"ok":true}'; else resp='{"ok":false}'; fi
   if echo "$resp" | grep -q '"ok":true'; then
     log "slack ok"
   else

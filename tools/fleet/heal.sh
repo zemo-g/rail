@@ -147,22 +147,8 @@ record_failure() {
 slack_scream() {
   local msg="$1"
   local token_path="${HOME}/.fleet/slack_token"
-  local channel
-  channel=$(cat "${HOME}/.fleet/slack_channel" 2>/dev/null | tr -d '[:space:]')
-  [ -z "$channel" ] && { log WARN "no slack_channel; skip alert: $msg"; return; }
-  [ -f "$token_path" ] || { log WARN "no slack token; skip alert: $msg"; return; }
-  [ "$DRYRUN" = "1" ] && { log WARN "[DRYRUN] would slack: $msg"; return; }
-  local bearer=$(cat "$token_path" 2>/dev/null | tr -d '\n')  # value read from file, never a literal (var named to satisfy leak-guard)
-  [ -z "$bearer" ] && return
-  local resp
-  resp=$(curl -s --max-time 5 -X POST "https://slack.com/api/chat.postMessage" \
-    -H "Authorization: Bearer $bearer" \
-    -H "Content-Type: application/json; charset=utf-8" \
-    -d "{\"channel\":\"$channel\",\"text\":\"🚨 $msg\"}" 2>&1)
-  case "$resp" in
-    *'"ok":true'*) : ;;
-    *) log WARN "SLACK_ALERT_FAILED: $(printf '%s' "$resp" | head -c 160)" ;;
-  esac
+  [ "$DRYRUN" = "1" ] && { log WARN "[DRYRUN] would ring: $msg"; return; }
+  if "${HOME}/.fleet/scripts/notify.py" -s "fleet self-healer" "🚨 $msg"; then :; else log WARN "NOTIFY_FAILED: $msg"; fi
 }
 
 # ── the actual checks ──────────────────────────────────────────────

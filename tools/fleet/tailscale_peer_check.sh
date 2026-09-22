@@ -55,11 +55,4 @@ msg=":warning: Tailscale peer drift on $(hostname -s)"
 
 log "DRIFT — added=[$added] removed=[$removed]"
 
-if [ -s "$SLACK_TOKEN_FILE" ]; then
-  token=$(cat "$SLACK_TOKEN_FILE")
-  curl -sm 5 -X POST https://slack.com/api/chat.postMessage \
-    -H "Authorization: Bearer $token" \
-    -H "Content-Type: application/json; charset=utf-8" \
-    -d "{\"channel\":\"<test-dm>\",\"text\":\"$(printf '%s' "$msg" | sed 's/"/\\"/g')\"}" \
-    >/dev/null 2>&1 && log "slack posted"
-fi
+if "$HOME/.fleet/scripts/notify.py" -s "tailscale peer drift" "$(printf '%b' "$msg")"; then log "notify posted"; else log "NOTIFY_FAILED"; fi
