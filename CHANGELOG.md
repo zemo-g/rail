@@ -4,6 +4,22 @@ All notable changes to Rail are documented here.
 
 ## Unreleased
 
+### Fixed
+- **A closure call hands over the closure, and the lambda fetches its own captures.** The caller
+  used to load a closure's captures into the argument registers after the params, as far as `x4`
+  and no further, because `x5`, `x6` and `x7` carried the capture count, the code pointer and the
+  closure. Past five params plus captures a capture read whatever sat in the next register; the
+  runtime's own callers loaded fewer still (`map` two captures, `filter` and `fold` one, a `try`
+  body none, the `try` handler its first capture into the wrong register, the thread trampoline
+  none), and the call sequence overwrote a sixth or later parameter. Nothing errored: `fold (\acc x
+  -> acc + x + a + b) 0 [1, 2]` returned 2003 for 42003. Now the caller leaves the closure in `x15`
+  and branches through `x16`, and the lambda copies its captures out of `x15` into its frame on
+  entry, so captures are unlimited and a closure takes up to 15 arguments; a 16th fails the link on
+  `_RAIL_ERROR_closure_takes_at_most_15_arguments` instead of running. A scratch build that flagged
+  the old ceiling found no code in the tree past it, so nothing shipped was computing wrong answers.
+  Tests t213 to t216, `tools/fuzz/known/closure_captures.rail`. The x86 backend keeps its own
+  convention and its own limits.
+
 ## v5.4.0 (2026-09-22): Hardening, and the beacon replays from one integer
 
 ### Added

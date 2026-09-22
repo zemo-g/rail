@@ -7,7 +7,7 @@ After editing `tools/compile.rail` (prefix every `self` with `RAIL_ARENA_MB=6000
 inlined linker makes the compiler bigger; default rail-link path needs the arena):
 1. `RAIL_ARENA_MB=6000 ./rail_native self`: self-compile (in-process rail-link)
 2. `cp /tmp/rail_self rail_native`: install new binary
-3. `./rail_native test`: verify 203/203
+3. `./rail_native test`: every test passes (the runner exits 0 iff n/n; 213 on 2026-09-22)
 4. `RAIL_ARENA_MB=6000 ./rail_native self && cmp rail_native /tmp/rail_self`: verify fixed point. **Needs ≥2 cycles**: gen0's shipped runtime asm doesn't necessarily match what gen0's source emits, so cycle 1 typically differs. Cycle 2 always lands the byte-identical fixed point (gen2 == gen3 == gen4). See `notes/bootstrap_convergence_audit_2026-05-13.md` for the empirical proof. Verify by running self twice after installing and `cmp`-ing the two outputs.
 
 **NOTE**: Self-compile works cleanly since the 256MB stack fix. No gen2_head bootstrap needed.

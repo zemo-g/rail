@@ -398,9 +398,22 @@ Direct application is beta-reduced at compile time:
 (\a -> \b -> a + b) 3 4    -- evaluates to 7
 ```
 
+Because of the flattening there is no partial application: `\x -> \y -> x + y` is one
+two-parameter closure, and calling it with one argument does not return a function. A
+closure call with the wrong number of arguments is not checked (a direct call to a named
+function is: that is a compile error). To return a function from a lambda, bind it first:
+
+```rail
+let adder = \x ->
+  let g = \y -> x + y
+  g
+(adder 5) 10    -- 15
+```
+
 ### Closures
 
-Lambdas can capture variables from their enclosing scope (up to 4 captured variables):
+Lambdas capture variables from their enclosing scope, any number of them, and take any
+number of parameters up to 15:
 
 ```rail
 main =
@@ -409,20 +422,11 @@ main =
   f 42    -- returns 142
 ```
 
-### Known Limitation: Lambdas in `filter`
-
-Single lambdas passed directly to `filter` can segfault at runtime due to a dispatch bug. Use named predicate functions instead:
-
-```rail
--- BAD: may segfault
-filter (\x -> x > 3) [1, 2, 3, 4, 5]
-
--- GOOD: use a named function
-gt3 x = if x > 3 then true else false
-filter gt3 [1, 2, 3, 4, 5]
-```
-
-This does not affect `map` or `fold`, where lambdas work correctly.
+A closure is `[4, code, ncap, cap0, cap1, ...]`. The caller passes it in `x15` and branches
+through `x16`; the lambda copies its captures out of `x15` into its frame on entry. Until
+2026-09-22 the caller loaded the captures into the argument registers instead, which capped
+params plus captures at five (two captures inside `map`, one in `filter` and `fold`, none in a
+`try` body) and silently read garbage past the cap (`tools/fuzz/known/closure_captures.rail`).
 
 ## Import System
 
@@ -644,11 +648,13 @@ let result = map double (map triple [1, 2, 3])
 
 1. **`split` is single-character only**: `split "abc" s` splits on each of `a`, `b`, and `c` individually, not on the substring `"abc"`.
 
-2. **Lambdas in `filter` segfault**: Use named predicate functions instead.
+2. **No partial application**: nested lambdas flatten into one multi-parameter closure, and
+   a closure called with the wrong number of arguments is not checked (see Nested Lambdas).
 
 3. **WASM backend**: Compiles but segfaults at runtime due to heap limits.
 
-4. **Closure capture limit**: Closures can capture up to 4 variables from the enclosing scope.
+4. **Closure arity**: a lambda takes at most 15 parameters (x0..x14; x15 and x16 carry the
+   closure and its code). Captures are unlimited.
 
 5. **No type inference**: The language is dynamically typed at the compilation level. Type annotations (like `i32 -> i32`) are parsed but ignored by the native compiler.
 
