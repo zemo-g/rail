@@ -480,14 +480,78 @@ _rail_malloc_chain_drain:
     ldp x29, x30, [sp], #64
     ret
 
-// _getenv(name) -> char* | 0 — Linux stub. The full impl would walk
-// _rail_envp comparing each entry against name+'='. We're only called
-// from _rail_arena_init (RAIL_ARENA_MB / RAIL_ARENA_TRACE), and
-// _rail_envp is populated by _main's prologue which hasn't run yet
-// at arena-init time. Returning 0 (env-var-not-found) is correct: the
-// caller falls through to defaults (1 GB arena, no trace).
+// _getenv(name) -> char* (the value, past '=') | 0
+//
+// Was a stub returning 0, on the reasoning that _rail_envp was not
+// populated yet at arena-init time. Two things have changed. _start now
+// computes envp from the initial stack and stores it BEFORE calling
+// _rail_arena_init, so it is live throughout. And the stub was not only
+// affecting the arena: `foreign getenv` is a Rail-level FFI, so every
+// Linux program calling getenv got nothing back.
+//
+// Note the Linux _rail_arena_init does NOT consult this: it uses a
+// statically reserved BSS heap of a fixed size, so RAIL_ARENA_MB still has
+// no effect on Linux and would need an mmap path to gain one. Fixing that
+// is a separate change; this fixes getenv.
+//
+// Walks the envp array comparing each "NAME=value" against name up to the
+// '=', which is what makes "HOME" not match "HOMEBREW_PREFIX=...".
 _getenv:
+    mov x9, x0                    // x9 = name
+    adrp x10, _rail_envp
+    add x10, x10, :lo12:_rail_envp
+    ldr x10, [x10]                // x10 = envp
+    cbz x10, .Lge_none
+.Lge_entry:
+    ldr x11, [x10]                // x11 = envp[i]
+    cbz x11, .Lge_none            // NULL terminator: not found
+    mov x12, #0
+.Lge_cmp:
+    ldrb w13, [x9, x12]           // name[j]
+    ldrb w14, [x11, x12]          // entry[j]
+    cbz w13, .Lge_nameend         // name consumed
+    cmp w13, w14
+    b.ne .Lge_next
+    add x12, x12, #1
+    b .Lge_cmp
+.Lge_nameend:
+    cmp w14, #61                  // entry[j] must be '=' for a full match
+    b.ne .Lge_next
+    add x0, x11, x12
+    add x0, x0, #1                // point past '='
+    ret
+.Lge_next:
+    add x10, x10, #8
+    b .Lge_entry
+.Lge_none:
     mov x0, #0
+    ret
+
+// _strdup(s) -> char* — was missing entirely, so any Linux program using
+// `foreign getenv` failed to LINK rather than misbehaving at runtime. The
+// FFI string-return path calls it to copy a borrowed C string onto the
+// Rail heap. NULL in gives an empty string out rather than faulting in
+// _strlen, which is the shape getenv's not-found case needs.
+_strdup:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    cbz x0, .Lsd_empty
+    str x0, [x29, #16]
+    bl _strlen
+    add x0, x0, #1
+    bl _malloc
+    str x0, [x29, #24]
+    ldr x1, [x29, #16]
+    bl _strcpy
+    ldr x0, [x29, #24]
+    ldp x29, x30, [sp], #32
+    ret
+.Lsd_empty:
+    mov x0, #1
+    bl _malloc
+    mov w1, #0
+    strb w1, [x0]
+    ldp x29, x30, [sp], #32
     ret
 
 // read(fd, buf, count) — syscall 63

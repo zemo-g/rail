@@ -4,7 +4,256 @@ All notable changes to Rail are documented here.
 
 ## Unreleased
 
+## v5.4.0 (2026-09-22): Hardening, and the beacon replays from one integer
+
+### Added
+- **`\r` is an escape in string literals** (carriage return, byte 13), lexed like `\n` and
+  `\t` and emitted through `esc_asm_char` as `\r`. Until now a `\r` literal was the two
+  characters backslash and r, and CRLF had to be built with `char_from_int 13`. Test t211.
+  Written by DeepSeek V4.1 Flash through the clerk's letters door on the night of 2026-09-20
+  (the Rail ladder, rung C), judged by `tools/fuzz/ladder/judge.py C` through a real rebuild.
+- **`tools/fuzz/ladder/`**: the night ladder's rungs and judge. A rung is a pointed task for the
+  local night worker with a check program, an expected output and a code judge that rebuilds the
+  compiler for compiler rungs, bounds wall clock and memory, and runs the suite. Rungs A and C
+  climbed on 2026-09-21; B (the live miscompile `mixed_int_from_fn`) is still open.
+
 ### Fixed
+- **`bytes_to_str` in `stdlib/http_client.rail` is linear.** It joined once per byte, copying
+  the accumulator every step: 100 KB of response took 5.5 GB of resident memory, which was the
+  real reason HTTPS responses were capped near 64 KB. It now collects the characters into a list
+  and joins once; the result is byte-identical. Test t212 checks 100,000 bytes; the ladder judge
+  (`judge.py A`) caps the check at 1 GB. Written by DeepSeek V4.1 Flash (rung A, 2026-09-21).
+- **Seven miscompiles behind a green suite, found by the 2026-09-11 hardening
+  loop** (a fuzzer, a reducer, a bisector and a perf agent on a shared findings
+  bus; every one passed 198/198, the fixed point and the CI fuzz seed). Each
+  ships with its minimal program as a suite test (t206..t210) and a
+  `tools/fuzz/known/` case, and `tools/fuzz/semantic.py`'s loop family now
+  generates the shapes that were missing.
+  - **Tail self-call arguments.** `sl (n - 1) ((acc + 2) / 3)` printed a heap
+    address: the bottom-test loop had no fallback and emitted `mov x20, x9`
+    with x9 never written. `let v = acc * 2 in sl (n - 1) v` gave 401 for 200
+    and `dn ((n - 1) * 1)` never terminated: the fallback moved general (tagged)
+    values into the raw loop registers as they were. A plain literal argument
+    (`f (n - 1) 5`) was loaded tagged, so the loop ran with 11. The bottom-test
+    form is refused unless every argument is direct, the fallback stacks the
+    general values and untags them on the way into the registers, and the
+    literal loads raw (t206).
+  - **String ordering.** `"abc" < "abd"` was 0, and 1 with the two lets
+    swapped: `_rail_lt/gt/le/ge` had no string branch and compared offset 8 of
+    each object. They dispatch like `_rail_eq` now (t207). `tools/x86_rt.s`
+    still lacks the branch and says so.
+  - **String parameters read as ints.** `app1 a = a + "x"` returned a heap
+    address and `f a b = length (a + b)` returned 0: a fn whose params are used
+    only in `+` or an ordering op took the raw-register convention, the
+    syntactic int mark, and the early-return raw compare, whatever its call
+    sites passed. The call-site proof (every site heap, or sites disagree)
+    now vetoes all three, and the proof reaches through a param handed on to
+    another fn (t208).
+  - **Frames under-sized for sibling slots.** Five sibling lets in one list
+    literal predicted one slot and consumed five; the fifth wrote past the
+    frame (SIGBUS). `max_sl_list` threads siblings cumulatively, an
+    application spine reserves its closure slot, and `compile_func` re-sizes
+    the frame from the slot cg actually reached, saying so when the predictor
+    was short (t209).
+  - **Floats out of containers.** `let (a, b) = (1.5, 2.25)` then `a + b`
+    was SIGSEGV at 0x3ff8000000000000 (1.5's bits dereferenced as a pointer);
+    through a 2-param fn it was 4.9e-324 (a tagged int read as float bits).
+    Two conventions coexisted with no boundary: raw binary64 bits for
+    statically-known floats, tag-6 boxes for the generic runtime, and the
+    runtime's own mixed arms read the untagged operand as raw bits in one
+    routine and as a box in the next. The boundary is now explicit (see
+    docs/NUMERICS.md): a raw float entering a generic location (a tuple,
+    list or ADT field, a closure-call argument, a parameter without an
+    all-sites float proof, a match result, a non-float-returning fn's return)
+    is boxed; a generic value read as a float goes through `_rail_fval`,
+    which converts a tagged int, loads a box and takes anything else as raw
+    bits. Every generic runtime routine reads through it too, which also
+    closes `known/mixed_int_from_fn` (`0.1 - (gint 0)` was 0.1). A float
+    accumulator loop `if n == 0 then acc else go (n - 1) (acc +. x)` is now
+    recognised as float-returning (the fn may assume its own recursive call),
+    and `float_arr_new n v` no longer marks its LENGTH float (the argument
+    positions were read off the application spine) (t210).
+- **`RAIL_ARENA_MB=6000 ./rail_native self` fell off the allocator cliff
+  once the compile allocated a few hundred MB more.** The in-process
+  self-hosted linker inherited an arena the compile had nearly filled and
+  ran on the free-list scan for minutes (or died in it). The assembly is on
+  disk before the linker starts and nothing from the compile is needed
+  after, so `self` resets the arena to its pre-compile mark first, the way
+  `run_test` does after every in-process compile.
+
+### Changed
+- **Codegen of the compiler's own source: 7.6 s to 1.7 s.** `compile_func`
+  injected the program's ~2,500 `__ret_`/`__float_ret_` markers in FRONT of
+  a function's locals, so every local lookup in cg walked past all of them
+  first. They now sit behind the locals (keys are disjoint, so nothing else
+  changes). The call-site analysis carries more kinds and costs 4 s more on
+  the same source, and recording a call-site slot used to rebuild the whole
+  marker map on every observation; the map is now touched only when a slot
+  narrows. Self-compile of the compiler's source: 21.5 s to 17.5 s at
+  `RAIL_ARENA_MB=6000`; at CI's 4000 MB, 19 s to 16 s with the peak
+  footprint 2.4 GB to 1.5 GB and no collection. A small fixed source goes
+  from 0.27 s to 0.31 s. Generated code is unchanged in speed (the perf
+  agent's six benches within noise, outputs identical). Seed sha256 and
+  suite count (203) updated.
+- `tools/fuzz/semantic.py` generates mixed int-and-float arithmetic by
+  default (`--no-mixed` restores the old grammar) now that
+  `known/mixed_int_from_fn` is closed; its loop family gained the compound,
+  let-bound and literal argument shapes.
+- **A bare `./rail_native self` spun for hours instead of finishing.** The
+  compiler's own source no longer fits the 1 GB default arena's bump window;
+  allocation falls to the free-list scan and a self-compile that takes 18 s at
+  `RAIL_ARENA_MB=2000` was still running at 240 s without it (the daily attest
+  audit sat in one for 36 hours on 2026-09-09). CI had set 4000 since June; the
+  README, the audit walker, the status page and two tools still ran it bare.
+  `self` now refuses below 2000 MB with the command to run (`RAIL_ARENA_MB=6000`
+  reproduces the committed seed; 4000 is the as/ld fallback CI uses), exits 2,
+  and t205 checks the refusal. Every caller in the tree sets the arena, and the
+  audit walker caps the compile at 600 s.
+- **The shell attestation verifier never bound the file to the signature.**
+  `tools/attest/verify.sh` compared the file's hash with the UNSIGNED
+  `artifact.sha256` sidecar field and verified the Ed25519 signature over
+  `witness.digest_sha256`, without requiring the two digests to agree. A
+  replacement artifact plus an edited sidecar reused a real signature and
+  printed `ok`. Both digests must now equal the file's, and
+  `tools/attest/verify_selftest.sh` holds the positive control and the
+  replacement-artifact negative control against both verifiers (the Rail
+  verifier already rejected it). Found by an outside first-pass review,
+  2026-09-06.
+- **`tools/verify/check.sh` inferred success from the absence of the word
+  FAIL**, so a test process that crashed without printing it (exit 139)
+  produced `passed: 4 failed: 0`. Section 2 now requires exit 0 and an
+  N/N summary line; section 5 runs the Rail verifier against the newest
+  release's attested compiler source instead of testing that a file exists;
+  section 6 runs the verifier selftest.
+- **`selfhost/f86f082`**: its sidecar signs bytes the public-surface scrub
+  (`c4f6050`) later rewrote. Retired to `.stale` with a `PROVENANCE.md`
+  rather than re-signed. `VERIFY.md` and `README.md` now say the seed links
+  `libSystem` and that `gpu_map` needs a Metal device.
+
+- **A large negative folded constant as a comparison operand inside a user
+  function failed to assemble** (`probe _ = if 0 < (0 - (65536 * 5)) then 0
+  else 1` gave `mov x9, #-655359`, rejected). The early-return prologue's
+  16-bit `mov` guard was `tgv <= 65535`, which every negative tagged value
+  satisfies; the positive half was fixed in f851882, the negative half was
+  not. `emit_load_int` is now parameterized by target register
+  (`emit_load_int_reg`) so the prologue never routes through `x0`, which
+  still holds the first argument there: the first attempt did, and the
+  compiler miscompiled ITSELF on the second generation (188/192, float
+  garbage) while still reaching a byte-identical gen3 == gen4. A fixed
+  point is not a correctness proof; the suite is. Found by
+  `tools/fuzz/semantic.py` within 14 generated cases once probes were
+  rendered in tail position. `t192 neg_const_cmp_operand`. Suite 191 -> 192.
+- **Two early-return functions in one program collided on `.Learly_<n>`**
+  (assembler: symbol already defined). The label now carries the function
+  name. Same test.
+
+### Added
+- **Chip-away (2026-09-07):** the last 48 em-dashes in `tools/compile.rail`
+  (43 comments, 4 strings: two parser messages, an asm comment, the
+  generate prompt) replaced per the house style. The x86_64 "literal bug"
+  carried in notes since May is not in the code: `x86_emit_rcx` and the
+  x86 `both_s` predicate already carry the ARM64 fix, and x86-64 `mov`
+  takes a 64-bit immediate; it stays unverified at runtime because no
+  x86 machine remains. Stdlib survey: 5 of 102 modules (`date`, `heap`,
+  `http_server`, `prng`, `set`) are imported by nothing in the tree; all
+  five compile; they are library API, not dead code, and stay.
+- **Items 5 to 7 of the consolidation (2026-09-07):**
+  - *A 0x00 byte inside a string stays a documented limit.* A version of
+    append/join/chars that built length-tagged results in the GC arena
+    passed the full suite at generation 1, because generation 1 still
+    ran on the old runtime (a compiler embeds ITS OWN runtime into what
+    it builds, so a runtime change reaches the compiler itself only at
+    generation 2), and then wedged the compiler in the in-process linker
+    at generation 2: the compiler resets arena windows while holding
+    strings, which was safe only because join/append allocate outside
+    the arena. Reverted; `known/char_from_int_nul` stays live with the
+    reason. Binary travels as hex or int arrays.
+  - *`++` was never a Rail operator.* Not in the grammar, not in the
+    stdlib; `+` concatenates strings. The parser now says so instead of
+    "unexpected operator '+'".
+  - *`show_float_exact`* prints `%.17g`, which round-trips the exact double. t196.
+  - *`tools/fuzz/semantic.py` milestone 2:* floats compared bit-exactly
+    through `show_float_exact`, hoisted multi-parameter functions, tail
+    loops, static kind checking of every subtree, deterministic names.
+    Mixed int/float arithmetic excluded by default (`--mixed`). Its first
+    hour found `known/float_param_bare_mul_lsb`: a bare `*` on two float
+    parameters returns 2 ulp high, invisible at 15 digits for months, and
+    `known/mixed_int_from_fn`: an int from a function or builtin read as
+    float bits in mixed arithmetic. The first is fixed the same day (the
+    raw-register param convention was chosen by a syntactic check that
+    could not see the call-site float proof, so float params were untagged
+    and retagged as ints; t197). The second is recorded live.
+- **Core consolidation, four fixes with their corpus cases (2026-09-07):**
+  - *Float results whose float-ness came only from call sites were int to
+    their consumers.* `mul2 a b = a * b` called with literals is proven
+    float-returning by the param-aware pass, but the call-site analysis that
+    ran before it had already seen the result as int, so `let y = mul2 0.5
+    0.25` fed `mse y 1.0` as int bits (5.27e+36). `get_arities` now runs a
+    second call-site round once `__float_ret_` is known (and `infer_call_ty`
+    consults it), gated on floats being present so float-free programs,
+    the compiler included, are byte-identical. t193.
+  - *Wrong-arity calls are a compile error.* Rail has no currying: a call
+    with too few arguments ran the body with garbage params and one with
+    too many dropped the extras. `check_arities` walks every body; names
+    bound locally are skipped. Both compile entry points now share
+    `compile_checked`, because the check was first hooked into
+    `compile_program` only and never ran for `rail_native file`.
+  - *`head` and `tail` walk cons cells only.* A string or tuple was
+    dereferenced as a cons cell (SIGSEGV); it now yields 0 / `[]` like an
+    empty list. t195.
+  - *Tail self-call constants go through the register loader.* A `*` or
+    `/` constant above 65535 bailed to the tag-corrupting fallback and was
+    silently wrong (`acc * 100000` gave 4340285440); a `+` or `-` constant
+    above 4095 was emitted as a 12-bit immediate and refused by the
+    assembler. t194. Suite 192 -> 195; seed rebuilt, gen2 == gen3, and the
+    suite run on the rebuilt seed. The whole tree (tools, examples, stdlib)
+    compiles under the arity check.
+- **`tools/fuzz/known/`: the known-miscompile corpus, 24 runnable cases**
+  with `KNOWN_CASES.md` (target list for semantic testing) and
+  `known_cases.py` (fixed cases must pass, live cases must still fail, a
+  live case that starts passing is reported as PROMOTE). Measured on the
+  post-#66 seed: 14 fixed regressions, 7 live defects, 3 defined
+  semantics. Two of the live ones are new float miscompiles found while
+  measuring: a float result from a bare-operator function whose
+  float-ness comes only from call sites poisons the consumer's parameter
+  (`mse y 1.0` gives 5.27e+36). `check.sh` section 8 and the `semantic`
+  CI job run the corpus. Until now this list lived in a private memory
+  index the outside reviewers could not see.
+- **`tools/fuzz/semantic.py`: an independent semantic oracle in CPython**
+  (Astra, 2026-09-06/07). A bounded AST interpreter that imports no Rail
+  code evaluates seeded random expressions; each is rendered in four codegen
+  positions (function tail, `show` argument, let-bound value, comparison
+  operand), compiled with `rail_native`, and the outputs must agree. Greedy
+  reducer, saved JSON repros with replay, `--keep-going`, a `semantic` CI
+  job (seed 42). Leaf literals include the 16-bit tagged-immediate boundary.
+  `tools/fuzz/SEMANTICS.md` states the subset and the trust boundary; the
+  two Python files are listed in `SHIMS.md` as tooling outside the 33
+  build/runtime files. Its first campaign in tail position found the
+  comparison-operand bug above on the pre-f851882 seed AND on current master.
+- **`check.sh` section 5 read the Rail verifier's verdict through a pipe and
+  lost its exit status**, so a verifier that printed `ok` and then died
+  (exit 139) still passed the umbrella 5/5 (found by the same outside
+  reviewer, 2026-09-07). The verdict line and the exit status are now
+  captured separately and both must agree, in `check.sh` and in
+  `verify_selftest.sh`. New `tools/verify/check_selftest.sh` runs the
+  umbrella against a stub `rail_native` three ways (well-behaved, test
+  process exit 139, verifier ok-then-139) and `check.sh` section 7 runs it.
+- **`run_test` compared only the FIRST line of a test program's output.**
+  `trim` ran before the stdout/exit split, so a crash (exit 139), a nonzero
+  status, and any extra line after a matching first line were all invisible,
+  and a correct multi-line expectation could not pass. The runner now keeps
+  full stdout and the exit status apart: a silent program asserts on its
+  exit status, a printing program on its whole output and must not have
+  died by signal. Re-running the 190 existing tests under the new rule
+  flipped no verdict. `t191 runner_judges_evidence` holds the review's
+  table as a test of the runner itself. Suite 190 -> 191.
+- **`docs/STATUS.md` was stale and could not be checked for staleness.**
+  It embedded the generation minute, so `check.sh` section 4 could never
+  match byte-for-byte, and the committed copy still carried the pre-#61
+  compiler size and seed hash. The generator no longer prints a timestamp,
+  names an untagged checkout instead of leaving the release blank, states
+  the `libSystem` and `as`/`ld` boundary, and the committed copy is
+  regenerated.
 - **`rail_native run` discarded the program's exit code** (returned a
   hardcoded 0).  Every caller that branched on a Rail program's status
   silently saw success.  This is what let the daily attestation job

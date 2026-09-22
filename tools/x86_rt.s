@@ -694,6 +694,11 @@ _rail_ne:
     ret
 
 # Float-aware ordered compares. Mirror ARM64 (compile.rail:2668-2671).
+# GAP (2026-09-11): the ARM64 routines gained a string branch (two heap
+# operands that are not tag-6 floats go through _str_unwrap + _strcmp);
+# these x86 copies still read offset 8 of both operands as a double, so
+# ordering two strings is allocation-order dependent here. Untested target;
+# mirror _rail_eq below when the x86 backend is next built.
 # Convention: rdi = left, rsi = right. Test rdi tag bit; if even, both heap-floats.
 .global _rail_lt
 _rail_lt:
