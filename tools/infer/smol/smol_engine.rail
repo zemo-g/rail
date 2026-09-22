@@ -1,0 +1,378 @@
+-- tools/infer/smol/smol_engine.rail -- SmolLM2-135M on Metal kernels written in Rail.
+--
+-- The public checkpoint (HuggingFaceTB/SmolLM2-135M, model.safetensors, bf16) is read
+-- byte for byte: raw bf16 goes to the GPU and a kernel widens it to f32 with a 16-bit
+-- shift, which is exact. Every kernel below is MSL text emitted from this file and
+-- JIT-compiled with fast math off (tools/metal/tensor_gpu_lib.m, tgl_fjit_compile).
+--
+-- One forward function serves both a chunk of rows and a single decode row. A row's
+-- arithmetic never depends on which other rows share its pass: the GEMM is the 8x8
+-- simdgroup kernel (row-independent, sequential K), and every reduction is one
+-- thread's ascending fma loop over exactly the positions that row can see. That is
+-- what makes prefill and decode agree to the bit, and what lets a verifier check a
+-- whole transcript in one pass (verify.rail).
+--
+-- Prereq: the program that imports this also runs with tools/metal/libtensor_gpu.dylib
+-- (the compiler weak-links it from the repo root) and /tmp/rail_fload.bin pointing at
+-- model.safetensors (smol.sh arranges both). No main here.
+
+foreign tgl_fjit_compile dummy -> int
+foreign tgl_fabuf_alloc n -> int
+foreign tgl_fabuf_upload h arr n -> int
+foreign tgl_fabuf_download h arr n -> int
+foreign tgl_fabuf_load_at h n off -> int
+foreign tgl_fabuf_digest h n -> int
+foreign tgl_fabuf_dump h n -> int
+foreign tgl_fgemm_r kid a b c m k n -> int
+foreign tgl_ftr_r kid i o r c -> int
+foreign tgl_f1_r kid i o nth -> int
+foreign tgl_f2_r kid a b o nth -> int
+foreign tgl_flnp_r kid a b c d nth -> int
+foreign tgl_batch_begin dummy -> int
+foreign tgl_batch_end dummy -> int
+foreign fopen path mode -> int
+foreign pread fd buf count offset -> int
+foreign malloc n -> ptr
+foreign free p -> int
+foreign clock_gettime_nsec_np c -> int
+
+-- model shape (config.json of the pinned checkpoint) and the engine's context window
+sm_layers = 30
+sm_maxt = 256
+
+now_ns _ = clock_gettime_nsec_np 4
+
+compile_k msl = let _ = write_file "/tmp/rail_fjit_kernel.metal" msl in tgl_fjit_compile 0
+
+msl_hdr = "#include <metal_stdlib>\nusing namespace metal;\nconstant uint D=576;constant uint NH=9;constant uint G=3;constant uint HD=64;constant uint HALF=32;constant uint KW=192;constant uint FF=1536;constant uint NV=49152;constant uint MT=256;\n"
+
+-- 2^x on a fixed polynomial: the same ops on every GPU, no library transcendental.
+msl_ep = "inline float ep(float x){float t=x*1.4426950408889634f;float k=floor(t+0.5f);float f=t-k;float p=0.0013333558f;p=fma(p,f,0.0096181291f);p=fma(p,f,0.0555041087f);p=fma(p,f,0.2402265069f);p=fma(p,f,0.6931471805f);p=fma(p,f,1.0f);int ki=clamp((int)k,-126,127);return p*as_type<float>((ki+127)<<23);}\n"
+
+k_fgemm = cat ["#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n",
+  "kernel void fgemm(device const float* A, device const float* B, device float* C, constant uint& M, constant uint& K, constant uint& N, uint2 tg [[threadgroup_position_in_grid]]){\n",
+  "  uint row0=tg.y*8,col0=tg.x*8; simdgroup_float8x8 acc=make_filled_simdgroup_matrix<float,8,8>(0.0f);\n",
+  "  for(uint k=0;k<K;k+=8){ simdgroup_float8x8 a,b; simdgroup_load(a,A+row0*K+k,K); simdgroup_load(b,B+k*N+col0,N); simdgroup_multiply_accumulate(acc,a,b,acc);} simdgroup_store(acc,C+row0*N+col0,N);}\n"]
+
+-- bf16 -> f32: the top 16 bits of an f32 ARE the bf16, so this is exact.
+k_bf16x = cat [msl_hdr, "kernel void bf16x(device const ushort* s, device float* o, uint i [[thread_position_in_grid]]){o[i]=as_type<float>(((uint)s[i])<<16);}\n"]
+k_tr = cat [msl_hdr, "kernel void tr(device const float* I, device float* O, constant uint& R, constant uint& C, uint2 g [[thread_position_in_grid]]){O[g.x*R+g.y]=I[g.y*C+g.x];}\n"]
+k_gather = cat [msl_hdr, "kernel void gather(device const float* E, device const float* ids, device float* X, uint i [[thread_position_in_grid]]){uint r=i/D; uint j=i%D; X[i]=E[((uint)ids[r])*D+j];}\n"]
+k_rms = cat [msl_hdr, "constant float EPS=0.00001f;\n",
+  "kernel void rmsn(device const float* X, device const float* g, device float* Y, uint r [[thread_position_in_grid]]){\n",
+  "  float ss=0.0f; for(uint j=0;j<D;j++){float v=X[r*D+j]; ss=fma(v,v,ss);}\n",
+  "  float ri=1.0f/sqrt(ss/(float)D+EPS); for(uint j=0;j<D;j++) Y[r*D+j]=(X[r*D+j]*ri)*g[j];}\n"]
+
+-- rotate-half RoPE; the cos/sin table is built on the CPU in Rail (rope_table below).
+-- P = [pos0, rows]: row r sits at absolute position pos0 + r; rows past `rows` are padding.
+k_rope nh w nm = cat [msl_hdr,
+  "kernel void ", nm, "(device const float* X, device const float* T, device const float* P, device float* Y, uint i [[thread_position_in_grid]]){\n",
+  "  uint r=i/(", show nh, "*HALF); uint rem=i%(", show nh, "*HALF); uint h=rem/HALF; uint j=rem%HALF; uint base=r*", show w, "+h*HD;\n",
+  "  if(r>=(uint)P[1]){Y[base+j]=0.0f;Y[base+j+HALF]=0.0f;return;}\n",
+  "  uint pos=(uint)P[0]+r; float c=T[pos*HD+j]; float s=T[pos*HD+HALF+j]; float x1=X[base+j]; float x2=X[base+j+HALF];\n",
+  "  Y[base+j]=fma(x1,c,-(x2*s)); Y[base+j+HALF]=fma(x2,c,x1*s);}\n"]
+
+k_kvapp = cat [msl_hdr, "kernel void kvapp(device const float* R, device const float* P, device float* C, uint i [[thread_position_in_grid]]){uint r=i/KW; uint j=i%KW; if(r>=(uint)P[1]) return; C[((uint)P[0]+r)*KW+j]=R[i];}\n"]
+
+-- scores for (row, head, cache column): one ascending fma loop over the head dim
+k_score = cat [msl_hdr,
+  "kernel void score(device const float* Q, device const float* K, device const float* P, device float* S, uint i [[thread_position_in_grid]]){\n",
+  "  uint r=i/(NH*MT); uint rem=i%(NH*MT); uint h=rem/MT; uint c=rem%MT;\n",
+  "  if(r>=(uint)P[1]){S[i]=0.0f;return;} uint pos=(uint)P[0]+r; if(c>pos){S[i]=0.0f;return;}\n",
+  "  uint qo=r*D+h*HD; uint ko=c*KW+(h/G)*HD; float acc=0.0f; for(uint j=0;j<HD;j++) acc=fma(Q[qo+j],K[ko+j],acc); S[i]=acc*0.125f;}\n"]
+
+-- softmax over exactly the columns row r can see (0..pos), in order
+k_smax = cat [msl_hdr, msl_ep,
+  "kernel void smax(device const float* S, device const float* P, device float* A, uint i [[thread_position_in_grid]]){\n",
+  "  uint r=i/NH; if(r>=(uint)P[1]) return; uint pos=(uint)P[0]+r; uint o=i*MT;\n",
+  "  float mx=S[o]; for(uint c=1;c<=pos;c++) mx=max(mx,S[o+c]);\n",
+  "  float sum=0.0f; for(uint c=0;c<=pos;c++){float e=ep(S[o+c]-mx); A[o+c]=e; sum+=e;}\n",
+  "  float inv=1.0f/sum; for(uint c=0;c<=pos;c++) A[o+c]*=inv;}\n"]
+
+k_av = cat [msl_hdr,
+  "kernel void av(device const float* A, device const float* V, device const float* P, device float* O, uint i [[thread_position_in_grid]]){\n",
+  "  uint r=i/D; uint d=i%D; if(r>=(uint)P[1]){O[i]=0.0f;return;} uint pos=(uint)P[0]+r;\n",
+  "  uint h=d/HD; uint ao=(r*NH+h)*MT; uint vo=(h/G)*HD+d%HD; float acc=0.0f;\n",
+  "  for(uint c=0;c<=pos;c++) acc=fma(A[ao+c],V[c*KW+vo],acc); O[i]=acc;}\n"]
+
+k_add = cat [msl_hdr, "kernel void vadd(device const float* a, device const float* b, device float* o, uint i [[thread_position_in_grid]]){o[i]=a[i]+b[i];}\n"]
+k_swiglu = cat [msl_hdr, msl_ep, "kernel void swiglu(device const float* G, device const float* U, device float* O, uint i [[thread_position_in_grid]]){float g=G[i]; float s=1.0f/(1.0f+ep(-g)); O[i]=(g*s)*U[i];}\n"]
+
+-- greedy: first index of the row maximum
+k_amax = cat [msl_hdr,
+  "kernel void amax(device const float* L, device const float* P, device float* O, uint r [[thread_position_in_grid]]){\n",
+  "  if(r>=(uint)P[1]){O[r*2]=0.0f;O[r*2+1]=0.0f;return;} uint o=r*NV; float b=L[o]; uint bi=0;\n",
+  "  for(uint j=1;j<NV;j++){float v=L[o+j]; if(v>b){b=v;bi=j;}} O[r*2]=(float)bi; O[r*2+1]=b;}\n"]
+
+-- FNV-1a 64 over the row's 49152 logits as little-endian bytes: a commitment to the
+-- whole distribution, not just its argmax. Four 16-bit parts, each exact in a float.
+k_rhash = cat [msl_hdr,
+  "kernel void rhash(device const float* L, device const float* P, device float* O, uint r [[thread_position_in_grid]]){\n",
+  "  ulong h=14695981039346656037UL; if(r<(uint)P[1]){uint o=r*NV; for(uint j=0;j<NV;j++){uint b=as_type<uint>(L[o+j]);\n",
+  "  for(uint k=0;k<4;k++){h^=(ulong)((b>>(8*k))&255u); h*=1099511628211UL;}}}\n",
+  "  O[r*4]=(float)((h>>48)&65535UL); O[r*4+1]=(float)((h>>32)&65535UL); O[r*4+2]=(float)((h>>16)&65535UL); O[r*4+3]=(float)(h&65535UL);}\n"]
+
+sm_kernels _ =
+  let k = arr_new 16 0
+  let _ = arr_set k 0 (compile_k k_fgemm)
+  let _ = arr_set k 1 (compile_k k_bf16x)
+  let _ = arr_set k 2 (compile_k k_tr)
+  let _ = arr_set k 3 (compile_k k_gather)
+  let _ = arr_set k 4 (compile_k k_rms)
+  let _ = arr_set k 5 (compile_k (k_rope 9 576 "ropeq"))
+  let _ = arr_set k 6 (compile_k (k_rope 3 192 "ropek"))
+  let _ = arr_set k 7 (compile_k k_kvapp)
+  let _ = arr_set k 8 (compile_k k_score)
+  let _ = arr_set k 9 (compile_k k_smax)
+  let _ = arr_set k 10 (compile_k k_av)
+  let _ = arr_set k 11 (compile_k k_add)
+  let _ = arr_set k 12 (compile_k k_swiglu)
+  let _ = arr_set k 13 (compile_k k_amax)
+  let _ = arr_set k 14 (compile_k k_rhash)
+  k
+
+kk k i = arr_get k i
+tb t i = arr_get t i
+
+-- ── deterministic RoPE table, built in Rail with plain IEEE double ops ──
+-- sin/cos by Cody-Waite reduction on pi/2 (fdlibm's split) and Taylor on
+-- |r| <= pi/4; no libm, so every machine produces the same bits.
+tsin r =
+  let z = r *. r
+  let p = 2.8114572543455206e-15
+  let p = p *. z -. 7.647163731819816e-13
+  let p = p *. z +. 1.6059043836821613e-10
+  let p = p *. z -. 2.505210838544172e-08
+  let p = p *. z +. 2.7557319223985893e-06
+  let p = p *. z -. 0.0001984126984126984
+  let p = p *. z +. 0.008333333333333333
+  let p = p *. z -. 0.16666666666666666
+  r +. (r *. z) *. p
+tcos r =
+  let z = r *. r
+  let p = 0.0 -. 1.5619206968586225e-16
+  let p = p *. z +. 4.779477332387385e-14
+  let p = p *. z -. 1.1470745597729725e-11
+  let p = p *. z +. 2.08767569878681e-09
+  let p = p *. z -. 2.755731922398589e-07
+  let p = p *. z +. 2.48015873015873e-05
+  let p = p *. z -. 0.001388888888888889
+  let p = p *. z +. 0.041666666666666664
+  let p = p *. z -. 0.5
+  1.0 +. z *. p
+-- which 0 = sin, 1 = cos; a >= 0
+dsc a which =
+  let q = float_to_int (a *. 0.6366197723675814 +. 0.5)
+  let qf = int_to_float q
+  let r = (a -. qf *. 1.5707963267341256) -. qf *. 6.077100506506192e-11
+  let m = (q + which) % 4
+  if m == 0 then tsin r
+  else if m == 1 then tcos r
+  else if m == 2 then 0.0 -. tsin r
+  else 0.0 -. tcos r
+
+-- theta^(-2i/64), theta = 1e5, i = 0..31, as exact double literals
+invf_list = [1.0, 0.6978305848598664, 0.48696752516586317, 0.3398208328942559, 0.23713737056616555, 0.16548170999431813, 0.1154781984689458, 0.08058421877614819, 0.056234132519034905, 0.03924189758484536, 0.02738419634264361, 0.019109529749704406, 0.01333521432163324, 0.009305720409296989, 0.006493816315762114, 0.004531583637600818, 0.003162277660168379, 0.0022067340690845897, 0.0015399265260594918, 0.0010746078283213173, 0.0007498942093324557, 0.0005232991146814947, 0.0003651741272548377, 0.00025482967479793463, 0.00017782794100389227, 0.00012409377607517196, 8.659643233600654e-05, 6.0429639023813276e-05, 4.216965034285823e-05, 2.9427271762092818e-05, 2.0535250264571462e-05, 1.4330125702369627e-05]
+fill_invf a xs i = if xs == [] then a else let _ = float_arr_set a i (head xs) in fill_invf a (tail xs) (i + 1)
+
+rope_fill tab invf pos j =
+  if pos >= sm_maxt then 0
+  else if j >= 32 then rope_fill tab invf (pos + 1) 0
+  else
+    let ang = (int_to_float pos) *. (float_arr_get invf j)
+    let _ = float_arr_set tab (pos * 64 + j) (dsc ang 1)
+    let _ = float_arr_set tab (pos * 64 + 32 + j) (dsc ang 0)
+    rope_fill tab invf pos (j + 1)
+
+rope_table _ =
+  let invf = fill_invf (float_arr_new 32 0.0) invf_list 0
+  let tab = float_arr_new (sm_maxt * 64) 0.0
+  let _ = rope_fill tab invf 0 0
+  tab
+
+-- ── safetensors header (little-endian length, then JSON) ──
+pq_match buf pos pcs = if pcs == [] then 1 else if byte_at buf pos == char_to_int (head pcs) then pq_match buf (pos + 1) (tail pcs) else 0
+pq_find buf pos hi pcs = if pos >= hi then 0 - 1 else if pq_match buf pos pcs == 1 then pos else pq_find buf (pos + 1) hi pcs
+pq_find_after buf pos hi pcs = let p = pq_find buf pos hi pcs in if p < 0 then 0 - 1 else p + length pcs
+pq_int buf pos acc = let c = byte_at buf pos in if c < 48 then acc else if c > 57 then acc else pq_int buf (pos + 1) (acc * 10 + (c - 48))
+pq_le_len buf off = byte_at buf off + byte_at buf (off + 1) * 256 + byte_at buf (off + 2) * 65536 + byte_at buf (off + 3) * 16777216 + byte_at buf (off + 4) * 4294967296 + byte_at buf (off + 5) * 1099511627776
+pq_offset hdr hi name =
+  let np = pq_find hdr 0 hi (chars (cat ["\"", name, "\":"]))
+  if np < 0 then 0 - 1
+  else pq_int hdr (pq_find_after hdr np hi (chars "\"data_offsets\":[")) 0
+
+-- m = [hdr buffer, header length, byte offset of the data section]
+sm_meta path =
+  let fd = fopen path "r"
+  let lb = malloc 16
+  let _ = pread fd lb 8 0
+  let hlen = pq_le_len lb 0
+  let hdr = malloc (hlen + 8)
+  let _ = pread fd hdr hlen 8
+  let m = arr_new 3 0
+  let _ = arr_set m 0 hdr
+  let _ = arr_set m 1 hlen
+  let _ = arr_set m 2 (8 + hlen)
+  m
+
+-- raw bf16 of `name` into the staging buffer (t 404), widened into buffer `dst`
+ld_raw t k m name n dst =
+  let st = pq_offset (arr_get m 0) (arr_get m 1) name
+  let _ = if st < 0 then print (cat ["missing tensor ", name]) else 0
+  let _ = tgl_fabuf_load_at (tb t 404) (n / 2) (arr_get m 2 + st)
+  tgl_f1_r (kk k 1) (tb t 404) dst n
+
+-- a linear weight W[out][in], stored transposed (in x out) for C = A @ B
+ld_lin t k m name rows cols slot =
+  let _ = ld_raw t k m name (rows * cols) (tb t 405)
+  let h = tgl_fabuf_alloc (rows * cols)
+  let _ = tgl_ftr_r (kk k 2) (tb t 405) h rows cols
+  arr_set t slot h
+
+ld_vec t k m name n slot =
+  let h = tgl_fabuf_alloc n
+  let _ = ld_raw t k m name n h
+  arr_set t slot h
+
+lp li s = cat ["model.layers.", show li, ".", s, ".weight"]
+
+ld_layers t k m li =
+  if li >= sm_layers then 0
+  else
+    let b = li * 10
+    let _ = ld_lin t k m (lp li "self_attn.q_proj") 576 576 b
+    let _ = ld_lin t k m (lp li "self_attn.k_proj") 192 576 (b + 1)
+    let _ = ld_lin t k m (lp li "self_attn.v_proj") 192 576 (b + 2)
+    let _ = ld_lin t k m (lp li "self_attn.o_proj") 576 576 (b + 3)
+    let _ = ld_lin t k m (lp li "mlp.gate_proj") 1536 576 (b + 4)
+    let _ = ld_lin t k m (lp li "mlp.up_proj") 1536 576 (b + 5)
+    let _ = ld_lin t k m (lp li "mlp.down_proj") 576 1536 (b + 6)
+    let _ = ld_vec t k m (lp li "input_layernorm") 576 (b + 7)
+    let _ = ld_vec t k m (lp li "post_attention_layernorm") 576 (b + 8)
+    ld_layers t k m (li + 1)
+
+al t slot n = arr_set t slot (tgl_fabuf_alloc n)
+al_caches t li = if li >= sm_layers then 0 else let _ = al t (300 + li) (sm_maxt * 192) in let _ = al t (330 + li) (sm_maxt * 192) in al_caches t (li + 1)
+
+-- Buffer table t: layer li at 10*li (+0 qT +1 kT +2 vT +3 oT +4 gateT +5 upT +6 downT
+-- +7 input norm +8 post norm); caches K 300+li, V 330+li; 400 E, 401 E^T, 402 final
+-- norm, 403 rope table, 404 bf16 staging, 405 f32 scratch; activations 410..428.
+sm_load k path =
+  let t = arr_new 440 0
+  let m = sm_meta path
+  let _ = al t 404 (49152 * 576 / 2)
+  let _ = al t 405 (1536 * 576)
+  let _ = al t 400 (49152 * 576)
+  let _ = ld_raw t k m "model.embed_tokens.weight" (49152 * 576) (tb t 400)
+  let _ = al t 401 (49152 * 576)
+  let _ = tgl_ftr_r (kk k 2) (tb t 400) (tb t 401) 49152 576
+  let _ = ld_vec t k m "model.norm.weight" 576 402
+  let _ = ld_layers t k m 0
+  let tab = rope_table 0
+  let _ = al t 403 (sm_maxt * 64)
+  let _ = tgl_fabuf_upload (tb t 403) tab (sm_maxt * 64)
+  let _ = al_caches t 0
+  let mt = sm_maxt
+  let _ = al t 410 (mt * 576)
+  let _ = al t 411 (mt * 576)
+  let _ = al t 412 (mt * 576)
+  let _ = al t 413 (mt * 192)
+  let _ = al t 414 (mt * 192)
+  let _ = al t 415 (mt * 576)
+  let _ = al t 416 (mt * 192)
+  let _ = al t 417 (mt * 9 * mt)
+  let _ = al t 418 (mt * 9 * mt)
+  let _ = al t 419 (mt * 576)
+  let _ = al t 420 (mt * 576)
+  let _ = al t 421 (mt * 1536)
+  let _ = al t 422 (mt * 1536)
+  let _ = al t 423 (mt * 1536)
+  let _ = al t 424 (mt * 49152)
+  let _ = al t 425 (mt * 2)
+  let _ = al t 426 (mt * 4)
+  let _ = al t 427 mt
+  let _ = al t 428 8
+  t
+
+-- ── the forward: rows [pos0, pos0 + rows), padded to a multiple of 8 ──
+sm_block t k tp li =
+  let b = li * 10
+  let x = tb t 410
+  let xn = tb t 411
+  let prm = tb t 428
+  let _ = tgl_f2_r (kk k 4) x (tb t (b + 7)) xn tp
+  let _ = tgl_fgemm_r (kk k 0) xn (tb t b) (tb t 412) tp 576 576
+  let _ = tgl_fgemm_r (kk k 0) xn (tb t (b + 1)) (tb t 413) tp 576 192
+  let _ = tgl_fgemm_r (kk k 0) xn (tb t (b + 2)) (tb t 414) tp 576 192
+  let _ = tgl_flnp_r (kk k 5) (tb t 412) (tb t 403) prm (tb t 415) (tp * 9 * 32)
+  let _ = tgl_flnp_r (kk k 6) (tb t 413) (tb t 403) prm (tb t 416) (tp * 3 * 32)
+  let _ = tgl_f2_r (kk k 7) (tb t 416) prm (tb t (300 + li)) (tp * 192)
+  let _ = tgl_f2_r (kk k 7) (tb t 414) prm (tb t (330 + li)) (tp * 192)
+  let _ = tgl_flnp_r (kk k 8) (tb t 415) (tb t (300 + li)) prm (tb t 417) (tp * 9 * sm_maxt)
+  let _ = tgl_f2_r (kk k 9) (tb t 417) prm (tb t 418) (tp * 9)
+  let _ = tgl_flnp_r (kk k 10) (tb t 418) (tb t (330 + li)) prm (tb t 419) (tp * 576)
+  let _ = tgl_fgemm_r (kk k 0) (tb t 419) (tb t (b + 3)) (tb t 420) tp 576 576
+  let _ = tgl_f2_r (kk k 11) x (tb t 420) x (tp * 576)
+  let _ = tgl_f2_r (kk k 4) x (tb t (b + 8)) xn tp
+  let _ = tgl_fgemm_r (kk k 0) xn (tb t (b + 4)) (tb t 421) tp 576 1536
+  let _ = tgl_fgemm_r (kk k 0) xn (tb t (b + 5)) (tb t 422) tp 576 1536
+  let _ = tgl_f2_r (kk k 12) (tb t 421) (tb t 422) (tb t 423) (tp * 1536)
+  let _ = tgl_fgemm_r (kk k 0) (tb t 423) (tb t (b + 6)) (tb t 420) tp 1536 576
+  tgl_f2_r (kk k 11) x (tb t 420) x (tp * 576)
+
+sm_blocks t k tp li = if li >= sm_layers then 0 else let _ = sm_block t k tp li in sm_blocks t k tp (li + 1)
+
+pad8 n = ((n + 7) / 8) * 8
+
+-- ids: a Rail list of token ids for rows pos0 .. pos0 + length ids - 1
+fill_ids a xs i = if xs == [] then a else let _ = float_arr_set a i (int_to_float (head xs)) in fill_ids a (tail xs) (i + 1)
+
+sm_forward t k ids pos0 =
+  let n = length ids
+  let tp = pad8 n
+  let ida = fill_ids (float_arr_new tp 0.0) ids 0
+  let _ = tgl_fabuf_upload (tb t 427) ida tp
+  let pa = float_arr_new 8 0.0
+  let _ = float_arr_set pa 0 (int_to_float pos0)
+  let _ = float_arr_set pa 1 (int_to_float n)
+  let _ = tgl_fabuf_upload (tb t 428) pa 8
+  let _ = tgl_batch_begin 0
+  let _ = tgl_f2_r (kk k 3) (tb t 400) (tb t 427) (tb t 410) (tp * 576)
+  let _ = sm_blocks t k tp 0
+  let _ = tgl_f2_r (kk k 4) (tb t 410) (tb t 402) (tb t 411) tp
+  let _ = tgl_fgemm_r (kk k 0) (tb t 411) (tb t 401) (tb t 424) tp 576 49152
+  let _ = tgl_f2_r (kk k 13) (tb t 424) (tb t 428) (tb t 425) tp
+  let _ = tgl_f2_r (kk k 14) (tb t 424) (tb t 428) (tb t 426) tp
+  let _ = tgl_batch_end 0
+  n
+
+-- after a forward of n rows: greedy token of row r, and the hex hash of row r's logits
+sm_results t n =
+  let a = float_arr_new (pad8 n * 2) 0.0
+  let _ = tgl_fabuf_download (tb t 425) a (pad8 n * 2)
+  let h = float_arr_new (pad8 n * 4) 0.0
+  let _ = tgl_fabuf_download (tb t 426) h (pad8 n * 4)
+  (a, h)
+sm_tok a r = float_to_int (float_arr_get a (r * 2))
+hexd d = if d < 10 then char_from_int (48 + d) else char_from_int (87 + d)
+hex16 v = cat [hexd (v / 4096), hexd ((v / 256) % 16), hexd ((v / 16) % 16), hexd (v % 16)]
+sm_hash h r = cat [hex16 (float_to_int (float_arr_get h (r * 4))), hex16 (float_to_int (float_arr_get h (r * 4 + 1))), hex16 (float_to_int (float_arr_get h (r * 4 + 2))), hex16 (float_to_int (float_arr_get h (r * 4 + 3)))]
+
+-- K and V caches of every layer, rows 0 .. n-1, folded into one digest string
+sm_cache_digest t n li acc =
+  if li >= sm_layers then acc
+  else
+    let dk = tgl_fabuf_digest (tb t (300 + li)) (n * 192)
+    let dv = tgl_fabuf_digest (tb t (330 + li)) (n * 192)
+    sm_cache_digest t n (li + 1) (cat [acc, show (dk % 1000003), ".", show (dv % 1000003), " "])
+
+-- ── small text-file helpers for the driver programs ──
+words s = filter nonempty (split " " (join " " (split "\n" s)))
+nonempty w = length w > 0
+pint w = parse_int w
+ints ws = map pint ws
+nth_int xs i = if i <= 0 then head xs else nth_int (tail xs) (i - 1)
+take_n xs n = if n <= 0 then [] else if xs == [] then [] else cons (head xs) (take_n (tail xs) (n - 1))
+showi x = show x
+join_ints xs = join " " (map showi xs)
+ms_since t0 = (now_ns 0 - t0) / 1000000

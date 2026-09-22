@@ -4,6 +4,17 @@ All notable changes to Rail are documented here.
 
 ## Unreleased
 
+### Added
+- **`tools/infer/smol/`: a public model on Rail's kernels, and exact one-pass verification of
+  what it generates.** SmolLM2-135M (the Hugging Face checkpoint, sha256-pinned) runs on Metal
+  kernels emitted from Rail: the bf16 bytes are widened on the GPU, every reduction is one
+  thread's ordered loop, so a row's bits do not depend on the pass it rides in. A transcript
+  produced by prefill-then-decode is re-derived by ONE forward pass, token for token and
+  logit row for logit row (FNV-64 of all 49,152 logits), with no tolerance: 240 tokens produced
+  in 3,734 ms verify in 77 ms on an M4 Pro, and the same transcript verifies on a base M1. The
+  M4 Pro and the M1 write byte-identical transcripts. A numpy reference agrees on every greedy
+  token tried. Greedy only; see the directory's README for what it is not.
+
 ### Fixed
 - **A closure call hands over the closure, and the lambda fetches its own captures.** The caller
   used to load a closure's captures into the argument registers after the params, as far as `x4`
