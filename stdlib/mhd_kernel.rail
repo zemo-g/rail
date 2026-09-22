@@ -88,6 +88,69 @@ mk_init_state =
   state
 
 -- ═══════════════════════════════════════════════════════════
+-- SEEDED PERTURBATION  (shared by the beacon and its verifier)
+-- ═══════════════════════════════════════════════════════════
+--
+-- mk_init_cell is a pure function of the cell index, so a bare re-init
+-- reproduces byte-identical state and a deterministic PDE then retraces
+-- the identical trajectory. The entropy beacon therefore perturbs each
+-- fresh epoch with OS entropy; the seed is what makes each epoch unique.
+--
+-- Because the seed fully determines the epoch, an epoch is exactly
+-- REPLAYABLE from that one integer: init -> perturb(seed) -> N steps
+-- reproduces the published frames bit-for-bit. Verified 2026-08-30
+-- against a live production epoch (seed 246384, recovered from the
+-- beacon log): sim_time and max|div B| matched the beacon's own
+-- reported values to all 15 printed digits.
+--
+-- These live in the kernel, not in the beacon, so that the beacon and
+-- any verifier share ONE implementation. Two copies of this arithmetic
+-- would drift, and a verifier that has drifted from the producer proves
+-- nothing. Pinned by suite test `mhd_perturb_seeded`.
+
+-- Seed (a raw u32 from /dev/urandom) to a phase in [0, 2*pi).
+-- Reduced mod 1e6 first so the multiply stays exact in a 63-bit tagged
+-- int, and so the integer is recoverable from the printed phase.
+mk_phase_of_seed raw = to_float (raw % 1000000) * 0.0000062831853
+
+-- A small phase-shifted velocity kick, with energy adjusted so PRESSURE
+-- IS UNCHANGED. Adding momentum without touching energy would silently
+-- lower the thermal pressure every cycle and eventually drive it
+-- negative, turning a fixed beacon into a crashing one. The thermal term
+-- is therefore recomputed from the pre-kick pressure:
+--   e = p/(gamma-1) + ke + me,  with gamma-1 = 2/3 as mk_init_cell builds it.
+mk_perturb_cell state ph i =
+  let x = i % mk_nn
+  let y = i / mk_nn
+  let xp = to_float x * 0.04908738521234052
+  let yp = to_float y * 0.04908738521234052
+  let rho = mk_get state mk_f_rho x y
+  let mx  = mk_get state mk_f_mx x y
+  let my  = mk_get state mk_f_my x y
+  let bx  = mk_get state mk_f_bx x y
+  let by  = mk_get state mk_f_by x y
+  let en  = mk_get state mk_f_en x y
+  let me  = 0.5 * (bx * bx + by * by)
+  let ke0 = 0.5 * (mx * mx + my * my) / rho
+  let p   = (en - ke0 - me) * 0.6666666666666667
+  let mx2 = mx + rho * 0.02 * sin (yp + ph)
+  let my2 = my + rho * 0.02 * sin (xp + ph)
+  let ke1 = 0.5 * (mx2 * mx2 + my2 * my2) / rho
+  let _ = mk_put state mk_f_mx x y mx2
+  let _ = mk_put state mk_f_my x y my2
+  mk_put state mk_f_en x y (p / 0.6666666666666667 + ke1 + me)
+
+mk_perturb_loop state ph i =
+  if i >= mk_nn2 then 0
+  else
+    let _ = mk_perturb_cell state ph i
+    mk_perturb_loop state ph (i + 1)
+
+-- Perturb a state in place from a raw seed. This is the whole epoch
+-- entry point: mk_init_loop then mk_perturb_seed reproduces any epoch.
+mk_perturb_seed state raw = mk_perturb_loop state (mk_phase_of_seed raw) 0
+
+-- ═══════════════════════════════════════════════════════════
 -- PRIMITIVE VARIABLE RECOVERY
 -- ═══════════════════════════════════════════════════════════
 
@@ -431,10 +494,18 @@ mk_rusanov_y uL uR fL fR fi =
 mk_muscl_apply state ns dt_dx dt_dy fxR fxL fyU fyD x y f =
   if f >= 6 then 0
   else
+    -- dt_dx/dt_dy arrive as parameters, and parameter types are not inferred
+    -- across the call from mk_muscl_cell. Without these coercions the whole
+    -- update expression infers as int and the density floor below compiles as
+    -- an int-vs-float comparison, which the typechecker warns about on every
+    -- build of the beacon. The estate idiom for "this parameter is a float"
+    -- is `+ 0.0`; see src/orchestrator.rail for the same pattern.
+    let dtx = dt_dx + 0.0
+    let dty = dt_dy + 0.0
     let u = mk_get state f x y
     let dfx = float_arr_get fxR f - float_arr_get fxL f
     let dfy = float_arr_get fyU f - float_arr_get fyD f
-    let val = u - dt_dx * dfx - dt_dy * dfy
+    let val = u - dtx * dfx - dty * dfy
     let val_safe = if f == mk_f_rho then (if val < 0.000001 then 0.000001 else val) else val
     let _ = float_arr_set ns (mk_idx f x y) val_safe
     mk_muscl_apply state ns dt_dx dt_dy fxR fxL fyU fyD x y (f + 1)
@@ -508,13 +579,26 @@ mk_total_energy state =
   let _ = mk_sum_field state mk_f_en 0 acc
   float_arr_get acc 0
 
+-- Returns |div B| at cell i.
+--
+-- The trailing `+ 0.0` is load-bearing, not decoration. Without it the
+-- compiler does not mark this function float-returning, and a CALLER doing
+-- arithmetic on the result gets a tagged int where it expects a double:
+--
+--   let d = mk_divb_cell s 100     -- prints fine via show_float
+--   d * d                          -- SEGFAULT
+--
+-- Comparison happens to survive the confusion, which is why mk_max_div_b
+-- (which only ever compares) worked for months while the first caller to
+-- multiply the result crashed instantly. Coercing here fixes it once for
+-- every caller instead of making each one remember.
 mk_divb_cell state i =
   let x = i % mk_nn
   let y = i / mk_nn
   let dbx = (mk_get state mk_f_bx (x + 1) y - mk_get state mk_f_bx (x - 1) y) / 0.09817477042468104
   let dby = (mk_get state mk_f_by x (y + 1) - mk_get state mk_f_by x (y - 1)) / 0.09817477042468104
   let div = dbx + dby
-  if div < 0.0 then 0.0 - div else div
+  (if div < 0.0 then 0.0 - div else div) + 0.0
 
 mk_divb_check state i acc =
   let adiv = mk_divb_cell state i
@@ -615,3 +699,106 @@ mk_print_diag step state m0 e0 dt t =
   let dm = (mass - m0) / m0
   let de = (energy - e0) / e0
   print (cat ["step ", show step, " t=", show_float t, " dt=", show_float dt, " dm=", show_float dm, " dE=", show_float de, " divB=", show_float divb, " rho_min=", show_float minrho])
+
+-- ═══════════════════════════════════════════════════════════
+-- GLM DIVERGENCE CLEANING  (Dedner et al. 2002, operator-split)
+-- ═══════════════════════════════════════════════════════════
+--
+-- MUSCL+Rusanov on cell-centered conserved variables does not preserve
+-- div B = 0 in 2D Cartesian MHD: it measures ~0.174 after 100 Orszag-Tang
+-- steps against Lax-Friedrichs' 5.7e-15. That is why the sharper
+-- integrator has never been allowed under the public beacon.
+--
+-- GLM augments the system with a scalar psi that carries divergence error
+-- away at speed c_h and damps it:
+--
+--     d(psi)/dt + c_h^2 (div B) = -(c_h/c_r) psi
+--     dB/dt     + grad(psi)     = 0
+--
+-- This is the OPERATOR-SPLIT form: the MHD step runs unchanged, then this
+-- correction runs as a substep. Split rather than a 7th field in the flux
+-- so that the existing 6-field state layout, the Rusanov solver and every
+-- caller stay untouched -- including the live beacon, which does not use
+-- this path at all.
+--
+-- Integrated with SYMPLECTIC Euler (psi first, then B from the NEW psi).
+-- Forward Euler on this wave system with centered differences is
+-- unconditionally unstable; taking B from the updated psi is the standard
+-- staggered-in-time fix and is stable for c_h dt <= dx.
+--
+-- Damping is algebraic, psi / (1 + dt c_h / c_r), rather than
+-- exp(-dt c_h / c_r): same leading behaviour, unconditionally stable for
+-- any dt, and no libm call in the inner loop.
+
+-- psi lives on its own plane, indexed like a single field of the state.
+mk_pidx x y = mk_wrap y * mk_nn + mk_wrap x
+mk_pget psi x y = float_arr_get psi (mk_pidx x y)
+mk_pput psi x y v = float_arr_set psi (mk_pidx x y) v
+
+mk_psi_new _ = float_arr_new mk_nn2 0.0
+
+-- Signed div B, centered, same stencil mk_divb_cell measures with.
+mk_divb_signed state x y =
+  let dbx = mk_get state mk_f_bx (x + 1) y - mk_get state mk_f_bx (x - 1) y
+  let dby = mk_get state mk_f_by x (y + 1) - mk_get state mk_f_by x (y - 1)
+  (dbx + dby) / 0.09817477042468104
+
+-- Pass 1: psi <- (psi - dt*c_h^2*div B) damped. Reads B only, writes psi only.
+mk_glm_psi_loop state psi ch2 dt damp i =
+  if i >= mk_nn2 then 0
+  else
+    let x = i % mk_nn
+    let y = i / mk_nn
+    let p = float_arr_get psi i - dt * ch2 * mk_divb_signed state x y
+    let _ = float_arr_set psi i (p * damp)
+    mk_glm_psi_loop state psi ch2 dt damp (i + 1)
+
+-- Pass 2: B <- B - dt*grad(psi), using the UPDATED psi. Reads psi only,
+-- writes B only, so the two passes never race on the same array.
+mk_glm_b_loop state psi dt i =
+  if i >= mk_nn2 then 0
+  else
+    let x = i % mk_nn
+    let y = i / mk_nn
+    let gx = (mk_pget psi (x + 1) y - mk_pget psi (x - 1) y) / 0.09817477042468104
+    let gy = (mk_pget psi x (y + 1) - mk_pget psi x (y - 1)) / 0.09817477042468104
+    let _ = mk_put state mk_f_bx x y (mk_get state mk_f_bx x y - dt * gx)
+    let _ = mk_put state mk_f_by x y (mk_get state mk_f_by x y - dt * gy)
+    mk_glm_b_loop state psi dt (i + 1)
+
+-- One cleaning substep applied in place to `state`.
+--   ch  : divergence-wave speed, take the step's max signal speed
+--   cr  : damping length; smaller damps harder
+mk_glm_clean state psi dt ch cr =
+  let ch2 = ch * ch
+  let damp = 1.0 / (1.0 + dt * ch / cr)
+  let _ = mk_glm_psi_loop state psi ch2 dt damp 0
+  let _ = mk_glm_b_loop state psi dt 0
+  0
+
+-- MUSCL step with GLM cleaning. `psi` is caller-owned and persists across
+-- steps -- that is the point, psi accumulates and transports the error.
+--
+-- c_h is the speed the divergence wave travels at, and cleaning is only as
+-- fast as c_h allows. The symplectic update is stable up to c_h dt = dx, so
+-- dx/dt is BOTH the physical maximum and the stability limit; Dedner takes
+-- c_h there. Passing it as a multiple of the signal speed keeps the caller
+-- honest about how close to that limit it is running:
+--
+--   dt = 0.01472621556370216 / smax  (mk_compute_dt_muscl)
+--   dx = 0.04908738521234052
+--   => dx/dt = 3.333 smax, so ch_mult = 3.333 sits exactly on the limit.
+--
+-- Measured, 100 Orszag-Tang steps, max|div B| against plain MUSCL's 0.174:
+--   ch_mult 1.0, cr 0.5   -> 0.0334  (5.2x)
+--   ch_mult 2.0, cr 0.5   -> 0.0334  (5.2x)
+--   ch_mult 3.0, cr 0.18  -> 0.0284  (6.1x)   <- best found
+-- Raising c_h toward the stability limit barely helps, which is itself the
+-- finding: cleaning reaches a balance against the rate the MUSCL flux
+-- GENERATES divergence, so the knob that matters is not the transport
+-- speed. See tools/plasma/GLM_METRIC.md.
+mk_muscl_glm_step state psi dt cr ch_mult =
+  let ch = ch_mult * mk_max_speed state
+  let ns = mk_muscl_step state dt
+  let _ = mk_glm_clean ns psi dt ch cr
+  ns

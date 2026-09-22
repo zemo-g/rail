@@ -1,0 +1,126 @@
+-- tools/plasma/mhd_verify_epoch.rail: replay and check one beacon epoch.
+--
+-- The ledatic.org entropy beacon perturbs each fresh epoch with an integer
+-- seed drawn from /dev/urandom. That seed IS the epoch: the Orszag-Tang
+-- initial condition is a pure function of the cell index, the perturbation
+-- is a pure function of the seed, and Lax-Friedrichs with CFL-adaptive dt
+-- is deterministic. So
+--
+--     mk_init_loop  ->  mk_perturb_seed(seed)  ->  N x 4 LF steps
+--
+-- reproduces every frame the beacon published in that epoch, bit for bit,
+-- on any machine, with nothing but one integer.
+--
+-- That is the difference between publishing numbers and publishing
+-- CHECKABLE numbers. A verifier costs what the producer cost -- it is not
+-- a proof system, it is a replay -- but it means an undetected lie about
+-- the beacon would require the physics itself to be forged, not merely
+-- the hash to be swapped.
+--
+-- This tool and the beacon share ONE implementation of the initial
+-- condition, the perturbation and the step (stdlib/mhd_kernel.rail).
+-- A verifier that has drifted from the producer proves nothing.
+--
+-- Usage:
+--   ./rail_native run tools/plasma/mhd_verify_epoch.rail <seed> <frames>
+--
+--   <seed>    the integer logged by the beacon at reset ("seed=NNNNNN")
+--   <frames>  how many beacon frames after that reset to advance
+--             (one frame = 4 LF steps)
+--
+-- Exit is 0 either way; read the printed report. Pass a third argument to
+-- assert an expected max|div B| string, in which case the tool prints
+-- MATCH or MISMATCH.
+--
+-- Worked example, from a real production epoch (2026-08-30):
+--   beacon log:  "resetting with fresh phase 1.5480763269552"  -> seed 246384
+--                "frame 5640 t=0.0300813371931802 divB=5.086209231564e-15"
+--   verify:      run ... 246384 2
+--                -> t=0.0300813371931802  divB=5.086209231564e-15
+
+import "stdlib/mhd_kernel.rail"
+
+steps_per_frame = 4
+
+-- One beacon frame: 4 LF steps, accumulating sim_time exactly as
+-- mhd_beacon.rail's inner_step does.
+adv_frame state ctx k =
+  if k >= steps_per_frame then state
+  else
+    let dt = mk_compute_dt state
+    let ns = mk_lxf_step state dt
+    let _ = float_arr_set ctx 0 (float_arr_get ctx 0 + dt)
+    let _ = float_arr_set ctx 1 dt
+    adv_frame ns ctx (k + 1)
+
+adv_frames state ctx n =
+  if n <= 0 then state
+  else adv_frames (adv_frame state ctx 0) ctx (n - 1)
+
+nth_arg xs i =
+  if i <= 0 then head xs
+  else nth_arg (tail xs) (i - 1)
+
+usage _ =
+  let _ = print "usage: mhd_verify_epoch <seed> <frames> [expected_divB]"
+  let _ = print "  <seed>   integer from the beacon's reset log line"
+  let _ = print "  <frames> beacon frames after that reset (4 LF steps each)"
+  0
+
+report seed frames expect =
+  let ph = mk_phase_of_seed seed
+  let _ = print "─────────────────────────────────────────────────────────"
+  let _ = print (cat ["  epoch seed   ", show seed])
+  let _ = print (cat ["  kick phase   ", show_float ph, "  (= seed * 2pi/1e6)"])
+  let _ = print (cat ["  frames       ", show frames, "  (", show (frames * steps_per_frame), " LF steps)"])
+  let _ = print "─────────────────────────────────────────────────────────"
+
+  let state = mk_init_state
+  let _ = mk_perturb_seed state seed
+  let m0 = mk_total_mass state
+  let e0 = mk_total_energy state
+  let ctx = float_arr_new 2 0.0
+  let final = adv_frames state ctx frames
+
+  let t = float_arr_get ctx 0
+  let mass = mk_total_mass final
+  let energy = mk_total_energy final
+  let divb = mk_max_div_b final
+  let rmin = mk_min_density final
+
+  let _ = print (cat ["  sim_time     ", show_float t])
+  let _ = print (cat ["  dt (last)    ", show_float (float_arr_get ctx 1)])
+  let _ = print (cat ["  dm/m         ", show_float ((mass - m0) / m0)])
+  let _ = print (cat ["  dE/E         ", show_float ((energy - e0) / e0)])
+  let _ = print (cat ["  max|div B|   ", show_float divb])
+  let _ = print (cat ["  rho_min      ", show_float rmin])
+  let _ = print "─────────────────────────────────────────────────────────"
+
+  -- Conservation is not the claim being verified here, but a replay that
+  -- has silently diverged is worth catching before anyone compares hashes.
+  -- The `+ 0.0` is the estate idiom for "this is a float": return types are
+  -- not inferred across the call from mk_total_mass, so without it the
+  -- comparison below compiles as int-vs-float and warns on every build.
+  let rel = (mass - m0) / m0 + 0.0
+  let dm = if rel < 0.0 then 0.0 - rel else rel
+  let _ = if dm > 0.0000000001 then
+            print "  WARNING: mass drift above 1e-10; this replay diverged"
+          else 0
+
+  if expect == "" then 0
+  else
+    let got = show_float divb
+    let _ = print (if got == expect
+                   then cat ["  MATCH    max|div B| = ", got]
+                   else cat ["  MISMATCH expected ", expect, ", got ", got])
+    0
+
+main =
+  let a = args
+  let n = length a
+  if n < 3 then usage 0
+  else
+    let seed = parse_int (nth_arg a 1)
+    let frames = parse_int (nth_arg a 2)
+    let expect = if n >= 4 then nth_arg a 3 else ""
+    report seed frames expect

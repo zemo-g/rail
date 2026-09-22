@@ -142,6 +142,16 @@ Previous best (before fix): linear drift to 21,380 at t=190 (128% off, and that 
 
 After fix: bounded oscillation within ±3.2% of truth over all 200 steps.
 
+> **Read this correctly (note added 2026-08-30).** The table above is **total
+> mass**, one scalar summed over every cell. It is not a statement about the
+> state. This figure was later quoted as "±3.2% over 200 steps" and read as
+> though the surrogate tracked the solution; it does not. Measured on
+> `tools/plasma/neural_mhd_rollout.rail`, single-step aggregate relative L2 is
+> **0.493**, with the four signed fields collapsed to near-constant zero. At
+> rollout step 40 the state is 36.4% wrong while mass drift reads 0.23% --
+> because a sum cancels errors that a norm does not. See
+> `tools/plasma/ROLLOUT_BASELINE.md`.
+
 The `σ(W1)` and `σ(W2)` logs during training confirm the constraint is active: both hold at exactly 1.3 once the weights want to grow past it.
 
 ---
