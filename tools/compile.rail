@@ -5242,6 +5242,64 @@ pat_report fname msg =
   let _ = print (cat ["  error: in ", fname, ": ", msg])
   1
 
+-- A constructor with fields used as a value (`map Some xs`, `let f = Pair`) or given fewer
+-- arguments than it has fields (`Pair 10`) becomes a lambda over the missing fields:
+-- `\__c0 -> Some __c0`. The arguments it was given are bound first, so each is evaluated once.
+-- Until 2026-09-23 code generation emitted a null pointer for it and calling it crashed.
+ctor_values decls = cvals_decls decls (pat_ctor_table decls)
+cvals_decls ds tbl = if ds == [] then [] else cons (cvals_decl (head ds) tbl) (cvals_decls (tail ds) tbl)
+cvals_decl d tbl = match d
+  | DFn n ps b -> DFn n ps (cvals_node b tbl)
+  | _ -> d
+cvals_node node tbl = match node
+  | NVar v -> cvals_saturate node v 0 tbl
+  | NApp f a -> cvals_app node tbl
+  | NOp o l r -> NOp o (cvals_node l tbl) (cvals_node r tbl)
+  | NIf c t e -> NIf (cvals_node c tbl) (cvals_node t tbl) (cvals_node e tbl)
+  | NLet x v b -> NLet x (cvals_node v tbl) (cvals_node b tbl)
+  | NLetTup xs v b -> NLetTup xs (cvals_node v tbl) (cvals_node b tbl)
+  | NLam p b -> NLam p (cvals_node b tbl)
+  | NList es -> NList (cvals_list es tbl)
+  | NTup es -> NTup (cvals_list es tbl)
+  | NMatch s arms -> NMatch (cvals_node s tbl) (cvals_arms arms tbl)
+  | _ -> node
+cvals_list es tbl = if es == [] then [] else cons (cvals_node (head es) tbl) (cvals_list (tail es) tbl)
+cvals_arms arms tbl = if arms == [] then [] else cons (cvals_arm (head arms) tbl) (cvals_arms (tail arms) tbl)
+cvals_arm a tbl = match a
+  | Arm c bs b g -> Arm c bs (cvals_node b tbl) (cvals_guard g tbl)
+cvals_guard g tbl = match g
+  | NoGuard -> NoGuard
+  | Guard n -> Guard (cvals_node n tbl)
+-- an application: rewrite its arguments (and its head, when the head is an expression); a
+-- constructor at the head given fewer arguments than it has fields is saturated
+cvals_app node tbl =
+  let hd = ast_app_fn node
+  let (fname, args) = ast_flat node
+  let spine = cvals_spine node tbl
+  if nd_tag hd == "V" then cvals_saturate spine (nd_s1 hd) (length args) tbl
+  else spine
+cvals_spine node tbl = match node
+  | NApp f a -> NApp (cvals_spine f tbl) (cvals_node a tbl)
+  | NVar v -> node
+  | _ -> cvals_node node tbl
+-- node applies constructor c to `given` arguments; if c has more fields, bind the arguments and
+-- return a lambda over the rest
+cvals_saturate node c given tbl =
+  let ar = pat_ctor_arity c tbl
+  if ar <= given then node
+  else cvals_bind_args node given (cvals_lambda (cvals_apply (NVar c) 0 given) given ar)
+-- `__ca0 .. __ca(given-1)` hold the given arguments: node is `C e0 .. e(given-1)`
+cvals_bind_args node given body = cvals_bind_go (cvals_args node []) 0 body
+cvals_args node acc = match node
+  | NApp f a -> cvals_args f (cons a acc)
+  | _ -> acc
+cvals_bind_go args i body =
+  if args == [] then body
+  else NLet (cat ["__ca", show i]) (head args) (cvals_bind_go (tail args) (i + 1) body)
+cvals_apply f i n = if i >= n then f else cvals_apply (NApp f (NVar (cat ["__ca", show i]))) (i + 1) n
+-- \__c(given) .. \__c(ar-1) -> app __c(given) .. __c(ar-1)
+cvals_lambda app i ar = if i >= ar then app else NLam (cat ["__c", show i]) (cvals_lambda (NApp app (NVar (cat ["__c", show i]))) (i + 1) ar)
+
 tc_lookup name tenv =
   if length tenv == 0 then "any"
   else
@@ -5502,7 +5560,7 @@ compile_program_with_file src fname =
   else compile_checked (inject_auth_fns decls)
 
 compile_checked decls =
-  let td = opt_decls decls
+  let td = opt_decls (ctor_values decls)
   let ar = get_arities td
   let siblings = build_ctor_siblings td
   let match_errs = check_exhaustiveness td siblings
@@ -6547,6 +6605,10 @@ run_tests _ =
   let t238 = run_test "var_patterns" "type T = | A int | B\nside x = let _ = print \"eval\" in x\nf x = match side x\n  | 0 -> 10\n  | n if n > 100 -> n - 100\n  | n -> n * 2\ng t = match t\n  | B -> 0\n  | other -> 1\nmain =\n  let _ = print (show (f 0))\n  let _ = print (show (f 150))\n  let _ = print (show (f 7))\n  let _ = print (show (g (A 3) * 10 + g B))\n  0" "eval\n10\neval\n50\neval\n14\n10"
   let t239 = run_test "bool_patterns" "flag b = match b\n  | true -> \"on\"\n  | false -> \"off\"\nmain =\n  let _ = print (flag true)\n  let _ = print (flag false)\n  let _ = print (flag (1 > 2))\n  0" "on\noff\noff"
   let t240 = driver_pattern_errors 0
+  -- t241: a constructor with fields is a function value (`map Some xs`, `let f = Pair`), and
+  -- one given fewer arguments than it has fields is a lambda over the rest, its given arguments
+  -- evaluated once (code generation emitted a null pointer for it until 2026-09-23)
+  let t241 = run_test "ctor_values" "type O = | Some int | None\ntype P = | Pair int int\nunwrap o = match o\n  | Some v -> v\n  | None -> 0\nfst p = match p\n  | Pair a b -> a\nsnd p = match p\n  | Pair a b -> b\nnoisy x = let _ = print \"arg\" in x\nmain =\n  let xs = map Some [1, 2, 3]\n  let _ = print (show (fold (\\acc o -> acc + unwrap o) 0 xs))\n  let mk = Pair (noisy 10)\n  let ps = map mk [1, 2]\n  let _ = print (show (fold (\\acc p -> acc + fst p * snd p) 0 ps))\n  let f = Pair\n  let q = f 3 4\n  let _ = print (show (fst q + snd q))\n  0" "6\narg\n30\n7"
   -- t186/t187: MHD kernel invariants. stdlib/mhd_{kernel,axisym,mpd}.rail is
   -- 1,254 lines driving the live entropy beacon and had NO suite coverage until
   -- 2026-08-30. t186 pins the guarantee the beacon actually publishes; t187 pins
@@ -6567,10 +6629,10 @@ run_tests _ =
   -- cleaner that damps the field to mush would pass the first one alone.
   let t189 = run_test "mhd_glm_divergence_cleaning" "import \"stdlib/mhd_kernel.rail\"\nabsf x = if x < 0.0 then 0.0 - x else x\nclean_k state psi dt ch cr k i =\n  if i >= k then 0\n  else\n    let _ = mk_glm_clean state psi (dt / to_float k) ch cr\n    clean_k state psi dt ch cr k (i + 1)\nrun state psi k n =\n  if n <= 0 then state\n  else\n    let dt = mk_compute_dt_muscl state\n    let ch = 3.0 * mk_max_speed state\n    let ns = mk_muscl_step state dt\n    let _ = if k > 0 then clean_k ns psi dt ch 0.18 k 0 else 0\n    run ns psi k (n - 1)\nmain =\n  let s0 = mk_init_state\n  let m0 = mk_total_mass s0\n  let e0 = mk_total_energy s0\n  let p = mk_max_div_b (run mk_init_state (mk_psi_new 0) 0 10)\n  let g = run mk_init_state (mk_psi_new 0) 4 10\n  let gd = mk_max_div_b g\n  -- GLM must cut divergence by at least 4x (measured 6.8x) ...\n  let cleaner = if gd * 4.0 < p then 1 else 0\n  -- ... without spending conservation to buy it ...\n  let dm = absf ((mk_total_mass g - m0) / m0)\n  let de = absf ((mk_total_energy g - e0) / e0)\n  let conserved = if dm < 0.0000000001 then (if de < 0.0000000001 then 1 else 0) else 0\n  -- ... and psi must actually be doing something (guards a stubbed-out clean).\n  let alive = if gd > 0.0 then 1 else 0\n  let ok = if cleaner == 1 then (if conserved == 1 then (if alive == 1 then 1 else 0) else 0) else 0\n  let _ = print (if ok == 1 then \"ok\" else cat [\"FAIL p=\", show_float p, \" g=\", show_float gd, \" dm=\", show_float dm])\n  0\n" "ok"
   let s_mhd = (if t186 then 1 else 0) + (if t187 then 1 else 0) + (if t188 then 1 else 0) + (if t189 then 1 else 0)
-  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0) + (if t230 then 1 else 0) + (if t231 then 1 else 0) + (if t232 then 1 else 0) + (if t233 then 1 else 0) + (if t234 then 1 else 0) + (if t235 then 1 else 0) + (if t236 then 1 else 0) + (if t237 then 1 else 0) + (if t238 then 1 else 0) + (if t239 then 1 else 0) + (if t240 then 1 else 0)
+  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0) + (if t230 then 1 else 0) + (if t231 then 1 else 0) + (if t232 then 1 else 0) + (if t233 then 1 else 0) + (if t234 then 1 else 0) + (if t235 then 1 else 0) + (if t236 then 1 else 0) + (if t237 then 1 else 0) + (if t238 then 1 else 0) + (if t239 then 1 else 0) + (if t240 then 1 else 0) + (if t241 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s_inf + s_bx + s_ed + s_tls + s_flt + s_drv + s_mhd
-  let _ = print (cat [show total, "/238 tests passed"])
-  if total == 238 then 0 else 1
+  let _ = print (cat [show total, "/239 tests passed"])
+  if total == 239 then 0 else 1
 
 -- ===========================================================================
 -- M6, self-hosted emit path. Replaces as/ld/codesign with the pure-Rail
@@ -7074,7 +7136,8 @@ dispatch_wasm path =
     let _ = print "  Binary: /tmp/rail_out.wasm"
     0
 
-wasm_program decls =
+wasm_program decls0 =
+  let decls = ctor_values decls0
   let strs = wasm_strs_all decls
   let stab = wasm_stab strs 256
   let pre_ar = get_arities decls
@@ -8700,7 +8763,7 @@ x86_compile_funcs decls ar lc =
     (cat [fasm, rest], lc2)
 
 x86_compile_checked_x86 decls =
-  let td = opt_decls decls
+  let td = opt_decls (ctor_values decls)
   let ar = get_arities td
   let siblings = build_ctor_siblings td
   let _ = check_exhaustiveness td siblings
