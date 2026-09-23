@@ -8,9 +8,9 @@
 | Fact | Value | Verify it yourself |
 |---|---|---|
 | Release | v5.4.0 | `git describe --tags` |
-| Compiler | 10035 lines of Rail | `wc -l tools/compile.rail` |
-| Seed binary | 957816 bytes | `wc -c rail_native` |
-| Seed sha256 | `3ca72f54ac44f027217774ec2978e1dd91de96628925c83cbd03356cf5ed9b23` | `shasum -a 256 rail_native` |
+| Compiler | 10067 lines of Rail | `wc -l tools/compile.rail` |
+| Seed binary | 1007480 bytes | `wc -c rail_native` |
+| Seed sha256 | `7d85cfe96f6cc303a7d52dc8d93c94d73b4a4743807bf3772e801cb2d08c83ba` | `shasum -a 256 rail_native` |
 | Stdlib | 103 modules | `ls stdlib/*.rail \| wc -l` |
 | Non-Rail surface | 33 in-tree files | `SHIMS.md` |
 | Tests | runner self-reports N/N and exits 0 iff N == N; `gpu_map` needs a Metal device | `./rail_native test; echo $?` |

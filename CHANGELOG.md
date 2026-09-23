@@ -5,6 +5,15 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Added
+- **`rail types`: Hindley-Milner type inference, stage 0 (observe only).** `tools/types.rail`
+  infers a type for every top-level function with no annotations (polymorphic per call-graph
+  group: `compose : (a -> b, c -> a) -> c -> b`), reports where a program cannot have one, and
+  compares the proven types with codegen's float/int guesses. `dyn` is the escape hatch for
+  Rail's dynamic idioms: merges (branches, list elements, array writes) join to `dyn`, argument
+  passing needs only consistency, `arr_new n 0` leaves the element open, and an int promotes
+  into a float context. Across the tree 297 of 485 files type-check, and in every program that
+  does, codegen's parameter guesses agree with the types; 31 float results are boxed that need
+  not be. Codegen does not read the types yet. `docs/TYPES.md`; tests t217, t218.
 - **`tools/infer/smol/`: a public model on Rail's kernels, and exact one-pass verification of
   what it generates.** SmolLM2-135M (the Hugging Face checkpoint, sha256-pinned) runs on Metal
   kernels emitted from Rail: the bf16 bytes are widened on the GPU, every reduction is one
