@@ -56,9 +56,10 @@ the checker says "this is only known at run time":
   does not have.
 - **A list or array whose elements differ is `[dyn]` / `arr dyn`**, counted in the report as a
   heterogeneous literal, not an error.
-- **ADT fields and foreign arguments are `dyn`** (neither declares a type), except that a
-  foreign function returning `float` takes floats, because codegen converts every argument
-  of such a call to a double.
+- **An ADT field declared by a plain name is `dyn`** (`| Box v` declares nothing), and so is a
+  foreign argument, except that a foreign function returning `float` takes floats, because
+  codegen converts every argument of such a call to a double. A field that names a type is
+  that type (next section).
 - **An array's element type is a variable that a store can widen.** A read returns that
   variable itself, not a copy of what it holds, so a value read before a store of another
   kind follows the array to `dyn`. An array handed to a function is checked both ways (the
@@ -71,6 +72,26 @@ the checker says "this is only known at run time":
   precise (`fact : int -> int`). A float operand makes any arithmetic a float whatever the other
   side holds (the runtime reads a string as 0.0); an int beside `dyn` may be a float, so it is
   `dyn`.
+
+## Typed constructor fields
+
+A field may name its type: `int`, `float`, `str`, `bool`, `dyn`, a type the program declares,
+or `[t]` for a list of `t`.
+
+```rail
+type Expr = | Num int | Add Expr Expr | Neg Expr | Many [Expr] | Name str
+eval e = match e
+  | Num n -> n
+  | Add a b -> eval a + eval b
+  ...
+```
+
+infers `eval : Expr -> int`: a match binds each field at its declared type. Every construction
+is a flow into the fields' types, checked like an argument; one that passes another type is a
+type error, and the field falls back to `dyn` for codegen, so the program runs as before. A
+constructor named as a value (`map Num xs`) builds through a closure the checks cannot see, so
+its fields are forced to `dyn`. No declaration in the tree used type names as fields before
+this, so existing programs keep `dyn` fields.
 
 ## How codegen uses the types
 
@@ -97,6 +118,7 @@ to `dyn` and the program is inferred again:
 | a function's result, from its body | that result |
 | a user fn named as a value (it is called with generic arguments) | all its parameters |
 | an array made by `arr_new`, from a callee that stores into it | that array |
+| a constructor's declared field | that field |
 
 Rounds stop when one forces nothing new. When they do not settle (a cap of 60), every
 parameter is generic and no result is raw: the generic representation is always correct.
@@ -140,13 +162,11 @@ Type errors are handled by the same check, since a clash is a bad flow.
 
 ## What comes next
 
-1. **Typed ADT fields.** `| Num int | Add Expr Expr` declares its fields' types, and a match
-   binds them at those types instead of `dyn`. Much of the `dyn` above is fields.
-2. **Type the compiler.** The AST becomes an ADT, and `rail types tools/compile.rail` reaches
-   zero errors.
-3. **Check.** Type errors in code that type-checks everywhere else become compile errors instead
+1. **Type the compiler.** The AST becomes an ADT with typed fields, and
+   `rail types tools/compile.rail` reaches zero errors.
+2. **Check.** Type errors in code that type-checks everywhere else become compile errors instead
    of wrong answers or segfaults. Code that relies on dynamic idioms stays accepted until it
    opts in.
-4. **What types make possible.** Structural `==` on lists, tuples and ADTs (today it compares
+3. **What types make possible.** Structural `==` on lists, tuples and ADTs (today it compares
    tag bytes), constructors as function values (today a crash), partial application, `show`
    on anything, float parameters through closures, and error messages that name types.

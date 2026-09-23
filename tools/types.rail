@@ -9,7 +9,8 @@
 -- The type language: int float str bool dyn, [t], (t1, .., tn), (t1 .. tn) -> r for an
 -- n-ary function (Rail has no partial application), named ADTs, arr t, farr, ptr. `dyn`
 -- is the escape hatch that lets untyped Rail keep compiling: a list literal whose elements
--- disagree is [dyn], ADT fields and foreign arguments are dyn, an array whose stores disagree
+-- disagree is [dyn], an ADT field declared without a type (`| Box v`) and a foreign argument
+-- are dyn, an array whose stores disagree
 -- is arr dyn, and anything unified with dyn becomes dyn, so a static type is only claimed
 -- where it is proven.
 -- Top-level functions are generalized per strongly-connected group of the call graph,
@@ -32,7 +33,7 @@
 -- st[4] flows   st[5] (unused)   st[6] force events   st[7] call-site counter
 -- st[8] lambda counter   st[9] this round's forces   st[10] bad flows nothing owns
 -- st[11] body records   st[12] current fn index   st[13] user fns (arr of decls)
--- st[14] user fn count   st[15] each user fn's type (arr)
+-- st[14] user fn count   st[15] each user fn's type (arr)   st[16] constructor count
 -- st[32..] type-variable bindings (0 = unbound); st[hm_cap + id] the owners of variable id
 hm_cap = 400000
 hm_base = 32
@@ -63,7 +64,8 @@ hm_fresh st =
     let _ = arr_set st (hm_cap + n) []
     ["tv", n]
 -- an owner code: 4k+1 is lambda k's parameters, 4k+2 the result of call site k (an arr_new),
--- 0 - (fi * 64 + i + 1) parameter i of user fn fi
+-- 0 - (fi * 64 + i + 1) parameter i of user fn fi (constructor fields have no variables to own:
+-- a construction's flows are checked against the declared field types directly)
 hm_fresh_owned st code =
   let v = hm_fresh st
   let _ = if head v == "tv" then arr_set st (hm_cap + head (tail v)) [code] else 0
@@ -388,10 +390,11 @@ hm_cell st t = if head t == "tv" then t else let v = hm_fresh st in let _ = (if 
 hm_subst_l st ts m = if ts == [] then [] else cons (hm_subst st (head ts) m) (hm_subst_l st (tail ts) m)
 
 -- ── the forces a round runs under ──
--- [params, results, sites, lambdas, count, nsites, nlams]: params[fi] = the forced parameter
--- indices of user fn fi ([-1] = all), results[fi] = 1 when its result is forced, sites[k] = 1
--- when call site k's result is forced, lambdas[k] = 1 when lambda k's parameters are.
-hm_no_forces _ = [arr_new 1 [], arr_new 1 0, arr_new 1 0, arr_new 1 0, 0, 0, 0]
+-- [params, results, sites, lambdas, count, nsites, nlams, fields]: params[fi] = the forced
+-- parameter indices of user fn fi ([-1] = all), results[fi] = 1 when its result is forced,
+-- sites[k] = 1 when call site k's result is forced, lambdas[k] = 1 when lambda k's parameters
+-- are, fields[ci] = the forced field indices of constructor ci ([-1] = all).
+hm_no_forces _ = [arr_new 1 [], arr_new 1 0, arr_new 1 0, arr_new 1 0, 0, 0, 0, arr_new 1 []]
 hm_fc_nth fc i = if i <= 0 then head fc else hm_fc_nth (tail fc) (i - 1)
 hm_forced_param st fi i =
   let fc = arr_get st 9
@@ -402,6 +405,10 @@ hm_forced_result st fi =
   if fi < 0 then false else if fi >= arr_get st 14 then false else arr_get (hm_fc_nth fc 1) fi == 1
 hm_forced_site st k = let fc = arr_get st 9 in if k >= hm_fc_nth fc 5 then false else arr_get (hm_fc_nth fc 2) k == 1
 hm_forced_lam st k = let fc = arr_get st 9 in if k >= hm_fc_nth fc 6 then false else arr_get (hm_fc_nth fc 3) k == 1
+hm_forced_field st ci i =
+  let fc = arr_get st 9
+  if ci >= arr_get st 16 then false
+  else let m = arr_get (hm_fc_nth fc 7) ci in if m == [] then false else if hm_has (0 - 1) m then true else hm_has i m
 
 -- ── inference ──
 -- cx = (genv, ctors) where ctors: (ctor, (type name, arity))
@@ -459,8 +466,10 @@ hm_var st env cx n =
     else
       let c = hm_lookup n ctors
       if c != [] then
-        let (tyname, ar) = c
-        if ar == 0 then ["adt", tyname] else ["fn", hm_dyn_n ar, ["adt", tyname]]
+        let ar = length (hm_nth c 1)
+        -- a constructor named as a value builds through a closure the flow checks cannot see,
+        -- so its fields are forced
+        if ar == 0 then ["adt", head c] else let _ = hm_event st ["cv", hm_nth c 2] in ["fn", hm_dyn_n ar, ["adt", head c]]
       else
         let bt = hm_bi st n
         if bt != [] then (if head (tail bt) == [] then head (tail (tail bt)) else bt)
@@ -493,8 +502,7 @@ hm_app_ty st env cx node fname args ats k =
         hm_call st (hm_inst st sch) ats node (if fi >= 0 then "u" else "k") fi k
       else
         let c = hm_lookup fname ctors
-        -- constructor fields are dyn: the arguments escape into them
-        if c != [] then let (tyname, ar) = c in let _ = hm_dynify_l st ats true in ["adt", tyname]
+        if c != [] then hm_ctor_app st c ats node k
         else if fname == "arr_new" then hm_arr_new st args ats k
         else if fname == "arr_get" then hm_arr_elem st ats
         else if fname == "arr_set" then hm_arr_set st ats
@@ -503,6 +511,15 @@ hm_app_ty st env cx node fname args ats k =
           let bt = hm_bi st fname
           if bt != [] then hm_call st bt ats node (if hm_free st (head (tail (tail bt))) [] == [] then "k" else "b") (0 - 1) k
           else let _ = hm_dynify_l st ats true in ["dyn"]
+
+-- a construction: each argument flows into its field's declared type (ck "f": a bad flow
+-- forces that field to dyn); an undeclared field is dyn, so its argument escapes into it
+hm_ctor_app st c ats node k =
+  let fts = hm_ctor_fields st c
+  let _ = if length fts == length ats then hm_args st fts ats node 1 "f" (hm_nth c 2) k else hm_dynify_l st ats true
+  ["adt", head c]
+hm_ctor_fields st c = hm_cf_go st (hm_nth c 2) (hm_nth c 1) 0
+hm_cf_go st ci fts i = if fts == [] then [] else cons (if hm_forced_field st ci i then ["dyn"] else head fts) (hm_cf_go st ci (tail fts) (i + 1))
 
 -- apply a function type to argument types; arity is checked elsewhere, so a count
 -- mismatch just yields dyn here
@@ -665,8 +682,11 @@ hm_arms st env cx arms scrut res =
             else if ctor == "_" then 0
             else
               let c = hm_lookup ctor ctors
-              if c == [] then 0 else let (tyname, ar) = c in hm_scrut st scrut ["adt", tyname] ctor
-    let env2 = hm_bind_all binds (hm_dyn_n (length binds)) env
+              if c == [] then 0 else hm_scrut st scrut ["adt", head c] ctor
+    -- a constructor's binds take its fields' declared types
+    let c = if str_starts_with "#" ctor then [] else hm_lookup ctor ctors
+    let fts = if c == [] then [] else hm_ctor_fields st c
+    let env2 = hm_bind_all binds (if length fts == length binds then fts else hm_dyn_n (length binds)) env
     let _ = if guard == [] then 0 else hm_infer st env2 cx guard
     let _ = hm_join st res (hm_infer st env2 cx body) "match arm" body
     hm_arms st env cx (tail arms) scrut res
@@ -743,13 +763,35 @@ hm_tj_pop ts n v acc =
   if w == v then cons w acc else hm_tj_pop ts n v (cons w acc)
 
 -- ── whole program ──
-hm_ctors decls acc =
+-- (ctor, [type name, field types, ci]); ci numbers the program's constructors. A field is
+-- typed where its declaration names a type (int float str bool dyn, a declared type, [t]);
+-- a placeholder name (`| Box v`) declares nothing and is dyn.
+hm_ctors decls =
+  let names = hm_ty_names decls []
+  hm_ctors_go decls names [] 0
+hm_ty_names decls acc = if decls == [] then acc else let d = head decls in hm_ty_names (tail decls) (if head d == "TY" then cons (head (tail d)) acc else acc)
+hm_ctors_go decls names acc ci =
   if decls == [] then acc
   else
     let d = head decls
-    if head d == "TY" then hm_ctors (tail decls) (hm_ctor_list (head (tail d)) (head (tail (tail d))) acc)
-    else hm_ctors (tail decls) acc
-hm_ctor_list tyname vs acc = if vs == [] then acc else let v = head vs in hm_ctor_list tyname (tail vs) (cons (head v, (tyname, head (tail (tail v)))) acc)
+    if head d == "TY" then
+      let (acc2, ci2) = hm_ctor_list (head (tail d)) (head (tail (tail d))) names acc ci
+      hm_ctors_go (tail decls) names acc2 ci2
+    else hm_ctors_go (tail decls) names acc ci
+hm_ctor_list tyname vs names acc ci =
+  if vs == [] then (acc, ci)
+  else
+    let v = head vs
+    let ar = head (tail (tail v))
+    let fts = if length v > 4 then hm_field_types (hm_nth v 4) names else hm_dyn_n ar
+    hm_ctor_list tyname (tail vs) names (cons (head v, [tyname, fts, ci]) acc) (ci + 1)
+hm_field_types fs names = if fs == [] then [] else cons (hm_field_type (head fs) names) (hm_field_types (tail fs) names)
+hm_field_type f names =
+  if head f == "list" then ["list", hm_field_type (head (tail f)) names]
+  else
+    let t = head (tail f)
+    if t == "int" then ["int"] else if t == "float" then ["float"] else if t == "str" then ["str"]
+    else if t == "bool" then ["bool"] else if hm_has t names then ["adt", t] else ["dyn"]
 
 hm_foreign decls acc =
   if decls == [] then acc
@@ -816,8 +858,11 @@ hm_prepare st decls =
   let _ = arr_set st 13 fa
   let _ = arr_set st 14 n
   let _ = arr_set st 15 (arr_new (n + 1) [])
-  let _ = arr_set st 9 [arr_new (n + 1) [], arr_new (n + 1) 0, arr_new 1 0, arr_new 1 0, 0, 0, 0]
-  [fa, n, hm_tarjan n adj, hm_ctors decls [], hm_foreign decls []]
+  let ctors = hm_ctors decls
+  let nc = length ctors
+  let _ = arr_set st 16 nc
+  let _ = arr_set st 9 [arr_new (n + 1) [], arr_new (n + 1) 0, arr_new 1 0, arr_new 1 0, 0, 0, 0, arr_new (nc + 1) []]
+  [fa, n, hm_tarjan n adj, ctors, hm_foreign decls []]
 hm_fill fa fns i = if fns == [] then 0 else let _ = arr_set fa i (head fns) in hm_fill fa (tail fns) (i + 1)
 hm_groups st genv ctors fa sccs = if sccs == [] then genv else hm_groups st (hm_group st genv ctors fa (head sccs)) ctors fa (tail sccs)
 hm_round st pre =
@@ -907,6 +952,7 @@ hm_check_flows st fls =
     let bad = hm_flow st (hm_nth f 5) (hm_nth f 4) [] []
     let _ = if bad == false then 0
             else if ck == "u" then hm_event st ["p", cf, i]
+            else if ck == "f" then hm_event st ["c", cf, i]
             else if ck == "k" then 0
             else hm_event st ["s", k]
     hm_check_flows st (tail fls)
@@ -928,14 +974,17 @@ hm_apply_events st fc evs =
     let fss = hm_fc_nth fc 2
     let fls = hm_fc_nth fc 3
     let n = hm_fc_nth fc 4
+    let ffs = hm_fc_nth fc 7
     let added = if kind == "p" then hm_add_param fps (hm_nth ev 1) (hm_nth ev 2)
                 else if kind == "v" then hm_add_param fps (hm_nth ev 1) (0 - 1)
                 else if kind == "a" then (let a1 = hm_add_param fps (hm_nth ev 1) (0 - 1) in let a2 = hm_add_flag frs (hm_nth ev 1) in a1 + a2)
                 else if kind == "r" then hm_add_flag frs (hm_nth ev 1)
                 else if kind == "s" then hm_add_flag fss (hm_nth ev 1)
                 else if kind == "l" then hm_add_flag fls (hm_nth ev 1)
+                else if kind == "c" then hm_add_param ffs (hm_nth ev 1) (hm_nth ev 2)
+                else if kind == "cv" then hm_add_param ffs (hm_nth ev 1) (0 - 1)
                 else 0
-    hm_apply_events st [fps, frs, fss, fls, n + added, hm_fc_nth fc 5, hm_fc_nth fc 6] (tail evs)
+    hm_apply_events st [fps, frs, fss, fls, n + added, hm_fc_nth fc 5, hm_fc_nth fc 6, ffs] (tail evs)
 hm_add_param fps fi i =
   if fi < 0 then 0
   else
@@ -954,7 +1003,7 @@ hm_solve decls =
   let pre = hm_prepare st decls
   let nf = hm_nth pre 1
   let genv0 = hm_round st pre
-  let fc = [arr_new (nf + 1) [], arr_new (nf + 1) 0, arr_new (arr_get st 7 + 2) 0, arr_new (arr_get st 8 + 2) 0, 0, arr_get st 7 + 2, arr_get st 8 + 2]
+  let fc = [arr_new (nf + 1) [], arr_new (nf + 1) 0, arr_new (arr_get st 7 + 2) 0, arr_new (arr_get st 8 + 2) 0, 0, arr_get st 7 + 2, arr_get st 8 + 2, arr_new (arr_get st 16 + 1) []]
   hm_solve_go st pre genv0 fc 1
 hm_solve_go st pre genv fc r =
   let _ = hm_check_flows st (arr_get st 4)
