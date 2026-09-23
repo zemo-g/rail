@@ -148,7 +148,7 @@ The flag is a compile-time constant checked in `compile_program`:
 ```rail
 compile_program src =
   let toks = tokenize src
-  let decls = pprog toks
+  let decls = pprog_ast toks
   if SAFE_MODE then
     let errs = safe_check_decls decls
     if errs > 0 then ""

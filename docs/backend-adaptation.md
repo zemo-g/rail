@@ -12,7 +12,7 @@ The compiler is a 4-stage pipeline. Only stage 3 and 4 are hardware-specific:
 
 ```
 1. tokenize src → tokens          (universal)
-2. pprog tokens → AST declarations (universal)
+2. pprog_ast tokens → typed declarations, tools/ast.rail (universal)
 3. compile_funcs decls → assembly  (HARDWARE-SPECIFIC)
 4. assemble + link → binary        (HARDWARE-SPECIFIC)
 ```
