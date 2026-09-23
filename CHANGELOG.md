@@ -145,6 +145,12 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **`split`, `str_split` and `chars` keep their string alive.** Each reads the string through
+  the pointer `_str_unwrap` returns (16 bytes into the object) while it allocates the pieces, and
+  the collector counts only a pointer to an object's start. A temporary string, reachable from
+  nothing else, was freed mid-walk: `split "," (show [7, 8, 9])` gave an empty first piece and
+  `chars` read garbage once the collector ran. Each now also keeps the string itself in its
+  frame. Found by `RAIL_GC_STRESS` (t31 `shell` returned an empty line). Test t247.
 - **A match with a guarded variable arm no longer writes past its frame.** `| n if n > 100 ->
   n - 100` binds `n` once for the guard and once for the body. The frame predictor ignored
   guards, and `cg_arms` reported only the last arm's highest slot, so `compile_func`'s check
