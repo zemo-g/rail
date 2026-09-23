@@ -5,6 +5,14 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Added
+- **`show` prints tuples, constructed values and bools.** `show (1, "a")` is `(1, a)`, `show
+  (Some (Pair 1 2))` is `Some (Pair 1 2)`, walking the tuple length and the constructor tables
+  (they printed their header bytes, nothing visible), and `show (x > 3)` is `true` or `false`
+  where the compiler knows the value is a bool: a literal, a comparison, `&&`, `||`, `not`, a
+  function or parameter `rail types` gives type `bool`, a let bound to one. A bool is an int at
+  run time, so inside a container or through a polymorphic parameter it still prints 1 or 0.
+  `types.rail` emits `__bool_ret_<fn>` and `__argbool_<fn>_<i>` for this. t207 and
+  `tools/fuzz/known/string_ordering.rail` now expect `true`/`false`. Test t243.
 - **Constructors are functions.** A constructor with fields can be passed as a value
   (`map Some xs`, `let f = Pair`), and given fewer arguments than it has fields it is a function
   of the rest (`map (Pair 10) xs`), its given arguments evaluated once. The front end rewrites
