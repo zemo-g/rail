@@ -71,7 +71,10 @@ true
 false
 ```
 
-Booleans are represented as tagged integers: `true` is 3, `false` is 1.
+Booleans are represented as tagged integers: `true` is 3, `false` is 1. `show` prints `true` or
+`false` where the compiler knows the value is a bool (a literal, a comparison, `&&`/`||`/`not`, a
+function or name whose type is `bool`); a bool inside a list, tuple or constructed value, or one
+reaching `show` through a polymorphic parameter, prints as 1 or 0.
 
 ### Strings
 
@@ -659,12 +662,14 @@ Heap objects have an 8-byte size header, followed by a tag word:
 |-----|------------|
 | 1 | Cons cell (head, tail) |
 | 2 | Nil (empty list) |
-| 3 | Tuple (elements...) |
+| 3 | Tuple (length, elements...) |
 | 4 | Closure (code pointer, capture count, captures...) |
-| 5 | ADT (constructor index, fields...) |
+| 5 | ADT (constructor id, fields...) |
 | 6 | Float (IEEE 754 double) |
 
-The GC mark bit is stored at bit 63 of the tag word.
+The GC mark bit is stored at bit 63 of the tag word. Constructor ids are numbered across the
+whole program; each program's `_rail_ctor_arity` and `_rail_ctor_name` tables give every
+constructor's field count and name, which `==` and `show` use to walk a constructed value.
 
 ## Backends
 
