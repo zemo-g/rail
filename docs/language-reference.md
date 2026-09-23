@@ -335,6 +335,10 @@ depth tree = match tree
   | Node val left right -> 1 + max (depth left) (depth right)
 ```
 
+A constructor pattern must name a declared constructor and bind at most its fields. A
+misspelled constructor (`| Nde v l r ->`) is a compile error, as is binding more fields than the
+constructor has.
+
 #### Integer Patterns
 
 ```rail
@@ -342,6 +346,14 @@ describe n = match n
   | 0 -> "zero"
   | 1 -> "one"
   | _ -> "other"
+```
+
+#### Boolean Patterns
+
+```rail
+flag b = match b
+  | true -> "on"
+  | false -> "off"
 ```
 
 #### String Patterns
@@ -353,7 +365,7 @@ greet lang = match lang
   | _ -> "Hi"
 ```
 
-#### Wildcard Pattern
+#### Wildcard and Variable Patterns
 
 `_` matches anything:
 
@@ -364,6 +376,18 @@ is_red c = match c
   | Red -> true
   | _ -> false
 ```
+
+A lowercase name matches anything too, and binds the value to that name for the arm's guard and
+body. Constructors are capitalized, so a lowercase name is always a variable:
+
+```rail
+clamp n = match n
+  | 0 -> 0
+  | big if big > 100 -> 100
+  | other -> other
+```
+
+The scrutinee is evaluated once, however many arms bind it.
 
 #### Guards
 
