@@ -2815,23 +2815,20 @@ amask_has_one m =
 
 variants_have_auth vs =
   if vs == [] then false
-  else
-    let v = head vs
-    let mask = head (tail (tail (tail v)))
-    if amask_has_one mask then true
-    else variants_have_auth (tail vs)
+  else if amask_has_one (variant_mask (head vs)) then true
+  else variants_have_auth (tail vs)
+variant_mask v = match v
+  | Variant c idx ar mask fs -> mask
+variant_arity v = match v
+  | Variant c idx ar mask fs -> ar
 
--- Walk decls, collect [name, variants] for each ADT with at least one auth field.
+-- Walk decls, collect (name, variants) for each ADT with at least one auth field.
 collect_auth_types decls =
   if decls == [] then []
-  else
-    let d = head decls
-    if head d == "TY" then
-      let nm = head (tail d)
-      let vs = head (tail (tail d))
-      if variants_have_auth vs then cons [nm, vs] (collect_auth_types (tail decls))
-      else collect_auth_types (tail decls)
-    else collect_auth_types (tail decls)
+  else append (auth_type_of (head decls)) (collect_auth_types (tail decls))
+auth_type_of d = match d
+  | DType nm vs -> if variants_have_auth vs then [(nm, vs)] else []
+  | _ -> []
 
 -- field bind names f0, f1, ... f(n-1) for a ctor of the given arity
 synth_binds i n =
@@ -2845,8 +2842,8 @@ synth_field_pieces tyname mask i =
   if mask == [] then []
   else
     let b = cat ["f", show i]
-    let raw = if head mask == 1 then ["A", ["V", cat ["digest_", tyname]], ["V", b]] else ["V", b]
-    let piece = ["A", ["V", "__auth_enc"], raw]
+    let raw = if head mask == 1 then NApp (NVar (cat ["digest_", tyname])) (NVar b) else NVar b
+    let piece = NApp (NVar "__auth_enc") raw
     cons piece (synth_field_pieces tyname (tail mask) (i + 1))
 
 -- one match arm per variant: | Ctor f0 .. fn -> cat [<tag>, framed-pieces..]
@@ -2854,34 +2851,26 @@ synth_arms tyname variants =
   if variants == [] then []
   else
     let v = head variants
-    let ctor = head v
-    let arity = head (tail (tail v))
-    let mask = head (tail (tail (tail v)))
-    let binds = synth_binds 0 arity
+    let ctor = variant_name v
+    let binds = synth_binds 0 (variant_arity v)
     let tag = str_sub ctor 0 1
-    let elems = cons ["S", tag] (synth_field_pieces tyname mask 0)
-    let body = ["A", ["V", "cat"], ["L", elems]]
-    cons [ctor, binds, body, []] (synth_arms tyname (tail variants))
+    let elems = cons (NStr tag) (synth_field_pieces tyname (variant_mask v) 0)
+    let body = NApp (NVar "cat") (NList elems)
+    cons (Arm ctor binds body NoGuard) (synth_arms tyname (tail variants))
 
 -- proj_of_<TY> + digest_<TY> decl pair for each collected auth type
 synth_auth_decls types =
   if types == [] then []
   else
-    let ty = head types
-    let name = head ty
-    let variants = head (tail ty)
-    let projfn = ["fn", cat ["proj_of_", name], ["t"], ["M", ["V", "t"], synth_arms name variants]]
-    let digfn = ["fn", cat ["digest_", name], ["t"], ["A", ["V", "sha256_hex"], ["A", ["V", cat ["proj_of_", name]], ["V", "t"]]]]
+    let (name, variants) = head types
+    let projfn = DFn (cat ["proj_of_", name]) ["t"] (NMatch (NVar "t") (synth_arms name variants))
+    let digfn = DFn (cat ["digest_", name]) ["t"] (NApp (NVar "sha256_hex") (NApp (NVar (cat ["proj_of_", name])) (NVar "t")))
     cons projfn (cons digfn (synth_auth_decls (tail types)))
 
 decls_have_fn nm decls =
   if decls == [] then false
-  else
-    let d = head decls
-    if head d == "fn" then
-      if head (tail d) == nm then true
-      else decls_have_fn nm (tail decls)
-    else decls_have_fn nm (tail decls)
+  else if decl_is_fn (head decls) && decl_fn_name (head decls) == nm then true
+  else decls_have_fn nm (tail decls)
 
 -- Ideal-mode primitives (B2a): `unauth`/`auth_make` as identity. This is the
 -- "free oracle" of the lambda-dot model -- the auth-typed source runs unmodified,
@@ -2889,75 +2878,60 @@ decls_have_fn nm decls =
 -- already define them (avoids duplicate symbols). The Prover/Verifier clones
 -- (B2b/B2c) inline their own proof logic and never call these.
 synth_ideal_prims decls =
-  let ua = if decls_have_fn "unauth" decls then [] else [["fn", "unauth", ["x"], ["V", "x"]]]
-  let am = if decls_have_fn "auth_make" decls then [] else [["fn", "auth_make", ["v"], ["V", "v"]]]
+  let ua = if decls_have_fn "unauth" decls then [] else [DFn "unauth" ["x"] (NVar "x")]
+  let am = if decls_have_fn "auth_make" decls then [] else [DFn "auth_make" ["v"] (NVar "v")]
   append ua am
 
 -- ── B2b: the duplicator (Prover clone) ──────────────────────────────────
 -- Recognized auth-traversal shape: a fn whose whole body is `match (unauth P) | arms`.
 -- Returns the auth param name P, or "" if the fn is not an auth traversal.
-auth_fn_param body =
-  if head body != "M" then ""
-  else
-    let scrut = head (tail body)
-    if head scrut != "A" then ""
-    else
-      let f = head (tail scrut)
-      let a = head (tail (tail scrut))
-      if head f != "V" then ""
-      else if head (tail f) != "unauth" then ""
-      else if head a != "V" then ""
-      else head (tail a)
+auth_fn_param body = match body
+  | NMatch scrut arms -> auth_scrut_param scrut
+  | _ -> ""
+auth_scrut_param scrut = match scrut
+  | NApp f a -> if ast_is_var f "unauth" && nd_tag a == "V" then nd_s1 a else ""
+  | _ -> ""
 
 -- which collected auth type owns a given constructor
 variants_have_ctor vs ctor =
   if vs == [] then false
-  else if head (head vs) == ctor then true
+  else if variant_name (head vs) == ctor then true
   else variants_have_ctor (tail vs) ctor
 
 type_of_ctor types ctor =
   if types == [] then ""
   else
-    let ty = head types
-    if variants_have_ctor (head (tail ty)) ctor then head ty
+    let (nm, vs) = head types
+    if variants_have_ctor vs ctor then nm
     else type_of_ctor (tail types) ctor
 
--- leftmost atom of an application spine
-spine_head node =
-  if head node == "A" then spine_head (head (tail node)) else node
-
 is_self_call node name =
-  if head node == "A" then
-    let sh = spine_head node
-    if head sh == "V" then head (tail sh) == name else false
+  if nd_tag node == "A" then ast_is_var (ast_app_fn node) name
   else false
 
 -- rebuild a self-call spine: rename the leftmost V to <name><suffix> and
 -- thread each original arg (so nested self-calls in args are handled too).
-rebuild_self node name suffix pbuf =
-  if head node == "A" then ["A", rebuild_self (head (tail node)) name suffix pbuf, thread_self (head (tail (tail node))) name suffix pbuf]
-  else ["V", cat [name, suffix]]
+rebuild_self node name suffix pbuf = match node
+  | NApp f a -> NApp (rebuild_self f name suffix pbuf) (thread_self a name suffix pbuf)
+  | _ -> NVar (cat [name, suffix])
 
 -- strict local rewrite: every self-call `name X..` -> `<name><suffix> X.. pbuf`;
 -- everything else is structurally preserved (NO arm reorder -> order invariant holds).
-thread_self node name suffix pbuf =
-  let tg = head node
-  if tg == "A" then
-    if is_self_call node name then ["A", rebuild_self node name suffix pbuf, pbuf]
-    else ["A", thread_self (head (tail node)) name suffix pbuf, thread_self (head (tail (tail node))) name suffix pbuf]
-  else if tg == "O" then ["O", head (tail node), thread_self (head (tail (tail node))) name suffix pbuf, thread_self (head (tail (tail (tail node)))) name suffix pbuf]
-  else if tg == "?" then ["?", thread_self (head (tail node)) name suffix pbuf, thread_self (head (tail (tail node))) name suffix pbuf, thread_self (head (tail (tail (tail node)))) name suffix pbuf]
-  else if tg == "D" then ["D", head (tail node), thread_self (head (tail (tail node))) name suffix pbuf, thread_self (head (tail (tail (tail node)))) name suffix pbuf]
-  else if tg == "TD" then ["TD", head (tail node), thread_self (head (tail (tail node))) name suffix pbuf, thread_self (head (tail (tail (tail node)))) name suffix pbuf]
-  else if tg == "M" then ["M", thread_self (head (tail node)) name suffix pbuf, thread_self_arms (head (tail (tail node))) name suffix pbuf]
-  else if tg == "L" then ["L", thread_self_list (head (tail node)) name suffix pbuf]
-  else node
+thread_self node name suffix pbuf = match node
+  | NApp f a -> if is_self_call node name then NApp (rebuild_self node name suffix pbuf) pbuf else NApp (thread_self f name suffix pbuf) (thread_self a name suffix pbuf)
+  | NOp o l r -> NOp o (thread_self l name suffix pbuf) (thread_self r name suffix pbuf)
+  | NIf c t e -> NIf (thread_self c name suffix pbuf) (thread_self t name suffix pbuf) (thread_self e name suffix pbuf)
+  | NLet x v b -> NLet x (thread_self v name suffix pbuf) (thread_self b name suffix pbuf)
+  | NLetTup xs v b -> NLetTup xs (thread_self v name suffix pbuf) (thread_self b name suffix pbuf)
+  | NMatch s arms -> NMatch (thread_self s name suffix pbuf) (thread_self_arms arms name suffix pbuf)
+  | NList es -> NList (thread_self_list es name suffix pbuf)
+  | _ -> node
 
 thread_self_arms arms name suffix pbuf =
   if arms == [] then []
-  else
-    let a = head arms
-    cons [head a, head (tail a), thread_self (head (tail (tail a))) name suffix pbuf, head (tail (tail (tail a)))] (thread_self_arms (tail arms) name suffix pbuf)
+  else cons (thread_self_arm (head arms) name suffix pbuf) (thread_self_arms (tail arms) name suffix pbuf)
+thread_self_arm a name suffix pbuf = match a
+  | Arm c bs b g -> Arm c bs (thread_self b name suffix pbuf) g
 
 thread_self_list xs name suffix pbuf =
   if xs == [] then []
@@ -2969,16 +2943,16 @@ thread_self_list xs name suffix pbuf =
 -- (entry-append of proj_of_<TY> P == per-arm snoc of the same projection).
 synth_prove_fn name params body types =
   let p = auth_fn_param body
-  let arms = head (tail (tail body))
-  let ty = type_of_ctor types (head (head arms))
-  let pbuf = ["V", "__pbuf"]
-  let proj = ["A", ["V", cat ["proj_of_", ty]], ["V", p]]
-  let getbuf = ["A", ["A", ["V", "arr_get"], pbuf], ["I", "0"]]
-  let newbuf = ["A", ["A", ["V", "append"], getbuf], ["A", ["A", ["V", "cons"], proj], ["L", []]]]
-  let setexpr = ["A", ["A", ["A", ["V", "arr_set"], pbuf], ["I", "0"]], newbuf]
+  let arms = nd_arms body
+  let ty = type_of_ctor types (arm_ctor (head arms))
+  let pbuf = NVar "__pbuf"
+  let proj = NApp (NVar (cat ["proj_of_", ty])) (NVar p)
+  let getbuf = NApp (NApp (NVar "arr_get") pbuf) (NInt "0")
+  let newbuf = NApp (NApp (NVar "append") getbuf) (NApp (NApp (NVar "cons") proj) (NList []))
+  let setexpr = NApp (NApp (NApp (NVar "arr_set") pbuf) (NInt "0")) newbuf
   let arms2 = thread_self_arms arms name "__prove" pbuf
-  let pbody = ["D", "_", setexpr, ["M", ["V", p], arms2]]
-  ["fn", cat [name, "__prove"], append params ["__pbuf"], pbody]
+  let pbody = NLet "_" setexpr (NMatch (NVar p) arms2)
+  DFn (cat [name, "__prove"]) (append params ["__pbuf"]) pbody
 
 -- ── B2c: the duplicator (Verifier clone) ───────────────────────────────
 -- The Verifier holds ONLY the root digest + the proof stream (NOT the tree).
@@ -2991,8 +2965,8 @@ synth_prove_fn name params body types =
 
 -- nested `tail` (k times) and head-of-that: field i of the length-decoded
 -- `__auth_fields` list is parts[i] (tag already stripped) -- head (tail^i parts).
-tail_n e k = if k == 0 then e else ["A", ["V", "tail"], tail_n e (k - 1)]
-nth_expr e k = ["A", ["V", "head"], tail_n e k]
+tail_n e k = if k == 0 then e else NApp (NVar "tail") (tail_n e (k - 1))
+nth_expr e k = NApp (NVar "head") (tail_n e k)
 
 -- the auth param (the tree) is replaced by `__exp` (the expected digest);
 -- every other param (path, ...) is preserved, and `__vbuf` is appended.
@@ -3004,48 +2978,43 @@ repl_param ps p =
 -- then run the (self-call-rewritten) arm body.
 verify_bind_lets binds idx parts inner =
   if binds == [] then inner
-  else ["D", head binds, nth_expr parts idx, verify_bind_lets (tail binds) (idx + 1) parts inner]
+  else NLet (head binds) (nth_expr parts idx) (verify_bind_lets (tail binds) (idx + 1) parts inner)
 
 -- dispatch on the projection tag (first char), one arm per variant.
 verify_arm_chain arms name parts vbuf =
-  if arms == [] then ["A", ["V", "error"], ["S", "reject: no matching variant"]]
+  if arms == [] then NApp (NVar "error") (NStr "reject: no matching variant")
   else
     let a = head arms
-    let ctor = head a
-    let binds = head (tail a)
-    let abody = head (tail (tail a))
-    let tag = str_sub ctor 0 1
-    let cond = ["O", "==", ["A", ["A", ["A", ["V", "str_sub"], ["V", "__pj"]], ["I", "0"]], ["I", "1"]], ["S", tag]]
-    let rew = thread_self abody name "__verify" vbuf
-    let thenb = verify_bind_lets binds 0 parts rew
-    ["?", cond, thenb, verify_arm_chain (tail arms) name parts vbuf]
+    let tag = str_sub (arm_ctor a) 0 1
+    let cond = NOp "==" (NApp (NApp (NApp (NVar "str_sub") (NVar "__pj")) (NInt "0")) (NInt "1")) (NStr tag)
+    let rew = thread_self (arm_body a) name "__verify" vbuf
+    let thenb = verify_bind_lets (arm_binds a) 0 parts rew
+    NIf cond thenb (verify_arm_chain (tail arms) name parts vbuf)
 
 synth_verify_fn name params body types =
   let p = auth_fn_param body
-  let arms = head (tail (tail body))
-  let vbuf = ["V", "__vbuf"]
-  let getbuf = ["A", ["A", ["V", "arr_get"], vbuf], ["I", "0"]]
-  let pop = ["A", ["A", ["A", ["V", "arr_set"], vbuf], ["I", "0"]], ["A", ["V", "tail"], getbuf]]
-  let hashne = ["O", "!=", ["A", ["V", "sha256_hex"], ["V", "__pj"]], ["V", "__exp"]]
-  let splitp = ["A", ["V", "__auth_fields"], ["V", "__pj"]]
-  let chain = verify_arm_chain arms name ["V", "__parts"] vbuf
-  let inner = ["D", "__parts", splitp, chain]
-  let hbody = ["?", hashne, ["A", ["V", "error"], ["S", "reject: digest mismatch"]], inner]
-  let vbody = ["D", "__pj", ["A", ["V", "head"], getbuf], ["D", "_", pop, hbody]]
-  ["fn", cat [name, "__verify"], append (repl_param params p) ["__vbuf"], vbody]
+  let arms = nd_arms body
+  let vbuf = NVar "__vbuf"
+  let getbuf = NApp (NApp (NVar "arr_get") vbuf) (NInt "0")
+  let pop = NApp (NApp (NApp (NVar "arr_set") vbuf) (NInt "0")) (NApp (NVar "tail") getbuf)
+  let hashne = NOp "!=" (NApp (NVar "sha256_hex") (NVar "__pj")) (NVar "__exp")
+  let splitp = NApp (NVar "__auth_fields") (NVar "__pj")
+  let chain = verify_arm_chain arms name (NVar "__parts") vbuf
+  let inner = NLet "__parts" splitp chain
+  let hbody = NIf hashne (NApp (NVar "error") (NStr "reject: digest mismatch")) inner
+  let vbody = NLet "__pj" (NApp (NVar "head") getbuf) (NLet "_" pop hbody)
+  DFn (cat [name, "__verify"]) (append (repl_param params p) ["__vbuf"]) vbody
 
 -- emit a __prove + __verify clone pair per user fn matching the auth-traversal shape
 synth_clones decls types =
   if decls == [] then []
   else
     let d = head decls
-    if head d == "fn" then
-      let nm = head (tail d)
-      let ps = head (tail (tail d))
-      let bd = head (tail (tail (tail d)))
-      if auth_fn_param bd != "" then
-        cons (synth_prove_fn nm ps bd types) (cons (synth_verify_fn nm ps bd types) (synth_clones (tail decls) types))
-      else synth_clones (tail decls) types
+    if decl_is_fn d && auth_fn_param (decl_fn_body d) != "" then
+      let nm = decl_fn_name d
+      let ps = decl_fn_params d
+      let bd = decl_fn_body d
+      cons (synth_prove_fn nm ps bd types) (cons (synth_verify_fn nm ps bd types) (synth_clones (tail decls) types))
     else synth_clones (tail decls) types
 
 -- Only synthesize when sha256_hex is actually in scope (the program imported it).
@@ -3078,7 +3047,7 @@ inject_auth_fns decls =
   let types = collect_auth_types decls
   if types == [] then decls
   else if decls_have_fn "sha256_hex" decls then
-    let helpers = pprog (tokenize (auth_helper_src 0))
+    let helpers = pprog_ast (tokenize (auth_helper_src 0))
     let d0 = append decls helpers
     let d1 = append d0 (synth_auth_decls types)
     let d2 = append d1 (synth_ideal_prims decls)
@@ -5458,15 +5427,16 @@ compile_program_with_file src fname =
   let ntoks = length toks
   let decls = pprog toks
   let decls = inject_grad_fns decls
-  let errs = ce_decls (ast_decls_of decls)
+  let td = ast_decls_of decls
+  let errs = ce_decls td
   let nerrs = report_errors errs positions ntoks fname
   if nerrs > 0 then
     let _ = print (cat [show nerrs, " error(s) found"])
     ""
-  else compile_checked (inject_auth_fns decls)
+  else compile_checked (inject_auth_fns td)
 
 compile_checked decls =
-  let td = opt_decls (ast_decls_of decls)
+  let td = opt_decls decls
   let ar = get_arities_t td
   let siblings = build_ctor_siblings td
   let match_errs = check_exhaustiveness td siblings
@@ -5586,7 +5556,7 @@ compile_program src =
   let toks = tokenize src
   let decls = pprog toks
   let decls = inject_grad_fns decls
-  compile_checked (inject_auth_fns decls)
+  compile_checked (inject_auth_fns (ast_decls_of decls))
 
 -- BUILD: assemble + link
 

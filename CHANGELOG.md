@@ -71,6 +71,11 @@ All notable changes to Rail are documented here.
   `gpu_map` dispatch and the `fold ... (range n)` rewrites match on `Node` and build `Node`s, and
   its pattern helpers return `NNull` where they returned `[]`. Every file in the tree compiles
   to byte-identical ARM64 and x86 assembly; the compiler's type errors drop from 468 to 406.
+- **The auth synthesis builds the typed syntax tree.** `inject_auth_fns` takes and returns `Decl`s:
+  the projection, digest, Prover and Verifier functions it synthesizes for an `auth` type are
+  built from `Node` constructors, and the auth types it collects are `(name, variants)` pairs.
+  The twelve auth programs in the suite and every file in the tree compile to byte-identical
+  assembly; the compiler's type errors drop from 406 to 362.
 - **Array and tuple field types.** A constructor field may be `(arr t)` or `(t1, t2)`, next to
   `[t]` and the named types.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
