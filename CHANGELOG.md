@@ -76,6 +76,15 @@ All notable changes to Rail are documented here.
   built from `Node` constructors, and the auth types it collects are `(name, variants)` pairs.
   The twelve auth programs in the suite and every file in the tree compile to byte-identical
   assembly; the compiler's type errors drop from 406 to 362.
+- **The AD synthesis builds the typed syntax tree.** `inject_grad_fns` takes and returns `Decl`s:
+  forward mode (`grad_deriv`), reverse mode (`grad_rev_*`) and the array walkers (map chains,
+  contraction readouts, layer chains, the matvec layer, the residual block) match on `Node` and
+  build `Node`s. Their records are tuples: cotangent contributions `(leaf, Node)`, let-bindings
+  `(name, Node)`, map stages `(bind, fn, src)`, layer stages `(bind, act, W, src)`, readouts
+  `("dot", g)` or `("sum", "")`. The 32 `#grad` programs (the suite's and rail-lab's AD oracle
+  tests) compile to byte-identical assembly, and the parser's typed declarations now reach code
+  generation without passing through the list form. The compiler's type errors drop from 362
+  to 129.
 - **Array and tuple field types.** A constructor field may be `(arr t)` or `(t1, t2)`, next to
   `[t]` and the named types.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
