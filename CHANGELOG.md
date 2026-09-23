@@ -43,12 +43,13 @@ All notable changes to Rail are documented here.
   on the way (`hm_join` returned a bool on one branch and an int on the other). Output is
   unchanged: `rail types` prints the same for every file in the tree, and every file compiles
   to the same assembly.
-- **The ARM64 code generator reads the typed syntax tree.** `cg`, `compile_func` and every
-  predicate they use (`is_float`, `is_int`, `max_sl`, the self-loop and early-return paths,
-  closure conversion's free variables) read `Node` through `tools/ast.rail`'s accessors instead
-  of list positions, and the arity map is built from typed declarations. The x86 backend keeps
-  list copies of the six predicates it shares until it moves over. Every file in the tree
-  compiles to byte-identical assembly, and the compiler's type errors drop from 1,318 to 1,029.
+- **The ARM64 and x86 code generators read the typed syntax tree.** `cg`, `compile_func` and
+  every predicate they use (`is_float`, `is_int`, `max_sl`, the self-loop and early-return
+  paths, closure conversion's free variables) read `Node` through `tools/ast.rail`'s accessors
+  instead of list positions, and the arity map is built from typed declarations. `x86_cg` and
+  `x86_compile_func` share those predicates, so the x86 backend's list copies of them are gone.
+  Every file in the tree compiles to byte-identical ARM64 and x86 assembly, and the compiler's
+  type errors drop from 1,318 to 869.
 - **Array and tuple field types.** A constructor field may be `(arr t)` or `(t1, t2)`, next to
   `[t]` and the named types.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
