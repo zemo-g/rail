@@ -5,6 +5,15 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Added
+- **`RAIL_GC_STRESS=N` and `tools/fuzz/gc_stress.py`: the collector under load.** The collector
+  runs only when the arena fills, and at the default 1 GB almost no test program fills it, so a
+  collector bug hides behind a correct answer (#109 did). `RAIL_GC_STRESS=N` makes the runtime
+  collect on every Nth allocation and fill every freed block with an address in the unmapped
+  first 4 GB, so an object the collector misses crashes or changes the output. `gc_stress.py`
+  compiles every suite test and every self-contained tree program, runs each normally and then
+  under the most aggressive N (1, 13, 127, 1021) that finishes in its budget, and compares. With
+  the #109 bug put back it flags 44 suite tests; on master it flags 3 (`shell`'s result, threads,
+  variable patterns), which are the next fixes. Test t245 runs a program at `RAIL_GC_STRESS=3`.
 - **`show` prints tuples, constructed values and bools.** `show (1, "a")` is `(1, a)`, `show
   (Some (Pair 1 2))` is `Some (Pair 1 2)`, walking the tuple length and the constructor tables
   (they printed their header bytes, nothing visible), and `show (x > 3)` is `true` or `false`
