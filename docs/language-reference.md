@@ -138,7 +138,20 @@ type Tree = | Leaf | Node val left right
 type Color = | Red | Green | Blue
 ```
 
-Constructors are capitalized by convention. Each constructor can take zero or more arguments.
+Constructors are capitalized by convention. Each constructor can take zero or more fields.
+
+A field may declare its type: `int`, `float`, `str`, `bool`, `dyn`, the name of a type the
+program declares, or `[t]` for a list of `t`. A field written as a plain name (`x`, `val`
+above) declares nothing and holds any value.
+
+```rail
+type Expr = | Num int | Add Expr Expr | Neg Expr | Seq [Expr] | Var str
+```
+
+A match binds a declared field at its type (`| Num n -> ...` makes `n` an int), so
+`rail types` infers `eval : Expr -> int` for an evaluator over `Expr` (see `docs/TYPES.md`).
+A construction that passes another type (`Num "x"`) is a type error `rail types` reports; the
+program still compiles and runs, with that field held generically.
 
 ## Functions
 
@@ -364,12 +377,12 @@ classify n = match n
 
 #### Exhaustiveness Checking
 
-The compiler warns (but does not error) on non-exhaustive matches against ADTs:
+A non-exhaustive match against an ADT is a compile error:
 
 ```rail
 type Option = | Some x | None
 
--- WARNING: non-exhaustive match -- missing: None
+-- error: non-exhaustive match -- missing: None
 get opt = match opt
   | Some x -> x
 ```

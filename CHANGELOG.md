@@ -22,6 +22,14 @@ All notable changes to Rail are documented here.
   error and how many parameters and results have a static representation; 301 of 487 files
   type-check. `rail infer` reports result kinds from the types. `docs/TYPES.md`; tests t217,
   t218, t220 to t222.
+- **Typed constructor fields.** A field may name its type (`int`, `float`, `str`, `bool`,
+  `dyn`, a declared type, or `[t]`): `type Expr = | Num int | Add Expr Expr | Many [Expr]`,
+  and a match binds each field at its type, so `rail types` infers `eval : Expr -> int`. Every
+  construction is checked against the declared types; one that passes another type is a type
+  error, and that field falls back to generic representation, so the program runs as before.
+  A field written as a plain name (`| Box v`) declares nothing, as before; no declaration in
+  the tree used type names as fields, so nothing that compiled changes. `docs/TYPES.md`,
+  `docs/language-reference.md`; tests t225 to t227 and infer_match_typed_fields.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
   assembling it.
 - **`tools/infer/smol/`: a public model on Rail's kernels, and exact one-pass verification of
