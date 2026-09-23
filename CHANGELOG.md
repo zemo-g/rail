@@ -92,6 +92,14 @@ All notable changes to Rail are documented here.
   drop from 129 to 62, all of them in the linker, assembler and SHA-256 records, which are not
   syntax trees. Codegen now gives 2,674 of the compiler's 3,505 parameters a static
   representation, up from 1,824 of 3,393 before phase C.
+- **The compiler type-checks.** `rail types tools/compile.rail` reports zero errors (1,739 at the
+  start of phase C). The last records were in the linker and assembler, now tuples: labels
+  `(name, off)`, relocations `(off, sym)`, symbols `(name, sec, off)`, the walker's state, the
+  data emitters' `(off, rebases)` and operand values `(value, rebase)`. The SHA-256 streaming
+  state is a `ShaSt` data type instead of an array holding arrays and ints. The compiler the
+  new linker links is byte-identical to the one the old linker linked, code signature included.
+  Codegen gives 3,204 of the compiler's 3,524 parameters and 1,499 of its 1,563 results a static
+  representation. Test t235 (streaming SHA-256 against `shasum` across block boundaries).
 - **Array and tuple field types.** A constructor field may be `(arr t)` or `(t1, t2)`, next to
   `[t]` and the named types.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without

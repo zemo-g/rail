@@ -4064,6 +4064,83 @@ import "stdlib/<name>.rail"
 
 
 
+## `stdlib/infer_kv.rail`
+
+### `kv_matmul_cpu a b`
+
+> Force-CPU matmul, same shape as lm_infer_cpu's wrapper: bypasses the
+> gpu_available gate so this module is deterministic regardless of
+> dylib/.no_gpu state.
+
+### `kv_cache_build n_blocks max_seq d i acc`
+
+> Fresh cache list for n_blocks layers, positions up to max_seq, width d.
+
+### `kv_cache_new n_blocks max_seq d`
+
+
+### `kv_row_store src dst pos d j`
+
+> Copy one 1-row tensor's data into cache row `pos`.
+
+### `kv_score_dot qd ck base d kk acc`
+
+> score(j) = (q . K[j]) * scale -- dot ascending over d, one scalar
+> accumulator, then a single scale multiply: matches matmul_k(q, K^T)
+> followed by tensor_scale, bit for bit.
+
+### `kv_scores_loop qd ck sd pos d scale j`
+
+
+### `kv_ctx_dot pd cv pos d c j acc`
+
+> ctx[c] = sum_j probs[j] * V[j][c], j ascending -- matmul_k order for
+> attn @ V restricted to the causal window.
+
+### `kv_ctx_loop pd cv ctxd pos d c`
+
+
+### `kv_attention_step qd ck cv pos d scale`
+
+> One attention step: q row (already RoPE'd) against cache rows 0..pos.
+> Returns the context row as a float_arr of width d. softmax_row is the
+> stdlib CPU softmax -- same max-subtract, same order.
+
+### `kv_add_cpu a b`
+
+> Force-CPU elementwise add (tensor_add would GPU-dispatch through f32
+> when the dylib is present -- a silent precision change; add_loop is
+> tensor.rail's own CPU fallback).
+
+### `kv_had_loop ad bd cd n i`
+
+> Elementwise product of two 1-row tensors (SwiGLU gate * up).
+
+### `kv_hadamard a b`
+
+
+### `kv_block_step x_row w_block ck cv pos d`
+
+> One block, one new position. x_row is [1,d]; ck/cv are this block's
+> cache arrays; pos is the new token's absolute position. Mirrors
+> lm_infer_cpu.rail infer_block_fwd stage for stage; RoPE reuses
+> rope_row_pairs directly with the explicit position.
+
+### `kv_unwrap t`
+
+
+### `kv_blocks_step_loop x blocks caches pos d i n`
+
+
+### `kv_forward_step x_row w_e we_t blocks caches gf pos d`
+
+> Full incremental forward for ONE token: one-hot row -> embed -> blocks
+> (caches updated at `pos`) -> final RMSNorm -> logits -> probs row.
+> we_t is tensor_transpose w_e, computed once by the caller. Returns the
+> [1,V] probs tensor for the next-token decision. CPU softmax forced
+> (softmax_row), matching the reference path's documented .no_gpu config.
+
+
 ## `stdlib/jit.rail`
 
 ### `jit_compile_rmsnorm_qkv _`
@@ -6650,9 +6727,21 @@ import "stdlib/<name>.rail"
 ### `sha256_update_arr st arr off n`
 
 > Feed `n` bytes from `arr` starting at `off` into the running hash.
-> Returns the same state array (mutated in place).
+> Returns the same state (its arrays mutated in place).
+
+### `sha256_update_st st arr off n`
+
+
+### `sha256_update_go st h k_tbl pbuf cnt arr off n`
+
 
 ### `sha256_stream_full st arr off remaining k_tbl h`
+
+
+### `sha_st_pbuf st`
+
+
+### `sha_st_cnt st`
 
 
 ### `sha256_update_str st s`
@@ -6664,6 +6753,9 @@ import "stdlib/<name>.rail"
 ### `sha256_finalize st`
 
 > Pad and produce the 32-byte digest.  After finalize the state is spent.
+
+### `sha256_finalize_go h k_tbl pbuf plen total`
+
 
 ### `sha256_finalize_hex st`
 
@@ -6975,6 +7067,15 @@ import "stdlib/<name>.rail"
 
 ### `recv_headers_loop fd buf acc`
 
+
+### `recv_body_loop fd buf acc needed`
+
+
+### `content_length_of s`
+
+> Content-Length value from a raw header blob, 0 if absent. parse_int
+> stops at the first non-digit and returns 0 on a leading space, so the
+> slice is de-spaced first.
 
 ### `send_all_tcp fd s`
 
