@@ -163,7 +163,10 @@ Type errors are handled by the same check, since a clash is a bad flow.
 ## What comes next
 
 1. **Type the compiler.** The AST becomes an ADT with typed fields, and
-   `rail types tools/compile.rail` reaches zero errors.
+   `rail types tools/compile.rail` reaches zero errors. Under way: `tools/ast.rail` declares the
+   tree and the parser builds it; the passes after it move over in pipeline order (the AD and
+   auth synthesis, the optimizer, the checks, inference, codegen, the other backends), and the
+   list adapter goes when the last one does.
 2. **Check.** Type errors in code that type-checks everywhere else become compile errors instead
    of wrong answers or segfaults. Code that relies on dynamic idioms stays accepted until it
    opts in.

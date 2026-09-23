@@ -30,6 +30,11 @@ All notable changes to Rail are documented here.
   A field written as a plain name (`| Box v`) declares nothing, as before; no declaration in
   the tree used type names as fields, so nothing that compiled changes. `docs/TYPES.md`,
   `docs/language-reference.md`; tests t225 to t227 and infer_match_typed_fields.
+- **The parser builds a typed syntax tree.** `tools/ast.rail` declares Rail's AST as data types
+  (`Node`, `Arm`, `Decl`, ...), and the parser produces them: `pa : [(str, str)] -> (Node,
+  [(str, str)])`, `pprog_ast : [(str, str)] -> [Decl]`. The passes after the parser still read
+  the older list form, which `ast_decls_list` produces, until each is moved over. Every file in
+  the tree compiles to byte-identical assembly.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
   assembling it.
 - **`tools/infer/smol/`: a public model on Rail's kernels, and exact one-pass verification of
