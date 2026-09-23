@@ -162,13 +162,14 @@ Type errors are handled by the same check, since a clash is a bad flow.
 
 ## What comes next
 
-1. **Type the compiler.** The AST becomes an ADT with typed fields, and
-   `rail types tools/compile.rail` reaches zero errors. Under way: `tools/ast.rail` declares the
-   tree and the parser builds it, the type checker reads it and is typed throughout
-   (`rail types tools/types.rail`: zero errors), and so do all five code generators (ARM64,
-   x86, wasm, Cortex-M, RISC-V), `rail safe`, the checks, the optimizer and the auth and AD
-   synthesis, and the list form and its adapters are deleted. Left: the linker's, assembler's
-   and SHA-256's records (`rail types tools/compile.rail`: 62 errors, none in a syntax tree).
+1. **Type the compiler: done (2026-09-23).** `rail types tools/compile.rail` reports zero
+   errors, down from 1,739. The syntax tree is a set of data types (`tools/ast.rail`) that the
+   parser builds and every pass reads: the type checker, all five code generators (ARM64, x86,
+   wasm, Cortex-M, RISC-V), `rail safe`, the checks, the optimizer and the auth and AD
+   synthesis. The linker's, assembler's and SHA-256's records are tuples and a `ShaSt` type.
+   Codegen gives 3,204 of the compiler's 3,524 parameters (91%) and 1,499 of its 1,563 results
+   a static representation; when phase C began it was 1,161 of 3,106 parameters (37%). Typing
+   it found the defects fixed in #94 and #98 (CHANGELOG, Fixed).
 2. **Check.** Type errors in code that type-checks everywhere else become compile errors instead
    of wrong answers or segfaults. Code that relies on dynamic idioms stays accepted until it
    opts in.
