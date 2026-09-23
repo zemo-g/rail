@@ -128,6 +128,15 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **`==` and `!=` compare structure.** On two heap values that were not floats, the runtime
+  called `strcmp` on them, which compared header bytes, so any two lists, tuples or constructed
+  values of one kind were equal: `Some 1 == Some 2`, `(1, 2) == (3, 4)` and `[1] == [2]` were
+  all true. They now compare shape and parts recursively (list tails by iteration), strings by
+  content, and a function or array only to itself. To walk them, the runtime needs each value's
+  size: a tuple now carries its length (`[3, n, elements]`), and constructor ids run across the
+  whole program, with per-program tables of each constructor's field count and name
+  (`_rail_ctor_arity`, `_rail_ctor_name`). ARM64; the x86 and wasm runtimes are unchanged.
+  Test t242, `tools/fuzz/known/struct_eq.rail`.
 - **A pattern must name a declared constructor.** A name that was not a constructor compiled to
   a tag test against -1: never matched, or, as the last arm, matched everything. So
   `| Rde -> 1 | Green -> 2` returned 2 for `Red`, `| true -> 1 | false -> 0` crashed on the tag

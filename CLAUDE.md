@@ -48,7 +48,7 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 - **Effect handlers**: `try body handler`: setjmp/longjmp non-local error recovery. Deep unwinding, nested handlers.
 - **Type checker**: Forward inference pass emits warnings (not errors) for: head/tail on non-list, arithmetic on non-numeric, wrong arity, calling non-functions.
 - **Package manager**: `import math` (bare imports), `rail get github.com/...`, `rail pkg` reads `rail.toml`.
-- **Tests**: `./rail_native test`: 239/239 on master (2026-09-23). Count fluctuates only when concurrent sessions collide on `/tmp/rail_out`; rerun with `--out-prefix` to confirm.
+- **Tests**: `./rail_native test`: 240/240 on master (2026-09-23). Count fluctuates only when concurrent sessions collide on `/tmp/rail_out`; rerun with `--out-prefix` to confirm.
 - **Checkpoints**: `stdlib/checkpoint.rail`: `save_checkpoint prefix weights adams step best_val` + `load_checkpoint` / in-place `load_model_into` / `load_adam_states_into`. Atomic via `<prefix>.committed` sentinel. `corpus_split text val_pct` for eval splits. `tools/train/lm_transformer.rail:run_segments` wires resume + periodic checkpoint into the training loop.
 - **Performance**: Tail-recursive loops match C -O2 (5 instructions/iteration). Self-loop optimization, untagged register params, bottom-test with `subs`.
 - **Targets**: macOS ARM64 (native), Linux ARM64 (Pi Zero), Linux x86_64 (cross-compile)
@@ -56,7 +56,7 @@ Self-hosting programming language. Compiler written in Rail, compiles itself to 
 ### Key Commands
 
 ```bash
-./rail_native test                    # run the suite (239/239)
+./rail_native test                    # run the suite (240/240)
 RAIL_ARENA_MB=6000 ./rail_native self # self-compile. The compiler now INLINES the pure-Rail
                                       #   Mach-O linker (tools/v5/link_lib.rail), so self_compile
                                       #   DEFAULTS to in-process rail-link (NO as/ld/codesign) when
@@ -93,7 +93,7 @@ RAIL_ARENA_MB=6000 ./rail_native self # self-compile. The compiler now INLINES t
 
 ### Modifying the Compiler
 
-Read `docs/COMPILER_BOOTSTRAP.md` before editing `tools/compile.rail`: bootstrap cycles, the diagnostic pattern, the data-section and ASCII-only traps. Always: `RAIL_ARENA_MB=6000 ./rail_native self`, then `./rail_native test` (239/239), then self again and `cmp` for the fixed point.
+Read `docs/COMPILER_BOOTSTRAP.md` before editing `tools/compile.rail`: bootstrap cycles, the diagnostic pattern, the data-section and ASCII-only traps. Always: `RAIL_ARENA_MB=6000 ./rail_native self`, then `./rail_native test` (240/240), then self again and `cmp` for the fixed point.
 
 ## Substrate beyond compile.rail (shipped 2026-05-11)
 

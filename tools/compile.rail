@@ -1831,7 +1831,8 @@ cg2 node env ar lc sl tg tp fs =
     let elems = nd_elems node
     let n = length elems
     let (pa, lc1, sl1) = cg_push_args_boxed elems env ar lc sl fs
-    (cat [pa, "    mov x0, #", show (8 + n * 8), "\n    bl _rail_alloc\n    mov x1, #3\n    str x1, [x0]\n", pop_to_tuple n 0], lc1, sl1)
+    -- [3, n, elems...]: a tuple carries its length, so equality and show can walk it
+    (cat [pa, "    mov x0, #", show (16 + n * 8), "\n    bl _rail_alloc\n    mov x1, #3\n    str x1, [x0]\n    mov x1, #", show n, "\n    str x1, [x0, #8]\n", pop_to_tuple n 0], lc1, sl1)
   else if tg == "TD" then
     let names = nd_names node
     let (va, lc1, sl1) = cg (nd_n2 node) env ar lc sl false fs
@@ -2142,14 +2143,14 @@ pop_to_closure n i =
 pop_to_tuple n i =
   if i >= n then ""
   else
-    let off = 8 + (n - 1 - i) * 8
+    let off = 16 + (n - 1 - i) * 8
     cat ["    ldr x1, [sp], #16\n    str x1, [x0, #", show off, "]\n", pop_to_tuple n (i + 1)]
 
 extract_tuple names tuple_sl idx next_sl env =
   if length names == 0 then ("", env, next_sl)
   else
     let nm = head names
-    let elem_off = 8 + idx * 8
+    let elem_off = 16 + idx * 8
     let load = cat ["    ldr x0, [x29, #", show tuple_sl, "]\n    ldr x0, [x0, #", show elem_off, "]\n    str x0, [x29, #", show next_sl, "]\n"]
     let env2 = cons (nm, next_sl) env
     let (rest, env3, sl2) = extract_tuple (tail names) tuple_sl (idx + 1) (next_sl + 8) env2
@@ -2814,11 +2815,21 @@ builtin_foreign_arities =
    ("exp", 3001), ("log", 3001), ("pow", 3002), ("floor", 3001),
    ("ceil", 3001), ("atan2", 3002)]
 
-get_arities_acc decls =
-  if length decls == 0 then []
-  else get_arities_decl (head decls) (get_arities_acc (tail decls))
-get_arities_decl d rest = match d
-  | DType n variants -> append (ctor_arities variants) rest
+-- Constructor ids run across the whole program (not per type), so one number names a
+-- constructor at run time: structural equality and show read its arity and name from the
+-- per-program tables ctor_tables_asm emits.
+get_arities_acc decls = get_arities_go decls 0
+get_arities_go decls base =
+  if decls == [] then []
+  else
+    let d = head decls
+    let n = decl_ctor_count d
+    get_arities_decl d base (get_arities_go (tail decls) (base + n))
+decl_ctor_count d = match d
+  | DType n variants -> length variants
+  | _ -> 0
+get_arities_decl d base rest = match d
+  | DType n variants -> append (ctor_arities variants base) rest
   -- 1000=int, 2000=str (strdup-wrapped), 3000=float, 4000=raw ptr
   | DForeign nm arity ret -> cons (nm, (if ret == "str" then 2000 else if ret == "float" then 3000 else if ret == "ptr" then 4000 else 1000) + arity) rest
   | DFn nm ps b -> cons (nm, length ps) rest
@@ -2826,11 +2837,33 @@ get_arities_decl d rest = match d
   | DGradMark g -> cons (g, 0) rest
   | DErr m p -> cons (m, length p) rest
 
-ctor_arities variants =
-  if length variants == 0 then []
-  else cons (ctor_arity (head variants)) (ctor_arities (tail variants))
-ctor_arity v = match v
-  | Variant name idx arity mask fs -> (name, 0 - (100 + idx * 100 + arity))
+ctor_arities variants base =
+  if variants == [] then []
+  else cons (ctor_arity (head variants) base) (ctor_arities (tail variants) (base + 1))
+ctor_arity v id = match v
+  | Variant name idx arity mask fs -> (name, 0 - (100 + id * 100 + arity))
+
+-- The constructor tables the runtime reads, in constructor-id order: how many, each one's
+-- field count, each one's name.
+ctor_tables_asm decls =
+  let cs = ctor_list decls
+  cat ["\n.section __DATA,__data\n.p2align 3\n.global _rail_ctor_count\n_rail_ctor_count:\n    .quad ", show (length cs), "\n.global _rail_ctor_arity\n_rail_ctor_arity:\n", ctor_arity_quads cs, ".global _rail_ctor_name\n_rail_ctor_name:\n", ctor_name_quads cs 0, ctor_name_strs cs 0]
+ctor_list decls = if decls == [] then [] else append (decl_ctors (head decls)) (ctor_list (tail decls))
+decl_ctors d = match d
+  | DType n variants -> pat_variant_arities variants
+  | _ -> []
+ctor_arity_quads cs = if cs == [] then "    .quad 0\n" else ctor_arity_quads_go cs
+ctor_arity_quads_go cs =
+  if cs == [] then ""
+  else
+    let (n, a) = head cs
+    cat ["    .quad ", show a, "\n", ctor_arity_quads_go (tail cs)]
+ctor_name_quads cs i = if cs == [] then (if i == 0 then "    .quad 0\n" else "") else cat ["    .quad .Lctor_name_", show i, "\n", ctor_name_quads (tail cs) (i + 1)]
+ctor_name_strs cs i =
+  if cs == [] then ""
+  else
+    let (n, a) = head cs
+    cat [".Lctor_name_", show i, ":\n    .asciz \"", n, "\"\n", ctor_name_strs (tail cs) (i + 1)]
 
 -- P2 Stage B / B1: auth-type projection synthesis.
 -- For every ADT whose definition uses the `auth` field modifier, synthesize a
@@ -4473,8 +4506,16 @@ compile_funcs_loop decls ar lc asm_acc desc_acc =
     compile_funcs_loop (tail decls) ar lc1 (cons fasm asm_acc) (cons fdesc desc_acc)
 
 rt_core =
-  let req = "_rail_eq:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    tst x1, #1\n    b.eq .Lreq_heap\n    cmp x1, x0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_heap:\n    cbz x1, .Lreq_raw_cmp\n    cbz x0, .Lreq_raw_cmp\n    tst x0, #1\n    b.ne .Lreq_mismatch\n    lsr x2, x1, #47\n    cbnz x2, .Lreq_fl\n    cmp x1, #4095\n    b.ls .Lreq_fl\n    ldr x2, [x1]\n    and x2, x2, #0x7fffffffffffffff\n    cmp x2, #6\n    b.eq .Lreq_fl\n    str x0, [x29, #16]\n    mov x0, x1\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _str_unwrap\n    mov x1, x0\n    ldr x0, [x29, #24]\n    bl _strcmp\n    cmp x0, #0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_raw_cmp:\n    cmp x1, x0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_mismatch:\n    mov x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_fl:\n    bl _rail_fval1\n    bl _rail_fval\n    fcmp d1, d0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n\n"
-  let rne = "_rail_ne:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    tst x1, #1\n    b.eq .Lrne_heap\n    cmp x1, x0\n    cset x0, ne\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lrne_heap:\n    cbz x1, .Lrne_raw_cmp\n    cbz x0, .Lrne_raw_cmp\n    tst x0, #1\n    b.ne .Lrne_mismatch\n    lsr x2, x1, #47\n    cbnz x2, .Lrne_fl\n    cmp x1, #4095\n    b.ls .Lrne_fl\n    ldr x2, [x1]\n    and x2, x2, #0x7fffffffffffffff\n    cmp x2, #6\n    b.eq .Lrne_fl\n    str x0, [x29, #16]\n    mov x0, x1\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _str_unwrap\n    mov x1, x0\n    ldr x0, [x29, #24]\n    bl _strcmp\n    cmp x0, #0\n    cset x0, ne\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lrne_raw_cmp:\n    cmp x1, x0\n    cset x0, ne\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lrne_mismatch:\n    mov x0, #3\n    ldp x29, x30, [sp], #32\n    ret\n.Lrne_fl:\n    bl _rail_fval1\n    bl _rail_fval\n    fcmp d1, d0\n    cset x0, ne\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n\n"
+  let req = "_rail_eq:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    tst x1, #1\n    b.eq .Lreq_heap\n    cmp x1, x0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_heap:\n    cbz x1, .Lreq_raw_cmp\n    cbz x0, .Lreq_raw_cmp\n    tst x0, #1\n    b.ne .Lreq_mismatch\n    lsr x2, x1, #47\n    cbnz x2, .Lreq_fl\n    cmp x1, #4095\n    b.ls .Lreq_fl\n    ldr x2, [x1]\n    and x2, x2, #0x7fffffffffffffff\n    cmp x2, #6\n    b.eq .Lreq_fl\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    bl _rail_eq_heap\n    cmp x0, #2\n    b.ne .Lreq_bool\n    ldr x0, [x29, #16]\n    ldr x1, [x29, #24]\n    str x0, [x29, #16]\n    mov x0, x1\n    bl _str_unwrap\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    bl _str_unwrap\n    mov x1, x0\n    ldr x0, [x29, #24]\n    bl _strcmp\n    cmp x0, #0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_bool:\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_raw_cmp:\n    cmp x1, x0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_mismatch:\n    mov x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n.Lreq_fl:\n    bl _rail_fval1\n    bl _rail_fval\n    fcmp d1, d0\n    cset x0, eq\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #32\n    ret\n\n"
+  let rne = "_rail_ne:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    bl _rail_eq\n    mov x1, #4\n    sub x0, x1, x0\n    ldp x29, x30, [sp], #16\n    ret\n\n"
+  -- _rail_eq_heap a b: structural equality of two heap values: 1 equal, 0 not, 2 when neither
+  -- is a container (the caller compares them as strings). Cons cells (1) compare heads by
+  -- recursion and tails by iteration; nil (2) equals nil; tuples (3, [3, n, elems]) compare
+  -- lengths and elements; constructed values (5, [5, id, fields]) compare constructor ids and
+  -- the fields _rail_ctor_arity says they have. Closures (4), arrays (7) and errors (8) are equal
+  -- only to themselves. Until 2026-09-23 these all went to strcmp, which compared header bytes:
+  -- `Some 1 == Some 2` and `(1, 2) == (3, 4)` were true.
+  let reqh = "_rail_eq_heap:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    cmp x0, x1\n    b.eq .Leqh_true\n    ldr x2, [x0]\n    and x2, x2, #0x7fffffffffffffff\n    ldr x3, [x1]\n    and x3, x3, #0x7fffffffffffffff\n    cmp x2, #4\n    b.eq .Leqh_false\n    cmp x2, #7\n    b.eq .Leqh_false\n    cmp x2, #8\n    b.eq .Leqh_false\n    cmp x2, #5\n    b.hi .Leqh_nota\n    cbz x2, .Leqh_nota\n    cmp x3, x2\n    b.ne .Leqh_false\n    cmp x2, #2\n    b.eq .Leqh_true\n    cmp x2, #1\n    b.eq .Leqh_cons\n    cmp x2, #3\n    b.eq .Leqh_tuple\n    ldr x4, [x0, #8]\n    ldr x5, [x1, #8]\n    cmp x4, x5\n    b.ne .Leqh_false\n    adrp x6, _rail_ctor_count@PAGE\n    ldr x6, [x6, _rail_ctor_count@PAGEOFF]\n    cmp x4, x6\n    b.hs .Leqh_true\n    adrp x6, _rail_ctor_arity@PAGE\n    add x6, x6, _rail_ctor_arity@PAGEOFF\n    ldr x5, [x6, x4, lsl #3]\n    b .Leqh_fields\n.Leqh_tuple:\n    ldr x4, [x0, #8]\n    ldr x5, [x1, #8]\n    cmp x4, x5\n    b.ne .Leqh_false\n.Leqh_fields:\n    str x5, [x29, #40]\n    str xzr, [x29, #32]\n.Leqh_floop:\n    ldr x4, [x29, #32]\n    ldr x5, [x29, #40]\n    cmp x4, x5\n    b.hs .Leqh_true\n    add x4, x4, #2\n    ldr x0, [x29, #16]\n    ldr x0, [x0, x4, lsl #3]\n    ldr x1, [x29, #24]\n    ldr x1, [x1, x4, lsl #3]\n    bl _rail_eq\n    cmp x0, #3\n    b.ne .Leqh_false\n    ldr x4, [x29, #32]\n    add x4, x4, #1\n    str x4, [x29, #32]\n    b .Leqh_floop\n.Leqh_cons:\n    ldr x0, [x29, #16]\n    ldr x0, [x0, #8]\n    ldr x1, [x29, #24]\n    ldr x1, [x1, #8]\n    bl _rail_eq\n    cmp x0, #3\n    b.ne .Leqh_false\n    ldr x0, [x29, #16]\n    ldr x0, [x0, #16]\n    ldr x1, [x29, #24]\n    ldr x1, [x1, #16]\n    str x0, [x29, #16]\n    str x1, [x29, #24]\n    cmp x0, x1\n    b.eq .Leqh_true\n    tst x0, #1\n    b.ne .Leqh_tail\n    tst x1, #1\n    b.ne .Leqh_tail\n    cbz x0, .Leqh_tail\n    cbz x1, .Leqh_tail\n    ldr x2, [x0]\n    and x2, x2, #0x7fffffffffffffff\n    cmp x2, #1\n    b.ne .Leqh_tail\n    ldr x3, [x1]\n    and x3, x3, #0x7fffffffffffffff\n    cmp x3, #1\n    b.eq .Leqh_cons\n.Leqh_tail:\n    bl _rail_eq\n    cmp x0, #3\n    b.ne .Leqh_false\n.Leqh_true:\n    mov x0, #1\n    ldp x29, x30, [sp], #64\n    ret\n.Leqh_false:\n    mov x0, #0\n    ldp x29, x30, [sp], #64\n    ret\n.Leqh_nota:\n    mov x0, #2\n    ldp x29, x30, [sp], #64\n    ret\n\n"
   let radd = "_rail_add:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    tst x1, #1\n    b.eq .Ladd_heap\n    tst x0, #1\n    b.eq .Ladd_fl\n    asr x1, x1, #1\n    asr x0, x0, #1\n    add x0, x1, x0\n    lsl x0, x0, #1\n    orr x0, x0, #1\n    ldp x29, x30, [sp], #16\n    ret\n.Ladd_heap:\n    tst x0, #1\n    b.ne .Ladd_fl\n    lsr x2, x1, #47\n    cbnz x2, .Ladd_fl\n    cmp x1, #4095\n    b.ls .Ladd_fl\n    ldr x2, [x1]\n    and x2, x2, #0x7fffffffffffffff\n    cmp x2, #6\n    b.eq .Ladd_fl\n    mov x2, x0\n    mov x0, x1\n    mov x1, x2\n    bl _rail_str_append\n    ldp x29, x30, [sp], #16\n    ret\n.Ladd_fl:\n    bl _rail_fval1\n    bl _rail_fval\n    fadd d0, d1, d0\n    mov x0, #16\n    bl _rail_alloc\n    mov x1, #6\n    str x1, [x0]\n    str d0, [x0, #8]\n    ldp x29, x30, [sp], #16\n    ret\n\n"
   let rprint = "_rail_print:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    tst x0, #1\n    b.eq .Lprnt_heap\n    asr x0, x0, #1\n    mov x1, #0\n    cmp x0, #0\n    b.ge .Lpi_pos\n    neg x0, x0\n    mov x1, #1\n.Lpi_pos:\n    str x1, [x29, #48]\n    mov x2, #0\n    mov x3, #10\n    add x4, x29, #16\n.Lpi_div:\n    udiv x5, x0, x3\n    msub x6, x5, x3, x0\n    add x6, x6, #48\n    str x6, [sp, #-16]!\n    add x2, x2, #1\n    mov x0, x5\n    cbnz x0, .Lpi_div\n    cbz x2, .Lpi_zero\n    mov x7, #0\n    ldr x1, [x29, #48]\n    cbz x1, .Lpi_nosign\n    mov w1, #45\n    strb w1, [x4, x7]\n    add x7, x7, #1\n.Lpi_nosign:\n.Lpi_rev:\n    ldr x6, [sp], #16\n    strb w6, [x4, x7]\n    add x7, x7, #1\n    sub x2, x2, #1\n    cbnz x2, .Lpi_rev\n    mov w1, #10\n    strb w1, [x4, x7]\n    add x7, x7, #1\n    mov x0, #1\n    mov x1, x4\n    mov x2, x7\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lprnt_done\n.Lpi_zero:\n    mov w0, #48\n    strb w0, [x4]\n    mov w0, #10\n    strb w0, [x4, #1]\n    mov x0, #1\n    mov x1, x4\n    mov x2, #2\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lprnt_done\n.Lprnt_heap:\n    ldr x1, [x0]\n    and x1, x1, #0x7fffffffffffffff\n    cmp x1, #6\n    b.eq .Lprnt_float\n    bl _str_unwrap\n    str x0, [x29, #16]\n    bl _strlen\n    mov x2, x0\n    mov x0, #1\n    ldr x1, [x29, #16]\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov w0, #10\n    strb w0, [x29, #24]\n    mov x0, #1\n    add x1, x29, #24\n    mov x2, #1\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    b .Lprnt_done\n.Lprnt_float:\n    ldr d0, [x0, #8]\n    str d0, [x29, #16]\n    mov x0, #32\n    bl _malloc\n    str x0, [x29, #24]\n    ldr d0, [x29, #16]\n    str d0, [sp, #-16]!\n    ldr x0, [x29, #24]\n    mov x1, #32\n    adrp x2, _fmt_gbare@PAGE\n    add x2, x2, _fmt_gbare@PAGEOFF\n    bl _snprintf\n    add sp, sp, #16\n    ldr x0, [x29, #24]\n    bl _strlen\n    mov x2, x0\n    mov x0, #1\n    ldr x1, [x29, #24]\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    mov w0, #10\n    strb w0, [x29, #32]\n    mov x0, #1\n    add x1, x29, #32\n    mov x2, #1\n    movz x16, #4\n    movk x16, #0x200, lsl #16\n    svc #0x80\n    ldr x0, [x29, #24]\n    bl _free\n.Lprnt_done:\n    mov x0, #1\n    ldp x29, x30, [sp], #64\n    ret\n\n"
   let rshow = "_rail_show:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    bl _rail_show_inner\n    bl _rail_wrap_str\n    ldp x29, x30, [sp], #16\n    ret\n\n_rail_show_inner:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    tst x0, #1\n    b.eq .Lshow_heap\n    asr x0, x0, #1\n    str x0, [x29, #16]\n    mov x0, #24\n    bl _rail_chained_malloc\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    ldr x1, [x29, #24]\n    mov x6, #0\n    cmp x0, #0\n    b.ge .Lsi_pos\n    neg x0, x0\n    mov w7, #45\n    strb w7, [x1, x6]\n    add x6, x6, #1\n.Lsi_pos:\n    str x6, [x29, #16]\n    mov x2, #0\n    mov x3, #10\n.Lsi_div:\n    udiv x4, x0, x3\n    msub x5, x4, x3, x0\n    add x5, x5, #48\n    str x5, [sp, #-16]!\n    add x2, x2, #1\n    mov x0, x4\n    cbnz x0, .Lsi_div\n    cbz x2, .Lsi_zero\n    ldr x6, [x29, #16]\n    ldr x1, [x29, #24]\n.Lsi_rev:\n    ldr x5, [sp], #16\n    strb w5, [x1, x6]\n    add x6, x6, #1\n    sub x2, x2, #1\n    cbnz x2, .Lsi_rev\n    mov w5, #0\n    strb w5, [x1, x6]\n    ldr x0, [x29, #24]\n    ldp x29, x30, [sp], #32\n    ret\n.Lsi_zero:\n    ldr x6, [x29, #16]\n    ldr x1, [x29, #24]\n    mov w0, #48\n    strb w0, [x1, x6]\n    add x6, x6, #1\n    mov w0, #0\n    strb w0, [x1, x6]\n    ldr x0, [x29, #24]\n    ldp x29, x30, [sp], #32\n    ret\n.Lshow_heap:\n    ldr x1, [x0]\n    cmp x1, #6\n    b.eq .Lshow_float\n    cmp x1, #2\n    b.eq .Lshow_nil\n    cmp x1, #1\n    b.eq .Lshow_list\n    ldp x29, x30, [sp], #32\n    ret\n.Lshow_nil:\n    mov x0, #4\n    bl _rail_chained_malloc\n    mov w1, #91\n    strb w1, [x0]\n    mov w1, #93\n    strb w1, [x0, #1]\n    mov w1, #0\n    strb w1, [x0, #2]\n    ldp x29, x30, [sp], #32\n    ret\n.Lshow_list:\n    bl _rail_show_list\n    ldp x29, x30, [sp], #32\n    ret\n.Lshow_float:\n    ldr d0, [x0, #8]\n    str d0, [x29, #24]\n    mov x0, #32\n    bl _rail_chained_malloc\n    str x0, [x29, #16]\n    ldr d0, [x29, #24]\n    str d0, [sp, #-16]!\n    ldr x0, [x29, #16]\n    mov x1, #32\n    adrp x2, _fmt_gbare@PAGE\n    add x2, x2, _fmt_gbare@PAGEOFF\n    bl _snprintf\n    add sp, sp, #16\n    ldr x0, [x29, #16]\n    ldp x29, x30, [sp], #32\n    ret\n\n_rail_show_list:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    str x0, [x29, #16]\n    mov x0, #4\n    bl _rail_chained_malloc\n    mov w1, #91\n    strb w1, [x0]\n    mov w1, #0\n    strb w1, [x0, #1]\n    str x0, [x29, #24]\n    mov x0, #4\n    bl _rail_chained_malloc\n    mov w1, #44\n    strb w1, [x0]\n    mov w1, #32\n    strb w1, [x0, #1]\n    mov w1, #0\n    strb w1, [x0, #2]\n    str x0, [x29, #32]\n    mov x0, #4\n    bl _rail_chained_malloc\n    mov w1, #93\n    strb w1, [x0]\n    mov w1, #0\n    strb w1, [x0, #1]\n    str x0, [x29, #40]\n    mov x0, #1\n    str x0, [x29, #48]\n.Lshowl_loop:\n    ldr x0, [x29, #16]\n    tst x0, #1\n    b.ne .Lshowl_done\n    ldr x1, [x0]\n    cmp x1, #2\n    b.eq .Lshowl_done\n    cmp x1, #1\n    b.ne .Lshowl_done\n    ldr x0, [x29, #48]\n    cbnz x0, .Lshowl_skip_sep\n    ldr x0, [x29, #24]\n    ldr x1, [x29, #32]\n    bl _rail_str_append\n    str x0, [x29, #24]\n.Lshowl_skip_sep:\n    str xzr, [x29, #48]\n    ldr x0, [x29, #16]\n    ldr x0, [x0, #8]\n    bl _rail_show\n    mov x1, x0\n    ldr x0, [x29, #24]\n    bl _rail_str_append\n    str x0, [x29, #24]\n    ldr x0, [x29, #16]\n    ldr x0, [x0, #16]\n    str x0, [x29, #16]\n    b .Lshowl_loop\n.Lshowl_done:\n    ldr x0, [x29, #24]\n    ldr x1, [x29, #40]\n    bl _rail_str_append\n    ldp x29, x30, [sp], #64\n    ret\n\n"
@@ -4496,7 +4537,7 @@ rt_core =
   -- untagged operand as raw bits in one routine and as a box in the next
   -- (findings F-5000-2, known/mixed_int_from_fn).
   let rfval = "_rail_fval:\n    tst x0, #1\n    b.ne .Lfv_int\n    lsr x2, x0, #47\n    cbnz x2, .Lfv_raw\n    cmp x0, #4095\n    b.ls .Lfv_raw\n    ldr x2, [x0]\n    and x2, x2, #0x7fffffffffffffff\n    cmp x2, #6\n    b.ne .Lfv_raw\n    ldr d0, [x0, #8]\n    ret\n.Lfv_raw:\n    fmov d0, x0\n    ret\n.Lfv_int:\n    asr x2, x0, #1\n    scvtf d0, x2\n    ret\n\n_rail_fval1:\n    tst x1, #1\n    b.ne .Lfv1_int\n    lsr x2, x1, #47\n    cbnz x2, .Lfv1_raw\n    cmp x1, #4095\n    b.ls .Lfv1_raw\n    ldr x2, [x1]\n    and x2, x2, #0x7fffffffffffffff\n    cmp x2, #6\n    b.ne .Lfv1_raw\n    ldr d1, [x1, #8]\n    ret\n.Lfv1_raw:\n    fmov d1, x1\n    ret\n.Lfv1_int:\n    asr x2, x1, #1\n    scvtf d1, x2\n    ret\n\n"
-  cat [req, rne, radd, rprint, rshow, rstrapp, rfval]
+  cat [req, rne, reqh, radd, rprint, rshow, rstrapp, rfval]
 
 rt_list =
   -- _rail_alloc slow path (bump arena full + GC+free-list can't cover)
@@ -5581,7 +5622,7 @@ compile_checked decls =
   let (funcs, gc_descs, _) = compile_funcs td ar 0
   let rt = runtime_asm
   let gc_desc_block = cat ["\n.section __DATA,__data\n.p2align 3\n.global _gc_desc_table_start\n_gc_desc_table_start:\n", gc_descs, ".global _gc_desc_table_end\n_gc_desc_table_end:\n"]
-  cat [hdr, funcs, rt, data_section_asm, gc_desc_block]
+  cat [hdr, funcs, rt, data_section_asm, ctor_tables_asm td, gc_desc_block]
 
 -- ── Arity check (2026-09-07) ─────────────────────────────────────────────
 -- Rail has no currying and no arity error at runtime: a call with too few
@@ -6609,6 +6650,9 @@ run_tests _ =
   -- one given fewer arguments than it has fields is a lambda over the rest, its given arguments
   -- evaluated once (code generation emitted a null pointer for it until 2026-09-23)
   let t241 = run_test "ctor_values" "type O = | Some int | None\ntype P = | Pair int int\nunwrap o = match o\n  | Some v -> v\n  | None -> 0\nfst p = match p\n  | Pair a b -> a\nsnd p = match p\n  | Pair a b -> b\nnoisy x = let _ = print \"arg\" in x\nmain =\n  let xs = map Some [1, 2, 3]\n  let _ = print (show (fold (\\acc o -> acc + unwrap o) 0 xs))\n  let mk = Pair (noisy 10)\n  let ps = map mk [1, 2]\n  let _ = print (show (fold (\\acc p -> acc + fst p * snd p) 0 ps))\n  let f = Pair\n  let q = f 3 4\n  let _ = print (show (fst q + snd q))\n  0" "6\narg\n30\n7"
+  -- t242: == and != compare lists, tuples and constructed values structurally (the runtime
+  -- strcmp'd their header bytes, so any two of one kind were equal: Some 1 == Some 2)
+  let t242 = run_test "structural_equality" "type O = | Some int | None\ntype T = | Leaf | Node T int T\ntype P = | Pair int str\nb x = if x then \"t\" else \"f\"\nmain =\n  let _ = print (cat [b ([1] == [2]), b ([1, 2] == [1, 2]), b ([] == []), b ([1] == []), b ([] == [1])])\n  let _ = print (cat [b ((1, 2) == (3, 4)), b ((1, 2) == (1, 2)), b ((1, \"a\") == (1, \"a\")), b ((1, 2) != (1, 3))])\n  let _ = print (cat [b (Some 1 == Some 2), b (Some 1 == Some 1), b (Some 1 == None), b (None == None), b (Some 1 != Some 2)])\n  let t1 = Node (Node Leaf 1 Leaf) 2 Leaf\n  let t2 = Node (Node Leaf 1 Leaf) 2 Leaf\n  let t3 = Node (Node Leaf 9 Leaf) 2 Leaf\n  let _ = print (cat [b (t1 == t2), b (t1 == t3), b (Pair 1 \"x\" == Pair 1 \"x\"), b (Pair 1 \"x\" == Pair 1 \"y\")])\n  let _ = print (cat [b ([[1, 2], [3]] == [[1, 2], [3]]), b ([[1, 2], [3]] == [[1, 2], [4]]), b ([1.5, 2.5] == [1.5, 2.5]), b ([1.5] == [2.5])])\n  let _ = print (cat [b (\"abc\" == \"abc\"), b (\"abc\" == \"abd\"), b (3 == 3), b (3 == 4), b ([Some 1, None] == [Some 1, None])])\n  let (x, y) = (10, 20)\n  let _ = print (show (x + y))\n  0" "fttff\nfttt\nftftt\ntftf\ntftf\ntftft\n30"
   -- t186/t187: MHD kernel invariants. stdlib/mhd_{kernel,axisym,mpd}.rail is
   -- 1,254 lines driving the live entropy beacon and had NO suite coverage until
   -- 2026-08-30. t186 pins the guarantee the beacon actually publishes; t187 pins
@@ -6629,10 +6673,10 @@ run_tests _ =
   -- cleaner that damps the field to mush would pass the first one alone.
   let t189 = run_test "mhd_glm_divergence_cleaning" "import \"stdlib/mhd_kernel.rail\"\nabsf x = if x < 0.0 then 0.0 - x else x\nclean_k state psi dt ch cr k i =\n  if i >= k then 0\n  else\n    let _ = mk_glm_clean state psi (dt / to_float k) ch cr\n    clean_k state psi dt ch cr k (i + 1)\nrun state psi k n =\n  if n <= 0 then state\n  else\n    let dt = mk_compute_dt_muscl state\n    let ch = 3.0 * mk_max_speed state\n    let ns = mk_muscl_step state dt\n    let _ = if k > 0 then clean_k ns psi dt ch 0.18 k 0 else 0\n    run ns psi k (n - 1)\nmain =\n  let s0 = mk_init_state\n  let m0 = mk_total_mass s0\n  let e0 = mk_total_energy s0\n  let p = mk_max_div_b (run mk_init_state (mk_psi_new 0) 0 10)\n  let g = run mk_init_state (mk_psi_new 0) 4 10\n  let gd = mk_max_div_b g\n  -- GLM must cut divergence by at least 4x (measured 6.8x) ...\n  let cleaner = if gd * 4.0 < p then 1 else 0\n  -- ... without spending conservation to buy it ...\n  let dm = absf ((mk_total_mass g - m0) / m0)\n  let de = absf ((mk_total_energy g - e0) / e0)\n  let conserved = if dm < 0.0000000001 then (if de < 0.0000000001 then 1 else 0) else 0\n  -- ... and psi must actually be doing something (guards a stubbed-out clean).\n  let alive = if gd > 0.0 then 1 else 0\n  let ok = if cleaner == 1 then (if conserved == 1 then (if alive == 1 then 1 else 0) else 0) else 0\n  let _ = print (if ok == 1 then \"ok\" else cat [\"FAIL p=\", show_float p, \" g=\", show_float gd, \" dm=\", show_float dm])\n  0\n" "ok"
   let s_mhd = (if t186 then 1 else 0) + (if t187 then 1 else 0) + (if t188 then 1 else 0) + (if t189 then 1 else 0)
-  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0) + (if t230 then 1 else 0) + (if t231 then 1 else 0) + (if t232 then 1 else 0) + (if t233 then 1 else 0) + (if t234 then 1 else 0) + (if t235 then 1 else 0) + (if t236 then 1 else 0) + (if t237 then 1 else 0) + (if t238 then 1 else 0) + (if t239 then 1 else 0) + (if t240 then 1 else 0) + (if t241 then 1 else 0)
+  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0) + (if t230 then 1 else 0) + (if t231 then 1 else 0) + (if t232 then 1 else 0) + (if t233 then 1 else 0) + (if t234 then 1 else 0) + (if t235 then 1 else 0) + (if t236 then 1 else 0) + (if t237 then 1 else 0) + (if t238 then 1 else 0) + (if t239 then 1 else 0) + (if t240 then 1 else 0) + (if t241 then 1 else 0) + (if t242 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s_inf + s_bx + s_ed + s_tls + s_flt + s_drv + s_mhd
-  let _ = print (cat [show total, "/239 tests passed"])
-  if total == 239 then 0 else 1
+  let _ = print (cat [show total, "/240 tests passed"])
+  if total == 240 then 0 else 1
 
 -- ===========================================================================
 -- M6, self-hosted emit path. Replaces as/ld/codesign with the pure-Rail
