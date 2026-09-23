@@ -4794,7 +4794,7 @@ rt_gc_3 =
 
 rt_gc_4 =
   -- _rail_gc: main entry point. Walk stack frames, mark, sweep.
-  -- Track A C3: per-frame, look up the return-address in the slot-type
+  -- Track A C3: per-frame, look up the owning function's return address in the slot-type
   -- descriptor table; use its 32-bit bits field to skip slots known to be
   -- int (00) or float (01). On miss, fall back to the bits = -1 behavior
   -- (all slots = 11 = scan), which matches the pre-C3 conservative walk.
@@ -4806,12 +4806,18 @@ rt_gc_4 =
   "    adrp x1, _gc_mark_top@PAGE\n    str xzr, [x1, _gc_mark_top@PAGEOFF]\n",
   "    mov x0, #524288\n    adrp x1, _gc_mark_cap@PAGE\n    str x0, [x1, _gc_mark_cap@PAGEOFF]\n",
   -- Walk stack frames via x29 chain
-  "    mov x19, x29\n",
+  "    mov x19, x29\n    str xzr, [x29, #32]\n",
   ".Lgc_frame_loop:\n    cbz x19, .Lgc_sweep\n",
   "    ldr x20, [x19]\n",
-  -- C3: resolve return address (caller PC at [fp, #8]) against descriptor table.
+  -- Which function owns the frame at x19? The return address that points INTO it is the one
+  -- saved in the frame below ([x29, #32] carries it up the walk; 0 for _rail_gc's own frame,
+  -- a miss that scans every slot). The address saved in this frame ([x19, #8]) points into the
+  -- caller, and owns the next frame. Until 2026-09-23 the walk looked this frame up by its own
+  -- saved address, applying the caller's slot bits to it: a runtime function's saved arguments
+  -- (_rail_cons holding a fresh tuple or constructed value) sat in slots the caller calls int,
+  -- were skipped, and the object was swept while still referenced.
   -- On hit: load 32-bit bits field at offset +16 of the record. On miss: -1.
-  "    ldr x0, [x19, #8]\n    str x19, [x29, #16]\n    str x20, [x29, #24]\n    bl _gc_lookup_fn_desc\n    ldr x19, [x29, #16]\n    ldr x20, [x29, #24]\n    cbz x0, .Lgc_bits_miss\n    ldr w23, [x0, #20]\n    b .Lgc_bits_ready\n.Lgc_bits_miss:\n    mov w23, #-1\n.Lgc_bits_ready:\n",
+  "    ldr x0, [x29, #32]\n    ldr x1, [x19, #8]\n    str x1, [x29, #32]\n    str x19, [x29, #16]\n    str x20, [x29, #24]\n    bl _gc_lookup_fn_desc\n    ldr x19, [x29, #16]\n    ldr x20, [x29, #24]\n    cbz x0, .Lgc_bits_miss\n    ldr w23, [x0, #20]\n    b .Lgc_bits_ready\n.Lgc_bits_miss:\n    mov w23, #-1\n.Lgc_bits_ready:\n",
   -- Scan frame: slots from fp+16 to fp+2048 (or parent frame).
   -- Additional cap at _rail_stack_top prevents walking past the real
   -- stack top for the final frame in the chain.
@@ -6015,6 +6021,21 @@ driver_import_diamond _ =
   let _ = print (if ok then "  PASS: 42" else cat ["  FAIL: ", last])
   ok
 
+-- the collector keeps what a runtime function still holds: until 2026-09-23 the frame walk
+-- applied each caller's slot bits to its callee's frame, so _rail_cons's saved tuple argument
+-- sat in a slot the caller calls int, was skipped, and got swept (74998500002 at 16 MB)
+driver_gc_small_arena _ =
+  let _ = print "  --- driver_gc_small_arena ---"
+  let dir = trim (shell "mktemp -d /tmp/rail_gc_XXXXXX")
+  let m = cat [dir, "/main.rail"]
+  let _ = write_file m "mk i n acc = if i >= n then acc else mk (i + 1) n (cons (i, i) acc)\nsumt xs acc = if xs == [] then acc else\n  let (a, b) = head xs\n  sumt (tail xs) (acc + a + b)\nround r acc = if r >= 30 then acc else round (r + 1) (acc + sumt (mk 0 50000 []) 0)\nmain =\n  let _ = print (show (round 0 0))\n  0\n"
+  let _ = shell (cat ["./rail_native --out-prefix ", dir, "/out ", m, " >/dev/null 2>&1"])
+  let last = trim (shell (cat ["RAIL_ARENA_MB=16 ", dir, "/out 2>&1 | tail -1"]))
+  let _ = shell (cat ["rm -rf ", dir])
+  let ok = last == "74998500000"
+  let _ = print (if ok then "  PASS: 74998500000 at 16 MB" else cat ["  FAIL: ", last])
+  ok
+
 driver_self_refuses_small_arena _ =
   let _ = print "  --- driver_self_refuses_small_arena ---"
   let line = trim (shell "RAIL_ARENA_MB=1000 ./rail_native self 2>&1 | head -1")
@@ -6687,6 +6708,8 @@ run_tests _ =
   -- tables; they printed header bytes) and true or false for a value code generation knows is a
   -- bool (a literal, a comparison, a bool-typed fn or name); a bool is an int at run time
   let t243 = run_test "show_everything" "type O = | Some int | None\ntype T = | Leaf | Node T int T\ntype P = | Pair int str\nis_even n = n % 2 == 0\nflag b = if b then 1 else 0\nmain =\n  let _ = print (show (1, 2))\n  let _ = print (show (1, \"a\", 2.5))\n  let _ = print (show (Some 3))\n  let _ = print (show None)\n  let _ = print (show (Node (Node Leaf 1 Leaf) 2 Leaf))\n  let _ = print (show (Pair 7 \"x\"))\n  let _ = print (show [Some 1, None])\n  let _ = print (show (Some (Some 5)))\n  let _ = print (show ((1, 2), [3, 4]))\n  let _ = print (show true)\n  let _ = print (show (3 > 2))\n  let _ = print (show (is_even 7))\n  let ok = 1 == 1\n  let _ = print (show ok)\n  let _ = print (show (flag true))\n  let _ = print (show 42)\n  0" "(1, 2)\n(1, a, 2.5)\nSome 3\nNone\nNode (Node Leaf 1 Leaf) 2 Leaf\nPair 7 x\n[Some 1, None]\nSome (Some 5)\n((1, 2), [3, 4])\ntrue\ntrue\nfalse\ntrue\n1\n42"
+  -- t244: the collector keeps a runtime function's live arguments (frame owner by return address)
+  let t244 = driver_gc_small_arena 0
   -- t186/t187: MHD kernel invariants. stdlib/mhd_{kernel,axisym,mpd}.rail is
   -- 1,254 lines driving the live entropy beacon and had NO suite coverage until
   -- 2026-08-30. t186 pins the guarantee the beacon actually publishes; t187 pins
@@ -6707,10 +6730,10 @@ run_tests _ =
   -- cleaner that damps the field to mush would pass the first one alone.
   let t189 = run_test "mhd_glm_divergence_cleaning" "import \"stdlib/mhd_kernel.rail\"\nabsf x = if x < 0.0 then 0.0 - x else x\nclean_k state psi dt ch cr k i =\n  if i >= k then 0\n  else\n    let _ = mk_glm_clean state psi (dt / to_float k) ch cr\n    clean_k state psi dt ch cr k (i + 1)\nrun state psi k n =\n  if n <= 0 then state\n  else\n    let dt = mk_compute_dt_muscl state\n    let ch = 3.0 * mk_max_speed state\n    let ns = mk_muscl_step state dt\n    let _ = if k > 0 then clean_k ns psi dt ch 0.18 k 0 else 0\n    run ns psi k (n - 1)\nmain =\n  let s0 = mk_init_state\n  let m0 = mk_total_mass s0\n  let e0 = mk_total_energy s0\n  let p = mk_max_div_b (run mk_init_state (mk_psi_new 0) 0 10)\n  let g = run mk_init_state (mk_psi_new 0) 4 10\n  let gd = mk_max_div_b g\n  -- GLM must cut divergence by at least 4x (measured 6.8x) ...\n  let cleaner = if gd * 4.0 < p then 1 else 0\n  -- ... without spending conservation to buy it ...\n  let dm = absf ((mk_total_mass g - m0) / m0)\n  let de = absf ((mk_total_energy g - e0) / e0)\n  let conserved = if dm < 0.0000000001 then (if de < 0.0000000001 then 1 else 0) else 0\n  -- ... and psi must actually be doing something (guards a stubbed-out clean).\n  let alive = if gd > 0.0 then 1 else 0\n  let ok = if cleaner == 1 then (if conserved == 1 then (if alive == 1 then 1 else 0) else 0) else 0\n  let _ = print (if ok == 1 then \"ok\" else cat [\"FAIL p=\", show_float p, \" g=\", show_float gd, \" dm=\", show_float dm])\n  0\n" "ok"
   let s_mhd = (if t186 then 1 else 0) + (if t187 then 1 else 0) + (if t188 then 1 else 0) + (if t189 then 1 else 0)
-  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0) + (if t230 then 1 else 0) + (if t231 then 1 else 0) + (if t232 then 1 else 0) + (if t233 then 1 else 0) + (if t234 then 1 else 0) + (if t235 then 1 else 0) + (if t236 then 1 else 0) + (if t237 then 1 else 0) + (if t238 then 1 else 0) + (if t239 then 1 else 0) + (if t240 then 1 else 0) + (if t241 then 1 else 0) + (if t242 then 1 else 0) + (if t243 then 1 else 0)
+  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0) + (if t230 then 1 else 0) + (if t231 then 1 else 0) + (if t232 then 1 else 0) + (if t233 then 1 else 0) + (if t234 then 1 else 0) + (if t235 then 1 else 0) + (if t236 then 1 else 0) + (if t237 then 1 else 0) + (if t238 then 1 else 0) + (if t239 then 1 else 0) + (if t240 then 1 else 0) + (if t241 then 1 else 0) + (if t242 then 1 else 0) + (if t243 then 1 else 0) + (if t244 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s_inf + s_bx + s_ed + s_tls + s_flt + s_drv + s_mhd
-  let _ = print (cat [show total, "/241 tests passed"])
-  if total == 241 then 0 else 1
+  let _ = print (cat [show total, "/242 tests passed"])
+  if total == 242 then 0 else 1
 
 -- ===========================================================================
 -- M6, self-hosted emit path. Replaces as/ld/codesign with the pure-Rail

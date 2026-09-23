@@ -136,6 +136,15 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **The collector no longer frees what a runtime function still holds.** Walking the stack, the
+  collector looked each frame up by the return address saved in that frame, which points into
+  the caller, so it applied the caller's slot map to the callee's frame. A runtime function's
+  saved arguments (`_rail_cons` holding a fresh tuple or constructed value) sat in slots the
+  caller marks int, were skipped, and the object was swept while still referenced: building
+  30 lists of 50,000 tuples and summing them gave 74998500002 instead of 74998500000 at a 16 MB
+  arena (right at 1 GB). A frame is now looked up by the return address saved in the frame
+  below it, which points into its owner. Test t244 runs that
+  program at `RAIL_ARENA_MB=16`.
 - **`==` and `!=` compare structure.** On two heap values that were not floats, the runtime
   called `strcmp` on them, which compared header bytes, so any two lists, tuples or constructed
   values of one kind were equal: `Some 1 == Some 2`, `(1, 2) == (3, 4)` and `[1] == [2]` were
