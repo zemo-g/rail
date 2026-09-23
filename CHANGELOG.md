@@ -37,6 +37,14 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **A lambda applied where it is written binds a float argument as a float.** `(\x -> x) 2.5`
+  is compiled inline, and its param took the argument's raw float bits with no float mark, nor
+  was the application itself ever seen as float: `(\x0 -> x0) (65536.0 /. 3.0) == 21845.333...`
+  was false and `show ((\x -> x) 2.5)` crashed. Found by the semantic fuzzer (seeds 1 to 4 had
+  failed on it with every compiler). Test t223, `tools/fuzz/known/lambda_applied_float.rail`.
+- **`%` with a float operand is a float.** It compiles to `fmod` and leaves raw float bits, but
+  the float predicate did not list `%`, so `show (5.5 % 2.0)` took the bits for a pointer and
+  crashed. Test t224, `tools/fuzz/known/float_mod.rail`.
 - **A float-returning function named as a value is a closure.** `float_arr_map dbl a` read the
   name `dbl` as a float constant (the marker for "returns a float" doubled as "is a float" when
   the function had parameters) and boxed the closure pointer as a double before the call: a bus

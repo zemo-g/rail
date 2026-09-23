@@ -117,9 +117,10 @@ Type errors are handled by the same check, since a clash is a bad flow.
   untyped list an int; the types say `dyn`, which is what those values are.
 - **The compiled output is unchanged in behaviour.** 104 runnable programs in the tree (every
   file whose code and imports stay inside the process) print the same with both compilers;
-  the suite, the known-miscompile corpus and the semantic fuzzer's CI seed pass; on four wider
-  fuzzer seeds both compilers fail the same cases (a lambda applied straight to a float, a
-  separate bug). 148 of the 474 files that compile produce byte-identical assembly.
+  the suite, the known-miscompile corpus and the semantic fuzzer's CI seed pass; four wider
+  fuzzer seeds failed the same cases with both compilers (a lambda applied straight to a float,
+  and `%` on floats), fixed right after, and now pass 464 of 464 each. 148 of the 474 files that
+  compile produce byte-identical assembly.
 
 ## What the types find (2026-09-22, every tracked `.rail` file)
 
