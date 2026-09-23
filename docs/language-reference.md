@@ -138,7 +138,18 @@ type Tree = | Leaf | Node val left right
 type Color = | Red | Green | Blue
 ```
 
-Constructors are capitalized by convention. Each constructor can take zero or more fields.
+Constructors are capitalized (a lowercase name in a pattern is a variable). Each constructor
+can take zero or more fields.
+
+A constructor with fields is also a function: it can be passed as a value, and given fewer
+arguments than it has fields it is a function of the rest.
+
+```rail
+type Pair = | Pair a b
+
+wrapped = map Some [1, 2, 3]         -- [Some 1, Some 2, Some 3]
+tens = map (Pair 10) [1, 2]          -- [Pair 10 1, Pair 10 2]
+```
 
 A field may declare its type: `int`, `float`, `str`, `bool`, `dyn`, the name of a type the
 program declares, `[t]` for a list of `t`, and in parentheses `(arr t)` for an array of `t` or

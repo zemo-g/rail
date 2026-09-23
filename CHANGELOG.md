@@ -5,6 +5,12 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Added
+- **Constructors are functions.** A constructor with fields can be passed as a value
+  (`map Some xs`, `let f = Pair`), and given fewer arguments than it has fields it is a function
+  of the rest (`map (Pair 10) xs`), its given arguments evaluated once. The front end rewrites
+  such a use to a lambda before type checking and code generation; until now the code generator
+  emitted a null pointer for it (a TODO) and calling it segfaulted. `docs/language-reference.md`;
+  test t241, `tools/fuzz/known/ctor_as_value.rail`.
 - **Variable and boolean patterns.** A lowercase name in a pattern matches anything and binds the
   value for the arm's guard and body (`| big if big > 100 -> 100 | other -> other`); the
   scrutinee is evaluated once. `| true ->` and `| false ->` match booleans. Constructors are
