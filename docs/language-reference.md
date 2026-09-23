@@ -268,6 +268,10 @@ The `+` operator on strings performs concatenation (same as `append`).
 
 Comparison works on integers, floats, and strings (string comparison is byte-wise).
 
+`==` and `!=` also compare structure: two lists, tuples or constructed values are equal when
+they have the same shape and equal parts (`[1, 2] == [1, 2]`, `Some 1 != Some 2`,
+`(1, "a") == (1, "a")`). A function or an array is equal only to itself.
+
 ### Logical
 
 | Operator | Description |
