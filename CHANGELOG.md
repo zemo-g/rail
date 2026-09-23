@@ -117,6 +117,15 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **A library imported along two paths is defined once.** An import inlined the file's
+  declarations every time, so a diamond (two imports that both reach `stdlib/tensor.rail`)
+  defined every function twice and the build failed on duplicate labels. That is why
+  `examples/checkpoint_roundtrip.rail`, `tools/infer/kv0_gate.rail` and two test programs in
+  `tools/test/` did not build, and why stdlib libraries relied on their importer for the types
+  they match on. Merging an import now drops any later declaration identical to one it brings; a
+  different declaration under the same name is kept, so a real conflict still fails. Those four
+  programs build and pass their own checks, and `stdlib/checkpoint.rail`, `stdlib/optim.rail`,
+  `stdlib/infer_kv.rail` and `tools/types.rail` import what they use. Test t237.
 - **`rail wasm` is linear in program size.** The backend tested `length xs == 0` at every
   step of its list walks (`length` walks the list), deduplicated the string table once per
   declaration, and scanned every call site in the program for each parameter. `tools/compile.rail`
