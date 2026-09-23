@@ -1331,6 +1331,15 @@ _pthread_mutex_init:
     mov x0, #-1
     ret
 
+// The allocator takes this mutex only while a thread is live, which never happens here.
+_pthread_mutex_lock:
+    mov x0, #0
+    ret
+
+_pthread_mutex_unlock:
+    mov x0, #0
+    ret
+
 _setjmp:
     mov x0, #0
     ret

@@ -158,6 +158,14 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **Threads share the heap safely.** `spawn_thread` ran its function on a second thread that
+  bumped the same allocation pointer with no lock, so two threads building lists at once could
+  be handed the same memory (a two-thread test hung on its first run), and a collection walked
+  only the calling thread's stack. Now, while any spawned thread is not yet joined, `_rail_alloc`
+  and `_rail_chained_malloc` take one mutex and collection is suspended (the arena grows
+  instead); `join_thread` counts the thread out after its result is in hand. The x86 runtime
+  (`tools/x86_rt.s`) is unchanged, and Linux gets no-op mutex stubs (it has no threads).
+  Tests t250, t251; t92 passes under `RAIL_GC_STRESS`.
 - **`split`, `str_split` and `chars` keep their string alive.** Each reads the string through
   the pointer `_str_unwrap` returns (16 bytes into the object) while it allocates the pieces, and
   the collector counts only a pointer to an object's start. A temporary string, reachable from
