@@ -35,6 +35,16 @@ All notable changes to Rail are documented here.
   [(str, str)])`, `pprog_ast : [(str, str)] -> [Decl]`. The passes after the parser still read
   the older list form, which `ast_decls_list` produces, until each is moved over. Every file in
   the tree compiles to byte-identical assembly.
+- **The type checker type-checks itself.** `tools/types.rail` reads the typed syntax tree and
+  keeps its own state typed: types are a `Ty` data type instead of lists, flows, events and
+  body records are data types, and the store is a `Store` of typed arrays instead of one
+  array holding everything. `rail types tools/types.rail` reports zero errors (it had 453), and
+  the compiler's own count drops from 1,739 to 1,318. It found a real inconsistency in itself
+  on the way (`hm_join` returned a bool on one branch and an int on the other). Output is
+  unchanged: `rail types` prints the same for every file in the tree, and every file compiles
+  to the same assembly.
+- **Array and tuple field types.** A constructor field may be `(arr t)` or `(t1, t2)`, next to
+  `[t]` and the named types.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
   assembling it.
 - **`tools/infer/smol/`: a public model on Rail's kernels, and exact one-pass verification of
