@@ -5,15 +5,25 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Added
-- **`rail types`: Hindley-Milner type inference, stage 0 (observe only).** `tools/types.rail`
-  infers a type for every top-level function with no annotations (polymorphic per call-graph
-  group: `compose : (a -> b, c -> a) -> c -> b`), reports where a program cannot have one, and
-  compares the proven types with codegen's float/int guesses. `dyn` is the escape hatch for
-  Rail's dynamic idioms: merges (branches, list elements, array writes) join to `dyn`, argument
-  passing needs only consistency, `arr_new n 0` leaves the element open, and an int promotes
-  into a float context. Across the tree 297 of 485 files type-check, and in every program that
-  does, codegen's parameter guesses agree with the types; 31 float results are boxed that need
-  not be. Codegen does not read the types yet. `docs/TYPES.md`; tests t217, t218.
+- **Types decide representation.** `tools/types.rail` infers a type for every top-level
+  function with no annotations (Hindley-Milner, polymorphic per call-graph group:
+  `compose : (a -> b, c -> a) -> c -> b`, with `dyn` for Rail's dynamic idioms), and codegen
+  reads from it which parameters arrive as raw floats or ints and which results leave as raw
+  floats. The call-site guessing passes that decided this (`argf_scan`, `hofpos`, the `rmap`
+  fixpoint, more than a thousand lines) are deleted. A claim codegen acts on has to hold for
+  every value that can reach it, so inference runs in rounds: wherever `dyn` or a clashing type
+  flows into a slot that claims a type (a parameter, a lambda's parameters, a result, an array
+  a callee stores into), that slot is forced to `dyn` and the program is inferred again, until
+  a round forces nothing new. The self-compile takes about 5 s instead of 20 (the guessing
+  passes cost 16.6 s; inference with its rounds takes 1.6 s on the compiler's source). Results
+  the types prove float leave as raw bits (the MHD kernel's `mk_pressure`); values the passes
+  had guessed int but that come out of untyped data stay generic. 104 runnable programs in
+  the tree print the same as before. `rail types <file>` prints every signature, every type
+  error and how many parameters and results have a static representation; 301 of 487 files
+  type-check. `rail infer` reports result kinds from the types. `docs/TYPES.md`; tests t217,
+  t218, t220 to t222.
+- **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
+  assembling it.
 - **`tools/infer/smol/`: a public model on Rail's kernels, and exact one-pass verification of
   what it generates.** SmolLM2-135M (the Hugging Face checkpoint, sha256-pinned) runs on Metal
   kernels emitted from Rail: the bf16 bytes are widened on the GPU, every reduction is one
@@ -27,6 +37,11 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **A float-returning function named as a value is a closure.** `float_arr_map dbl a` read the
+  name `dbl` as a float constant (the marker for "returns a float" doubled as "is a float" when
+  the function had parameters) and boxed the closure pointer as a double before the call: a bus
+  error, on master and on the build before the closure change alike. Float constants (no
+  parameters) now carry their own marker. Test t219, `tools/fuzz/known/float_hof_named_fn.rail`.
 - **A closure call hands over the closure, and the lambda fetches its own captures.** The caller
   used to load a closure's captures into the argument registers after the params, as far as `x4`
   and no further, because `x5`, `x6` and `x7` carried the capture count, the code pointer and the
