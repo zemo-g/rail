@@ -76,7 +76,7 @@ the checker says "this is only known at run time":
 ## Typed constructor fields
 
 A field may name its type: `int`, `float`, `str`, `bool`, `dyn`, a type the program declares,
-or `[t]` for a list of `t`.
+`[t]` for a list of `t`, `(arr t)` for an array of `t`, or `(t1, t2)` for a tuple.
 
 ```rail
 type Expr = | Num int | Add Expr Expr | Neg Expr | Many [Expr] | Name str
@@ -164,9 +164,10 @@ Type errors are handled by the same check, since a clash is a bad flow.
 
 1. **Type the compiler.** The AST becomes an ADT with typed fields, and
    `rail types tools/compile.rail` reaches zero errors. Under way: `tools/ast.rail` declares the
-   tree and the parser builds it; the passes after it move over in pipeline order (the AD and
-   auth synthesis, the optimizer, the checks, inference, codegen, the other backends), and the
-   list adapter goes when the last one does.
+   tree and the parser builds it, and the type checker itself reads it and is typed throughout
+   (`rail types tools/types.rail`: zero errors). The other passes move over one at a time
+   (codegen, the checks, the optimizer, the AD and auth synthesis, the other backends); two
+   adapters convert between the typed tree and the older list form until the last one does.
 2. **Check.** Type errors in code that type-checks everywhere else become compile errors instead
    of wrong answers or segfaults. Code that relies on dynamic idioms stays accepted until it
    opts in.

@@ -141,8 +141,9 @@ type Color = | Red | Green | Blue
 Constructors are capitalized by convention. Each constructor can take zero or more fields.
 
 A field may declare its type: `int`, `float`, `str`, `bool`, `dyn`, the name of a type the
-program declares, or `[t]` for a list of `t`. A field written as a plain name (`x`, `val`
-above) declares nothing and holds any value.
+program declares, `[t]` for a list of `t`, and in parentheses `(arr t)` for an array of `t` or
+`(t1, t2)` for a tuple. A field written as a plain name (`x`, `val` above) declares nothing and
+holds any value.
 
 ```rail
 type Expr = | Num int | Add Expr Expr | Neg Expr | Seq [Expr] | Var str
