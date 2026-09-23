@@ -145,6 +145,14 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **A match with a guarded variable arm no longer writes past its frame.** `| n if n > 100 ->
+  n - 100` binds `n` once for the guard and once for the body. The frame predictor ignored
+  guards, and `cg_arms` reported only the last arm's highest slot, so `compile_func`'s check
+  (recompile when the body reaches past the predicted frame) never fired. The body's `n` was
+  stored one slot past the frame, over the caller's saved frame pointer. Programs mostly ran
+  anyway; the collector, walking frames, followed that pointer and crashed. Found by
+  `RAIL_GC_STRESS`. A match now reports the highest slot any arm reaches, and the predictor
+  counts a guard's bindings before the body's. Test t246 runs t238 at `RAIL_GC_STRESS=1`.
 - **The collector no longer frees what a runtime function still holds.** Walking the stack, the
   collector looked each frame up by the return address saved in that frame, which points into
   the caller, so it applied the caller's slot map to the callee's frame. A runtime function's
