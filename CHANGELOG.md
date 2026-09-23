@@ -56,6 +56,12 @@ All notable changes to Rail are documented here.
   `Node`. Lambdas are identified by `ast_key` (a length-prefixed serialization in
   `tools/ast.rail`) instead of `show` on a list. Every file in the tree emits byte-identical
   WAT, and the compiler's type errors drop from 869 to 643.
+- **The Cortex-M and RISC-V backends read the typed syntax tree.** Their environment entries
+  are a data type (`CmEnt`: a parameter in a register, a local in a frame slot, a constructor
+  with its tag and arity) instead of lists like `["P", name, reg]`, and `cm_emit_expr` and
+  `cv_emit_expr` match on `Node`; the RISC-V backend's copy of `cm_collect_args` is gone. Every
+  file in the tree emits byte-identical Thumb-2 and RV32 assembly, and the compiler's type
+  errors drop from 643 to 567.
 - **Array and tuple field types.** A constructor field may be `(arr t)` or `(t1, t2)`, next to
   `[t]` and the named types.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
