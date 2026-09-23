@@ -50,6 +50,12 @@ All notable changes to Rail are documented here.
   `x86_compile_func` share those predicates, so the x86 backend's list copies of them are gone.
   Every file in the tree compiles to byte-identical ARM64 and x86 assembly, and the compiler's
   type errors drop from 1,318 to 869.
+- **The wasm backend and `rail safe` read the typed syntax tree.** `rail wasm` and `rail safe`
+  take the parser's `Decl`s directly; the code generator (`wg`, `wg_tail`), its float and call-site
+  passes, the named-function rewrite (which now builds `Node`s) and the safe-mode checker match on
+  `Node`. Lambdas are identified by `ast_key` (a length-prefixed serialization in
+  `tools/ast.rail`) instead of `show` on a list. Every file in the tree emits byte-identical
+  WAT, and the compiler's type errors drop from 869 to 643.
 - **Array and tuple field types.** A constructor field may be `(arr t)` or `(t1, t2)`, next to
   `[t]` and the named types.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
@@ -67,6 +73,11 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **`rail safe` checks match guards.** The checker read arm bodies only, so a banned name
+  (`shell`, `read_file`, ...) inside an `if` guard passed. Test t228.
+- **`rail safe` validates tail calls.** The wasm backend emits `return_call` for a tail call, and
+  `rail wasm` runs wat2wasm with `--enable-tail-call`, but `rail safe` did not, so every program
+  with a tail call failed validation. Test t229 (skipped where wat2wasm is not installed).
 - **A lambda applied where it is written binds a float argument as a float.** `(\x -> x) 2.5`
   is compiled inline, and its param took the argument's raw float bits with no float mark, nor
   was the application itself ever seen as float: `(\x0 -> x0) (65536.0 /. 3.0) == 21845.333...`

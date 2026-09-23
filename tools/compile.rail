@@ -5765,6 +5765,33 @@ driver_types_fields _ =
   let _ = print (if ok then "  PASS: typed fields" else cat ["  FAIL: ", out])
   ok
 
+driver_safe_guard _ =
+  let _ = print "  --- driver_safe_guard ---"
+  let path = cat [trim (shell "mktemp -u /tmp/rail_safe_XXXXXX"), ".rail"]
+  let _ = write_file path "f n = match n\n  | 0 -> 0\n  | _ if length (shell \"id\") > 0 -> 1\n  | _ -> 2\nmain = f 1\n"
+  let out = shell (cat ["./rail_native safe ", path, " 2>&1; echo \"rc=$?\""])
+  let _ = shell (cat ["rm -f ", path])
+  let ok = str_contains "REJECTED: 1 banned construct(s) found" out && str_contains "rc=1" out
+  let _ = print (if ok then "  PASS: banned name in a guard" else cat ["  FAIL: ", out])
+  ok
+
+-- wasm emits return_call for tail calls, so the validator needs the tail-call proposal; skipped
+-- where wat2wasm is not installed (CI)
+driver_safe_tail_call _ =
+  let _ = print "  --- driver_safe_tail_call ---"
+  let have = trim (shell "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH command -v wat2wasm 2>/dev/null")
+  if have == "" then
+    let _ = print "  SKIP: no wat2wasm"
+    true
+  else
+    let path = cat [trim (shell "mktemp -u /tmp/rail_safe_XXXXXX"), ".rail"]
+    let _ = write_file path "count n acc = if n == 0 then acc else count (n - 1) (acc + 1)\nmain = count 10 0\n"
+    let out = shell (cat ["./rail_native safe ", path, " 2>&1; echo \"rc=$?\""])
+    let _ = shell (cat ["rm -f ", path])
+    let ok = str_contains "wat2wasm: OK" out && str_contains "rc=0" out
+    let _ = print (if ok then "  PASS: a tail call validates" else cat ["  FAIL: ", out])
+    ok
+
 driver_self_refuses_small_arena _ =
   let _ = print "  --- driver_self_refuses_small_arena ---"
   let line = trim (shell "RAIL_ARENA_MB=1000 ./rail_native self 2>&1 | head -1")
@@ -6390,6 +6417,12 @@ run_tests _ =
   let t225 = driver_types_fields 0
   let t226 = run_test "adt_typed_fields" "type Expr =\n  | Num int\n  | Add Expr Expr\n  | Neg Expr\n  | Many [Expr]\n  | Name str\neval e = match e\n  | Num n -> n\n  | Add a b -> eval a + eval b\n  | Neg x -> 0 - eval x\n  | Many xs -> sum_all xs 0\n  | Name s -> length s\nsum_all xs acc = if xs == [] then acc else sum_all (tail xs) (acc + eval (head xs))\nmain =\n  let _ = print (show (eval (Add (Num 2) (Neg (Num 5)))))\n  let _ = print (show (eval (Many [Num 1, Name \"abc\", Add (Num 10) (Num 20)])))\n  0" "-3\n34"
   let t227 = run_test "adt_field_fed_other_type" "type Box = | Box int | Pair float str\nget b = match b\n  | Box v -> v + 1\n  | Pair f s -> 0\nmain =\n  let _ = print (show (get (Box 5)))\n  let _ = print (get (Box \"a\"))\n  let _ = print (show (match Pair 1.5 \"x\" | Pair f s -> f *. 2.0 | Box v -> 0.0))\n  0" "6\n1\n3"
+  -- t228: `rail safe` rejects a banned name inside a match guard (before 2026-09-23 it read
+  -- only arm bodies, so a guard was never checked)
+  let t228 = driver_safe_guard 0
+  -- t229: `rail safe` validates with the tail-call proposal on, as `rail wasm` does; without it
+  -- every program whose wasm has a return_call failed wat2wasm
+  let t229 = driver_safe_tail_call 0
   -- t186/t187: MHD kernel invariants. stdlib/mhd_{kernel,axisym,mpd}.rail is
   -- 1,254 lines driving the live entropy beacon and had NO suite coverage until
   -- 2026-08-30. t186 pins the guarantee the beacon actually publishes; t187 pins
@@ -6410,10 +6443,10 @@ run_tests _ =
   -- cleaner that damps the field to mush would pass the first one alone.
   let t189 = run_test "mhd_glm_divergence_cleaning" "import \"stdlib/mhd_kernel.rail\"\nabsf x = if x < 0.0 then 0.0 - x else x\nclean_k state psi dt ch cr k i =\n  if i >= k then 0\n  else\n    let _ = mk_glm_clean state psi (dt / to_float k) ch cr\n    clean_k state psi dt ch cr k (i + 1)\nrun state psi k n =\n  if n <= 0 then state\n  else\n    let dt = mk_compute_dt_muscl state\n    let ch = 3.0 * mk_max_speed state\n    let ns = mk_muscl_step state dt\n    let _ = if k > 0 then clean_k ns psi dt ch 0.18 k 0 else 0\n    run ns psi k (n - 1)\nmain =\n  let s0 = mk_init_state\n  let m0 = mk_total_mass s0\n  let e0 = mk_total_energy s0\n  let p = mk_max_div_b (run mk_init_state (mk_psi_new 0) 0 10)\n  let g = run mk_init_state (mk_psi_new 0) 4 10\n  let gd = mk_max_div_b g\n  -- GLM must cut divergence by at least 4x (measured 6.8x) ...\n  let cleaner = if gd * 4.0 < p then 1 else 0\n  -- ... without spending conservation to buy it ...\n  let dm = absf ((mk_total_mass g - m0) / m0)\n  let de = absf ((mk_total_energy g - e0) / e0)\n  let conserved = if dm < 0.0000000001 then (if de < 0.0000000001 then 1 else 0) else 0\n  -- ... and psi must actually be doing something (guards a stubbed-out clean).\n  let alive = if gd > 0.0 then 1 else 0\n  let ok = if cleaner == 1 then (if conserved == 1 then (if alive == 1 then 1 else 0) else 0) else 0\n  let _ = print (if ok == 1 then \"ok\" else cat [\"FAIL p=\", show_float p, \" g=\", show_float gd, \" dm=\", show_float dm])\n  0\n" "ok"
   let s_mhd = (if t186 then 1 else 0) + (if t187 then 1 else 0) + (if t188 then 1 else 0) + (if t189 then 1 else 0)
-  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0)
+  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s_inf + s_bx + s_ed + s_tls + s_flt + s_drv + s_mhd
-  let _ = print (cat [show total, "/225 tests passed"])
-  if total == 225 then 0 else 1
+  let _ = print (cat [show total, "/227 tests passed"])
+  if total == 227 then 0 else 1
 
 -- ===========================================================================
 -- M6, self-hosted emit path. Replaces as/ld/codesign with the pure-Rail
@@ -6782,39 +6815,20 @@ is_banned name =
 -- safe_check with depth tracking: returns error count
 safe_check node depth =
   if depth > 500 then 1
-  else
-    let tg = head node
-    let d1 = depth + 1
-    if tg == "V" then
-      if is_banned (head (tail node)) then 1 else 0
-    else if tg == "I" then 0
-    else if tg == "FL" then 0
-    else if tg == "S" then 0
-    else if tg == "B" then 0
-    else if tg == "NULL" then 0
-    else if tg == "O" then
-      safe_check (head (tail (tail node))) d1 + safe_check (head (tail (tail (tail node)))) d1
-    else if tg == "?" then
-      safe_check (head (tail node)) d1 + safe_check (head (tail (tail node))) d1 + safe_check (head (tail (tail (tail node)))) d1
-    else if tg == "D" then
-      if is_banned (head (tail node)) then 1
-      else safe_check (head (tail (tail node))) d1 + safe_check (head (tail (tail (tail node)))) d1
-    else if tg == "TD" then
-      safe_check (head (tail (tail node))) d1 + safe_check (head (tail (tail (tail node)))) d1
-    else if tg == "A" then
-      let (fname, fargs) = flat node
-      if is_banned fname then 1
-      else safe_check_list (tail node) d1
-    else if tg == "F" then
-      safe_check (head (tail (tail node))) d1
-    else if tg == "L" then
-      safe_check_list (head (tail node)) d1
-    else if tg == "T" then
-      safe_check_list (head (tail node)) d1
-    else if tg == "M" then
-      safe_check (head (tail node)) d1 + safe_check_arms (head (tail (tail node))) d1
-    else if tg == "E" then 0
-    else 0
+  else safe_check_node node (depth + 1)
+safe_check_node node d1 = match node
+  | NVar v -> if is_banned v then 1 else 0
+  | NOp o l r -> safe_check l d1 + safe_check r d1
+  | NIf c t e -> safe_check c d1 + safe_check t d1 + safe_check e d1
+  | NLet x v b -> if is_banned x then 1 else safe_check v d1 + safe_check b d1
+  | NLetTup xs v b -> safe_check v d1 + safe_check b d1
+  | NApp f a -> if safe_app_banned node then 1 else safe_check f d1 + safe_check a d1
+  | NLam p b -> safe_check b d1
+  | NList es -> safe_check_list es d1
+  | NTup es -> safe_check_list es d1
+  | NMatch s arms -> safe_check s d1 + safe_check_arms arms d1
+  | _ -> 0
+safe_app_banned node = let (fname, _) = ast_flat node in is_banned fname
 
 safe_check_list ns depth =
   if length ns == 0 then 0
@@ -6822,7 +6836,12 @@ safe_check_list ns depth =
 
 safe_check_arms arms depth =
   if length arms == 0 then 0
-  else safe_check (head (tail (tail (head arms)))) depth + safe_check_arms (tail arms) depth
+  else safe_check_arm (head arms) depth + safe_check_arms (tail arms) depth
+safe_check_arm a depth = match a
+  | Arm c bs b g -> safe_check b depth + safe_check_guard g depth
+safe_check_guard g depth = match g
+  | NoGuard -> 0
+  | Guard n -> safe_check n depth
 
 -- Count functions and check each body. Returns (banned_errors, fn_count)
 safe_check_decls decls =
@@ -6832,18 +6851,22 @@ safe_check_decls_acc decls errs fcount =
   if length decls == 0 then errs
   else
     let d = head decls
-    let tg = head d
-    if tg == "TY" then safe_check_decls_acc (tail decls) errs fcount
-    else if tg == "E" then safe_check_decls_acc (tail decls) errs fcount
-    else if tg == "FN_EXT" then safe_check_decls_acc (tail decls) (errs + 1) fcount
-    else if tg == "LINK" then safe_check_decls_acc (tail decls) (errs + 1) fcount
+    if safe_decl_skipped d then safe_check_decls_acc (tail decls) errs fcount
+    else if safe_decl_banned d then safe_check_decls_acc (tail decls) (errs + 1) fcount
     else
       let fc = fcount + 1
       if fc > 100 then errs + 1
       else
-        let body = head (tail (tail (tail d)))
-        let e = safe_check body 0
+        let e = safe_check (decl_fn_body d) 0
         safe_check_decls_acc (tail decls) (errs + e) fc
+safe_decl_skipped d = match d
+  | DType n vs -> true
+  | DErr m p -> true
+  | _ -> false
+safe_decl_banned d = match d
+  | DForeign n ar rk -> true
+  | DLink l -> true
+  | _ -> false
 
 -- Validate WASM output: check imports are only fd_write + proc_exit
 safe_validate_wasm wat =
@@ -6869,7 +6892,7 @@ dispatch_safe path =
   else
     let _ = print (cat ["Compiling ", path, " (safe mode)..."])
     let toks = tokenize src
-    let decls = pprog toks
+    let decls = pprog_ast toks
     let errs = safe_check_decls decls
     if errs > 0 then
       let _ = print (cat ["  REJECTED: ", show errs, " banned construct(s) found"])
@@ -6887,7 +6910,7 @@ dispatch_safe path =
         else
           let _ = write_file "/tmp/rail_safe.wat" wat
           let _ = print (cat ["  WAT: ", show (length wat), " bytes"])
-          let w2w = trim (shell "wat2wasm /tmp/rail_safe.wat -o /tmp/rail_safe.wasm 2>&1")
+          let w2w = trim (shell "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH wat2wasm --enable-tail-call /tmp/rail_safe.wat -o /tmp/rail_safe.wasm 2>&1")
           if w2w != "" then
             let _ = print (cat ["  wat2wasm: ", w2w])
             1
@@ -6900,7 +6923,7 @@ dispatch_wasm path =
   let _ = print (cat ["Compiling ", path, " to WASM..."])
   let src = read_file path
   let toks = tokenize src
-  let decls = pprog toks
+  let decls = pprog_ast toks
   let wat = wasm_program decls
   let _ = write_file "/tmp/rail_out.wat" wat
   let _ = print (cat ["  WAT: ", show (length wat), " bytes"])
@@ -6920,12 +6943,12 @@ dispatch_wasm path =
 wasm_program decls =
   let strs = wasm_strs_all decls
   let stab = wasm_stab strs 256
-  let pre_ar = get_arities decls
+  let pre_ar = get_arities_t decls
   -- Rewrite named-function value references to synthetic lambdas
   -- so the existing lambda machinery gives them function-table
   -- slots.  Lets `map foo xs` work when `foo` is a 1-arg user fn.
   let decls = nf_rewrite_decls decls pre_ar
-  let ar = get_arities decls
+  let ar = get_arities_t decls
   let lams = wasm_collect_lambdas decls 0
   let nlams = length lams
   let hdr = "(module\n  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))\n  (import \"wasi_snapshot_preview1\" \"proc_exit\" (func $proc_exit (param i32)))\n  (memory (export \"memory\") 16 16)\n\n"
@@ -6949,15 +6972,13 @@ wasm_elem_list n i =
 
 wasm_fns decls stab ar lams float_env sites =
   if length decls == 0 then ""
-  else
-    let tg = head (head decls)
-    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_fns (tail decls) stab ar lams float_env sites
-    else cat [wasm_fn (head decls) stab ar lams float_env sites, wasm_fns (tail decls) stab ar lams float_env sites]
+  else if decl_is_fn (head decls) == false then wasm_fns (tail decls) stab ar lams float_env sites
+  else cat [wasm_fn (head decls) stab ar lams float_env sites, wasm_fns (tail decls) stab ar lams float_env sites]
 
 wasm_fn d stab ar lams float_env sites =
-  let nm = head (tail d)
-  let ps = head (tail (tail d))
-  let bd = head (tail (tail (tail d)))
+  let nm = decl_fn_name d
+  let ps = decl_fn_params d
+  let bd = decl_fn_body d
   let pstr = if length ps == 0 then "" else join " " (wasm_plist ps)
   -- Pre-seed env with float markers for params that any caller flags
   -- as float.  Lets the body's is_float_w resolve V references to
@@ -6982,21 +7003,20 @@ wasm_env ps i =
   if length ps == 0 then []
   else cons (head ps, i) (wasm_env (tail ps) (i + 1))
 
-wasm_locs node =
-  let tg = head node
-  if tg == "D" then cons (head (tail node)) (append (wasm_locs (head (tail (tail node)))) (wasm_locs (head (tail (tail (tail node))))))
-  else if tg == "TD" then append (head (tail node)) (append (wasm_locs (head (tail (tail node)))) (wasm_locs (head (tail (tail (tail node))))))
-  else if tg == "?" then append (wasm_locs (head (tail node))) (append (wasm_locs (head (tail (tail node)))) (wasm_locs (head (tail (tail (tail node))))))
-  else if tg == "O" then append (wasm_locs (head (tail (tail node)))) (wasm_locs (head (tail (tail (tail node)))))
-  else if tg == "A" then wasm_locs_l (tail node)
-  else if tg == "L" then wasm_locs_l (head (tail node))
-  else if tg == "M" then cons "__scrut" (cons "__ptr" (append (wasm_locs (head (tail node))) (wasm_locs_arms (head (tail (tail node))))))
-  else if tg == "F" then wasm_locs (head (tail (tail node)))
-  else []
+wasm_locs node = match node
+  | NLet x v b -> cons x (append (wasm_locs v) (wasm_locs b))
+  | NLetTup xs v b -> append xs (append (wasm_locs v) (wasm_locs b))
+  | NIf c t e -> append (wasm_locs c) (append (wasm_locs t) (wasm_locs e))
+  | NOp o l r -> append (wasm_locs l) (wasm_locs r)
+  | NApp f a -> append (wasm_locs f) (wasm_locs a)
+  | NList es -> wasm_locs_l es
+  | NMatch s arms -> cons "__scrut" (cons "__ptr" (append (wasm_locs s) (wasm_locs_arms arms)))
+  | NLam p b -> wasm_locs b
+  | _ -> []
 
 wasm_locs_arms arms =
   if length arms == 0 then []
-  else append (head (tail (head arms))) (append (wasm_locs (head (tail (tail (head arms))))) (wasm_locs_arms (tail arms)))
+  else append (arm_binds (head arms)) (append (wasm_locs (arm_body (head arms))) (wasm_locs_arms (tail arms)))
 
 wasm_locs_l ns =
   if length ns == 0 then []
@@ -7032,84 +7052,47 @@ wasm_efind n env =
 -- which the let-binding emitter inserts whenever the bound expression
 -- is structurally float.  A nodes (function calls) check the env for
 -- "__floatfn_<fname>" markers, those are pre-seeded per function by
--- a global pass over all top-level decls (wasm_collect_float_fns).
-is_float_w node env =
-  let tg = head node
-  if tg == "FL" then true
-  else if tg == "V" then
-    wasm_efind (cat ["__wfloat_", head (tail node)]) env != (0 - 1)
-  else if tg == "A" then
-    let (fname, _) = flat node
-    if fname == "to_float" || fname == "int_to_float" || fname == "float_arr_get" || fname == "parse_float" then true
-    else if fname == "sqrt" || fname == "sin" || fname == "cos" || fname == "tanh" || fname == "exp" || fname == "log" || fname == "pow" || fname == "fabs" || fname == "floor" || fname == "ceil" || fname == "atan2" then true
-    else wasm_efind (cat ["__floatfn_", fname]) env != (0 - 1)
-  else if tg == "O" then
-    let op = op_base (head (tail node))
-    if op == "+" || op == "-" || op == "*" || op == "/" then
-      is_float_w (head (tail (tail node))) env || is_float_w (head (tail (tail (tail node)))) env
-    else false
-  else if tg == "?" then
-    is_float_w (head (tail (tail node))) env || is_float_w (head (tail (tail (tail node)))) env
-  else if tg == "D" then
-    -- let nm = val in body, the EXPRESSION's type is the body's.
-    -- Extend env with a float marker if the bound value is float.
-    let nm = head (tail node)
-    let val_node = head (tail (tail node))
-    let body_node = head (tail (tail (tail node)))
-    let new_env = if is_float_w val_node env then
-                    cons (cat ["__wfloat_", nm], 0 - 100) env
-                  else env
-    is_float_w body_node new_env
-  else if tg == "TD" then
-    is_float_w (head (tail (tail (tail node)))) env
-  else if tg == "M" then
-    match_is_float (head (tail (tail node))) env
+-- a global pass over all top-level decls (wasm_float_fns_fixpoint).
+is_float_w node env = match node
+  | NFloat v -> true
+  | NVar v -> wasm_efind (cat ["__wfloat_", v]) env != (0 - 1)
+  | NApp f a -> is_float_w_app node env
+  | NOp o l r -> is_float_w_op (op_base o) l r env
+  | NIf c t e -> is_float_w t env || is_float_w e env
+  | NLet nm v b -> is_float_w b (wasm_let_env nm v env)
+  | NLetTup xs v b -> is_float_w b env
+  | NMatch s arms -> match_is_float arms env
+  | _ -> false
+is_float_w_app node env =
+  let (fname, _) = ast_flat node
+  if fname == "to_float" || fname == "int_to_float" || fname == "float_arr_get" || fname == "parse_float" then true
+  else if fname == "sqrt" || fname == "sin" || fname == "cos" || fname == "tanh" || fname == "exp" || fname == "log" || fname == "pow" || fname == "fabs" || fname == "floor" || fname == "ceil" || fname == "atan2" then true
+  else wasm_efind (cat ["__floatfn_", fname]) env != (0 - 1)
+is_float_w_op op l r env =
+  if op == "+" || op == "-" || op == "*" || op == "/" then is_float_w l env || is_float_w r env
   else false
+-- `let nm = v in b`: the expression's type is the body's, and the body sees a float marker for
+-- nm when the bound value is float
+wasm_let_env nm v env = if is_float_w v env then cons (cat ["__wfloat_", nm], 0 - 100) env else env
 
 -- Any arm body is float → the match expression is float.
 match_is_float arms env =
   if length arms == 0 then false
-  else if is_float_w (head (tail (tail (head arms)))) env then true
+  else if is_float_w (arm_body (head arms)) env then true
   else match_is_float (tail arms) env
-
--- Decide whether a function returns float by checking its body with
--- no env (V nodes pessimistically int).  Used to seed __floatfn_
--- markers before the per-function compile.  Misses some cases (e.g.
--- a user function that calls another user float function) but is
--- adequate for the wrapper-style code in tools/plasma/mhd.rail.
-wasm_decl_returns_float decl =
-  let tg = head decl
-  if tg == "fn" then
-    let body = head (tail (tail (tail decl)))
-    is_float_w body []
-  else false
-
-wasm_collect_float_fns decls =
-  if length decls == 0 then []
-  else
-    let d = head decls
-    if head d == "fn" then
-      if wasm_decl_returns_float d then cons (head (tail d)) (wasm_collect_float_fns (tail decls))
-      else wasm_collect_float_fns (tail decls)
-    else wasm_collect_float_fns (tail decls)
 
 -- Iterate to a fixed point so functions that call other float-returning
 -- user functions also get marked.  Body is checked against an env
 -- containing the markers from the previous iteration.
 wasm_decl_returns_float_env decl env =
-  let tg = head decl
-  if tg == "fn" then
-    let body = head (tail (tail (tail decl)))
-    is_float_w body env
+  if decl_is_fn decl then is_float_w (decl_fn_body decl) env
   else false
 
 wasm_collect_float_fns_env decls env acc =
   if length decls == 0 then reverse acc
   else
     let d = head decls
-    if head d == "fn" then
-      if wasm_decl_returns_float_env d env then wasm_collect_float_fns_env (tail decls) env (cons (head (tail d)) acc)
-      else wasm_collect_float_fns_env (tail decls) env acc
+    if wasm_decl_returns_float_env d env then wasm_collect_float_fns_env (tail decls) env (cons (decl_fn_name d) acc)
     else wasm_collect_float_fns_env (tail decls) env acc
 
 float_fn_markers names acc =
@@ -7139,31 +7122,19 @@ wasm_float_fns_fixpoint_iter decls names iters =
 -- resolves V references to let-bound floats.  Records each call
 -- site as (fname, list-of-bool-arg-is-float).  Bool flags are
 -- precomputed; caller_passes_float just inspects.
-collect_calls_env node env acc =
-  let tg = head node
-  if tg == "A" then
-    let (fname, fargs) = flat node
-    let flags = arg_float_flags fargs env []
-    let acc1 = cons (cons fname (cons flags [])) acc
-    collect_calls_env_l fargs env acc1
-  else if tg == "O" then
-    collect_calls_env (head (tail (tail node))) env (collect_calls_env (head (tail (tail (tail node)))) env acc)
-  else if tg == "?" then
-    collect_calls_env (head (tail node)) env (collect_calls_env (head (tail (tail node))) env (collect_calls_env (head (tail (tail (tail node)))) env acc))
-  else if tg == "D" then
-    let nm = head (tail node)
-    let val_node = head (tail (tail node))
-    let body_node = head (tail (tail (tail node)))
-    let new_env = if is_float_w val_node env then
-                    cons (cat ["__wfloat_", nm], 0 - 100) env
-                  else env
-    collect_calls_env val_node env (collect_calls_env body_node new_env acc)
-  else if tg == "TD" then
-    collect_calls_env (head (tail (tail node))) env (collect_calls_env (head (tail (tail (tail node)))) env acc)
-  else if tg == "L" then collect_calls_env_l (head (tail node)) env acc
-  else if tg == "M" then collect_calls_env (head (tail node)) env (collect_calls_env_arms (head (tail (tail node))) env acc)
-  else if tg == "F" then collect_calls_env (head (tail (tail node))) env acc
-  else acc
+collect_calls_env node env acc = match node
+  | NApp f a -> collect_calls_app node env acc
+  | NOp o l r -> collect_calls_env l env (collect_calls_env r env acc)
+  | NIf c t e -> collect_calls_env c env (collect_calls_env t env (collect_calls_env e env acc))
+  | NLet nm v b -> collect_calls_env v env (collect_calls_env b (wasm_let_env nm v env) acc)
+  | NLetTup xs v b -> collect_calls_env v env (collect_calls_env b env acc)
+  | NList es -> collect_calls_env_l es env acc
+  | NMatch s arms -> collect_calls_env s env (collect_calls_env_arms arms env acc)
+  | NLam p b -> collect_calls_env b env acc
+  | _ -> acc
+collect_calls_app node env acc =
+  let (fname, fargs) = ast_flat node
+  collect_calls_env_l fargs env (cons (fname, arg_float_flags fargs env []) acc)
 
 collect_calls_env_l nodes env acc =
   if length nodes == 0 then acc
@@ -7171,7 +7142,7 @@ collect_calls_env_l nodes env acc =
 
 collect_calls_env_arms arms env acc =
   if length arms == 0 then acc
-  else collect_calls_env (head (tail (tail (head arms)))) env (collect_calls_env_arms (tail arms) env acc)
+  else collect_calls_env (arm_body (head arms)) env (collect_calls_env_arms (tail arms) env acc)
 
 arg_float_flags fargs env acc =
   if length fargs == 0 then reverse acc
@@ -7186,32 +7157,23 @@ all_call_sites decls float_env =
   if length decls == 0 then []
   else
     let d = head decls
-    if head d == "fn" then
-      append (collect_calls_env (head (tail (tail (tail d)))) float_env []) (all_call_sites (tail decls) float_env)
+    if decl_is_fn d then append (collect_calls_env (decl_fn_body d) float_env []) (all_call_sites (tail decls) float_env)
     else all_call_sites (tail decls) float_env
 
 -- Was any call site to `fname` flagged as passing a float at slot i?
 caller_passes_float fname i sites =
   if length sites == 0 then false
   else
-    let site = head sites
-    let call_name = head site
-    let flags = head (tail site)
+    let (call_name, flags) = head sites
     if call_name == fname then
       if i < length flags then
-        if list_nth flags i == 1 then true
+        if wasm_flag_at flags i == 1 then true
         else caller_passes_float fname i (tail sites)
       else caller_passes_float fname i (tail sites)
     else caller_passes_float fname i (tail sites)
 
-dbg_print_sites sites =
-  if length sites == 0 then 0
-  else
-    let s = head sites
-    let nm = head s
-    let args = head (tail s)
-    let _ = print (cat ["  site: ", nm, " (", show (length args), " args)"])
-    dbg_print_sites (tail sites)
+-- the i-th flag (the caller has checked i < length flags)
+wasm_flag_at flags i = if i == 0 then head flags else wasm_flag_at (tail flags) (i - 1)
 
 -- Build float-marker env entries for the params of one function.
 param_float_markers fname params i sites acc =
@@ -7236,25 +7198,25 @@ wg_as_float node env stab ar lams =
 -- replacement), eliminates the stack growth that otherwise kills
 -- recursive Rail loops past ~10k iterations.
 wg_tail node env stab ar lams =
-  let tg = head node
+  let tg = nd_tag node
   if tg == "?" then
-    cat [wg (head (tail node)) env stab ar lams, "    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    if (result i64)\n", wg_tail (head (tail (tail node))) env stab ar lams, "    else\n", wg_tail (head (tail (tail (tail node)))) env stab ar lams, "    end\n"]
+    cat [wg (nd_n1 node) env stab ar lams, "    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    if (result i64)\n", wg_tail (nd_n2 node) env stab ar lams, "    else\n", wg_tail (nd_n3 node) env stab ar lams, "    end\n"]
   else if tg == "D" then
-    let nm = head (tail node)
-    let val_node = head (tail (tail node))
-    let body_node = head (tail (tail (tail node)))
+    let nm = nd_s1 node
+    let val_node = nd_n2 node
+    let body_node = nd_n3 node
     let new_env = if is_float_w val_node env then
                     cons (cat ["__wfloat_", nm], length env) (cons (nm, length env) env)
                   else cons (nm, length env) env
     cat [wg val_node env stab ar lams, "    local.set $", nm, "\n", wg_tail body_node new_env stab ar lams]
   else if tg == "TD" then
-    cat [wg (head (tail (tail node))) env stab ar lams, "    drop\n", wg_tail (head (tail (tail (tail node)))) env stab ar lams]
+    cat [wg (nd_n2 node) env stab ar lams, "    drop\n", wg_tail (nd_n3 node) env stab ar lams]
   else if tg == "M" then
-    let scrut = head (tail node)
-    let arms = head (tail (tail node))
+    let scrut = nd_n1 node
+    let arms = nd_arms node
     cat [wg scrut env stab ar lams, "    local.set $__scrut\n", wg_match_tail arms env stab ar lams]
   else if tg == "A" then
-    let (fname, fargs) = flat node
+    let (fname, fargs) = ast_flat node
     -- Only convert genuine user-function tail calls.  Builtins,
     -- foreign calls (1000+ arity), and constructor allocations
     -- aren't tail-optimizable and just defer to the regular wg
@@ -7282,9 +7244,9 @@ wg_match_tail arms env stab ar lams =
   if length arms == 0 then "    unreachable\n"
   else
     let arm = head arms
-    let ctor = head arm
-    let binds = head (tail arm)
-    let body = head (tail (tail arm))
+    let ctor = arm_ctor arm
+    let binds = arm_binds arm
+    let body = arm_body arm
     if ctor == "_" then
       wg_tail body env stab ar lams
     else if str_starts_with "#int:" ctor then
@@ -7304,13 +7266,13 @@ wg_match_tail arms env stab ar lams =
         cat ["    local.get $__scrut\n    i64.const 1\n    i64.shr_u\n    local.set $__ptr\n    local.get $__ptr\n    i32.wrap_i64\n    i32.const 8\n    i32.add\n    i64.load\n    i64.const 1\n    i64.shr_u\n    i64.const ", show cidx, "\n    i64.eq\n    if (result i64)\n", bind_code, wg_tail body bind_env stab ar lams, "    else\n", wg_match_tail (tail arms) env stab ar lams, "    end\n"]
 
 wg node env stab ar lams =
-  let tg = head node
-  if tg == "I" then cat ["    i64.const ", show (str_to_int (head (tail node)) * 2 + 1), "\n"]
-  else if tg == "S" then cat ["    i64.const ", show (wasm_sfind (head (tail node)) stab * 2), "\n"]
-  else if tg == "B" then if head (tail node) == "true" then "    i64.const 3\n" else "    i64.const 1\n"
-  else if tg == "FL" then cat ["    f64.const ", head (tail node), "\n    i64.reinterpret_f64\n"]
+  let tg = nd_tag node
+  if tg == "I" then cat ["    i64.const ", show (str_to_int (nd_s1 node) * 2 + 1), "\n"]
+  else if tg == "S" then cat ["    i64.const ", show (wasm_sfind (nd_s1 node) stab * 2), "\n"]
+  else if tg == "B" then if nd_s1 node == "true" then "    i64.const 3\n" else "    i64.const 1\n"
+  else if tg == "FL" then cat ["    f64.const ", nd_s1 node, "\n    i64.reinterpret_f64\n"]
   else if tg == "V" then
-    let nm = head (tail node)
+    let nm = nd_s1 node
     if wasm_efind nm env >= 0 then cat ["    local.get $", nm, "\n"]
     else
       let ar_val = afind nm ar
@@ -7325,9 +7287,9 @@ wg node env stab ar lams =
         if ar_val == 0 then cat ["    call $", nm, "\n"]
         else "    i64.const 1\n"
   else if tg == "O" then
-    let op = op_base (head (tail node))
-    let lhs = head (tail (tail node))
-    let rhs = head (tail (tail (tail node)))
+    let op = op_base (nd_s1 node)
+    let lhs = nd_n2 node
+    let rhs = nd_n3 node
     let any_float = is_float_w lhs env || is_float_w rhs env
     if any_float then
       -- Float path.  wg_as_float leaves raw f64 bits as an i64 on
@@ -7340,26 +7302,26 @@ wg node env stab ar lams =
     else
       cat [wg lhs env stab ar lams, "    i64.const 1\n    i64.shr_s\n", wg rhs env stab ar lams, "    i64.const 1\n    i64.shr_s\n", wasm_op op, "    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"]
   else if tg == "?" then
-    cat [wg (head (tail node)) env stab ar lams, "    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    if (result i64)\n", wg (head (tail (tail node))) env stab ar lams, "    else\n", wg (head (tail (tail (tail node)))) env stab ar lams, "    end\n"]
+    cat [wg (nd_n1 node) env stab ar lams, "    i64.const 1\n    i64.shr_s\n    i32.wrap_i64\n    if (result i64)\n", wg (nd_n2 node) env stab ar lams, "    else\n", wg (nd_n3 node) env stab ar lams, "    end\n"]
   else if tg == "D" then
-    let nm = head (tail node)
-    let val_node = head (tail (tail node))
-    let body_node = head (tail (tail (tail node)))
+    let nm = nd_s1 node
+    let val_node = nd_n2 node
+    let body_node = nd_n3 node
     let new_env = if is_float_w val_node env then
                     cons (cat ["__wfloat_", nm], length env) (cons (nm, length env) env)
                   else cons (nm, length env) env
     cat [wg val_node env stab ar lams, "    local.set $", nm, "\n", wg body_node new_env stab ar lams]
-  else if tg == "TD" then cat [wg (head (tail (tail node))) env stab ar lams, "    drop\n", wg (head (tail (tail (tail node)))) env stab ar lams]
+  else if tg == "TD" then cat [wg (nd_n2 node) env stab ar lams, "    drop\n", wg (nd_n3 node) env stab ar lams]
   else if tg == "L" then
-    wg_list (head (tail node)) env stab ar lams
+    wg_list (nd_elems node) env stab ar lams
   else if tg == "M" then
-    let scrut = head (tail node)
-    let arms = head (tail (tail node))
+    let scrut = nd_n1 node
+    let arms = nd_arms node
     cat [wg scrut env stab ar lams, "    local.set $__scrut\n", wg_match arms env stab ar lams]
   else if tg == "F" then
-    let param = head (tail node)
-    let body = head (tail (tail node))
-    let fvl = wasm_fvs_filter (fvs body [param]) ar
+    let param = nd_s1 node
+    let body = nd_n2 node
+    let fvl = wasm_fvs_filter (nd_fvs body [param]) ar
     let lam_idx = wasm_find_lambda node lams 0
     let ncap = length fvl
     let alloc_size = 16 + ncap * 8
@@ -7367,7 +7329,7 @@ wg node env stab ar lams =
     let hdr = alloc_size * 256 + 4
     cat ["    i32.const ", show alloc_size, "\n    call $alloc_obj\n    i64.extend_i32_u\n    local.set $__ptr\n    local.get $__ptr\n    i32.wrap_i64\n    i64.const ", show hdr, "\n    i64.store\n    local.get $__ptr\n    i32.wrap_i64\n    i32.const 8\n    i32.add\n    i64.const ", show lam_idx, "\n    i64.store\n", wg_store_caps fvl env 0, "    local.get $__ptr\n    i64.const 1\n    i64.shl\n"]
   else if tg == "A" then
-    let (fname, fargs) = flat node
+    let (fname, fargs) = ast_flat node
     if fname == "print" then cat [wg (head fargs) env stab ar lams, "    call $__rail_print\n    i64.const 1\n"]
     else if fname == "show" then cat [wg (head fargs) env stab ar lams, "    call $show\n"]
     else if fname == "head" then cat [wg (head fargs) env stab ar lams, "    call $head\n"]
@@ -7412,9 +7374,9 @@ wg_match arms env stab ar lams =
   if length arms == 0 then "    unreachable\n"
   else
     let arm = head arms
-    let ctor = head arm
-    let binds = head (tail arm)
-    let body = head (tail (tail arm))
+    let ctor = arm_ctor arm
+    let binds = arm_binds arm
+    let body = arm_body arm
     if ctor == "_" then
       wg body env stab ar lams
     else if str_starts_with "#int:" ctor then
@@ -7480,66 +7442,30 @@ wasm_fvs_filter lst ar =
 -- higher arities fall through (user must wrap manually).
 nf_rewrite_decls decls ar =
   if length decls == 0 then []
-  else
-    let d = head decls
-    let tg = head d
-    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then
-      cons d (nf_rewrite_decls (tail decls) ar)
-    else
-      let nm = head (tail d)
-      let ps = head (tail (tail d))
-      let body = head (tail (tail (tail d)))
-      let nb = nf_rewrite_node body ar
-      cons (cons tg (cons nm (cons ps (cons nb [])))) (nf_rewrite_decls (tail decls) ar)
+  else cons (nf_rewrite_decl (head decls) ar) (nf_rewrite_decls (tail decls) ar)
+nf_rewrite_decl d ar = match d
+  | DFn nm ps body -> DFn nm ps (nf_rewrite_node body ar)
+  | _ -> d
 
-nf_rewrite_node node ar =
-  let tg = head node
-  if tg == "V" then
-    let nm = head (tail node)
-    let av = afind nm ar
-    let (cidx, _) = decode_ctor av
-    if cidx == (0 - 1) && av == 1 then
-      -- Arity 1: η-expand to `\__nfx -> name __nfx`.
-      cons "F" (cons "__nfx" (cons (cons "A" (cons (cons "V" (cons nm [])) (cons (cons "V" (cons "__nfx" [])) []))) []))
-    else if cidx == (0 - 1) && av == 2 then
-      -- Arity 2: curried η-expand to `\__nfa -> \__nfb -> name __nfa __nfb`.
-      -- Matches the shape $fold expects (f(acc) returns a 1-arg closure).
-      let call_inner = cons "A" (cons (cons "V" (cons nm [])) (cons (cons "V" (cons "__nfa" [])) []))
-      let call_full = cons "A" (cons call_inner (cons (cons "V" (cons "__nfb" [])) []))
-      let inner_lam = cons "F" (cons "__nfb" (cons call_full []))
-      cons "F" (cons "__nfa" (cons inner_lam []))
-    else node
-  else if tg == "A" then nf_rewrite_a node ar
-  else if tg == "O" then
-    let op = head (tail node)
-    let l = nf_rewrite_node (head (tail (tail node))) ar
-    let r = nf_rewrite_node (head (tail (tail (tail node)))) ar
-    cons "O" (cons op (cons l (cons r [])))
-  else if tg == "?" then
-    let c = nf_rewrite_node (head (tail node)) ar
-    let t = nf_rewrite_node (head (tail (tail node))) ar
-    let e = nf_rewrite_node (head (tail (tail (tail node)))) ar
-    cons "?" (cons c (cons t (cons e [])))
-  else if tg == "F" then
-    let p = head (tail node)
-    let b = nf_rewrite_node (head (tail (tail node))) ar
-    cons "F" (cons p (cons b []))
-  else if tg == "D" then
-    let n = head (tail node)
-    let v = nf_rewrite_node (head (tail (tail node))) ar
-    let b = nf_rewrite_node (head (tail (tail (tail node)))) ar
-    cons "D" (cons n (cons v (cons b [])))
-  else if tg == "TD" then
-    let n = head (tail node)
-    let v = nf_rewrite_node (head (tail (tail node))) ar
-    let b = nf_rewrite_node (head (tail (tail (tail node)))) ar
-    cons "TD" (cons n (cons v (cons b [])))
-  else if tg == "L" then
-    cons "L" (cons (nf_rewrite_list (head (tail node)) ar) [])
-  else if tg == "M" then
-    let scrut = nf_rewrite_node (head (tail node)) ar
-    let arms = nf_rewrite_arms (head (tail (tail node))) ar
-    cons "M" (cons scrut (cons arms []))
+nf_rewrite_node node ar = match node
+  | NVar nm -> nf_rewrite_var node nm ar
+  | NApp f a -> nf_rewrite_a node ar
+  | NOp o l r -> NOp o (nf_rewrite_node l ar) (nf_rewrite_node r ar)
+  | NIf c t e -> NIf (nf_rewrite_node c ar) (nf_rewrite_node t ar) (nf_rewrite_node e ar)
+  | NLam p b -> NLam p (nf_rewrite_node b ar)
+  | NLet n v b -> NLet n (nf_rewrite_node v ar) (nf_rewrite_node b ar)
+  | NLetTup ns v b -> NLetTup ns (nf_rewrite_node v ar) (nf_rewrite_node b ar)
+  | NList es -> NList (nf_rewrite_list es ar)
+  | NMatch s arms -> NMatch (nf_rewrite_node s ar) (nf_rewrite_arms arms ar)
+  | _ -> node
+nf_rewrite_var node nm ar =
+  let av = afind nm ar
+  let (cidx, _) = decode_ctor av
+  -- Arity 1: η-expand to `\__nfx -> name __nfx`.
+  if cidx == (0 - 1) && av == 1 then NLam "__nfx" (NApp (NVar nm) (NVar "__nfx"))
+  -- Arity 2: curried η-expand to `\__nfa -> \__nfb -> name __nfa __nfb`.
+  -- Matches the shape $fold expects (f(acc) returns a 1-arg closure).
+  else if cidx == (0 - 1) && av == 2 then NLam "__nfa" (NLam "__nfb" (NApp (NApp (NVar nm) (NVar "__nfa")) (NVar "__nfb")))
   else node
 
 -- Rewrite an A node.  The function-slot chain (A (A (A name a1) a2) a3)
@@ -7547,15 +7473,13 @@ nf_rewrite_node node ar =
 -- in value position ARE rewritten.  If the leftmost isn't a V
 -- (e.g. a lambda or if-expression being applied), recurse into it
 -- as a value.
-nf_rewrite_a node ar =
-  let lhs = head (tail node)
-  let arg = head (tail (tail node))
-  let ltg = head lhs
-  let new_lhs = if ltg == "A" then nf_rewrite_a lhs ar
-                else if ltg == "V" then lhs
-                else nf_rewrite_node lhs ar
-  let new_arg = nf_rewrite_node arg ar
-  cons "A" (cons new_lhs (cons new_arg []))
+nf_rewrite_a node ar = match node
+  | NApp f a -> NApp (nf_rewrite_head f ar) (nf_rewrite_node a ar)
+  | _ -> node
+nf_rewrite_head f ar = match f
+  | NApp g b -> nf_rewrite_a f ar
+  | NVar v -> f
+  | _ -> nf_rewrite_node f ar
 
 nf_rewrite_list lst ar =
   if length lst == 0 then []
@@ -7563,36 +7487,28 @@ nf_rewrite_list lst ar =
 
 nf_rewrite_arms arms ar =
   if length arms == 0 then []
-  else
-    let a = head arms
-    let ctor = head a
-    let binds = head (tail a)
-    let body = head (tail (tail a))
-    let nb = nf_rewrite_node body ar
-    cons (cons ctor (cons binds (cons nb []))) (nf_rewrite_arms (tail arms) ar)
+  else cons (nf_rewrite_arm (head arms) ar) (nf_rewrite_arms (tail arms) ar)
+nf_rewrite_arm a ar = match a
+  | Arm c bs b g -> Arm c bs (nf_rewrite_node b ar) g
 
 wasm_collect_lambdas decls idx =
   if length decls == 0 then []
+  else if decl_is_fn (head decls) == false then wasm_collect_lambdas (tail decls) idx
   else
-    let tg = head (head decls)
-    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_collect_lambdas (tail decls) idx
-    else
-      let bd = head (tail (tail (tail (head decls))))
-      let found = wcl_node bd
-      let tagged = wcl_tag found idx
-      append tagged (wasm_collect_lambdas (tail decls) (idx + length found))
+    let found = wcl_node (decl_fn_body (head decls))
+    let tagged = wcl_tag found idx
+    append tagged (wasm_collect_lambdas (tail decls) (idx + length found))
 
-wcl_node node =
-  let tg = head node
-  if tg == "F" then cons node (wcl_node (head (tail (tail node))))
-  else if tg == "O" then append (wcl_node (head (tail (tail node)))) (wcl_node (head (tail (tail (tail node)))))
-  else if tg == "?" then append (wcl_node (head (tail node))) (append (wcl_node (head (tail (tail node)))) (wcl_node (head (tail (tail (tail node))))))
-  else if tg == "D" then append (wcl_node (head (tail (tail node)))) (wcl_node (head (tail (tail (tail node)))))
-  else if tg == "TD" then append (wcl_node (head (tail (tail node)))) (wcl_node (head (tail (tail (tail node)))))
-  else if tg == "A" then wcl_list (tail node)
-  else if tg == "L" then wcl_list (head (tail node))
-  else if tg == "M" then append (wcl_node (head (tail node))) (wcl_arms (head (tail (tail node))))
-  else []
+wcl_node node = match node
+  | NLam p b -> cons node (wcl_node b)
+  | NOp o l r -> append (wcl_node l) (wcl_node r)
+  | NIf c t e -> append (wcl_node c) (append (wcl_node t) (wcl_node e))
+  | NLet x v b -> append (wcl_node v) (wcl_node b)
+  | NLetTup xs v b -> append (wcl_node v) (wcl_node b)
+  | NApp f a -> append (wcl_node f) (wcl_node a)
+  | NList es -> wcl_list es
+  | NMatch s arms -> append (wcl_node s) (wcl_arms arms)
+  | _ -> []
 
 wcl_list ns =
   if length ns == 0 then []
@@ -7600,14 +7516,14 @@ wcl_list ns =
 
 wcl_arms arms =
   if length arms == 0 then []
-  else append (wcl_node (head (tail (tail (head arms))))) (wcl_arms (tail arms))
+  else append (wcl_node (arm_body (head arms))) (wcl_arms (tail arms))
 
 wcl_tag found idx =
   if length found == 0 then []
   else cons (head found, idx) (wcl_tag (tail found) (idx + 1))
 
 -- Find lambda in collected list.  Matches by param name + free
--- variable set + body structure (serialized via `show`).  The
+-- variable set + body structure (serialized via `ast_key`).  The
 -- body-structure check distinguishes lambdas with the same
 -- param/free-var shape but different bodies, e.g. `\x -> x * 2`
 -- vs `\x -> x > 2`.
@@ -7615,13 +7531,13 @@ wasm_find_lambda node lams idx =
   if length lams == 0 then 0
   else
     let (lnode, lidx) = head lams
-    let lp = head (tail lnode)
-    let lb = head (tail (tail lnode))
-    let np = head (tail node)
-    let nb = head (tail (tail node))
+    let lp = nd_s1 lnode
+    let lb = nd_n2 lnode
+    let np = nd_s1 node
+    let nb = nd_n2 node
     if lp == np then
-      if join "," (fvs lb [lp]) == join "," (fvs nb [np]) then
-        if show lb == show nb then lidx
+      if join "," (nd_fvs lb [lp]) == join "," (nd_fvs nb [np]) then
+        if ast_key lb == ast_key nb then lidx
         else wasm_find_lambda node (tail lams) (idx + 1)
       else wasm_find_lambda node (tail lams) (idx + 1)
     else wasm_find_lambda node (tail lams) (idx + 1)
@@ -7630,9 +7546,9 @@ wasm_lambda_fns lams stab ar =
   if length lams == 0 then ""
   else
     let (lnode, lidx) = head lams
-    let param = head (tail lnode)
-    let body = head (tail (tail lnode))
-    let fvl = wasm_fvs_filter (fvs body [param]) ar
+    let param = nd_s1 lnode
+    let body = nd_n2 lnode
+    let fvl = wasm_fvs_filter (nd_fvs body [param]) ar
     let locs = wasm_dedup (append fvl (cons "__ptr" (cons "__scrut" (wasm_locs body))))
     let rl = wasm_fltr locs [param, "__env"]
     let ld = if length rl == 0 then "" else join "" (wasm_llist rl)
@@ -7677,22 +7593,21 @@ wasm_fop op =
   else if op == ">=" then "    f64.ge\n    i64.extend_i32_u\n    i64.const 1\n    i64.shl\n    i64.const 1\n    i64.or\n"
   else "    f64.add\n    i64.reinterpret_f64\n"
 
-wasm_strs node =
-  let tg = head node
-  if tg == "S" then [head (tail node)]
-  else if tg == "O" then append (wasm_strs (head (tail (tail node)))) (wasm_strs (head (tail (tail (tail node)))))
-  else if tg == "?" then append (wasm_strs (head (tail node))) (append (wasm_strs (head (tail (tail node)))) (wasm_strs (head (tail (tail (tail node))))))
-  else if tg == "D" then append (wasm_strs (head (tail (tail node)))) (wasm_strs (head (tail (tail (tail node)))))
-  else if tg == "A" then wasm_strs_l (tail node)
-  else if tg == "L" then wasm_strs_l (head (tail node))
-  else if tg == "TD" then append (wasm_strs (head (tail (tail node)))) (wasm_strs (head (tail (tail (tail node)))))
-  else if tg == "M" then append (wasm_strs (head (tail node))) (wasm_strs_arms (head (tail (tail node))))
-  else if tg == "F" then wasm_strs (head (tail (tail node)))
-  else []
+wasm_strs node = match node
+  | NStr s -> [s]
+  | NOp o l r -> append (wasm_strs l) (wasm_strs r)
+  | NIf c t e -> append (wasm_strs c) (append (wasm_strs t) (wasm_strs e))
+  | NLet x v b -> append (wasm_strs v) (wasm_strs b)
+  | NApp f a -> append (wasm_strs f) (wasm_strs a)
+  | NList es -> wasm_strs_l es
+  | NLetTup xs v b -> append (wasm_strs v) (wasm_strs b)
+  | NMatch s arms -> append (wasm_strs s) (wasm_strs_arms arms)
+  | NLam p b -> wasm_strs b
+  | _ -> []
 
 wasm_strs_arms arms =
   if length arms == 0 then []
-  else append (wasm_strs (head (tail (tail (head arms))))) (wasm_strs_arms (tail arms))
+  else append (wasm_strs (arm_body (head arms))) (wasm_strs_arms (tail arms))
 
 wasm_strs_l ns =
   if length ns == 0 then []
@@ -7700,10 +7615,8 @@ wasm_strs_l ns =
 
 wasm_strs_all decls =
   if length decls == 0 then []
-  else
-    let tg = head (head decls)
-    if tg == "E" || tg == "TY" || tg == "FN_EXT" || tg == "LINK" then wasm_strs_all (tail decls)
-    else wasm_dedup (append (wasm_strs (head (tail (tail (tail (head decls)))))) (wasm_strs_all (tail decls)))
+  else if decl_is_fn (head decls) == false then wasm_strs_all (tail decls)
+  else wasm_dedup (append (wasm_strs (decl_fn_body (head decls))) (wasm_strs_all (tail decls)))
 
 wasm_stab strs off =
   if length strs == 0 then []
