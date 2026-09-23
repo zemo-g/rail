@@ -88,6 +88,28 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **A failed guard on a `_` arm falls through to the next arm.** A guarded `_` arm was compiled
+  as the last arm: when its guard was false the match jumped to its end and the arms after it
+  never ran, so the match gave 0. The language reference's own `classify` printed 0 for a
+  negative number. A guard that fails on the last arm is now the no-match trap (exit 1) instead of
+  a leftover value. Tests t230, t231; `tools/fuzz/known/guard_wildcard_fallthrough.rail`.
+- **The x86, wasm, Cortex-M and RISC-V backends refuse match guards.** They compiled an arm
+  without its guard, so a guarded program ran the wrong arm; now they report that guards are
+  compiled only by the ARM64 backend. Test t233.
+- **`fold f init (range n)` keeps the element when the body uses it inside a list, match or
+  tuple let.** The rewrite for a body that ignores the element asked whether the element occurs
+  in the body, and that check skipped lists, tuples and matches: `fold (\a b -> a + length [b])
+  0 (range 5)` lost `b` and failed to link. Test t232;
+  `tools/fuzz/known/fold_elem_in_container.rail`.
+- **The checks look at every subtree.** The exhaustiveness check skipped matches inside list and
+  tuple literals, tuple lets and guards; parse errors inside a guard were never reported (the
+  program compiled); and the arity check skipped the head of an application whose head is an
+  expression, as in `(if c then f 1 2 else g) x y`. Test t233.
+- **wasm string literals keep `"`, `\` and backticks.** The data section took each byte from a
+  `printf` subprocess whose shell quoting read those three characters as 0, so they became NUL
+  in the module; it also forked once per byte of every literal, so a file with a few kilobytes
+  of strings took minutes to compile. `char_to_int` now gives the byte. Test t234 (skipped where
+  wasmtime is not installed).
 - **`rail safe` checks match guards.** The checker read arm bodies only, so a banned name
   (`shell`, `read_file`, ...) inside an `if` guard passed. Test t228.
 - **`rail safe` validates tail calls.** The wasm backend emits `return_call` for a tail call, and

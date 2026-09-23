@@ -1894,10 +1894,20 @@ cg_arms arms scrut_sl env ar lc sl end_lbl tp fs =
     let binds = arm_binds arm
     let body = arm_body arm
     let guard = arm_guard arm
+    -- An arm with a guard falls through to the arms after it when the guard fails; after the
+    -- last arm that is the no-match trap. (Until 2026-09-23 a guarded `_` arm was compiled as
+    -- the last arm and a failed guard jumped to the end of the match, so the arms after it
+    -- never ran and the match gave 0.)
     if ctor == "_" then
-      let (ga, lc0, sl0, next0) = cg_guard guard env ar lc sl end_lbl fs
-      let (ba, lc1, sl2) = cg_arm_body body env ar lc0 sl0 tp fs
-      (cat [ga, ba], lc1, sl2)
+      if guard_present guard then
+        let next_lbl = cat [".Lmatch_arm_", show lc]
+        let (ga, lc0, sl0, _) = cg_guard guard env ar (lc + 1) sl next_lbl fs
+        let (ba, lc1, sl2) = cg_arm_body body env ar lc0 sl0 tp fs
+        let (rest, lc2, sl3) = cg_arms (tail arms) scrut_sl env ar lc1 sl end_lbl tp fs
+        (cat [ga, ba, "    b ", end_lbl, "\n", next_lbl, ":\n", rest], lc2, sl3)
+      else
+        let (ba, lc1, sl2) = cg_arm_body body env ar lc sl tp fs
+        (ba, lc1, sl2)
     else if str_starts_with "#int:" ctor then
       let val = str_after "#int:" ctor
       let next_lbl = cat [".Lmatch_arm_", show lc]
@@ -1921,9 +1931,15 @@ cg_arms arms scrut_sl env ar lc sl end_lbl tp fs =
     let is_last = length (tail arms) == 0
     if is_last then
       let (ext, env2, sl2) = extract_adt_fields binds scrut_sl 0 sl env
-      let (ga, lc0, sl0, _) = cg_guard guard env2 ar lc sl2 end_lbl fs
-      let (ba, lc1, sl3) = cg_arm_body body env2 ar lc0 sl0 tp fs
-      (cat [ext, ga, ba], lc1, sl3)
+      if guard_present guard then
+        let next_lbl = cat [".Lmatch_arm_", show lc]
+        let (ga, lc0, sl0, _) = cg_guard guard env2 ar (lc + 1) sl2 next_lbl fs
+        let (ba, lc1, sl3) = cg_arm_body body env2 ar lc0 sl0 tp fs
+        let (trap, lc2, sl4) = cg_arms [] scrut_sl env ar lc1 sl end_lbl tp fs
+        (cat [ext, ga, ba, "    b ", end_lbl, "\n", next_lbl, ":\n", trap], lc2, sl4)
+      else
+        let (ba, lc1, sl3) = cg_arm_body body env2 ar lc sl2 tp fs
+        (cat [ext, ba], lc1, sl3)
     else
       let next_lbl = cat [".Lmatch_arm_", show lc]
       let check = cat ["    ldr x0, [x29, #", show scrut_sl, "]\n    ldr x0, [x0, #8]\n    cmp x0, #", show cidx, "\n    b.ne ", next_lbl, "\n"]
@@ -1932,6 +1948,10 @@ cg_arms arms scrut_sl env ar lc sl end_lbl tp fs =
       let (ba, lc1, sl3) = cg_arm_body body env2 ar lc0 sl0 tp fs
       let (rest, lc2, sl4) = cg_arms (tail arms) scrut_sl env ar lc1 sl end_lbl tp fs
       (cat [check, ext, ga, ba, "    b ", end_lbl, "\n", next_lbl, ":\n", rest], lc2, sl4)
+
+guard_present g = match g
+  | NoGuard -> false
+  | Guard n -> true
 
 cg_guard guard env ar lc sl next_lbl fs = match guard
   | NoGuard -> ("", lc, sl, next_lbl)
@@ -4909,7 +4929,9 @@ rt_arena =
 
 runtime_asm = cat [rt_core, rt_list, rt_closure, rt_io, rt_args, rt_arith, rt_fiber, rt_thread, rt_array, rt_gpu, rt_string, rt_float, rt_effects, rt_str_gc, rt_gc_1, rt_gc_2, rt_gc_3, rt_gc_4, rt_gc_5, rt_syscall, rt_arena]
 
--- Check if variable name appears in AST node
+-- Whether variable `name` occurs free in a node. The fold rewrites below drop a lambda's
+-- element binding when this says it is unused, so it must see every subtree (until 2026-09-23
+-- it skipped lists, tuples and matches, and `fold (\a b -> a + length [b]) 0 (range 5)` lost `b`).
 uses_var node name = match node
   | NVar v -> v == name
   | NOp o l r -> uses_var l name || uses_var r name
@@ -4917,8 +4939,18 @@ uses_var node name = match node
   | NLam p b -> if p == name then false else uses_var b name
   | NIf c t e -> uses_var c name || uses_var t name || uses_var e name
   | NLet x v b -> if x == name then uses_var v name else uses_var v name || uses_var b name
-  | NLetTup xs v b -> uses_var v name || uses_var b name
+  | NLetTup xs v b -> if is_in name xs then uses_var v name else uses_var v name || uses_var b name
+  | NList es -> uses_var_l es name
+  | NTup es -> uses_var_l es name
+  | NMatch s arms -> uses_var s name || uses_var_arms arms name
   | _ -> false
+uses_var_l es name = if es == [] then false else uses_var (head es) name || uses_var_l (tail es) name
+uses_var_arms arms name = if arms == [] then false else uses_var_arm (head arms) name || uses_var_arms (tail arms) name
+uses_var_arm a name = match a
+  | Arm c bs b g -> if is_in name bs then false else uses_var b name || uses_var_guard g name
+uses_var_guard g name = match g
+  | NoGuard -> false
+  | Guard n -> uses_var n name
 
 -- Match fold f init (range n) pattern
 -- Returns (matched, f, init, n)
@@ -5125,8 +5157,17 @@ check_node node siblings = match node
   | NOp o l r -> check_node2 l r siblings
   | NIf c t e -> check_node3 c t e siblings
   | NLet x v b -> check_node2 v b siblings
+  | NLetTup xs v b -> check_node2 v b siblings
   | NLam p b -> check_node b siblings
+  | NList es -> check_nodes es siblings
+  | NTup es -> check_nodes es siblings
   | _ -> 0
+check_nodes es siblings =
+  if es == [] then 0
+  else
+    let e1 = check_node (head es) siblings
+    let e2 = check_nodes (tail es) siblings
+    e1 + e2
 -- in order, since each reports as it goes
 check_node2 a b siblings =
   let e1 = check_node a siblings
@@ -5146,10 +5187,13 @@ check_node_match scrut arms siblings =
 check_arms_nodes arms siblings =
   if length arms == 0 then 0
   else
-    let body = arm_body (head arms)
-    let e1 = check_node body siblings
+    let e0 = check_guard_node (arm_guard (head arms)) siblings
+    let e1 = check_node (arm_body (head arms)) siblings
     let e2 = check_arms_nodes (tail arms) siblings
-    e1 + e2
+    e0 + e1 + e2
+check_guard_node g siblings = match g
+  | NoGuard -> 0
+  | Guard n -> check_node n siblings
 
 check_exhaustiveness decls siblings =
   if length decls == 0 then 0
@@ -5375,9 +5419,12 @@ ce_list elems =
 
 ce_arms arms =
   if length arms == 0 then []
-  else
-    let body = arm_body (head arms)
-    append (ce_node body) (ce_arms (tail arms))
+  else append (ce_arm (head arms)) (ce_arms (tail arms))
+ce_arm a = match a
+  | Arm c bs b g -> append (ce_guard g) (ce_node b)
+ce_guard g = match g
+  | NoGuard -> []
+  | Guard n -> ce_node n
 
 ce_decls decls =
   if length decls == 0 then []
@@ -5482,7 +5529,7 @@ arity_binders_guard g acc = match g
 
 -- count mismatched direct calls in one expression
 arity_walk node fns bound fname_ctx = match node
-  | NApp f a -> arity_walk_app node f fns bound fname_ctx
+  | NApp f a -> arity_walk_app node fns bound fname_ctx
   | NLet x v b -> arity_walk v fns bound fname_ctx + arity_walk b fns bound fname_ctx
   | NLetTup xs v b -> arity_walk v fns bound fname_ctx + arity_walk b fns bound fname_ctx
   | NLam p b -> arity_walk b fns bound fname_ctx
@@ -5492,12 +5539,14 @@ arity_walk node fns bound fname_ctx = match node
   | NList es -> arity_walk_list es fns bound fname_ctx
   | NTup es -> arity_walk_list es fns bound fname_ctx
   | _ -> 0
-arity_walk_app node fn_node fns bound fname_ctx =
+arity_walk_app node fns bound fname_ctx =
   let (callee, args) = ast_flat node
   let want = if is_in callee bound then 0 - 1 else efind callee fns
   let n = length args
   let bad = if want == (0 - 1) then 0 else if want == n then 0 else arity_report fname_ctx callee want n
-  let inner = if nd_tag fn_node == "A" then 0 else if nd_tag fn_node == "V" then 0 else arity_walk fn_node fns bound fname_ctx
+  -- the head, when it is an expression rather than a name: `(if c then g else h) x y`
+  let hd = ast_app_fn node
+  let inner = if nd_tag hd == "V" then 0 else arity_walk hd fns bound fname_ctx
   bad + arity_walk_list args fns bound fname_ctx + inner
 
 arity_report fname_ctx callee want n =
@@ -5700,7 +5749,8 @@ driver_safe_guard _ =
   let _ = write_file path "f n = match n\n  | 0 -> 0\n  | _ if length (shell \"id\") > 0 -> 1\n  | _ -> 2\nmain = f 1\n"
   let out = shell (cat ["./rail_native safe ", path, " 2>&1; echo \"rc=$?\""])
   let _ = shell (cat ["rm -f ", path])
-  let ok = str_contains "REJECTED: 1 banned construct(s) found" out && str_contains "rc=1" out
+  -- two: the banned name in the guard, and the guard itself (wasm compiles no guards)
+  let ok = str_contains "REJECTED: 2 banned construct(s) found" out && str_contains "rc=1" out
   let _ = print (if ok then "  PASS: banned name in a guard" else cat ["  FAIL: ", out])
   ok
 
@@ -5719,6 +5769,43 @@ driver_safe_tail_call _ =
     let _ = shell (cat ["rm -f ", path])
     let ok = str_contains "wat2wasm: OK" out && str_contains "rc=0" out
     let _ = print (if ok then "  PASS: a tail call validates" else cat ["  FAIL: ", out])
+    ok
+
+-- compile `src` with `./rail_native <cmd>` and expect it refused with `want` in the output
+driver_expect_error name cmd src want =
+  let _ = print (cat ["  --- ", name, " ---"])
+  let path = cat [trim (shell "mktemp -u /tmp/rail_err_XXXXXX"), ".rail"]
+  let _ = write_file path src
+  let out = shell (cat ["./rail_native ", cmd, " ", path, " 2>&1; echo \"rc=$?\""])
+  let _ = shell (cat ["rm -f ", path])
+  let ok = str_contains want out && str_contains "rc=1" out
+  let _ = print (if ok then cat ["  PASS: ", want] else cat ["  FAIL: ", out])
+  ok
+
+-- each check walks every subtree: a match inside a list literal, the head of an application
+-- that is an expression, a guard (all skipped before 2026-09-23); and x86 refuses guards
+driver_checks_subtrees _ =
+  let a = driver_expect_error "nonexh_in_list" "asm" "type C = | R | G | B\nf c =\n  let xs = [match c\n    | R -> 1]\n  0\nmain = f R\n" "non-exhaustive match -- missing: G, B"
+  let b = driver_expect_error "arity_in_expr_head" "asm" "f a b c = a\nmain = (if 1 > 0 then f 1 2 else f) 1 2\n" "'f' takes 3 argument(s), called with 2"
+  let c = driver_expect_error "parse_error_in_guard" "asm" "f x = match x\n  | _ if (x + ) -> 1\n  | _ -> 2\nmain = f 3\n" "unexpected 'rp'"
+  let d = driver_expect_error "x86_refuses_guards" "x86" "f x = match x\n  | _ if x > 6 -> 1\n  | _ -> x\nmain = f 3\n" "match guards"
+  a && b && c && d
+
+-- string literals reach wasm byte for byte, quotes and backslashes included; skipped where
+-- wasmtime is not installed (CI)
+driver_wasm_string_bytes _ =
+  let _ = print "  --- driver_wasm_string_bytes ---"
+  let have = trim (shell "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH command -v wasmtime 2>/dev/null")
+  if have == "" then
+    let _ = print "  SKIP: no wasmtime"
+    true
+  else
+    let path = cat [trim (shell "mktemp -u /tmp/rail_wasm_XXXXXX"), ".rail"]
+    let _ = write_file path "main =\n  let _ = print \"q\\\"b\\\\c`d\"\n  0\n"
+    let out = shell (cat ["./rail_native wasm ", path, " 2>&1"])
+    let _ = shell (cat ["rm -f ", path])
+    let ok = str_contains "q\"b\\c`d" out
+    let _ = print (if ok then "  PASS: q\"b\\c`d" else cat ["  FAIL: ", out])
     ok
 
 driver_self_refuses_small_arena _ =
@@ -6352,6 +6439,19 @@ run_tests _ =
   -- t229: `rail safe` validates with the tail-call proposal on, as `rail wasm` does; without it
   -- every program whose wasm has a return_call failed wat2wasm
   let t229 = driver_safe_tail_call 0
+  -- t230..t233: defects found while typing the compiler (2026-09-23). t230: a guarded `_` arm
+  -- was compiled as the last arm, so when its guard failed the arms after it never ran and the
+  -- match gave 0 (docs/language-reference.md's own `classify` printed 0 for a negative).
+  let t230 = run_test "guard_wildcard_fallthrough" "classify n = match n\n  | 0 -> \"zero\"\n  | _ if n > 0 -> \"positive\"\n  | _ -> \"negative\"\npick x = match x\n  | _ if x > 6 -> 1\n  | _ if x > 2 -> 2\n  | 0 -> 3\n  | _ -> 4\ncount n acc = match n\n  | 0 -> acc\n  | _ if n > 100 -> count (n - 10) (acc + 1)\n  | _ -> count (n - 1) (acc + 1)\nmain =\n  let _ = print (classify (0 - 5))\n  let _ = print (show (pick 9 * 1000 + pick 4 * 100 + pick 0 * 10 + pick 1))\n  let _ = print (show (count 150 0))\n  0" "negative\n1234\n105"
+  -- t231: a guard failing on the last arm is the no-match trap (exit 1), not whatever x0 held
+  let t231 = run_test "guard_last_arm_traps" "type T = | A int | B\nf t = match t\n  | B -> 99\n  | A n if n > 0 -> n + 50\nmain = f (A (0 - 7))" "1"
+  -- t232: the fold-over-range rewrite drops the element binding only when the body never uses
+  -- it; the use check skipped lists, matches and tuple lets, and `b` came out unbound
+  let t232 = run_test "fold_elem_in_container" "main =\n  let r = fold (\\a b -> a + length [b]) 0 (range 5)\n  let s = fold (\\a b -> a + (match b | _ -> 1)) 0 (range 4)\n  let t = fold (\\a b -> a + (let (p, q) = (b, 1) in q)) 0 (range 3)\n  let _ = print (show r)\n  let _ = print (show s)\n  let _ = print (show t)\n  0" "5\n4\n3"
+  let t233 = driver_checks_subtrees 0
+  -- t234: the wasm data section took each byte from a `printf` subprocess, whose quoting read
+  -- `"`, `\` and a backtick as 0, so those characters became NUL in every wasm string
+  let t234 = driver_wasm_string_bytes 0
   -- t186/t187: MHD kernel invariants. stdlib/mhd_{kernel,axisym,mpd}.rail is
   -- 1,254 lines driving the live entropy beacon and had NO suite coverage until
   -- 2026-08-30. t186 pins the guarantee the beacon actually publishes; t187 pins
@@ -6372,10 +6472,10 @@ run_tests _ =
   -- cleaner that damps the field to mush would pass the first one alone.
   let t189 = run_test "mhd_glm_divergence_cleaning" "import \"stdlib/mhd_kernel.rail\"\nabsf x = if x < 0.0 then 0.0 - x else x\nclean_k state psi dt ch cr k i =\n  if i >= k then 0\n  else\n    let _ = mk_glm_clean state psi (dt / to_float k) ch cr\n    clean_k state psi dt ch cr k (i + 1)\nrun state psi k n =\n  if n <= 0 then state\n  else\n    let dt = mk_compute_dt_muscl state\n    let ch = 3.0 * mk_max_speed state\n    let ns = mk_muscl_step state dt\n    let _ = if k > 0 then clean_k ns psi dt ch 0.18 k 0 else 0\n    run ns psi k (n - 1)\nmain =\n  let s0 = mk_init_state\n  let m0 = mk_total_mass s0\n  let e0 = mk_total_energy s0\n  let p = mk_max_div_b (run mk_init_state (mk_psi_new 0) 0 10)\n  let g = run mk_init_state (mk_psi_new 0) 4 10\n  let gd = mk_max_div_b g\n  -- GLM must cut divergence by at least 4x (measured 6.8x) ...\n  let cleaner = if gd * 4.0 < p then 1 else 0\n  -- ... without spending conservation to buy it ...\n  let dm = absf ((mk_total_mass g - m0) / m0)\n  let de = absf ((mk_total_energy g - e0) / e0)\n  let conserved = if dm < 0.0000000001 then (if de < 0.0000000001 then 1 else 0) else 0\n  -- ... and psi must actually be doing something (guards a stubbed-out clean).\n  let alive = if gd > 0.0 then 1 else 0\n  let ok = if cleaner == 1 then (if conserved == 1 then (if alive == 1 then 1 else 0) else 0) else 0\n  let _ = print (if ok == 1 then \"ok\" else cat [\"FAIL p=\", show_float p, \" g=\", show_float gd, \" dm=\", show_float dm])\n  0\n" "ok"
   let s_mhd = (if t186 then 1 else 0) + (if t187 then 1 else 0) + (if t188 then 1 else 0) + (if t189 then 1 else 0)
-  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0)
+  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0) + (if t230 then 1 else 0) + (if t231 then 1 else 0) + (if t232 then 1 else 0) + (if t233 then 1 else 0) + (if t234 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s_inf + s_bx + s_ed + s_tls + s_flt + s_drv + s_mhd
-  let _ = print (cat [show total, "/227 tests passed"])
-  if total == 227 then 0 else 1
+  let _ = print (cat [show total, "/232 tests passed"])
+  if total == 232 then 0 else 1
 
 -- ===========================================================================
 -- M6, self-hosted emit path. Replaces as/ld/codesign with the pure-Rail
@@ -6822,7 +6922,7 @@ dispatch_safe path =
     let _ = print (cat ["Compiling ", path, " (safe mode)..."])
     let toks = tokenize src
     let decls = pprog_ast toks
-    let errs = safe_check_decls decls
+    let errs = safe_check_decls decls + guards_unsupported decls path "wasm"
     if errs > 0 then
       let _ = print (cat ["  REJECTED: ", show errs, " banned construct(s) found"])
       1
@@ -6848,11 +6948,21 @@ dispatch_safe path =
             let _ = print "  Binary: /tmp/rail_safe.wasm"
             0
 
+-- The x86, wasm, Cortex-M and RISC-V backends compile a match arm without its guard, so a
+-- guarded program would run the wrong arm; they refuse it instead. Returns the error count.
+guards_unsupported decls path backend =
+  if ast_decls_have_guard decls then
+    let _ = print (cat [path, ": error: match guards (`| p if cond ->`) are compiled only by the ARM64 backend; the ", backend, " backend does not yet"])
+    1
+  else 0
+
 dispatch_wasm path =
   let _ = print (cat ["Compiling ", path, " to WASM..."])
   let src = read_file path
   let toks = tokenize src
   let decls = pprog_ast toks
+  if guards_unsupported decls path "wasm" > 0 then 1
+  else
   let wat = wasm_program decls
   let _ = write_file "/tmp/rail_out.wat" wat
   let _ = print (cat ["  WAT: ", show (length wat), " bytes"])
@@ -7579,13 +7689,9 @@ wasm_esc_c cs =
 wasm_cc c =
   if c == "\n" then 10
   else if c == "\t" then 9
-  else
-    -- macOS `printf '%d' "'X"` returns SIGNED values for high bytes
-    -- (\xe2 → -30); WAT `\hh` escapes need unsigned [0,255].  Mask to
-    -- the low byte to handle multi-byte UTF-8 prefixes correctly.
-    let raw = str_to_int (trim (shell (cat ["printf '%d' \"'", c, "\""])))
-    let nonneg = if raw < 0 then raw + 256 else raw
-    nonneg % 256
+  -- the byte itself (until 2026-09-23 a `printf` subprocess per character, which read `"`, `\`
+  -- and a backtick as 0 and cost a fork per byte of every string literal)
+  else char_to_int c % 256
 
 is_safe_pkg_name name =
   let check = trim (shell (cat ["printf '%s' '", name, "' | grep -qE '^[a-zA-Z0-9_./-]+$' && echo yes || echo no"]))
@@ -8497,7 +8603,7 @@ compile_x86 path =
   let tdecls = pprog_ast toks
   let decls = ast_decls_list tdecls
   let errs = ce_decls tdecls
-  let nerrs = report_errors errs positions ntoks path
+  let nerrs = report_errors errs positions ntoks path + guards_unsupported tdecls path "x86"
   if nerrs > 0 then
     let _ = print (cat [show nerrs, " error(s) found"])
     1
@@ -8869,7 +8975,7 @@ compile_cortexm path =
   let ntoks = length toks
   let decls = pprog_ast toks
   let errs = ce_decls decls
-  let nerrs = report_errors errs positions ntoks path
+  let nerrs = report_errors errs positions ntoks path + guards_unsupported decls path "Cortex-M"
   if nerrs > 0 then
     let _ = print (cat [show nerrs, " error(s) found"])
     1
@@ -9117,7 +9223,7 @@ compile_riscv32 path =
   let ntoks = length toks
   let decls = pprog_ast toks
   let errs = ce_decls decls
-  let nerrs = report_errors errs positions ntoks path
+  let nerrs = report_errors errs positions ntoks path + guards_unsupported decls path "RISC-V"
   if nerrs > 0 then
     let _ = print (cat [show nerrs, " error(s) found"])
     1
