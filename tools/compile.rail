@@ -717,9 +717,9 @@ pprog_ast ts =
           if cv r3 == "as" then
             let (qname, r4) = xp "id" (ad r3)
             let prefixed = prefix_decls_ast (append qname "_") imp_decls
-            append prefixed (pprog_ast r4)
-          else append imp_decls (pprog_ast r2)
-        else append imp_decls (pprog_ast r2)
+            import_merge prefixed (pprog_ast r4)
+          else import_merge imp_decls (pprog_ast r2)
+        else import_merge imp_decls (pprog_ast r2)
       else if ct (sn r) == "id" then
         -- Bare: import math | import math as M
         let (name, r2) = xp "id" r
@@ -734,9 +734,9 @@ pprog_ast ts =
           if cv r3 == "as" then
             let (qname, r4) = xp "id" (ad r3)
             let prefixed = prefix_decls_ast (append qname "_") imp_decls
-            append prefixed (pprog_ast r4)
-          else append imp_decls (pprog_ast r2)
-        else append imp_decls (pprog_ast r2)
+            import_merge prefixed (pprog_ast r4)
+          else import_merge imp_decls (pprog_ast r2)
+        else import_merge imp_decls (pprog_ast r2)
       else pprog_ast r
     else if cv ts2 == "link" then
       -- skip link pragmas for now
@@ -751,6 +751,57 @@ pprog_ast ts =
     let (d, r) = pdcl ts2
     if ast_is_err d then cons d (pprog_ast (sks ts2))
     else cons d (pprog_ast r)
+
+-- An import's declarations go ahead of the rest of the program, minus any later declaration
+-- identical to one of them: a library imported along two paths (a diamond) is defined once.
+-- Until 2026-09-23 it was defined twice and the build failed on duplicate labels, so libraries
+-- relied on their importer for the types they match on. A different declaration under the same
+-- name is kept, so a real conflict still fails.
+import_merge first rest = append first (drop_dup_decls rest (decl_index first (arr_new asm_nbuckets [])))
+decl_index ds idx =
+  if ds == [] then idx
+  else
+    let d = head ds
+    let n = decl_nm d
+    let _ = if n == "" then 0 else let b = asm_hash_str n in let _ = arr_set idx b (cons d (arr_get idx b)) in 0
+    decl_index (tail ds) idx
+drop_dup_decls ds idx =
+  if ds == [] then []
+  else
+    let d = head ds
+    let n = decl_nm d
+    if n != "" && decl_dup_in d n (arr_get idx (asm_hash_str n)) then drop_dup_decls (tail ds) idx
+    else cons d (drop_dup_decls (tail ds) idx)
+decl_dup_in d n bucket =
+  if bucket == [] then false
+  else if decl_nm (head bucket) == n && decl_key (head bucket) == decl_key d then true
+  else decl_dup_in d n (tail bucket)
+-- the name a declaration defines ("" for a parse error, which is never merged away)
+decl_nm d = match d
+  | DFn n ps b -> n
+  | DType n vs -> n
+  | DForeign n a r -> n
+  | DLink l -> cat ["#link:", l]
+  | DGradMark g -> cat ["#grad:", g]
+  | DErr m p -> ""
+-- a string two declarations share only when they are the same declaration
+decl_key d = match d
+  | DFn n ps b -> cat ["F", n, "(", join " " ps, ")", ast_key b]
+  | DType n vs -> cat ["T", n, variants_key vs]
+  | DForeign n a r -> cat ["X", n, "/", show a, "/", r]
+  | DLink l -> cat ["L", l]
+  | DGradMark g -> cat ["G", g]
+  | DErr m p -> cat ["E", m, p]
+variants_key vs = if vs == [] then "" else cat [variant_key (head vs), ";", variants_key (tail vs)]
+variant_key v = match v
+  | Variant c idx ar mask fs -> cat [c, "/", show idx, "/", show ar, "/", join "," (ints_str mask), "/", fields_key fs]
+ints_str xs = if xs == [] then [] else cons (show (head xs)) (ints_str (tail xs))
+fields_key fs = if fs == [] then "" else cat [field_key (head fs), ",", fields_key (tail fs)]
+field_key f = match f
+  | FName t -> t
+  | FList g -> cat ["[", field_key g, "]"]
+  | FArr g -> cat ["(arr ", field_key g, ")"]
+  | FTup gs -> cat ["(", fields_key gs, ")"]
 
 -- ARM64 CODEGEN
 
@@ -5709,6 +5760,23 @@ driver_wasm_many_strings _ =
   ok
 wasm_stress_fns i n = if i >= n then [] else cons (cat ["s", show i, " = \"text number ", show i, "\"\n"]) (wasm_stress_fns (i + 1) n)
 
+-- a library imported along two paths is defined once: until 2026-09-23 a diamond defined it
+-- twice and the build failed on duplicate labels
+driver_import_diamond _ =
+  let _ = print "  --- driver_import_diamond ---"
+  let dir = trim (shell "mktemp -d /tmp/rail_imp_XXXXXX")
+  let a = cat [dir, "/lib_a.rail"]
+  let b = cat [dir, "/lib_b.rail"]
+  let m = cat [dir, "/main.rail"]
+  let _ = write_file a "type Box = | Box int\nunbox b = match b | Box v -> v\n"
+  let _ = write_file b (cat ["import \"", a, "\"\ntwice b = unbox b * 2\n"])
+  let _ = write_file m (cat ["import \"", a, "\"\nimport \"", b, "\"\nmain =\n  let _ = print (show (twice (Box 21)))\n  0\n"])
+  let last = trim (shell (cat ["./rail_native --out-prefix ", dir, "/out run ", m, " 2>&1 | tail -1"]))
+  let _ = shell (cat ["rm -rf ", dir])
+  let ok = last == "42"
+  let _ = print (if ok then "  PASS: 42" else cat ["  FAIL: ", last])
+  ok
+
 driver_self_refuses_small_arena _ =
   let _ = print "  --- driver_self_refuses_small_arena ---"
   let line = trim (shell "RAIL_ARENA_MB=1000 ./rail_native self 2>&1 | head -1")
@@ -6360,6 +6428,9 @@ run_tests _ =
   -- t236: rail wasm is linear in string literals (the string table and call-site lookups walked
   -- lists measured by length at every step; compile.rail took over 15 minutes, now seconds)
   let t236 = driver_wasm_many_strings 0
+  -- t237: imports are deduplicated, so a diamond (a library reached along two import paths)
+  -- builds; it failed on duplicate labels, and stdlib libraries relied on their importer instead
+  let t237 = driver_import_diamond 0
   -- t186/t187: MHD kernel invariants. stdlib/mhd_{kernel,axisym,mpd}.rail is
   -- 1,254 lines driving the live entropy beacon and had NO suite coverage until
   -- 2026-08-30. t186 pins the guarantee the beacon actually publishes; t187 pins
@@ -6380,10 +6451,10 @@ run_tests _ =
   -- cleaner that damps the field to mush would pass the first one alone.
   let t189 = run_test "mhd_glm_divergence_cleaning" "import \"stdlib/mhd_kernel.rail\"\nabsf x = if x < 0.0 then 0.0 - x else x\nclean_k state psi dt ch cr k i =\n  if i >= k then 0\n  else\n    let _ = mk_glm_clean state psi (dt / to_float k) ch cr\n    clean_k state psi dt ch cr k (i + 1)\nrun state psi k n =\n  if n <= 0 then state\n  else\n    let dt = mk_compute_dt_muscl state\n    let ch = 3.0 * mk_max_speed state\n    let ns = mk_muscl_step state dt\n    let _ = if k > 0 then clean_k ns psi dt ch 0.18 k 0 else 0\n    run ns psi k (n - 1)\nmain =\n  let s0 = mk_init_state\n  let m0 = mk_total_mass s0\n  let e0 = mk_total_energy s0\n  let p = mk_max_div_b (run mk_init_state (mk_psi_new 0) 0 10)\n  let g = run mk_init_state (mk_psi_new 0) 4 10\n  let gd = mk_max_div_b g\n  -- GLM must cut divergence by at least 4x (measured 6.8x) ...\n  let cleaner = if gd * 4.0 < p then 1 else 0\n  -- ... without spending conservation to buy it ...\n  let dm = absf ((mk_total_mass g - m0) / m0)\n  let de = absf ((mk_total_energy g - e0) / e0)\n  let conserved = if dm < 0.0000000001 then (if de < 0.0000000001 then 1 else 0) else 0\n  -- ... and psi must actually be doing something (guards a stubbed-out clean).\n  let alive = if gd > 0.0 then 1 else 0\n  let ok = if cleaner == 1 then (if conserved == 1 then (if alive == 1 then 1 else 0) else 0) else 0\n  let _ = print (if ok == 1 then \"ok\" else cat [\"FAIL p=\", show_float p, \" g=\", show_float gd, \" dm=\", show_float dm])\n  0\n" "ok"
   let s_mhd = (if t186 then 1 else 0) + (if t187 then 1 else 0) + (if t188 then 1 else 0) + (if t189 then 1 else 0)
-  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0) + (if t230 then 1 else 0) + (if t231 then 1 else 0) + (if t232 then 1 else 0) + (if t233 then 1 else 0) + (if t234 then 1 else 0) + (if t235 then 1 else 0) + (if t236 then 1 else 0)
+  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0) + (if t223 then 1 else 0) + (if t224 then 1 else 0) + (if t225 then 1 else 0) + (if t226 then 1 else 0) + (if t227 then 1 else 0) + (if t228 then 1 else 0) + (if t229 then 1 else 0) + (if t230 then 1 else 0) + (if t231 then 1 else 0) + (if t232 then 1 else 0) + (if t233 then 1 else 0) + (if t234 then 1 else 0) + (if t235 then 1 else 0) + (if t236 then 1 else 0) + (if t237 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s_inf + s_bx + s_ed + s_tls + s_flt + s_drv + s_mhd
-  let _ = print (cat [show total, "/234 tests passed"])
-  if total == 234 then 0 else 1
+  let _ = print (cat [show total, "/235 tests passed"])
+  if total == 235 then 0 else 1
 
 -- ===========================================================================
 -- M6, self-hosted emit path. Replaces as/ld/codesign with the pure-Rail
