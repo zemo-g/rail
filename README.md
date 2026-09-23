@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="#quick-start"><img src="https://img.shields.io/badge/tests-244%2F244-brightgreen" alt="tests 244/244"></a>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/tests-245%2F245-brightgreen" alt="tests 245/245"></a>
   <a href="#why-rail"><img src="https://img.shields.io/badge/self--hosting-fixed%20point-blue" alt="self-hosting"></a>
   <a href="#what-rail-does"><img src="https://img.shields.io/badge/HTTPS-pure%20Rail-ff5500" alt="pure-Rail HTTPS"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/GC-ARM64%20assembly-purple" alt="GC in ARM64 asm"></a>
@@ -34,7 +34,7 @@ Rail compiles itself. The compiler — ~10,000 lines of Rail — produces a ~0.9
 ```
 RAIL_ARENA_MB=6000 ./rail_native self && cp /tmp/rail_self ./rail_native  # cycle 1
 RAIL_ARENA_MB=6000 ./rail_native self && cmp rail_native /tmp/rail_self   # cycle 2 — byte-identical
-./rail_native test                                     # 244/244
+./rail_native test                                     # 245/245
 ```
 
 ### What the self-hosting is *for*
@@ -68,7 +68,7 @@ Apple Silicon (ARM64 macOS) is the primary target; Linux ARM64, Linux x86_64, We
 ```bash
 ./rail_native <file.rail>        # compile to /tmp/rail_out
 ./rail_native run <file.rail>    # compile + execute
-./rail_native test               # run the suite (244 tests)
+./rail_native test               # run the suite (245 tests)
 RAIL_ARENA_MB=6000 ./rail_native self               # self-compile, fixed point at gen2
 ./rail_native x86 <file.rail>    # cross-compile to Linux x86_64
 ./rail_native linux <file.rail>  # cross-compile to Linux ARM64
