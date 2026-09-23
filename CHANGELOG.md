@@ -85,6 +85,13 @@ All notable changes to Rail are documented here.
   tests) compile to byte-identical assembly, and the parser's typed declarations now reach code
   generation without passing through the list form. The compiler's type errors drop from 362
   to 129.
+- **The list form is gone.** Nothing reads or builds the old list AST any more, so the two
+  adapters (`ast_list`/`ast_decls_list`, `ast_of`/`ast_decls_of`), `pprog`, and the list
+  helpers only they served (`flat`, `fvs`, `get_app_fn`, `collect_lam_params`) are deleted, 170
+  lines. The parser's `Decl`s flow through every pass and backend. The compiler's type errors
+  drop from 129 to 62, all of them in the linker, assembler and SHA-256 records, which are not
+  syntax trees. Codegen now gives 2,674 of the compiler's 3,505 parameters a static
+  representation, up from 1,824 of 3,393 before phase C.
 - **Array and tuple field types.** A constructor field may be `(arr t)` or `(t1, t2)`, next to
   `[t]` and the named types.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
