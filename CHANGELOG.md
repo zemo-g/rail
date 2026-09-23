@@ -67,6 +67,10 @@ All notable changes to Rail are documented here.
   `Decl`, and so does `gpu_map`'s kernel text (`ast_to_metal`). Every file in the tree, and a set
   of programs written to trip each check, produce the same errors, warnings and assembly as
   before; the compiler's type errors drop from 567 to 468.
+- **The optimizer reads and builds the typed syntax tree.** Constant folding, map fusion, the
+  `gpu_map` dispatch and the `fold ... (range n)` rewrites match on `Node` and build `Node`s, and
+  its pattern helpers return `NNull` where they returned `[]`. Every file in the tree compiles
+  to byte-identical ARM64 and x86 assembly; the compiler's type errors drop from 468 to 406.
 - **Array and tuple field types.** A constructor field may be `(arr t)` or `(t1, t2)`, next to
   `[t]` and the named types.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without
