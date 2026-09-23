@@ -4,6 +4,19 @@ All notable changes to Rail are documented here.
 
 ## Unreleased
 
+### Changed
+- **The arena grows in place; `RAIL_ARENA_MB` is where the first collection happens, not a
+  wall.** The runtime reserves 64 GB of address space at startup (or `RAIL_ARENA_MB`, if larger;
+  untouched pages cost no memory) and bump-allocates inside it. When a collection frees under a
+  quarter of the heap, or the free list cannot serve a request, the arena's end moves out
+  (doubling, at least enough for the request) instead of the allocation spilling to `malloc`.
+  A spilled object sat outside the arena, where the collector does not look: a spilled string
+  printed as its tag byte, and a spilled cell's children were never traced. And a live set
+  bigger than the arena collected on nearly every allocation: 300,000 live tuples at 16 MB ran
+  for over two minutes; now 0.01 s. `RAIL_ARENA_TRACE=1` prints `rail_arena_grow` for each move.
+  The Linux target keeps its fixed 1 GB heap (`tools/linux_libc.s` sets no reservation), and
+  with it the spill path. Tests t248, t249.
+
 ### Added
 - **`RAIL_GC_STRESS=N` and `tools/fuzz/gc_stress.py`: the collector under load.** The collector
   runs only when the arena fills, and at the default 1 GB almost no test program fills it, so a
