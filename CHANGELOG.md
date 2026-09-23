@@ -5,6 +5,11 @@ All notable changes to Rail are documented here.
 ## Unreleased
 
 ### Added
+- **Variable and boolean patterns.** A lowercase name in a pattern matches anything and binds the
+  value for the arm's guard and body (`| big if big > 100 -> 100 | other -> other`); the
+  scrutinee is evaluated once. `| true ->` and `| false ->` match booleans. Constructors are
+  capitalized, so a lowercase pattern is always a variable. The parser rewrites a variable arm to
+  `_` plus a `let`, so every backend compiles it. `docs/language-reference.md`; tests t238, t239.
 - **Types decide representation.** `tools/types.rail` infers a type for every top-level
   function with no annotations (Hindley-Milner, polymorphic per call-graph group:
   `compose : (a -> b, c -> a) -> c -> b`, with `dyn` for Rail's dynamic idioms), and codegen
@@ -117,6 +122,13 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **A pattern must name a declared constructor.** A name that was not a constructor compiled to
+  a tag test against -1: never matched, or, as the last arm, matched everything. So
+  `| Rde -> 1 | Green -> 2` returned 2 for `Red`, `| true -> 1 | false -> 0` crashed on the tag
+  load, and `| n ->` bound nothing. An undeclared constructor, or a pattern binding more fields
+  than its constructor has, is now a compile error; lowercase names and `true`/`false` are
+  patterns (Added). Test t240; `tools/fuzz/known/bool_pattern.rail`,
+  `tools/fuzz/known/ctor_typo_in_pattern.rail`.
 - **A library imported along two paths is defined once.** An import inlined the file's
   declarations every time, so a diamond (two imports that both reach `stdlib/tensor.rail`)
   defined every function twice and the build failed on duplicate labels. That is why
