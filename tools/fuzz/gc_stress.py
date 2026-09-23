@@ -7,8 +7,8 @@ RAIL_GC_STRESS=N makes the runtime collect on every Nth allocation and poison
 what it frees, so a live object the collector misses crashes or changes the
 output instead of passing unnoticed.
 
-Programs: every suite test in tools/compile.rail (run_test "name" "src"
-"expected"), and every runnable program in the tree that stays inside its
+Programs: every suite test in tools/compile.rail whose source is a literal
+(run_test "name" "src" "expected"), and every runnable program in the tree that stays inside its
 process (the rundiff safety filter). Each is compiled once and run normally;
 then under N = 1, 13, 127, 1021, taking the first N that finishes inside the
 budget. Verdicts:
@@ -81,9 +81,11 @@ def suite_programs():
     for m in re.finditer(r'let (t\d+) = run_test "', src):
         i = m.end() - 1
         name, i = rail_string(src, i)
-        if src[i] != ' ' or src[i + 1] != '"':
-            continue
-        text, i = rail_string(src, i + 1)
+        while src[i] == ' ':
+            i += 1
+        if src[i] != '"':
+            continue  # a source built at run time (t149 to t152 splice dict_src with cat)
+        text, i = rail_string(src, i)
         progs.append((f'suite {m.group(1)} {name}', text))
     return progs
 
