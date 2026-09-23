@@ -26,7 +26,8 @@ All notable changes to Rail are documented here.
   compiles every suite test and every self-contained tree program, runs each normally and then
   under the most aggressive N (1, 13, 127, 1021) that finishes in its budget, and compares. With
   the #109 bug put back it flags 44 suite tests; on master it flags 3 (`shell`'s result, threads,
-  variable patterns), which are the next fixes. Test t245 runs a program at `RAIL_GC_STRESS=3`.
+  variable patterns), each fixed below, and it now flags none. CI runs it on every push and pull
+  request (job `gc-stress`). Test t245 runs a program at `RAIL_GC_STRESS=3`.
 - **`show` prints tuples, constructed values and bools.** `show (1, "a")` is `(1, a)`, `show
   (Some (Pair 1 2))` is `Some (Pair 1 2)`, walking the tuple length and the constructor tables
   (they printed their header bytes, nothing visible), and `show (x > 3)` is `true` or `false`
