@@ -3058,8 +3058,8 @@ inject_auth_fns decls =
 -- grad_deriv emits the derivative of an expr w.r.t. param p AS a Rail AST,
 -- so the synthesized f__grad is itself a re-attestable Rail program.
 -- grad_ucall rebuilds a unary foreign-float call node (sin/cos/exp/...) as
--- a curried application ["A", ["V", fn], arg] -- the shape the parser emits.
-grad_ucall fn arg = ["A", ["V", fn], arg]
+-- a curried application (NApp (NVar fn) arg) -- the shape the parser emits.
+grad_ucall fn arg = (NApp (NVar fn) arg)
 
 -- grad_scope_has: is nm a let-bound tangent variable currently in scope?
 -- (local membership check -- avoids a forward-ref to str_in defined far below.)
@@ -3068,7 +3068,7 @@ grad_scope_has nm scope =
   else if head scope == nm then true
   else grad_scope_has nm (tail scope)
 
--- C5.2 match support. An arm [ctor, binds, body, guard] is differentiable iff it binds no
+-- C5.2 match support. An arm (Arm ctor binds body guard) is differentiable iff it binds no
 -- pattern var (binds==[]), carries no guard, and its ctor is a NON-BINDING discriminant test:
 -- a real nullary ADT constructor (uppercase initial), an int/str literal pattern (#-prefixed),
 -- or "_". A lowercase variable catch-all (| x -> ...) binds the whole scrutinee, which could
@@ -3085,103 +3085,94 @@ grad_ctor_safe ctor =
 
 grad_arms_ok arms =
   if arms == [] then true
-  else
-    let arm = head arms
-    let ctor = head arm
-    let binds = head (tail arm)
-    let guard = head (tail (tail (tail arm)))
-    if binds == [] then
-      if guard == [] then (if grad_ctor_safe ctor then grad_arms_ok (tail arms) else false)
-      else false
-    else false
+  else if grad_arm_ok (head arms) then grad_arms_ok (tail arms)
+  else false
+grad_arm_ok a = match a
+  | Arm ctor binds body g -> if binds == [] then (if guard_present g then false else grad_ctor_safe ctor) else false
 
 -- grad_deriv_arms: differentiate each arm body, keeping ctor/binds/guard verbatim (binds and
 -- guard are [] by the grad_arms_ok gate). The result is a match with the SAME scrutinee and
 -- patterns -- the n-way analog of the "?" branch differentiation.
 grad_deriv_arms arms p scope =
   if arms == [] then []
-  else
-    let arm = head arms
-    let ctor = head arm
-    let binds = head (tail arm)
-    let body = head (tail (tail arm))
-    let guard = head (tail (tail (tail arm)))
-    cons [ctor, binds, grad_deriv body p scope, guard] (grad_deriv_arms (tail arms) p scope)
+  else cons (grad_deriv_arm (head arms) p scope) (grad_deriv_arms (tail arms) p scope)
+grad_deriv_arm a p scope = match a
+  | Arm ctor binds body g -> Arm ctor binds (grad_deriv body p scope) g
 
 -- grad_deriv node p scope -> derivative AST of node wrt param p. scope carries the
 -- let-bound var names in scope so a reference to a let var v differentiates to its
 -- tangent binding v__d (forward-mode through let -- C3). scope-first lookup so an
 -- inner `let v = ...` correctly shadows a param of the same name.
 grad_deriv node p scope =
-  let tg = head node
-  if tg == "FL" then ["FL", "0.0"]
-  else if tg == "I" then ["FL", "0.0"]
+  let tg = nd_tag node
+  if tg == "FL" then (NFloat "0.0")
+  else if tg == "I" then (NFloat "0.0")
   else if tg == "V" then
-    let nm = head (tail node)
-    if grad_scope_has nm scope then ["V", cat [nm, "__d"]]
-    else if nm == p then ["FL", "1.0"]
-    else ["FL", "0.0"]
+    let nm = nd_s1 node
+    if grad_scope_has nm scope then (NVar (cat [nm, "__d"]))
+    else if nm == p then (NFloat "1.0")
+    else (NFloat "0.0")
   else if tg == "O" then
-    let op = op_base (head (tail node))
-    let a = head (tail (tail node))
-    let b = head (tail (tail (tail node)))
+    let op = op_base (nd_s1 node)
+    let a = nd_n2 node
+    let b = nd_n3 node
     let da = grad_deriv a p scope
     let db = grad_deriv b p scope
-    if op == "+" then ["O", "+", da, db]
-    else if op == "-" then ["O", "-", da, db]
-    else if op == "*" then ["O", "+", ["O", "*", da, b], ["O", "*", a, db]]
-    else if op == "/" then ["O", "/", ["O", "-", ["O", "*", da, b], ["O", "*", a, db]], ["O", "*", b, b]]
-    else ["FL", "0.0"]
+    if op == "+" then (NOp "+" da db)
+    else if op == "-" then (NOp "-" da db)
+    else if op == "*" then (NOp "+" (NOp "*" da b) (NOp "*" a db))
+    else if op == "/" then (NOp "/" (NOp "-" (NOp "*" da b) (NOp "*" a db)) (NOp "*" b b))
+    else (NFloat "0.0")
   else if tg == "A" then
-    -- unary foreign-float call: ["A", ["V", fname], arg]. Chain rule on arg.
-    -- Multi-arg curried calls (head fn == "A") and user-fn calls fall through to
+    -- unary foreign-float call: (NApp (NVar fname) arg). Chain rule on arg.
+    -- Multi-arg curried calls (an application as the function) and user-fn calls fall through to
     -- 0.0 -- C2 differentiates only the recognized unary transcendental set.
-    let fn = head (tail node)
-    let arg = head (tail (tail node))
-    if head fn == "V" then
-      let fname = head (tail fn)
+    let fn = nd_n1 node
+    let arg = nd_n2 node
+    if nd_tag fn == "V" then
+      let fname = nd_s1 fn
       let du = grad_deriv arg p scope
-      if fname == "sin" then ["O", "*", grad_ucall "cos" arg, du]
-      else if fname == "cos" then ["O", "*", ["O", "-", ["FL", "0.0"], grad_ucall "sin" arg], du]
-      else if fname == "exp" then ["O", "*", grad_ucall "exp" arg, du]
-      else if fname == "tanh" then ["O", "*", ["O", "-", ["FL", "1.0"], ["O", "*", grad_ucall "tanh" arg, grad_ucall "tanh" arg]], du]
-      else if fname == "sqrt" then ["O", "/", du, ["O", "+", grad_ucall "sqrt" arg, grad_ucall "sqrt" arg]]
-      else if fname == "log" then ["O", "/", du, arg]
-      else if fname == "fneg" then ["O", "-", ["FL", "0.0"], du]
-      else ["FL", "0.0"]
-    else ["FL", "0.0"]
+      if fname == "sin" then (NOp "*" (grad_ucall "cos" arg) du)
+      else if fname == "cos" then (NOp "*" (NOp "-" (NFloat "0.0") (grad_ucall "sin" arg)) du)
+      else if fname == "exp" then (NOp "*" (grad_ucall "exp" arg) du)
+      else if fname == "tanh" then (NOp "*" (NOp "-" (NFloat "1.0") (NOp "*" (grad_ucall "tanh" arg) (grad_ucall "tanh" arg))) du)
+      else if fname == "sqrt" then (NOp "/" du (NOp "+" (grad_ucall "sqrt" arg) (grad_ucall "sqrt" arg)))
+      else if fname == "log" then (NOp "/" du arg)
+      else if fname == "fneg" then (NOp "-" (NFloat "0.0") du)
+      else (NFloat "0.0")
+    else (NFloat "0.0")
   else if tg == "D" then
-    -- single-binding let: ["D", nm, val, body]. Emit the primal binding (so primal
+    -- single-binding let: (NLet nm val body). Emit the primal binding (so primal
     -- references to nm in body/derivative resolve) plus a tangent binding nm__d = d(val),
     -- then differentiate body with nm in scope. Tuple-destructure lets ("TD") fall
     -- through to 0.0 -- C3 handles only the single-binding form.
-    let nm = head (tail node)
-    let val = head (tail (tail node))
-    let bod = head (tail (tail (tail node)))
+    let nm = nd_s1 node
+    let val = nd_n2 node
+    let bod = nd_n3 node
     let dval = grad_deriv val p scope
     let dbod = grad_deriv bod p (cons nm scope)
-    ["D", nm, val, ["D", cat [nm, "__d"], dval, dbod]]
+    (NLet nm val (NLet (cat [nm, "__d"]) dval dbod))
   else if tg == "?" then
     -- piecewise control flow (C5.0): the predicate is primal-only (non-differentiable);
     -- emit it verbatim and differentiate each branch. Pointwise AD --
     -- d(if c then a else b) = if c then d(a) else d(b) -- the active branch carries the
     -- derivative; the kink at the boundary is measure-zero and not represented. This is
     -- how data-dependent control flow is differentiated, and it enables relu/abs/clamp.
-    let c = head (tail node)
-    let a = head (tail (tail node))
-    let b = head (tail (tail (tail node)))
-    ["?", c, grad_deriv a p scope, grad_deriv b p scope]
+    let c = nd_n1 node
+    let a = nd_n2 node
+    let b = nd_n3 node
+    (NIf c (grad_deriv a p scope) (grad_deriv b p scope))
   else if tg == "M" then
     -- match (C5.2): the n-way analog of "?". The scrutinee is a discriminant (int/str/ADT)
     -- evaluated to select one arm -- primal-only, emitted verbatim -- and each arm body is
     -- differentiated. Only non-binding discriminant arms are differentiated (grad_arms_ok); a
     -- payload-binding or guarded arm would risk dropping a tangent, so the whole match punts to
     -- 0.0 -- the pre-C5.2 behavior, never a wrong nonzero gradient.
-    let scrut = head (tail node)
-    let arms = head (tail (tail node))
-    if grad_arms_ok arms then ["M", scrut, grad_deriv_arms arms p scope]
-    else ["FL", "0.0"]
-  else ["FL", "0.0"]
+    let scrut = nd_n1 node
+    let arms = nd_arms node
+    if grad_arms_ok arms then (NMatch scrut (grad_deriv_arms arms p scope))
+    else (NFloat "0.0")
+  else (NFloat "0.0")
 
 -- Pillar 3 / C4 (reverse-mode AD). Where forward-mode (grad_deriv) computes one
 -- directional derivative per call, reverse-mode computes ALL input partials in a
@@ -3209,51 +3200,51 @@ grad_rev_trans_fn fname =
 -- supplies the chain by pushing ct * f'(arg) into arg. fneg' = -1 written as 0.0 - 1.0.
 grad_rev_local fname arg =
   if fname == "sin" then grad_ucall "cos" arg
-  else if fname == "cos" then ["O", "-", ["FL", "0.0"], grad_ucall "sin" arg]
+  else if fname == "cos" then (NOp "-" (NFloat "0.0") (grad_ucall "sin" arg))
   else if fname == "exp" then grad_ucall "exp" arg
-  else if fname == "tanh" then ["O", "-", ["FL", "1.0"], ["O", "*", grad_ucall "tanh" arg, grad_ucall "tanh" arg]]
-  else if fname == "sqrt" then ["O", "/", ["FL", "1.0"], ["O", "+", grad_ucall "sqrt" arg, grad_ucall "sqrt" arg]]
-  else if fname == "log" then ["O", "/", ["FL", "1.0"], arg]
-  else ["O", "-", ["FL", "0.0"], ["FL", "1.0"]]
+  else if fname == "tanh" then (NOp "-" (NFloat "1.0") (NOp "*" (grad_ucall "tanh" arg) (grad_ucall "tanh" arg)))
+  else if fname == "sqrt" then (NOp "/" (NFloat "1.0") (NOp "+" (grad_ucall "sqrt" arg) (grad_ucall "sqrt" arg)))
+  else if fname == "log" then (NOp "/" (NFloat "1.0") arg)
+  else (NOp "-" (NFloat "0.0") (NFloat "1.0"))
 
 -- grad_rev_flat: a flat differentiable expr -- FL/I/V, O over +,-,*,/, and a recognized
 -- unary transcendental ("A": sin/cos/exp/tanh/sqrt/log/fneg) over a flat arg. This is the
 -- atom the reverse sweep pushes cotangents through. let / unknown call / TD -> false.
 grad_rev_flat node =
-  let tg = head node
+  let tg = nd_tag node
   if tg == "FL" then true
   else if tg == "I" then true
   else if tg == "V" then true
   else if tg == "O" then
-    let op = op_base (head (tail node))
-    let a = head (tail (tail node))
-    let b = head (tail (tail (tail node)))
+    let op = op_base (nd_s1 node)
+    let a = nd_n2 node
+    let b = nd_n3 node
     let okop = if op == "+" then true else if op == "-" then true else if op == "*" then true else if op == "/" then true else false
     if okop then (if grad_rev_flat a then grad_rev_flat b else false) else false
   else if tg == "A" then
-    let fn = head (tail node)
-    if head fn == "V" then
-      (if grad_rev_trans_fn (head (tail fn)) then grad_rev_flat (head (tail (tail node))) else false)
+    let fn = nd_n1 node
+    if nd_tag fn == "V" then
+      (if grad_rev_trans_fn (nd_s1 fn) then grad_rev_flat (nd_n2 node) else false)
     else false
   else if tg == "?" then
     -- control flow (C5.1): the predicate is primal-only (not differentiated), so an if is
     -- reverse-flat iff BOTH branches are. A let nested inside a branch -> not flat -> false
     -- (the let-spine machinery handles lets only at top level), so no wrong f__rgrad emits.
-    let a = head (tail (tail node))
-    let b = head (tail (tail (tail node)))
+    let a = nd_n2 node
+    let b = nd_n3 node
     if grad_rev_flat a then grad_rev_flat b else false
   else if tg == "M" then
     -- match (C5.2): reverse-flat iff every arm is a non-binding discriminant arm (grad_arms_ok)
     -- whose body is itself reverse-flat. A payload-binding/guarded arm, or a non-flat arm body,
     -- -> false -> grad_rev_supported false -> forward-only fallback (no wrong f__rgrad emitted).
-    let arms = head (tail (tail node))
+    let arms = nd_arms node
     if grad_arms_ok arms then grad_rev_marms_flat arms else false
   else false
 
 grad_rev_marms_flat arms =
   if arms == [] then true
   else
-    let body = head (tail (tail (head arms)))
+    let body = arm_body (head arms)
     if grad_rev_flat body then grad_rev_marms_flat (tail arms) else false
 
 -- grad_rev_supported: C4.1 reverse-mode handles a let-SPINE of flat rationals -- a chain
@@ -3262,36 +3253,36 @@ grad_rev_marms_flat arms =
 -- ("TD") and transcendental ("A") bodies fall through to forward-mode only, so no wrong
 -- f__rgrad is ever emitted. A flat body is the binds=[] degenerate case (= C4.0).
 grad_rev_supported node =
-  let tg = head node
+  let tg = nd_tag node
   if tg == "D" then
-    let val = head (tail (tail node))
-    let bod = head (tail (tail (tail node)))
+    let val = nd_n2 node
+    let bod = nd_n3 node
     if grad_rev_flat val then grad_rev_supported bod else false
   else grad_rev_flat node
 
--- grad_rev_push node ct -> list of [leafname, contribAST]. ct is the cotangent AST
+-- grad_rev_push node ct -> list of (leafname, contribAST). ct is the cotangent AST
 -- flowing into node; each variable use emits one contribution to that var's adjoint.
 -- Standard reverse rules: +(both ct), -(b gets -ct), *(a:ct*b, b:a*ct),
 -- /(a:ct/b, b:-(a*ct)/(b*b)). Contributions to the same leaf are summed downstream.
 grad_rev_push node ct =
-  let tg = head node
+  let tg = nd_tag node
   if tg == "FL" then []
   else if tg == "I" then []
-  else if tg == "V" then cons [head (tail node), ct] []
+  else if tg == "V" then [(nd_s1 node, ct)]
   else if tg == "O" then
-    let op = op_base (head (tail node))
-    let a = head (tail (tail node))
-    let b = head (tail (tail (tail node)))
+    let op = op_base (nd_s1 node)
+    let a = nd_n2 node
+    let b = nd_n3 node
     if op == "+" then append (grad_rev_push a ct) (grad_rev_push b ct)
-    else if op == "-" then append (grad_rev_push a ct) (grad_rev_push b ["O", "-", ["FL", "0.0"], ct])
-    else if op == "*" then append (grad_rev_push a ["O", "*", ct, b]) (grad_rev_push b ["O", "*", a, ct])
-    else if op == "/" then append (grad_rev_push a ["O", "/", ct, b]) (grad_rev_push b ["O", "/", ["O", "-", ["FL", "0.0"], ["O", "*", a, ct]], ["O", "*", b, b]])
+    else if op == "-" then append (grad_rev_push a ct) (grad_rev_push b (NOp "-" (NFloat "0.0") ct))
+    else if op == "*" then append (grad_rev_push a (NOp "*" ct b)) (grad_rev_push b (NOp "*" a ct))
+    else if op == "/" then append (grad_rev_push a (NOp "/" ct b)) (grad_rev_push b (NOp "/" (NOp "-" (NFloat "0.0") (NOp "*" a ct)) (NOp "*" b b)))
     else []
   else if tg == "A" then
     -- unary transcendental f(arg): contribution to arg's leaves is ct * f'(arg), pushed on.
-    let fn = head (tail node)
-    let arg = head (tail (tail node))
-    if head fn == "V" then grad_rev_push arg ["O", "*", ct, (grad_rev_local (head (tail fn)) arg)]
+    let fn = nd_n1 node
+    let arg = nd_n2 node
+    if nd_tag fn == "V" then grad_rev_push arg (NOp "*" ct (grad_rev_local (nd_s1 fn) arg))
     else []
   else if tg == "?" then
     -- control flow (C5.1): the reverse mirror of grad_deriv's piecewise "?". The cotangent
@@ -3300,18 +3291,18 @@ grad_rev_push node ct =
     -- from a branch is thus conditioned on c (if c then <contrib> else 0.0), and the existing
     -- pushback machinery distributes the guarded cotangent unchanged. c is emitted verbatim
     -- (primal-only); the forward primals are in scope via grad_rev_primals so it resolves.
-    let c = head (tail node)
-    let a = head (tail (tail node))
-    let b = head (tail (tail (tail node)))
-    append (grad_rev_push a ["?", c, ct, ["FL", "0.0"]]) (grad_rev_push b ["?", c, ["FL", "0.0"], ct])
+    let c = nd_n1 node
+    let a = nd_n2 node
+    let b = nd_n3 node
+    append (grad_rev_push a (NIf c ct (NFloat "0.0"))) (grad_rev_push b (NIf c (NFloat "0.0") ct))
   else if tg == "M" then
     -- match (C5.2): the n-way mirror of the "?" guarded-cotangent split. The cotangent ct
     -- reaches arm i's body only when the scrutinee selects arm i, so guard ct by a match that
     -- yields ct in arm i and 0.0 in every other arm, then push that guarded cotangent into the
     -- arm body. Summed over arms, each leaf's adjoint is the sum of its per-arm contributions
     -- conditioned on selection -- the exact reverse of d(match)/dp = the active arm's d(body).
-    let scrut = head (tail node)
-    let arms = head (tail (tail node))
+    let scrut = nd_n1 node
+    let arms = nd_arms node
     grad_rev_push_marms scrut arms arms 0 ct
   else []
 
@@ -3320,43 +3311,39 @@ grad_rev_push node ct =
 -- gate) so the synthesized match is exhaustive over the same scrutinee and yields a float.
 grad_rev_ct_arms arms hit ct =
   if arms == [] then []
-  else
-    let arm = head arms
-    let ctor = head arm
-    let binds = head (tail arm)
-    let guard = head (tail (tail (tail arm)))
-    let b = if hit == 0 then ct else ["FL", "0.0"]
-    cons [ctor, binds, b, guard] (grad_rev_ct_arms (tail arms) (hit - 1) ct)
+  else cons (grad_rev_ct_arm (head arms) (if hit == 0 then ct else NFloat "0.0")) (grad_rev_ct_arms (tail arms) (hit - 1) ct)
+grad_rev_ct_arm a b = match a
+  | Arm ctor binds body g -> Arm ctor binds b g
 
 grad_rev_push_marms scrut allarms arms idx ct =
   if arms == [] then []
   else
-    let body = head (tail (tail (head arms)))
-    let gct = ["M", scrut, grad_rev_ct_arms allarms idx ct]
+    let body = arm_body (head arms)
+    let gct = (NMatch scrut (grad_rev_ct_arms allarms idx ct))
     append (grad_rev_push body gct) (grad_rev_push_marms scrut allarms (tail arms) (idx + 1) ct)
 
 -- grad_rev_terms: pick out the contribution ASTs for leaf nm.
 grad_rev_terms nm contribs =
   if contribs == [] then []
   else
-    let c = head contribs
+    let (cn, cv) = head contribs
     let rest = grad_rev_terms nm (tail contribs)
-    if head c == nm then cons (head (tail c)) rest
+    if cn == nm then cons cv rest
     else rest
 
 -- grad_rev_sumterms: left-assoc sum of contribution ASTs; no spurious +0.0 (a single
 -- contribution passes through unperturbed, preserving signed-zero cancellation).
 grad_rev_sumterms terms =
-  if terms == [] then ["FL", "0.0"]
+  if terms == [] then (NFloat "0.0")
   else if tail terms == [] then head terms
-  else ["O", "+", head terms, grad_rev_sumterms (tail terms)]
+  else (NOp "+" (head terms) (grad_rev_sumterms (tail terms)))
 
 -- grad_rev_sets: the float_arr_set sequence (one per param), terminating in 0.
 grad_rev_sets idx n =
-  if idx == n then ["I", "0"]
+  if idx == n then (NInt "0")
   else
-    let setc = ["A", ["A", ["A", ["V", "float_arr_set"], ["V", "__go"]], ["I", show idx]], ["V", cat ["__rbar", show idx]]]
-    ["D", "_", setc, grad_rev_sets (idx + 1) n]
+    let setc = (NApp (NApp (NApp (NVar "float_arr_set") (NVar "__go")) (NInt (show idx))) (NVar (cat ["__rbar", show idx])))
+    (NLet "_" setc (grad_rev_sets (idx + 1) n))
 
 -- grad_rev_lets: bind each param adjoint (let __rbarK = sum of K's contributions),
 -- then the set sequence. contribs is the single backward sweep, shared across params.
@@ -3365,27 +3352,26 @@ grad_rev_lets params idx contribs n =
   else
     let p = head params
     let pbar = grad_rev_sumterms (grad_rev_terms p contribs)
-    ["D", cat ["__rbar", show idx], pbar, grad_rev_lets (tail params) (idx + 1) contribs n]
+    (NLet (cat ["__rbar", show idx]) pbar (grad_rev_lets (tail params) (idx + 1) contribs n))
 
--- grad_rev_bindings: flatten a let-spine ["D",nm,val,body] into [[nm,val],...] in
+-- grad_rev_bindings: flatten a let-spine (NLet nm val body) into [(nm, val), ...] in
 -- forward (topological) order. A non-D node terminates the spine (it is the return).
-grad_rev_bindings node =
-  if head node == "D" then
-    cons [head (tail node), head (tail (tail node))] (grad_rev_bindings (head (tail (tail (tail node)))))
-  else []
+grad_rev_bindings node = match node
+  | NLet nm v b -> cons (nm, v) (grad_rev_bindings b)
+  | _ -> []
 
 -- grad_rev_ret: the final return expr at the bottom of a let-spine.
-grad_rev_ret node =
-  if head node == "D" then grad_rev_ret (head (tail (tail (tail node))))
-  else node
+grad_rev_ret node = match node
+  | NLet nm v b -> grad_rev_ret b
+  | _ -> node
 
 -- grad_rev_primals: re-emit the forward primal let-bindings around the backward sweep,
 -- so each intermediate VALUE is in scope for the * and / pushback rules below.
 grad_rev_primals binds inner =
   if binds == [] then inner
   else
-    let bd = head binds
-    ["D", head bd, head (tail bd), grad_rev_primals (tail binds) inner]
+    let (bn, bv) = head binds
+    NLet bn bv (grad_rev_primals (tail binds) inner)
 
 -- grad_rev_back: walk the let-bindings in REVERSE (topological) order. For each binding
 -- ai = ei, materialize ai's adjoint as ONE let (__radj_ai = sum of contributions seen so
@@ -3396,20 +3382,20 @@ grad_rev_primals binds inner =
 grad_rev_back rbinds contribs params n =
   if rbinds == [] then grad_rev_lets params 0 contribs n
   else
-    let bd = head rbinds
-    let ai = head bd
-    let ei = head (tail bd)
+    let (ai, ei) = head rbinds
     let aname = cat ["__radj_", ai]
     let abar = grad_rev_sumterms (grad_rev_terms ai contribs)
-    let newc = grad_rev_push ei ["V", aname]
-    ["D", aname, abar, grad_rev_back (tail rbinds) (append contribs newc) params n]
+    let newc = grad_rev_push ei (NVar aname)
+    (NLet aname abar (grad_rev_back (tail rbinds) (append contribs newc) params n))
 
 -- grad_rev_binders / grad_rev_elem / grad_rev_distinct: a let-binding that shadows a
 -- param or another binding makes a leaf name ambiguous in the cotangent map, so refuse
 -- (forward-mode only) rather than emit a wrong f__rgrad.
 grad_rev_binders binds =
   if binds == [] then []
-  else cons (head (head binds)) (grad_rev_binders (tail binds))
+  else
+    let (bn, bv) = head binds
+    cons bn (grad_rev_binders (tail binds))
 
 grad_rev_elem x xs =
   if xs == [] then false
@@ -3430,39 +3416,34 @@ grad_rev_names_ok params body =
 grad_rev_rbody params body n =
   let binds = grad_rev_bindings body
   let ret = grad_rev_ret body
-  let initc = grad_rev_push ret ["FL", "1.0"]
+  let initc = grad_rev_push ret (NFloat "1.0")
   grad_rev_primals binds (grad_rev_back (reverse binds) initc params n)
 
 collect_grad_marks decls =
   if decls == [] then []
-  else
-    let d = head decls
-    if head d == "GRADMARK" then cons (head (tail d)) (collect_grad_marks (tail decls))
-    else collect_grad_marks (tail decls)
+  else append (grad_mark_of (head decls)) (collect_grad_marks (tail decls))
+grad_mark_of d = match d
+  | DGradMark g -> [g]
+  | _ -> []
 
 strip_grad_marks decls =
   if decls == [] then []
-  else
-    let d = head decls
-    if head d == "GRADMARK" then strip_grad_marks (tail decls)
-    else cons d (strip_grad_marks (tail decls))
+  else if grad_mark_of (head decls) != [] then strip_grad_marks (tail decls)
+  else cons (head decls) (strip_grad_marks (tail decls))
 
 grad_lookup_fn nm decls =
-  if decls == [] then []
-  else
-    let d = head decls
-    if head d == "fn" then
-      if head (tail d) == nm then d else grad_lookup_fn nm (tail decls)
-    else grad_lookup_fn nm (tail decls)
+  if decls == [] then DErr "" "0"
+  else if decl_is_fn (head decls) && decl_fn_name (head decls) == nm then head decls
+  else grad_lookup_fn nm (tail decls)
 
 -- grad_chain builds the multi-input gradient body: an if-chain on selector __gi
 -- returning the partial w.r.t. the idx-th param. __gi out of range -> 0.0. One forward
 -- pass per call (forward-mode), mirroring the oracle's `diff e i`.
 grad_chain ps body idx =
-  if ps == [] then ["FL", "0.0"]
+  if ps == [] then (NFloat "0.0")
   else
-    let guard = ["O", "==", ["V", "__gi"], ["I", show idx]]
-    ["?", guard, grad_deriv body (head ps) [], grad_chain (tail ps) body (idx + 1)]
+    let guard = (NOp "==" (NVar "__gi") (NInt (show idx)))
+    (NIf guard (grad_deriv body (head ps) []) (grad_chain (tail ps) body (idx + 1)))
 
 -- V5 slice 2: the array reverse-mode let-spine walker (cotangent threading). Recognizes a STRICT
 -- linear map-chain ending in a sum:
@@ -3474,34 +3455,34 @@ grad_chain ps body idx =
 -- reverse mode seeds a{m-1}'s array cotangent as the broadcast of the scalar upstream __gy, then
 -- threads it back through each map (diagonal Jacobian: cot(source_j) = Gj'(source_j) .* cot(a_j)).
 
--- mc_chain: validate the spine is a strict linear map-chain and collect stages [[bind,G,src],...]
+-- mc_chain: validate the spine is a strict linear map-chain and collect stages [[bind, G, src], ...]
 -- in forward order, or [] if the body is not exactly this shape. prevsrc = the name the next
 -- binding's source must equal. Crash-safe: head/tail on a non-D or short node degrade to 0/[] via
 -- runtime safety, so it is sound to call on any body.
 mc_chain body prevsrc =
-  if head body != "D" then []
+  if nd_tag body != "D" then []
   else
-    let bn = head (tail body)
-    let bval = head (tail (tail body))
-    let brest = head (tail (tail (tail body)))
-    let (vfn, vargs) = flat bval
+    let bn = nd_s1 body
+    let bval = nd_n2 body
+    let brest = nd_n3 body
+    let (vfn, vargs) = ast_flat bval
     if vfn != "float_arr_map" then []
     else if length vargs != 2 then []
-    else if head (head vargs) != "V" then []
-    else if head (head (tail vargs)) != "V" then []
-    else if head (tail (head (tail vargs))) != prevsrc then []
+    else if nd_tag (head vargs) != "V" then []
+    else if nd_tag (head (tail vargs)) != "V" then []
+    else if nd_s1 (head (tail vargs)) != prevsrc then []
     else
-      let gname = head (tail (head vargs))
-      let stage = [bn, gname, prevsrc]
-      if head brest == "D" then
+      let gname = nd_s1 (head vargs)
+      let stage = (bn, gname, prevsrc)
+      if nd_tag brest == "D" then
         let more = mc_chain brest bn
         if more == [] then [] else cons stage more
       else
-        let (rfn, rargs) = flat brest
+        let (rfn, rargs) = ast_flat brest
         if rfn != "float_arr_sum" then []
         else if length rargs != 1 then []
-        else if head (head rargs) != "V" then []
-        else if head (tail (head rargs)) != bn then []
+        else if nd_tag (head rargs) != "V" then []
+        else if nd_s1 (head rargs) != bn then []
         else cons stage []
 
 detect_map_chain body params =
@@ -3512,10 +3493,9 @@ detect_map_chain body params =
 mc_reltfns nm stages idx =
   if stages == [] then []
   else
-    let st = head stages
-    let gname = head (tail st)
-    let gderiv = ["A", ["A", ["V", cat [gname, "__grad"]], ["V", "__vx"]], ["I", "0"]]
-    let f = ["fn", cat [nm, "__rgrad_elt", show idx], ["__vx", "__vc"], ["O", "*", gderiv, ["V", "__vc"]]]
+    let (sbn, gname, ssrc) = head stages
+    let gderiv = (NApp (NApp (NVar (cat [gname, "__grad"])) (NVar "__vx")) (NInt "0"))
+    let f = (DFn (cat [nm, "__rgrad_elt", show idx]) ["__vx", "__vc"] (NOp "*" gderiv (NVar "__vc")))
     cons f (mc_reltfns nm (tail stages) (idx + 1))
 
 -- mc_primals: wrap inner with the forward primal lets (re-materialize each map result that is an
@@ -3523,129 +3503,125 @@ mc_reltfns nm stages idx =
 mc_primals stages inner =
   if stages == [] then inner
   else
-    let st = head stages
-    let bn = head st
-    let gname = head (tail st)
-    let src = head (tail (tail st))
-    let mapexpr = ["A", ["A", ["V", "float_arr_map"], ["V", gname]], ["V", src]]
-    ["D", bn, mapexpr, mc_primals (tail stages) inner]
+    let (bn, gname, src) = head stages
+    let mapexpr = (NApp (NApp (NVar "float_arr_map") (NVar gname)) (NVar src))
+    (NLet bn mapexpr (mc_primals (tail stages) inner))
 
 -- mc_sweep: the reverse cotangent sweep. rstages = stages in REVERSE forward-order. For stage j>0
 -- bind __ct{j-1} = float_arr_map2 nm__rgrad_elt{j} src_j incoming ; for stage 0 RETURN that map2
 -- (= cotangent of xs = dL/dxs). incoming names the cotangent of a_j flowing in.
 mc_sweep nm rstages j incoming =
-  let st = head rstages
-  let src = head (tail (tail st))
+  let (sbn, sg, src) = head rstages
   let eltname = cat [nm, "__rgrad_elt", show j]
-  let pushexpr = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", eltname]], ["V", src]], ["V", incoming]]
+  let pushexpr = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar eltname)) (NVar src)) (NVar incoming))
   if j == 0 then pushexpr
   else
     let ctname = cat ["__ct", show (j - 1)]
-    ["D", ctname, pushexpr, mc_sweep nm (tail rstages) (j - 1) ctname]
+    (NLet ctname pushexpr (mc_sweep nm (tail rstages) (j - 1) ctname))
 
 -- mcr_chain: like mc_chain but the terminal is a dot-product READOUT
 --   float_arr_sum (float_arr_map2 gmul w z)   (w = 2nd param, z = last map binding, gmul a "V").
--- Collects the SAME [bind,G,src] map stages (>=1); the readout fn name is pulled by mcr_gmul.
+-- Collects the SAME [bind, G, src] map stages (>=1); the readout fn name is pulled by mcr_gmul.
 -- Returns [] unless the whole body is exactly a linear map-chain ending in that readout.
 mcr_chain body prevsrc wname =
-  if head body != "D" then []
+  if nd_tag body != "D" then []
   else
-    let bn = head (tail body)
-    let bval = head (tail (tail body))
-    let brest = head (tail (tail (tail body)))
-    let (vfn, vargs) = flat bval
+    let bn = nd_s1 body
+    let bval = nd_n2 body
+    let brest = nd_n3 body
+    let (vfn, vargs) = ast_flat bval
     if vfn != "float_arr_map" then []
     else if length vargs != 2 then []
-    else if head (head vargs) != "V" then []
-    else if head (head (tail vargs)) != "V" then []
-    else if head (tail (head (tail vargs))) != prevsrc then []
+    else if nd_tag (head vargs) != "V" then []
+    else if nd_tag (head (tail vargs)) != "V" then []
+    else if nd_s1 (head (tail vargs)) != prevsrc then []
     else
-      let gname = head (tail (head vargs))
-      let stage = [bn, gname, prevsrc]
-      if head brest == "D" then
+      let gname = nd_s1 (head vargs)
+      let stage = (bn, gname, prevsrc)
+      if nd_tag brest == "D" then
         let more = mcr_chain brest bn wname
         if more == [] then [] else cons stage more
       else
-        let (rfn, rargs) = flat brest
+        let (rfn, rargs) = ast_flat brest
         if rfn != "float_arr_sum" then []
         else if length rargs != 1 then []
         else
           let inner = head rargs
-          let (ifn, iargs) = flat inner
+          let (ifn, iargs) = ast_flat inner
           if ifn != "float_arr_map2" then []
           else if length iargs != 3 then []
-          else if head (head iargs) != "V" then []
-          else if head (head (tail iargs)) != "V" then []
-          else if head (head (tail (tail iargs))) != "V" then []
-          else if head (tail (head (tail iargs))) != wname then []
-          else if head (tail (head (tail (tail iargs)))) != bn then []
+          else if nd_tag (head iargs) != "V" then []
+          else if nd_tag (head (tail iargs)) != "V" then []
+          else if nd_tag (head (tail (tail iargs))) != "V" then []
+          else if nd_s1 (head (tail iargs)) != wname then []
+          else if nd_s1 (head (tail (tail iargs))) != bn then []
           else cons stage []
 
 -- mcr_gmul: pull the readout's binary fn name from the (already validated) chain-readout terminal.
 mcr_gmul body =
-  if head body != "D" then ""
+  if nd_tag body != "D" then ""
   else
-    let brest = head (tail (tail (tail body)))
-    if head brest == "D" then mcr_gmul brest
+    let brest = nd_n3 body
+    if nd_tag brest == "D" then mcr_gmul brest
     else
-      let (rfn, rargs) = flat brest
+      let (rfn, rargs) = ast_flat brest
       if rfn != "float_arr_sum" then ""
       else
         let inner = head rargs
-        let (ifn, iargs) = flat inner
+        let (ifn, iargs) = ast_flat inner
         if ifn != "float_arr_map2" then ""
         else if length iargs != 3 then ""
-        else if head (head iargs) != "V" then ""
-        else head (tail (head iargs))
+        else if nd_tag (head iargs) != "V" then ""
+        else nd_s1 (head iargs)
 
 detect_chain_readout body params =
   if length params != 2 then false
   else (mcr_chain body (head params) (head (tail params))) != []
 
 -- lc_chain: validate the spine is a strict linear LAYER-chain and collect stages
--- [[bind,act,W,src],...] in forward order, or [] if the body is not exactly this
+-- [[bind, act, W, src], ...] in forward order, or [] if the body is not exactly this
 -- shape. Each stage binds  h = float_arr_map act (float_mat_vec W src)  -- the map's
 -- SECOND argument being a float_mat_vec APPLICATION (an "A" node, not a bare "V") is
 -- what distinguishes a slice-5 net layer from slice-2's bare-var map-chain. prevsrc =
 -- the name the next stage's matvec source must equal; terminal is float_arr_sum last.
 -- Crash-safe: head/tail on a non-D or short node degrade to 0/[] via runtime safety.
 lc_chain body prevsrc =
-  if head body != "D" then []
+  if nd_tag body != "D" then []
   else
-    let bn = head (tail body)
-    let bval = head (tail (tail body))
-    let brest = head (tail (tail (tail body)))
-    let (vfn, vargs) = flat bval
+    let bn = nd_s1 body
+    let bval = nd_n2 body
+    let brest = nd_n3 body
+    let (vfn, vargs) = ast_flat bval
     if vfn != "float_arr_map" then []
     else if length vargs != 2 then []
-    else if head (head vargs) != "V" then []
-    else if head (head (tail vargs)) != "A" then []
+    else if nd_tag (head vargs) != "V" then []
+    else if nd_tag (head (tail vargs)) != "A" then []
     else
-      let (mfn, margs) = flat (head (tail vargs))
+      let (mfn, margs) = ast_flat (head (tail vargs))
       if mfn != "float_mat_vec" then []
       else if length margs != 2 then []
-      else if head (head margs) != "V" then []
-      else if head (head (tail margs)) != "V" then []
-      else if head (tail (head (tail margs))) != prevsrc then []
+      else if nd_tag (head margs) != "V" then []
+      else if nd_tag (head (tail margs)) != "V" then []
+      else if nd_s1 (head (tail margs)) != prevsrc then []
       else
-        let actname = head (tail (head vargs))
-        let wname = head (tail (head margs))
-        let stage = [bn, actname, wname, prevsrc]
-        if head brest == "D" then
+        let actname = nd_s1 (head vargs)
+        let wname = nd_s1 (head margs)
+        let stage = (bn, actname, wname, prevsrc)
+        if nd_tag brest == "D" then
           let more = lc_chain brest bn
           if more == [] then [] else cons stage more
         else
-          let (rfn, rargs) = flat brest
+          let (rfn, rargs) = ast_flat brest
           let oksum = if rfn != "float_arr_sum" then 0
                       else if length rargs != 1 then 0
-                      else if head (head rargs) != "V" then 0
-                      else if head (tail (head rargs)) != bn then 0
+                      else if nd_tag (head rargs) != "V" then 0
+                      else if nd_s1 (head rargs) != bn then 0
                       else 1
           let okdot = if rfn != "float_dot" then 0
                       else if length rargs != 2 then 0
-                      else if head (head rargs) != "V" then 0
-                      else if head (tail (head rargs)) != bn then 0
-                      else if head (head (tail rargs)) != "V" then 0
+                      else if nd_tag (head rargs) != "V" then 0
+                      else if nd_s1 (head rargs) != bn then 0
+                      else if nd_tag (head (tail rargs)) != "V" then 0
                       else 1
           if (oksum + okdot) == 0 then [] else cons stage []
 
@@ -3658,21 +3634,21 @@ lc_last lst =
 -- readout. Used to locate the input x = params[L] WITHOUT first knowing x (the dot
 -- readout adds a trailing g param, so x is no longer simply the last param). lc_chain
 -- remains the authority that fully validates the matvec source-threading with this x.
-lc_count body =
-  if head body != "D" then 0
-  else 1 + (lc_count (head (tail (tail (tail body)))))
+lc_count body = match body
+  | NLet x v b -> 1 + lc_count b
+  | _ -> 0
 
 -- lc_wmatch: each collected stage's weight (stage[2]) equals the positional param.
 -- Walks stages and params together; the one leftover param is the input x.
 lc_wmatch stages params =
   if stages == [] then true
   else
-    let w = head (tail (tail (head stages)))
+    let (sbn, sact, w, ssrc) = head stages
     if w != head params then false
     else lc_wmatch (tail stages) (tail params)
 
 -- detect_layer_chain (slice 5b, general depth L): a #grad net  net W1 .. WL x  whose
--- body is L layer stages feeding a sum readout. params = [W1,..,WL, x] (the L weights
+-- body is L layer stages feeding a sum readout. params = [W1, .., WL, x] (the L weights
 -- then the input x, x last); there are L+1 params and L stages, with stage[k].weight =
 -- params[k] in order so __wrt=k selects dL/d(params[k]) and __wrt=L selects dL/dx.
 -- Mutually exclusive from the slice-2/3/4 walkers by the matvec-app map disambiguator
@@ -3686,11 +3662,12 @@ detect_layer_chain body params =
       let okarity = if length params == (nl + 1) then true else (length params == (nl + 2))
       if okarity == false then false
       else
-        let xin = list_nth params nl
+        let xin = lc_param_at params nl
         let stages = lc_chain body xin
         if stages == [] then false
         else if length stages != nl then false
         else lc_wmatch stages params
+lc_param_at ps i = if i == 0 then head ps else lc_param_at (tail ps) (i - 1)
 
 -- ---- slice-5b reverse-AST builders (one stage per layer; reused for any depth L) ----
 -- All names are fixed prefixes (__z{k}/__h{k}/__ctz{k}/__cth{k}/__cty), so only nm and
@@ -3701,9 +3678,9 @@ detect_layer_chain body params =
 lc_actfn_go nm stages i =
   if stages == [] then []
   else
-    let act = head (tail (head stages))
-    let actd = ["A", ["A", ["V", cat [act, "__grad"]], ["V", "__vz"]], ["I", "0"]]
-    let fn = ["fn", cat [nm, "__rgrad_act", show i], ["__vz", "__vc"], ["O", "*", actd, ["V", "__vc"]]]
+    let (sbn, act, sw, ssrc) = head stages
+    let actd = (NApp (NApp (NVar (cat [act, "__grad"])) (NVar "__vz")) (NInt "0"))
+    let fn = (DFn (cat [nm, "__rgrad_act", show i]) ["__vz", "__vc"] (NOp "*" actd (NVar "__vc")))
     cons fn (lc_actfn_go nm (tail stages) (i + 1))
 
 -- lc_fwd_go: forward primals  __z{k} = float_mat_vec W prev ; __h{k} = float_arr_map act
@@ -3711,16 +3688,14 @@ lc_actfn_go nm stages i =
 lc_fwd_go stages i prev =
   if stages == [] then []
   else
-    let st = head stages
-    let act = head (tail st)
-    let w = head (tail (tail st))
+    let (sbn, act, w, ssrc) = head stages
     let znm = cat ["__z", show (i + 1)]
-    let ze = ["A", ["A", ["V", "float_mat_vec"], ["V", w]], prev]
-    if (tail stages) == [] then cons [znm, ze] []
+    let ze = (NApp (NApp (NVar "float_mat_vec") (NVar w)) prev)
+    if (tail stages) == [] then cons (znm, ze) []
     else
       let hnm = cat ["__h", show (i + 1)]
-      let he = ["A", ["A", ["V", "float_arr_map"], ["V", act]], ["V", znm]]
-      cons [znm, ze] (cons [hnm, he] (lc_fwd_go (tail stages) (i + 1) ["V", hnm]))
+      let he = (NApp (NApp (NVar "float_arr_map") (NVar act)) (NVar znm))
+      cons (znm, ze) (cons (hnm, he) (lc_fwd_go (tail stages) (i + 1) (NVar hnm)))
 
 -- lc_rev_go: reverse sweep over rstages = reverse stages, i from L-1 downto 0.
 -- __ctz{i+1} = float_arr_map2 nm__rgrad_act{i} __z{i+1} upstream ; then (for i>0) the
@@ -3728,61 +3703,62 @@ lc_fwd_go stages i prev =
 lc_rev_go nm rstages i upstream =
   if rstages == [] then []
   else
-    let st = head rstages
-    let w = head (tail (tail st))
+    let (sbn, sact, w, ssrc) = head rstages
     let ctznm = cat ["__ctz", show (i + 1)]
     let znm = cat ["__z", show (i + 1)]
-    let ctze = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_act", show i]]], ["V", znm]], upstream]
-    if i == 0 then cons [ctznm, ctze] []
+    let ctze = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_act", show i]))) (NVar znm)) upstream)
+    if i == 0 then cons (ctznm, ctze) []
     else
       let cthnm = cat ["__cth", show i]
-      let cthe = ["A", ["A", ["V", "float_mat_vec_t"], ["V", w]], ["V", ctznm]]
-      cons [ctznm, ctze] (cons [cthnm, cthe] (lc_rev_go nm (tail rstages) (i - 1) ["V", cthnm]))
+      let cthe = (NApp (NApp (NVar "float_mat_vec_t") (NVar w)) (NVar ctznm))
+      cons (ctznm, ctze) (cons (cthnm, cthe) (lc_rev_go nm (tail rstages) (i - 1) (NVar cthnm)))
 
 -- lc_sel_go: the __wrt if-chain.  __wrt=k -> dW{k+1} = float_outer __ctz{k+1} in{k+1}
 -- (in1 = x, in{k+1} = __h{k}) ; fallthrough __wrt=L -> dx = float_mat_vec_t W1 __ctz1.
 lc_sel_go w0 xin stages k =
-  if stages == [] then ["A", ["A", ["V", "float_mat_vec_t"], ["V", w0]], ["V", "__ctz1"]]
+  if stages == [] then (NApp (NApp (NVar "float_mat_vec_t") (NVar w0)) (NVar "__ctz1"))
   else
-    let ink = if k == 0 then ["V", xin] else ["V", cat ["__h", show k]]
-    let dwe = ["A", ["A", ["V", "float_outer"], ["V", cat ["__ctz", show (k + 1)]]], ink]
-    let g = ["O", "==", ["V", "__wrt"], ["I", show k]]
-    ["?", g, dwe, lc_sel_go w0 xin (tail stages) (k + 1)]
+    let ink = if k == 0 then (NVar xin) else (NVar (cat ["__h", show k]))
+    let dwe = (NApp (NApp (NVar "float_outer") (NVar (cat ["__ctz", show (k + 1)]))) ink)
+    let g = (NOp "==" (NVar "__wrt") (NInt (show k)))
+    (NIf g dwe (lc_sel_go w0 xin (tail stages) (k + 1)))
 
--- lc_mk_lets: fold a [name,valAST] binding list into nested ["D",name,val,body] lets.
+-- lc_mk_lets: fold a [name, valAST] binding list into nested (NLet name val body) lets.
 lc_mk_lets binds final =
   if binds == [] then final
   else
-    let b = head binds
-    ["D", head b, head (tail b), lc_mk_lets (tail binds) final]
+    let (bn, bv) = head binds
+    NLet bn bv (lc_mk_lets (tail binds) final)
 
 -- lc_readout: walk the (already-validated) layer-chain spine to its terminal readout
--- and classify it. ["sum"] for float_arr_sum last ; ["dot", gname] for float_dot last g.
+-- and classify it. ("sum", "") for float_arr_sum last ; ("dot", gname) for float_dot last g.
 -- The readout determines the seed cotangent on the net output y (the slice-5b general-L
 -- spine reuses everything else): sum -> d(sum y)/dy = 1 (broadcast __gy) ; dot g ->
 -- d(sum_i y_i g_i)/dy = g (so __cty_i = g_i * __gy), which injects an ARBITRARY upstream
 -- cotangent g and is the composition primitive a downstream loss gradient plugs into.
-lc_readout body =
-  if head body == "D" then lc_readout (head (tail (tail (tail body))))
-  else
-    let (rfn, rargs) = flat body
-    if rfn == "float_dot" then ["dot", head (tail (head (tail rargs)))]
-    else ["sum"]
+lc_readout body = match body
+  | NLet x v b -> lc_readout b
+  | _ -> lc_readout_term body
+lc_readout_term body =
+  let (rfn, rargs) = ast_flat body
+  if rfn == "float_dot" then ("dot", nd_s1 (head (tail rargs)))
+  else ("sum", "")
 
 -- lc_seedmul_fn: the per-net elementwise seed-scaler  \__a __b -> __a *. __b  emitted
 -- ONLY for a dot readout (so the proven sum path stays byte-identical to slice 5b).
 lc_seedmul_fn nm =
-  ["fn", cat [nm, "__rgrad_seedmul"], ["__a", "__b"], ["O", "*", ["V", "__a"], ["V", "__b"]]]
+  (DFn (cat [nm, "__rgrad_seedmul"]) ["__a", "__b"] (NOp "*" (NVar "__a") (NVar "__b")))
 
 -- lc_seedbind: the __cty binding. sum -> float_arr_new (len __z{L}) __gy (broadcast,
 -- byte-identical to slice 5b). dot g -> float_arr_map2 nm__rgrad_seedmul g (broadcast
 -- __gy), i.e. __cty_i = g_i * __gy.
 lc_seedbind nm ro nlayers =
-  let gyv = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", cat ["__z", show nlayers]]]], ["V", "__gy"]]
-  if head ro == "dot" then
-    ["__cty", ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_seedmul"]]], ["V", head (tail ro)]], gyv]]
+  let gyv = (NApp (NApp (NVar "float_arr_new") (NApp (NVar "float_arr_len") (NVar (cat ["__z", show nlayers])))) (NVar "__gy"))
+  let (ro_k, ro_g) = ro
+  if ro_k == "dot" then
+    ("__cty", NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_seedmul"]))) (NVar ro_g)) gyv)
   else
-    ["__cty", gyv]
+    ("__cty", gyv)
 
 -- mv_act: recognize the matvec-layer LET-form
 --   f W x = let z = float_mat_vec W x in float_arr_sum (float_arr_map act z)
@@ -3793,31 +3769,31 @@ lc_seedbind nm ro nlayers =
 -- head/tail on a non-D or short node degrade to 0/[] via runtime safety.
 mv_act body params =
   if length params != 2 then ""
-  else if head body != "D" then ""
+  else if nd_tag body != "D" then ""
   else
-    let bn = head (tail body)
-    let bval = head (tail (tail body))
-    let brest = head (tail (tail (tail body)))
-    let (vfn, vargs) = flat bval
+    let bn = nd_s1 body
+    let bval = nd_n2 body
+    let brest = nd_n3 body
+    let (vfn, vargs) = ast_flat bval
     if vfn != "float_mat_vec" then ""
     else if length vargs != 2 then ""
-    else if head (head vargs) != "V" then ""
-    else if head (head (tail vargs)) != "V" then ""
-    else if head (tail (head vargs)) != head params then ""
-    else if head (tail (head (tail vargs))) != head (tail params) then ""
+    else if nd_tag (head vargs) != "V" then ""
+    else if nd_tag (head (tail vargs)) != "V" then ""
+    else if nd_s1 (head vargs) != head params then ""
+    else if nd_s1 (head (tail vargs)) != head (tail params) then ""
     else
-      let (rfn, rargs) = flat brest
+      let (rfn, rargs) = ast_flat brest
       if rfn != "float_arr_sum" then ""
       else if length rargs != 1 then ""
       else
         let inner = head rargs
-        let (ifn, iargs) = flat inner
+        let (ifn, iargs) = ast_flat inner
         if ifn != "float_arr_map" then ""
         else if length iargs != 2 then ""
-        else if head (head iargs) != "V" then ""
-        else if head (head (tail iargs)) != "V" then ""
-        else if head (tail (head (tail iargs))) != bn then ""
-        else head (tail (head iargs))
+        else if nd_tag (head iargs) != "V" then ""
+        else if nd_tag (head (tail iargs)) != "V" then ""
+        else if nd_s1 (head (tail iargs)) != bn then ""
+        else nd_s1 (head iargs)
 
 detect_matvec_layer body params =
   (mv_act body params) != ""
@@ -3828,21 +3804,21 @@ detect_matvec_layer body params =
 -- #grad-marked). Rejects anything that is not the dotted float-add of the two params.
 res_is_add cfn decls =
   let cd = grad_lookup_fn cfn decls
-  if cd == [] then false
+  if decl_is_fn cd == false then false
   else
-    let cps = head (tail (tail cd))
-    let cbd = head (tail (tail (tail cd)))
+    let cps = decl_fn_params cd
+    let cbd = decl_fn_body cd
     if length cps != 2 then false
-    else if head cbd != "O" then false
-    else if head (tail cbd) != "+." then false
+    else if nd_tag cbd != "O" then false
+    else if nd_s1 cbd != "+." then false
     else
-      let lop = head (tail (tail cbd))
-      let rop = head (tail (tail (tail cbd)))
-      if head lop != "V" then false
-      else if head rop != "V" then false
+      let lop = nd_n2 cbd
+      let rop = nd_n3 cbd
+      if nd_tag lop != "V" then false
+      else if nd_tag rop != "V" then false
       else
-        let lv = head (tail lop)
-        let rv = head (tail rop)
+        let lv = nd_s1 lop
+        let rv = nd_s1 rop
         let p0 = head cps
         let p1 = head (tail cps)
         if lv == p0 then rv == p1
@@ -3860,67 +3836,67 @@ res_is_add cfn decls =
 -- D node, flat -> ("_expr",[])); the map-chain walkers need a float_arr_map first binding.
 detect_residual body params decls =
   if length params < 2 then false
-  else if head body != "D" then false
+  else if nd_tag body != "D" then false
   else
-    let z_bn = head (tail body)
-    let z_val = head (tail (tail body))
-    let rest1 = head (tail (tail (tail body)))
-    let (z_fn, z_args) = flat z_val
+    let z_bn = nd_s1 body
+    let z_val = nd_n2 body
+    let rest1 = nd_n3 body
+    let (z_fn, z_args) = ast_flat z_val
     if z_fn != "float_mat_vec" then false
     else if length z_args != 2 then false
-    else if head (head z_args) != "V" then false
-    else if head (head (tail z_args)) != "V" then false
+    else if nd_tag (head z_args) != "V" then false
+    else if nd_tag (head (tail z_args)) != "V" then false
     else
-      let wname = head (tail (head z_args))
-      let xname = head (tail (head (tail z_args)))
+      let wname = nd_s1 (head z_args)
+      let xname = nd_s1 (head (tail z_args))
       if wname != head params then false
       else if xname != head (tail params) then false
-      else if head rest1 != "D" then false
+      else if nd_tag rest1 != "D" then false
       else
-        let s_bn = head (tail rest1)
-        let s_val = head (tail (tail rest1))
-        let rest2 = head (tail (tail (tail rest1)))
-        let (s_fn, s_args) = flat s_val
+        let s_bn = nd_s1 rest1
+        let s_val = nd_n2 rest1
+        let rest2 = nd_n3 rest1
+        let (s_fn, s_args) = ast_flat s_val
         if s_fn != "float_arr_map" then false
         else if length s_args != 2 then false
-        else if head (head s_args) != "V" then false
-        else if head (head (tail s_args)) != "V" then false
-        else if head (tail (head (tail s_args))) != z_bn then false
-        else if head rest2 != "D" then false
+        else if nd_tag (head s_args) != "V" then false
+        else if nd_tag (head (tail s_args)) != "V" then false
+        else if nd_s1 (head (tail s_args)) != z_bn then false
+        else if nd_tag rest2 != "D" then false
         else
-          let r_bn = head (tail rest2)
-          let r_val = head (tail (tail rest2))
-          let term = head (tail (tail (tail rest2)))
-          let (r_fn, r_args) = flat r_val
+          let r_bn = nd_s1 rest2
+          let r_val = nd_n2 rest2
+          let term = nd_n3 rest2
+          let (r_fn, r_args) = ast_flat r_val
           if r_fn != "float_arr_map2" then false
           else if length r_args != 3 then false
-          else if head (head r_args) != "V" then false
-          else if head (head (tail r_args)) != "V" then false
-          else if head (head (tail (tail r_args))) != "V" then false
+          else if nd_tag (head r_args) != "V" then false
+          else if nd_tag (head (tail r_args)) != "V" then false
+          else if nd_tag (head (tail (tail r_args))) != "V" then false
           else
-            let cfn = head (tail (head r_args))
-            let aA = head (tail (head (tail r_args)))
-            let aB = head (tail (head (tail (tail r_args))))
+            let cfn = nd_s1 (head r_args)
+            let aA = nd_s1 (head (tail r_args))
+            let aB = nd_s1 (head (tail (tail r_args)))
             let okargs = if aA == xname then aB == s_bn
                          else if aA == s_bn then aB == xname
                          else false
             if okargs == false then false
             else if (res_is_add cfn decls) == false then false
             else
-              let (t_fn, t_args) = flat term
+              let (t_fn, t_args) = ast_flat term
               let okdot = if t_fn != "float_dot" then 0
                           else if length params != 3 then 0
                           else if length t_args != 2 then 0
-                          else if head (head t_args) != "V" then 0
-                          else if head (tail (head t_args)) != r_bn then 0
-                          else if head (head (tail t_args)) != "V" then 0
-                          else if head (tail (head (tail t_args))) != head (tail (tail params)) then 0
+                          else if nd_tag (head t_args) != "V" then 0
+                          else if nd_s1 (head t_args) != r_bn then 0
+                          else if nd_tag (head (tail t_args)) != "V" then 0
+                          else if nd_s1 (head (tail t_args)) != head (tail (tail params)) then 0
                           else 1
               let oksum = if t_fn != "float_arr_sum" then 0
                           else if length params != 2 then 0
                           else if length t_args != 1 then 0
-                          else if head (head t_args) != "V" then 0
-                          else if head (tail (head t_args)) != r_bn then 0
+                          else if nd_tag (head t_args) != "V" then 0
+                          else if nd_s1 (head t_args) != r_bn then 0
                           else 1
               (okdot + oksum) > 0
 
@@ -3930,28 +3906,28 @@ synth_grad_decls marks decls =
     let nm = head marks
     let fd = grad_lookup_fn nm decls
     let rest = synth_grad_decls (tail marks) decls
-    if fd == [] then rest
+    if decl_is_fn fd == false then rest
     else
-      let params = head (tail (tail fd))
-      let body = head (tail (tail (tail fd)))
+      let params = decl_fn_params fd
+      let body = decl_fn_body fd
       if params == [] then rest
       else
-        let (bfn, bargs) = flat body
+        let (bfn, bargs) = ast_flat body
         let is_map = if bfn == "float_arr_map" then length bargs == 2 else false
-        let is_map_v = if is_map then head (head bargs) == "V" else false
+        let is_map_v = if is_map then nd_tag (head bargs) == "V" else false
         let is_sum = if bfn == "float_arr_sum" then length bargs == 1 else false
-        let sarg = if is_sum then head bargs else ["V", "_"]
-        let (ifn, iargs) = flat sarg
+        let sarg = if is_sum then head bargs else (NVar "_")
+        let (ifn, iargs) = ast_flat sarg
         let is_sum_map = if is_sum then (if ifn == "float_arr_map" then length iargs == 2 else false) else false
-        let is_sum_map_v = if is_sum_map then head (head iargs) == "V" else false
+        let is_sum_map_v = if is_sum_map then nd_tag (head iargs) == "V" else false
         let is_sum_map2 = if is_sum then (if ifn == "float_arr_map2" then length iargs == 3 else false) else false
-        let m2g = if is_sum_map2 then head iargs else ["V", "_"]
-        let m2w = if is_sum_map2 then head (tail iargs) else ["V", "_"]
-        let m2x = if is_sum_map2 then head (tail (tail iargs)) else ["V", "_"]
-        let m2_all_v = if head m2g == "V" then (if head m2w == "V" then head m2x == "V" else false) else false
-        let m2_inorder = if length params == 2 then (if head (tail m2w) == head params then head (tail m2x) == head (tail params) else false) else false
+        let m2g = if is_sum_map2 then head iargs else (NVar "_")
+        let m2w = if is_sum_map2 then head (tail iargs) else (NVar "_")
+        let m2x = if is_sum_map2 then head (tail (tail iargs)) else (NVar "_")
+        let m2_all_v = if nd_tag m2g == "V" then (if nd_tag m2w == "V" then nd_tag m2x == "V" else false) else false
+        let m2_inorder = if length params == 2 then (if nd_s1 m2w == head params then nd_s1 m2x == head (tail params) else false) else false
         let is_sum_map2_v = if is_sum_map2 then (if m2_all_v then m2_inorder else false) else false
-        let is_sum_v = if is_sum then head sarg == "V" else false
+        let is_sum_v = if is_sum then nd_tag sarg == "V" else false
         let xsname = head params
         if is_map_v then
           -- V0 (forward) + V1 (reverse/VJP) for  f xs = float_arr_map g xs  (g #grad-marked).
@@ -3959,23 +3935,23 @@ synth_grad_decls marks decls =
           -- V1: f__rgrad xs gys = float_arr_map2 (\x c -> (g__grad x 0) *. c) xs gys
           --     The Jacobian of an elementwise map is diagonal, so the VJP is the SAME
           --     elementwise multiply as the JVP: out_i = g'(xs_i) * gys_i.
-          let gname = head (tail (head bargs))
-          let gderiv = ["A", ["A", ["V", cat [gname, "__grad"]], ["V", "__vx"]], ["I", "0"]]
-          let eltfn = ["fn", cat [nm, "__grad_elt"], ["__vx"], gderiv]
-          let mapfn = ["fn", cat [nm, "__grad"], params, ["A", ["A", ["V", "float_arr_map"], ["V", cat [nm, "__grad_elt"]]], ["V", xsname]]]
-          let reltfn = ["fn", cat [nm, "__rgrad_elt"], ["__vx", "__vc"], ["O", "*", gderiv, ["V", "__vc"]]]
-          let rmapfn = ["fn", cat [nm, "__rgrad"], append params ["__gys"], ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_elt"]]], ["V", xsname]], ["V", "__gys"]]]
+          let gname = nd_s1 (head bargs)
+          let gderiv = (NApp (NApp (NVar (cat [gname, "__grad"])) (NVar "__vx")) (NInt "0"))
+          let eltfn = (DFn (cat [nm, "__grad_elt"]) ["__vx"] gderiv)
+          let mapfn = (DFn (cat [nm, "__grad"]) params (NApp (NApp (NVar "float_arr_map") (NVar (cat [nm, "__grad_elt"]))) (NVar xsname)))
+          let reltfn = (DFn (cat [nm, "__rgrad_elt"]) ["__vx", "__vc"] (NOp "*" gderiv (NVar "__vc")))
+          let rmapfn = (DFn (cat [nm, "__rgrad"]) (append params ["__gys"]) (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_elt"]))) (NVar xsname)) (NVar "__gys")))
           cons eltfn (cons mapfn (cons reltfn (cons rmapfn rest)))
         else if is_sum_map_v then
           -- V3 (reverse): f xs = float_arr_sum (float_arr_map g xs)  is the scalar LOSS.
           -- Gradient at scalar cotangent gy = broadcast-then-chain-rule:
           --   f__rgrad xs gy = float_arr_map2 (\x c -> (g__grad x 0) *. c) xs (float_arr_new (len xs) gy)
           -- = V2's broadcast fused with V1's map2.  At gy=1.0 this is the true grad [g'(xs_i)].
-          let gname = head (tail (head iargs))
-          let gderiv = ["A", ["A", ["V", cat [gname, "__grad"]], ["V", "__vx"]], ["I", "0"]]
-          let reltfn = ["fn", cat [nm, "__rgrad_elt"], ["__vx", "__vc"], ["O", "*", gderiv, ["V", "__vc"]]]
-          let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", xsname]]], ["V", "__gy"]]
-          let rmapfn = ["fn", cat [nm, "__rgrad"], append params ["__gy"], ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_elt"]]], ["V", xsname]], bcast]]
+          let gname = nd_s1 (head iargs)
+          let gderiv = (NApp (NApp (NVar (cat [gname, "__grad"])) (NVar "__vx")) (NInt "0"))
+          let reltfn = (DFn (cat [nm, "__rgrad_elt"]) ["__vx", "__vc"] (NOp "*" gderiv (NVar "__vc")))
+          let bcast = (NApp (NApp (NVar "float_arr_new") (NApp (NVar "float_arr_len") (NVar xsname))) (NVar "__gy"))
+          let rmapfn = (DFn (cat [nm, "__rgrad"]) (append params ["__gy"]) (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_elt"]))) (NVar xsname)) bcast))
           cons reltfn (cons rmapfn rest)
         else if is_sum_map2_v then
           -- V4 (reverse): f w x = float_arr_sum (float_arr_map2 g w x) is a CONTRACTION
@@ -3984,32 +3960,32 @@ synth_grad_decls marks decls =
           -- cotangent gy:  dL/dw_i = (dg/da)(w_i,x_i)*gy ;  dL/dx_i = (dg/db)(w_i,x_i)*gy.
           -- Two-pass map2 (all 2-arg, no map3): partials = map2 (ga|gb) w x ; then scale by
           -- broadcast gy.  Reuses the scalar 2-arg g__grad (g__grad a b 0 / g__grad a b 1).
-          let gname = head (tail m2g)
+          let gname = nd_s1 m2g
           let w0 = head params
           let x0 = head (tail params)
-          let gaderiv = ["A", ["A", ["A", ["V", cat [gname, "__grad"]], ["V", "__va"]], ["V", "__vb"]], ["I", "0"]]
-          let gbderiv = ["A", ["A", ["A", ["V", cat [gname, "__grad"]], ["V", "__va"]], ["V", "__vb"]], ["I", "1"]]
-          let gafn = ["fn", cat [nm, "__rgrad_ga"], ["__va", "__vb"], gaderiv]
-          let gbfn = ["fn", cat [nm, "__rgrad_gb"], ["__va", "__vb"], gbderiv]
-          let sclfn = ["fn", cat [nm, "__rgrad_scl"], ["__vp", "__vc"], ["O", "*", ["V", "__vp"], ["V", "__vc"]]]
-          let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", w0]]], ["V", "__gy"]]
-          let inner_a = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_ga"]]], ["V", w0]], ["V", x0]]
-          let inner_b = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_gb"]]], ["V", w0]], ["V", x0]]
-          let outer_a = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_scl"]]], inner_a], bcast]
-          let outer_b = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_scl"]]], inner_b], bcast]
-          let guard = ["O", "==", ["V", "__wrt"], ["I", "0"]]
-          let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy", "__wrt"], ["?", guard, outer_a, outer_b]]
+          let gaderiv = (NApp (NApp (NApp (NVar (cat [gname, "__grad"])) (NVar "__va")) (NVar "__vb")) (NInt "0"))
+          let gbderiv = (NApp (NApp (NApp (NVar (cat [gname, "__grad"])) (NVar "__va")) (NVar "__vb")) (NInt "1"))
+          let gafn = (DFn (cat [nm, "__rgrad_ga"]) ["__va", "__vb"] gaderiv)
+          let gbfn = (DFn (cat [nm, "__rgrad_gb"]) ["__va", "__vb"] gbderiv)
+          let sclfn = (DFn (cat [nm, "__rgrad_scl"]) ["__vp", "__vc"] (NOp "*" (NVar "__vp") (NVar "__vc")))
+          let bcast = (NApp (NApp (NVar "float_arr_new") (NApp (NVar "float_arr_len") (NVar w0))) (NVar "__gy"))
+          let inner_a = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_ga"]))) (NVar w0)) (NVar x0))
+          let inner_b = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_gb"]))) (NVar w0)) (NVar x0))
+          let outer_a = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_scl"]))) inner_a) bcast)
+          let outer_b = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_scl"]))) inner_b) bcast)
+          let guard = (NOp "==" (NVar "__wrt") (NInt "0"))
+          let rgfn = (DFn (cat [nm, "__rgrad"]) (append params ["__gy", "__wrt"]) (NIf guard outer_a outer_b))
           cons gafn (cons gbfn (cons sclfn (cons rgfn rest)))
         else if is_sum_v then
           -- V2 (reverse): f xs = float_arr_sum xs.  d(sum)/d xs_i = 1, so the VJP of scalar
           -- cotangent gy is the broadcast:  f__rgrad xs gy = float_arr_new (float_arr_len xs) gy.
-          let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", xsname]]], ["V", "__gy"]]
-          let rmapfn = ["fn", cat [nm, "__rgrad"], append params ["__gy"], bcast]
+          let bcast = (NApp (NApp (NVar "float_arr_new") (NApp (NVar "float_arr_len") (NVar xsname))) (NVar "__gy"))
+          let rmapfn = (DFn (cat [nm, "__rgrad"]) (append params ["__gy"]) bcast)
           cons rmapfn rest
         else if detect_layer_chain body params then
           -- V5 slice 5b/rung1 (whole-net, general depth L):  net W1 .. WL x [g] =
           --   let h1 = float_arr_map act1 (float_mat_vec W1 x) in ... in <readout> hL
-          -- L dense layers (flat row-major weights) + a scalar readout. Synthesizes ONE
+          -- L dense layers (ast_flat row-major weights) + a scalar readout. Synthesizes ONE
           -- net__rgrad W1 .. WL x [g] __gy __wrt that re-materializes the forward primals,
           -- seeds the terminal cotangent from the readout (rung1: sum -> broadcast __gy ;
           -- dot g -> g .* __gy, the arbitrary-cotangent injection), then sweeps back:
@@ -4018,23 +3994,24 @@ synth_grad_decls marks decls =
           -- selects dL/dW{k+1} (k=0..L-1) and __wrt=L selects dL/dx. The sum emission is
           -- byte-identical to the slice-5b shape the oracle validated; L=1 reduces to s4.
           let nlayers = lc_count body
-          let xin = list_nth params nlayers
+          let xin = lc_param_at params nlayers
           let stages = lc_chain body xin
-          let w0 = head (tail (tail (head stages)))
+          let (s0bn, s0act, w0, s0src) = head stages
           let ro = lc_readout body
+          let (ro_k, ro_g) = ro
           let actbase = lc_actfn_go nm stages 0
-          let actfns = if head ro == "dot" then cons (lc_seedmul_fn nm) actbase else actbase
-          let fwd = lc_fwd_go stages 0 ["V", xin]
+          let actfns = if ro_k == "dot" then cons (lc_seedmul_fn nm) actbase else actbase
+          let fwd = lc_fwd_go stages 0 (NVar xin)
           let ctybind = lc_seedbind nm ro nlayers
-          let rev = lc_rev_go nm (reverse stages) (nlayers - 1) ["V", "__cty"]
+          let rev = lc_rev_go nm (reverse stages) (nlayers - 1) (NVar "__cty")
           let allbinds = append fwd (cons ctybind rev)
           let sel = lc_sel_go w0 xin stages 0
           let rbody = lc_mk_lets allbinds sel
-          let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy", "__wrt"], rbody]
+          let rgfn = (DFn (cat [nm, "__rgrad"]) (append params ["__gy", "__wrt"]) rbody)
           append actfns (cons rgfn rest)
         else if detect_matvec_layer body params then
           -- V5 slice 4 (matvec layer): f W x = let z = float_mat_vec W x in
-          --   float_arr_sum (float_arr_map act z)  is a dense layer (flat row-major W,
+          --   float_arr_sum (float_arr_map act z)  is a dense layer (ast_flat row-major W,
           --   out*n) + elementwise nonlinearity act (#grad-marked unary) + sum readout.
           --   Reverse: ct_z_j = act'(z_j) .* __gy ; then dL/dW = outer(ct_z, x) (__wrt=0,
           --   param0) and dL/dx = W^T . ct_z (__wrt=1, param1). The two reverse atoms are
@@ -4043,16 +4020,16 @@ synth_grad_decls marks decls =
           let actnm = mv_act body params
           let wname = head params
           let xname = head (tail params)
-          let actderiv = ["A", ["A", ["V", cat [actnm, "__grad"]], ["V", "__vz"]], ["I", "0"]]
-          let actfn = ["fn", cat [nm, "__rgrad_act"], ["__vz", "__vc"], ["O", "*", actderiv, ["V", "__vc"]]]
-          let zexpr = ["A", ["A", ["V", "float_mat_vec"], ["V", wname]], ["V", xname]]
-          let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", "__z"]]], ["V", "__gy"]]
-          let ctzexpr = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_act"]]], ["V", "__z"]], bcast]
-          let dW = ["A", ["A", ["V", "float_outer"], ["V", "__ctz"]], ["V", xname]]
-          let dx = ["A", ["A", ["V", "float_mat_vec_t"], ["V", wname]], ["V", "__ctz"]]
-          let guard = ["O", "==", ["V", "__wrt"], ["I", "0"]]
-          let rbody = ["D", "__z", zexpr, ["D", "__ctz", ctzexpr, ["?", guard, dW, dx]]]
-          let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy", "__wrt"], rbody]
+          let actderiv = (NApp (NApp (NVar (cat [actnm, "__grad"])) (NVar "__vz")) (NInt "0"))
+          let actfn = (DFn (cat [nm, "__rgrad_act"]) ["__vz", "__vc"] (NOp "*" actderiv (NVar "__vc")))
+          let zexpr = (NApp (NApp (NVar "float_mat_vec") (NVar wname)) (NVar xname))
+          let bcast = (NApp (NApp (NVar "float_arr_new") (NApp (NVar "float_arr_len") (NVar "__z"))) (NVar "__gy"))
+          let ctzexpr = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_act"]))) (NVar "__z")) bcast)
+          let dW = (NApp (NApp (NVar "float_outer") (NVar "__ctz")) (NVar xname))
+          let dx = (NApp (NApp (NVar "float_mat_vec_t") (NVar wname)) (NVar "__ctz"))
+          let guard = (NOp "==" (NVar "__wrt") (NInt "0"))
+          let rbody = (NLet "__z" zexpr (NLet "__ctz" ctzexpr (NIf guard dW dx)))
+          let rgfn = (DFn (cat [nm, "__rgrad"]) (append params ["__gy", "__wrt"]) rbody)
           cons actfn (cons rgfn rest)
         else if detect_residual body params decls then
           -- Rung 6 (residual fan-out): net W x [g] =
@@ -4064,33 +4041,33 @@ synth_grad_decls marks decls =
           --   __z = float_mat_vec W x ; __cty = readout seed (dot g -> g .* __gy ; sum ->
           --   broadcast __gy) ; __ctz = act'(__z) .* __cty ; __wrt=0 -> dW = outer(__ctz,x) ;
           --   else -> dx = __cty + W^T . __ctz  (the fan-out sum). add verified by res_is_add.
-          let z_val = head (tail (tail body))
-          let (z_fn, z_args) = flat z_val
-          let wname = head (tail (head z_args))
-          let xname = head (tail (head (tail z_args)))
-          let rest1 = head (tail (tail (tail body)))
-          let s_val = head (tail (tail rest1))
-          let (s_fn, s_args) = flat s_val
-          let actnm = head (tail (head s_args))
-          let rest2 = head (tail (tail (tail rest1)))
-          let term = head (tail (tail (tail rest2)))
-          let (t_fn, t_args) = flat term
-          let ro = if t_fn == "float_dot" then ["dot", head (tail (head (tail t_args)))] else ["sum"]
-          let actderiv = ["A", ["A", ["V", cat [actnm, "__grad"]], ["V", "__vz"]], ["I", "0"]]
-          let actfn = ["fn", cat [nm, "__rgrad_act"], ["__vz", "__vc"], ["O", "*", actderiv, ["V", "__vc"]]]
-          let addvfn = ["fn", cat [nm, "__rgrad_addv"], ["__a", "__b"], ["O", "+", ["V", "__a"], ["V", "__b"]]]
-          let seedmulfn = ["fn", cat [nm, "__rgrad_seedmul"], ["__a", "__b"], ["O", "*", ["V", "__a"], ["V", "__b"]]]
-          let zexpr = ["A", ["A", ["V", "float_mat_vec"], ["V", wname]], ["V", xname]]
-          let gyv = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", "__z"]]], ["V", "__gy"]]
-          let ctyexpr = if head ro == "dot" then ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_seedmul"]]], ["V", head (tail ro)]], gyv] else gyv
-          let ctzexpr = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_act"]]], ["V", "__z"]], ["V", "__cty"]]
-          let dW = ["A", ["A", ["V", "float_outer"], ["V", "__ctz"]], ["V", xname]]
-          let wtctz = ["A", ["A", ["V", "float_mat_vec_t"], ["V", wname]], ["V", "__ctz"]]
-          let dx = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_addv"]]], ["V", "__cty"]], wtctz]
-          let guard = ["O", "==", ["V", "__wrt"], ["I", "0"]]
-          let rbody = ["D", "__z", zexpr, ["D", "__cty", ctyexpr, ["D", "__ctz", ctzexpr, ["?", guard, dW, dx]]]]
-          let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy", "__wrt"], rbody]
-          let helpers = if head ro == "dot" then cons actfn (cons addvfn (cons seedmulfn [])) else cons actfn (cons addvfn [])
+          let z_val = nd_n2 body
+          let (z_fn, z_args) = ast_flat z_val
+          let wname = nd_s1 (head z_args)
+          let xname = nd_s1 (head (tail z_args))
+          let rest1 = nd_n3 body
+          let s_val = nd_n2 rest1
+          let (s_fn, s_args) = ast_flat s_val
+          let actnm = nd_s1 (head s_args)
+          let rest2 = nd_n3 rest1
+          let term = nd_n3 rest2
+          let (t_fn, t_args) = ast_flat term
+          let (ro_k, ro_g) = if t_fn == "float_dot" then ("dot", nd_s1 (head (tail t_args))) else ("sum", "")
+          let actderiv = (NApp (NApp (NVar (cat [actnm, "__grad"])) (NVar "__vz")) (NInt "0"))
+          let actfn = (DFn (cat [nm, "__rgrad_act"]) ["__vz", "__vc"] (NOp "*" actderiv (NVar "__vc")))
+          let addvfn = (DFn (cat [nm, "__rgrad_addv"]) ["__a", "__b"] (NOp "+" (NVar "__a") (NVar "__b")))
+          let seedmulfn = (DFn (cat [nm, "__rgrad_seedmul"]) ["__a", "__b"] (NOp "*" (NVar "__a") (NVar "__b")))
+          let zexpr = (NApp (NApp (NVar "float_mat_vec") (NVar wname)) (NVar xname))
+          let gyv = (NApp (NApp (NVar "float_arr_new") (NApp (NVar "float_arr_len") (NVar "__z"))) (NVar "__gy"))
+          let ctyexpr = if ro_k == "dot" then (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_seedmul"]))) (NVar ro_g)) gyv) else gyv
+          let ctzexpr = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_act"]))) (NVar "__z")) (NVar "__cty"))
+          let dW = (NApp (NApp (NVar "float_outer") (NVar "__ctz")) (NVar xname))
+          let wtctz = (NApp (NApp (NVar "float_mat_vec_t") (NVar wname)) (NVar "__ctz"))
+          let dx = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_addv"]))) (NVar "__cty")) wtctz)
+          let guard = (NOp "==" (NVar "__wrt") (NInt "0"))
+          let rbody = (NLet "__z" zexpr (NLet "__cty" ctyexpr (NLet "__ctz" ctzexpr (NIf guard dW dx))))
+          let rgfn = (DFn (cat [nm, "__rgrad"]) (append params ["__gy", "__wrt"]) rbody)
+          let helpers = if ro_k == "dot" then cons actfn (cons addvfn (cons seedmulfn [])) else cons actfn (cons addvfn [])
           append helpers (cons rgfn rest)
         else if detect_chain_readout body params then
           -- V5 slice 3 (contraction readout on the map-chain): a linear map-chain feeding a
@@ -4103,24 +4080,24 @@ synth_grad_decls marks decls =
           let m = length stages
           let wname = head (tail params)
           let gmul = mcr_gmul body
-          let zname = head (head (reverse stages))
+          let (zname, zg, zsrc) = head (reverse stages)
           let reltfns = mc_reltfns nm stages 0
-          let gaderiv = ["A", ["A", ["A", ["V", cat [gmul, "__grad"]], ["V", "__va"]], ["V", "__vb"]], ["I", "0"]]
-          let gbderiv = ["A", ["A", ["A", ["V", cat [gmul, "__grad"]], ["V", "__va"]], ["V", "__vb"]], ["I", "1"]]
-          let gafn = ["fn", cat [nm, "__rgrad_ga"], ["__va", "__vb"], gaderiv]
-          let gbfn = ["fn", cat [nm, "__rgrad_gb"], ["__va", "__vb"], gbderiv]
-          let sclfn = ["fn", cat [nm, "__rgrad_scl"], ["__vp", "__vc"], ["O", "*", ["V", "__vp"], ["V", "__vc"]]]
-          let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", wname]]], ["V", "__gy"]]
-          let pa = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_ga"]]], ["V", wname]], ["V", zname]]
-          let pb = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_gb"]]], ["V", wname]], ["V", zname]]
-          let dw = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_scl"]]], pa], bcast]
-          let ctz = ["A", ["A", ["A", ["V", "float_arr_map2"], ["V", cat [nm, "__rgrad_scl"]]], pb], bcast]
+          let gaderiv = (NApp (NApp (NApp (NVar (cat [gmul, "__grad"])) (NVar "__va")) (NVar "__vb")) (NInt "0"))
+          let gbderiv = (NApp (NApp (NApp (NVar (cat [gmul, "__grad"])) (NVar "__va")) (NVar "__vb")) (NInt "1"))
+          let gafn = (DFn (cat [nm, "__rgrad_ga"]) ["__va", "__vb"] gaderiv)
+          let gbfn = (DFn (cat [nm, "__rgrad_gb"]) ["__va", "__vb"] gbderiv)
+          let sclfn = (DFn (cat [nm, "__rgrad_scl"]) ["__vp", "__vc"] (NOp "*" (NVar "__vp") (NVar "__vc")))
+          let bcast = (NApp (NApp (NVar "float_arr_new") (NApp (NVar "float_arr_len") (NVar wname))) (NVar "__gy"))
+          let pa = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_ga"]))) (NVar wname)) (NVar zname))
+          let pb = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_gb"]))) (NVar wname)) (NVar zname))
+          let dw = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_scl"]))) pa) bcast)
+          let ctz = (NApp (NApp (NApp (NVar "float_arr_map2") (NVar (cat [nm, "__rgrad_scl"]))) pb) bcast)
           let seedname = cat ["__ct", show (m - 1)]
           let sweepbody = mc_sweep nm (reverse stages) (m - 1) seedname
-          let dxs = ["D", seedname, ctz, sweepbody]
-          let guard = ["O", "==", ["V", "__wrt"], ["I", "0"]]
-          let rbody = mc_primals stages ["?", guard, dxs, dw]
-          let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy", "__wrt"], rbody]
+          let dxs = (NLet seedname ctz sweepbody)
+          let guard = (NOp "==" (NVar "__wrt") (NInt "0"))
+          let rbody = mc_primals stages (NIf guard dxs dw)
+          let rgfn = (DFn (cat [nm, "__rgrad"]) (append params ["__gy", "__wrt"]) rbody)
           append reltfns (cons gafn (cons gbfn (cons sclfn (cons rgfn rest))))
         else if detect_map_chain body params then
           -- V5 slice 2 (array reverse-mode let-spine walker): a strict linear map-chain ending in
@@ -4133,16 +4110,16 @@ synth_grad_decls marks decls =
           let reltfns = mc_reltfns nm stages 0
           let primals_init = reverse (tail (reverse stages))
           let seedname = cat ["__ct", show (m - 1)]
-          let bcast = ["A", ["A", ["V", "float_arr_new"], ["A", ["V", "float_arr_len"], ["V", xsname]]], ["V", "__gy"]]
+          let bcast = (NApp (NApp (NVar "float_arr_new") (NApp (NVar "float_arr_len") (NVar xsname))) (NVar "__gy"))
           let sweepbody = mc_sweep nm (reverse stages) (m - 1) seedname
-          let fullsweep = ["D", seedname, bcast, sweepbody]
+          let fullsweep = (NLet seedname bcast sweepbody)
           let rbody = mc_primals primals_init fullsweep
-          let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__gy"], rbody]
+          let rgfn = (DFn (cat [nm, "__rgrad"]) (append params ["__gy"]) rbody)
           append reltfns (cons rgfn rest)
         else
-          let gfn = ["fn", cat [nm, "__grad"], append params ["__gi"], grad_chain params body 0]
+          let gfn = (DFn (cat [nm, "__grad"]) (append params ["__gi"]) (grad_chain params body 0))
           if grad_rev_supported body && grad_rev_names_ok params body then
-            let rgfn = ["fn", cat [nm, "__rgrad"], append params ["__go"], grad_rev_rbody params body (length params)]
+            let rgfn = (DFn (cat [nm, "__rgrad"]) (append params ["__go"]) (grad_rev_rbody params body (length params)))
             cons gfn (cons rgfn rest)
           else cons gfn rest
 
@@ -5425,15 +5402,13 @@ data_section_asm = "\n.section __DATA,__data\n_fmt_int:\n    .byte 37, 108, 100,
 compile_program_with_file src fname =
   let (toks, positions) = tokenize_with_pos src
   let ntoks = length toks
-  let decls = pprog toks
-  let decls = inject_grad_fns decls
-  let td = ast_decls_of decls
-  let errs = ce_decls td
+  let decls = inject_grad_fns (pprog_ast toks)
+  let errs = ce_decls decls
   let nerrs = report_errors errs positions ntoks fname
   if nerrs > 0 then
     let _ = print (cat [show nerrs, " error(s) found"])
     ""
-  else compile_checked (inject_auth_fns td)
+  else compile_checked (inject_auth_fns decls)
 
 compile_checked decls =
   let td = opt_decls decls
@@ -5554,9 +5529,8 @@ check_arities decls fns =
 -- first hooked into this function only and never ran for `rail_native file`).
 compile_program src =
   let toks = tokenize src
-  let decls = pprog toks
-  let decls = inject_grad_fns decls
-  compile_checked (inject_auth_fns (ast_decls_of decls))
+  let decls = inject_grad_fns (pprog_ast toks)
+  compile_checked (inject_auth_fns decls)
 
 -- BUILD: assemble + link
 
