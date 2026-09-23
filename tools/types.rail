@@ -1,45 +1,90 @@
--- tools/types.rail -- Hindley-Milner type inference for Rail, stage 0: observe only.
+-- tools/types.rail -- Hindley-Milner type inference for Rail, and the representation
+-- codegen gives every function's parameters and result.
 --
--- `./rail_native types <file.rail>` infers a type for every top-level function, reports
--- the places where the program cannot have one, and compares the verdicts with the
--- float/int guesses codegen makes today (get_arities: __argf_ / __float_ret_). Nothing
--- here feeds codegen yet; this file changes what the compiler prints, never what it emits.
+-- `./rail_native types <file.rail>` infers a type for every top-level function and reports
+-- the places where the program cannot have one. get_arities (tools/compile.rail) asks
+-- hm_codegen_markers which parameters arrive as raw floats or as ints and which results
+-- leave as raw floats; those markers used to come from a thousand lines of guessing.
 --
--- The type language: int float str bool unit dyn, [t], (t1, .., tn), (t1 .. tn) -> r for
--- an n-ary function (Rail has no partial application), named ADTs, arr t, farr, ptr.
--- `dyn` is the escape hatch that lets untyped Rail keep compiling: a list literal whose
--- elements disagree is [dyn], ADT fields and foreign arguments are dyn, and anything
--- unified with dyn becomes dyn (never a guessed concrete type), so a static type is
--- only ever claimed where it is proven. Top-level functions are generalized per
--- strongly-connected group of the call graph, callees first (let-polymorphism).
+-- The type language: int float str bool dyn, [t], (t1, .., tn), (t1 .. tn) -> r for an
+-- n-ary function (Rail has no partial application), named ADTs, arr t, farr, ptr. `dyn`
+-- is the escape hatch that lets untyped Rail keep compiling: a list literal whose elements
+-- disagree is [dyn], ADT fields and foreign arguments are dyn, an array whose stores disagree
+-- is arr dyn, and anything unified with dyn becomes dyn, so a static type is only claimed
+-- where it is proven.
+-- Top-level functions are generalized per strongly-connected group of the call graph,
+-- callees first (let-polymorphism).
+--
+-- A claim codegen acts on must hold for every value that can reach it, so inference runs in
+-- rounds. After each round every flow of a value into a typed slot is checked (arguments into
+-- parameters, a function's body into its result, a closure handed to a caller that will feed
+-- it); where dyn, or a clashing type, reaches a slot that claims a type, the slot's owner (a
+-- function's parameter or result, a lambda's parameters, a call's result) is forced to dyn
+-- and the program is inferred again, until a round forces nothing new. A function referenced
+-- as a value is called through a closure with generic arguments, so its parameters are
+-- forced as well.
 --
 -- Imported into tools/compile.rail; uses its parser and AST helpers (flat,
--- collect_lam_params, efind, cat). All names here start with hm_.
+-- collect_lam_params, efind, cat, argf_key). All names here start with hm_.
 
--- ── the store: st[0] next var id, st[1] error list, st[2] current fn name, st[3]
---    heterogeneous-literal count, st[16..] type-variable bindings (0 = unbound) ──
-hm_cap = 4000000
+-- ── the store ──
+-- st[0] next var id   st[1] errors   st[2] current fn name   st[3] heterogeneous count
+-- st[4] flows   st[5] (unused)   st[6] force events   st[7] call-site counter
+-- st[8] lambda counter   st[9] this round's forces   st[10] bad flows nothing owns
+-- st[11] body records   st[12] current fn index   st[13] user fns (arr of decls)
+-- st[14] user fn count   st[15] each user fn's type (arr)
+-- st[32..] type-variable bindings (0 = unbound); st[hm_cap + id] the owners of variable id
+hm_cap = 400000
+hm_base = 32
 hm_new_store _ =
-  let st = arr_new hm_cap 0
-  let _ = arr_set st 0 16
+  let st = arr_new (2 * hm_cap) 0
+  let _ = arr_set st 9 (hm_no_forces 0)
+  let _ = hm_reset st
+  st
+hm_reset st =
+  let _ = arr_set st 0 hm_base
   let _ = arr_set st 1 []
   let _ = arr_set st 2 ""
   let _ = arr_set st 3 0
-  st
+  let _ = arr_set st 4 []
+  let _ = arr_set st 6 []
+  let _ = arr_set st 7 0
+  let _ = arr_set st 8 0
+  let _ = arr_set st 10 0
+  let _ = arr_set st 11 []
+  arr_set st 12 (0 - 1)
 
 hm_fresh st =
   let n = arr_get st 0
   if n >= hm_cap - 1 then ["dyn"]
   else
     let _ = arr_set st 0 (n + 1)
+    let _ = arr_set st n 0
+    let _ = arr_set st (hm_cap + n) []
     ["tv", n]
+-- an owner code: 4k+1 is lambda k's parameters, 4k+2 the result of call site k (an arr_new),
+-- 0 - (fi * 64 + i + 1) parameter i of user fn fi
+hm_fresh_owned st code =
+  let v = hm_fresh st
+  let _ = if head v == "tv" then arr_set st (hm_cap + head (tail v)) [code] else 0
+  v
+hm_owners st id = arr_get st (hm_cap + id)
 
 hm_err st msg = let _ = arr_set st 1 (cons (cat ["in ", arr_get st 2, ": ", msg]) (arr_get st 1)) in 0
+hm_event st ev = arr_set st 6 (cons ev (arr_get st 6))
 
 hm_prune st t =
   if head t == "tv" then
     let b = arr_get st (head (tail t))
     if b == 0 then t else hm_prune st b
+  else t
+
+-- the last variable on t's binding chain (unbound, or the one holding a concrete type).
+-- Binding another variable to it, rather than to the type it holds, keeps the two linked.
+hm_repr st t =
+  if head t == "tv" then
+    let b = arr_get st (head (tail t))
+    if b == 0 then t else if head b == "tv" then hm_repr st b else t
   else t
 
 hm_occurs st id t =
@@ -53,22 +98,42 @@ hm_occurs st id t =
   else false
 hm_occurs_l st id ts = if ts == [] then false else if hm_occurs st id (head ts) then true else hm_occurs_l st id (tail ts)
 
--- anything that meets dyn becomes dyn: bind every free variable inside t to dyn
-hm_dynify st t =
+hm_concrete h = if h == "tv" then false else h != "dyn"
+
+-- anything that meets dyn becomes dyn: bind every free variable inside t to dyn. When t's
+-- values flow into dyn (esc), a function among them can then be called with anything, so
+-- the owners of every parameter it claims a type for are forced.
+hm_dynify st t esc =
   let x = hm_prune st t
   let h = head x
   if h == "tv" then arr_set st (head (tail x)) ["dyn"]
-  else if h == "list" then hm_dynify st (head (tail x))
-  else if h == "arr" then hm_dynify st (head (tail x))
-  else if h == "tup" then hm_dynify_l st (head (tail x))
-  else if h == "fn" then let _ = hm_dynify_l st (head (tail x)) in hm_dynify st (head (tail (tail x)))
+  else if h == "list" then hm_dynify st (head (tail x)) esc
+  else if h == "arr" then (if esc then hm_arr_escape st (head (tail x)) else hm_dynify st (head (tail x)) esc)
+  else if h == "tup" then hm_dynify_l st (head (tail x)) esc
+  else if h == "fn" then
+    let _ = if esc then hm_escape_l st (head (tail x)) else 0
+    let _ = hm_dynify_l st (head (tail x)) esc
+    hm_dynify st (head (tail (tail x))) esc
   else 0
-hm_dynify_l st ts = if ts == [] then 0 else let _ = hm_dynify st (head ts) in hm_dynify_l st (tail ts)
+-- whoever holds an array that reached dyn may store anything into it
+hm_arr_escape st e =
+  let x = hm_prune st e
+  if head x == "dyn" then 0
+  else if head e == "tv" then (let _ = hm_dynify st x true in hm_setroot st e ["dyn"])
+  else hm_force_owners st e
+hm_dynify_l st ts esc = if ts == [] then 0 else let _ = hm_dynify st (head ts) esc in hm_dynify_l st (tail ts) esc
+hm_escape_l st ps = if ps == [] then 0 else let _ = (if hm_concrete (head (hm_prune st (head ps))) then hm_force_owners st (head ps) else 0) in hm_escape_l st (tail ps)
 
 hm_bind st v t =
   let id = head (tail v)
   if hm_occurs st id t then let _ = arr_set st id ["dyn"] in true
-  else let _ = arr_set st id t in true
+  else
+    let _ = arr_set st id t
+    let _ = if head t == "tv" then hm_merge_owners st id (head (tail t)) else 0
+    true
+hm_merge_owners st from to =
+  let o = hm_owners st from
+  if o == [] then 0 else arr_set st (hm_cap + to) (append o (hm_owners st to))
 
 hm_unify st a b =
   let x = hm_prune st a
@@ -78,10 +143,10 @@ hm_unify st a b =
   if hx == "tv" then
     if hy == "tv" then (if head (tail x) == head (tail y) then true else hm_bind st x y)
     else if hy == "dyn" then let _ = arr_set st (head (tail x)) ["dyn"] in true
-    else hm_bind st x y
-  else if hy == "tv" then (if hx == "dyn" then let _ = arr_set st (head (tail y)) ["dyn"] in true else hm_bind st y x)
-  else if hx == "dyn" then let _ = hm_dynify st y in true
-  else if hy == "dyn" then let _ = hm_dynify st x in true
+    else hm_bind st x (hm_repr st b)
+  else if hy == "tv" then (if hx == "dyn" then let _ = arr_set st (head (tail y)) ["dyn"] in true else hm_bind st y (hm_repr st a))
+  else if hx == "dyn" then let _ = hm_dynify st y true in true
+  else if hy == "dyn" then let _ = hm_dynify st x false in true
   else if hx != hy then false
   else if hx == "list" then hm_unify st (head (tail x)) (head (tail y))
   else if hx == "arr" then hm_unify st (head (tail x)) (head (tail y))
@@ -91,22 +156,22 @@ hm_unify st a b =
   else true
 hm_unify_l st xs ys = if xs == [] then ys == [] else if ys == [] then false else if hm_unify st (head xs) (head ys) then hm_unify_l st (tail xs) (tail ys) else false
 
--- Merging two possible values (if/match branches, list elements, array stores) is a
--- JOIN, not a unification: where one side is dyn the merge is dyn, because at run time
--- the value may be either. (Passing an argument only needs consistency: hm_unify.)
--- hm_lub builds the joined type, binding variables on the way; ["clash"] = no join.
+-- Merging two possible values (if/match branches, list elements) is a JOIN, not a
+-- unification: where one side is dyn the merge is dyn, because at run time the value may
+-- be either. (Passing an argument only needs consistency: hm_unify.) hm_lub builds the
+-- joined type, binding variables on the way; ["clash"] = no join.
 hm_lub st a b =
   let x = hm_prune st a
   let y = hm_prune st b
   let hx = head x
   let hy = head y
-  if hx == "tv" then (if hy == "tv" then (if head (tail x) == head (tail y) then x else let _ = hm_bind st x y in y) else let _ = hm_bind st x y in y)
-  else if hy == "tv" then let _ = hm_bind st y x in x
-  else if hx == "dyn" then let _ = hm_dynify st y in x
-  else if hy == "dyn" then let _ = hm_dynify st x in y
+  if hx == "tv" then (if hy == "tv" then (if head (tail x) == head (tail y) then x else let _ = hm_bind st x y in y) else let _ = hm_bind st x (hm_repr st b) in y)
+  else if hy == "tv" then let _ = hm_bind st y (hm_repr st a) in x
+  else if hx == "dyn" then let _ = hm_dynify st y true in x
+  else if hy == "dyn" then let _ = hm_dynify st x true in y
   else if hx != hy then ["clash"]
   else if hx == "list" then hm_lub_wrap "list" (hm_lub st (head (tail x)) (head (tail y)))
-  else if hx == "arr" then hm_lub_wrap "arr" (hm_lub st (head (tail x)) (head (tail y)))
+  else if hx == "arr" then (if hm_unify st (head (tail x)) (head (tail y)) then x else ["clash"])
   else if hx == "tup" then
     let ts = hm_lub_l st (head (tail x)) (head (tail y))
     if hm_any_clash ts then ["clash"] else ["tup", ts]
@@ -123,20 +188,45 @@ hm_lub_l st xs ys =
   else cons (hm_lub st (head xs) (head ys)) (hm_lub_l st (tail xs) (tail ys))
 hm_any_clash ts = if ts == [] then false else if head (head ts) == "clash" then true else hm_any_clash (tail ts)
 
--- rebind the root variable of an owned result variable (v is ["tv", id])
-hm_setroot st v t = if head v != "tv" then 0 else let b = arr_get st (head (tail v)) in if b == 0 then hm_set_checked st (head (tail v)) t else if head b == "tv" then hm_setroot st b t else hm_set_checked st (head (tail v)) t
+-- rebind a join's own result variable (v is ["tv", id]); a variable it was linked to (a
+-- branch's parameter, say) keeps its type, which code elsewhere may already have read
+hm_setroot st v t = if head v != "tv" then 0 else hm_set_checked st (head (tail v)) t
 hm_set_checked st id t =
   let p = hm_prune st t
   if head p == "tv" then (if head (tail p) == id then 0 else arr_set st id p)
   else if hm_occurs st id p then arr_set st id ["dyn"] else arr_set st id p
 
--- join t into res; a real clash (str vs int) is reported and the merge becomes dyn
+-- join t into res; a real clash (str vs int) is reported and the merge becomes dyn. The
+-- first value joined is linked, not copied, and the link survives as long as later values
+-- add nothing, so a merge of an array read follows that array's element type if a later
+-- store widens it.
 hm_join st res t what node =
+  let cur = hm_prune st res
+  if head cur == "tv" then (if head (tail cur) == head (tail res) then hm_bind st res (hm_repr st t) else hm_lub_into st res cur t what node)
+  else hm_lub_into st res cur t what node
+hm_lub_into st res cur t what node =
   let l = hm_lub st res t
   if head l == "clash" then
-    let _ = hm_err st (cat [what, " `", hm_ast node, "` is ", hm_show st t, " where ", hm_show st res, " is expected"])
+    let _ = (if what == "" then arr_set st 3 (arr_get st 3 + 1) else hm_err st (cat [what, " `", hm_ast node, "` is ", hm_show st t, " where ", hm_show st res, " is expected"]))
+    let _ = hm_dynify st cur true
+    let _ = hm_dynify st t true
     hm_setroot st res ["dyn"]
+  else if hm_same st l cur then 0
   else hm_setroot st res l
+-- structurally the same type (variables by identity)
+hm_same st a b =
+  let x = hm_prune st a
+  let y = hm_prune st b
+  let hx = head x
+  if hx != head y then false
+  else if hx == "tv" then head (tail x) == head (tail y)
+  else if hx == "list" then hm_same st (head (tail x)) (head (tail y))
+  else if hx == "arr" then hm_same st (head (tail x)) (head (tail y))
+  else if hx == "tup" then hm_same_l st (head (tail x)) (head (tail y))
+  else if hx == "fn" then (if hm_same_l st (head (tail x)) (head (tail y)) then hm_same st (head (tail (tail x))) (head (tail (tail y))) else false)
+  else if hx == "adt" then head (tail x) == head (tail y)
+  else true
+hm_same_l st xs ys = if xs == [] then ys == [] else if ys == [] then false else if hm_same st (head xs) (head ys) then hm_same_l st (tail xs) (tail ys) else false
 
 -- ── printing ──
 -- free variables print as a, b, c.. in order of appearance within the one type shown
@@ -262,9 +352,11 @@ hm_bi2 st n a b i f s bo d =
   else []
 
 -- ── schemes and environments ──
--- genv: (name, ["forall", ids, type]) for generalized fns, (name, ["mono", type]) while their
--- group is being inferred. env: (name, type) for locals.
+-- genv: (name, ["forall", ids, type, fi]) for generalized fns, (name, ["mono", type, fi]) while
+-- their group is being inferred (fi = the user fn's index, -1 for a foreign fn). env: (name,
+-- type) for locals.
 hm_lookup n env = if env == [] then [] else let (k, v) = head env in if k == n then v else hm_lookup n (tail env)
+hm_sch_fi sch = if head sch == "mono" then head (tail (tail sch)) else head (tail (tail (tail sch)))
 
 hm_free st t acc =
   let x = hm_prune st t
@@ -287,11 +379,29 @@ hm_subst st t m =
   let h = head x
   if h == "tv" then (let r = hm_lookup (head (tail x)) m in if r == [] then x else r)
   else if h == "list" then ["list", hm_subst st (head (tail x)) m]
-  else if h == "arr" then ["arr", hm_subst st (head (tail x)) m]
+  else if h == "arr" then ["arr", hm_cell st (hm_subst st (head (tail x)) m)]
   else if h == "tup" then ["tup", hm_subst_l st (head (tail x)) m]
   else if h == "fn" then ["fn", hm_subst_l st (head (tail x)) m, hm_subst st (head (tail (tail x))) m]
   else x
+-- a fresh variable holding t (a widenable slot)
+hm_cell st t = if head t == "tv" then t else let v = hm_fresh st in let _ = (if head v == "tv" then arr_set st (head (tail v)) t else 0) in v
 hm_subst_l st ts m = if ts == [] then [] else cons (hm_subst st (head ts) m) (hm_subst_l st (tail ts) m)
+
+-- ── the forces a round runs under ──
+-- [params, results, sites, lambdas, count, nsites, nlams]: params[fi] = the forced parameter
+-- indices of user fn fi ([-1] = all), results[fi] = 1 when its result is forced, sites[k] = 1
+-- when call site k's result is forced, lambdas[k] = 1 when lambda k's parameters are.
+hm_no_forces _ = [arr_new 1 [], arr_new 1 0, arr_new 1 0, arr_new 1 0, 0, 0, 0]
+hm_fc_nth fc i = if i <= 0 then head fc else hm_fc_nth (tail fc) (i - 1)
+hm_forced_param st fi i =
+  let fc = arr_get st 9
+  if fi < 0 then false else if fi >= arr_get st 14 then false
+  else let m = arr_get (head fc) fi in if m == [] then false else if hm_has (0 - 1) m then true else hm_has i m
+hm_forced_result st fi =
+  let fc = arr_get st 9
+  if fi < 0 then false else if fi >= arr_get st 14 then false else arr_get (hm_fc_nth fc 1) fi == 1
+hm_forced_site st k = let fc = arr_get st 9 in if k >= hm_fc_nth fc 5 then false else arr_get (hm_fc_nth fc 2) k == 1
+hm_forced_lam st k = let fc = arr_get st 9 in if k >= hm_fc_nth fc 6 then false else arr_get (hm_fc_nth fc 3) k == 1
 
 -- ── inference ──
 -- cx = (genv, ctors) where ctors: (ctor, (type name, arity))
@@ -312,11 +422,7 @@ hm_infer st env cx node =
   else if tg == "TD" then hm_td st env cx node
   else if tg == "L" then hm_list st env cx (head (tail node))
   else if tg == "T" then ["tup", hm_infer_l st env cx (head (tail node))]
-  else if tg == "F" then
-    let (ps, body) = collect_lam_params node
-    let pts = hm_fresh_l st ps
-    let bt = hm_infer st (hm_bind_all ps pts env) cx body
-    ["fn", pts, bt]
+  else if tg == "F" then hm_lambda st env cx node
   else if tg == "A" then hm_app st env cx node
   else if tg == "M" then hm_match st env cx node
   else ["dyn"]
@@ -324,6 +430,16 @@ hm_infer st env cx node =
 hm_infer_l st env cx nodes = if nodes == [] then [] else cons (hm_infer st env cx (head nodes)) (hm_infer_l st env cx (tail nodes))
 hm_fresh_l st xs = if xs == [] then [] else cons (hm_fresh st) (hm_fresh_l st (tail xs))
 hm_bind_all ns ts env = if ns == [] then env else hm_bind_all (tail ns) (tail ts) (cons (head ns, head ts) env)
+
+-- a lambda's parameters are owned by it, so a flow that feeds one dyn can force them
+hm_lambda st env cx node =
+  let k = arr_get st 8 + 1
+  let _ = arr_set st 8 k
+  let (ps, body) = collect_lam_params node
+  let pts = if hm_forced_lam st k then hm_dyn_n (length ps) else hm_owned_l st ps (k * 4 + 1)
+  let bt = hm_infer st (hm_bind_all ps pts env) cx body
+  ["fn", pts, bt]
+hm_owned_l st xs code = if xs == [] then [] else cons (hm_fresh_owned st code) (hm_owned_l st (tail xs) code)
 
 -- a name as a value: local, then global (a nullary global IS its value), builtin, constructor
 hm_var st env cx n =
@@ -335,7 +451,11 @@ hm_var st env cx n =
     if sch != [] then
       let t = hm_inst st sch
       let x = hm_prune st t
-      if head x == "fn" then (if head (tail x) == [] then head (tail (tail x)) else x) else x
+      if head x == "fn" then
+        if head (tail x) == [] then head (tail (tail x))
+        -- called through a closure with generic arguments: every parameter may be anything
+        else let _ = (if hm_sch_fi sch >= 0 then hm_event st ["v", hm_sch_fi sch] else 0) in x
+      else x
     else
       let c = hm_lookup n ctors
       if c != [] then
@@ -347,60 +467,97 @@ hm_var st env cx n =
         else ["dyn"]
 hm_dyn_n n = if n <= 0 then [] else cons ["dyn"] (hm_dyn_n (n - 1))
 
+-- A call site k: its arguments flow into the callee's parameters (recorded, checked after
+-- the round); a forced site's result is dyn. Callee kinds: "u" a user fn, "b" a builtin
+-- whose result type depends on its arguments, "k" one whose result type is fixed (and
+-- foreign fns), "c" a closure.
 hm_app st env cx node =
+  let k = arr_get st 7 + 1
+  let _ = arr_set st 7 k
   let (fname, args) = flat node
   let ats = hm_infer_l st env cx args
+  let r = hm_app_ty st env cx node fname args ats k
+  if hm_forced_site st k then ["dyn"] else r
+hm_app_ty st env cx node fname args ats k =
   if fname == "_expr" then
     let ft = hm_infer st env cx (get_app_fn node)
-    hm_call st ft ats node
-  else if fname == "arr_set" then hm_arr_set st ats
-  -- `arr_new n 0`: 0 is Rail's null, so it says nothing about what the array will hold
-  else if fname == "arr_new" then (if hm_is_zero (head (tail args)) then ["arr", hm_fresh st] else ["arr", hm_nth ats 1])
+    hm_call st ft ats node "c" (0 - 1) k
   else
     let lt = hm_lookup fname env
-    if lt != [] then hm_call st lt ats node
+    if lt != [] then hm_call st lt ats node "c" (0 - 1) k
     else
       let (genv, ctors) = cx
       let sch = hm_lookup fname genv
-      if sch != [] then hm_call st (hm_inst st sch) ats node
+      if sch != [] then
+        let fi = hm_sch_fi sch
+        hm_call st (hm_inst st sch) ats node (if fi >= 0 then "u" else "k") fi k
       else
         let c = hm_lookup fname ctors
-        if c != [] then let (tyname, ar) = c in ["adt", tyname]
+        -- constructor fields are dyn: the arguments escape into them
+        if c != [] then let (tyname, ar) = c in let _ = hm_dynify_l st ats true in ["adt", tyname]
+        else if fname == "arr_new" then hm_arr_new st args ats k
+        else if fname == "arr_get" then hm_arr_elem st ats
+        else if fname == "arr_set" then hm_arr_set st ats
+        else if fname == "arr_len" then let _ = hm_arr_elem st ats in ["int"]
         else
           let bt = hm_bi st fname
-          if bt != [] then hm_call st bt ats node
-          else ["dyn"]
+          if bt != [] then hm_call st bt ats node (if hm_free st (head (tail (tail bt))) [] == [] then "k" else "b") (0 - 1) k
+          else let _ = hm_dynify_l st ats true in ["dyn"]
 
 -- apply a function type to argument types; arity is checked elsewhere, so a count
 -- mismatch just yields dyn here
-hm_call st ft ats node =
+hm_call st ft ats node ck cf k =
   let x = hm_prune st ft
   if head x == "fn" then
     let ps = head (tail x)
     if length ps != length ats then ["dyn"]
     else
-      let _ = hm_args st ps ats node 1
+      let _ = hm_args st ps ats node 1 ck cf k
       head (tail (tail x))
   else if head x == "tv" then
     let r = hm_fresh st
     let _ = hm_unify st x ["fn", ats, r]
     r
-  else if head x == "dyn" then let _ = hm_dynify_l st ats in ["dyn"]
-  else let _ = hm_err st (cat ["`", hm_ast node, "` calls a ", hm_show st x, ", not a function"]) in ["dyn"]
+  else if head x == "dyn" then let _ = hm_dynify_l st ats true in ["dyn"]
+  else
+    let _ = hm_err st (cat ["`", hm_ast node, "` calls a ", hm_show st x, ", not a function"])
+    let _ = hm_event st ["a", arr_get st 12]
+    ["dyn"]
 
-hm_args st ps ats node i =
+hm_args st ps ats node i ck cf k =
   if ps == [] then 0
   else
     let _ = if hm_unify st (head ps) (head ats) then 0 else hm_err st (cat ["argument ", show i, " of `", hm_ast node, "` is ", hm_show st (head ats), " but ", hm_show st (head ps), " is expected"])
-    hm_args st (tail ps) (tail ats) node (i + 1)
+    let _ = arr_set st 4 (cons [ck, cf, k, i - 1, head ps, head ats, arr_get st 12] (arr_get st 4))
+    hm_args st (tail ps) (tail ats) node (i + 1) ck cf k
 
+-- An array is mutable and shared: its element type is a variable that a store may widen
+-- (a join, so a store of another kind makes it dyn), and a read returns that variable
+-- itself, so whatever the read fed follows a later widening. The element of an array made
+-- here is owned by this call site: a flow that must widen it from elsewhere forces the
+-- site's result to dyn. `arr_new n 0` says nothing (0 is Rail's null).
+hm_arr_new st args ats k =
+  if length ats != 2 then ["dyn"]
+  else
+    let e = hm_fresh_owned st (k * 4 + 2)
+    let _ = if hm_is_zero (head (tail args)) then 0 else hm_widen st e (head (tail ats))
+    ["arr", e]
 hm_is_zero node = if head node == "I" then head (tail node) == "0" else head node == "NULL"
+-- the element variable of the array argument (binding an unknown argument to a fresh array)
+hm_arr_elem st ats =
+  if ats == [] then ["dyn"]
+  else
+    let at = hm_prune st (head ats)
+    if head at == "arr" then head (tail at)
+    else if head at == "tv" then let e = hm_fresh st in let _ = hm_bind st at ["arr", e] in e
+    else if head at == "dyn" then ["dyn"]
+    else ["dyn"]
 hm_arr_set st ats =
   if length ats != 3 then ["dyn"]
   else
-    let e = hm_fresh st
-    let at = hm_prune st (head ats)
-    let _ = if head at == "arr" then hm_widen st (head (tail at)) (head (tail (tail ats))) else (if hm_unify st at ["arr", e] then hm_widen st e (head (tail (tail ats))) else 0)
+    let e = hm_arr_elem st ats
+    let v = head (tail (tail ats))
+    let _ = if head e == "dyn" then hm_dynify st v true else hm_widen st e v
     ["int"]
 
 -- numeric/string operators. Rail promotes an int into a float context (0.0 +. n with n an
@@ -432,29 +589,34 @@ hm_arith_operands st lt rt node op =
   let y = hm_prune st rt
   let hx = head x
   let hy = head y
-  if hx == "dyn" then (if dotted then ["float"] else ["dyn"])
-  else if hy == "dyn" then (if dotted then ["float"] else ["dyn"])
+  -- a float operand makes the result a float whatever the other side holds (the runtime
+  -- converts it, a string to 0.0); an int beside dyn is an int or, when dyn holds a float
+  -- or a string, a float
+  if hx == "dyn" then (if dotted then ["float"] else if hy == "float" then ["float"] else ["dyn"])
+  else if hy == "dyn" then (if dotted then ["float"] else if hx == "float" then ["float"] else ["dyn"])
   else if hm_num_mix st x y then ["float"]
   else if dotted then hm_float_operands st x y node
-  else if hx == "float" then (if hy == "tv" then ["float"] else hm_arith_same st x y node op)
-  else if hy == "float" then (if hx == "tv" then ["float"] else hm_arith_same st x y node op)
-  else hm_arith_same st x y node op
+  else if hx == "float" then (if hy == "tv" then ["float"] else hm_arith_same st lt rt node op)
+  else if hy == "float" then (if hx == "tv" then ["float"] else hm_arith_same st lt rt node op)
+  else hm_arith_same st lt rt node op
 -- a dotted operator: the result is float, an operand may be float or int (or unknown)
 hm_float_operands st x y node =
   let bad = if hm_numeric_or_var (head x) then (if hm_numeric_or_var (head y) then false else true) else true
   if bad then let _ = hm_err st (cat ["`", hm_ast node, "` does float arithmetic on ", hm_show st x, " and ", hm_show st y]) in ["float"]
   else ["float"]
 hm_numeric_or_var h = if h == "int" then true else if h == "float" then true else h == "tv"
-hm_arith_same st x y node op =
-  if hm_unify st x y then
-    let r = hm_prune st x
+-- the result is the operands' own type, linked to them (a variable, not a copy of what it
+-- holds), so what later narrows an operand narrows the result too
+hm_arith_same st lt rt node op =
+  if hm_unify st lt rt then
+    let r = hm_prune st lt
     let hr = head r
-    if hr == "int" then ["int"]
-    else if hr == "float" then ["float"]
-    else if hr == "str" then (if op == "+" then ["str"] else let _ = hm_err st (cat ["`", hm_ast node, "` does arithmetic on strings"]) in ["dyn"])
+    if hr == "int" then hm_repr st lt
+    else if hr == "float" then hm_repr st lt
+    else if hr == "str" then (if op == "+" then hm_repr st lt else let _ = hm_err st (cat ["`", hm_ast node, "` does arithmetic on strings"]) in ["dyn"])
     else if hr == "tv" then r
     else let _ = hm_err st (cat ["`", hm_ast node, "` does arithmetic on ", hm_show st r]) in ["dyn"]
-  else let _ = hm_err st (cat ["`", hm_ast node, "` mixes ", hm_show st x, " and ", hm_show st y]) in ["dyn"]
+  else let _ = hm_err st (cat ["`", hm_ast node, "` mixes ", hm_show st lt, " and ", hm_show st rt]) in ["dyn"]
 
 hm_if st env cx node =
   let ct = hm_prune st (hm_infer st env cx (head (tail node)))
@@ -468,7 +630,7 @@ hm_td st env cx node =
   let names = head (tail node)
   let vt = hm_prune st (hm_infer st env cx (head (tail (tail node))))
   let ts = hm_fresh_l st names
-  let _ = if hm_unify st vt ["tup", ts] then 0 else hm_err st (cat ["`", hm_ast (head (tail (tail node))), "` is ", hm_show st vt, ", destructured as a ", show (length names), "-tuple"])
+  let _ = if hm_unify st vt ["tup", ts] then 0 else let _ = hm_event st ["a", arr_get st 12] in hm_err st (cat ["`", hm_ast (head (tail (tail node))), "` is ", hm_show st vt, ", destructured as a ", show (length names), "-tuple"])
   hm_infer st (hm_bind_all names ts env) cx (head (tail (tail (tail node))))
 
 hm_list st env cx elems =
@@ -482,10 +644,7 @@ hm_list_elems st env cx elems e =
     let _ = hm_widen st e t
     hm_list_elems st env cx (tail elems) e
 -- a container slot that holds values of different kinds is dyn (counted, not an error)
-hm_widen st e t =
-  let l = hm_lub st e t
-  if head l == "clash" then let _ = arr_set st 3 (arr_get st 3 + 1) in hm_setroot st e ["dyn"]
-  else hm_setroot st e l
+hm_widen st e t = hm_join st e t "" []
 
 hm_match st env cx node =
   let scrut = hm_infer st env cx (head (tail node))
@@ -511,7 +670,7 @@ hm_arms st env cx arms scrut res =
     let _ = if guard == [] then 0 else hm_infer st env2 cx guard
     let _ = hm_join st res (hm_infer st env2 cx body) "match arm" body
     hm_arms st env cx (tail arms) scrut res
-hm_scrut st scrut t ctor = if hm_unify st scrut t then 0 else hm_err st (cat ["pattern ", ctor, " matched against a ", hm_show st scrut])
+hm_scrut st scrut t ctor = if hm_unify st scrut t then 0 else let _ = hm_event st ["a", arr_get st 12] in hm_err st (cat ["pattern ", ctor, " matched against a ", hm_show st scrut])
 
 -- ── the call graph and its strongly-connected groups (Tarjan), callees first ──
 hm_refs node acc =
@@ -601,7 +760,7 @@ hm_foreign decls acc =
       let rt = if rk == "str" then ["str"] else if rk == "float" then ["float"] else if rk == "ptr" then ["ptr"] else ["int"]
       -- codegen converts every argument of a float-returning foreign call to a double
       let pt = if rk == "float" then hm_float_n (head (tail (tail d))) else hm_dyn_n (head (tail (tail d)))
-      hm_foreign (tail decls) (cons (head (tail d), ["forall", [], ["fn", pt, rt]]) acc)
+      hm_foreign (tail decls) (cons (head (tail d), ["forall", [], ["fn", pt, rt], 0 - 1]) acc)
     else hm_foreign (tail decls) acc
 
 hm_float_n n = if n <= 0 then [] else cons ["float"] (hm_float_n (n - 1))
@@ -618,23 +777,35 @@ hm_group st genv ctors fa comp =
 hm_group_mono st fa comp acc =
   if comp == [] then acc
   else
-    let d = arr_get fa (head comp)
-    hm_group_mono st fa (tail comp) (cons (head (tail d), ["mono", ["fn", hm_fresh_l st (head (tail (tail d))), hm_fresh st]]) acc)
+    let fi = head comp
+    let d = arr_get fa fi
+    let ps = hm_mono_params st fi (head (tail (tail d))) 0
+    let r = if hm_forced_result st fi then ["dyn"] else hm_fresh st
+    let ft = ["fn", ps, r]
+    let _ = arr_set (arr_get st 15) fi ft
+    hm_group_mono st fa (tail comp) (cons (head (tail d), ["mono", ft, fi]) acc)
+hm_mono_params st fi ps i =
+  if ps == [] then []
+  else cons (if hm_forced_param st fi i then ["dyn"] else if i < 64 then hm_fresh_owned st (0 - (fi * 64 + i + 1)) else hm_fresh st) (hm_mono_params st fi (tail ps) (i + 1))
 hm_group_bodies st genv ctors fa comp mem =
   if comp == [] then 0
   else
-    let d = arr_get fa (head comp)
+    let fi = head comp
+    let d = arr_get fa fi
     let nm = head (tail d)
     let _ = arr_set st 2 nm
+    let _ = arr_set st 12 fi
     let ft = head (tail (hm_lookup nm mem))
     let pts = head (tail ft)
     let env = hm_bind_all (head (tail (tail d))) pts []
     let bt = hm_infer st env (genv, ctors) (head (tail (tail (tail d))))
     let _ = if hm_unify st (head (tail (tail ft))) bt then 0 else hm_err st (cat ["the body's type ", hm_show st bt, " disagrees with its uses ", hm_show st (head (tail (tail ft)))])
+    let _ = arr_set st 11 (cons [fi, head (tail (tail ft)), bt] (arr_get st 11))
     hm_group_bodies st genv ctors fa (tail comp) mem
-hm_group_gen st mem = if mem == [] then [] else let (nm, sch) = head mem in let t = head (tail sch) in cons (nm, ["forall", reverse (hm_free st t []), t]) (hm_group_gen st (tail mem))
+hm_group_gen st mem = if mem == [] then [] else let (nm, sch) = head mem in let t = head (tail sch) in cons (nm, ["forall", reverse (hm_free st t []), t, head (tail (tail sch))]) (hm_group_gen st (tail mem))
 
-hm_program st decls =
+-- the program's call graph and constructors, computed once: [fa, n, sccs, ctors, foreign]
+hm_prepare st decls =
   let fns = hm_fns decls
   let n = length fns
   let fa = arr_new (n + 1) 0
@@ -642,11 +813,291 @@ hm_program st decls =
   let idx = hm_index fns 0 []
   let adj = arr_new (n + 1) []
   let _ = hm_build_adj fns idx adj 0
-  let sccs = hm_tarjan n adj
-  let ctors = hm_ctors decls []
-  hm_groups st (hm_foreign decls []) ctors fa sccs
+  let _ = arr_set st 13 fa
+  let _ = arr_set st 14 n
+  let _ = arr_set st 15 (arr_new (n + 1) [])
+  let _ = arr_set st 9 [arr_new (n + 1) [], arr_new (n + 1) 0, arr_new 1 0, arr_new 1 0, 0, 0, 0]
+  [fa, n, hm_tarjan n adj, hm_ctors decls [], hm_foreign decls []]
 hm_fill fa fns i = if fns == [] then 0 else let _ = arr_set fa i (head fns) in hm_fill fa (tail fns) (i + 1)
 hm_groups st genv ctors fa sccs = if sccs == [] then genv else hm_groups st (hm_group st genv ctors fa (head sccs)) ctors fa (tail sccs)
+hm_round st pre =
+  let _ = hm_reset st
+  hm_groups st (hm_nth pre 4) (hm_nth pre 3) (head pre) (hm_nth pre 2)
+
+-- one round under no forces: the types the program has as written (what `rail types` shows)
+hm_program st decls = hm_round st (hm_prepare st decls)
+
+-- ── checking the round's flows ──
+-- Values of type src flow into a slot of type dst. dyn reaching a slot that claims a type,
+-- or two types that clash, is a bad flow; the owners of the slot where it happens are
+-- forced. Inside a function type the parameters flow the other way (whoever holds the
+-- slot calls the function with its own values). Returns true when a bad flow was found
+-- that no owner inside dst took, so the caller must force the slot as a whole.
+-- ctx: the owners of the nearest owned slot enclosing dst (a function parameter whose type
+-- is this structure), used where the bad position itself has none. An array is shared, so
+-- its elements are checked both ways: the receiver may store into it.
+hm_flow st src dst sctx dctx =
+  let s = hm_prune st src
+  let d = hm_prune st dst
+  let dc = hm_ctx st dst dctx
+  let sc = hm_ctx st src sctx
+  let hs = head s
+  let hd = head d
+  if hd == "dyn" then false
+  else if hd == "tv" then false
+  else if hs == "tv" then false
+  else if hs == "dyn" then hm_bad_at st dc
+  else if hs != hd then hm_bad_at st dc
+  else if hs == "list" then hm_flow st (head (tail s)) (head (tail d)) sc dc
+  else if hs == "arr" then
+    let fwd = hm_flow st (head (tail s)) (head (tail d)) sc dc
+    let back = hm_flow st (head (tail d)) (head (tail s)) dc sc
+    if fwd then true else back
+  else if hs == "tup" then (if length (head (tail s)) != length (head (tail d)) then hm_bad_at st dc else hm_flow_l st (head (tail s)) (head (tail d)) sc dc)
+  else if hs == "fn" then
+    let sp = head (tail s)
+    let dp = head (tail d)
+    if length sp != length dp then hm_bad_at st dc
+    else
+      let pb = hm_flow_back st dp sp dc sc
+      let rb = hm_flow st (head (tail (tail s))) (head (tail (tail d))) sc dc
+      if pb then true else rb
+  else if hs == "adt" then (if head (tail s) == head (tail d) then false else hm_bad_at st dc)
+  else false
+hm_ctx st t ctx = let os = hm_chain_owners st t [] in if os == [] then ctx else os
+hm_flow_l st ss ds sc dc =
+  if ss == [] then false else if ds == [] then false
+  else let a = hm_flow st (head ss) (head ds) sc dc in let b = hm_flow_l st (tail ss) (tail ds) sc dc in if a then true else b
+-- the slot's parameter values (srcs) flow into the function's own parameters (dsts); a bad
+-- flow no owner took forces the function value's own owners
+hm_flow_back st srcs dsts sc dc =
+  if srcs == [] then false else if dsts == [] then false
+  else
+    let a = if hm_flow st (head srcs) (head dsts) sc dc then hm_bad_at st dc else false
+    let b = hm_flow_back st (tail srcs) (tail dsts) sc dc
+    if a then true else b
+-- force the owners os; true if there are none (the caller must force the slot as a whole)
+hm_bad_at st os = if os == [] then true else let _ = hm_owner_events st os in false
+hm_force_owners st t =
+  let os = hm_chain_owners st t []
+  if os == [] then arr_set st 10 (arr_get st 10 + 1) else hm_owner_events st os
+hm_chain_owners st t acc =
+  if head t == "tv" then
+    let id = head (tail t)
+    let acc2 = append (hm_owners st id) acc
+    let b = arr_get st id
+    if b == 0 then acc2 else hm_chain_owners st b acc2
+  else acc
+hm_owner_events st os =
+  if os == [] then 0
+  else
+    let c = head os
+    let _ = if c > 0 then (if c % 4 == 1 then hm_event st ["l", c / 4] else hm_event st ["s", c / 4]) else let q = 0 - c - 1 in hm_event st ["p", q / 64, q % 64]
+    hm_owner_events st (tail os)
+
+-- after a round: every recorded argument flow and every body-into-result flow
+hm_check_flows st fls =
+  if fls == [] then 0
+  else
+    let f = head fls
+    let ck = head f
+    let cf = hm_nth f 1
+    let k = hm_nth f 2
+    let i = hm_nth f 3
+    let bad = hm_flow st (hm_nth f 5) (hm_nth f 4) [] []
+    let _ = if bad == false then 0
+            else if ck == "u" then hm_event st ["p", cf, i]
+            else if ck == "k" then 0
+            else hm_event st ["s", k]
+    hm_check_flows st (tail fls)
+hm_check_bodies st recs =
+  if recs == [] then 0
+  else
+    let r = head recs
+    let _ = if hm_flow st (hm_nth r 2) (hm_nth r 1) [] [] then hm_event st ["r", head r] else 0
+    hm_check_bodies st (tail recs)
+
+-- fold the round's events into the forces; returns the new forces (count = forced items)
+hm_apply_events st fc evs =
+  if evs == [] then fc
+  else
+    let ev = head evs
+    let kind = head ev
+    let fps = head fc
+    let frs = hm_fc_nth fc 1
+    let fss = hm_fc_nth fc 2
+    let fls = hm_fc_nth fc 3
+    let n = hm_fc_nth fc 4
+    let added = if kind == "p" then hm_add_param fps (hm_nth ev 1) (hm_nth ev 2)
+                else if kind == "v" then hm_add_param fps (hm_nth ev 1) (0 - 1)
+                else if kind == "a" then (let a1 = hm_add_param fps (hm_nth ev 1) (0 - 1) in let a2 = hm_add_flag frs (hm_nth ev 1) in a1 + a2)
+                else if kind == "r" then hm_add_flag frs (hm_nth ev 1)
+                else if kind == "s" then hm_add_flag fss (hm_nth ev 1)
+                else if kind == "l" then hm_add_flag fls (hm_nth ev 1)
+                else 0
+    hm_apply_events st [fps, frs, fss, fls, n + added, hm_fc_nth fc 5, hm_fc_nth fc 6] (tail evs)
+hm_add_param fps fi i =
+  if fi < 0 then 0
+  else
+    let m = arr_get fps fi
+    if hm_has (0 - 1) m then 0
+    else if i < 0 then let _ = arr_set fps fi [0 - 1] in 1
+    else if hm_has i m then 0
+    else let _ = arr_set fps fi (cons i m) in 1
+hm_add_flag a i = if i < 0 then 0 else if arr_get a i == 1 then 0 else let _ = arr_set a i 1 in 1
+
+-- Rounds until nothing new is forced. Returns [st, genv, rounds, converged]. The arrays of
+-- the forces are sized after round one (the traversal, and so every site and lambda number,
+-- is the same in every round).
+hm_solve decls =
+  let st = hm_new_store 0
+  let pre = hm_prepare st decls
+  let nf = hm_nth pre 1
+  let genv0 = hm_round st pre
+  let fc = [arr_new (nf + 1) [], arr_new (nf + 1) 0, arr_new (arr_get st 7 + 2) 0, arr_new (arr_get st 8 + 2) 0, 0, arr_get st 7 + 2, arr_get st 8 + 2]
+  hm_solve_go st pre genv0 fc 1
+hm_solve_go st pre genv fc r =
+  let _ = hm_check_flows st (arr_get st 4)
+  let _ = hm_check_bodies st (arr_get st 11)
+  let fc2 = hm_apply_events st fc (arr_get st 6)
+  if hm_fc_nth fc2 4 == hm_fc_nth fc 4 then [st, genv, r, true]
+  else if r >= hm_max_rounds then [st, genv, r, false]
+  else
+    let _ = arr_set st 9 fc2
+    let genv2 = hm_round st pre
+    hm_solve_go st pre genv2 fc2 (r + 1)
+hm_max_rounds = 60
+
+-- ── what codegen reads ──
+-- A kind per parameter and result: 1 int (or bool), 2 float, 3 a heap value, 0 anything;
+-- -1 nothing known (a polymorphic parameter no call site reaches).
+hm_kind_h h =
+  if h == "int" then 1 else if h == "bool" then 1 else if h == "float" then 2
+  else if h == "str" then 3 else if h == "list" then 3 else if h == "tup" then 3 else if h == "adt" then 3
+  else if h == "arr" then 3 else if h == "farr" then 3 else if h == "fn" then 3
+  else 0
+hm_kjoin a b = if a == (0 - 1) then b else if b == (0 - 1) then a else if a == b then a else 0
+
+-- sa[fi * 32 + i]: parameter i of user fn fi. A parameter with a concrete type takes its
+-- kind; a polymorphic one takes the join of what its direct call sites pass, where an
+-- argument whose type is the calling function's own polymorphic parameter j contributes
+-- that parameter's kind (monovariant: one compiled body serves every call).
+hm_param_kinds st nf =
+  let sa = arr_new (nf * 32 + 32) (0 - 1)
+  let pa = arr_new (nf * 32 + 32) 0
+  let _ = hm_pk_init st sa pa 0 nf
+  let _ = hm_pk_fix st sa pa (arr_get st 4) 0
+  sa
+hm_pk_init st sa pa fi nf =
+  if fi >= nf then 0
+  else
+    let ft = hm_prune st (arr_get (arr_get st 15) fi)
+    let _ = if head ft == "fn" then hm_pk_params st sa pa fi (head (tail ft)) 0 else 0
+    hm_pk_init st sa pa (fi + 1) nf
+hm_pk_params st sa pa fi ps i =
+  if ps == [] then 0
+  else if i >= 32 then 0
+  else
+    let p = hm_prune st (head ps)
+    let _ = if head p == "tv" then arr_set pa (fi * 32 + i) 1 else arr_set sa (fi * 32 + i) (hm_kind_h (head p))
+    hm_pk_params st sa pa fi (tail ps) (i + 1)
+hm_pk_fix st sa pa fls n =
+  let ch = hm_pk_pass st sa pa fls 0
+  if ch == 0 then 0 else if n >= 30 then 0 else hm_pk_fix st sa pa fls (n + 1)
+hm_pk_pass st sa pa fls ch =
+  if fls == [] then ch
+  else
+    let f = head fls
+    let cf = hm_nth f 1
+    let i = hm_nth f 3
+    let ch2 = if head f != "u" then ch
+              else if i >= 32 then ch
+              else if arr_get pa (cf * 32 + i) != 1 then ch
+              else
+                let slot = cf * 32 + i
+                let cur = arr_get sa slot
+                let nv = hm_kjoin cur (hm_kind_at st sa (hm_nth f 5) (hm_nth f 6))
+                if nv == cur then ch else let _ = arr_set sa slot nv in ch + 1
+    hm_pk_pass st sa pa (tail fls) ch2
+hm_kind_at st sa t encl =
+  let x = hm_prune st t
+  if head x != "tv" then hm_kind_h (head x)
+  else if encl < 0 then 0
+  else
+    let j = hm_param_index st encl x
+    if j < 0 then 0 else if j >= 32 then 0 else arr_get sa (encl * 32 + j)
+-- the index of fi's parameter whose type is the variable x, or -1
+hm_param_index st fi x =
+  let ft = hm_prune st (arr_get (arr_get st 15) fi)
+  if head ft != "fn" then 0 - 1 else hm_pi_go st (head (tail ft)) (head (tail x)) 0
+hm_pi_go st ps id i =
+  if ps == [] then 0 - 1
+  else
+    let p = hm_prune st (head ps)
+    if head p == "tv" then (if head (tail p) == id then i else hm_pi_go st (tail ps) id (i + 1))
+    else hm_pi_go st (tail ps) id (i + 1)
+
+-- a result: its concrete kind, or, when it is a parameter's variable, that parameter's kind
+hm_result_kind st sa fi =
+  let ft = hm_prune st (arr_get (arr_get st 15) fi)
+  if head ft != "fn" then 0
+  else
+    let r = hm_prune st (head (tail (tail ft)))
+    if head r != "tv" then hm_kind_h (head r)
+    else
+      let j = hm_param_index st fi r
+      if j < 0 then 0 else if j >= 32 then 0 else let k = arr_get sa (fi * 32 + j) in if k < 0 then 0 else k
+
+-- The markers get_arities hands codegen: __argf_<fn>_<i> = the kind of parameter i (2 =
+-- arrives as raw float bits, 1 = an int, 3 = a heap value, 0 = anything),
+-- __float_ret_<fn> for a result that leaves as raw float bits, and __float_const_<fn> when
+-- that fn has no parameters (naming it evaluates it). When the rounds did not
+-- settle, every parameter is 0 and no result is raw (the generic representation is always
+-- correct).
+hm_codegen_markers decls =
+  let sol = hm_solve decls
+  let st = head sol
+  let nf = arr_get st 14
+  let fa = arr_get st 13
+  if hm_nth sol 3 then
+    let sa = hm_param_kinds st nf
+    hm_marks st sa fa 0 nf []
+  else hm_generic_marks fa 0 nf []
+hm_marks st sa fa fi nf acc =
+  if fi >= nf then acc
+  else
+    let d = arr_get fa fi
+    let nm = head (tail d)
+    let acc1 = hm_param_marks sa nm fi (length (head (tail (tail d)))) 0 acc
+    let fr = hm_result_kind st sa fi == 2
+    let acc2 = if fr then cons (cat ["__float_ret_", nm], 1) acc1 else acc1
+    -- a float constant (no parameters): naming it IS the float, not a closure
+    let acc3 = if fr && head (tail (tail d)) == [] then cons (cat ["__float_const_", nm], 1) acc2 else acc2
+    hm_marks st sa fa (fi + 1) nf acc3
+hm_param_marks sa nm fi np i acc =
+  if i >= np then acc
+  else if i >= 32 then acc
+  else
+    let k = arr_get sa (fi * 32 + i)
+    hm_param_marks sa nm fi np (i + 1) (if k < 0 then acc else cons (argf_key nm i, k) acc)
+hm_generic_marks fa fi nf acc =
+  if fi >= nf then acc
+  else
+    let d = arr_get fa fi
+    hm_generic_marks fa (fi + 1) nf (hm_zero_marks (head (tail d)) 0 (length (head (tail (tail d)))) acc)
+hm_zero_marks nm i np acc = if i >= np then acc else hm_zero_marks nm (i + 1) np (cons (argf_key nm i, 0) acc)
+
+-- (name, result kind) for every user fn, in declaration order (`rail infer`, tests)
+hm_result_kinds decls =
+  let sol = hm_solve decls
+  let st = head sol
+  let nf = arr_get st 14
+  let fa = arr_get st 13
+  let sa = hm_param_kinds st nf
+  hm_rk_go st sa fa 0 nf (hm_nth sol 3)
+hm_rk_go st sa fa fi nf ok =
+  if fi >= nf then []
+  else cons (head (tail (arr_get fa fi)), if ok then hm_result_kind st sa fi else 0) (hm_rk_go st sa fa (fi + 1) nf ok)
 
 -- ── the report ──
 hm_sig st sch = let t = head (tail (tail sch)) in hm_show_n st t (head (tail sch))
@@ -661,36 +1112,34 @@ hm_static_h st x h =
   else true
 hm_static_l st ts = if ts == [] then true else if hm_static st (head ts) then hm_static_l st (tail ts) else false
 
--- codegen's guesses for fn nm vs the proven types: (param or result, proven, guessed)
-hm_disagree st nm ft ar =
-  let x = hm_prune st ft
-  let ps = head (tail x)
-  let pd = hm_dis_params st nm ps ar 0 []
-  let rt = head (hm_prune st (head (tail (tail x))))
-  let gf = efind (cat ["__float_ret_", nm]) ar != (0 - 1)
-  if rt == "float" then (if gf then pd else cons (cat [nm, " result: proven float, codegen does not treat it as float"]) pd)
-  else if rt == "int" then (if gf then cons (cat [nm, " result: proven int, codegen treats it as float"]) pd else pd)
-  else pd
-hm_dis_params st nm ps ar i acc =
-  if ps == [] then acc
-  else
-    let h = head (hm_prune st (head ps))
-    let slot = efind (argf_key nm i) ar
-    let acc2 = if h == "float" then (if slot == 1 then cons (cat [nm, " param ", show i, ": proven float, codegen reads it as int"]) acc else acc)
-               else if h == "int" then (if slot == 2 then cons (cat [nm, " param ", show i, ": proven int, codegen reads it as float"]) acc else acc)
-               else if slot == 2 then (if h == "tv" then acc else cons (cat [nm, " param ", show i, ": proven ", h, ", codegen reads it as float"]) acc)
-               else acc
-    hm_dis_params st nm (tail ps) ar (i + 1) acc2
-
-hm_report st fns genv ar k nstatic dis =
-  if fns == [] then (k, nstatic, dis)
+hm_report st fns genv k nstatic =
+  if fns == [] then (k, nstatic)
   else
     let nm = head (tail (head fns))
     let sch = hm_lookup nm genv
     let t = head (tail (tail sch))
     let _ = print (cat ["  ", nm, " : ", hm_sig st sch])
     let st2 = if hm_static st t then nstatic + 1 else nstatic
-    hm_report st (tail fns) genv ar (k + 1) st2 (append (hm_disagree st nm t ar) dis)
+    hm_report st (tail fns) genv (k + 1) st2
+
+-- how many parameters and results codegen gets a static representation for
+hm_codegen_summary decls =
+  let sol = hm_solve decls
+  let st = head sol
+  let nf = arr_get st 14
+  if hm_nth sol 3 == false then cat ["codegen: the rounds did not settle after ", show (hm_nth sol 2), "; every parameter and result is generic"]
+  else
+    let sa = hm_param_kinds st nf
+    let (np, ns) = hm_count_params (arr_get st 13) sa 0 nf 0 0
+    let (nr, nrs) = hm_count_results st sa 0 nf 0 0
+    cat ["codegen: settled after ", show (hm_nth sol 2), " round", if hm_nth sol 2 == 1 then "" else "s", "; ", show ns, " of ", show np, " parameters and ", show nrs, " of ", show nr, " results have a static representation"]
+hm_count_params fa sa fi nf np ns =
+  if fi >= nf then (np, ns)
+  else
+    let n = length (head (tail (tail (arr_get fa fi))))
+    hm_count_params fa sa (fi + 1) nf (np + n) (ns + hm_count_static sa fi 0 n 0)
+hm_count_static sa fi i n acc = if i >= n then acc else if i >= 32 then acc else hm_count_static sa fi (i + 1) n (if arr_get sa (fi * 32 + i) > 0 then acc + 1 else acc)
+hm_count_results st sa fi nf nr nrs = if fi >= nf then (nr, nrs) else hm_count_results st sa (fi + 1) nf (nr + 1) (if hm_result_kind st sa fi > 0 then nrs + 1 else nrs)
 
 types_file path =
   let src = read_file path
@@ -699,15 +1148,10 @@ types_file path =
   let genv = hm_program st decls
   let fns = hm_fns decls
   let _ = print (cat ["--- ", path, " ---"])
-  let ar = get_arities (opt_decls decls)
-  let (k, ns, dis) = hm_report st fns genv ar 0 0 []
+  let (k, ns) = hm_report st fns genv 0 0
   let errs = reverse (arr_get st 1)
   let _ = print (cat ["functions: ", show k, ", fully static: ", show ns, ", type errors: ", show (length errs), ", heterogeneous literals: ", show (arr_get st 3)])
   let _ = hm_print_all "error: " errs
-  -- a disagreement is only a claim about the program when the program type-checks
-  let _ = if errs == [] then
-            let _ = print (cat ["codegen disagreements: ", show (length dis)])
-            hm_print_all "  " (reverse dis)
-          else print (cat ["codegen disagreements: not compared (", show (length errs), " type errors)"])
+  let _ = print (hm_codegen_summary (opt_decls (inject_auth_fns (inject_grad_fns decls))))
   if errs == [] then 0 else 1
 hm_print_all pre xs = if xs == [] then 0 else let _ = print (cat [pre, head xs]) in hm_print_all pre (tail xs)

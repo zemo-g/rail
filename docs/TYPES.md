@@ -1,22 +1,31 @@
 # Types in Rail
 
 Rail's code generator decides how to represent every value: a tagged int, a heap pointer,
-or a raw double in a register. Until now it decided by **guessing**, with more than a thousand lines of
-heuristic passes in `tools/compile.rail` (`__argf_`, `__float_ret_`, `hofpos`, the `rmap`
-fixpoint). Many entries in `tools/fuzz/known/` are places where a guess was wrong and the
-program printed a wrong answer without an error.
+or a raw double in a register. Until 2026-09-22 it decided by **guessing**, with more than
+a thousand lines of call-site heuristics in `tools/compile.rail` (`argf_scan`, `hofpos`,
+the `rmap` fixpoint). Many entries in `tools/fuzz/known/` are places where a guess was wrong
+and the program printed a wrong answer without an error.
 
-`tools/types.rail` is the replacement's first stage: Hindley-Milner type inference with a
-`dyn` escape hatch. No annotations are needed.
+Those passes are gone. `tools/types.rail` infers types (Hindley-Milner with a `dyn` escape
+hatch, no annotations needed), and codegen reads its representation decisions from them.
 
 ```
 ./rail_native types program.rail
 ```
 
-prints a type for every top-level function, every place the program cannot have one, and,
-when the program type-checks, every place the proven types disagree with codegen's guesses.
-**Stage 0 is observe-only: codegen does not read these types yet**, so compiled binaries are
-unchanged.
+prints a type for every top-level function, every place the program cannot have one, and a
+line saying how many parameters and results codegen gives a static representation:
+
+```
+--- examples/quicksort.rail ---
+  showNum : a -> str
+  filterLeq : ([a], a) -> [a]
+  filterGt : ([a], a) -> [a]
+  qsort : [a] -> [a]
+  main : () -> int
+functions: 5, fully static: 5, type errors: 0, heterogeneous literals: 0
+codegen: settled after 2 rounds; 3 of 6 parameters and 5 of 5 results have a static representation
+```
 
 ## The type language
 
@@ -50,40 +59,93 @@ the checker says "this is only known at run time":
 - **ADT fields and foreign arguments are `dyn`** (neither declares a type), except that a
   foreign function returning `float` takes floats, because codegen converts every argument
   of such a call to a double.
-- **`arr_new n 0` says nothing about the element type.** `0` is Rail's null; the array's
-  writes decide.
+- **An array's element type is a variable that a store can widen.** A read returns that
+  variable itself, not a copy of what it holds, so a value read before a store of another
+  kind follows the array to `dyn`. An array handed to a function is checked both ways (the
+  callee may store into it), and one that reaches `dyn` can be written with anything, so its
+  element type becomes `dyn`. `arr_new n 0` says nothing about the element type (`0` is Rail's
+  null).
 - **An int promotes into a float context.** `0.0 +. n` with `n` an int is legal Rail, so a float
   operand never forces the variable next to it to be float (`half x = x /. 2.0` is
   `a -> float`). An int literal does pin a variable to int (`n <= 1`), which keeps counters
-  precise (`fact : int -> int`).
+  precise (`fact : int -> int`). A float operand makes any arithmetic a float whatever the other
+  side holds (the runtime reads a string as 0.0); an int beside `dyn` may be a float, so it is
+  `dyn`.
 
-## What stage 0 found (2026-09-22, every tracked `.rail` file)
+## How codegen uses the types
 
-- **297 of 485 files type-check with no errors.** Across them, 89% of function signatures
-  (53,112 of 59,543, counting imported modules once per importer) are fully static.
-- **The compiler itself** (`tools/compile.rail`, 1,339 functions, about 18 s with
-  `RAIL_ARENA_MB=6000`): 1,250 signatures are fully static, and of its 1,685 type errors,
-  1,533 are one idiom. The AST is lists like `["O", op, left, right]` that mix a string tag
-  with sub-trees, so a function that reads `head node == "O"` and later passes an element on
-  as a node cannot have a type. That code is dynamically typed as written; typing it means
-  giving the AST an ADT.
+Each parameter gets a **kind**: float (it arrives as raw float bits), int, a heap value, or
+anything. A parameter whose type is concrete takes that type's kind. A polymorphic one
+(`square x = x * x : a -> a`) takes the join of what its direct call sites pass, where an
+argument whose type is the calling function's own polymorphic parameter contributes that
+parameter's kind: one compiled body serves every call. A result is raw float bits when its
+type is float, or when it is a parameter's variable and that parameter's kind is float.
+
+A claim codegen acts on must hold for every value that can reach it, because the garbage
+collector skips a slot it believes holds an int and a raw-float parameter reads its bits as a
+double. So inference runs in **rounds**. After each round every flow of a value into a typed
+slot is checked: arguments into parameters, a function's body into its result, and, inside a
+function type, the other way round (whoever holds a closure calls it with its own values).
+Where `dyn`, or a clashing type, reaches a slot that claims a type, the slot's owner is forced
+to `dyn` and the program is inferred again:
+
+| what reaches the slot | what is forced |
+|---|---|
+| a user fn's parameter | that parameter |
+| a lambda's parameter | that lambda's parameters |
+| a builtin or closure call whose result depends on its arguments | that call's result |
+| a function's result, from its body | that result |
+| a user fn named as a value (it is called with generic arguments) | all its parameters |
+| an array made by `arr_new`, from a callee that stores into it | that array |
+
+Rounds stop when one forces nothing new. When they do not settle (a cap of 60), every
+parameter is generic and no result is raw: the generic representation is always correct.
+Type errors are handled by the same check, since a clash is a bad flow.
+
+## What changed when codegen moved to the types (2026-09-22)
+
+- **The self-compile takes about 5 s instead of 20.** The call-site passes cost 16.6 s of it;
+  inference with its rounds takes 1.6 s on the compiler's own source (11 rounds).
+- **`float_arr_map` with a named function works.** Naming a float-returning function was read as
+  naming a float constant, so the closure pointer was boxed as a double before the call (a bus
+  error, t219). Float constants now carry their own marker.
+- **Results the types prove float leave as raw bits** even when the body's code does not produce
+  them raw (`head` of a `[float]`); the MHD kernel's `mk_pressure`, which its flux functions
+  call per cell, is one.
+- **Where `dyn` reaches a parameter, it stays generic.** The call-site passes called `lr * wd`
+  an int (arithmetic on two unknowns defaulted to int) and `x - 1` on a value out of an
+  untyped list an int; the types say `dyn`, which is what those values are.
+- **The compiled output is unchanged in behaviour.** 104 runnable programs in the tree (every
+  file whose code and imports stay inside the process) print the same with both compilers;
+  the suite, the known-miscompile corpus and the semantic fuzzer's CI seed pass; on four wider
+  fuzzer seeds both compilers fail the same cases (a lambda applied straight to a float, a
+  separate bug). 148 of the 474 files that compile produce byte-identical assembly.
+
+## What the types find (2026-09-22, every tracked `.rail` file)
+
+- **301 of 487 files type-check with no errors.** Across all files, 87.7% of function signatures
+  (53,524 of 61,058, counting imported modules once per importer) are fully static. (The
+  stage-0 figure, 89%, was also counted across all files.)
+- **Codegen gives a static representation to 47% of parameters and 86% of results** across
+  the tree. 209 files settle in one round; the most any file needs is 18.
+- **The compiler itself** (`tools/compile.rail`, 1,349 functions): 1,227 signatures are fully
+  static, and it has 1,720 type errors (stage 0 traced 91% of its 1,685 to one idiom). The AST is lists like
+  `["O", op, left, right]` that mix a string tag with sub-trees, so a function that reads
+  `head node == "O"` and later passes an element on as a node cannot have a type. That code is
+  dynamically typed as written; typing it means giving the AST an ADT. Codegen settles after
+  11 rounds with 1,161 of 3,106 parameters static.
 - The other recurring idiom is **an array used as a record** (slot 0 an array, slot 2 an
   int), read at different types in one function.
-- **In every program that type-checks, codegen's parameter guesses agree with the proven
-  types.** The only disagreements left are 31 functions whose results are proven float but
-  which codegen returns boxed: correct, slower (the MHD kernel's `mk_pressure`, called per
-  cell by its flux functions, is one).
 
 ## What comes next
 
-Each stage lands behind the suite, the known-miscompile corpus, the semantic fuzzer and the
-byte-identical self-compile, and changes what compiles only when it is proposed as such:
-
-1. **Check.** Type errors in code that type-checks everywhere else become compile errors instead
+1. **Typed ADT fields.** `| Num int | Add Expr Expr` declares its fields' types, and a match
+   binds them at those types instead of `dyn`. Much of the `dyn` above is fields.
+2. **Type the compiler.** The AST becomes an ADT, and `rail types tools/compile.rail` reaches
+   zero errors.
+3. **Check.** Type errors in code that type-checks everywhere else become compile errors instead
    of wrong answers or segfaults. Code that relies on dynamic idioms stays accepted until it
    opts in.
-2. **Codegen from types.** Float and int representation decided by proven types, removing the
-   heuristic passes one at a time; the 31 boxed float returns become raw.
-3. **What types make possible.** Structural `==` on lists, tuples and ADTs (today it compares
+4. **What types make possible.** Structural `==` on lists, tuples and ADTs (today it compares
    tag bytes), constructors as function values (today a crash), partial application, `show`
-   on anything, and error messages that name types.
+   on anything, float parameters through closures, and error messages that name types.

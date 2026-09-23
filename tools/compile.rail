@@ -933,7 +933,7 @@ emit_load_int_reg r v =
 -- Authoritative float operators (Option A). The lexer emits a distinct token
 -- for the dotted forms `+. -. *. /. <. >.` so float-ness is carried by the op
 -- itself rather than inferred from operands. Signal-consumers (is_float/is_int/
--- returns_float/infer_ty/let_binding_ty/O-node codegen) test the dotted form to
+-- tools/types.rail/O-node codegen) test the dotted form to
 -- FORCE the float path; structure-consumers (parser AST walkers, AD desugar,
 -- used_in_arith) call op_base to match the underlying op. Only the 6 spellings
 -- actually used in the codebase are recognized (no <=. >=. ==. !=.).
@@ -997,44 +997,20 @@ is_int node env =
     else efind (cat ["__rt_", fname]) env != (0 - 1)
   else false
 
--- Track B: precise type of a let-bound RHS, looked up from the per-function
--- env that holds inject_fret_markers' __ret_<fname> entries.
--- Returns 0 (UNKNOWN), 1 (INT), 2 (FLOAT), or 3 (HEAP). Only patterns we can
--- decide from local syntax + global return-type map; conservative otherwise.
-let_binding_ty node env =
-  let tg = head node
-  if tg == "I" then 1
-  else if tg == "FL" then 2
-  else if tg == "B" then 1
-  else if tg == "S" then 3
-  else if tg == "NULL" then 3
-  else if tg == "L" then 3
-  else if tg == "T" then 3
-  else if tg == "F" then 3
-  else if tg == "O" then
-    let op = head (tail node)
-    if op == "+." || op == "-." || op == "*." || op == "/." then 2 else 0
-  else if tg == "A" then
-    let (fname, _) = flat node
-    if fname == "_expr" then 0
-    else
-      let r = efind (cat ["__ret_", fname]) env
-      if r == (0 - 1) then 0 else r
-  else 0
-
 is_float node env =
   let tg = head node
   if tg == "FL" then true
   else if tg == "V" then
     -- a local float (param/let `__float_<name>`) OR a reference to a top-level float CONSTANT
-    -- (a 0-arg float-returning binding, `__float_ret_<name>`). The global marker is consulted
+    -- (a 0-arg float-returning binding, `__float_const_<name>`). The global marker is consulted
     -- ONLY when `name` is not a local (efind == -1): a local int must never inherit a
     -- same-named global's floatness -- `gv = 2.5` + `addone gv = gv + 1` typed the local gv
-    -- float and SIGSEGV'd (the 811d7f2 shadowing guard, landed 2026-07-12; the unguarded
-    -- __float_ret_ consult came in 4f689b7).
+    -- float and SIGSEGV'd (the 811d7f2 shadowing guard, landed 2026-07-12). A float-returning
+    -- fn WITH parameters named as a value is a closure, not a float (until 2026-09-22 it read
+    -- `__float_ret_`, and `float_arr_map dbl a` boxed the closure pointer as a double).
     let vnm = head (tail node)
     if efind (cat ["__float_", vnm]) env != (0 - 1) then true
-    else if efind vnm env == (0 - 1) then efind (cat ["__float_ret_", vnm]) env != (0 - 1)
+    else if efind vnm env == (0 - 1) then efind (cat ["__float_const_", vnm]) env != (0 - 1)
     else false
   else if tg == "O" then
     let op = head (tail node)
@@ -1554,7 +1530,7 @@ cg node env ar lc sl tp fs =
         let call = if tp then cat [rr, "    ldp x29, x30, [sp]\n    add sp, sp, #", fs, "\n    b _", nm, "\n"] else cat ["    bl _", nm, "\n"]
         (call, lc, sl)
       else if ar_val != (0 - 1) then
-        let entry = if efind (cat ["__float_ret_", nm]) ar != (0 - 1) && efind (cat ["__hofpos_", nm]) ar == (0 - 1) then cat ["_", nm, "__gen"] else cat ["_", nm]
+        let entry = if efind (cat ["__float_ret_", nm]) ar != (0 - 1) then cat ["_", nm, "__gen"] else cat ["_", nm]
         (cat ["    mov x0, #24\n    bl _rail_alloc\n    mov x1, #4\n    str x1, [x0]\n    adrp x1, ", entry, "@PAGE\n    add x1, x1, ", entry, "@PAGEOFF\n    str x1, [x0, #8]\n    mov x1, #0\n    str x1, [x0, #16]\n"], lc, sl)
       else (cat ["    ; ERROR undefined: ", nm, "\n    bl _RAIL_UNDEFINED_IDENT_", nm, "\n"], lc, sl)
     else if off < 0 then (cat ["    lsl x0, x", show (0 - off), ", #1\n    orr x0, x0, #1\n"], lc, sl)
@@ -1725,10 +1701,6 @@ cg2 node env ar lc sl tg tp fs =
     let env2 = if is_int vl env then cons (cat ["__int_", nm], 1) env2 else env2
     let vl_is_float = is_float vl env
     let env2 = if vl_is_float then cons (cat ["__float_", nm], 1) env2 else env2
-    -- Track B: tag the binding with its inferred precise type for the
-    -- precise-GC stack-slot map. 0 = UNKNOWN (skip), 1=INT, 2=FLOAT, 3=HEAP.
-    let bind_ty = let_binding_ty vl env
-    let env2 = if bind_ty != 0 then cons (cat ["__ty_", nm], bind_ty) env2 else env2
     let (ba, lc2, sl2) = cg bd env2 ar lc1 (sl + 8) tp fs
     (cat [va, "    str x0, [x29, #", show sl, "]\n", ba], lc2, sl2)
   else if tg == "L" then
@@ -1782,13 +1754,10 @@ cg2 node env ar lc sl tg tp fs =
     let albl = cat [".Lafter_lam_", show lc]
     let all_ps = append params caps
     -- A captured float local is stored raw (push_captured) and read raw: the
-    -- lambda env inherits its mark. Params are generic unless this lambda sits
-    -- in a float-applying HOF position (`__lam_raw`, see cg_call_arg), where
-    -- its leading params arrive raw and its result must leave raw.
-    let lam_raw = efind "__lam_raw" env
-    let lam_env0 = inherit_float_marks caps env (mk_env all_ps 16)
-    let lam_env = if lam_raw > 0 then mark_lead_float params lam_raw lam_env0 else lam_env0
-    let lam_f = if pf_on ar == false then false else if lam_raw > 0 then false else is_float inner_body lam_env
+    -- lambda env inherits its mark. Params are generic (a closure call passes
+    -- boxed floats), and a float result leaves boxed.
+    let lam_env = inherit_float_marks caps env (mk_env all_ps 16)
+    let lam_f = if pf_on ar == false then false else is_float inner_body lam_env
     let lam_first_sl = 16 + 8 * length all_ps
     let lam_final_sl = max_sl inner_body lam_first_sl
     let lam_raw_fs = if lam_final_sl < 48 then 48 else lam_final_sl
@@ -1915,7 +1884,7 @@ cg_push_args args env ar lc sl fs =
 -- A statically-typed float (a let or param the compiler has proved float, a
 -- float-returning call, a dotted op) is raw binary64 bits in x0. A GENERIC
 -- location (a tuple, list or ADT field, a closure-call argument, a parameter
--- without an all-sites float proof, a match result) holds only tagged ints and
+-- whose type is not float, a match result) holds only tagged ints and
 -- heap pointers, so a raw float crossing into one is boxed as the tag-6 object
 -- the generic runtime already reads, and a generic value read as a float goes
 -- through _rail_fval. Before this, an extracted tuple element reached
@@ -1938,16 +1907,12 @@ cg_push_args_boxed args env ar lc sl fs =
     let (rest, lc2, sl2) = cg_push_args_boxed (tail args) env ar lc1 sl1 fs
     (cat [aa, "    str x0, [sp, #-16]!\n", rest], lc2, sl2)
 
--- Direct call to a user fn: argument i arrives RAW when the callee's slot i is
--- proven float at every site (the callee reads it raw) and generic otherwise.
--- A lambda written straight into a float-applying HOF position keeps the raw
--- convention its callee expects (`__lam_raw` = leading float params).
+-- Direct call to a user fn: argument i arrives RAW when the callee's parameter i is
+-- a float (the callee reads it raw) and generic otherwise.
 cg_call_arg fname i node env ar lc sl fs =
   if pf_on ar == false then cg node env ar lc sl false fs
   else
-  let m = efind (hoff_key fname i) ar
-  let env2 = if head node == "F" && m > 0 then cons ("__lam_raw", m) env else env
-  let (aa, lc1, sl1) = cg node env2 ar lc sl false fs
+  let (aa, lc1, sl1) = cg node env ar lc sl false fs
   let raw = efind (argf_key fname i) ar == 2
   let f = is_float node env
   let conv = if raw && f == false then unbox_float_asm else if raw == false && f then box_float_asm else ""
@@ -1995,10 +1960,6 @@ inherit_float_marks caps env lam_env =
     let c = head caps
     let lam_env2 = if efind (cat ["__float_", c]) env != (0 - 1) then cons (cat ["__float_", c], 1) lam_env else lam_env
     inherit_float_marks (tail caps) env lam_env2
-
-mark_lead_float params m env =
-  if m <= 0 || length params == 0 then env
-  else mark_lead_float (tail params) (m - 1) (cons (cat ["__float_", head params], 1) env)
 
 -- Closure calls (2026-09-22). A closure is [4, code, ncap, cap0, cap1, ...].
 -- The caller leaves the closure in x15 and branches through x16; the callee
@@ -2361,50 +2322,6 @@ self_temps_to_regs n =
 is_float_fn fname =
   fname == "to_float" || fname == "int_to_float" || fname == "parse_float" || fname == "float_arr_get" || fname == "fneg" || fname == "fsqrt" || fname == "fabs" || fname == "sqrt" || fname == "sin" || fname == "cos" || fname == "tanh" || fname == "exp" || fname == "log" || fname == "pow" || fname == "floor" || fname == "ceil" || fname == "atan2"
 
--- returns_float: does the RETURN expression of this AST node yield a float?
--- Unlike body_has_float, this only checks the return path, not the whole body.
--- Used to mark user functions as float-returning in the arity map.
-returns_float node fret_list penv =
-  let tg = head node
-  if tg == "FL" then true
-  else if tg == "I" || tg == "S" || tg == "B" || tg == "NULL" then false
-  else if tg == "V" then efind (cat ["__float_", head (tail node)]) penv != (0 - 1)
-  else if tg == "?" then
-    -- if/then/else: both branches must return float
-    returns_float (head (tail (tail node))) fret_list penv && returns_float (head (tail (tail (tail node)))) fret_list penv
-  else if tg == "D" || tg == "TD" then
-    -- let binding: check the body (continuation), not the value
-    returns_float (head (tail (tail (tail node)))) fret_list penv
-  else if tg == "A" then
-    -- function call: check if callee is a known float function
-    let (fname, _) = flat node
-    if is_float_fn fname then true
-    else rf_has fname fret_list
-  else if tg == "O" then
-    -- binary op: +,-,*,/ with float operand returns float; dotted arith always float
-    let op = head (tail node)
-    if op == "+." || op == "-." || op == "*." || op == "/." then true
-    else if op == "+" || op == "-" || op == "*" || op == "/" then
-      returns_float (head (tail (tail node))) fret_list penv || returns_float (head (tail (tail (tail node)))) fret_list penv
-    else false
-  else if tg == "M" then
-    -- match: all arms must return float
-    rf_all_arms (head (tail (tail node))) fret_list penv
-  else false
-
-rf_all_arms arms fret_list penv =
-  if length arms == 0 then true
-  else
-    let arm = head arms
-    let arm_body = head (tail (tail arm))
-    if returns_float arm_body fret_list penv then rf_all_arms (tail arms) fret_list penv
-    else false
-
-rf_has name lst =
-  if length lst == 0 then false
-  else if head lst == name then true
-  else rf_has name (tail lst)
-
 body_has_float node =
   let tg = head node
   if tg == "FL" then true
@@ -2528,10 +2445,9 @@ mark_int_params params body env =
 -- p is a float, p might be a tagged-int param the caller pushes.
 -- Marking p there would mismatch the caller's push convention.
 --
--- Multi-arg float user-fns (e.g. `mul2 a b = a *. b`) need either
--- whole-program analysis (every call site passes a float in arg N)
--- or per-call-site arg coercion. That's the remaining gap, see
--- memory entry feedback_rail_float_user_fn_args.md.
+-- Multi-arg float user-fns (e.g. `mul2 a b = a *. b`) get their float
+-- parameters from the types (tools/types.rail): a parameter whose type,
+-- or whose every call site, is float arrives raw (__argf_ = 2).
 
 takes_only_floats_fn fname =
   fname == "sqrt" || fname == "sin" || fname == "cos" || fname == "tanh" || fname == "exp" || fname == "log" || fname == "fabs" || fname == "floor" || fname == "ceil" || fname == "atan2" || fname == "fneg" || fname == "fsqrt" || fname == "pow"
@@ -2628,9 +2544,7 @@ mfp_pass params body env =
 
 env_grew old new = length new > length old
 
--- Copy __float_ret_ AND __ret_ entries from arity map into local env.
--- __float_ret_ feeds the existing native-float emitter; __ret_ feeds
--- cg2's let-binding type tagging (track B / precise-GC).
+-- Copy the __float_ret_ and __float_const_ entries from the arity map into the local env.
 -- The markers go BEHIND the locals (2026-09-11): every local lookup in cg
 -- used to walk past the ~2 per-fn markers of the whole program first, and
 -- a marker lookup still scans the few locals before them. Keys are disjoint
@@ -2642,7 +2556,7 @@ fret_markers_of ar =
   else
     let (k, v) = head ar
     if str_contains "__float_ret_" k then cons (k, v) (fret_markers_of (tail ar))
-    else if str_contains "__ret_" k then cons (k, v) (fret_markers_of (tail ar))
+    else if str_contains "__float_const_" k then cons (k, v) (fret_markers_of (tail ar))
     else fret_markers_of (tail ar)
 
 max_sl node sl =
@@ -2717,56 +2631,14 @@ pop_to_adt n i =
     let off = 16 + (n - 1 - i) * 8
     cat ["    ldr x1, [sp], #16\n    str x1, [x0, #", show off, "]\n", pop_to_adt n (i + 1)]
 
+-- The representation markers codegen reads (__argf_<fn>_<i>: how parameter i arrives;
+-- __float_ret_<fn>: the result leaves as raw float bits) come from the types
+-- (tools/types.rail, hm_codegen_markers).
 get_arities decls =
   let user_ar = get_arities_acc decls
-  -- Two-pass float return detection: first collect names, then re-scan with the list
-  let fret_pass1 = collect_float_ret_fns decls []
-  let fret_pass2 = collect_float_ret_fns decls fret_pass1
-  let fret_markers = mk_fret_markers fret_pass2
-  let base_ar = append fret_markers (append builtin_foreign_arities user_ar)
-  -- Cross-function return-type inference (track B). Markers consumed by
-  -- inject_ret_markers + cg2's let-binding type tagging.
-  let ret_markers = infer_return_types decls base_ar
-  let full_ar = append ret_markers base_ar
-  -- Increment A: whole-call-site float-param agreement (additive __argf_ markers).
-  -- V-series Inc1/Inc3: collect_argf_unified couples the HOF-float seed
-  -- (collect_hofpos: float_arr_map dbl, fold reduce-fns) with the call-site lub in
-  -- a two-round fixpoint so fold accumulators feed the reduce-fn float marking (#41).
-  let argf_markers = collect_argf_unified decls full_ar ret_markers
-  let ar_with_argf = append argf_markers full_ar
-  -- C4-fix: third float-return pass, now param-float-aware. A fn whose
-  -- return-expr is float ONLY because of float params (e.g. fb x y =
-  -- (x /. y) -. y) is invisible to passes 1-2 (param floatness is unknown
-  -- until __argf_ proves every call site passes floats). Re-scan with a
-  -- per-fn penv from mark_argf_params; additive (only ADDs float-ret names),
-  -- two iterations for one level of call indirection (mirrors passes 1-2).
-  let fret_pf1 = collect_float_ret_pf decls ar_with_argf fret_pass2
-  let fret_pf2 = collect_float_ret_pf decls ar_with_argf fret_pf1
-  let ar1 = append (mk_fret_markers fret_pf2) ar_with_argf
-  -- Round 2 (2026-09-07, known/float_result_compose_bare): a fn whose
-  -- float-ness comes ONLY from its call sites (`mul2 a b = a * b`, called
-  -- with literals) is proven float-returning by the C4 pass above, but the
-  -- call-site analysis that ran BEFORE C4 saw its result as int, so a
-  -- let-bound result (`let y = mul2 0.5 0.25`) fed a later call (`mse y 1.0`)
-  -- as int bits: 5.27e+36. Re-run the call-site lub now that __float_ret_
-  -- is known (infer_call_ty consults it), then re-derive float returns once
-  -- more for the consumers. Gated on floats being present, so a float-free
-  -- program (compile.rail itself) takes the identical path and stays
-  -- byte-identical.
-  let arf = if decls_have_float decls then
-    let argf2 = collect_argf_unified decls ar1 ret_markers
-    let ar2 = append argf2 ar1
-    let fret_r1 = collect_float_ret_pf decls ar2 fret_pf2
-    let fret_r2 = collect_float_ret_pf decls ar2 fret_r1
-    append (mk_fret_markers fret_r2) ar2
-  else ar1
-  -- __prog_float (2026-09-11): 1 iff the program has ANY float source (a
-  -- literal, a dotted op, a float builtin, a float-returning foreign fn).
-  -- Without one no value is ever a float, so the float representation
-  -- boundary (boxing, _rail_fval reads, branch promotion) is skipped
-  -- wholesale; it walks subtrees with allocating lookups, and compile.rail
-  -- itself is float-free. Kept at the head of the map so the lookup is O(1).
-  cons ("__prog_float", if decls_have_float decls || decls_have_foreign_float decls then 1 else 0) arf
+  let base_ar = append builtin_foreign_arities user_ar
+  let tm = hm_codegen_markers decls
+  cons ("__prog_float", if decls_have_float decls || decls_have_foreign_float decls then 1 else 0) (append tm base_ar)
 
 decls_have_foreign_float decls =
   if decls == [] then false
@@ -2779,453 +2651,10 @@ decls_have_foreign_float decls =
 -- __prog_float is the head entry of the arity map, so this is O(1).
 pf_on ar = efind "__prog_float" ar == 1
 
--- Scan function declarations: if returns_float, add name to list
-collect_float_ret_fns decls known =
-  if length decls == 0 then known
-  else
-    let d = head decls
-    let dtag = head d
-    if head d == "fn" then
-      let nm = head (tail d)
-      let bd = head (tail (tail (tail d)))
-      -- The fn may assume its own recursive call is float; every other
-      -- branch still has to be (2026-09-11: the accumulator loop
-      -- `if n == 0 then acc else go (n - 1) (acc +. x)` was never marked).
-      let rf = returns_float bd (cons nm known) []
-      if rf then collect_float_ret_fns (tail decls) (cons nm known)
-      else collect_float_ret_fns (tail decls) known
-    else collect_float_ret_fns (tail decls) known
-
--- C4-fix third pass: param-float-aware float-return detection. Builds each
--- fn's penv from __argf_ markers (same source mark_argf_params/codegen uses),
--- so a fn whose return-expr is float ONLY via float params (e.g.
--- fb x y = (x /. y) -. y) is caught. Additive: seeded with the pass-1/2 set,
--- can only ADD names. Requires the __argf_ markers, so it runs after argf.
-collect_float_ret_pf decls ar known =
-  if length decls == 0 then known
-  else
-    let d = head decls
-    if head d == "fn" then
-      let nm = head (tail d)
-      let ps = head (tail (tail d))
-      let bd = head (tail (tail (tail d)))
-      let penv = mark_argf_params ps nm ar [] 0
-      let rf = returns_float bd (cons nm known) penv
-      if rf then collect_float_ret_pf (tail decls) ar (cons nm known)
-      else collect_float_ret_pf (tail decls) ar known
-    else collect_float_ret_pf (tail decls) ar known
-
-mk_fret_markers names =
-  if length names == 0 then []
-  else cons (cat ["__float_ret_", head names], 1) (mk_fret_markers (tail names))
-
--- ────────────────────────────────────────────────────────────────────────
--- Cross-function return-type inference (track B of precise-GC plan).
--- Tags: 0 = UNKNOWN, 1 = INT, 2 = FLOAT, 3 = HEAP.
--- Output: (__ret_<fname>, tag) entries appended to the arity map. Phase 2
--- of the precise-GC plan reads these to refine stack-slot type tags so
--- function-call results aren't conservatively scanned.
--- ────────────────────────────────────────────────────────────────────────
-
-ty_lub a b =
-  if a == 0 then b
-  else if b == 0 then a
-  else if a == b then a
-  else 0
-
-infer_is_float_builtin n =
-  n == "to_float" || n == "int_to_float" || n == "float_arr_get" || n == "fneg" || n == "fsqrt" || n == "fabs" || n == "parse_float" || n == "sqrt" || n == "sin" || n == "cos" || n == "tanh" || n == "exp" || n == "log" || n == "pow" || n == "floor" || n == "ceil" || n == "atan2"
-
-infer_is_int_builtin n =
-  n == "length" || n == "str_to_int" || n == "ord" || n == "float_to_int" || n == "byte_get" || n == "arr_len" || n == "str_find" || n == "is_error" || n == "char_to_int" || n == "to_int" || n == "fcmp_lt" || n == "fcmp_eq" || n == "parse_int" || n == "mul_shr"
-
-infer_is_heap_builtin n =
-  n == "cat" || n == "join" || n == "show" || n == "show_float" || n == "show_float_exact" || n == "cons" || n == "append" || n == "reverse" || n == "map" || n == "filter" || n == "range" || n == "chars" || n == "split" || n == "str_split" || n == "str_replace" || n == "str_sub" || n == "trim" || n == "read_file" || n == "read_file_bytes" || n == "read_line" || n == "shell" || n == "arr_new" || n == "float_arr_new" || n == "err_msg" || n == "tokenize" || n == "tokenize_with_pos" || n == "char_from_int" || n == "alloc_stats_snapshot"
-
--- Decode the arity field for a fname out of the arity map.
--- Returns (0 - 1) when not found.
-infer_arity_of fname ar =
-  let v = efind fname ar
-  if v == (0 - 1) then 0 - 1
-  else if v < (0 - 99) then
-    let raw = 0 - v - 100
-    raw % 100
-  else if v >= 1000 then v % 1000
-  else v
-
--- Map a function call to a return type tag.
-infer_call_ty fname args ar rmap =
-  let n_args = length args
-  let expected = infer_arity_of fname ar
-  if expected != (0 - 1) && n_args < expected then 3
-  else if fname == "head" || fname == "arr_get" then 4
-  else if infer_is_float_builtin fname then 2
-  else if infer_is_int_builtin fname then 1
-  else if infer_is_heap_builtin fname then 3
-  else
-    let av = efind fname ar
-    if av != (0 - 1) && av < (0 - 99) then 3
-    else if av >= 1000 && av < 2000 then 1
-    else if av >= 2000 && av < 3000 then 3
-    else if av >= 3000 && av < 4000 then 2
-    else if av >= 4000 then 0
-    else if av == (0 - 1) then 0
-    else if efind (cat ["__float_ret_", fname]) ar != (0 - 1) then 2
-    else
-      let r = efind (cat ["__ret_", fname]) rmap
-      if r == (0 - 1) then 0 else r
-
--- Type of an expression node under the in-progress rmap.
-infer_ty node ar rmap =
-  let tg = head node
-  if tg == "I" then 1
-  else if tg == "FL" then 2
-  else if tg == "S" then 3
-  else if tg == "B" then 1
-  else if tg == "NULL" then 3
-  else if tg == "L" then 3
-  else if tg == "T" then 3
-  else if tg == "F" then 3
-  else if tg == "V" then
-    -- A let-local proven float (e.g. `let y = mlp 1.0 2.0`) carries a __vf_
-    -- marker threaded in by argf_scan's D/TD case; a float/int PARAM carries a
-    -- __vf_ marker threaded in by collect_argf's per-fn penv (multi-hop, #42).
-    -- 2=float, 1=int (lets concrete int params demote downstream float-marks),
-    -- absent/0=unresolved (composes as a float arg at a later call site, Inc B).
-    -- 4 = a value of unknown kind that must NOT be assumed int (a tuple or
-    -- match binding, a lambda param, a container element); 0 = unresolved
-    -- (a param not yet typed by its sites), which composes optimistically.
-    let vf = efind (cat ["__vf_", head (tail node)]) rmap
-    if vf == 2 then 2 else if vf == 1 then 1 else if vf == 3 then 3 else if vf == 4 then 4 else 0
-  else if tg == "O" then
-    let op = head (tail node)
-    if op == "<" || op == ">" || op == "<=" || op == ">=" || op == "==" || op == "!=" || op == "&&" || op == "||" || op == "<." || op == ">." then 1
-    else if op == "%" then 1
-    else if op == "+." || op == "-." || op == "*." || op == "/." then 2
-    else if op == "+" || op == "-" || op == "*" || op == "/" then
-      let l = infer_ty (head (tail (tail node))) ar rmap
-      let r = infer_ty (head (tail (tail (tail node)))) ar rmap
-      -- Arithmetic on tagged ints/floats never produces a heap pointer.
-      -- Explicit float anywhere → FLOAT; otherwise default INT (covers
-      -- unknown × unknown, int × unknown). Safe for GC: misclassifying
-      -- a float return as INT only causes the slot to be skipped (correct).
-      if l == 2 || r == 2 then 2
-      else if op == "+" && (l == 3 || r == 3) then 3
-      -- `+` is string-polymorphic: two unknowns may be two strings.
-      else if op == "+" && l == 0 && r == 0 then 0
-      else 1
-    else 0
-  else if tg == "?" then
-    let t = infer_ty (head (tail (tail node))) ar rmap
-    let e = infer_ty (head (tail (tail (tail node)))) ar rmap
-    ty_lub t e
-  else if tg == "D" then
-    -- The body is typed with the binding's own type in scope (2026-09-11:
-    -- `(let x = 0.0 -. 2.0 in x) * 0` was typed int, so the float it passed
-    -- reached a raw-register loop).
-    let t = infer_ty (head (tail (tail node))) ar rmap
-    let rmap2 = if t != 0 then cons (cat ["__vf_", head (tail node)], t) rmap else rmap
-    infer_ty (head (tail (tail (tail node)))) ar rmap2
-  -- Names bound by a tuple pattern or a match arm are kind 4 here as well as
-  -- in the call-site scan, so a fn that returns one (`unb x = match x | B v
-  -- -> v`) types as 4 and its result never reaches a raw-register param.
-  else if tg == "TD" then
-    infer_ty (head (tail (tail (tail node)))) ar (vf_mark_unknown (head (tail node)) rmap)
-  else if tg == "M" then
-    infer_arms_ty (head (tail (tail node))) ar rmap 0 false
-  else if tg == "A" then
-    let (fname, args) = flat node
-    if fname == "_expr" then 0
-    else if fname == "try" then 0
-    else infer_call_ty fname args ar rmap
-  else 0
-
--- lub of arm bodies. `seen` = whether we've folded any arm yet.
-infer_arms_ty arms ar rmap acc seen =
-  if length arms == 0 then acc
-  else
-    let arm = head arms
-    let body = head (tail (tail arm))
-    let t = infer_ty body ar (vf_mark_unknown (head (tail arm)) rmap)
-    let new_acc = if seen then ty_lub acc t else t
-    infer_arms_ty (tail arms) ar rmap new_acc true
-
--- Initial map: every user fn at UNKNOWN.
-init_rmap decls =
-  if length decls == 0 then []
-  else
-    let d = head decls
-    if head d == "fn" then
-      cons (cat ["__ret_", head (tail d)], 0) (init_rmap (tail decls))
-    else init_rmap (tail decls)
-
-rmap_set key val env =
-  if env == [] then [(key, val)]
-  else
-    let (k, v) = head env
-    if k == key then cons (key, val) (tail env)
-    else cons (k, v) (rmap_set key val (tail env))
-
--- One refinement pass: re-walk every user fn body, update its rmap entry.
-refine_rmap decls ar rmap =
-  if length decls == 0 then rmap
-  else
-    let d = head decls
-    if head d == "fn" then
-      let nm = head (tail d)
-      let bd = head (tail (tail (tail d)))
-      let new_ty = infer_ty bd ar rmap
-      let key = cat ["__ret_", nm]
-      let cur = efind key rmap
-      let merged = if cur == 0 then new_ty
-                   else if new_ty == 0 then cur
-                   else if cur == new_ty then cur
-                   else 0
-      let rmap2 = rmap_set key merged rmap
-      refine_rmap (tail decls) ar rmap2
-    else refine_rmap (tail decls) ar rmap
-
-rmap_eq a b =
-  if a == [] then true
-  else
-    let (k, v) = head a
-    if efind k b == v then rmap_eq (tail a) b
-    else false
-
--- Fixpoint driver. Caps at 8 iterations (mutual recursion settles in 2-3).
-fixpoint_rmap decls ar rmap budget =
-  if budget <= 0 then rmap
-  else
-    let r2 = refine_rmap decls ar rmap
-    if rmap_eq r2 rmap && rmap_eq rmap r2 then rmap
-    else fixpoint_rmap decls ar r2 (budget - 1)
-
-infer_return_types decls ar =
-  let r0 = init_rmap decls
-  fixpoint_rmap decls ar r0 8
-
--- ── Increment A: arithmetic-float-param fix via whole-call-site agreement ──
--- A user-fn param is float iff EVERY call site passes an unambiguously-float arg
--- (infer_ty == 2) in that position. Marker __argf_<fname>_<i> = 2 means "all sites
--- float at position i"; 1 means demoted. SOUND: complete call-site enumeration
--- (argf_scan handles every AST tag incl. lambda bodies), partial-application demotion,
--- and value-reference demotion (a fn used as a value can't have indirect calls
--- enumerated -> demote all its slots). Monotone-safe: a single int/unknown/under-applied
--- /value-ref site demotes the slot, so a legit `0.0 +. int` caller is never mismarked.
+-- The marker key for parameter i of fn fname (see get_arities).
 argf_key fname i = cat ["__argf_", fname, "_", show i]
 
--- true lub across call sites: unseen -> t; agree -> t; disagree -> 0 (unmarkable).
--- Slot ends 2 iff EVERY site is float, 1 iff every site is int, else 0.
-argf_join cur t =
-  if cur == (0 - 1) then t
-  else if cur == t then cur
-  else 0
-
--- One lookup; the map is rebuilt only when the slot actually narrows. An
--- unseen slot is consed at the head (a lookup finds it the same), an
--- unchanged one leaves the map alone. Until 2026-09-11 every observation
--- rebuilt the map up to the key (O(entries) allocation per call argument),
--- and once more sites recorded instead of abstaining that doubled the
--- self-compile's arena use and put CI's 4000 MB build into GC (168 s vs 19 s).
-argf_set fname i t acc =
-  let key = argf_key fname i
-  let cur = efind key acc
-  let nv = argf_join cur t
-  if cur == (0 - 1) then cons (key, nv) acc
-  else if nv == cur then acc
-  else rmap_set key nv acc
-
-argf_demote fname i arity acc =
-  if i >= arity then acc
-  else argf_demote fname (i + 1) arity (argf_set fname i 0 acc)
-
-argf_obs_args fname args i ar rmap acc =
-  if args == [] then acc
-  else
-    let a = head args
-    -- A bare variable's type is its __vf_ marker (one lookup, shared with the
-    -- abstain test below); anything else goes through infer_ty.
-    let vf = if head a == "V" then efind (cat ["__vf_", head (tail a)]) rmap else (0 - 1)
-    let t = if head a == "V" then (if vf == 2 then 2 else if vf == 1 then 1 else if vf == 3 then 3 else if vf == 4 then 4 else 0) else infer_ty a ar rmap
-    -- Abstain (don't record) on an UNRESOLVED arg whose type can't be known yet
-    -- WITHOUT poisoning the lub (argf_join 0 x = 0 permanently). Two shapes:
-    --  (1) a bare param V -- its float/int comes from the penv fixpoint (#42); and
-    --  (2) an application `(g ...)` of a HIGHER-ORDER param g (g not a global fn) --
-    --      its return type is the passed-in fn's, only knowable once the param is
-    --      typed. This is the fold self-update `faf_go f (f acc (get a i)) ...`:
-    --      recording 0 there demotes the accumulator slot that the initial-value
-    --      observation (float z) set to 2, and the accumulator never gets float-
-    --      marked (the #41 fold gap). The slot's real type still comes from the
-    --      caller's z; genuine global-fn returns / _expr / IIFEs still record 0
-    --      (conservative demote), preserving prior mixed-type soundness.
-    -- Present-but-unknown (__vf_ == 0: a destructured or match-bound name, a
-    -- param whose own sites disagree) records 0; only a name never seen
-    -- (a lambda param, an uncalled fn's param) abstains.
-    let bare_v = head a == "V" && t == 0 && vf == (0 - 1)
-    let hoparam_app = if head a == "A" && t == 0 then is_hoparam_app a ar else false
-    let acc2 = if bare_v || hoparam_app then acc else argf_set fname i t acc
-    argf_obs_args fname (tail args) (i + 1) ar rmap acc2
-
-argf_call fname args ar rmap acc =
-  let n = length args
-  let arity = infer_arity_of fname ar
-  let acc2 = argf_obs_args fname args 0 ar rmap acc
-  if arity > n && arity < 100 then argf_demote fname n arity acc2 else acc2
-
--- complete traversal recording every call's arg observations + value-ref demotions.
-argf_scan node ar rmap acc =
-  let tg = head node
-  if tg == "A" then
-    let (fname, args) = flat node
-    -- An application whose head is not a name (an applied lambda) flattens
-    -- to ("_expr", []): walk its two halves directly so the lambda body and
-    -- the arguments are still scanned (2026-09-11: `(\x -> loop 0 x) 0.42`
-    -- never registered loop's call site).
-    if fname == "_expr" then argf_scan (head (tail (tail node))) ar rmap (argf_scan (head (tail node)) ar rmap acc)
-    else
-    let acc2 = argf_call fname args ar rmap acc
-    argf_scan_list args ar rmap acc2
-  else if tg == "V" then
-    let nm = head (tail node)
-    let av = efind nm ar
-    if av != (0 - 1) && av >= 0 && av < 100 then
-      -- V-series Inc1: a named fn passed into a float-applying HOF param is
-      -- pre-seeded __hofpos_ + observed float; suppress the blanket value-ref
-      -- demotion so its float param survives (raw f64 bits already flow across
-      -- the blr correctly -- only the callee's fmov-vs-asr read was wrong).
-      if efind (cat ["__hofpos_", nm]) acc != (0 - 1) then acc
-      else argf_demote nm 0 (infer_arity_of nm ar) acc
-    else acc
-  else if tg == "O" then argf_scan (head (tail (tail (tail node)))) ar rmap (argf_scan (head (tail (tail node))) ar rmap acc)
-  else if tg == "?" then argf_scan (head (tail (tail (tail node)))) ar rmap (argf_scan (head (tail (tail node))) ar rmap (argf_scan (head (tail node)) ar rmap acc))
-  else if tg == "D" then argf_scan_d node ar rmap acc
-  else if tg == "TD" then argf_scan_d node ar rmap acc
-  else if tg == "L" then argf_scan_list (head (tail node)) ar rmap acc
-  else if tg == "T" then argf_scan_list (head (tail node)) ar rmap acc
-  else if tg == "M" then argf_scan_arms (head (tail (tail node))) ar rmap (argf_scan (head (tail node)) ar rmap acc)
-  -- A lambda's param holds whatever the closure call passed (closure-call
-  -- arguments are generic, a float among them boxed): present-but-unknown, so
-  -- a fn it is handed to cannot claim the raw-register convention on its
-  -- account (2026-09-11: `(\x -> loop 0 x) 0.42` untagged a float box).
-  else if tg == "F" then argf_scan (head (tail (tail node))) ar (vf_mark_unknown [head (tail node)] rmap) acc
-  else acc
-
-argf_scan_list nodes ar rmap acc =
-  if nodes == [] then acc
-  else argf_scan_list (tail nodes) ar rmap (argf_scan (head nodes) ar rmap acc)
-
--- Names a match arm binds are of unknown kind, like tuple destructuring.
-argf_scan_arms arms ar rmap acc =
-  if arms == [] then acc
-  else
-    let rmap2 = vf_mark_unknown (head (tail (head arms))) rmap
-    argf_scan_arms (tail arms) ar rmap (argf_scan (head (tail (tail (head arms)))) ar rmap2 acc)
-
--- let/let-typed binding: scan the value, then scan the body with a __vf_ marker
--- for the bound name IFF the value is provably float (infer_ty == 2). That makes
--- a float user-fn RESULT bound to a local (`let y = mlp 1.0 2.0`) observable as a
--- float at a later call site (`mse y 1.0` -> __argf_mse_0 = 2). Inert for int code
--- (infer_ty is never 2 there), so the int-only diff-fuzzer grammar is unaffected.
-argf_scan_d node ar rmap acc =
-  let nm = head (tail node)
-  let val = head (tail (tail node))
-  let bd = head (tail (tail (tail node)))
-  let acc2 = argf_scan val ar rmap acc
-  let tg = head node
-  let t = if tg == "D" then infer_ty val ar rmap else 0
-  -- D: a let whose value has a known kind (1 int, 2 float, 3 heap, 4 taken
-  -- out of a container) is observable at later call sites; an unresolved one
-  -- (0) stays absent and abstains, as before. TD: names destructured from a
-  -- tuple are kind 4: a site that passes one demotes the callee's slot, so a
-  -- float or string taken out of a tuple never reaches a raw-register or
-  -- raw-float parameter (findings F-5000-2 p2 shapes, 2026-09-11).
-  let rmap2 = if tg == "D" then (if t != 0 then cons (cat ["__vf_", nm], t) rmap else rmap)
-              else vf_mark_unknown nm rmap
-  argf_scan bd ar rmap2 acc2
-
--- An application of a HIGHER-ORDER param (not a global fn, not a builtin):
--- its type is the passed-in fn's, unknowable here, so sites abstain.
-is_hoparam_app node ar =
-  if head node != "A" then false
-  else
-    let (g, gargs) = flat node
-    if g == "_expr" then false
-    else if is_builtin_name g then false
-    else efind g ar == (0 - 1)
-
--- Every builtin cg_bi dispatches on, plus the typed builtin groups. A chain of
--- comparisons, not a list: a top-level list binding is re-evaluated (and
--- re-allocated) on every reference, and this runs for every let in every
--- call-site analysis round (a self-compile allocated 500 MB through it).
-is_builtin_name n =
-  if n == "head" || n == "tail" || n == "length" || n == "cat" || n == "show" || n == "cons" || n == "append" || n == "print" || n == "join" || n == "chars" || n == "map" || n == "filter" || n == "reverse" || n == "range" || n == "fold" then true
-  else if infer_is_int_builtin n || infer_is_heap_builtin n || infer_is_float_builtin n then true
-  else n == "alloc_stats_snapshot" || n == "arena_mark" || n == "arena_reset" || n == "arr_get" || n == "arr_set" || n == "bit_and" || n == "bit_or" || n == "bit_xor" || n == "byte_at" || n == "byte_set" || n == "channel" || n == "error" || n == "fiber_await" || n == "fiber_init" || n == "fiber_yield" || n == "float_arr_from_f32_file" || n == "float_arr_len" || n == "float_arr_to_f32_file" || n == "gpu_map" || n == "join_thread" || n == "mutex_lock" || n == "mutex_new" || n == "mutex_unlock" || n == "not" || n == "rc_alloc" || n == "rc_release" || n == "rc_retain" || n == "recv" || n == "rotl" || n == "rotr" || n == "send" || n == "shl" || n == "shr" || n == "spawn" || n == "spawn_thread" || n == "try" || n == "write_file" || n == "trim" || n == "chomp" || n == "fneg" || n == "fsqrt" || n == "fabs" || n == "to_float" || n == "int_to_float" || n == "float_to_int" || n == "to_int" || n == "parse_float"
-
-vf_mark_unknown names rmap =
-  if names == [] then rmap
-  else vf_mark_unknown (tail names) (cons (cat ["__vf_", head names], 4) rmap)
-
--- per-fn param-float env: __vf_<p>=2 (float) / =1 (int), derived from the
--- discovered __argf_<nm>_<i> slots in ar. Threaded into argf_scan so a bare
--- variable arg that is a param of the enclosing fn resolves to its concrete
--- type and propagates float-ness across a user-fn hop (the #42 multi-hop fix).
-argf_penv_vf ps nm ar i acc =
-  if ps == [] then acc
-  else
-    let p = head ps
-    let slot = efind (argf_key nm i) ar
-    -- 3 (heap) and 0 (mixed / unknown) are threaded too, so a bare param
-    -- passed on to another fn records what its own sites said instead of
-    -- abstaining: `wrap s = app1 s` with `wrap "a"` demotes app1's slot.
-    let acc2 = if slot == 2 then cons (cat ["__vf_", p], 2) acc
-               else if slot == 1 then cons (cat ["__vf_", p], 1) acc
-               else if slot == 3 then cons (cat ["__vf_", p], 3) acc
-               else if slot == 4 then cons (cat ["__vf_", p], 4) acc
-               else if slot == 0 then cons (cat ["__vf_", p], 0) acc
-               else acc
-    argf_penv_vf (tail ps) nm ar (i + 1) acc2
-
-collect_argf decls ar rmap acc =
-  if decls == [] then acc
-  else
-    let d = head decls
-    if head d == "fn" then
-      let nm = head (tail d)
-      let ps = head (tail (tail d))
-      let bd = head (tail (tail (tail d)))
-      let rmap2 = argf_penv_vf ps nm ar 0 rmap
-      collect_argf (tail decls) ar rmap (argf_scan bd ar rmap2 acc)
-    else collect_argf (tail decls) ar rmap acc
-
--- Fixpoint: fold the discovered __argf markers back into the arity map each
--- round so the next round's penv can see them -> bare-variable params resolve
--- across multiple user-fn hops (chk -> approx; float_arr_fold -> faf_go).
--- Bounded at n (mirrors hoff_fix=6); the lub is monotone (slots only narrow
--- toward 0), so any round past convergence is idempotent.
-collect_argf_fix decls ar rmap acc n =
-  if n <= 0 then acc
-  else
-    let nxt = collect_argf decls (append acc ar) rmap acc
-    -- early-exit on convergence: a true fixpoint (effective mapping unchanged in
-    -- both directions) is idempotent under collect_argf, so every remaining round
-    -- reproduces it. Returning it now yields the SAME markers the full n rounds
-    -- would, keeping the self-host output byte-identical while cutting the common
-    -- case (markers settle in 2-3 rounds) from the fixed 6-round walk.
-    if rmap_eq nxt acc && rmap_eq acc nxt then nxt
-    else collect_argf_fix decls ar rmap nxt (n - 1)
-
--- Cheap O(AST) float-presence gate. body_has_float is the canonical predicate the
--- float codegen already trusts (TCO guard, int-param-marking skip, d8-save layout).
--- For a program with NO float anywhere, collect_hofpos provably yields [] (its seeds
--- require a float-consuming HOF position, i.e. lead_float_count > 0, impossible
--- without floats), so collect_argf_unified's full body reduces EXACTLY to a single
--- collect_argf_fix from []. Gating to that reduction is therefore output-identical
--- (the self-host fixed point + every int-only test preserved by construction) while
--- skipping the two collect_hofpos sweeps + the redundant second fixpoint that made
--- the 8499-line float-free attest.rail crypto closure compile for hours. NOTE:
--- compile.rail is ITSELF float-free, so it takes this path -- the reduction (not a
--- literal []) is what keeps its bytes identical.
+-- Does any fn body contain a float (a literal, a dotted op, a float builtin)?
 decls_have_float decls =
   if decls == [] then false
   else
@@ -3235,199 +2664,9 @@ decls_have_float decls =
       else decls_have_float (tail decls)
     else decls_have_float (tail decls)
 
--- V-series Inc3 (#41): two-round unified float-dataflow seed. collect_hofpos (HOF
--- seed) and collect_argf (call-site lub) are mutually dependent for folds: the
--- accumulator's float-ness comes from collect_argf (__argf_faf_go_acc=2 via #42
--- multi-hop from the 0.0 literal), but collect_hofpos's penv-aware lead_float_count
--- must SEE that to mark the reduce-fn param float (__hoff_faf_go_f) and seed the
--- passed-in reduce fn (addf/maxf). Round 1 establishes the accumulator; round 2's
--- collect_hofpos picks it up (penv = append argf1 ar) and seeds the reduce fn;
--- round 2's argf folds it in. Two rounds = exactly the hofpos<->argf cycle depth
--- (forwarding depth is handled WITHIN each collect_hofpos by hoff_fix's 6 iters).
--- For programs with no float HOFs (compile.rail itself) round 2 == round 1, so the
--- emitted binary is byte-identical -- the self-host fixed point is preserved.
-collect_argf_unified decls ar rmap =
-  if decls_have_float decls then
-    let hof1 = collect_hofpos decls ar
-    let argf1 = collect_argf_fix decls ar rmap hof1 6
-    let hof2 = collect_hofpos decls (append argf1 ar)
-    -- When the HOF-float seed reaches its fixpoint in one round (hof2 == hof1), the
-    -- second collect_argf_fix is a pure re-derivation of argf1 (identical decls/ar/
-    -- rmap/seed), so return argf1 and skip a full 6-round closure walk. Byte-identical:
-    -- only a float FOLD -- where round-2 collect_hofpos picks up the accumulator's
-    -- float-ness from argf1 (#41) and thus hof2 != hof1 -- needs the second fixpoint.
-    -- The common float case (floats present but no float HOFs, e.g. attest.rail, whose
-    -- floats live only in json's number parser) converges in one round, halving the
-    -- float-path cost that otherwise made any json+TLS program compile for minutes.
-    if rmap_eq hof2 hof1 && rmap_eq hof1 hof2 then argf1
-    else collect_argf_fix decls ar rmap hof2 6
-  else collect_argf_fix decls ar rmap [] 6
-
--- ── V-series Inc1: higher-order float-param marking (native float_arr path) ──
--- A named fn passed AS A VALUE into a float-consuming HOF position (e.g.
--- `float_arr_map dbl xs`) must keep its float-param convention so the indirect
--- blr reads/returns raw f64 bits (float_arr_get/set already use raw bits; the
--- only break was the callee body compiling as int because nothing marked its
--- param float). Bodies are TYPE-AGNOSTIC -- `x * x` is float iff x is float --
--- so the signal comes from the APPLICATION CONTEXT: a param applied to a known
--- float (float_arr_get a i) is float-consuming. We compute __hoff_<H>_<k> = how
--- many leading float args param k of H is applied to (transitively through
--- forwarders like float_arr_map -> fam_go, via a bounded fixpoint), then at
--- value-ref sites seed __argf_<g>_i=2 for g's leading params + __hofpos_<g> to
--- suppress the V-case demotion. The seed is one observation in the argf lub, so
--- a genuine int direct-call site still joins it to 0 (sound for mixed/ill-typed).
-hoff_key h k = cat ["__hoff_", h, "_", show k]
-
-idx_of nm ps i =
-  if ps == [] then 0 - 1
-  else if head ps == nm then i
-  else idx_of nm (tail ps) (i + 1)
-
-hoff_max_set key m hofmap =
-  if efind key hofmap > m then hofmap else rmap_set key m hofmap
-
--- count consecutive leading args that are statically float. penv carries the
--- enclosing fn's float params (`__float_<p>`, derived from __argf slots): WITHOUT
--- it a fold's `f acc (get a i)` sees acc (a bare param) as non-float -> stops at 0
--- -> the reduce-fn f is never marked float-consuming (the #41 fold-acc gap).
-lead_float_count args penv =
-  if args == [] then 0
-  else if is_float (head args) penv then 1 + lead_float_count (tail args) penv
-  else 0
-
--- contributions of one application (fn applied to args) inside H (params hps):
--- (a) fn is a param of H applied to leading floats -> raise __hoff_H_<idx fn>.
--- (b) any arg that is a param p of H passed at position j inherits __hoff_fn_j
---     -> raise __hoff_H_<idx p> (transitive forwarding through global callees).
-hoff_app H hps penv fn args hofmap =
-  let pidx = idx_of fn hps 0
-  let m0 = if pidx >= 0 then hoff_max_set (hoff_key H pidx) (lead_float_count args penv) hofmap else hofmap
-  hoff_inherit H hps fn args 0 m0
-
-hoff_inherit H hps fn args j hofmap =
-  if args == [] then hofmap
-  else
-    let a = head args
-    let hm2 = if head a == "V" then
-                let q = idx_of (head (tail a)) hps 0
-                if q >= 0 then
-                  let m = efind (hoff_key fn j) hofmap
-                  if m > 0 then hoff_max_set (hoff_key H q) m hofmap else hofmap
-                else hofmap
-              else hofmap
-    hoff_inherit H hps fn (tail args) (j + 1) hm2
-
-hoff_scan H hps penv node hofmap =
-  let tg = head node
-  if tg == "A" then
-    let (fn, args) = flat node
-    hoff_scan_list H hps penv args (hoff_app H hps penv fn args hofmap)
-  else if tg == "O" then hoff_scan H hps penv (head (tail (tail (tail node)))) (hoff_scan H hps penv (head (tail (tail node))) hofmap)
-  else if tg == "?" then hoff_scan H hps penv (head (tail (tail (tail node)))) (hoff_scan H hps penv (head (tail (tail node))) (hoff_scan H hps penv (head (tail node)) hofmap))
-  else if tg == "D" || tg == "TD" then hoff_scan H hps penv (head (tail (tail (tail node)))) (hoff_scan H hps penv (head (tail (tail node))) hofmap)
-  else if tg == "L" || tg == "T" then hoff_scan_list H hps penv (head (tail node)) hofmap
-  else if tg == "M" then hoff_arms H hps penv (head (tail (tail node))) (hoff_scan H hps penv (head (tail node)) hofmap)
-  else if tg == "F" then hoff_scan H hps penv (head (tail (tail node))) hofmap
-  else hofmap
-
-hoff_scan_list H hps penv nodes hofmap =
-  if nodes == [] then hofmap
-  else hoff_scan_list H hps penv (tail nodes) (hoff_scan H hps penv (head nodes) hofmap)
-
-hoff_arms H hps penv arms hofmap =
-  if arms == [] then hofmap
-  else hoff_arms H hps penv (tail arms) (hoff_scan H hps penv (head (tail (tail (head arms)))) hofmap)
-
--- penv = enclosing fn's float-param env from already-known __argf slots (the #41
--- coupling: collect_argf's accumulator-float discovery feeds back into the HOF seed).
--- PERF: penv depends only on `ar`, which is CONSTANT within one collect_hofpos, so
--- it is invariant across the hoff_fix iterations. Precompute it ONCE per decl via
--- penv_list and thread the aligned list through, rather than recomputing it on every
--- one of the 6 passes. The old per-pass recompute (a full-`ar` efind walk per param,
--- each allocating cat/cons keys) was a ~6x marking-phase blowup + GC thrash that made
--- the self-compile run >90 min. Marking RESULTS are byte-identical -- penv_list yields
--- the same penv mark_argf_params produced inline; this only removes redundant work.
-penv_list decls ar =
-  if decls == [] then []
-  else
-    let d = head decls
-    if head d == "fn" then cons (mark_argf_params (head (tail (tail d))) (head (tail d)) ar [] 0) (penv_list (tail decls) ar)
-    else cons [] (penv_list (tail decls) ar)
-
-hoff_pass decls penvs hofmap =
-  if decls == [] then hofmap
-  else
-    let d = head decls
-    if head d == "fn" then
-      let nm = head (tail d)
-      let ps = head (tail (tail d))
-      let bd = head (tail (tail (tail d)))
-      hoff_pass (tail decls) (tail penvs) (hoff_scan nm ps (head penvs) bd hofmap)
-    else hoff_pass (tail decls) (tail penvs) hofmap
-
-hoff_fix decls penvs hofmap n =
-  if n <= 0 then hofmap
-  else
-    let nxt = hoff_pass decls penvs hofmap
-    if rmap_eq nxt hofmap && rmap_eq hofmap nxt then nxt
-    else hoff_fix decls penvs nxt (n - 1)
-
--- seed float-param markers for g (leading m params) + __hofpos_<g>.
-seed_float_fn g m ar acc =
-  let av = efind g ar
-  if av == (0 - 1) || av < 0 || av >= 100 then acc
-  else seed_params g m 0 (cons (cat ["__hofpos_", g], 1) acc)
-
-seed_params g m k acc =
-  if k >= m then acc
-  else seed_params g m (k + 1) (rmap_set (argf_key g k) 2 acc)
-
--- at a call `fn arg0 arg1 ...`: any arg that is a named fn g passed into a
--- float-consuming position (__hoff_fn_j > 0) gets g's leading params seeded.
-hofpos_obs fn args j ar hofmap acc =
-  if args == [] then acc
-  else
-    let a = head args
-    let m = efind (hoff_key fn j) hofmap
-    let acc1 = if m > 0 && head a == "V" then seed_float_fn (head (tail a)) m ar acc else acc
-    hofpos_obs fn (tail args) (j + 1) ar hofmap acc1
-
-hofpos_scan node ar hofmap acc =
-  let tg = head node
-  if tg == "A" then
-    let (fn, args) = flat node
-    hofpos_scan_list args ar hofmap (hofpos_obs fn args 0 ar hofmap acc)
-  else if tg == "O" then hofpos_scan (head (tail (tail (tail node)))) ar hofmap (hofpos_scan (head (tail (tail node))) ar hofmap acc)
-  else if tg == "?" then hofpos_scan (head (tail (tail (tail node)))) ar hofmap (hofpos_scan (head (tail (tail node))) ar hofmap (hofpos_scan (head (tail node)) ar hofmap acc))
-  else if tg == "D" || tg == "TD" then hofpos_scan (head (tail (tail (tail node)))) ar hofmap (hofpos_scan (head (tail (tail node))) ar hofmap acc)
-  else if tg == "L" || tg == "T" then hofpos_scan_list (head (tail node)) ar hofmap acc
-  else if tg == "M" then hofpos_arms (head (tail (tail node))) ar hofmap (hofpos_scan (head (tail node)) ar hofmap acc)
-  else if tg == "F" then hofpos_scan (head (tail (tail node))) ar hofmap acc
-  else acc
-
-hofpos_scan_list nodes ar hofmap acc =
-  if nodes == [] then acc
-  else hofpos_scan_list (tail nodes) ar hofmap (hofpos_scan (head nodes) ar hofmap acc)
-
-hofpos_arms arms ar hofmap acc =
-  if arms == [] then acc
-  else hofpos_arms (tail arms) ar hofmap (hofpos_scan (head (tail (tail (head arms)))) ar hofmap acc)
-
--- value-ref seed pass: compute the HOF-signature fixpoint, then scan all bodies.
-collect_hofpos decls ar =
-  let penvs = penv_list decls ar
-  hofpos_decls decls ar (hoff_fix decls penvs [] 6) []
-
-hofpos_decls decls ar hofmap acc =
-  if decls == [] then acc
-  else
-    let d = head decls
-    if head d == "fn" then hofpos_decls (tail decls) ar hofmap (hofpos_scan (head (tail (tail (tail d)))) ar hofmap acc)
-    else hofpos_decls (tail decls) ar hofmap acc
-
--- compile_func hook: mark param p __float_ when __argf_<fn>_<i> proved all-sites-float.
--- Mark a param float (slot==2, all sites float) OR int (slot==1, all sites int -> scvtf-promote
--- in float contexts, fixing `0.0 + int_param`). Never override an existing __float_ mark.
+-- compile_func hook: mark param p __float_ when its kind is float (it arrives as raw float
+-- bits) or __int_ when it is an int (scvtf-promoted in float contexts, `0.0 + int_param`).
+-- Never override an existing __float_ mark.
 mark_argf_params ps nm ar env i =
   if ps == [] then env
   else
@@ -4859,7 +4098,7 @@ inject_grad_fns decls =
   if marks == [] then decls
   else append (strip_grad_marks decls) (synth_grad_decls marks decls)
 
--- okps: the params whose call sites allow an int reading (argf_int_params).
+-- okps: the params whose kind allows an int reading (slots_int_params).
 -- The early return compares the raw tagged words, which orders ints and
 -- nothing else: with two string params `if a < b` compared two pointers
 -- (findings F-5000-1, t208, 2026-09-11).
@@ -4974,8 +4213,8 @@ slots_any slots v =
   else if head slots == v then true
   else slots_any (tail slots) v
 
--- The params whose call sites do not contradict an int reading (every site
--- int, or no site seen); only these may take the syntactic `__int_` mark
+-- The params whose kind does not contradict an int reading (an int, or
+-- nothing known); only these may take the syntactic `__int_` mark
 -- (used_in_arith counts the string-polymorphic `+` and the ordering
 -- operators as evidence) or the early-return raw compare.
 slots_int_params ps slots =
@@ -4995,9 +4234,9 @@ compile_func d ar lc =
   -- window can spill past the real stack top on small-env processes,
   -- producing an EXC_BAD_ACCESS at .Lgc_scan+8.
   let save_args = if nm == "main" then "    adrp x8, _rail_argc@PAGE\n    str x0, [x8, _rail_argc@PAGEOFF]\n    adrp x8, _rail_argv@PAGE\n    str x1, [x8, _rail_argv@PAGEOFF]\n    adrp x8, _rail_envp@PAGE\n    str x2, [x8, _rail_envp@PAGEOFF]\n    mov x8, sp\n    adrp x9, _rail_stack_top@PAGE\n    str x8, [x9, _rail_stack_top@PAGEOFF]\n" else ""
-  -- Raw-register params (x19..x21, untagged) only when NO param is a float:
-  -- all_params_int is syntactic and cannot see a call-site float proof
-  -- (__argf_ == 2), so `mul2c a b = a * b` called with floats got its params
+  -- Raw-register params (x19..x21, untagged) only when every param may be an
+  -- int: all_params_int is syntactic and cannot see a float param the types
+  -- proved (__argf_ == 2), so `mul2c a b = a * b` called with floats got its params
   -- `asr`-untagged and `lsl/orr`-retagged: each float came back with its low
   -- bit set, 2 ulp high (known/float_param_bare_mul_lsb, 2026-09-07).
   -- One arity-map lookup per param; the four questions below read the list.
@@ -5008,7 +4247,7 @@ compile_func d ar lc =
   let env = if use_regs then mk_env_reg ps 16 0 else mk_env ps 16
   let env = if length ps <= 3 then mark_int_params (slots_int_params ps slots) bd env else env
   let env = mark_float_params ps bd env
-  -- Increment A: mark params proved float at every call site (__argf_).
+  -- Mark params by the kind the types gave them (__argf_: 2 float, 1 int).
   let env = mark_argf_params ps nm ar env 0
   let env = cons ("__nregs", nregs) env
   -- Inject global float-return markers from arity map into local env
@@ -5018,15 +4257,21 @@ compile_func d ar lc =
   let has_float = body_has_float bd
   let d8_off = show (16 + 8 * length ps)
   let first_sl = 16 + 8 * length ps + (if has_float then 16 else 0)
-  -- A float-marked param whose call sites are not all proven float (the mark
-  -- came from the body's own use of it, or the fn is called as a value) arrives
-  -- generic and is normalised to raw bits on entry.
+  -- A float-marked param whose kind is not float (the mark came from the body's
+  -- own use of it, or the fn is called as a value) arrives generic and is
+  -- normalised to raw bits on entry.
   let norm = if use_regs || pf_on ar == false then "" else norm_float_params ps nm ar env 0
   -- A float body in a fn that is not float-returning (a `?` with one float
   -- branch, a let whose body is float) leaves boxed; its callers read generic.
-  let ret_f = if pf_on ar == false then false else nm != "main" && is_float bd env && efind (cat ["__float_ret_", nm]) env == (0 - 1)
-  let is_tp = nm != "main" && ret_f == false
-  let env = if efind (cat ["__float_ret_", nm]) env != (0 - 1) then cons ("__ret_raw", 1) env else env
+  let fret = nm != "main" && efind (cat ["__float_ret_", nm]) env != (0 - 1)
+  let body_f = if pf_on ar == false then false else is_float bd env
+  let ret_f = nm != "main" && body_f && fret == false
+  -- A float-returning fn (its type says so) whose body codegen does not produce raw float
+  -- bits (a call to a polymorphic fn, `head xs` of a [float]) reads the generic value back
+  -- as raw on the way out.
+  let ret_u = fret && body_f == false
+  let is_tp = nm != "main" && ret_f == false && ret_u == false
+  let env = if fret then cons ("__ret_raw", 1) env else env
   let final_sl = max_sl bd first_sl
   let raw_fs = if final_sl < 48 then 48 else final_sl
   let frame_size0 = ((raw_fs + 15) / 16) * 16
@@ -5035,7 +4280,7 @@ compile_func d ar lc =
   let int_ok_ps = slots_int_params ps slots
   -- ret_f: the early return would hand the base case back raw while the body
   -- leaves boxed, so the whole `?` goes through cg (branch promotion, then box).
-  let has_early = if use_self_loop || ret_f then false else mk_early_ret nm ps bd lc int_ok_ps != ""
+  let has_early = if use_self_loop || ret_f || ret_u then false else mk_early_ret nm ps bd lc int_ok_ps != ""
   let early = if has_early then mk_early_ret nm ps bd lc int_ok_ps else ""
   let cg_body = if has_early && head bd == "?" then head (tail (tail (tail bd))) else bd
   -- Mark function as int-returning if body is provably int (enables guard elimination on calls)
@@ -5097,7 +4342,7 @@ compile_func d ar lc =
   let fs = show frame_size
   let _ = if short then print (cat ["  note: frame predictor under-sized ", nm, " (", fs0, " < ", fs, "), recompiled"]) else 0
   let (body_asm1, lc1, _) = if short then cg cg_body env ar lc first_sl is_tp fs else (body_asm, lc1, sl_reached)
-  let body_asm = if ret_f then cat [body_asm1, box_float_asm] else body_asm1
+  let body_asm = if ret_f then cat [body_asm1, box_float_asm] else if ret_u then cat [body_asm1, unbox_float_asm] else body_asm1
   -- A float-returning fn referenced as a value (a closure, a HOF argument)
   -- is entered through _<nm>__gen, which boxes the raw result for the generic
   -- caller. Direct calls keep the raw convention.
@@ -6443,6 +5688,13 @@ driver_types_errors _ =
   let _ = print (if ok then "  PASS: type error reported" else cat ["  FAIL: ", out])
   ok
 
+driver_types_codegen _ =
+  let _ = print "  --- driver_types_codegen ---"
+  let out = driver_types_run "sq x = x * x\nmain = sq 7\n"
+  let ok = str_contains "sq : a -> a" out && str_contains "codegen: settled after 1 round; 1 of 1 parameters and 2 of 2 results have a static representation" out && str_contains "rc=0" out
+  let _ = print (if ok then "  PASS: codegen summary" else cat ["  FAIL: ", out])
+  ok
+
 driver_self_refuses_small_arena _ =
   let _ = print "  --- driver_self_refuses_small_arena ---"
   let line = trim (shell "RAIL_ARENA_MB=1000 ./rail_native self 2>&1 | head -1")
@@ -6523,8 +5775,8 @@ init_list lst =
   if length lst <= 1 then []
   else cons (head lst) (init_list (tail lst))
 
--- Track B: inference test helpers. Verify infer_return_types' result by
--- looking up __ret_<fname> in the arity map produced for `src`.
+-- The kind of a fn's result as codegen sees it (tools/types.rail): 0 UNKNOWN, 1 INT,
+-- 2 FLOAT (leaves as raw float bits), 3 HEAP.
 infer_ty_str t =
   if t == 0 then "UNKNOWN"
   else if t == 1 then "INT"
@@ -6534,11 +5786,7 @@ infer_ty_str t =
 
 run_infer_test name src fname expected =
   let _ = print (cat ["  --- infer_", name, " ---"])
-  let toks = tokenize src
-  let decls = pprog toks
-  let decls = opt_decls decls
-  let ar = get_arities decls
-  let actual = efind (cat ["__ret_", fname]) ar
+  let actual = infer_kind_of (hm_result_kinds (opt_decls (pprog (tokenize src)))) fname
   let pass = actual == expected
   let _ = if pass then print (cat ["  PASS: ", fname, "=", infer_ty_str actual])
                   else print (cat ["  FAIL: ", fname, "=", infer_ty_str actual, " want ", infer_ty_str expected])
@@ -6546,16 +5794,15 @@ run_infer_test name src fname expected =
 
 run_infer_test2 name src f1 e1 f2 e2 =
   let _ = print (cat ["  --- infer_", name, " ---"])
-  let toks = tokenize src
-  let decls = pprog toks
-  let decls = opt_decls decls
-  let ar = get_arities decls
-  let a1 = efind (cat ["__ret_", f1]) ar
-  let a2 = efind (cat ["__ret_", f2]) ar
+  let ks = hm_result_kinds (opt_decls (pprog (tokenize src)))
+  let a1 = infer_kind_of ks f1
+  let a2 = infer_kind_of ks f2
   let pass = a1 == e1 && a2 == e2
   let _ = if pass then print (cat ["  PASS: ", f1, "=", infer_ty_str a1, " ", f2, "=", infer_ty_str a2])
                   else print (cat ["  FAIL: ", f1, "=", infer_ty_str a1, " ", f2, "=", infer_ty_str a2, " want ", infer_ty_str e1, " ", infer_ty_str e2])
   pass
+
+infer_kind_of ks nm = let k = efind nm ks in if k < 0 then 0 else k
 
 args = []
 
@@ -6566,9 +5813,7 @@ compile_file prefix path =
   if length asm == 0 then 1
   else build prefix asm
 
--- Track B: dump cross-function return-type inference for one or more files.
--- Reports per-fn type and aggregate coverage (% non-UNKNOWN). Used to verify
--- the precise-GC plan's ≥80% coverage gate against stdlib modules.
+-- `rail infer`: the kind of every fn's result, per file, and the share codegen knows.
 infer_dump_files paths =
   let totals = infer_dump_walk paths 0 0
   let (n, k) = totals
@@ -6586,28 +5831,19 @@ infer_dump_walk paths n_acc k_acc =
 infer_dump_one path =
   let src = read_file path
   let _ = print (cat ["--- ", path, " ---"])
-  let toks = tokenize src
-  let decls = pprog toks
-  let decls = opt_decls decls
-  let ar = get_arities decls
-  let stats = infer_dump_decls decls ar 0 0
+  let decls = opt_decls (pprog (tokenize src))
+  let stats = infer_dump_kinds (hm_result_kinds decls) 0 0
   let (n, k) = stats
   let pct = if n == 0 then 0 else (k * 100) / n
   let _ = print (cat ["  ", show k, "/", show n, " (", show pct, "%) non-UNKNOWN"])
   stats
 
-infer_dump_decls decls ar n_acc k_acc =
-  if length decls == 0 then (n_acc, k_acc)
+infer_dump_kinds ks n_acc k_acc =
+  if ks == [] then (n_acc, k_acc)
   else
-    let d = head decls
-    if head d == "fn" then
-      let nm = head (tail d)
-      let r = efind (cat ["__ret_", nm]) ar
-      let r2 = if r == (0 - 1) then 0 else r
-      let _ = print (cat ["  ", nm, " : ", infer_ty_str r2])
-      let kk = if r2 != 0 then k_acc + 1 else k_acc
-      infer_dump_decls (tail decls) ar (n_acc + 1) kk
-    else infer_dump_decls (tail decls) ar n_acc k_acc
+    let (nm, r) = head ks
+    let _ = print (cat ["  ", nm, " : ", infer_ty_str r])
+    infer_dump_kinds (tail ks) (n_acc + 1) (if r != 0 then k_acc + 1 else k_acc)
 
 -- Smoke-test subset for fast DX iteration. Targets the most-likely-to-break
 -- pathways: parse, codegen, GC, float arith, TCO, closures, ADTs.
@@ -6828,7 +6064,7 @@ run_tests _ =
   -- param_is_float marks both params float so the native fcmp path is used.
   -- Real-world victim: stdlib/mhd_kernel.rail mk_minmod (the whole MUSCL path).
   let t136 = run_test "float_user_fn_minmod" "minmod a b =\n  if a > 0.0 then (if b > 0.0 then (if a < b then a else b) else 0.0)\n  else if a < 0.0 then (if b < 0.0 then (if a > b then a else b) else 0.0)\n  else 0.0\nmain =\n  let _ = print (cat [show_float (minmod 3.0 5.0), \" \", show_float (minmod 8.0 6.0)])\n  0" "3 6"
-  -- t137/t138 (Increment A): arithmetic-float-param via whole-call-site agreement.
+  -- t137/t138 (Increment A, a call-site pass; the types decide this since 2026-09-22):
   -- t137: every call site of mul2 passes a float -> params marked __float_ -> `a * b` is float-mul.
   -- t138 (negative guard): inc(int) stays int -> inc 5 == 6 (never mismark an int param as float).
   -- t139 (int-param dual): addk's only call site passes an INT, so x is marked __int_ and
@@ -6951,7 +6187,9 @@ run_tests _ =
   let i3 = run_infer_test "list_return" "mklist x = cons x (cons (x + 1) [])\nmain = 0" "mklist" 3
   let i4 = run_infer_test2 "mutual_rec" "evnp n = if n == 0 then 1 else oddp (n - 1)\noddp n = if n == 0 then 0 else evnp (n - 1)\nmain = evnp 10" "evnp" 1 "oddp" 1
   let i5 = run_infer_test "adt_ctor" "type Box = | MkBox v\nwrap x = MkBox x\nmain = 0" "wrap" 3
-  let i6 = run_infer_test "match_int" "type Shape = | Circ r | Sq s\narea sh = match sh\n  | Circ r -> r * r * 3\n  | Sq s -> s * s\nmain = 0" "area" 1
+  -- Constructor fields are untyped (dyn), so `r * r * 3` may be a float: UNKNOWN. The
+  -- guessing pass this replaced said INT, which a `Circ 1.5` contradicts.
+  let i6 = run_infer_test "match_int" "type Shape = | Circ r | Sq s\narea sh = match sh\n  | Circ r -> r * r * 3\n  | Sq s -> s * s\nmain = 0" "area" 0
   let s_inf = (if i1 then 1 else 0) + (if i2 then 1 else 0) + (if i3 then 1 else 0) + (if i4 then 1 else 0) + (if i5 then 1 else 0) + (if i6 then 1 else 0)
   let t165 = run_test "selfloop_div_inc" "bl n a = if n == 0 then a else bl (n / 2) (a + 1)\nmain = bl 16 0" "5"
   let t166 = run_test "selfloop_const_mul" "topbit n d = if d * 4 > n then d else topbit n (d * 4)\nmain = topbit 100 1" "64"
@@ -7054,6 +6292,19 @@ run_tests _ =
   -- t216: the call sequence itself sat in x5..x7, so a sixth or later param was overwritten; and a
   -- closure built inside a closure capturing the outer's param and captures.
   let t216 = run_test "closure_many_params" "main =\n  let p = 1\n  let f6 = \\a b c d e g -> a + b * 10 + c * 100 + d * 1000 + e * 10000 + g * 100000\n  let f12 = \\a b c d e f gg hh i j kk l -> a + b + c + d + e + f + gg + hh + i + j + kk + l * 1000 + p\n  let outer = \\x ->\n    let g = \\y -> x + y + p\n    g\n  let inner = outer 600000\n  let _ = print (show (f6 1 2 3 4 5 6))\n  let _ = print (show (f12 1 1 1 1 1 1 1 1 1 1 1 9))\n  let _ = print (show (inner 7000000))\n  0" "654321\n9012\n7600001"
+  -- t219: a float-returning fn named as a value is a closure. Until 2026-09-22 the reference
+  -- read the fn's float-result marker as "this name is a float" and boxed the closure pointer
+  -- as a double; float_arr_map with a named fn jumped into the heap (bus error).
+  let t219 = run_test "float_hof_named_fn" "import \"stdlib/float_arr.rail\"\ndbl x = x *. 2.0\nmain =\n  let a = float_arr_new 3 1.5\n  let b = float_arr_map dbl a\n  let _ = print (show_float (float_arr_get b 1))\n  let c = float_arr_map (\\y -> y +. 1.0) a\n  let _ = print (show_float (float_arr_get c 2))\n  0" "3\n2.5"
+  -- t220: a result the types prove float but whose body codegen leaves generic (`head` of a
+  -- [float]) now leaves as raw float bits: compile_func reads the boxed value back on the
+  -- way out, and the callers' raw `+.` sees the right number.
+  let t220 = run_test "float_result_from_types" "pickf n = if n > 0 then head [1.5, 2.5] else head [3.5]\nmain =\n  let _ = print (show_float (pickf 1 +. pickf 0))\n  0" "5"
+  -- t221: dyn reaching a typed parameter makes it generic. `inc` is int -> int as written, but a
+  -- string from a mixed list reaches it, so it keeps the generic representation and the run-time
+  -- `+` (a string beside an int reads as 0.0): 1, not an untagged pointer.
+  let t221 = run_test "dyn_flow_keeps_generic" "inc x = x + 1\nmain =\n  let mixed = [1, \"a\"]\n  let _ = print (show (inc 5))\n  let _ = print (inc (head (tail mixed)))\n  0" "6\n1"
+  let t222 = driver_types_codegen 0
   -- t186/t187: MHD kernel invariants. stdlib/mhd_{kernel,axisym,mpd}.rail is
   -- 1,254 lines driving the live entropy beacon and had NO suite coverage until
   -- 2026-08-30. t186 pins the guarantee the beacon actually publishes; t187 pins
@@ -7074,10 +6325,10 @@ run_tests _ =
   -- cleaner that damps the field to mush would pass the first one alone.
   let t189 = run_test "mhd_glm_divergence_cleaning" "import \"stdlib/mhd_kernel.rail\"\nabsf x = if x < 0.0 then 0.0 - x else x\nclean_k state psi dt ch cr k i =\n  if i >= k then 0\n  else\n    let _ = mk_glm_clean state psi (dt / to_float k) ch cr\n    clean_k state psi dt ch cr k (i + 1)\nrun state psi k n =\n  if n <= 0 then state\n  else\n    let dt = mk_compute_dt_muscl state\n    let ch = 3.0 * mk_max_speed state\n    let ns = mk_muscl_step state dt\n    let _ = if k > 0 then clean_k ns psi dt ch 0.18 k 0 else 0\n    run ns psi k (n - 1)\nmain =\n  let s0 = mk_init_state\n  let m0 = mk_total_mass s0\n  let e0 = mk_total_energy s0\n  let p = mk_max_div_b (run mk_init_state (mk_psi_new 0) 0 10)\n  let g = run mk_init_state (mk_psi_new 0) 4 10\n  let gd = mk_max_div_b g\n  -- GLM must cut divergence by at least 4x (measured 6.8x) ...\n  let cleaner = if gd * 4.0 < p then 1 else 0\n  -- ... without spending conservation to buy it ...\n  let dm = absf ((mk_total_mass g - m0) / m0)\n  let de = absf ((mk_total_energy g - e0) / e0)\n  let conserved = if dm < 0.0000000001 then (if de < 0.0000000001 then 1 else 0) else 0\n  -- ... and psi must actually be doing something (guards a stubbed-out clean).\n  let alive = if gd > 0.0 then 1 else 0\n  let ok = if cleaner == 1 then (if conserved == 1 then (if alive == 1 then 1 else 0) else 0) else 0\n  let _ = print (if ok == 1 then \"ok\" else cat [\"FAIL p=\", show_float p, \" g=\", show_float gd, \" dm=\", show_float dm])\n  0\n" "ok"
   let s_mhd = (if t186 then 1 else 0) + (if t187 then 1 else 0) + (if t188 then 1 else 0) + (if t189 then 1 else 0)
-  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0)
+  let s_drv = (if t185 then 1 else 0) + (if t191 then 1 else 0) + (if t192 then 1 else 0) + (if t193 then 1 else 0) + (if t194 then 1 else 0) + (if t195 then 1 else 0) + (if t196 then 1 else 0) + (if t197 then 1 else 0) + (if t205 then 1 else 0) + (if t206 then 1 else 0) + (if t207 then 1 else 0) + (if t208 then 1 else 0) + (if t209 then 1 else 0) + (if t210 then 1 else 0) + (if t211 then 1 else 0) + (if t212 then 1 else 0) + (if t213 then 1 else 0) + (if t214 then 1 else 0) + (if t215 then 1 else 0) + (if t216 then 1 else 0) + (if t217 then 1 else 0) + (if t218 then 1 else 0) + (if t219 then 1 else 0) + (if t220 then 1 else 0) + (if t221 then 1 else 0) + (if t222 then 1 else 0)
   let total = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s_inf + s_bx + s_ed + s_tls + s_flt + s_drv + s_mhd
-  let _ = print (cat [show total, "/215 tests passed"])
-  if total == 215 then 0 else 1
+  let _ = print (cat [show total, "/219 tests passed"])
+  if total == 219 then 0 else 1
 
 -- ===========================================================================
 -- M6, self-hosted emit path. Replaces as/ld/codesign with the pure-Rail
@@ -9259,7 +8510,7 @@ x86_compile_func d ar lc =
   let bd = head (tail (tail (tail d)))
   let save_args = if nm == "main" then cat ["    lea r10, [rip+_rail_argc]\n    lea rax, [rdi*2+1]\n    mov [r10], rax\n    lea r10, [rip+_rail_argv]\n    mov [r10], rsi\n"] else ""
   -- Raw-register params (x19..x21, untagged) only when NO param is a float:
-  -- all_params_int is syntactic and cannot see a call-site float proof
+  -- all_params_int is syntactic and cannot see a float param the types proved
   -- (__argf_ == 2), so `mul2c a b = a * b` called with floats got its params
   -- `asr`-untagged and `lsl/orr`-retagged: each float came back with its low
   -- bit set, 2 ulp high (known/float_param_bare_mul_lsb, 2026-09-07).
@@ -10033,6 +9284,10 @@ main =
     else if cmd == "packages" then dispatch_packages 0
     else if cmd == "pkg" then dispatch_pkg 0
     else if cmd == "deploy" then dispatch_deploy a
+    else if cmd == "asm" then
+      if length a >= 3 then dispatch_asm (tail (tail a))
+      else let _ = print "Usage: rail asm <file.rail> [out.s]"
+      1
     else if cmd == "types" then
       if length a >= 3 then types_file (head (tail (tail a)))
       else let _ = print "Usage: rail types <file.rail>"
@@ -10045,6 +9300,14 @@ main =
   else
     let _ = run_tests 0
     self_compile 0
+
+-- `rail asm <file> [out.s]`: the ARM64 assembly the compiler emits, without assembling it
+dispatch_asm rest =
+  let path = head rest
+  let out = if length rest >= 2 then head (tail rest) else "/tmp/rail_out.s"
+  let asm = compile_program_with_file (read_file path) path
+  if length asm == 0 then 1
+  else let _ = write_file out asm in let _ = print (cat ["  asm: ", out]) in 0
 
 dispatch_deploy a =
   if length a >= 4 then

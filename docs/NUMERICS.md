@@ -27,8 +27,8 @@ Overflow is a real hazard on the 63-bit tag; guard multiplicative/loop code with
 - Floats are **unboxed IEEE 754 doubles in ARM64 d-registers**. `fadd`/`fmul`/
   `fdiv`/`fsqrt` are round-to-nearest-even and deterministic **on a given ISA**.
 - **Two representations, one boundary (2026-09-11).** A float the compiler
-  has proved float (a literal, a dotted op, a float-returning call, a let or a
-  parameter with an all-sites float proof) is raw binary64 bits in a register
+  has proved float (a literal, a dotted op, a float-returning call, a let, or a
+  parameter or result whose type is float; see TYPES.md) is raw binary64 bits in a register
   or a frame slot. A *generic* location (a tuple, list or ADT field, a closure
   argument, a parameter without the proof, a match result) holds only tagged
   ints and heap pointers: a float crossing into one is boxed as the tag-6
