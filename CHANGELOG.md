@@ -117,6 +117,11 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **`rail wasm` is linear in program size.** The backend tested `length xs == 0` at every
+  step of its list walks (`length` walks the list), deduplicated the string table once per
+  declaration, and scanned every call site in the program for each parameter. `tools/compile.rail`
+  took more than 15 minutes (it never finished) and now takes 8 seconds; 1,600 string literals
+  went from over 100 seconds to under one. The WAT is byte-identical. Test t236.
 - **A failed guard on a `_` arm falls through to the next arm.** A guarded `_` arm was compiled
   as the last arm: when its guard was false the match jumped to its end and the arms after it
   never ran, so the match gave 0. The language reference's own `classify` printed 0 for a
