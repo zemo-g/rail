@@ -62,6 +62,11 @@ All notable changes to Rail are documented here.
   `cv_emit_expr` match on `Node`; the RISC-V backend's copy of `cm_collect_args` is gone. Every
   file in the tree emits byte-identical Thumb-2 and RV32 assembly, and the compiler's type
   errors drop from 643 to 567.
+- **The checks read the typed syntax tree.** Parse-error collection (`ce_decls`), the
+  exhaustiveness check, the arity check and the warning pass (`tc_infer`) match on `Node` and
+  `Decl`, and so does `gpu_map`'s kernel text (`ast_to_metal`). Every file in the tree, and a set
+  of programs written to trip each check, produce the same errors, warnings and assembly as
+  before; the compiler's type errors drop from 567 to 468.
 - **Array and tuple field types.** A constructor field may be `(arr t)` or `(t1, t2)`, next to
   `[t]` and the named types.
 - **`rail asm <file> [out.s]`** writes the ARM64 assembly the compiler emits without

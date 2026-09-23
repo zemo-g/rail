@@ -166,9 +166,9 @@ Type errors are handled by the same check, since a clash is a bad flow.
    `rail types tools/compile.rail` reaches zero errors. Under way: `tools/ast.rail` declares the
    tree and the parser builds it, the type checker reads it and is typed throughout
    (`rail types tools/types.rail`: zero errors), and so do all five code generators (ARM64,
-   x86, wasm, Cortex-M, RISC-V) and `rail safe`. The other passes move over one at a time (the
-   checks, the optimizer, the AD and auth synthesis); two adapters convert between the typed
-   tree and the older list form until the last one does.
+   x86, wasm, Cortex-M, RISC-V), `rail safe` and the checks. The optimizer and the AD and auth
+   synthesis move over next; two adapters convert between the typed tree and the older list
+   form until the last one does.
 2. **Check.** Type errors in code that type-checks everywhere else become compile errors instead
    of wrong answers or segfaults. Code that relies on dynamic idioms stays accepted until it
    opts in.
