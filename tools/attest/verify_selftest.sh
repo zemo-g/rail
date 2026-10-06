@@ -11,7 +11,14 @@
 # fixture (it compared the file to the unsigned field and the signature to the
 # signed field, and never compared those two to each other).
 #
-# Usage: tools/attest/verify_selftest.sh [pubkey_pem]      exit 0 iff all four outcomes hold
+# Refusals: the Rail verifier must refuse a missing, empty or malformed
+# attestation, a missing input and a missing or broken pubkey with a BAD line
+# and verify.sh's exit for the same fault (3 no file, 4 no key, 5 no witness
+# digest). On 2026-10-05 a missing attestation segfaulted it (exit 139): a
+# nonzero exit, but a crash, not a verdict; a missing input said "digest
+# mismatch" and a missing pubkey "BAD signature".
+#
+# Usage: tools/attest/verify_selftest.sh [pubkey_pem]      exit 0 iff every outcome holds
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 2
 pub=${1:-$HOME/.ledatic/witness/fleet0.pub.pem}
@@ -35,8 +42,8 @@ a["artifact"]["sha256"] = sys.argv[3]          # unsigned field only; witness un
 json.dump(a, open(sys.argv[2], "w"), indent=2)
 PY
 
-rail_verify() {  # <input> <attestation> <want: ok|BAD> -> 0 iff the verdict line AND the exit status agree with want
-  RAIL_ARENA_MB="${RAIL_ARENA_MB:-2000}" ./rail_native --out-prefix "$tmp/rv" run tools/attest/verify.rail "$1" "$2" "$pub" > "$tmp/rv.log" 2>&1; rc=$?
+rail_verify() {  # <input> <attestation> <want: ok|BAD> [pubkey] -> 0 iff the verdict line AND the exit status agree with want
+  RAIL_ARENA_MB="${RAIL_ARENA_MB:-2000}" ./rail_native --out-prefix "$tmp/rv" run tools/attest/verify.rail "$1" "$2" "${4:-$pub}" > "$tmp/rv.log" 2>&1; rc=$?
   v=$(grep -E '^(ok|BAD)' "$tmp/rv.log" | tail -1)
   case "$3" in
     ok)  [ "$rc" = 0 ] && [ "${v#ok}" != "$v" ];;
@@ -55,4 +62,21 @@ tools/attest/verify.sh "$ctl_in" "$ctl_att" "$pub" >/dev/null 2>&1; expect "shel
 rail_verify "$ctl_in" "$ctl_att" ok; expect "Rail verifier accepts the control (ok + exit 0)" 0 $?
 tools/attest/verify.sh "$tmp/replacement.json" "$tmp/tampered.attestation.json" "$pub" >/dev/null 2>&1; expect "shell verifier rejects a replacement artifact" nonzero $?
 rail_verify "$tmp/replacement.json" "$tmp/tampered.attestation.json" BAD; expect "Rail verifier rejects a replacement artifact (BAD + nonzero exit)" 0 $?
+
+rail_refuses() {  # <label> <want exit> <input> <attestation> [pubkey]: a BAD line and exactly that exit
+  rail_verify "$3" "$4" BAD "${5:-}" && [ "$rc" = "$2" ]
+  expect "Rail verifier refuses $1 (BAD + exit $2, got $rc)" 0 $?
+}
+: > "$tmp/empty.json"
+printf '{}\n' > "$tmp/obj.json"
+printf 'not json\n' > "$tmp/garbage.json"
+printf '{"witness": 7}\n' > "$tmp/witness_num.json"
+rail_refuses "a missing attestation" 3 "$ctl_in" "$tmp/none.attestation.json"
+rail_refuses "an empty attestation" 3 "$ctl_in" "$tmp/empty.json"
+rail_refuses "an attestation with no witness" 5 "$ctl_in" "$tmp/obj.json"
+rail_refuses "an attestation that is not JSON" 5 "$ctl_in" "$tmp/garbage.json"
+rail_refuses "a witness that is not an object" 5 "$ctl_in" "$tmp/witness_num.json"
+rail_refuses "a missing input" 3 "$tmp/none.json" "$ctl_att"
+rail_refuses "a missing pubkey" 4 "$ctl_in" "$ctl_att" "$tmp/none.pem"
+rail_refuses "a pubkey that is not a key" 4 "$ctl_in" "$ctl_att" "$tmp/garbage.json"
 exit $fail

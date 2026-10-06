@@ -159,6 +159,17 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **`tools/attest/verify.rail` refuses a missing or malformed file instead of crashing.** A
+  missing, empty or non-JSON attestation, or one whose witness is not an object, segfaulted the
+  verifier (exit 139): nonzero, but a crash and no verdict. A missing input read as "digest
+  mismatch" and a missing pubkey as "BAD signature". It now checks each file with `access(2)`
+  first and reads JSON fields only from objects, printing a `BAD` line with `verify.sh`'s exit
+  for the same fault (3 no file, 4 no key, 5 no witness digest). Two runtime traps sat under
+  the crash: `_fopen` returns the errno of a failed open (2 for a missing file) where callers
+  test for 0, so `read_file` and `read_file_size` read stderr instead; and an argv string
+  passed to a foreign `char*` arrives as its heap-object pointer, so the path is copied into a
+  C buffer before `access`. The `_fopen` stub itself is not changed here.
+  `tools/attest/verify_selftest.sh` gains eight refusal cases; all eight fail against the old verifier.
 - **Threads share the heap safely.** `spawn_thread` ran its function on a second thread that
   bumped the same allocation pointer with no lock, so two threads building lists at once could
   be handed the same memory (a two-thread test hung on its first run), and a collection walked

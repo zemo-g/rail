@@ -24,6 +24,7 @@ import "stdlib/base64.rail"
 import "stdlib/json.rail"
 import "stdlib/env.rail"
 import "stdlib/file.rail"
+import "stdlib/stat.rail"
 
 -- ── PEM armor strip + extract Ed25519 raw pubkey ─────────────────────
 -- Ed25519 SubjectPublicKeyInfo DER = 12-byte prefix + 32 bytes raw key.
@@ -40,12 +41,43 @@ pem_strip_headers lines acc =
   if length lines == 0 then acc
   else pem_strip_step lines acc
 
-pem_extract_pubkey pem_text =
+pem_der pem_text =
   let lines = str_split "\n" pem_text
-  let body = pem_strip_headers lines ""
-  let der = base64_decode_bytes body
+  base64_decode_bytes (pem_strip_headers lines "")
+
+pem_extract_pubkey pem_text =
+  let der = pem_der pem_text
   let n = arr_len der
   arr_slice der (n - 32) 32
+
+-- 1 when the file holds a PEM body of at least the 32-byte Ed25519 key.
+pubkey_ok pub_path =
+  if readable pub_path == 0 then 0
+  else if arr_len (pem_der (read_file pub_path)) < 32 then 0
+  else 1
+
+foreign malloc size -> ptr
+
+-- The path as a fresh NUL-terminated C buffer. A runtime string (argv) reaches
+-- a foreign char* as its heap-object pointer, not its bytes, so access(2) on
+-- an argv path tests a garbage name and says "missing" (literals pass
+-- cleanly, which hides it; stdlib/sqlite.rail's sq_strdup is the same fix).
+c_path s = c_path_into s (malloc ((length (chars s)) + 1)) 0 (length (chars s))
+c_path_into s buf i n =
+  if i >= n then (let _ = byte_set buf i 0 in buf)
+  else let _ = byte_set buf i (char_to_int (str_sub s i 1)) in c_path_into s buf (i + 1) n
+
+-- 1 when access(2) says the path can be read (R_OK), else 0.
+readable path =
+  let c = c_path path
+  let rc = access c 4
+  let _ = free c
+  if rc == 0 then 1 else 0
+
+-- A field of a parsed JSON value, or ["null"] when the value is not an
+-- object: json_get walks an object's pairs and segfaults on anything else.
+obj_get v key =
+  if head v == "obj" then json_get v key else ["null"]
 
 -- ── Reconstruct the canonical message the witness signed ─────────────
 build_message digest pulse_id value_hex witnessed_at =
@@ -102,22 +134,46 @@ sha256_hex_file path =
   let _ = be32_write out 28 (arr_get h 7)
   bytes_to_hex out 32
 
+-- Refuse before reading anything that is not there, with verify.sh's exits
+-- (3 no file, 4 no key, 5 no witness digest). Until 2026-10-05 a missing,
+-- empty or malformed attestation segfaulted here (exit 139), a missing input
+-- read as "digest mismatch" and a missing pubkey as "BAD signature".
+-- Existence is access(2) (is_readable), not fopen: the runtime's _fopen
+-- returns the errno of a failed open (2 for a missing file) where callers
+-- expect 0, so read_file_size and read_file read stderr instead.
 verify_one input_path att_path pub_path =
-  let att_text = read_file att_path
-  let att = parse_json att_text
-  let witness = json_get att "witness"
-  let want_digest = json_str (json_get witness "digest_sha256")
-  let pulse_id = json_int (json_get witness "pulse_id")
-  let value_hex = json_str (json_get witness "value_hex")
-  let witnessed_at = json_int (json_get witness "witnessed_at")
-  let sig_b64 = json_str (json_get witness "sig")
-  let pk_fp = json_str (json_get witness "pk_fp")
-  let name = pick_artifact_name att
-  let have_digest = sha256_hex_file input_path
-  if have_digest != want_digest then
-    let _ = print (cat ["BAD digest mismatch: file=", have_digest, " att=", want_digest])
+  if readable input_path == 0 then
+    let _ = print (cat ["BAD no input: ", input_path])
+    3
+  else if readable att_path == 0 then
+    let _ = print (cat ["BAD no attestation: ", att_path])
+    3
+  else if read_file_size att_path < 1 then
+    let _ = print (cat ["BAD no attestation: ", att_path])
+    3
+  else if pubkey_ok pub_path == 0 then
+    let _ = print (cat ["BAD no Ed25519 key in pubkey: ", pub_path])
+    4
+  else verify_att input_path (parse_json (read_file att_path)) pub_path
+
+verify_att input_path att pub_path =
+  let witness = obj_get att "witness"
+  let want_digest = json_str (obj_get witness "digest_sha256")
+  if length (chars want_digest) == 0 then
+    let _ = print "BAD no witness.digest_sha256 in attestation"
     5
-  else verify_sig pub_path want_digest pulse_id value_hex witnessed_at sig_b64 pk_fp name
+  else
+    let pulse_id = json_int (obj_get witness "pulse_id")
+    let value_hex = json_str (obj_get witness "value_hex")
+    let witnessed_at = json_int (obj_get witness "witnessed_at")
+    let sig_b64 = json_str (obj_get witness "sig")
+    let pk_fp = json_str (obj_get witness "pk_fp")
+    let name = pick_artifact_name att
+    let have_digest = sha256_hex_file input_path
+    if have_digest != want_digest then
+      let _ = print (cat ["BAD digest mismatch: file=", have_digest, " att=", want_digest])
+      5
+    else verify_sig pub_path want_digest pulse_id value_hex witnessed_at sig_b64 pk_fp name
 
 default_pub_path _ = cat [getenv "HOME", "/.ledatic/witness/fleet0.pub.pem"]
 

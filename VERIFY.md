@@ -75,7 +75,8 @@ re-verify it. Regenerate and commit it whenever the compiler or the seed changes
 ## 6. A release is attested against a public beacon
 
 ```bash
-tools/attest/verify_selftest.sh        # positive control + a replacement artifact both verifiers must reject
+tools/attest/verify_selftest.sh        # positive control, a replacement artifact both verifiers must reject, and
+                                       #   the Rail verifier refusing missing or malformed files with verify.sh's exits
 tools/verify/check_selftest.sh         # the umbrella itself must fail on a crashed test run or an ok-then-crash verifier
 git show 28ad78be16259b7c9af48bbf3e2a06810aa6491e:tools/compile.rail > /tmp/v530_compile.rail
 ./rail_native run tools/attest/verify.rail /tmp/v530_compile.rail releases/v5.3.0/compile.rail.attestation.json
