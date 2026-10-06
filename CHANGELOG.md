@@ -169,7 +169,7 @@ All notable changes to Rail are documented here.
   test for 0, so `read_file` and `read_file_size` read stderr instead; and an argv string
   passed to a foreign `char*` arrives as its heap-object pointer, so the path is copied into a
   C buffer before `access`. The `_fopen` stub itself is not changed here.
-  `tools/attest/verify_selftest.sh` gains eight refusal cases, five of which crash before this.
+  `tools/attest/verify_selftest.sh` gains eight refusal cases; all eight fail against the old verifier.
 - **Threads share the heap safely.** `spawn_thread` ran its function on a second thread that
   bumped the same allocation pointer with no lock, so two threads building lists at once could
   be handed the same memory (a two-thread test hung on its first run), and a collection walked
