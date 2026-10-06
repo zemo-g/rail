@@ -159,6 +159,15 @@ All notable changes to Rail are documented here.
   directory's README for what it is not.
 
 ### Fixed
+- **A failed `fopen` returns 0 on macOS.** The runtime's `_fopen` makes the raw `open` syscall
+  and treated a negative result as failure, which is Linux's convention (`tools/linux_libc.s`
+  keeps it, correctly). Darwin reports a failed syscall with the carry flag set and a positive
+  errno, so opening a missing file returned 2 (ENOENT), which is fd 2. Every `fp == 0` guard
+  missed it: `read_file_size` measured stderr (29 when stderr was a pipe), and `read_file` read
+  stderr and then `fclose`d it, so the program's next open was handed fd 2 and its errors went
+  nowhere. `_fopen` now tests the carry flag, as `_fread` already did. `_ftell`, `_fwrite`,
+  `_read` and `_fclose` still return a raw errno on failure; they act on descriptors the caller
+  already holds. Test t252.
 - **`tools/attest/verify.rail` refuses a missing or malformed file instead of crashing.** A
   missing, empty or non-JSON attestation, or one whose witness is not an object, segfaulted the
   verifier (exit 139): nonzero, but a crash and no verdict. A missing input read as "digest
